@@ -2934,14 +2934,17 @@ dependencies = [
 [[package]]
 name = "fr-config"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d924e8048073745736356ae0e45a592af"
 
 [[package]]
 name = "fr-expire"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d924e8048073745736356ae0e45a592af"
 
 [[package]]
 name = "fr-persist"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d924e8048073745736356ae0e45a592af"
 dependencies = [
  "fr-protocol",
 ]
@@ -2949,10 +2952,12 @@ dependencies = [
 [[package]]
 name = "fr-protocol"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d924e8048073745736356ae0e45a592af"
 
 [[package]]
 name = "fr-store"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankenredis?rev=7b00450d924e8048073745736356ae0e45a592af#7b00450d924e8048073745736356ae0e45a592af"
 dependencies = [
  "fr-expire",
 ]

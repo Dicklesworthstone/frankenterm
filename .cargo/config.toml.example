@@ -31,3 +31,10 @@ fastapi-router = { path = "../fastapi_rust/crates/fastapi-router" }
 fastapi-macros = { path = "../fastapi_rust/crates/fastapi-macros" }
 fastapi-openapi = { path = "../fastapi_rust/crates/fastapi-openapi" }
 fastapi-output = { path = "../fastapi_rust/crates/fastapi-output" }
+
+[patch."https://github.com/Dicklesworthstone/frankenredis"]
+fr-store = { path = "../frankenredis/crates/fr-store" }
+fr-protocol = { path = "../frankenredis/crates/fr-protocol" }
+fr-config = { path = "../frankenredis/crates/fr-config" }
+fr-expire = { path = "../frankenredis/crates/fr-expire" }
+fr-persist = { path = "../frankenredis/crates/fr-persist" }

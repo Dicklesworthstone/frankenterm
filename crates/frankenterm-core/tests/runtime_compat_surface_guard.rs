@@ -100,6 +100,7 @@ fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
         &[
             "tokio::select!",
             "tokio::process::",
+            "tokio::runtime::Builder",
             "tokio::signal::",
             "tokio::time::sleep",
             "tokio::time::timeout",
@@ -163,6 +164,10 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
     assert!(
         runtime_compat.contains("pub mod process"),
         "runtime_compat.rs must continue to expose a process bridge while this migration contract is active"
+    );
+    assert!(
+        runtime_compat.contains("pub fn start_paused"),
+        "runtime_compat.rs must continue to expose a paused-test runtime builder bridge while this migration contract is active"
     );
     assert!(
         web.contains("use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};"),

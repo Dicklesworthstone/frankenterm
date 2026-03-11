@@ -7,10 +7,12 @@
 //! ## Conflict Detection (ft-1i2ge.4.5)
 //!
 //! After assignment solving and safety envelope enforcement, the loop can
-//! detect assignment conflicts across two dimensions:
+//! detect assignment conflicts across three dimensions:
 //!
 //! - **File reservation overlaps**: Two assignments targeting overlapping
 //!   file paths (using wildcard-aware path matching).
+//! - **Resource reservation overlaps**: Two assignments targeting the same
+//!   logical resource scope (for example panes, sockets, or named locks).
 //! - **Concurrent bead claims**: Multiple agents assigned the same bead
 //!   in the same cycle, or a bead already claimed by an active agent.
 //!
@@ -154,6 +156,8 @@ pub enum DeconflictionStrategy {
 pub enum ConflictType {
     /// Two assignments touch overlapping file paths.
     FileReservationOverlap,
+    /// Two assignments touch overlapping logical resource scopes.
+    ResourceReservationOverlap,
     /// Multiple agents assigned the same bead in one cycle.
     ConcurrentBeadClaim,
     /// An assignment targets a bead already actively claimed.
@@ -183,6 +187,7 @@ pub struct AssignmentConflict {
     pub conflict_type: ConflictType,
     pub involved_agents: Vec<String>,
     pub involved_beads: Vec<String>,
+    /// Conflicting scope identifiers (paths or resource ids).
     pub conflicting_paths: Vec<String>,
     pub detected_at_ms: i64,
     pub resolution: ConflictResolution,
@@ -217,6 +222,16 @@ pub struct ConflictDetectionReport {
 pub struct KnownReservation {
     pub holder: String,
     pub paths: Vec<String>,
+    pub exclusive: bool,
+    pub bead_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Known logical resource reservation held by an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownResourceReservation {
+    pub holder: String,
+    pub resources: Vec<String>,
     pub exclusive: bool,
     pub bead_id: Option<String>,
     pub expires_at_ms: Option<i64>,
@@ -950,12 +965,33 @@ impl MissionLoop {
     /// Detect assignment conflicts across file reservations and bead claims.
     ///
     /// This should be called after `evaluate()` with the current set of known
-    /// reservations and active claims. The report contains structured conflict
-    /// descriptions and ready-to-send deconfliction messages.
+    /// reservations and active claims. Resource reservations default to empty;
+    /// use `detect_conflicts_with_resources` to include them explicitly.
     pub fn detect_conflicts(
         &mut self,
         assignment_set: &AssignmentSet,
         known_reservations: &[KnownReservation],
+        active_claims: &[ActiveBeadClaim],
+        current_ms: i64,
+        issues: &[BeadIssueDetail],
+    ) -> ConflictDetectionReport {
+        self.detect_conflicts_with_resources(
+            assignment_set,
+            known_reservations,
+            &[],
+            active_claims,
+            current_ms,
+            issues,
+        )
+    }
+
+    /// Detect assignment conflicts across file reservations, resource
+    /// reservations, and bead claims.
+    pub fn detect_conflicts_with_resources(
+        &mut self,
+        assignment_set: &AssignmentSet,
+        known_reservations: &[KnownReservation],
+        known_resource_reservations: &[KnownResourceReservation],
         active_claims: &[ActiveBeadClaim],
         current_ms: i64,
         issues: &[BeadIssueDetail],
@@ -986,7 +1022,20 @@ impl MissionLoop {
             issues,
         );
 
-        // Phase 2: Detect concurrent bead claims (same bead assigned to
+        // Phase 2: Detect resource reservation overlaps between assignments
+        // and existing reservations.
+        if conflicts.len() < max {
+            self.detect_resource_reservation_overlaps(
+                assignment_set,
+                known_resource_reservations,
+                current_ms,
+                &mut conflicts,
+                max,
+                issues,
+            );
+        }
+
+        // Phase 3: Detect concurrent bead claims (same bead assigned to
         // multiple agents in this cycle).
         if conflicts.len() < max {
             self.detect_concurrent_bead_claims(
@@ -998,7 +1047,7 @@ impl MissionLoop {
             );
         }
 
-        // Phase 3: Detect collisions with active bead claims from previous
+        // Phase 4: Detect collisions with active bead claims from previous
         // cycles / external state.
         if conflicts.len() < max {
             self.detect_active_claim_collisions(
@@ -1056,6 +1105,103 @@ impl MissionLoop {
             messages,
             auto_resolved_count,
             pending_resolution_count,
+        }
+    }
+
+    fn detect_resource_reservation_overlaps(
+        &self,
+        assignment_set: &AssignmentSet,
+        known_resource_reservations: &[KnownResourceReservation],
+        current_ms: i64,
+        conflicts: &mut Vec<AssignmentConflict>,
+        max: usize,
+        issues: &[BeadIssueDetail],
+    ) {
+        for assignment in &assignment_set.assignments {
+            if conflicts.len() >= max {
+                break;
+            }
+
+            let assignment_resources: Vec<String> = known_resource_reservations
+                .iter()
+                .filter(|r| {
+                    r.bead_id.as_deref() == Some(assignment.bead_id.as_str())
+                        && r.holder == assignment.agent_id
+                })
+                .flat_map(|r| r.resources.clone())
+                .collect();
+
+            if assignment_resources.is_empty() {
+                continue;
+            }
+
+            for reservation in known_resource_reservations {
+                if conflicts.len() >= max {
+                    break;
+                }
+                if !reservation.exclusive {
+                    continue;
+                }
+                if reservation.holder == assignment.agent_id {
+                    continue;
+                }
+                if let Some(exp) = reservation.expires_at_ms {
+                    if exp <= current_ms {
+                        continue;
+                    }
+                }
+
+                let overlapping: Vec<String> = assignment_resources
+                    .iter()
+                    .filter(|resource| {
+                        reservation
+                            .resources
+                            .iter()
+                            .any(|reserved| resource_scopes_overlap(resource, reserved))
+                    })
+                    .cloned()
+                    .collect();
+
+                if !overlapping.is_empty() {
+                    let resolution = resolve_conflict(
+                        self.config.conflict_detection.strategy,
+                        &assignment.agent_id,
+                        &reservation.holder,
+                        assignment.score,
+                        0.0,
+                        &assignment.bead_id,
+                        reservation.bead_id.as_deref().unwrap_or("unknown"),
+                        issues,
+                    );
+
+                    let conflict_id = format!(
+                        "conflict-resource-{}-{}-{}",
+                        self.state.cycle_count, assignment.bead_id, reservation.holder
+                    );
+                    conflicts.push(AssignmentConflict {
+                        conflict_id,
+                        conflict_type: ConflictType::ResourceReservationOverlap,
+                        involved_agents: vec![
+                            assignment.agent_id.clone(),
+                            reservation.holder.clone(),
+                        ],
+                        involved_beads: {
+                            let mut beads = vec![assignment.bead_id.clone()];
+                            if let Some(ref bid) = reservation.bead_id {
+                                if !beads.contains(bid) {
+                                    beads.push(bid.clone());
+                                }
+                            }
+                            beads
+                        },
+                        conflicting_paths: overlapping,
+                        detected_at_ms: current_ms,
+                        resolution,
+                        reason_code: "resource_reservation_overlap".to_string(),
+                        error_code: "FTM2004".to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -1322,6 +1468,11 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     wildcard_match(a, b) || wildcard_match(b, a)
 }
 
+/// Check if two logical resource scopes overlap.
+fn resource_scopes_overlap(a: &str, b: &str) -> bool {
+    a == b || wildcard_match(a, b) || wildcard_match(b, a)
+}
+
 /// Simple wildcard path matching: `*` matches any sequence, `?` matches one char.
 fn wildcard_match(pattern: &str, candidate: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -1417,6 +1568,12 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
                 conflict.conflicting_paths.join(", ")
             )
         }
+        ConflictType::ResourceReservationOverlap => {
+            format!(
+                "Resource reservation overlap on: {}",
+                conflict.conflicting_paths.join(", ")
+            )
+        }
         ConflictType::ConcurrentBeadClaim => {
             format!(
                 "Concurrent claim on bead(s): {}",
@@ -1488,6 +1645,7 @@ fn generate_conflict_messages(conflict: &AssignmentConflict) -> Vec<Deconflictio
             thread_id: thread_id.clone(),
             importance: match conflict.conflict_type {
                 ConflictType::FileReservationOverlap => "high".to_string(),
+                ConflictType::ResourceReservationOverlap => "high".to_string(),
                 ConflictType::ConcurrentBeadClaim => "high".to_string(),
                 ConflictType::ActiveClaimCollision => "normal".to_string(),
             },
@@ -3119,6 +3277,20 @@ mod tests {
         }
     }
 
+    fn make_resource_reservation(
+        holder: &str,
+        resources: &[&str],
+        bead_id: Option<&str>,
+    ) -> KnownResourceReservation {
+        KnownResourceReservation {
+            holder: holder.to_string(),
+            resources: resources.iter().map(|resource| resource.to_string()).collect(),
+            exclusive: true,
+            bead_id: bead_id.map(|b| b.to_string()),
+            expires_at_ms: Some(999_999),
+        }
+    }
+
     fn make_active_claim(bead_id: &str, agent_id: &str) -> ActiveBeadClaim {
         ActiveBeadClaim {
             bead_id: bead_id.to_string(),
@@ -3193,6 +3365,96 @@ mod tests {
                 .involved_agents
                 .contains(&"agent2".to_string())
         );
+    }
+
+    #[test]
+    fn conflict_detection_resource_reservation_overlap_detected() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let resource_reservations = vec![
+            make_resource_reservation("agent1", &["pane:alpha"], Some("a")),
+            make_resource_reservation("agent2", &["pane:alpha"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts_with_resources(
+            &aset,
+            &[],
+            &resource_reservations,
+            &[],
+            5000,
+            &issues,
+        );
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::ResourceReservationOverlap
+        );
+        assert_eq!(
+            report.conflicts[0].reason_code,
+            "resource_reservation_overlap"
+        );
+        assert_eq!(report.conflicts[0].error_code, "FTM2004");
+        assert!(
+            report.conflicts[0]
+                .conflicting_paths
+                .contains(&"pane:alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn conflict_detection_resource_reservation_wildcard_overlap_detected() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let resource_reservations = vec![
+            make_resource_reservation("agent1", &["pane:alpha"], Some("a")),
+            make_resource_reservation("agent2", &["pane:*"], Some("b")),
+        ];
+        let issues = vec![
+            sample_detail("a", BeadStatus::Open, 0, &[]),
+            sample_detail("b", BeadStatus::Open, 1, &[]),
+        ];
+        let report = ml.detect_conflicts_with_resources(
+            &aset,
+            &[],
+            &resource_reservations,
+            &[],
+            5000,
+            &issues,
+        );
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(
+            report.conflicts[0].conflict_type,
+            ConflictType::ResourceReservationOverlap
+        );
+    }
+
+    #[test]
+    fn conflict_detection_expired_resource_reservation_ignored() {
+        let mut ml = MissionLoop::new(MissionLoopConfig::default());
+        let aset = make_assignment_set(vec![make_assignment("a", "agent1", 1.0)]);
+        let resource_reservations = vec![
+            make_resource_reservation("agent1", &["pane:alpha"], Some("a")),
+            KnownResourceReservation {
+                holder: "agent2".to_string(),
+                resources: vec!["pane:alpha".to_string()],
+                exclusive: true,
+                bead_id: Some("b".to_string()),
+                expires_at_ms: Some(4000),
+            },
+        ];
+        let issues = vec![sample_detail("a", BeadStatus::Open, 0, &[])];
+        let report = ml.detect_conflicts_with_resources(
+            &aset,
+            &[],
+            &resource_reservations,
+            &[],
+            5000,
+            &issues,
+        );
+        assert!(report.conflicts.is_empty());
     }
 
     #[test]
@@ -3728,6 +3990,7 @@ mod tests {
     fn conflict_type_serde_roundtrip() {
         let types = vec![
             ConflictType::FileReservationOverlap,
+            ConflictType::ResourceReservationOverlap,
             ConflictType::ConcurrentBeadClaim,
             ConflictType::ActiveClaimCollision,
         ];
@@ -3824,6 +4087,22 @@ mod tests {
         assert!(wildcard_match("**/plan.rs", "crates/core/src/plan.rs"));
         assert!(wildcard_match("src/*.rs", "src/mission_loop.rs"));
         assert!(!wildcard_match("src/*.rs", "tests/foo.rs"));
+    }
+
+    #[test]
+    fn resource_scopes_overlap_exact_match() {
+        assert!(resource_scopes_overlap("pane:alpha", "pane:alpha"));
+    }
+
+    #[test]
+    fn resource_scopes_overlap_wildcard_match() {
+        assert!(resource_scopes_overlap("pane:*", "pane:alpha"));
+        assert!(resource_scopes_overlap("pane:alpha", "pane:*"));
+    }
+
+    #[test]
+    fn resource_scopes_overlap_no_match() {
+        assert!(!resource_scopes_overlap("pane:alpha", "pane:beta"));
     }
 
     #[test]

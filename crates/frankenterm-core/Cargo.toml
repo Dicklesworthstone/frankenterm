@@ -96,12 +96,12 @@ frankensearch = { workspace = true, optional = true }
 # Agent detection integration (optional, behind feature)
 franken-agent-detection = { workspace = true, optional = true }
 # FrankenRedis session integration (optional, behind feature)
-# Pin exact crate versions while sourcing code from the sibling source-of-truth repo.
-fr-store = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-store", optional = true }
-fr-protocol = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-protocol", optional = true }
-fr-config = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-config", optional = true }
-fr-expire = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-expire", optional = true }
-fr-persist = { version = "=0.1.0", path = "../../../frankenredis/crates/fr-persist", optional = true }
+# Pin exact crate versions while sourcing code from the source-of-truth git repo.
+fr-store = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
+fr-protocol = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
+fr-config = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
+fr-expire = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
+fr-persist = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
 
 # Semantic search (optional, behind feature)
 tokenizers = { version = "0.21", optional = true }

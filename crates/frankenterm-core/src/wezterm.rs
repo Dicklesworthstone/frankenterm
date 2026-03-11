@@ -1982,7 +1982,7 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .start_paused(true)
             .build()

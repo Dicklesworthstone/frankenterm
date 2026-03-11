@@ -1199,6 +1199,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// No-op: paused time control is only available on tokio-backed test runtimes.
+    #[cfg(test)]
+    #[must_use]
+    pub fn start_paused(self, _start_paused: bool) -> Self {
+        self
+    }
+
     /// No-op: thread naming is not exposed in asupersync.
     #[must_use]
     pub fn thread_name(self, _name: &str) -> Self {
@@ -1253,6 +1260,14 @@ impl RuntimeBuilder {
     /// No-op: `enable_all()` is already called in the constructors.
     #[must_use]
     pub fn enable_all(self) -> Self {
+        self
+    }
+
+    /// Starts the test runtime with tokio's paused clock when requested.
+    #[cfg(test)]
+    #[must_use]
+    pub fn start_paused(mut self, start_paused: bool) -> Self {
+        self.inner.start_paused(start_paused);
         self
     }
 
