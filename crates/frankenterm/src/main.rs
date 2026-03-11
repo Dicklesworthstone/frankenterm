@@ -10095,16 +10095,26 @@ async fn distributed_publish_security_error<S>(
 {
     use asupersync::io::AsyncWriteExt;
 
-    let payload = serde_json::json!({
-        "ok": false,
-        "protocol_version": frankenterm_core::wire_protocol::PROTOCOL_VERSION,
-        "server_version": frankenterm_core::VERSION,
-        "error": {
+    let mut payload = serde_json::Map::new();
+    payload.insert("ok".to_string(), serde_json::Value::Bool(false));
+    if matches!(
+        err,
+        frankenterm_core::distributed::DistributedSecurityError::ProtocolVersionMissing { .. }
+            | frankenterm_core::distributed::DistributedSecurityError::ProtocolVersionMismatch { .. }
+    ) {
+        payload.insert(
+            "protocol_version".to_string(),
+            serde_json::Value::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+        );
+    }
+    payload.insert(
+        "error".to_string(),
+        serde_json::json!({
             "code": err.code(),
             "message": err.to_string()
-        }
-    });
-    if let Ok(encoded) = serde_json::to_string(&payload) {
+        }),
+    );
+    if let Ok(encoded) = serde_json::to_string(&serde_json::Value::Object(payload)) {
         let _ = reader.get_mut().write_all(encoded.as_bytes()).await;
         let _ = reader.get_mut().write_all(b"\n").await;
         let _ = reader.get_mut().flush().await;
@@ -38870,6 +38880,14 @@ recorder_backend = "frankensqlite"
                     serde_json::from_str(line.trim()).expect("parse security response json");
                 assert_eq!(payload["ok"], serde_json::Value::Bool(false));
                 assert_eq!(payload["error"]["code"], "dist.auth_failed");
+                assert!(
+                    payload.get("protocol_version").is_none(),
+                    "auth failures must not leak protocol negotiation details"
+                );
+                assert!(
+                    payload.get("server_version").is_none(),
+                    "auth failures must not leak server fingerprint details"
+                );
 
                 drop(reader);
                 frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100))
@@ -38984,6 +39002,10 @@ recorder_backend = "frankensqlite"
                 assert_eq!(
                     payload["protocol_version"],
                     serde_json::Value::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION)
+                );
+                assert!(
+                    payload.get("server_version").is_none(),
+                    "version mismatch responses should advertise protocol only, not server version"
                 );
 
                 drop(reader);
@@ -39101,6 +39123,10 @@ recorder_backend = "frankensqlite"
                 assert_eq!(
                     payload["protocol_version"],
                     serde_json::Value::from(frankenterm_core::wire_protocol::PROTOCOL_VERSION)
+                );
+                assert!(
+                    payload.get("server_version").is_none(),
+                    "version mismatch responses should advertise protocol only, not server version"
                 );
 
                 drop(reader);
