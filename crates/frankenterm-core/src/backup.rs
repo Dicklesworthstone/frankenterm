@@ -779,9 +779,9 @@ pub fn import_backup(
     // Use rusqlite backup API to restore (consistent, handles WAL mode)
     if target_db_path.exists() {
         // Remove WAL and journal files if they exist
-        let wal_path = target_db_path.with_extension("db-wal");
-        let shm_path = target_db_path.with_extension("db-shm");
-        let journal_path = target_db_path.with_extension("db-journal");
+        let wal_path = sqlite_sidecar_path(target_db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(target_db_path, "-shm");
+        let journal_path = sqlite_sidecar_path(target_db_path, "-journal");
         for p in [&wal_path, &shm_path, &journal_path] {
             if p.exists() {
                 let _ = fs::remove_file(p);
@@ -800,6 +800,12 @@ pub fn import_backup(
 }
 
 // --- Internal helpers ---
+
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
 
 /// Use rusqlite's online backup API for a consistent snapshot.
 fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
@@ -1448,6 +1454,50 @@ mod tests {
         let safety_path = PathBuf::from(result.safety_backup_path.unwrap());
         assert!(safety_path.join("database.db").exists());
         assert!(safety_path.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn import_removes_sidecars_for_non_db_target_names() {
+        let tmp = TempDir::new().unwrap();
+        let source_db = tmp.path().join("source.db");
+        let _conn = create_test_db(&source_db);
+        drop(_conn);
+
+        let backup_dir = tmp.path().join("backup");
+        let export_opts = ExportOptions {
+            output: Some(backup_dir.clone()),
+            verify: true,
+            ..Default::default()
+        };
+        let _export = export_backup(&source_db, tmp.path(), &export_opts).unwrap();
+
+        let target_db = tmp.path().join("existing.sqlite3");
+        let _existing = create_test_db(&target_db);
+        drop(_existing);
+
+        let wal_path = sqlite_sidecar_path(&target_db, "-wal");
+        let shm_path = sqlite_sidecar_path(&target_db, "-shm");
+        let journal_path = sqlite_sidecar_path(&target_db, "-journal");
+        fs::write(&wal_path, b"wal").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
+        fs::write(&journal_path, b"journal").unwrap();
+
+        let import_opts = ImportOptions {
+            dry_run: false,
+            yes: true,
+            no_safety_backup: true,
+        };
+        import_backup(&backup_dir, &target_db, tmp.path(), &import_opts).unwrap();
+
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+        assert!(!journal_path.exists());
+
+        let conn = Connection::open(&target_db).unwrap();
+        let pane_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pane_count, 2);
     }
 
     #[test]
