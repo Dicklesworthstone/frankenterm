@@ -729,7 +729,10 @@ impl PatternLibrary {
 struct CompiledRule {
     def: RuleDef,
     regex: Option<Regex>,
+    capture_names: Vec<String>,
 }
+
+type AnchorMatchRef = (usize, (usize, usize));
 
 /// Target false positive rate for the Bloom filter (1%).
 /// This keeps the filter small (~10KB for 1000 patterns) while providing
@@ -771,16 +774,24 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     let mut quick_byte_set: HashSet<u8> = HashSet::new();
 
     for (idx, rule) in rules.iter().enumerate() {
-        let regex = match rule.regex.as_ref() {
-            Some(raw) => Some(Regex::new(raw).map_err(|e| {
-                PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", rule.id))
-            })?),
-            None => None,
+        let (regex, capture_names) = match rule.regex.as_ref() {
+            Some(raw) => {
+                let regex = Regex::new(raw).map_err(|e| {
+                    PatternError::InvalidRegex(format!(
+                        "rule id '{}' has invalid regex: {e}",
+                        rule.id
+                    ))
+                })?;
+                let capture_names = regex.capture_names().flatten().map(str::to_owned).collect();
+                (Some(regex), capture_names)
+            }
+            None => (None, Vec::new()),
         };
 
         compiled_rules.push(CompiledRule {
             def: rule.clone(),
             regex,
+            capture_names,
         });
 
         for anchor in &rule.anchors {
@@ -1963,8 +1974,8 @@ impl PatternEngine {
             return Vec::new();
         };
 
-        let mut candidate_rules: HashSet<usize> = HashSet::new();
-        let mut matched_anchor_by_rule: HashMap<usize, (String, (usize, usize))> = HashMap::new();
+        let (mut indices, matched_anchor_by_rule) =
+            Self::collect_candidate_rules(index, text, matcher);
 
         #[cfg(test)]
         {
@@ -1972,40 +1983,10 @@ impl PatternEngine {
             eprintln!("detect: Aho-Corasick found {match_count} matches in text");
         }
 
-        // Use find_overlapping_iter to detect all anchors, including ones that overlap
-        // (e.g., "limit reached" and "Usage limit reached for all Pro models")
-        for matched in matcher.find_overlapping_iter(text) {
-            #[cfg(test)]
-            {
-                let pattern = matched.pattern().as_usize();
-                let span = matched.span();
-                eprintln!("detect: matched pattern {pattern} at {span:?}");
-            }
-
-            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
-                #[cfg(test)]
-                {
-                    let pattern = matched.pattern().as_usize();
-                    eprintln!("detect: pattern {pattern} not found in anchor_list");
-                }
-                continue;
-            };
-
-            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
-                for &idx in rule_indices {
-                    candidate_rules.insert(idx);
-                    matched_anchor_by_rule
-                        .entry(idx)
-                        .or_insert_with(|| (anchor.clone(), (matched.start(), matched.end())));
-                }
-            }
-        }
-
-        if candidate_rules.is_empty() {
+        if indices.is_empty() {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = candidate_rules.into_iter().collect();
         indices.sort_unstable();
 
         self.telemetry
@@ -2016,10 +1997,9 @@ impl PatternEngine {
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
-            let (fallback_anchor, fallback_span) = matched_anchor_by_rule
-                .get(&idx)
-                .cloned()
-                .unwrap_or_default();
+            let (fallback_anchor, fallback_span) = matched_anchor_by_rule[idx]
+                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
+                .unwrap_or(("", (0, 0)));
 
             if let Some(regex) = compiled.regex.as_ref() {
                 self.telemetry
@@ -2030,18 +2010,10 @@ impl PatternEngine {
                         continue;
                     };
 
-                    let mut extracted = serde_json::Map::new();
-                    for name in regex.capture_names().flatten() {
-                        if let Some(value) = captures.name(name) {
-                            extracted.insert(
-                                name.to_string(),
-                                serde_json::Value::String(value.as_str().to_string()),
-                            );
-                        }
-                    }
+                    let extracted = Self::extract_captures(compiled, &captures);
 
                     let (matched_text, span) = captures.get(0).map_or_else(
-                        || (fallback_anchor.clone(), fallback_span),
+                        || (fallback_anchor.to_string(), fallback_span),
                         |m| (m.as_str().to_string(), (m.start(), m.end())),
                     );
 
@@ -2228,31 +2200,13 @@ impl PatternEngine {
 
         let redactor = Redactor::new();
 
-        let mut candidate_rules: HashSet<usize> = HashSet::new();
-        type AnchorMatches = HashMap<usize, Vec<(String, (usize, usize))>>;
-        let mut matched_anchors_by_rule: AnchorMatches = HashMap::new();
+        let (mut indices, matched_anchors_by_rule) =
+            Self::collect_candidate_rules_with_all_anchors(index, text, matcher);
 
-        for matched in matcher.find_overlapping_iter(text) {
-            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
-                continue;
-            };
-
-            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
-                for &idx in rule_indices {
-                    candidate_rules.insert(idx);
-                    matched_anchors_by_rule
-                        .entry(idx)
-                        .or_default()
-                        .push((anchor.clone(), (matched.start(), matched.end())));
-                }
-            }
-        }
-
-        if candidate_rules.is_empty() {
+        if indices.is_empty() {
             return (Vec::new(), Vec::new());
         }
 
-        let mut indices: Vec<usize> = candidate_rules.into_iter().collect();
         indices.sort_unstable();
 
         let mut detections: Vec<Detection> = Vec::new();
@@ -2261,12 +2215,16 @@ impl PatternEngine {
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
+            let empty_anchors: &[AnchorMatchRef] = &[];
 
             let anchors = matched_anchors_by_rule
-                .get(&idx)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let (fallback_anchor, fallback_span) = anchors.first().cloned().unwrap_or_default();
+                .get(idx)
+                .and_then(Option::as_deref)
+                .unwrap_or(empty_anchors);
+            let (fallback_anchor, fallback_span) = anchors
+                .first()
+                .map(|(anchor_idx, span)| (index.anchor_list[*anchor_idx].as_str(), *span))
+                .unwrap_or(("", (0, 0)));
 
             let pack_id = self
                 .library
@@ -2286,18 +2244,10 @@ impl PatternEngine {
                     };
                     any_capture = true;
 
-                    let mut extracted = serde_json::Map::new();
-                    for name in regex.capture_names().flatten() {
-                        if let Some(value) = captures.name(name) {
-                            extracted.insert(
-                                name.to_string(),
-                                serde_json::Value::String(value.as_str().to_string()),
-                            );
-                        }
-                    }
+                    let extracted = Self::extract_captures(compiled, &captures);
 
                     let (raw_matched_text, span) = captures.get(0).map_or_else(
-                        || (fallback_anchor.clone(), fallback_span),
+                        || (fallback_anchor.to_string(), fallback_span),
                         |m| (m.as_str().to_string(), (m.start(), m.end())),
                     );
 
@@ -2373,7 +2323,8 @@ impl PatternEngine {
                 }
             } else {
                 // Anchor-only rule: ALL anchor hits imply matches.
-                for (anchor_text, span) in anchors {
+                for (anchor_idx, span) in anchors {
+                    let anchor_text = &index.anchor_list[*anchor_idx];
                     let detection = Detection {
                         rule_id: rule.id.clone(),
                         agent_type: rule.agent_type,
@@ -2418,6 +2369,97 @@ impl PatternEngine {
         }
 
         (detections, traces)
+    }
+
+    fn collect_candidate_rules(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        // Use find_overlapping_iter to detect all anchors, including ones that overlap
+        // (e.g., "limit reached" and "Usage limit reached for all Pro models")
+        for matched in matcher.find_overlapping_iter(text) {
+            #[cfg(test)]
+            {
+                let pattern = matched.pattern().as_usize();
+                let span = matched.span();
+                eprintln!("detect: matched pattern {pattern} at {span:?}");
+            }
+
+            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
+                #[cfg(test)]
+                {
+                    let pattern = matched.pattern().as_usize();
+                    eprintln!("detect: pattern {pattern} not found in anchor_list");
+                }
+                continue;
+            };
+
+            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
+                let anchor_match = (
+                    matched.pattern().as_usize(),
+                    (matched.start(), matched.end()),
+                );
+                for &idx in rule_indices {
+                    if matched_anchor_by_rule[idx].is_none() {
+                        candidate_rules.push(idx);
+                        matched_anchor_by_rule[idx] = Some(anchor_match);
+                    }
+                }
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    fn collect_candidate_rules_with_all_anchors(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+    ) -> (Vec<usize>, Vec<Option<Vec<AnchorMatchRef>>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchors_by_rule = vec![None; index.compiled_rules.len()];
+
+        for matched in matcher.find_overlapping_iter(text) {
+            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
+                continue;
+            };
+
+            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
+                let anchor_match = (
+                    matched.pattern().as_usize(),
+                    (matched.start(), matched.end()),
+                );
+                for &idx in rule_indices {
+                    let bucket = matched_anchors_by_rule[idx].get_or_insert_with(|| {
+                        candidate_rules.push(idx);
+                        Vec::new()
+                    });
+                    bucket.push(anchor_match);
+                }
+            }
+        }
+
+        (candidate_rules, matched_anchors_by_rule)
+    }
+
+    fn extract_captures(
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut extracted = serde_json::Map::new();
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                extracted.insert(
+                    name.clone(),
+                    serde_json::Value::String(value.as_str().to_string()),
+                );
+            }
+        }
+        extracted
     }
 
     fn trace_gates_skeleton() -> Vec<TraceGate> {
