@@ -3333,6 +3333,59 @@ impl PolicyEngine {
         result
     }
 
+    /// Register a connector bundle within an actor's namespace.
+    ///
+    /// Registers the bundle normally and also binds it to the actor's tenant
+    /// namespace so that future cross-tenant access checks apply.  Returns
+    /// the result of the bundle registration.
+    pub fn register_bundle_in_namespace(
+        &mut self,
+        bundle: crate::connector_bundles::ConnectorBundle,
+        actor_namespace: &crate::namespace_isolation::TenantNamespace,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), crate::connector_bundles::BundleRegistryError> {
+        let bundle_id = bundle.bundle_id.clone();
+        self.register_bundle(bundle, actor, now_ms)?;
+        // Bind all connectors in this bundle to the actor's namespace
+        self.bind_resource_to_namespace(
+            crate::namespace_isolation::NamespacedResourceKind::Connector,
+            &bundle_id,
+            actor_namespace.clone(),
+            actor,
+            now_ms,
+        );
+        Ok(())
+    }
+
+    /// Check whether a connector credential access is allowed under namespace
+    /// isolation.  Returns `true` if the access is within the same namespace
+    /// (or namespace isolation is disabled).
+    pub fn check_credential_namespace(
+        &mut self,
+        connector_id: &str,
+        actor_namespace: &crate::namespace_isolation::TenantNamespace,
+        actor: &str,
+        now_ms: u64,
+    ) -> bool {
+        if !self.namespace_isolation_enabled {
+            return true;
+        }
+        let target_ns = self.namespace_registry.lookup(
+            crate::namespace_isolation::NamespacedResourceKind::Credential,
+            connector_id,
+        );
+        let result = self.check_cross_tenant_access(
+            actor_namespace,
+            &target_ns,
+            crate::namespace_isolation::NamespacedResourceKind::Credential,
+            connector_id,
+            actor,
+            now_ms,
+        );
+        result.is_allowed()
+    }
+
     /// Register a connector bundle with audit chain recording and compliance notification.
     pub fn register_bundle(
         &mut self,
@@ -12381,6 +12434,540 @@ mod tests {
         assert!(
             engine.compliance_engine().counters().total_denials > violations_before,
             "compliance engine should record namespace violation"
+        );
+    }
+
+    // ---- Namespace isolation: connector execution context tests ----
+
+    #[test]
+    fn authorize_namespace_same_tenant_connector_allowed() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let ns = TenantNamespace::new("org-alpha").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "jira-webhook",
+            ns.clone(),
+        );
+
+        let input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("jira-webhook")
+            .with_namespace(ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "same-tenant connector invoke should be allowed: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_workflow_denied_cross_tenant() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("dept-eng").unwrap();
+        let wf_ns = TenantNamespace::new("dept-sales").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Workflow,
+            "deploy-prod",
+            wf_ns,
+        );
+
+        let input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
+            .with_workflow("deploy-prod")
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "cross-tenant workflow access should be denied with strict policy"
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_workflow_same_tenant_allowed() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let ns = TenantNamespace::new("dept-eng").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Workflow,
+            "deploy-staging",
+            ns.clone(),
+        );
+
+        let input = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
+            .with_workflow("deploy-staging")
+            .with_namespace(ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "same-tenant workflow access should be allowed: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_hierarchical_parent_to_child() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        // Permissive policy allows hierarchical access
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::permissive(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let parent_ns = TenantNamespace::new("org").unwrap();
+        let child_ns = TenantNamespace::new("org.team-alpha").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "pane-200",
+            child_ns,
+        );
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(200)
+            .with_namespace(parent_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_allowed(),
+            "parent namespace should access child resources with permissive policy: {:?}",
+            decision.reason()
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_connector_credential_cross_tenant_denied() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("team-red").unwrap();
+        let cred_ns = TenantNamespace::new("team-blue").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "github-api",
+            cred_ns,
+        );
+
+        // ConnectorCredentialAction should be denied cross-tenant
+        let input = PolicyInput::new(ActionKind::ConnectorCredentialAction, ActorKind::Robot)
+            .with_domain("github-api")
+            .with_namespace(actor_ns);
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "cross-tenant credential action should be denied"
+        );
+    }
+
+    #[test]
+    fn authorize_namespace_all_connector_action_kinds_isolated() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let connector_actions = [
+            ActionKind::ConnectorNotify,
+            ActionKind::ConnectorTicket,
+            ActionKind::ConnectorTriggerWorkflow,
+            ActionKind::ConnectorAuditLog,
+            ActionKind::ConnectorInvoke,
+            ActionKind::ConnectorCredentialAction,
+        ];
+
+        for action in &connector_actions {
+            let ns_config = NamespaceIsolationConfig {
+                enabled: true,
+                cross_tenant_policy: CrossTenantPolicy::strict(),
+                ..Default::default()
+            };
+            let mut safety = crate::config::SafetyConfig::default();
+            safety.namespace_isolation = ns_config;
+            let mut engine = PolicyEngine::from_safety_config(&safety);
+
+            let actor_ns = TenantNamespace::new("isolated-a").unwrap();
+            let connector_ns = TenantNamespace::new("isolated-b").unwrap();
+            engine.namespace_registry_mut().bind(
+                NamespacedResourceKind::Connector,
+                "test-connector",
+                connector_ns,
+            );
+
+            let input = PolicyInput::new(*action, ActorKind::Robot)
+                .with_domain("test-connector")
+                .with_namespace(actor_ns);
+            let decision = engine.authorize(&input);
+            assert!(
+                decision.is_denied(),
+                "cross-tenant {action:?} should be denied with strict policy",
+            );
+        }
+    }
+
+    #[test]
+    fn check_credential_namespace_denies_cross_tenant() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let actor_ns = TenantNamespace::new("team-x").unwrap();
+        let cred_ns = TenantNamespace::new("team-y").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Credential,
+            "slack-bot-token",
+            cred_ns,
+        );
+
+        let allowed = engine.check_credential_namespace(
+            "slack-bot-token",
+            &actor_ns,
+            "agent-007",
+            1000,
+        );
+        assert!(!allowed, "cross-tenant credential access should be denied");
+
+        // Verify audit chain recorded the check
+        assert!(
+            engine.audit_chain().len() > 0,
+            "audit chain should record credential namespace check"
+        );
+    }
+
+    #[test]
+    fn check_credential_namespace_allows_same_tenant() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let ns = TenantNamespace::new("team-x").unwrap();
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Credential,
+            "my-token",
+            ns.clone(),
+        );
+
+        let allowed = engine.check_credential_namespace(
+            "my-token",
+            &ns,
+            "agent-007",
+            1000,
+        );
+        assert!(allowed, "same-tenant credential access should be allowed");
+    }
+
+    #[test]
+    fn register_bundle_in_namespace_binds_to_tenant() {
+        use crate::connector_bundles::{
+            BundleCategory, BundleConnectorEntry, BundleTier, ConnectorBundle,
+        };
+        use crate::namespace_isolation::{NamespacedResourceKind, TenantNamespace};
+
+        let mut engine = PolicyEngine::permissive();
+
+        let ns = TenantNamespace::new("acme-corp").unwrap();
+        let bundle = ConnectorBundle::new(
+            "acme-slack",
+            "Acme Slack Connector",
+            BundleTier::Tier1,
+            BundleCategory::Messaging,
+            5000,
+        )
+        .with_connector(BundleConnectorEntry::required("slack-hook", "Slack Webhook"));
+
+        engine
+            .register_bundle_in_namespace(bundle, &ns, "admin", 5000)
+            .expect("registration should succeed");
+
+        // Verify the bundle's connector is bound to the namespace
+        let bound_ns = engine.namespace_registry().lookup(
+            NamespacedResourceKind::Connector,
+            "acme-slack",
+        );
+        assert_eq!(
+            bound_ns.as_str(),
+            "acme-corp",
+            "bundle should be bound to the registering actor's namespace"
+        );
+    }
+
+    #[test]
+    fn namespace_isolation_e2e_multi_tenant_scenario() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        // E2e scenario: Two tenants with strict isolation, each with their own
+        // panes, connectors, and workflows. Verify complete isolation.
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let tenant_a = TenantNamespace::new("tenant-alpha").unwrap();
+        let tenant_b = TenantNamespace::new("tenant-beta").unwrap();
+
+        // Bind resources to tenant-alpha
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "pane-301",
+            tenant_a.clone(),
+        );
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "alpha-slack",
+            tenant_a.clone(),
+        );
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Workflow,
+            "alpha-deploy",
+            tenant_a.clone(),
+        );
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Credential,
+            "alpha-token",
+            tenant_a.clone(),
+        );
+
+        // Bind resources to tenant-beta
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Pane,
+            "pane-302",
+            tenant_b.clone(),
+        );
+        engine.namespace_registry_mut().bind(
+            NamespacedResourceKind::Connector,
+            "beta-jira",
+            tenant_b.clone(),
+        );
+
+        // --- Tenant A accessing own resources: all allowed ---
+        let input_a_pane = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(301)
+            .with_namespace(tenant_a.clone());
+        let decision_a_pane = engine.authorize(&input_a_pane);
+        assert!(
+            decision_a_pane.is_allowed(),
+            "tenant-alpha should access own pane: {:?}",
+            decision_a_pane.reason()
+        );
+
+        let input_a_conn = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("alpha-slack")
+            .with_namespace(tenant_a.clone());
+        assert!(
+            engine.authorize(&input_a_conn).is_allowed(),
+            "tenant-alpha should access own connector"
+        );
+
+        let input_a_wf = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
+            .with_workflow("alpha-deploy")
+            .with_namespace(tenant_a.clone());
+        assert!(
+            engine.authorize(&input_a_wf).is_allowed(),
+            "tenant-alpha should access own workflow"
+        );
+
+        // --- Tenant B accessing tenant A's resources: all denied ---
+        let input_b_pane = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(301)
+            .with_namespace(tenant_b.clone());
+        assert!(
+            engine.authorize(&input_b_pane).is_denied(),
+            "tenant-beta must not access tenant-alpha's pane"
+        );
+
+        let input_b_conn = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("alpha-slack")
+            .with_namespace(tenant_b.clone());
+        assert!(
+            engine.authorize(&input_b_conn).is_denied(),
+            "tenant-beta must not access tenant-alpha's connector"
+        );
+
+        let input_b_wf = PolicyInput::new(ActionKind::WorkflowRun, ActorKind::Robot)
+            .with_workflow("alpha-deploy")
+            .with_namespace(tenant_b.clone());
+        assert!(
+            engine.authorize(&input_b_wf).is_denied(),
+            "tenant-beta must not access tenant-alpha's workflow"
+        );
+
+        // --- Tenant A accessing tenant B's resources: denied ---
+        let input_a_b_conn = PolicyInput::new(ActionKind::ConnectorNotify, ActorKind::Robot)
+            .with_domain("beta-jira")
+            .with_namespace(tenant_a.clone());
+        assert!(
+            engine.authorize(&input_a_b_conn).is_denied(),
+            "tenant-alpha must not access tenant-beta's connector"
+        );
+
+        // --- Verify audit chain recorded all denials ---
+        let chain_len = engine.audit_chain().len();
+        assert!(
+            chain_len >= 4,
+            "audit chain should record at least 4 cross-tenant denials, got {chain_len}"
+        );
+
+        // --- Verify compliance engine tracked violations ---
+        let denials = engine.compliance_engine().counters().total_denials;
+        assert!(
+            denials >= 4,
+            "compliance engine should have at least 4 denials, got {denials}"
+        );
+
+        // --- Verify namespace registry has correct binding count ---
+        let snap = engine.namespace_registry().snapshot();
+        assert_eq!(snap.total_bindings, 6, "should have 6 resource bindings");
+        assert_eq!(
+            snap.active_namespaces, 2,
+            "should have 2 active namespaces"
+        );
+    }
+
+    #[test]
+    fn namespace_isolation_e2e_failure_recovery_scenario() {
+        use crate::namespace_isolation::{
+            CrossTenantPolicy, NamespaceIsolationConfig, NamespacedResourceKind, TenantNamespace,
+        };
+
+        // Failure injection scenario: Bind resource to wrong namespace,
+        // detect violation, rebind to correct namespace, verify recovery.
+        let ns_config = NamespaceIsolationConfig {
+            enabled: true,
+            cross_tenant_policy: CrossTenantPolicy::strict(),
+            ..Default::default()
+        };
+        let mut safety = crate::config::SafetyConfig::default();
+        safety.namespace_isolation = ns_config;
+        let mut engine = PolicyEngine::from_safety_config(&safety);
+
+        let correct_ns = TenantNamespace::new("team-correct").unwrap();
+        let wrong_ns = TenantNamespace::new("team-wrong").unwrap();
+
+        // Step 1: Accidentally bind connector to wrong namespace
+        engine.bind_resource_to_namespace(
+            NamespacedResourceKind::Connector,
+            "critical-api",
+            wrong_ns,
+            "admin",
+            1000,
+        );
+
+        // Step 2: Actor from correct namespace tries to access — denied
+        let input = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("critical-api")
+            .with_namespace(correct_ns.clone());
+        let decision = engine.authorize(&input);
+        assert!(
+            decision.is_denied(),
+            "access should be denied when connector bound to wrong namespace"
+        );
+
+        // Step 3: Detect the issue via audit chain
+        let chain_len_before_fix = engine.audit_chain().len();
+        assert!(
+            chain_len_before_fix > 0,
+            "audit chain should have recorded the denial"
+        );
+
+        // Step 4: Rebind connector to correct namespace (recovery)
+        let prev = engine.bind_resource_to_namespace(
+            NamespacedResourceKind::Connector,
+            "critical-api",
+            correct_ns.clone(),
+            "admin",
+            2000,
+        );
+        assert_eq!(
+            prev.map(|ns| ns.as_str().to_string()),
+            Some("team-wrong".to_string()),
+            "should return previous namespace binding"
+        );
+
+        // Step 5: Access now succeeds
+        let input2 = PolicyInput::new(ActionKind::ConnectorInvoke, ActorKind::Robot)
+            .with_domain("critical-api")
+            .with_namespace(correct_ns);
+        let decision2 = engine.authorize(&input2);
+        assert!(
+            decision2.is_allowed(),
+            "access should be allowed after rebinding: {:?}",
+            decision2.reason()
+        );
+
+        // Step 6: Verify audit chain recorded both the denial and the rebinding
+        assert!(
+            engine.audit_chain().len() > chain_len_before_fix,
+            "audit chain should have recorded the rebinding"
         );
     }
 }
