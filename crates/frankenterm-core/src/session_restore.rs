@@ -253,22 +253,45 @@ pub fn load_checkpoint_by_id(
          WHERE checkpoint_id = ?1",
     )?;
 
-    let pane_states = stmt
+    let raw_pane_states = stmt
         .query_map([checkpoint_id], |row| {
-            let terminal_json: Option<String> = row.get(3)?;
-            let agent_json: Option<String> = row.get(4)?;
-
-            Ok(RestoredPaneState {
-                pane_id: row.get::<_, i64>(0)? as u64,
-                cwd: row.get(1)?,
-                command: row.get(2)?,
-                terminal_state: terminal_json
-                    .and_then(|j| serde_json::from_str::<TerminalState>(&j).ok()),
-                agent_metadata: agent_json
-                    .and_then(|j| serde_json::from_str::<AgentMetadata>(&j).ok()),
-            })
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+
+    let mut pane_states = Vec::with_capacity(raw_pane_states.len());
+    for (pane_id, cwd, command, terminal_json, agent_json) in raw_pane_states {
+        let terminal_state =
+            serde_json::from_str::<TerminalState>(&terminal_json).map_err(|error| {
+                RestoreError::CorruptCheckpoint(format!(
+                    "pane {pane_id} has invalid terminal_state_json: {error}"
+                ))
+            })?;
+        let agent_metadata = match agent_json {
+            Some(agent_json) => Some(serde_json::from_str::<AgentMetadata>(&agent_json).map_err(
+                |error| {
+                    RestoreError::CorruptCheckpoint(format!(
+                        "pane {pane_id} has invalid agent_metadata_json: {error}"
+                    ))
+                },
+            )?),
+            None => None,
+        };
+
+        pane_states.push(RestoredPaneState {
+            pane_id,
+            cwd,
+            command,
+            terminal_state: Some(terminal_state),
+            agent_metadata,
+        });
+    }
 
     Ok(Some(CheckpointData {
         checkpoint_id,
@@ -296,7 +319,7 @@ fn save_restore_checkpoint(
     session_id: &str,
     pane_id_map: &HashMap<u64, u64>,
 ) -> Result<i64, RestoreError> {
-    let conn = open_conn(db_path)?;
+    let mut conn = open_conn(db_path)?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -308,7 +331,8 @@ fn save_restore_checkpoint(
             .collect::<HashMap<String, u64>>(),
     });
 
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
          VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
@@ -319,8 +343,14 @@ fn save_restore_checkpoint(
             metadata.to_string(),
         ],
     )?;
+    let checkpoint_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+        rusqlite::params![session_id, now_ms],
+    )?;
+    tx.commit()?;
 
-    Ok(conn.last_insert_rowid())
+    Ok(checkpoint_id)
 }
 
 // =============================================================================
@@ -1085,6 +1115,28 @@ mod tests {
     }
 
     #[test]
+    fn save_restore_checkpoint_updates_session_last_checkpoint_at() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-last-cp", false);
+
+        let checkpoint_id = save_restore_checkpoint(&db_path, "sess-last-cp", &HashMap::new())
+            .expect("restore checkpoint");
+
+        let (checkpoint_at, last_checkpoint_at): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT c.checkpoint_at, s.last_checkpoint_at
+                 FROM session_checkpoints c
+                 JOIN mux_sessions s ON s.session_id = c.session_id
+                 WHERE c.id = ?1",
+                [checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(last_checkpoint_at, Some(checkpoint_at));
+    }
+
+    #[test]
     fn restore_banner_basic() {
         let banner = restore_banner(42, "sess-test", 1700000000000, None);
         assert!(banner.contains("Session restored"));
@@ -1165,6 +1217,24 @@ mod tests {
         assert_eq!(ts.rows, 24);
         assert_eq!(ts.cols, 80);
         assert!(!ts.is_alt_screen);
+    }
+
+    #[test]
+    fn load_latest_checkpoint_reports_corrupt_terminal_state_json() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-bad-ts", false);
+        let cp_id = insert_checkpoint(&conn, "sess-bad-ts", 5000, 1);
+
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (?1, ?2, ?3)",
+            params![cp_id, 0i64, "{not-json"],
+        )
+        .unwrap();
+
+        let err = load_latest_checkpoint(&db_path, "sess-bad-ts").expect_err("corrupt checkpoint");
+        let is_corrupt = matches!(err, RestoreError::CorruptCheckpoint(_));
+        assert!(is_corrupt, "expected corrupt checkpoint error, got {err:?}");
     }
 
     #[test]
