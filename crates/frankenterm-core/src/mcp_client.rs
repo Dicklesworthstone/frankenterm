@@ -12,6 +12,7 @@ use crate::mcp_framework::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::time::Instant;
 
 const LOG_TARGET: &str = "ft::mcp_client";
@@ -89,6 +90,111 @@ impl McpClientError {
 /// Convenience result alias for outbound MCP client operations.
 pub type McpClientResult<T> = std::result::Result<T, McpClientError>;
 
+/// Framework-neutral outbound MCP tool definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpClientToolDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
+}
+
+impl McpClientToolDefinition {
+    fn from_framework(tool: FrameworkTool) -> McpClientResult<Self> {
+        Ok(Self {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            output_schema: tool.output_schema,
+            icon: tool
+                .icon
+                .map(|icon| {
+                    serde_json::to_value(icon)
+                        .map_err(|err| framework_payload_error("remote tool icon", err))
+                })
+                .transpose()?,
+            version: tool.version,
+            tags: tool.tags,
+            annotations: tool
+                .annotations
+                .map(|annotations| {
+                    serde_json::to_value(annotations)
+                        .map_err(|err| framework_payload_error("remote tool annotations", err))
+                })
+                .transpose()?,
+        })
+    }
+
+    pub(crate) fn into_framework(self) -> McpClientResult<FrameworkTool> {
+        Ok(FrameworkTool {
+            name: self.name,
+            description: self.description,
+            input_schema: self.input_schema,
+            output_schema: self.output_schema,
+            icon: self
+                .icon
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|err| framework_payload_error("remote tool icon", err))
+                })
+                .transpose()?,
+            version: self.version,
+            tags: self.tags,
+            annotations: self
+                .annotations
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|err| framework_payload_error("remote tool annotations", err))
+                })
+                .transpose()?,
+        })
+    }
+
+    #[must_use]
+    pub fn is_destructive(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("destructive"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// Framework-neutral outbound MCP content item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct McpClientContentItem(pub serde_json::Value);
+
+impl McpClientContentItem {
+    fn from_framework(content: FrameworkContent) -> McpClientResult<Self> {
+        roundtrip_framework_payload("remote tool content", content)
+    }
+
+    pub(crate) fn into_framework(self) -> McpClientResult<FrameworkContent> {
+        roundtrip_framework_payload("remote tool content", self)
+    }
+
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        self.0
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| *value == "text")
+            .and_then(|_| self.0.get("text"))
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
 /// Outbound MCP client wrapper.
 pub struct FtMcpClient {
     client: FrameworkClient,
@@ -156,10 +262,14 @@ impl FtMcpClient {
     }
 
     /// List tools from the connected server.
-    pub fn list_tools(&mut self) -> McpClientResult<Vec<FrameworkTool>> {
+    pub fn list_tools(&mut self) -> McpClientResult<Vec<McpClientToolDefinition>> {
         let start = Instant::now();
         match self.client.list_tools() {
             Ok(tools) => {
+                let tools = tools
+                    .into_iter()
+                    .map(McpClientToolDefinition::from_framework)
+                    .collect::<McpClientResult<Vec<_>>>()?;
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_list_tools",
@@ -190,10 +300,14 @@ impl FtMcpClient {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-    ) -> McpClientResult<Vec<FrameworkContent>> {
+    ) -> McpClientResult<Vec<McpClientContentItem>> {
         let start = Instant::now();
         match self.client.call_tool(name, arguments) {
             Ok(content) => {
+                let content = content
+                    .into_iter()
+                    .map(McpClientContentItem::from_framework)
+                    .collect::<McpClientResult<Vec<_>>>()?;
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_call_tool",
@@ -225,12 +339,6 @@ impl FtMcpClient {
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server.name
-    }
-
-    /// Consume wrapper and return the raw fastmcp client.
-    #[must_use]
-    pub fn into_client(self) -> FrameworkClient {
-        self.client
     }
 }
 
@@ -423,12 +531,29 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
     }
 }
 
+fn roundtrip_framework_payload<T, U>(label: &str, payload: T) -> McpClientResult<U>
+where
+    T: Serialize,
+    U: for<'de> Deserialize<'de>,
+{
+    let value = serde_json::to_value(payload).map_err(|err| framework_payload_error(label, err))?;
+    serde_json::from_value(value).map_err(|err| framework_payload_error(label, err))
+}
+
+fn framework_payload_error(label: &str, err: impl Display) -> McpClientError {
+    McpClientError::new(
+        ERR_PROTOCOL,
+        format!("Failed to map {label} across the MCP client seam: {err}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
-        ExternalServerConfig, FrameworkContent, FrameworkMcpError, FtMcpClient, LOG_TARGET,
-        McpClientConfig, discover_servers, map_mcp_error, select_server,
+        ExternalServerConfig, FrameworkMcpError, FtMcpClient, LOG_TARGET, McpClientConfig,
+        McpClientContentItem, McpClientToolDefinition, discover_servers, map_mcp_error,
+        select_server,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -612,10 +737,10 @@ mod tests {
         let output = client
             .call_tool("echo", serde_json::json!({"text": "hello"}))
             .expect("call tool");
-        assert!(matches!(
-            output.first(),
-            Some(FrameworkContent::Text { text }) if text == "hello"
-        ));
+        assert_eq!(
+            output.first().and_then(McpClientContentItem::as_text),
+            Some("hello")
+        );
 
         let captured = events.lock().expect("lock logs").clone();
         assert!(captured.iter().any(|event| {
@@ -647,6 +772,33 @@ mod tests {
                     .get("tool")
                     .is_some_and(|value| field_matches(value, "echo"))
         }));
+    }
+
+    #[test]
+    fn tool_definition_reads_destructive_annotation() {
+        let safe = McpClientToolDefinition {
+            name: "safe".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructive": false})),
+        };
+        let destructive = McpClientToolDefinition {
+            name: "drop_db".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructive": true})),
+        };
+
+        assert!(!safe.is_destructive());
+        assert!(destructive.is_destructive());
     }
 
     fn field_matches(value: &str, expected: &str) -> bool {

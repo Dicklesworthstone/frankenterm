@@ -20,7 +20,10 @@ use crate::mcp_framework::{
 use super::mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
 use crate::Result;
 use crate::config::{Config, McpClientConfig};
-use crate::mcp_client::{ExternalServerConfig, FtMcpClient, discover_servers};
+use crate::mcp_client::{
+    ExternalServerConfig, FtMcpClient, McpClientContentItem, McpClientToolDefinition,
+    discover_servers,
+};
 
 const LOG_TARGET: &str = "ft::mcp_proxy";
 
@@ -198,13 +201,36 @@ pub(super) fn compose_proxy_tools(
         for tool in filtered {
             let external_name = tool.name.clone();
             let exposed_name = format!("{route_prefix}/{}", external_name);
-            let handler = RemoteProxyToolHandler::new(
+            let handler = match RemoteProxyToolHandler::new(
                 tool,
                 exposed_name.clone(),
                 external_name.clone(),
                 server_name.clone(),
                 Arc::clone(&shared_client),
-            );
+            ) {
+                Ok(handler) => handler,
+                Err(err) => {
+                    if fail_fast {
+                        return Err(crate::error::ConfigError::ValidationError(format!(
+                            "mcp proxy tool mapping failed for server '{server_name}' tool '{external_name}': {}",
+                            err.message
+                        ))
+                        .into());
+                    }
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        event = "mcp_proxy_tool_mapping_failed",
+                        server = %server_name,
+                        tool = %external_name,
+                        code = err.code,
+                        message = %err.message,
+                        fallback_to_local = settings.proxy_fallback_to_local,
+                        strict = settings.proxy_strict,
+                        "Failed to map remote tool definition across local proxy seam; skipping tool"
+                    );
+                    continue;
+                }
+            };
 
             builder = if let Some(path) = db_path.as_ref() {
                 builder.tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
@@ -264,7 +290,7 @@ fn insert_route_prefix(used_route_prefixes: &mut HashSet<String>, route_prefix: 
 fn list_remote_tools(
     client: &Arc<Mutex<FtMcpClient>>,
     server_name: &str,
-) -> crate::mcp_client::McpClientResult<Vec<Tool>> {
+) -> crate::mcp_client::McpClientResult<Vec<McpClientToolDefinition>> {
     let mut guard = client.lock().map_err(|_| {
         crate::mcp_client::McpClientError::new(
             "mcp_proxy.client_lock_poisoned",
@@ -274,19 +300,17 @@ fn list_remote_tools(
     guard.list_tools()
 }
 
-fn filter_remote_tools(settings: &McpClientConfig, tools: Vec<Tool>) -> Vec<Tool> {
+fn filter_remote_tools(
+    settings: &McpClientConfig,
+    tools: Vec<McpClientToolDefinition>,
+) -> Vec<McpClientToolDefinition> {
     if settings.proxy_allow_mutating_tools {
         return tools;
     }
 
     let mut filtered = Vec::with_capacity(tools.len());
     for tool in tools {
-        let destructive = tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.destructive)
-            .unwrap_or(false);
-        if destructive {
+        if tool.is_destructive() {
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_tool_filtered",
@@ -389,20 +413,21 @@ struct RemoteProxyToolHandler {
 
 impl RemoteProxyToolHandler {
     fn new(
-        mut definition: Tool,
+        definition: McpClientToolDefinition,
         exposed_name: String,
         external_name: String,
         server_name: String,
         client: Arc<Mutex<FtMcpClient>>,
-    ) -> Self {
+    ) -> crate::mcp_client::McpClientResult<Self> {
+        let mut definition = definition.into_framework()?;
         definition.name.clone_from(&exposed_name);
-        Self {
+        Ok(Self {
             definition,
             exposed_name,
             external_name,
             server_name,
             client,
-        }
+        })
     }
 }
 
@@ -422,6 +447,24 @@ impl ToolHandler for RemoteProxyToolHandler {
 
         match guard.call_tool(&self.external_name, arguments) {
             Ok(content) => {
+                let content = content
+                    .into_iter()
+                    .map(McpClientContentItem::into_framework)
+                    .collect::<crate::mcp_client::McpClientResult<Vec<Content>>>()
+                    .map_err(|err| {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            event = "mcp_proxy_route_decode_failed",
+                            route = "remote",
+                            server = %self.server_name,
+                            tool = %self.exposed_name,
+                            code = err.code,
+                            message = %err.message,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "Remote MCP proxy tool returned content that could not be mapped back into the local framework surface"
+                        );
+                        McpError::tool_error(format!("[{}] {}", err.code, err.message))
+                    })?;
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_proxy_route",
@@ -457,8 +500,9 @@ impl ToolHandler for RemoteProxyToolHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ExternalServerConfig, McpClientConfig, Server, Tool, compose_proxy_tools,
-        filter_remote_tools, insert_route_prefix, sanitize_prefix_segment, select_proxy_servers,
+        Config, ExternalServerConfig, McpClientConfig, McpClientToolDefinition, Server,
+        compose_proxy_tools, filter_remote_tools, insert_route_prefix, sanitize_prefix_segment,
+        select_proxy_servers,
     };
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -559,7 +603,7 @@ mod tests {
             proxy_allow_mutating_tools: false,
             ..McpClientConfig::default()
         };
-        let safe = Tool {
+        let safe = McpClientToolDefinition {
             name: "safe".to_string(),
             description: None,
             input_schema: serde_json::json!({"type":"object"}),
@@ -567,12 +611,9 @@ mod tests {
             icon: None,
             version: None,
             tags: vec![],
-            annotations: Some(
-                serde_json::from_value(serde_json::json!({"destructive": false}))
-                    .expect("deserialize safe tool annotations"),
-            ),
+            annotations: Some(serde_json::json!({"destructive": false})),
         };
-        let destructive = Tool {
+        let destructive = McpClientToolDefinition {
             name: "drop_db".to_string(),
             description: None,
             input_schema: serde_json::json!({"type":"object"}),
@@ -580,10 +621,7 @@ mod tests {
             icon: None,
             version: None,
             tags: vec![],
-            annotations: Some(
-                serde_json::from_value(serde_json::json!({"destructive": true}))
-                    .expect("deserialize destructive tool annotations"),
-            ),
+            annotations: Some(serde_json::json!({"destructive": true})),
         };
 
         let filtered = filter_remote_tools(&settings, vec![safe, destructive]);
