@@ -48,22 +48,70 @@ log_event() {
         "$error_code" >> "$LOG_FILE"
 }
 
+RCH_FAIL_OPEN_REGEX='\[RCH\] local|running locally'
+RCH_PROBE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_probe.log"
+RCH_SMOKE_LOG="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_rch_smoke.log"
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback_in_logs() {
+    local label="$1"
+    shift
+
+    if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$@" 2>/dev/null; then
+        log_event "rch_offload" "cargo_step" "$label" "fail" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK"
+        echo "rch fell back to local execution during ${label}; refusing offload policy violation." >&2
+        exit 3
+    fi
+}
+
+run_rch_cargo_logged() {
+    local label="$1"
+    local output_file="$2"
+    shift 2
+
+    set +e
+    run_rch exec -- cargo "$@" 2>&1 | tee "$output_file"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    check_rch_fallback_in_logs "$label" "$output_file"
+    return "$rc"
+}
+
 # ── Preflight ──────────────────────────────────────────────────────────────
 log_event "preflight" "startup" "checking_rch" "started"
 
 if ! command -v rch &>/dev/null; then
-    log_event "preflight" "startup" "rch_binary" "skip" "rch_not_found" "RCH-E001"
-    echo "WARN: rch not found, falling back to local cargo"
-    CARGO_CMD="cargo"
-else
-    if rch workers probe --all 2>&1 | grep -q '✓'; then
-        CARGO_CMD="rch exec -- cargo"
-        log_event "preflight" "startup" "rch_workers" "available" "rch_ok"
-    else
-        log_event "preflight" "startup" "rch_workers" "unavailable" "rch_workers_down" "RCH-E100"
-        echo "WARN: rch workers unavailable, falling back to local cargo"
-        CARGO_CMD="cargo"
-    fi
+    log_event "preflight" "startup" "rch_binary_missing" "fail" "rch_required_missing" "RCH-E001"
+    echo "rch is required; refusing local cargo execution." >&2
+    exit 1
+fi
+
+set +e
+run_rch --json workers probe --all >"$RCH_PROBE_LOG" 2>&1
+probe_rc=$?
+set -e
+if [[ $probe_rc -ne 0 ]] || ! probe_has_reachable_workers "$RCH_PROBE_LOG"; then
+    log_event "preflight" "startup" "rch_workers_probe" "fail" "rch_workers_unhealthy" "RCH-E100"
+    echo "rch workers are unavailable; refusing local cargo execution." >&2
+    exit 1
+fi
+
+set +e
+run_rch exec -- cargo check --help >"$RCH_SMOKE_LOG" 2>&1
+smoke_rc=$?
+set -e
+check_rch_fallback_in_logs "rch_remote_smoke" "$RCH_SMOKE_LOG"
+if [[ $smoke_rc -ne 0 ]]; then
+    log_event "preflight" "startup" "cargo_check_help" "fail" "rch_remote_smoke_failed" "RCH-E101"
+    echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
+    exit 1
 fi
 
 cd "$PROJECT_ROOT"
@@ -90,7 +138,8 @@ log_event "harness" "nominal_path" "crate_count=$TOTAL_CRATES" "started"
 
 # ── Step 1: Compile check for all affected crates ──────────────────────────
 echo "[1/$TOTAL_STEPS] Compile check (term + surface)..."
-if $CARGO_CMD check -p frankenterm-term -p frankenterm-surface 2>>"$LOG_FILE"; then
+COMPILE_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_compile.log"
+if run_rch_cargo_logged "memory_leak_compile" "$COMPILE_OUTPUT" check -p frankenterm-term -p frankenterm-surface; then
     log_event "compile" "nominal_path" "cargo_check" "pass"
     echo "  ✓ Compile check passed"
     PASSED=$((PASSED + 1))
@@ -108,7 +157,7 @@ for crate in "${CRATES[@]}"; do
     echo "[$STEP/$TOTAL_STEPS] Testing $crate..."
     TEST_OUTPUT="$LOG_DIR/${SCENARIO_ID}_${TIMESTAMP}_${crate}.log"
 
-    if $CARGO_CMD test -p "$crate" --lib 2>&1 | tee "$TEST_OUTPUT"; then
+    if run_rch_cargo_logged "${crate}_tests" "$TEST_OUTPUT" test -p "$crate" --lib; then
         # Count passed tests
         test_count=$(grep -c "test result: ok" "$TEST_OUTPUT" 2>/dev/null || echo "0")
         log_event "unit_tests" "nominal_path" "$crate" "pass" "tests_ok=$test_count"
