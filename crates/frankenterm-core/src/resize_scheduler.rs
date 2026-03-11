@@ -1040,14 +1040,10 @@ impl ResizeScheduler {
 
         // Reject completion when superseded by a newer intent — the caller should
         // use cancel_active_if_superseded to properly transition to the newer intent.
+        // Note: we intentionally do NOT clear active_seq here so that
+        // cancel_active_if_superseded can still detect and properly cancel it.
         let is_stale = latest_seq.is_some_and(|latest| latest > intent_seq);
         if is_stale {
-            if let Some(state) = self.panes.get_mut(&pane_id) {
-                state.active_seq = None;
-                state.active_phase = None;
-                state.active_phase_started_at_ms = None;
-            }
-
             self.metrics.completion_rejected = self.metrics.completion_rejected.saturating_add(1);
             self.push_lifecycle_event(
                 pane_id,
@@ -2441,12 +2437,17 @@ mod tests {
         });
 
         // Background pane 1 is always deferred by interactive pane 2.
+        // Each frame: complete pane 2's active slot before submitting the next
+        // intent, so pane 2 is always eligible to be scheduled and pane 1
+        // keeps getting deferred.
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 1, 100));
         let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 101));
         let _ = scheduler.schedule_frame();
+        scheduler.complete_active(2, 1);
 
         let _ = scheduler.submit_intent(intent(2, 2, ResizeWorkClass::Interactive, 1, 102));
         let _ = scheduler.schedule_frame();
+        scheduler.complete_active(2, 2);
 
         // Third frame triggers drop before scheduling due to deferral threshold.
         let _ = scheduler.submit_intent(intent(2, 3, ResizeWorkClass::Interactive, 1, 103));
@@ -3166,12 +3167,13 @@ mod tests {
 
         let _ = scheduler.submit_intent(intent(1, 1, ResizeWorkClass::Background, 5, 100));
 
-        // Schedule 3 empty frames (no other work, but pane 1 won't fit)
-        // Actually need another pane to take the slot each time
+        // Schedule 4 frames where pane 2 takes the slot each time,
+        // deferring pane 1 and accumulating aging credit.
         for i in 0..4 {
-            let _ = scheduler.submit_intent(intent(2, 1, ResizeWorkClass::Interactive, 1, 100 + i));
+            let seq = (i + 1) as u64;
+            let _ = scheduler.submit_intent(intent(2, seq, ResizeWorkClass::Interactive, 1, 100 + i));
             let _ = scheduler.schedule_frame();
-            assert!(scheduler.complete_active(2, 1));
+            assert!(scheduler.complete_active(2, seq));
         }
 
         let snap = scheduler.snapshot();
