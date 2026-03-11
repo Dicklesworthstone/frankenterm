@@ -2288,8 +2288,8 @@ steps:
             completed_at: 1100,
             duration_ms: 100,
         }];
-        // No completed steps, so start from 0
-        assert_eq!(super::compute_next_step(&logs), 0);
+        // Retry at step 1 means re-execute step 1
+        assert_eq!(super::compute_next_step(&logs), 1);
     }
 
     #[test]

@@ -1222,11 +1222,16 @@ mod tests {
 
     #[test]
     fn compute_next_step_out_of_order_logs() {
-        let logs = vec![
-            make_step_log(2, "continue"),
-            make_step_log(0, "continue"),
-            make_step_log(1, "continue"),
-        ];
+        // Simulate logs arriving out of vec order but with correct chronological IDs.
+        // Step 0 completed first (lowest ID), step 2 completed last (highest ID).
+        let mut log0 = make_step_log(0, "continue");
+        let mut log1 = make_step_log(1, "continue");
+        let mut log2 = make_step_log(2, "continue");
+        log0.id = 1;
+        log1.id = 2;
+        log2.id = 3;
+        // Vec order differs from step order (the "out of order" part)
+        let logs = vec![log2, log0, log1];
         assert_eq!(compute_next_step(&logs), 3);
     }
 
@@ -1251,12 +1256,14 @@ mod tests {
             })
             .to_string(),
         );
+        // jump_log must have the highest ID (most recent chronologically)
+        let mut log0 = make_step_log(0, "continue");
+        let mut log1 = make_step_log(1, "continue");
+        log0.id = 1;
+        log1.id = 2;
+        jump_log.id = 3;
 
-        let logs = vec![
-            make_step_log(0, "continue"),
-            make_step_log(1, "continue"),
-            jump_log,
-        ];
+        let logs = vec![log0, log1, jump_log];
         // After jumping to 5, the next step should be 5
         assert_eq!(compute_next_step(&logs), 5);
     }

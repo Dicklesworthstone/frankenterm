@@ -1695,8 +1695,8 @@ mod tests {
     fn default_agent_command_escapes_spaces_in_path() {
         let cwd = PathBuf::from("/my project/code");
         let cmd = default_agent_command(AgentType::ClaudeCode, &cwd).unwrap();
-        // The path should be quoted
-        assert!(cmd.contains('"'));
+        // The path should be single-quoted (shell_escape uses single quotes)
+        assert!(cmd.contains('\''));
         assert!(cmd.contains("claude"));
     }
 
