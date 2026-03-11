@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-release.json",
   "title": "WA Robot Release Response",
-  "description": "Schema for the data field when calling 'wa robot release <pane_id>'. Releases a pane reservation.",
+  "description": "Schema for the data field when calling 'wa robot reservations release <reservation_id>'. Releases a pane reservation.",
   "type": "object",
   "required": ["reservation_id", "released"],
   "properties": {

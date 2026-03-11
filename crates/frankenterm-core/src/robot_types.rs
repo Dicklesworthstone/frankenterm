@@ -1806,13 +1806,13 @@ pub struct AccountsRefreshData {
 // Reservations
 // ============================================================================
 
-/// Response data for `ft robot reserve`.
+/// Response data for `ft robot reservations reserve`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveData {
     pub reservation: ReservationInfo,
 }
 
-/// Response data for `ft robot release`.
+/// Response data for `ft robot reservations release`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseData {
     pub reservation_id: i64,

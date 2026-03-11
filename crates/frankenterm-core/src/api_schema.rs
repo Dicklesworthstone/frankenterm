@@ -416,7 +416,7 @@ impl SchemaRegistry {
                     id: "reserve".into(),
                     title: "Reserve Pane".into(),
                     description: "Create a pane reservation".into(),
-                    robot_command: Some("robot reserve".into()),
+                    robot_command: Some("robot reservations reserve".into()),
                     mcp_tool: Some("wa.reserve".into()),
                     schema_file: "wa-robot-reserve.json".into(),
                     stable: true,
@@ -426,7 +426,7 @@ impl SchemaRegistry {
                     id: "release".into(),
                     title: "Release Reservation".into(),
                     description: "Release a pane reservation".into(),
-                    robot_command: Some("robot release".into()),
+                    robot_command: Some("robot reservations release".into()),
                     mcp_tool: Some("wa.release".into()),
                     schema_file: "wa-robot-release.json".into(),
                     stable: true,
@@ -964,6 +964,31 @@ mod tests {
                 "hand-authored schema {schema} is not in the registry"
             );
         }
+    }
+
+    #[test]
+    fn reservation_endpoints_use_nested_robot_command_paths() {
+        let reg = SchemaRegistry::canonical();
+
+        let reservations = reg
+            .get("reservations_list")
+            .expect("reservations_list endpoint exists");
+        assert_eq!(
+            reservations.robot_command.as_deref(),
+            Some("robot reservations list")
+        );
+
+        let reserve = reg.get("reserve").expect("reserve endpoint exists");
+        assert_eq!(
+            reserve.robot_command.as_deref(),
+            Some("robot reservations reserve")
+        );
+
+        let release = reg.get("release").expect("release endpoint exists");
+        assert_eq!(
+            release.robot_command.as_deref(),
+            Some("robot reservations release")
+        );
     }
 
     // --- ApiVersion parse edge cases ---

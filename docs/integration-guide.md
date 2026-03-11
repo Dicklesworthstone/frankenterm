@@ -139,8 +139,8 @@ Each robot command has a corresponding typed struct:
 | `robot accounts list` | `AccountsListData` | Account balances |
 | `robot accounts refresh` | `AccountsRefreshData` | Refresh result |
 | `robot reservations list` | `ReservationsListData` | Pane reservations |
-| `robot reserve` | `ReserveData` | New reservation |
-| `robot release` | `ReleaseData` | Release confirmation |
+| `robot reservations reserve` | `ReserveData` | New reservation |
+| `robot reservations release` | `ReleaseData` | Release confirmation |
 | `robot approve` | `ApproveData` | Approval validation |
 | `robot why` | `WhyData` | Error code explanation |
 | `robot help` | `QuickStartData` | Quick-start guide |

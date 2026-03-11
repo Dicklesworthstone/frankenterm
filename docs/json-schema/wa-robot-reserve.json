@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-reserve.json",
   "title": "WA Robot Reserve Response",
-  "description": "Schema for the data field when calling 'wa robot reserve <pane_id>'. Creates a pane reservation.",
+  "description": "Schema for the data field when calling 'wa robot reservations reserve <pane_id>'. Creates a pane reservation.",
   "type": "object",
   "required": ["reservation"],
   "properties": {
