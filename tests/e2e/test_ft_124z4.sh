@@ -18,6 +18,9 @@ LAST_STEP_LOG=""
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
 LOCAL_RCH_TMPDIR_OVERRIDE=""
+RCH_WORKERS_TOML="${HOME}/.config/rch/workers.toml"
+RCH_CONFIG_FILE="${ROOT_DIR}/.rch/config.toml"
+RCH_REMOTE_BASE_DEFAULT="/home/ubuntu/rch"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
@@ -89,6 +92,179 @@ run_rch() {
   fi
 }
 
+extract_rch_remote_base() {
+  local configured
+  configured="$(awk -F'"' '/^[[:space:]]*remote_base[[:space:]]*=/{print $2; exit}' "${RCH_CONFIG_FILE}" 2>/dev/null || true)"
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s\n' "${RCH_REMOTE_BASE_DEFAULT}"
+  fi
+}
+
+collect_external_cargo_manifest_paths() {
+  python3 - "${ROOT_DIR}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1]).resolve()
+project_parent = root.parent
+pattern = re.compile(r'path\s*=\s*"([^"]+)"')
+found = set()
+
+for manifest in root.rglob("Cargo.toml"):
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = manifest.read_text(encoding="utf-8", errors="ignore")
+
+    for match in pattern.finditer(text):
+        resolved = (manifest.parent / match.group(1)).resolve()
+        if resolved == root or str(resolved).startswith(str(root) + "/"):
+            continue
+        try:
+            rel = resolved.relative_to(project_parent)
+        except ValueError:
+            continue
+        manifest_path = rel / "Cargo.toml" if resolved.is_dir() else rel
+        found.add(str(manifest_path))
+
+for item in sorted(found):
+    print(item)
+PY
+}
+
+load_worker_topology_tsv() {
+  python3 - "${RCH_WORKERS_TOML}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+path = Path(sys.argv[1]).expanduser()
+if not path.is_file():
+    sys.exit(1)
+
+data = tomllib.loads(path.read_text(encoding="utf-8"))
+for worker in data.get("workers", []):
+    print(
+        "\t".join(
+            [
+                worker.get("id", ""),
+                worker.get("host", ""),
+                worker.get("user", ""),
+                worker.get("identity_file", ""),
+            ]
+        )
+    )
+PY
+}
+
+append_topology_report() {
+  local report_path="$1"
+  local worker_id="$2"
+  local host="$3"
+  local outcome="$4"
+  local detail="$5"
+
+  jq -cn \
+    --arg worker_id "${worker_id}" \
+    --arg host "${host}" \
+    --arg outcome "${outcome}" \
+    --arg detail "${detail}" \
+    '{
+      worker_id: $worker_id,
+      host: $host,
+      outcome: $outcome,
+      detail: $detail
+    }' >> "${report_path}"
+}
+
+probe_worker_remote_paths() {
+  local worker_id="$1"
+  local host="$2"
+  local user="$3"
+  local identity_file="$4"
+  local remote_base="$5"
+  local worker_log="$6"
+  shift 6
+
+  set +e
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ControlMaster=no \
+    -i "${identity_file}" \
+    "${user}@${host}" \
+    bash -s -- "${remote_base}" "$@" >"${worker_log}" 2>&1 <<'EOF'
+set -euo pipefail
+remote_base="$1"
+shift
+
+for dep in "$@"; do
+  target="${remote_base}/${dep}"
+  if [[ ! -f "${target}" ]]; then
+    echo "missing:${target}"
+    exit 12
+  fi
+done
+
+echo "ok"
+EOF
+  local rc=$?
+  set -e
+  return "${rc}"
+}
+
+run_rch_topology_preflight() {
+  local remote_base
+  local deps_file topology_report
+  local worker_id host user identity_file worker_log
+  local missing_any="false"
+  local -a dep_paths=()
+
+  remote_base="$(extract_rch_remote_base)"
+  mapfile -t dep_paths < <(collect_external_cargo_manifest_paths)
+
+  if [[ ${#dep_paths[@]} -eq 0 ]]; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "skipped" "no_external_path_dependencies" "none" "$(basename "${STDOUT_FILE}")"
+    return 0
+  fi
+
+  if [[ ! -f "${RCH_WORKERS_TOML}" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "missing_workers_toml" "RCH-WORKERS-CONFIG-MISSING" "$(basename "${STDOUT_FILE}")"
+    echo "rch workers config not found: ${RCH_WORKERS_TOML}" >&2
+    return 2
+  fi
+
+  deps_file="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_external_path_deps.txt"
+  topology_report="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_rch_worker_topology.jsonl"
+  printf '%s\n' "${dep_paths[@]}" > "${deps_file}"
+  : > "${topology_report}"
+
+  emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "running" "none" "none" "$(basename "${deps_file}")"
+
+  while IFS=$'\t' read -r worker_id host user identity_file; do
+    [[ -n "${worker_id}" && -n "${host}" && -n "${user}" && -n "${identity_file}" ]] || continue
+    worker_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${worker_id}_topology.log"
+
+    if probe_worker_remote_paths "${worker_id}" "${host}" "${user}" "${identity_file}" "${remote_base}" "${worker_log}" "${dep_paths[@]}"; then
+      append_topology_report "${topology_report}" "${worker_id}" "${host}" "ok" "all external path manifests present"
+    else
+      missing_any="true"
+      append_topology_report "${topology_report}" "${worker_id}" "${host}" "missing" "$(tr '\n' ' ' < "${worker_log}")"
+    fi
+  done < <(load_worker_topology_tsv)
+
+  if [[ "${missing_any}" == "true" ]]; then
+    emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "failed" "rch_worker_topology_drift" "RCH-REMOTE-TOPOLOGY" "$(basename "${topology_report}")"
+    echo "rch worker topology drift detected; see ${topology_report}" >&2
+    return 2
+  fi
+
+  emit_log "preflight" "rch_topology_preflight" "external_cargo_paths" "passed" "remote_path_dependencies_present" "none" "$(basename "${topology_report}")"
+}
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -104,6 +280,8 @@ cd "${ROOT_DIR}"
 require_cmd jq
 require_cmd rch
 require_cmd cargo
+require_cmd python3
+require_cmd ssh
 
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 
@@ -136,6 +314,10 @@ if [[ "${healthy_workers}" -lt 1 ]]; then
 fi
 
 emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
+
+if ! run_rch_topology_preflight; then
+  exit 2
+fi
 
 emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "running" "none" "none" "$(basename "${STDOUT_FILE}")"
 if run_step rch_remote_smoke run_rch exec -- cargo check --help; then

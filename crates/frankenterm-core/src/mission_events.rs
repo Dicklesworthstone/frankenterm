@@ -145,6 +145,7 @@ pub mod reason_codes {
 
     // Reconcile phase
     pub const CONFLICT_RESERVATION_OVERLAP: &str = "mission.reconcile.reservation_overlap";
+    pub const CONFLICT_RESOURCE_OVERLAP: &str = "mission.reconcile.resource_overlap";
     pub const CONFLICT_CONCURRENT_CLAIM: &str = "mission.reconcile.concurrent_claim";
     pub const CONFLICT_ACTIVE_COLLISION: &str = "mission.reconcile.active_collision";
     pub const CONFLICT_AUTO_RESOLVED: &str = "mission.reconcile.auto_resolved";
@@ -742,6 +743,7 @@ impl<'a> CycleEventEmitter<'a> {
     ) -> Option<u64> {
         let reason = match conflict_type {
             "file_reservation_overlap" => reason_codes::CONFLICT_RESERVATION_OVERLAP,
+            "resource_reservation_overlap" => reason_codes::CONFLICT_RESOURCE_OVERLAP,
             "concurrent_bead_claim" => reason_codes::CONFLICT_CONCURRENT_CLAIM,
             "active_claim_collision" => reason_codes::CONFLICT_ACTIVE_COLLISION,
             _ => "mission.reconcile.conflict_unknown",
@@ -1297,6 +1299,7 @@ mod tests {
             reason_codes::REJECTION_SAFETY,
             reason_codes::REJECTION_SOLVER,
             reason_codes::CONFLICT_RESERVATION_OVERLAP,
+            reason_codes::CONFLICT_RESOURCE_OVERLAP,
             reason_codes::CONFLICT_CONCURRENT_CLAIM,
             reason_codes::CONFLICT_ACTIVE_COLLISION,
             reason_codes::CONFLICT_AUTO_RESOLVED,
@@ -1449,15 +1452,21 @@ mod tests {
             );
             emitter.emit_conflict_detected(
                 "c-002",
-                "concurrent_bead_claim",
+                "resource_reservation_overlap",
                 &["a2".to_string()],
                 &["b2".to_string()],
             );
             emitter.emit_conflict_detected(
                 "c-003",
-                "active_claim_collision",
+                "concurrent_bead_claim",
                 &["a3".to_string()],
                 &["b3".to_string()],
+            );
+            emitter.emit_conflict_detected(
+                "c-004",
+                "active_claim_collision",
+                &["a4".to_string()],
+                &["b4".to_string()],
             );
         }
         let events = log.events();
@@ -1467,10 +1476,14 @@ mod tests {
         );
         assert_eq!(
             events[1].reason_code,
-            reason_codes::CONFLICT_CONCURRENT_CLAIM
+            reason_codes::CONFLICT_RESOURCE_OVERLAP
         );
         assert_eq!(
             events[2].reason_code,
+            reason_codes::CONFLICT_CONCURRENT_CLAIM
+        );
+        assert_eq!(
+            events[3].reason_code,
             reason_codes::CONFLICT_ACTIVE_COLLISION
         );
     }
