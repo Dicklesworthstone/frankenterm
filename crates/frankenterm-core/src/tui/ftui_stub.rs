@@ -6713,10 +6713,10 @@ mod tests {
 
     #[test]
     fn focus_traversal_full_cycle() {
-        // Tab through all 7 views and verify focus resets each time
+        // Tab through all 8 views and verify focus resets each time
         let mut model = make_model(MockQuery::healthy());
         model.view_state.focus = FocusRegion::FilterBar;
-        for _ in 0..7 {
+        for _ in 0..8 {
             let tab = ftui::KeyEvent {
                 code: ftui::KeyCode::Tab,
                 kind: ftui::KeyEventKind::Press,
@@ -6849,7 +6849,7 @@ mod tests {
     #[test]
     fn snapshot_home_degraded_80x24() {
         let text = snapshot_view(MockQuery::degraded(), View::Home, 80, 24);
-        assert_tab_bar_full(&text, View::Home);
+        assert_tab_bar(&text, View::Home);
         assert_footer_present(&text, View::Home);
         // Degraded state should show ERROR badge, "stopped" watcher, or "unavailable" db
         assert!(
@@ -7171,13 +7171,20 @@ mod tests {
         let tab_line = text.lines().next().unwrap();
         // Verify separator characters between tabs
         assert!(tab_line.contains('|'), "Tab bar should have separators");
-        // Verify shortcut numbers
+        // Verify shortcut numbers for tabs that fit at 80 columns.
+        // The render_tab_bar function truncates when tabs exceed the width,
+        // so at 80 cols not all 8 tabs may be visible.
         for (i, view) in View::all().iter().enumerate() {
             let expected = format!("{} {}", i + 1, view.name());
-            assert!(
-                tab_line.contains(&expected),
-                "Tab bar should contain '{expected}': {tab_line}"
-            );
+            if tab_line.contains(&expected) {
+                // Tab is visible — good
+            } else {
+                // Tab was truncated due to width — only acceptable for later tabs
+                assert!(
+                    i >= 7,
+                    "Tab bar should contain '{expected}' at 80 cols: {tab_line}"
+                );
+            }
         }
     }
 
@@ -7373,6 +7380,7 @@ mod tests {
             View::History,
             View::Search,
             View::Help,
+            View::Timeline,
             View::Home, // wraps
         ];
         for &view in &expected {
@@ -7793,10 +7801,10 @@ mod tests {
         for _ in 0..100 {
             s.press(ftui::KeyCode::Tab);
         }
-        // 100 tabs from Home: 100 % 7 = 2 -> should be on Events (Home+2)
-        // Home->Panes->Events->Triage->History->Search->Help->Home...
-        // 100 mod 7 = 2 (0-indexed from Home): Panes(1), Events(2)
-        s.assert_view(View::Events);
+        // 100 tabs from Home: 100 % 8 = 4 -> should be on History (Home+4)
+        // Home->Panes->Events->Triage->History->Search->Help->Timeline->Home...
+        // 100 mod 8 = 4 (0-indexed from Home): Panes(1), Events(2), Triage(3), History(4)
+        s.assert_view(View::History);
         s.capture();
     }
 
@@ -7996,10 +8004,10 @@ mod tests {
             }
         }
 
-        // 100 tabs through 7 views = 100 mod 7 = position 2
-        // Views: Home(0), Panes(1), Events(2), Triage(3), History(4), Search(5), Help(6)
-        // 100 % 7 = 2 → Events
-        s.assert_view(View::Events);
+        // 100 tabs through 8 views = 100 mod 8 = position 4
+        // Views: Home(0), Panes(1), Events(2), Triage(3), History(4), Search(5), Help(6), Timeline(7)
+        // 100 % 8 = 4 → History
+        s.assert_view(View::History);
     }
 
     #[test]
