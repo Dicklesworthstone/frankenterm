@@ -1139,7 +1139,8 @@ pub fn detect_tailer_mode(config: &crate::config::Config) -> TailerMode {
 /// The bridge converts each delta kind:
 /// - `Output` → `StreamEvent::OutputData` (`delta_text` when present, otherwise
 ///   a metadata fallback string)
-/// - `Gap` → `StreamEvent::OutputData` with overflow flag
+/// - `Gap` → `StreamEvent::OutputData` with overflow flag and empty payload;
+///   the ingester converts that into a GAP-only segment
 /// - `Ended` → `StreamEvent::PaneClosed`
 pub struct StreamingBridge {
     ingester: crate::ingest::StreamIngester,
@@ -1223,8 +1224,9 @@ impl StreamingBridge {
                 // After an explicit upstream gap we reset local seq tracking so
                 // the next output delta establishes a fresh baseline.
                 self.last_mux_seqno.remove(&pane_id);
-                // A gap from the subscription → treat as overflow so ingester
-                // emits a proper GAP segment.
+                // Explicit upstream gaps are bridged as overflow + empty data.
+                // StreamIngester recognizes that pair and emits only a GAP
+                // instead of fabricating an empty delta segment.
                 StreamEvent::OutputData {
                     pane_id,
                     data: String::new(),
@@ -2824,6 +2826,7 @@ mod tests {
     #[cfg(feature = "vendored")]
     #[test]
     fn streaming_bridge_process_gap_emits_gap_segment() {
+        use crate::ingest::CapturedSegmentKind;
         use crate::vendored::PaneDelta;
 
         let mut bridge = StreamingBridge::new();
@@ -2846,10 +2849,11 @@ mod tests {
         };
         let segments = bridge.process_delta(gap);
 
-        // Gap delta with overflow=true → next event will emit gap.
-        // The current event itself is an empty delta, so we get 1 segment.
-        // But overflow is set for the *next* event.
-        assert!(!segments.is_empty());
+        assert_eq!(segments.len(), 1);
+        assert!(
+            matches!(segments[0].kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert!(segments[0].content.is_empty());
         assert_eq!(bridge.events_processed(), 2);
     }
 

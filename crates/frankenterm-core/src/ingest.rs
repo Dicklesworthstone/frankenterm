@@ -2123,6 +2123,10 @@ pub enum StreamEvent {
         /// Pane that produced the output.
         pane_id: u64,
         /// UTF-8 delta text (new bytes decoded from PTY).
+        ///
+        /// This may be empty for synthetic upstream gap markers; in that case
+        /// the ingester should emit only a GAP and not fabricate a zero-length
+        /// delta segment.
         data: String,
         /// Epoch milliseconds when the data was received from the mux.
         received_at: i64,
@@ -2209,9 +2213,9 @@ impl StreamIngester {
 
     /// Process a stream event and return zero or more CapturedSegments.
     ///
-    /// Returns a Vec because overflow events produce two segments (GAP + Delta).
-    /// Normal deltas produce exactly one segment. PaneClosed and Disconnected
-    /// may produce GAP segments for affected panes.
+    /// Returns a Vec because overflow events with payload produce two segments
+    /// (GAP + Delta). Explicit upstream gaps, PaneClosed, and Disconnected may
+    /// produce GAP-only output.
     pub fn process(&mut self, event: StreamEvent) -> Vec<CapturedSegment> {
         match event {
             StreamEvent::OutputData {
@@ -2239,6 +2243,10 @@ impl StreamIngester {
             self.overflow_pending.insert(pane_id);
         }
 
+        if data.is_empty() && !self.overflow_pending.contains(&pane_id) {
+            return segments;
+        }
+
         let cursor = self
             .cursors
             .entry(pane_id)
@@ -2250,6 +2258,12 @@ impl StreamIngester {
             self.gaps_emitted += 1;
             self.segments_emitted += 1;
             segments.push(gap);
+        }
+
+        // Vendored explicit gap markers are bridged as overflow + empty data.
+        // Once the GAP is emitted, there is no delta payload to persist.
+        if data.is_empty() {
+            return segments;
         }
 
         // Emit the delta segment via PaneCursor (bypasses snapshot diff,
@@ -4630,6 +4644,43 @@ mod tests {
         });
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
+    }
+
+    #[test]
+    fn ingester_empty_overflow_event_emits_gap_without_empty_delta() {
+        let mut ingester = StreamIngester::new();
+
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "before\n".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].seq, 0);
+
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: String::new(),
+            received_at: 200,
+            overflow: true,
+        });
+        assert_eq!(segs.len(), 1, "explicit upstream gaps should emit only GAP");
+        assert!(
+            matches!(segs[0].kind, CapturedSegmentKind::Gap { ref reason } if reason == "stream_overflow")
+        );
+        assert_eq!(segs[0].seq, 1);
+
+        let segs = ingester.process(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "after-gap\n".to_string(),
+            received_at: 300,
+            overflow: false,
+        });
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].kind, CapturedSegmentKind::Delta);
+        assert_eq!(segs[0].seq, 2);
+        assert_eq!(segs[0].content, "after-gap\n");
     }
 
     // --- PaneClosed ---
