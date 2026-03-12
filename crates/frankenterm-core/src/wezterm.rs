@@ -1982,6 +1982,7 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
+        use crate::runtime_compat::CompatRuntime;
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .start_paused(true)

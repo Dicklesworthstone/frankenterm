@@ -257,6 +257,7 @@ pub enum SubsystemPayload {
     /// Swarm work queue snapshot.
     SwarmWorkQueue(SwarmWorkQueuePayload),
     /// Mux connection pool stats.
+    #[cfg(feature = "vendored")]
     MuxPool(MuxPoolPayload),
     /// Core telemetry (resources, histograms, counters).
     Runtime(RuntimePayload),
@@ -285,6 +286,7 @@ pub struct SwarmWorkQueuePayload {
 }
 
 /// Wrapper for mux pool stats.
+#[cfg(feature = "vendored")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MuxPoolPayload {
     pub snapshot: crate::vendored::mux_pool::MuxPoolStats,
