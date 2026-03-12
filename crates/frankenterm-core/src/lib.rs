@@ -233,6 +233,7 @@ pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
 pub mod migration_artifact_contracts;
+pub mod migration_rehearsal;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "subprocess-bridge")]
