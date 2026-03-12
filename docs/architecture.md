@@ -94,6 +94,45 @@ Core passive loop contract: observe/store/detect only. Side effects are delegate
 - `policy.rs`: action authorization model (`ActionKind`, `ActorKind`, `PolicyDecision`) and gating helpers.
 - Documentation parity note: workflow runtime code is directory-backed under `workflows/`; there is no standalone `workflows.rs`.
 
+### Swarm orchestration runtime modules (`crates/frankenterm-core/src/*`)
+
+The native swarm-orchestration runtime already exists as a distinct set of
+core modules rather than a single monolith:
+
+- `fleet_launcher.rs`: launch-plan construction, phased rollout groups, slot
+  ordering, and launch invariants for agent fleets.
+- `swarm_work_queue.rs`: dependency-aware work queue plus beads import/sync
+  (`.beads/issues.jsonl` -> `WorkItem` queue snapshot).
+- `swarm_scheduler.rs`: queue-pressure evaluation, assignment, rebalance,
+  scale-up/down, and circuit-breaker logic over the work queue.
+- `swarm_pipeline.rs`: multi-step pipeline executor with hooks, retries,
+  compensation, and recovery-policy support.
+- `mission_loop.rs`: assignment scoring loop, safety envelope, conflict
+  detection/deconfliction, operator overrides, metrics windows, and
+  operator-report generation.
+- `mission_agent_mail.rs`: Agent Mail emission/notification helpers used by
+  mission/swarm coordination flows.
+- `lock_orchestration.rs`: lock acquisition groups, deadlock detection, lock
+  expiry, and explicit handoff protocol for pane/bead/resource ownership.
+- `swarm_command_center.rs`: operator-facing command palette/live-view model
+  for fleet control surfaces.
+
+These modules are not just placeholders: they are backed by dedicated test
+surfaces such as `crates/frankenterm-core/tests/swarm_simulation_regression.rs`,
+`crates/frankenterm-core/tests/mission_e2e_scenario_matrix.rs`,
+`crates/frankenterm-core/tests/proptest_mission_loop.rs`,
+`crates/frankenterm-core/tests/proptest_swarm_scheduler.rs`,
+`crates/frankenterm-core/tests/proptest_swarm_work_queue_ext.rs`, and
+`crates/frankenterm-core/tests/proptest_fleet_launcher.rs`.
+
+Important current integration note: these runtime primitives are exported from
+`frankenterm-core`, but the primary CLI mission surfaces in
+`crates/frankenterm/src/main.rs` still center on persisted `plan::Mission`
+artifacts and transition plans (`ft mission plan/run/status/explain/...`).
+That means the live `MissionLoop` / queue / scheduler / fleet-launcher stack is
+implemented and testable in core, yet not fully surfaced as the dominant
+operator-facing mission runtime path in the CLI.
+
 ### Storage model (authoritative persistence seam)
 
 `storage.rs` defines append- and event-oriented tables including:
