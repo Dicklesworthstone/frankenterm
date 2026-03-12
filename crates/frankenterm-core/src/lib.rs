@@ -425,6 +425,7 @@ pub mod time_series;
 pub mod token_bucket;
 pub mod topological_sort;
 pub mod topology_orchestration;
+pub mod traceability_verification;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
