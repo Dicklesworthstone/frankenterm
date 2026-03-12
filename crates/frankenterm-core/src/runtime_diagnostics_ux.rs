@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn catalog_robot_safe_commands_empty_for_unknown() {
-        let catalog = DiagnosticCatalog::standard();
+        let _catalog = DiagnosticCatalog::standard();
         // Use a failure class we handle but check for a non-existent one.
         let empty_catalog = DiagnosticCatalog::from_templates(Vec::new());
         let cmds = empty_catalog.robot_safe_commands(&FailureClass::Timeout);
