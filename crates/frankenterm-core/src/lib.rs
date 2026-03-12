@@ -75,6 +75,7 @@ pub mod ars_secret_scan;
 pub mod ars_serialize;
 pub mod ars_symbolic_exec;
 pub mod ars_timeout;
+pub mod asupersync_observability;
 pub mod auto_tune;
 pub mod backpressure;
 pub mod backpressure_severity;
