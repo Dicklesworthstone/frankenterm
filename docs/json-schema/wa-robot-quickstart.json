@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-quickstart.json",
+  "title": "WA Robot Quick Start Response",
+  "description": "Schema for the data field when calling 'wa robot quick-start' or defaulting to 'wa robot' with no subcommand. Returns the machine-oriented quick-start guide.",
+  "type": "object",
+  "required": [
+    "description",
+    "global_flags",
+    "core_loop",
+    "commands",
+    "tips",
+    "error_handling"
+  ],
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "High-level description of robot mode and its current backend bridge"
+    },
+    "global_flags": {
+      "type": "array",
+      "description": "Global flags accepted by robot commands",
+      "items": {
+        "$ref": "#/$defs/global_flag"
+      }
+    },
+    "core_loop": {
+      "type": "array",
+      "description": "Recommended basic operator/agent loop for safe robot usage",
+      "items": {
+        "$ref": "#/$defs/core_step"
+      }
+    },
+    "commands": {
+      "type": "array",
+      "description": "Catalog of high-signal robot commands with examples",
+      "items": {
+        "$ref": "#/$defs/command"
+      }
+    },
+    "tips": {
+      "type": "array",
+      "description": "Practical usage guidance and compatibility notes",
+      "items": {
+        "type": "string"
+      }
+    },
+    "error_handling": {
+      "$ref": "#/$defs/error_handling",
+      "description": "Common error codes and safety guidance"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "global_flag": {
+      "type": "object",
+      "required": ["flag", "description"],
+      "properties": {
+        "flag": {
+          "type": "string",
+          "description": "CLI flag syntax"
+        },
+        "env_var": {
+          "type": "string",
+          "description": "Environment variable equivalent when one exists"
+        },
+        "description": {
+          "type": "string",
+          "description": "What the flag controls"
+        }
+      },
+      "additionalProperties": false
+    },
+    "core_step": {
+      "type": "object",
+      "required": ["step", "action", "command"],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Ordered step number in the recommended loop"
+        },
+        "action": {
+          "type": "string",
+          "description": "Human-readable action summary"
+        },
+        "command": {
+          "type": "string",
+          "description": "Representative command or pseudo-command for the step"
+        }
+      },
+      "additionalProperties": false
+    },
+    "command": {
+      "type": "object",
+      "required": ["name", "args", "summary", "examples"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Canonical robot subcommand or nested command family"
+        },
+        "args": {
+          "type": "string",
+          "description": "Argument synopsis for the command"
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short explanation of the command's purpose"
+        },
+        "examples": {
+          "type": "array",
+          "description": "Representative command examples",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "error_handling": {
+      "type": "object",
+      "required": ["common_codes", "safety_notes"],
+      "properties": {
+        "common_codes": {
+          "type": "array",
+          "description": "Stable error codes and operator recovery guidance",
+          "items": {
+            "$ref": "#/$defs/error_code"
+          }
+        },
+        "safety_notes": {
+          "type": "array",
+          "description": "High-level safety reminders for mutating commands",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "error_code": {
+      "type": "object",
+      "required": ["code", "meaning", "recovery"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Stable machine-readable error code"
+        },
+        "meaning": {
+          "type": "string",
+          "description": "What the error code means"
+        },
+        "recovery": {
+          "type": "string",
+          "description": "Recommended recovery or next action"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

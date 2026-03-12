@@ -213,6 +213,16 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "quickstart".into(),
+                    title: "Robot Quick Start".into(),
+                    description: "Show the machine-oriented quick-start guide".into(),
+                    robot_command: Some("robot quick-start".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-quickstart.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "state".into(),
                     title: "Pane State".into(),
                     description: "Get all observed panes as structured data".into(),
@@ -996,6 +1006,7 @@ mod tests {
         // These are the known hand-authored schemas that should be covered
         let expected = [
             "wa-robot-help.json",
+            "wa-robot-quickstart.json",
             "wa-robot-state.json",
             "wa-robot-get-text.json",
             "wa-robot-send.json",
@@ -1015,6 +1026,7 @@ mod tests {
             "wa-robot-workflow-abort.json",
             "wa-robot-rules-list.json",
             "wa-robot-rules-test.json",
+            "wa-robot-rules-show.json",
             "wa-robot-rules-lint.json",
             "wa-robot-accounts.json",
             "wa-robot-accounts-refresh.json",
@@ -1031,6 +1043,42 @@ mod tests {
                 "hand-authored schema {schema} is not in the registry"
             );
         }
+    }
+
+    #[test]
+    fn registered_schema_files_exist_on_disk() {
+        let reg = SchemaRegistry::canonical();
+        let schema_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/json-schema");
+
+        for schema in reg.schema_files() {
+            let path = schema_dir.join(schema);
+            assert!(
+                path.exists(),
+                "registered schema file should exist on disk: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn help_quickstart_and_rule_detail_endpoints_use_live_robot_command_paths() {
+        let reg = SchemaRegistry::canonical();
+
+        let help = reg.get("help").expect("help endpoint exists");
+        assert_eq!(help.robot_command.as_deref(), Some("robot help"));
+
+        let quickstart = reg.get("quickstart").expect("quickstart endpoint exists");
+        assert_eq!(
+            quickstart.robot_command.as_deref(),
+            Some("robot quick-start")
+        );
+
+        let rules_show = reg.get("rules_show").expect("rules_show endpoint exists");
+        assert_eq!(
+            rules_show.robot_command.as_deref(),
+            Some("robot rules show")
+        );
     }
 
     #[test]

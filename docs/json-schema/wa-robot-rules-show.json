@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-show.json",
+  "title": "WA Robot Rules Show Response",
+  "description": "Schema for the data field when calling 'wa robot rules show <rule_id>'. Returns the full detail payload for a single detection rule.",
+  "type": "object",
+  "required": [
+    "id",
+    "agent_type",
+    "event_type",
+    "severity",
+    "description",
+    "anchors"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Full rule identifier"
+    },
+    "agent_type": {
+      "type": "string",
+      "description": "Agent type this rule applies to"
+    },
+    "event_type": {
+      "type": "string",
+      "description": "Event type produced by the rule"
+    },
+    "severity": {
+      "type": "string",
+      "description": "Severity level emitted by the rule"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable explanation of what the rule detects"
+    },
+    "anchors": {
+      "type": "array",
+      "description": "Anchor strings used for candidate generation",
+      "items": {
+        "type": "string"
+      }
+    },
+    "regex": {
+      "type": "string",
+      "description": "Optional regex used for extraction or validation"
+    },
+    "workflow": {
+      "type": "string",
+      "description": "Optional workflow triggered by this rule"
+    },
+    "remediation": {
+      "type": "string",
+      "description": "Suggested remediation guidance"
+    },
+    "manual_fix": {
+      "type": "string",
+      "description": "Manual operator fix instructions when automation is insufficient"
+    },
+    "learn_more_url": {
+      "type": "string",
+      "description": "Optional URL for more detail"
+    }
+  },
+  "additionalProperties": false
+}
