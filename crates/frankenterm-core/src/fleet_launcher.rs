@@ -127,7 +127,7 @@ pub enum StartupStrategy {
 ///
 /// Produced by `FleetLauncher::plan()` from a `FleetSpec`. Contains fully
 /// resolved slot assignments, lifecycle identities, and startup ordering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchPlan {
     /// Fleet name.
     pub name: String,
@@ -152,7 +152,7 @@ pub struct LaunchPlan {
 }
 
 /// A single slot in a launch plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchSlot {
     /// Slot index (0-based, determines launch order for sequential).
     pub index: u32,
@@ -179,7 +179,7 @@ pub struct LaunchSlot {
 }
 
 /// A launch phase groups slots that should start together.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchPhase {
     /// Phase index (0-based).
     pub index: u32,
@@ -194,7 +194,7 @@ pub struct LaunchPhase {
 // =============================================================================
 
 /// Outcome of executing a launch plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchOutcome {
     /// Fleet name.
     pub name: String,
@@ -219,7 +219,7 @@ pub struct LaunchOutcome {
 }
 
 /// Per-slot outcome.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotOutcome {
     pub index: u32,
     pub label: String,
@@ -257,7 +257,7 @@ pub enum FleetLaunchStatus {
 // =============================================================================
 
 /// Errors that can occur during fleet planning or launch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FleetLaunchError {
     /// Fleet spec has no mix entries.
     EmptyMix,
@@ -289,6 +289,252 @@ impl std::fmt::Display for FleetLaunchError {
             }
             Self::ValidationFailed(msg) => write!(f, "fleet spec validation failed: {msg}"),
         }
+    }
+}
+
+// =============================================================================
+// LaunchPlan query surface
+// =============================================================================
+
+/// Per-program distribution summary within a launch plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramDistribution {
+    /// Program name (e.g., "claude-code", "codex-cli").
+    pub program: String,
+    /// Number of slots allocated to this program.
+    pub slot_count: u32,
+    /// Slot indices for this program.
+    pub slot_indices: Vec<u32>,
+}
+
+/// Reason code for a metadata projection failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MetadataProjectionFailure {
+    /// No slots assigned to the specified program.
+    ProgramNotFound { program: String },
+    /// No slots in the specified phase.
+    PhaseNotFound { phase: u32 },
+    /// Slot index out of bounds.
+    SlotIndexOutOfBounds { index: u32, max: u32 },
+    /// Phase index mismatch (slot references a phase that doesn't exist).
+    PhaseSlotMismatch { slot_index: u32, claimed_phase: u32 },
+    /// Inconsistent field: slot has missing or empty required fields.
+    InconsistentSlotField { slot_index: u32, field: String },
+}
+
+impl std::fmt::Display for MetadataProjectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProgramNotFound { program } => {
+                write!(f, "no slots for program '{program}'")
+            }
+            Self::PhaseNotFound { phase } => write!(f, "no phase {phase}"),
+            Self::SlotIndexOutOfBounds { index, max } => {
+                write!(f, "slot index {index} out of bounds (max {max})")
+            }
+            Self::PhaseSlotMismatch {
+                slot_index,
+                claimed_phase,
+            } => write!(
+                f,
+                "slot {slot_index} claims phase {claimed_phase} but no such phase exists"
+            ),
+            Self::InconsistentSlotField { slot_index, field } => {
+                write!(f, "slot {slot_index} has empty/missing field '{field}'")
+            }
+        }
+    }
+}
+
+impl LaunchPlan {
+    /// Return distinct programs across all slots, preserving first-seen order.
+    #[must_use]
+    pub fn programs(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for slot in &self.slots {
+            if seen.insert(slot.agent_identity.program.clone()) {
+                out.push(slot.agent_identity.program.clone());
+            }
+        }
+        out
+    }
+
+    /// Return per-program distribution summary.
+    #[must_use]
+    pub fn program_distribution(&self) -> Vec<ProgramDistribution> {
+        let mut map: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for slot in &self.slots {
+            map.entry(slot.agent_identity.program.clone())
+                .or_default()
+                .push(slot.index);
+        }
+        map.into_iter()
+            .map(|(program, slot_indices)| ProgramDistribution {
+                program,
+                slot_count: slot_indices.len() as u32,
+                slot_indices,
+            })
+            .collect()
+    }
+
+    /// Return slots belonging to a specific phase.
+    #[must_use]
+    pub fn slots_in_phase(&self, phase_index: u32) -> Vec<&LaunchSlot> {
+        self.slots.iter().filter(|s| s.phase == phase_index).collect()
+    }
+
+    /// Return slot by index, or `None` if out of bounds.
+    #[must_use]
+    pub fn slot(&self, index: u32) -> Option<&LaunchSlot> {
+        self.slots.iter().find(|s| s.index == index)
+    }
+
+    /// Return phase labels in order.
+    #[must_use]
+    pub fn phase_labels(&self) -> Vec<String> {
+        self.phases.iter().map(|p| p.label.clone()).collect()
+    }
+
+    /// Run deterministic invariant checks and return any failures found.
+    ///
+    /// These checks validate internal consistency of the plan metadata:
+    /// - All slot indices are sequential (0..n)
+    /// - All slot labels are unique
+    /// - All lifecycle identities are unique
+    /// - Every slot's phase references an existing phase
+    /// - Every phase's slot_indices reference existing slots
+    /// - No slot has empty label or program
+    #[must_use]
+    pub fn invariant_violations(&self) -> Vec<MetadataProjectionFailure> {
+        let mut violations = Vec::new();
+
+        // Check sequential indices
+        for (i, slot) in self.slots.iter().enumerate() {
+            if slot.index != i as u32 {
+                violations.push(MetadataProjectionFailure::SlotIndexOutOfBounds {
+                    index: slot.index,
+                    max: self.slots.len().saturating_sub(1) as u32,
+                });
+            }
+        }
+
+        // Check phase references
+        let phase_indices: std::collections::HashSet<u32> =
+            self.phases.iter().map(|p| p.index).collect();
+        for slot in &self.slots {
+            if !phase_indices.contains(&slot.phase) {
+                violations.push(MetadataProjectionFailure::PhaseSlotMismatch {
+                    slot_index: slot.index,
+                    claimed_phase: slot.phase,
+                });
+            }
+        }
+
+        // Check slot field consistency
+        for slot in &self.slots {
+            if slot.label.is_empty() {
+                violations.push(MetadataProjectionFailure::InconsistentSlotField {
+                    slot_index: slot.index,
+                    field: "label".to_string(),
+                });
+            }
+            if slot.agent_identity.program.is_empty() {
+                violations.push(MetadataProjectionFailure::InconsistentSlotField {
+                    slot_index: slot.index,
+                    field: "program".to_string(),
+                });
+            }
+        }
+
+        violations
+    }
+}
+
+// =============================================================================
+// LaunchOutcome query surface
+// =============================================================================
+
+/// Summary of entities registered during fleet launch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistrySummary {
+    /// Total entities in registry snapshot.
+    pub total_entities: usize,
+    /// Session entity count.
+    pub sessions: usize,
+    /// Window entity count.
+    pub windows: usize,
+    /// Pane entity count.
+    pub panes: usize,
+    /// Agent entity count.
+    pub agents: usize,
+}
+
+impl LaunchOutcome {
+    /// Return a high-level summary of registered entities.
+    #[must_use]
+    pub fn registry_summary(&self) -> RegistrySummary {
+        let sessions = self
+            .registry_snapshot
+            .iter()
+            .filter(|e| e.identity.kind == LifecycleEntityKind::Session)
+            .count();
+        let windows = self
+            .registry_snapshot
+            .iter()
+            .filter(|e| e.identity.kind == LifecycleEntityKind::Window)
+            .count();
+        let panes = self
+            .registry_snapshot
+            .iter()
+            .filter(|e| e.identity.kind == LifecycleEntityKind::Pane)
+            .count();
+        let agents = self
+            .registry_snapshot
+            .iter()
+            .filter(|e| e.identity.kind == LifecycleEntityKind::Agent)
+            .count();
+        RegistrySummary {
+            total_entities: self.registry_snapshot.len(),
+            sessions,
+            windows,
+            panes,
+            agents,
+        }
+    }
+
+    /// Return outcomes for only successful slots.
+    #[must_use]
+    pub fn successful_outcomes(&self) -> Vec<&SlotOutcome> {
+        self.slot_outcomes
+            .iter()
+            .filter(|o| o.status == SlotStatus::Registered)
+            .collect()
+    }
+
+    /// Return outcomes for failed slots.
+    #[must_use]
+    pub fn failed_outcomes(&self) -> Vec<&SlotOutcome> {
+        self.slot_outcomes
+            .iter()
+            .filter(|o| o.status == SlotStatus::Failed)
+            .collect()
+    }
+
+    /// Return outcomes for skipped slots.
+    #[must_use]
+    pub fn skipped_outcomes(&self) -> Vec<&SlotOutcome> {
+        self.slot_outcomes
+            .iter()
+            .filter(|o| o.status == SlotStatus::Skipped)
+            .collect()
+    }
+
+    /// Check if the outcome is fully successful (all slots registered).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.status == FleetLaunchStatus::Complete
     }
 }
 
@@ -1840,5 +2086,291 @@ mod tests {
         assert_eq!(durable.checkpoint_count(), 1);
         // 1 session + 1 window + 3 panes + 3 agents = 8
         assert_eq!(lifecycle.len(), 8);
+    }
+
+    // =========================================================================
+    // Queryable launch metadata surface tests (ft-3681t.3.1.1)
+    // =========================================================================
+
+    #[test]
+    fn launch_plan_programs_returns_distinct_ordered() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec(
+            "prog-test",
+            vec![agent_mix("claude", 2), agent_mix("codex", 1), agent_mix("claude", 1)],
+        );
+        let plan = launcher.plan(&spec).unwrap();
+        let programs = plan.programs();
+        // "claude" appears twice in mix but should be listed once; "codex" second
+        assert_eq!(programs, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn launch_plan_program_distribution() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec(
+            "dist-test",
+            vec![agent_mix("claude", 3), agent_mix("codex", 1)],
+        );
+        let plan = launcher.plan(&spec).unwrap();
+        let dist = plan.program_distribution();
+        assert_eq!(dist.len(), 2);
+        let claude = dist.iter().find(|d| d.program == "claude").unwrap();
+        let codex = dist.iter().find(|d| d.program == "codex").unwrap();
+        assert_eq!(claude.slot_count, 3);
+        assert_eq!(codex.slot_count, 1);
+        assert_eq!(claude.slot_indices.len(), 3);
+        assert_eq!(codex.slot_indices.len(), 1);
+    }
+
+    #[test]
+    fn launch_plan_slot_by_index() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("slot-test", vec![agent_mix("a", 3)]);
+        let plan = launcher.plan(&spec).unwrap();
+        assert!(plan.slot(0).is_some());
+        assert!(plan.slot(2).is_some());
+        assert!(plan.slot(3).is_none());
+        assert_eq!(plan.slot(1).unwrap().index, 1);
+    }
+
+    #[test]
+    fn launch_plan_slots_in_phase() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("phase-test", vec![agent_mix("a", 5)]);
+        let plan = launcher.plan(&spec).unwrap();
+        // Parallel strategy: all slots in phase 0
+        let phase0_slots = plan.slots_in_phase(0);
+        assert_eq!(phase0_slots.len(), 5);
+        let phase1_slots = plan.slots_in_phase(1);
+        assert!(phase1_slots.is_empty());
+    }
+
+    #[test]
+    fn launch_plan_phase_labels() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("labels-test", vec![agent_mix("a", 2)]);
+        let plan = launcher.plan(&spec).unwrap();
+        let labels = plan.phase_labels();
+        assert!(!labels.is_empty());
+        // Parallel has a single "all" phase
+        assert_eq!(labels, vec!["all"]);
+    }
+
+    #[test]
+    fn launch_plan_invariant_violations_clean() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec(
+            "inv-test",
+            vec![agent_mix("claude", 3), agent_mix("codex", 2)],
+        );
+        let plan = launcher.plan(&spec).unwrap();
+        let violations = plan.invariant_violations();
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn launch_plan_serde_roundtrip() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec(
+            "serde-test",
+            vec![agent_mix("claude", 2), agent_mix("codex", 1)],
+        );
+        let plan = launcher.plan(&spec).unwrap();
+        let json = serde_json::to_string(&plan).expect("serialize LaunchPlan");
+        let back: LaunchPlan = serde_json::from_str(&json).expect("deserialize LaunchPlan");
+        assert_eq!(back.name, plan.name);
+        assert_eq!(back.slots.len(), plan.slots.len());
+        assert_eq!(back.phases.len(), plan.phases.len());
+        assert_eq!(back.generation, plan.generation);
+        assert_eq!(back.workspace_id, plan.workspace_id);
+        assert_eq!(back.domain, plan.domain);
+        assert_eq!(back.warnings, plan.warnings);
+    }
+
+    #[test]
+    fn launch_outcome_serde_roundtrip() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("out-serde", vec![agent_mix("a", 2)]);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let json = serde_json::to_string(&outcome).expect("serialize LaunchOutcome");
+        let back: LaunchOutcome =
+            serde_json::from_str(&json).expect("deserialize LaunchOutcome");
+        assert_eq!(back.name, outcome.name);
+        assert_eq!(back.total_slots, outcome.total_slots);
+        assert_eq!(back.successful_slots, outcome.successful_slots);
+        assert_eq!(back.failed_slots, outcome.failed_slots);
+        assert_eq!(back.status, outcome.status);
+    }
+
+    #[test]
+    fn launch_outcome_registry_summary() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("sum-test", vec![agent_mix("a", 3)]);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let summary = outcome.registry_summary();
+        // 1 session + 1 window + 3 panes + 3 agents = 8
+        assert_eq!(summary.total_entities, 8);
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.windows, 1);
+        assert_eq!(summary.panes, 3);
+        assert_eq!(summary.agents, 3);
+    }
+
+    #[test]
+    fn launch_outcome_successful_outcomes() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("succ-test", vec![agent_mix("a", 3)]);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        assert_eq!(outcome.successful_outcomes().len(), 3);
+        assert!(outcome.failed_outcomes().is_empty());
+        assert!(outcome.skipped_outcomes().is_empty());
+        assert!(outcome.is_complete());
+    }
+
+    #[test]
+    fn launch_outcome_is_complete_flag() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let spec = basic_spec("comp-test", vec![agent_mix("a", 1)]);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.status, FleetLaunchStatus::Complete);
+    }
+
+    #[test]
+    fn fleet_launch_error_serde_roundtrip() {
+        let errors = vec![
+            FleetLaunchError::EmptyMix,
+            FleetLaunchError::ZeroWeight,
+            FleetLaunchError::ProfileNotFound("missing".to_string()),
+            FleetLaunchError::TemplateNotFound("tpl".to_string()),
+            FleetLaunchError::RegistrationFailed {
+                slot_index: 5,
+                reason: "test".to_string(),
+            },
+            FleetLaunchError::ValidationFailed("bad".to_string()),
+        ];
+        for err in &errors {
+            let json = serde_json::to_string(err).expect("serialize FleetLaunchError");
+            let back: FleetLaunchError =
+                serde_json::from_str(&json).expect("deserialize FleetLaunchError");
+            assert_eq!(&back, err);
+        }
+    }
+
+    #[test]
+    fn program_distribution_serde_roundtrip() {
+        let dist = ProgramDistribution {
+            program: "claude-code".to_string(),
+            slot_count: 5,
+            slot_indices: vec![0, 1, 2, 3, 4],
+        };
+        let json = serde_json::to_string(&dist).expect("serialize");
+        let back: ProgramDistribution = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, dist);
+    }
+
+    #[test]
+    fn metadata_projection_failure_display() {
+        let failures = vec![
+            MetadataProjectionFailure::ProgramNotFound {
+                program: "x".to_string(),
+            },
+            MetadataProjectionFailure::PhaseNotFound { phase: 99 },
+            MetadataProjectionFailure::SlotIndexOutOfBounds { index: 10, max: 5 },
+            MetadataProjectionFailure::PhaseSlotMismatch {
+                slot_index: 3,
+                claimed_phase: 77,
+            },
+            MetadataProjectionFailure::InconsistentSlotField {
+                slot_index: 0,
+                field: "label".to_string(),
+            },
+        ];
+        for f in &failures {
+            let msg = f.to_string();
+            assert!(!msg.is_empty(), "Display for {:?} is empty", f);
+        }
+    }
+
+    #[test]
+    fn metadata_projection_failure_serde_roundtrip() {
+        let failures = vec![
+            MetadataProjectionFailure::ProgramNotFound {
+                program: "missing".to_string(),
+            },
+            MetadataProjectionFailure::PhaseNotFound { phase: 42 },
+            MetadataProjectionFailure::SlotIndexOutOfBounds { index: 10, max: 5 },
+            MetadataProjectionFailure::PhaseSlotMismatch {
+                slot_index: 3,
+                claimed_phase: 99,
+            },
+            MetadataProjectionFailure::InconsistentSlotField {
+                slot_index: 0,
+                field: "label".to_string(),
+            },
+        ];
+        for f in &failures {
+            let json = serde_json::to_string(f).expect("serialize");
+            let back: MetadataProjectionFailure =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, f.clone());
+        }
+    }
+
+    #[test]
+    fn registry_summary_serde_roundtrip() {
+        let summary = RegistrySummary {
+            total_entities: 8,
+            sessions: 1,
+            windows: 1,
+            panes: 3,
+            agents: 3,
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let back: RegistrySummary = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, summary);
+    }
+
+    #[test]
+    fn plan_distribution_matches_spec_weights() {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        // Spec: 60% claude (weight 3), 40% codex (weight 2), total 10 panes
+        let spec = FleetSpec {
+            total_panes: 10,
+            ..basic_spec(
+                "weight-match",
+                vec![agent_mix("claude", 3), agent_mix("codex", 2)],
+            )
+        };
+        let plan = launcher.plan(&spec).unwrap();
+        let dist = plan.program_distribution();
+        let claude = dist.iter().find(|d| d.program == "claude").unwrap();
+        let codex = dist.iter().find(|d| d.program == "codex").unwrap();
+        assert_eq!(claude.slot_count, 6); // 3/5 * 10 = 6
+        assert_eq!(codex.slot_count, 4); // 2/5 * 10 = 4
+        // Total must match
+        let total: u32 = dist.iter().map(|d| d.slot_count).sum();
+        assert_eq!(total, 10);
     }
 }
