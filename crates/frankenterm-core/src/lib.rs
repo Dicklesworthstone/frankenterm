@@ -335,6 +335,7 @@ pub mod ring_buffer;
 pub mod robot_api_contracts;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
+pub mod robot_sdk_contracts;
 pub mod robot_idempotency;
 pub mod robot_types;
 pub mod rope;
