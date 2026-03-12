@@ -356,6 +356,7 @@ pub mod scope_tree;
 pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_eviction;
+pub mod scrollback_tiers;
 pub mod search;
 #[cfg(feature = "frankensearch")]
 pub mod search_bridge;
