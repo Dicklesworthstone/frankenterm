@@ -343,6 +343,30 @@ impl SchemaRegistry {
                     since: "0.1.0".into(),
                 },
                 EndpointMeta {
+                    id: "agents_configure".into(),
+                    title: "Configure Agents".into(),
+                    description:
+                        "Generate or update FrankenTerm integration config files for detected agents"
+                            .into(),
+                    robot_command: Some("robot agents configure".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-agents-configure.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
+                    id: "agents_configure_dry_run".into(),
+                    title: "Configure Agents Dry-Run".into(),
+                    description:
+                        "Preview FrankenTerm integration config generation for detected agents"
+                            .into(),
+                    robot_command: Some("robot agents configure --dry-run".into()),
+                    mcp_tool: None,
+                    schema_file: "wa-robot-agents-configure-dry-run.json".into(),
+                    stable: true,
+                    since: "0.1.0".into(),
+                },
+                EndpointMeta {
                     id: "workflow_run".into(),
                     title: "Run Workflow".into(),
                     description: "Execute a named workflow".into(),
@@ -1020,6 +1044,8 @@ mod tests {
             "wa-robot-agents-list.json",
             "wa-robot-agents-running.json",
             "wa-robot-agents-detect.json",
+            "wa-robot-agents-configure.json",
+            "wa-robot-agents-configure-dry-run.json",
             "wa-robot-workflow-run.json",
             "wa-robot-workflow-list.json",
             "wa-robot-workflow-status.json",

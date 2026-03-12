@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-agents-configure-dry-run.json",
+  "title": "WA Robot Agents Configure Dry-Run Response",
+  "description": "Schema for the data field when calling 'wa robot agents configure --dry-run'. Returns a per-agent plan without writing files.",
+  "type": "object",
+  "required": ["plan", "total", "would_create", "would_modify", "would_skip", "errors"],
+  "properties": {
+    "plan": {
+      "type": "array",
+      "description": "Per-agent dry-run plan items",
+      "items": {
+        "$ref": "#/$defs/plan_item"
+      }
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total agents included in the dry-run plan"
+    },
+    "would_create": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many config files would be created"
+    },
+    "would_modify": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many existing files would be appended to or have their FrankenTerm section replaced"
+    },
+    "would_skip": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many targets are already current and would be skipped"
+    },
+    "errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many per-agent dry-run planning steps failed"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "plan_item": {
+      "type": "object",
+      "required": [
+        "slug",
+        "display_name",
+        "config_kind",
+        "scope",
+        "filename",
+        "file_exists",
+        "section_exists",
+        "action"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Canonical agent/provider slug"
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Human-readable agent name"
+        },
+        "config_kind": {
+          "type": "string",
+          "description": "Generated config file kind (for example claude_md or agents_md)"
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["project", "global"],
+          "description": "Placement scope for the generated file"
+        },
+        "filename": {
+          "type": "string",
+          "description": "Target file path; project scope is workspace-relative, global scope is absolute"
+        },
+        "file_exists": {
+          "type": "boolean",
+          "description": "Whether the target file already exists"
+        },
+        "section_exists": {
+          "type": "boolean",
+          "description": "Whether the target file already contains a FrankenTerm-managed section"
+        },
+        "action": {
+          "type": "string",
+          "description": "Action that would be taken (create, append, replace, skip, or error)"
+        },
+        "content_preview": {
+          "type": ["string", "null"],
+          "description": "Preview of the FrankenTerm-managed content block"
+        },
+        "error": {
+          "type": ["string", "null"],
+          "description": "Error message when dry-run planning for this agent failed"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

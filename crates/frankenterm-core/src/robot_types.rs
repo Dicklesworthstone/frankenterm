@@ -1019,6 +1019,8 @@ pub struct AgentConfigureDryRunData {
     pub would_modify: usize,
     /// How many would be skipped.
     pub would_skip: usize,
+    /// How many agents could not be prepared for configuration.
+    pub errors: usize,
 }
 
 /// A single item in a configure dry-run plan.
@@ -1043,6 +1045,9 @@ pub struct AgentConfigurePlanItem {
     /// Preview of the content that would be written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_preview: Option<String>,
+    /// Error message when dry-run planning for this agent failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ============================================================================

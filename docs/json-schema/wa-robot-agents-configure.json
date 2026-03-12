@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-agents-configure.json",
+  "title": "WA Robot Agents Configure Response",
+  "description": "Schema for the data field when calling 'wa robot agents configure' without '--dry-run'. Returns per-agent config mutation results plus aggregate counters.",
+  "type": "object",
+  "required": ["results", "total", "created", "updated", "skipped", "errors"],
+  "properties": {
+    "results": {
+      "type": "array",
+      "description": "Per-agent config generation results",
+      "items": {
+        "$ref": "#/$defs/result_item"
+      }
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total agents processed in this configure run"
+    },
+    "created": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many config files were created from scratch"
+    },
+    "updated": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many existing files were appended to or had the FrankenTerm section replaced"
+    },
+    "skipped": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many files were already current and therefore skipped"
+    },
+    "errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many per-agent operations failed"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "result_item": {
+      "type": "object",
+      "required": ["slug", "display_name", "action", "filename", "backup_created"],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "description": "Canonical agent/provider slug"
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Human-readable agent name"
+        },
+        "action": {
+          "type": "string",
+          "description": "Action taken for this agent (for example create, append, replace, skip, or error)"
+        },
+        "filename": {
+          "type": "string",
+          "description": "Target file path; project scope is workspace-relative, global scope is absolute"
+        },
+        "backup_created": {
+          "type": "boolean",
+          "description": "Whether a backup file was created before mutating an existing file"
+        },
+        "error": {
+          "type": ["string", "null"],
+          "description": "Error message when the per-agent operation failed"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

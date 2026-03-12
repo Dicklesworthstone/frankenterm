@@ -182,6 +182,8 @@ SEE ALSO:
     ft robot send 3 "ls"              Send text via robot interface
     ft robot agents list              List detected installed agents
     ft robot agents running           List running pane agents
+    ft robot agents configure --dry-run
+                                      Preview FrankenTerm config generation for detected agents
     ft robot events --unhandled       Unhandled events as JSON
     ft robot -f json state            Force JSON output format
 
@@ -2817,6 +2819,40 @@ enum RobotAgentsCommands {
         #[arg(long)]
         refresh: bool,
     },
+
+    /// Generate or update agent-specific FrankenTerm integration config files
+    Configure {
+        /// Restrict generation to specific detected agent slugs (repeat or comma-separate)
+        #[arg(long = "agent", value_delimiter = ',', conflicts_with = "all")]
+        agents: Vec<String>,
+
+        /// Generate configs for all detected agents (default when --agent is omitted)
+        #[arg(long)]
+        all: bool,
+
+        /// Preview config actions without writing files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Where to place generated config files
+        #[arg(long, value_enum, default_value_t = RobotAgentConfigScope::Project)]
+        scope: RobotAgentConfigScope,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RobotAgentConfigScope {
+    Project,
+    Global,
+}
+
+impl From<RobotAgentConfigScope> for frankenterm_core::agent_config_templates::ConfigScope {
+    fn from(value: RobotAgentConfigScope) -> Self {
+        match value {
+            RobotAgentConfigScope::Project => Self::Project,
+            RobotAgentConfigScope::Global => Self::Global,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -5956,6 +5992,326 @@ fn load_installed_agent_inventory(
     Ok(sorted_detected_installed_agents(entries))
 }
 
+#[derive(Debug, Clone)]
+struct PreparedAgentConfig {
+    template: frankenterm_core::agent_config_templates::AgentConfigTemplate,
+    action: frankenterm_core::agent_config_templates::ConfigAction,
+    target_path: PathBuf,
+    filename: String,
+    existing_content: Option<String>,
+    display_name: String,
+    slug: String,
+}
+
+fn robot_agent_config_scope_label(scope: RobotAgentConfigScope) -> &'static str {
+    match scope {
+        RobotAgentConfigScope::Project => "project",
+        RobotAgentConfigScope::Global => "global",
+    }
+}
+
+fn agent_config_kind_label(
+    kind: frankenterm_core::agent_config_templates::AgentConfigKind,
+) -> &'static str {
+    match kind {
+        frankenterm_core::agent_config_templates::AgentConfigKind::ClaudeMd => "claude_md",
+        frankenterm_core::agent_config_templates::AgentConfigKind::AgentsMd => "agents_md",
+        frankenterm_core::agent_config_templates::AgentConfigKind::CursorRules => "cursor_rules",
+        frankenterm_core::agent_config_templates::AgentConfigKind::ConventionsMd => {
+            "conventions_md"
+        }
+        frankenterm_core::agent_config_templates::AgentConfigKind::CopilotInstructions => {
+            "copilot_instructions"
+        }
+    }
+}
+
+fn agent_config_action_label(
+    action: frankenterm_core::agent_config_templates::ConfigAction,
+) -> &'static str {
+    match action {
+        frankenterm_core::agent_config_templates::ConfigAction::Create => "create",
+        frankenterm_core::agent_config_templates::ConfigAction::Append => "append",
+        frankenterm_core::agent_config_templates::ConfigAction::Replace => "replace",
+        frankenterm_core::agent_config_templates::ConfigAction::Skip => "skip",
+    }
+}
+
+fn resolve_requested_agent_slugs(
+    installed_agents: &[frankenterm_core::agent_correlator::InstalledAgentInventoryEntry],
+    requested_agents: &[String],
+) -> std::result::Result<Vec<String>, String> {
+    if requested_agents.is_empty() {
+        return Ok(installed_agents
+            .iter()
+            .map(|entry| entry.slug.clone())
+            .collect());
+    }
+
+    let available: HashSet<&str> = installed_agents
+        .iter()
+        .map(|entry| entry.slug.as_str())
+        .collect();
+    let mut resolved = Vec::new();
+    let mut seen = HashSet::new();
+
+    for requested in requested_agents {
+        let slug = frankenterm_core::agent_provider::AgentProvider::from_slug(requested.trim())
+            .canonical_slug()
+            .to_string();
+        if !available.contains(slug.as_str()) {
+            let mut available_slugs: Vec<&str> = available.iter().copied().collect();
+            available_slugs.sort_unstable();
+            return Err(format!(
+                "Requested agent '{requested}' is not currently detected. Available detected agents: {}",
+                available_slugs.join(", ")
+            ));
+        }
+        if seen.insert(slug.clone()) {
+            resolved.push(slug);
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_agent_config_root(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+) -> Option<PathBuf> {
+    entry.root_paths.first().map(PathBuf::from).or_else(|| {
+        entry
+            .config_path
+            .as_ref()
+            .map(PathBuf::from)
+            .and_then(|path| {
+                if path.is_dir() {
+                    Some(path)
+                } else {
+                    path.parent().map(Path::to_path_buf)
+                }
+            })
+    })
+}
+
+fn render_agent_config_filename(
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+    target_path: &Path,
+) -> String {
+    match scope {
+        RobotAgentConfigScope::Project => target_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(target_path)
+            .display()
+            .to_string(),
+        RobotAgentConfigScope::Global => target_path.display().to_string(),
+    }
+}
+
+fn resolve_agent_config_target_path(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+    template: &frankenterm_core::agent_config_templates::AgentConfigTemplate,
+) -> std::result::Result<PathBuf, String> {
+    match scope {
+        RobotAgentConfigScope::Project => Ok(workspace_root.join(&template.filename)),
+        RobotAgentConfigScope::Global => resolve_agent_config_root(entry)
+            .map(|root| root.join(&template.filename))
+            .ok_or_else(|| {
+                format!(
+                    "No global config root was detected for agent '{}' (slug {}).",
+                    frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug)
+                        .display_name(),
+                    entry.slug
+                )
+            }),
+    }
+}
+
+fn prepare_agent_config(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+) -> std::result::Result<PreparedAgentConfig, String> {
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    let template = frankenterm_core::agent_config_templates::generate_template(&provider);
+    let target_path = resolve_agent_config_target_path(entry, scope, workspace_root, &template)?;
+    let existing_content = if target_path.exists() {
+        Some(
+            fs::read_to_string(&target_path)
+                .map_err(|err| format!("Failed to read '{}': {err}", target_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let file_exists = existing_content.is_some();
+    let section_exists = existing_content.as_deref().is_some_and(|content| {
+        content.contains(frankenterm_core::agent_config_templates::SECTION_START_MARKER)
+    });
+    let action = if !file_exists {
+        frankenterm_core::agent_config_templates::ConfigAction::Create
+    } else if section_exists {
+        if frankenterm_core::agent_config_templates::section_is_current(
+            existing_content.as_deref().unwrap_or(""),
+            &template.content,
+        ) {
+            frankenterm_core::agent_config_templates::ConfigAction::Skip
+        } else {
+            frankenterm_core::agent_config_templates::ConfigAction::Replace
+        }
+    } else {
+        frankenterm_core::agent_config_templates::ConfigAction::Append
+    };
+
+    Ok(PreparedAgentConfig {
+        template,
+        action,
+        filename: render_agent_config_filename(scope, workspace_root, &target_path),
+        target_path,
+        existing_content,
+        display_name: provider.display_name().to_string(),
+        slug: entry.slug.clone(),
+    })
+}
+
+fn build_agent_configure_plan_item(
+    prepared: &PreparedAgentConfig,
+    scope: RobotAgentConfigScope,
+) -> frankenterm_core::robot_types::AgentConfigurePlanItem {
+    frankenterm_core::robot_types::AgentConfigurePlanItem {
+        slug: prepared.slug.clone(),
+        display_name: prepared.display_name.clone(),
+        config_kind: agent_config_kind_label(prepared.template.kind).to_string(),
+        scope: robot_agent_config_scope_label(scope).to_string(),
+        filename: prepared.filename.clone(),
+        file_exists: prepared.existing_content.is_some(),
+        section_exists: prepared.existing_content.as_deref().is_some_and(|content| {
+            content.contains(frankenterm_core::agent_config_templates::SECTION_START_MARKER)
+        }),
+        action: agent_config_action_label(prepared.action).to_string(),
+        content_preview: Some(prepared.template.content.clone()),
+        error: None,
+    }
+}
+
+fn fallback_agent_config_filename(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+) -> String {
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    let template = frankenterm_core::agent_config_templates::generate_template(&provider);
+    match resolve_agent_config_target_path(entry, scope, workspace_root, &template) {
+        Ok(path) => render_agent_config_filename(scope, workspace_root, &path),
+        Err(_) => match scope {
+            RobotAgentConfigScope::Project => template.filename.clone(),
+            RobotAgentConfigScope::Global => template.filename.clone(),
+        },
+    }
+}
+
+fn build_agent_configure_error_plan_item(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+    error: String,
+) -> frankenterm_core::robot_types::AgentConfigurePlanItem {
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    let template = frankenterm_core::agent_config_templates::generate_template(&provider);
+    frankenterm_core::robot_types::AgentConfigurePlanItem {
+        slug: entry.slug.clone(),
+        display_name: provider.display_name().to_string(),
+        config_kind: agent_config_kind_label(template.kind).to_string(),
+        scope: robot_agent_config_scope_label(scope).to_string(),
+        filename: fallback_agent_config_filename(entry, scope, workspace_root),
+        file_exists: false,
+        section_exists: false,
+        action: "error".to_string(),
+        content_preview: None,
+        error: Some(error),
+    }
+}
+
+fn build_agent_configure_error_result_item(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+    error: String,
+) -> frankenterm_core::robot_types::AgentConfigureResultItem {
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    frankenterm_core::robot_types::AgentConfigureResultItem {
+        slug: entry.slug.clone(),
+        display_name: provider.display_name().to_string(),
+        action: "error".to_string(),
+        filename: fallback_agent_config_filename(entry, scope, workspace_root),
+        backup_created: false,
+        error: Some(error),
+    }
+}
+
+fn agent_config_backup_path(path: &Path) -> PathBuf {
+    let stamp = now_ms();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!("{file_name}.{stamp}.bak"))
+}
+
+fn apply_prepared_agent_config(
+    prepared: &PreparedAgentConfig,
+) -> std::result::Result<frankenterm_core::robot_types::AgentConfigureResultItem, String> {
+    if prepared.action == frankenterm_core::agent_config_templates::ConfigAction::Skip {
+        return Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
+            slug: prepared.slug.clone(),
+            display_name: prepared.display_name.clone(),
+            action: agent_config_action_label(prepared.action).to_string(),
+            filename: prepared.filename.clone(),
+            backup_created: false,
+            error: None,
+        });
+    }
+
+    if let Some(parent) = prepared.target_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create '{}': {err}", parent.display()))?;
+    }
+
+    let mut backup_created = false;
+    if prepared.target_path.exists() {
+        let backup_path = agent_config_backup_path(&prepared.target_path);
+        fs::copy(&prepared.target_path, &backup_path).map_err(|err| {
+            format!(
+                "Failed to create backup '{}' from '{}': {err}",
+                backup_path.display(),
+                prepared.target_path.display()
+            )
+        })?;
+        backup_created = true;
+    }
+
+    let merged = frankenterm_core::agent_config_templates::merge_into_existing(
+        prepared.existing_content.as_deref().unwrap_or(""),
+        &prepared.template.content,
+    );
+    fs::write(&prepared.target_path, merged).map_err(|err| {
+        format!(
+            "Failed to write '{}': {err}",
+            prepared.target_path.display()
+        )
+    })?;
+
+    Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
+        slug: prepared.slug.clone(),
+        display_name: prepared.display_name.clone(),
+        action: agent_config_action_label(prepared.action).to_string(),
+        filename: prepared.filename.clone(),
+        backup_created,
+        error: None,
+    })
+}
+
 fn infer_running_agents_from_panes(
     panes: &[frankenterm_core::wezterm::PaneInfo],
 ) -> BTreeMap<u64, frankenterm_core::agent_correlator::RunningAgentInventoryEntry> {
@@ -8149,6 +8505,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Run installed-agent detection (use --refresh for a re-probe)",
             },
             RobotCommandInfo {
+                name: "agents configure",
+                description: "Generate or preview FrankenTerm agent config files",
+            },
+            RobotCommandInfo {
                 name: "workflow run",
                 description: "Run a workflow by name on a pane",
             },
@@ -8379,6 +8739,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 args: "[--refresh]",
                 summary: "Run agent installation probes (use --refresh to force a re-probe)",
                 examples: vec!["ft robot agents detect", "ft robot agents detect --refresh"],
+            },
+            QuickStartCommand {
+                name: "agents configure",
+                args: "[--agent <slug>|--all] [--scope project|global] [--dry-run]",
+                summary: "Generate or preview FrankenTerm integration config files for detected agents",
+                examples: vec![
+                    "ft robot agents configure --dry-run",
+                    "ft robot agents configure --agent codex --scope global",
+                ],
             },
             QuickStartCommand {
                 name: "workflow run",
@@ -17966,6 +18335,35 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             );
                                         print_robot_response(&response, format, stats)?;
                                     }
+                                    RobotAgentsCommands::Configure { dry_run, .. } => {
+                                        if dry_run {
+                                            let response = RobotResponse::<
+                                                frankenterm_core::robot_types::AgentConfigureDryRunData,
+                                            >::error_with_code(
+                                                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                                                "Agent detection feature is not available in this build",
+                                                Some(
+                                                    "Rebuild ft with filesystem agent detection enabled."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                        } else {
+                                            let response = RobotResponse::<
+                                                frankenterm_core::robot_types::AgentConfigureData,
+                                            >::error_with_code(
+                                                ROBOT_ERR_FEATURE_NOT_AVAILABLE,
+                                                "Agent detection feature is not available in this build",
+                                                Some(
+                                                    "Rebuild ft with filesystem agent detection enabled."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                        }
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -18139,6 +18537,276 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     );
                                     let response = RobotResponse::success(data, elapsed);
                                     print_robot_response(&response, format, stats)?;
+                                }
+                                RobotAgentsCommands::Configure {
+                                    agents,
+                                    dry_run,
+                                    scope,
+                                    ..
+                                } => {
+                                    let installed_agents = match load_installed_agent_inventory(
+                                        false,
+                                    ) {
+                                        Ok(installed) => installed,
+                                        Err(err) => {
+                                            if dry_run {
+                                                let response = RobotResponse::<
+                                                    frankenterm_core::robot_types::AgentConfigureDryRunData,
+                                                >::error_with_code(
+                                                    "robot.agent_detection_error",
+                                                    format!(
+                                                        "Failed to load installed agent inventory: {err}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                            } else {
+                                                let response = RobotResponse::<
+                                                    frankenterm_core::robot_types::AgentConfigureData,
+                                                >::error_with_code(
+                                                    "robot.agent_detection_error",
+                                                    format!(
+                                                        "Failed to load installed agent inventory: {err}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                            }
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let selected_slugs = match resolve_requested_agent_slugs(
+                                        &installed_agents,
+                                        &agents,
+                                    ) {
+                                        Ok(slugs) => slugs,
+                                        Err(err) => {
+                                            if dry_run {
+                                                let response = RobotResponse::<
+                                                        frankenterm_core::robot_types::AgentConfigureDryRunData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_INVALID_ARGS,
+                                                        err,
+                                                        Some(
+                                                            "Use `ft robot agents list` to inspect detected agent slugs."
+                                                                .to_string(),
+                                                        ),
+                                                        elapsed_ms(start),
+                                                    );
+                                                print_robot_response(&response, format, stats)?;
+                                            } else {
+                                                let response = RobotResponse::<
+                                                        frankenterm_core::robot_types::AgentConfigureData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_INVALID_ARGS,
+                                                        err,
+                                                        Some(
+                                                            "Use `ft robot agents list` to inspect detected agent slugs."
+                                                                .to_string(),
+                                                        ),
+                                                        elapsed_ms(start),
+                                                    );
+                                                print_robot_response(&response, format, stats)?;
+                                            }
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    let selected_entries: Vec<_> = selected_slugs
+                                        .iter()
+                                        .filter_map(|slug| {
+                                            installed_agents
+                                                .iter()
+                                                .find(|entry| entry.slug == *slug)
+                                        })
+                                        .collect();
+
+                                    if dry_run {
+                                        let mut plan = Vec::new();
+                                        let mut would_create = 0_usize;
+                                        let mut would_modify = 0_usize;
+                                        let mut would_skip = 0_usize;
+                                        let mut errors = 0_usize;
+
+                                        for entry in &selected_entries {
+                                            match prepare_agent_config(
+                                                entry,
+                                                scope,
+                                                &workspace_root,
+                                            ) {
+                                                Ok(prepared) => {
+                                                    match prepared.action {
+                                                        frankenterm_core::agent_config_templates::ConfigAction::Create => {
+                                                            would_create += 1;
+                                                        }
+                                                        frankenterm_core::agent_config_templates::ConfigAction::Append
+                                                        | frankenterm_core::agent_config_templates::ConfigAction::Replace => {
+                                                            would_modify += 1;
+                                                        }
+                                                        frankenterm_core::agent_config_templates::ConfigAction::Skip => {
+                                                            would_skip += 1;
+                                                        }
+                                                    }
+                                                    tracing::info!(
+                                                        command = "robot.agents.configure",
+                                                        dry_run = true,
+                                                        agent_slug = %prepared.slug,
+                                                        scope = %robot_agent_config_scope_label(scope),
+                                                        action = %agent_config_action_label(prepared.action),
+                                                        file_path = %prepared.target_path.display(),
+                                                        "planned agent config action"
+                                                    );
+                                                    plan.push(build_agent_configure_plan_item(
+                                                        &prepared, scope,
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    errors += 1;
+                                                    tracing::warn!(
+                                                        command = "robot.agents.configure",
+                                                        dry_run = true,
+                                                        agent_slug = %entry.slug,
+                                                        scope = %robot_agent_config_scope_label(scope),
+                                                        error = %err,
+                                                        "agent config dry-run prepare failed"
+                                                    );
+                                                    plan.push(
+                                                        build_agent_configure_error_plan_item(
+                                                            entry,
+                                                            scope,
+                                                            &workspace_root,
+                                                            err,
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        let data = frankenterm_core::robot_types::AgentConfigureDryRunData {
+                                            total: plan.len(),
+                                            would_create,
+                                            would_modify,
+                                            would_skip,
+                                            errors,
+                                            plan,
+                                        };
+                                        let elapsed = elapsed_ms(start);
+                                        tracing::info!(
+                                            command = "robot.agents.configure",
+                                            dry_run = true,
+                                            response_time_ms = elapsed,
+                                            agents_processed = data.total,
+                                            "robot agents configure dry-run completed"
+                                        );
+                                        let response = RobotResponse::success(data, elapsed);
+                                        print_robot_response(&response, format, stats)?;
+                                    } else {
+                                        let mut results = Vec::new();
+                                        let mut created = 0_usize;
+                                        let mut updated = 0_usize;
+                                        let mut skipped = 0_usize;
+                                        let mut errors = 0_usize;
+
+                                        for entry in &selected_entries {
+                                            match prepare_agent_config(
+                                                entry,
+                                                scope,
+                                                &workspace_root,
+                                            ) {
+                                                Ok(prepared) => {
+                                                    let planned_action = prepared.action;
+                                                    match apply_prepared_agent_config(&prepared) {
+                                                        Ok(result) => {
+                                                            match planned_action {
+                                                                frankenterm_core::agent_config_templates::ConfigAction::Create => {
+                                                                    created += 1;
+                                                                }
+                                                                frankenterm_core::agent_config_templates::ConfigAction::Append
+                                                                | frankenterm_core::agent_config_templates::ConfigAction::Replace => {
+                                                                    updated += 1;
+                                                                }
+                                                                frankenterm_core::agent_config_templates::ConfigAction::Skip => {
+                                                                    skipped += 1;
+                                                                }
+                                                            }
+                                                            tracing::info!(
+                                                                command = "robot.agents.configure",
+                                                                dry_run = false,
+                                                                agent_slug = %prepared.slug,
+                                                                scope = %robot_agent_config_scope_label(scope),
+                                                                action = %agent_config_action_label(planned_action),
+                                                                file_path = %prepared.target_path.display(),
+                                                                backup_created = result.backup_created,
+                                                                "applied agent config action"
+                                                            );
+                                                            results.push(result);
+                                                        }
+                                                        Err(err) => {
+                                                            errors += 1;
+                                                            tracing::warn!(
+                                                                command = "robot.agents.configure",
+                                                                agent_slug = %prepared.slug,
+                                                                scope = %robot_agent_config_scope_label(scope),
+                                                                file_path = %prepared.target_path.display(),
+                                                                error = %err,
+                                                                "agent config apply failed"
+                                                            );
+                                                            results.push(frankenterm_core::robot_types::AgentConfigureResultItem {
+                                                                slug: prepared.slug.clone(),
+                                                                display_name: prepared.display_name.clone(),
+                                                                action: "error".to_string(),
+                                                                filename: prepared.filename.clone(),
+                                                                backup_created: false,
+                                                                error: Some(err),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    errors += 1;
+                                                    tracing::warn!(
+                                                        command = "robot.agents.configure",
+                                                        agent_slug = %entry.slug,
+                                                        scope = %robot_agent_config_scope_label(scope),
+                                                        error = %err,
+                                                        "agent config prepare failed"
+                                                    );
+                                                    results.push(
+                                                        build_agent_configure_error_result_item(
+                                                            entry,
+                                                            scope,
+                                                            &workspace_root,
+                                                            err,
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        let data =
+                                            frankenterm_core::robot_types::AgentConfigureData {
+                                                total: results.len(),
+                                                created,
+                                                updated,
+                                                skipped,
+                                                errors,
+                                                results,
+                                            };
+                                        let elapsed = elapsed_ms(start);
+                                        tracing::info!(
+                                            command = "robot.agents.configure",
+                                            dry_run = false,
+                                            response_time_ms = elapsed,
+                                            agents_processed = data.total,
+                                            errors = data.errors,
+                                            "robot agents configure completed"
+                                        );
+                                        let response = RobotResponse::success(data, elapsed);
+                                        print_robot_response(&response, format, stats)?;
+                                    }
                                 }
                             }
                         }
@@ -44672,6 +45340,42 @@ log_level = "debug"
     }
 
     #[test]
+    fn test_robot_agents_configure_dry_run_parse() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "agents",
+            "configure",
+            "--agent",
+            "codex,gemini",
+            "--scope",
+            "global",
+            "--dry-run",
+        ])
+        .expect("robot agents configure should parse");
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Agents {
+                    command:
+                        RobotAgentsCommands::Configure {
+                            agents,
+                            all,
+                            dry_run,
+                            scope,
+                        },
+                }) => {
+                    assert_eq!(agents, vec!["codex".to_string(), "gemini".to_string()]);
+                    assert!(!all);
+                    assert!(dry_run);
+                    assert_eq!(scope, RobotAgentConfigScope::Global);
+                }
+                _ => panic!("expected RobotCommands::Agents::Configure"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
     fn test_feature_disabled_graceful() {
         if frankenterm_core::agent_correlator::filesystem_detection_available() {
             assert!(
@@ -44686,6 +45390,134 @@ log_level = "debug"
             err.contains("not enabled"),
             "expected feature-disabled error, got: {err}"
         );
+    }
+
+    #[test]
+    fn project_scope_agent_config_write_is_idempotent() {
+        let root = unique_temp_dir("agent_config_project");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![root.join(".codex").display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root).unwrap();
+        assert_eq!(
+            prepared.target_path,
+            workspace_root.join("AGENTS.md"),
+            "project scope should target workspace root"
+        );
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Create
+        );
+
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert_eq!(result.action, "create");
+        let created = std::fs::read_to_string(workspace_root.join("AGENTS.md")).unwrap();
+        assert!(created.contains("frankenterm:start"));
+
+        let prepared_again =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root).unwrap();
+        assert_eq!(
+            prepared_again.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Skip
+        );
+        let skipped = apply_prepared_agent_config(&prepared_again).unwrap();
+        assert_eq!(skipped.action, "skip");
+        assert!(!skipped.backup_created);
+    }
+
+    #[test]
+    fn global_scope_agent_config_targets_detected_root_and_creates_backup() {
+        let root = unique_temp_dir("agent_config_global");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+        let target = global_root.join(".cursorrules");
+        write_file(&target, "# existing cursor rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(prepared.target_path, target);
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Append
+        );
+
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert_eq!(result.action, "append");
+        assert!(result.backup_created);
+
+        let updated = std::fs::read_to_string(&target).unwrap();
+        assert!(updated.contains("existing cursor rules"));
+        assert!(updated.contains("FrankenTerm Integration"));
+
+        let backups: Vec<_> = std::fs::read_dir(&global_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".cursorrules.") && name.ends_with(".bak"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "expected exactly one backup file");
+    }
+
+    #[test]
+    fn global_scope_agent_config_error_items_use_template_filename_when_root_missing() {
+        let root = unique_temp_dir("agent_config_error");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let plan_item = build_agent_configure_error_plan_item(
+            &entry,
+            RobotAgentConfigScope::Global,
+            &workspace_root,
+            "missing global root".to_string(),
+        );
+        assert_eq!(plan_item.filename, "AGENTS.md");
+        assert_eq!(plan_item.action, "error");
+        assert_eq!(plan_item.error.as_deref(), Some("missing global root"));
+
+        let result_item = build_agent_configure_error_result_item(
+            &entry,
+            RobotAgentConfigScope::Global,
+            &workspace_root,
+            "missing global root".to_string(),
+        );
+        assert_eq!(result_item.filename, "AGENTS.md");
+        assert_eq!(result_item.action, "error");
+        assert_eq!(result_item.error.as_deref(), Some("missing global root"));
     }
 
     // ========================================================================
@@ -45488,6 +46320,33 @@ log_level = "debug"
                     command: RobotAgentsCommands::Running,
                 }) => {}
                 _ => panic!("expected RobotCommands::Agents::Running"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_agents_configure_parses_defaults() {
+        let cli = Cli::try_parse_from(["ft", "robot", "agents", "configure"])
+            .expect("robot agents configure should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Agents {
+                    command:
+                        RobotAgentsCommands::Configure {
+                            agents,
+                            all,
+                            dry_run,
+                            scope,
+                        },
+                }) => {
+                    assert!(agents.is_empty());
+                    assert!(!all);
+                    assert!(!dry_run);
+                    assert_eq!(scope, RobotAgentConfigScope::Project);
+                }
+                _ => panic!("expected RobotCommands::Agents::Configure"),
             },
             _ => panic!("expected Robot command"),
         }
