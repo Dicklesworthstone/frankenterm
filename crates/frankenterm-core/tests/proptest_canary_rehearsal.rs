@@ -40,7 +40,7 @@ fn arb_rehearsal_verdict() -> impl Strategy<Value = RehearsalVerdict> {
     ]
 }
 
-fn arb_drill_step(passed: bool) -> impl Strategy<Value = DrillStep> {
+fn _arb_drill_step(passed: bool) -> impl Strategy<Value = DrillStep> {
     ("[a-z-]{3,10}", ".{1,30}", 0..5000u64).prop_map(move |(id, desc, elapsed)| {
         if passed {
             DrillStep::pass(id, desc, elapsed)

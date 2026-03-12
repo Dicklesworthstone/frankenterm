@@ -31,7 +31,7 @@ fn arb_confidence_decision() -> impl Strategy<Value = ConfidenceDecision> {
     ]
 }
 
-fn arb_cell_result(passed: bool) -> impl Strategy<Value = CellResult> {
+fn _arb_cell_result(passed: bool) -> impl Strategy<Value = CellResult> {
     (
         "[a-z-]{3,15}",
         arb_journey_category(),

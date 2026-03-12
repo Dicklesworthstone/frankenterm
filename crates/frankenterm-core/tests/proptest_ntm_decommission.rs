@@ -43,7 +43,7 @@ fn arb_doc_category() -> impl Strategy<Value = DocCategory> {
     ]
 }
 
-fn arb_gate_check(passed: bool) -> impl Strategy<Value = GateCheck> {
+fn _arb_gate_check(passed: bool) -> impl Strategy<Value = GateCheck> {
     ("[A-Z]-[0-9]{1,4}", ".{1,30}").prop_map(move |(id, desc)| GateCheck {
         check_id: id,
         description: desc,
@@ -56,7 +56,7 @@ fn arb_gate_check(passed: bool) -> impl Strategy<Value = GateCheck> {
     })
 }
 
-fn arb_doc_entry(complete: bool) -> impl Strategy<Value = DocEntry> {
+fn _arb_doc_entry(complete: bool) -> impl Strategy<Value = DocEntry> {
     (
         "[A-Z]-[0-9]{1,4}",
         ".{1,30}",

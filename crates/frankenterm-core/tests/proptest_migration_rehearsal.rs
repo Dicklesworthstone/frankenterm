@@ -61,7 +61,7 @@ fn arb_scenario() -> impl Strategy<Value = RehearsalScenario> {
         })
 }
 
-fn arb_scenario_result(outcome: ScenarioOutcome) -> impl Strategy<Value = ScenarioResult> {
+fn _arb_scenario_result(outcome: ScenarioOutcome) -> impl Strategy<Value = ScenarioResult> {
     (
         "[a-z-]{3,15}",
         arb_scenario_category(),
