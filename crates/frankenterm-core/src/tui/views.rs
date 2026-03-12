@@ -1334,10 +1334,23 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
 /// Render the events feed view
 pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
 
     let filtered_indices = filtered_event_indices(state);
     let selected_filtered = state
@@ -1347,29 +1360,49 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .get(selected_filtered)
         .and_then(|idx| state.events.get(*idx));
 
-    // --- Left: event list ---
+    // --- Left/Top: event list ---
     let list_block = Block::default()
         .title(format!(
-            "Events ({}/{})",
+            "Events ({}/{}){}",
             filtered_indices.len(),
-            state.events.len()
+            state.events.len(),
+            if stacked_mode { " [compact]" } else { "" }
         ))
         .borders(Borders::ALL);
     let list_inner = list_block.inner(chunks[0]);
     list_block.render(chunks[0], buf);
 
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
     let list_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
         .split(list_inner);
 
-    // Filter summary header
-    let filter_summary = format!(
-        "unhandled_only={}  pane/rule='{}'",
-        state.events_unhandled_only, state.events_pane_filter,
-    );
+    // Filter summary header — responsive columns
+    let columns = if ultra_compact {
+        "sev  pane rule"
+    } else if stacked_mode {
+        "sev       pane  rule              status"
+    } else {
+        "sev       pane  rule                          status"
+    };
+    let filter_summary = if stacked_mode {
+        format!(
+            "u={}  q='{}'",
+            state.events_unhandled_only, state.events_pane_filter,
+        )
+    } else {
+        format!(
+            "unhandled_only={}  pane/rule='{}'",
+            state.events_unhandled_only, state.events_pane_filter,
+        )
+    };
     Paragraph::new(vec![
-        Line::from("sev       pane  rule                          status"),
+        Line::from(columns),
         Line::from(Span::styled(
             filter_summary,
             Style::default().fg(Color::Gray),
@@ -1386,51 +1419,64 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         Paragraph::new(Span::styled(msg, Style::default().fg(Color::Yellow)))
             .render(list_chunks[1], buf);
     } else {
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
         let mut lines: Vec<Line> = Vec::with_capacity(filtered_indices.len());
         for (pos, event_index) in filtered_indices.iter().enumerate() {
             let event = &state.events[*event_index];
             let severity_style = severity_color(&event.severity);
             let handled_marker = if event.handled { " " } else { "*" };
 
-            if pos == selected_filtered {
-                lines.push(Line::styled(
-                    format!(
-                        "[{:8}] {:>4}  {:28} {}",
-                        truncate_str(&event.severity, 8),
-                        event.pane_id,
-                        truncate_str(&event.rule_id, 28),
-                        handled_marker,
-                    ),
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ));
+            let raw_line = if ultra_compact {
+                format!(
+                    "[{:6}] {:>4} {}",
+                    truncate_str(&event.severity, 6),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 14),
+                )
+            } else if stacked_mode {
+                format!(
+                    "[{:8}] {:>4} {:20} {}",
+                    truncate_str(&event.severity, 8),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 20),
+                    handled_marker,
+                )
             } else {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("[{:8}]", truncate_str(&event.severity, 8)),
-                        severity_style,
-                    ),
-                    Span::raw(format!(
-                        " {:>4}  {:28} {}",
-                        event.pane_id,
-                        truncate_str(&event.rule_id, 28),
-                        handled_marker,
-                    )),
-                ]));
-            }
+                format!(
+                    "[{:8}] {:>4}  {:28} {}",
+                    truncate_str(&event.severity, 8),
+                    event.pane_id,
+                    truncate_str(&event.rule_id, 28),
+                    handled_marker,
+                )
+            };
+
+            let style = if pos == selected_filtered {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                severity_style
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
         }
         Paragraph::new(lines).render(list_chunks[1], buf);
     }
 
-    // --- Right: event detail panel ---
+    // --- Right/Bottom: event detail panel ---
     let detail_block = Block::default()
-        .title("Event Details")
+        .title(if stacked_mode {
+            "Selected Event"
+        } else {
+            "Event Details"
+        })
         .borders(Borders::ALL);
     let detail_inner = detail_block.inner(chunks[1]);
     detail_block.render(chunks[1], buf);
 
     if let Some(event) = selected_event {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
         let severity_style = severity_color(&event.severity);
         let handled_label = if event.handled {
             "handled"
@@ -1442,68 +1488,99 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         } else {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         };
-        let triage = event.triage_state.as_deref().unwrap_or("unset");
-        let labels = if event.labels.is_empty() {
-            "none".to_string()
-        } else {
-            event.labels.join(",")
-        };
-        let note = event.note.as_deref().unwrap_or("none");
 
-        let mut details = vec![
-            Line::from(vec![
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("#{} P{} {}", event.id, event.pane_id, event.timestamp),
+                detail_width,
+            )));
+            details.push(Line::from(vec![
+                Span::styled(
+                    truncate_str(&event.severity, 10),
+                    severity_style,
+                ),
+                Span::raw(" | "),
+                Span::styled(handled_label, handled_style),
+            ]));
+            details.push(Line::from(truncate_str(
+                &format!("Rule: {}", event.rule_id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Match: {}", event.message),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("u=unhandled j/k=nav", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            let triage = event.triage_state.as_deref().unwrap_or("unset");
+            let labels = if event.labels.is_empty() {
+                "none".to_string()
+            } else {
+                event.labels.join(",")
+            };
+            let note = event.note.as_deref().unwrap_or("none");
+
+            details.push(Line::from(vec![
                 Span::raw("ID: "),
                 Span::styled(
                     event.id.to_string(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            Line::from(format!("Pane: {}", event.pane_id)),
-            Line::from(vec![
+            ]));
+            details.push(Line::from(format!("Pane: {}", event.pane_id)));
+            details.push(Line::from(vec![
                 Span::raw("Severity: "),
                 Span::styled(event.severity.clone(), severity_style),
-            ]),
-            Line::from(vec![
+            ]));
+            details.push(Line::from(vec![
                 Span::raw("Status: "),
                 Span::styled(handled_label, handled_style),
-            ]),
-            Line::from(format!("Triage: {triage}")),
-            Line::from(format!("Labels: {}", truncate_str(&labels, 60))),
-            Line::from(format!("Note: {}", truncate_str(note, 60))),
-            Line::from(""),
-            Line::from(Span::styled(
+            ]));
+            details.push(Line::from(format!("Triage: {triage}")));
+            details.push(Line::from(format!(
+                "Labels: {}",
+                truncate_str(&labels, 60)
+            )));
+            details.push(Line::from(format!("Note: {}", truncate_str(note, 60))));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
                 "Rule:",
                 Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!("  {}", event.rule_id)),
-            Line::from(""),
-            Line::from(Span::styled(
+            )));
+            details.push(Line::from(format!("  {}", event.rule_id)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
                 "Match (redacted):",
                 Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!("  {}", truncate_str(&event.message, 60))),
-        ];
-
-        // Timestamp
-        details.push(Line::from(""));
-        details.push(Line::from(format!("Captured: {}", event.timestamp)));
-
-        // Suggested next actions
-        details.push(Line::from(""));
-        details.push(Line::from(Span::styled(
-            "Actions:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        if !event.handled {
+            )));
             details.push(Line::from(format!(
-                "  ft events --pane {} --unhandled",
+                "  {}",
+                truncate_str(&event.message, 60)
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(format!("Captured: {}", event.timestamp)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Actions:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if !event.handled {
+                details.push(Line::from(format!(
+                    "  ft events --pane {} --unhandled",
+                    event.pane_id
+                )));
+            }
+            details.push(Line::from(format!(
+                "  ft why --recent --pane {}",
                 event.pane_id
             )));
         }
-        details.push(Line::from(format!(
-            "  ft why --recent --pane {}",
-            event.pane_id
-        )));
 
         Paragraph::new(details).render(detail_inner, buf);
     } else {
@@ -1556,10 +1633,23 @@ fn history_result_style(result: &str) -> Style {
 
 /// Render the action-history view.
 pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
 
     let filtered_indices = filtered_history_indices(state);
     let selected_filtered = state
@@ -1569,28 +1659,48 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .get(selected_filtered)
         .and_then(|idx| state.history_entries.get(*idx));
 
-    // --- Left: grouped history list ---
+    // --- Left/Top: grouped history list ---
     let list_block = Block::default()
         .title(format!(
-            "History ({}/{})",
+            "History ({}/{}){}",
             filtered_indices.len(),
-            state.history_entries.len()
+            state.history_entries.len(),
+            if stacked_mode { " [compact]" } else { "" }
         ))
         .borders(Borders::ALL);
     let list_inner = list_block.inner(chunks[0]);
     list_block.render(chunks[0], buf);
 
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
     let list_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
         .split(list_inner);
 
-    let filter_summary = format!(
-        "undoable_only={}  q='{}'",
-        state.history_undoable_only, state.history_filter_query,
-    );
+    let columns = if ultra_compact {
+        "audit action         result"
+    } else if stacked_mode {
+        "audit  action           result  undo  actor"
+    } else {
+        "audit     action             result    undo  actor"
+    };
+    let filter_summary = if stacked_mode {
+        format!(
+            "u={}  q='{}'",
+            state.history_undoable_only, state.history_filter_query,
+        )
+    } else {
+        format!(
+            "undoable_only={}  q='{}'",
+            state.history_undoable_only, state.history_filter_query,
+        )
+    };
     Paragraph::new(vec![
-        Line::from("audit     action             result    undo  actor"),
+        Line::from(columns),
         Line::from(Span::styled(
             filter_summary,
             Style::default().fg(Color::Gray),
@@ -1632,51 +1742,65 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 "-"
             };
             let result_style = history_result_style(&entry.result);
-            let action = truncate_str(&entry.action_kind, 18);
-            let actor = truncate_str(&entry.actor_kind, 8);
-            let line_text = format!(
-                "#{:>6} {:18} {:8} {:>5} {}",
-                entry.audit_id, action, entry.result, undo_tag, actor
-            );
 
-            if pos == selected_filtered {
-                lines.push(Line::styled(
-                    line_text,
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else if entry.undoable {
-                lines.push(Line::styled(
-                    line_text,
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ));
+            let line_text = if ultra_compact {
+                format!(
+                    "#{:>5} {:12} {:8}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 12),
+                    entry.result,
+                )
+            } else if stacked_mode {
+                format!(
+                    "#{:>5} {:14} {:8} {:>4} {}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 14),
+                    entry.result,
+                    undo_tag,
+                    truncate_str(&entry.actor_kind, 6),
+                )
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw(format!(
-                        "#{:>6} {:18} ",
-                        entry.audit_id,
-                        truncate_str(&entry.action_kind, 18)
-                    )),
-                    Span::styled(format!("{:8}", entry.result), result_style),
-                    Span::raw(format!(" {:>5} {}", undo_tag, actor)),
-                ]));
-            }
+                format!(
+                    "#{:>6} {:18} {:8} {:>5} {}",
+                    entry.audit_id,
+                    truncate_str(&entry.action_kind, 18),
+                    entry.result,
+                    undo_tag,
+                    truncate_str(&entry.actor_kind, 8),
+                )
+            };
+
+            let style = if pos == selected_filtered {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.undoable {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                result_style
+            };
+            lines.push(Line::styled(line_text, style));
         }
 
         Paragraph::new(lines).render(list_chunks[1], buf);
     }
 
-    // --- Right: selected history detail ---
+    // --- Right/Bottom: selected history detail ---
     let detail_block = Block::default()
-        .title("History Details")
+        .title(if stacked_mode {
+            "Selected Entry"
+        } else {
+            "History Details"
+        })
         .borders(Borders::ALL);
     let detail_inner = detail_block.inner(chunks[1]);
     detail_block.render(chunks[1], buf);
 
     if let Some(entry) = selected_entry {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
         let undo_status = if entry.undoable {
             "undoable"
         } else if entry.undone {
@@ -1684,66 +1808,100 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         } else {
             "not-undoable"
         };
-        let group = history_group_title(&history_group_key(entry));
 
-        let mut details = vec![
-            Line::from(vec![
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            let group = history_group_title(&history_group_key(entry));
+            details.push(Line::from(truncate_str(
+                &format!("#{} {} {}", entry.audit_id, entry.timestamp, group),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!(
+                    "{} | {} | {}",
+                    entry.action_kind, entry.result, undo_status
+                ),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Actor: {}", entry.actor_kind),
+                detail_width,
+            )));
+            if !entry.summary.is_empty() {
+                details.push(Line::from(truncate_str(&entry.summary, detail_width)));
+            }
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("u=undoable j/k=nav", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            let group = history_group_title(&history_group_key(entry));
+            details.push(Line::from(vec![
                 Span::raw("Audit ID: "),
                 Span::styled(
                     format!("#{}", entry.audit_id),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            Line::from(format!("Group: {}", group)),
-            Line::from(format!("Action: {}", entry.action_kind)),
-            Line::from(format!("Result: {}", entry.result)),
-            Line::from(format!("Actor: {}", entry.actor_kind)),
-            Line::from(format!("Undo: {}", undo_status)),
-            Line::from(format!("Timestamp: {}", entry.timestamp)),
-        ];
+            ]));
+            details.push(Line::from(format!("Group: {}", group)));
+            details.push(Line::from(format!("Action: {}", entry.action_kind)));
+            details.push(Line::from(format!("Result: {}", entry.result)));
+            details.push(Line::from(format!("Actor: {}", entry.actor_kind)));
+            details.push(Line::from(format!("Undo: {}", undo_status)));
+            details.push(Line::from(format!("Timestamp: {}", entry.timestamp)));
 
-        if let Some(pane_id) = entry.pane_id {
-            details.push(Line::from(format!("Pane: {}", pane_id)));
-        }
-        if let Some(workflow_id) = &entry.workflow_id {
-            details.push(Line::from(format!("Workflow: {}", workflow_id)));
-        }
-        if let Some(step_name) = &entry.step_name {
-            details.push(Line::from(format!("Step: {}", step_name)));
-        }
-        if let Some(strategy) = &entry.undo_strategy {
-            details.push(Line::from(format!("Undo Strategy: {}", strategy)));
-        }
-        if let Some(hint) = &entry.undo_hint {
-            details.push(Line::from(format!("Undo Hint: {}", truncate_str(hint, 80))));
-        }
-        if !entry.summary.is_empty() {
-            details.push(Line::from(format!(
-                "Summary: {}",
-                truncate_str(&entry.summary, 80)
-            )));
-        }
-
-        details.push(Line::from(""));
-        details.push(Line::from(Span::styled(
-            "Quick Jumps:",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        if let Some(workflow_id) = &entry.workflow_id {
-            details.push(Line::from(format!("  ft history --workflow {workflow_id}")));
-            details.push(Line::from(format!("  ft workflow status {workflow_id}")));
-        }
-        if let Some(pane_id) = entry.pane_id {
-            details.push(Line::from(format!(
-                "  ft history --pane {pane_id} --limit 50"
-            )));
-            details.push(Line::from(format!(
-                "  ft events --pane-id {pane_id} --limit 20"
-            )));
-            if let Some(rule_id) = &entry.rule_id {
+            if let Some(pane_id) = entry.pane_id {
+                details.push(Line::from(format!("Pane: {}", pane_id)));
+            }
+            if let Some(workflow_id) = &entry.workflow_id {
+                details.push(Line::from(format!("Workflow: {}", workflow_id)));
+            }
+            if let Some(step_name) = &entry.step_name {
+                details.push(Line::from(format!("Step: {}", step_name)));
+            }
+            if let Some(strategy) = &entry.undo_strategy {
+                details.push(Line::from(format!("Undo Strategy: {}", strategy)));
+            }
+            if let Some(hint) = &entry.undo_hint {
                 details.push(Line::from(format!(
-                    "  ft events --pane-id {pane_id} --rule-id {rule_id}"
+                    "Undo Hint: {}",
+                    truncate_str(hint, 80)
                 )));
+            }
+            if !entry.summary.is_empty() {
+                details.push(Line::from(format!(
+                    "Summary: {}",
+                    truncate_str(&entry.summary, 80)
+                )));
+            }
+
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Quick Jumps:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if let Some(workflow_id) = &entry.workflow_id {
+                details.push(Line::from(format!(
+                    "  ft history --workflow {workflow_id}"
+                )));
+                details.push(Line::from(format!(
+                    "  ft workflow status {workflow_id}"
+                )));
+            }
+            if let Some(pane_id) = entry.pane_id {
+                details.push(Line::from(format!(
+                    "  ft history --pane {pane_id} --limit 50"
+                )));
+                details.push(Line::from(format!(
+                    "  ft events --pane-id {pane_id} --limit 20"
+                )));
+                if let Some(rule_id) = &entry.rule_id {
+                    details.push(Line::from(format!(
+                        "  ft events --pane-id {pane_id} --rule-id {rule_id}"
+                    )));
+                }
             }
         }
 
@@ -1858,35 +2016,48 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let selected_saved = state
             .saved_search_selected_index
             .min(state.saved_searches.len().saturating_sub(1));
-        let mut saved_lines = vec![Line::from(
-            "name           ena sched(ms) pane last_run      err query",
-        )];
+        let saved_header = if area.width < 96 {
+            "name        ena query"
+        } else {
+            "name           ena sched(ms) pane last_run      err query"
+        };
+        let mut saved_lines = vec![Line::from(saved_header)];
+        let search_compact_saved = area.width < 96;
         for (idx, saved) in state.saved_searches.iter().enumerate() {
             let enabled = if saved.enabled { "on" } else { "off" };
-            let schedule = saved
-                .schedule_interval_ms
-                .map_or_else(|| "-".to_string(), |v| v.to_string());
-            let pane = saved
-                .pane_id
-                .map_or_else(|| "-".to_string(), |id| id.to_string());
-            let last_run = saved
-                .last_run_at
-                .map_or_else(|| "-".to_string(), |ts| ts.to_string());
-            let err = if saved.last_error.is_some() {
-                "yes"
+            let line = if search_compact_saved {
+                format!(
+                    "{:11} {:3} {}",
+                    truncate_str(&saved.name, 11),
+                    enabled,
+                    truncate_str(&saved.query, 30),
+                )
             } else {
-                "no"
+                let schedule = saved
+                    .schedule_interval_ms
+                    .map_or_else(|| "-".to_string(), |v| v.to_string());
+                let pane = saved
+                    .pane_id
+                    .map_or_else(|| "-".to_string(), |id| id.to_string());
+                let last_run = saved
+                    .last_run_at
+                    .map_or_else(|| "-".to_string(), |ts| ts.to_string());
+                let err = if saved.last_error.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                };
+                format!(
+                    "{:14} {:3} {:9} {:4} {:12} {:3} {}",
+                    truncate_str(&saved.name, 14),
+                    enabled,
+                    truncate_str(&schedule, 9),
+                    truncate_str(&pane, 4),
+                    truncate_str(&last_run, 12),
+                    err,
+                    truncate_str(&saved.query, 32),
+                )
             };
-            let line = format!(
-                "{:14} {:3} {:9} {:4} {:12} {:3} {}",
-                truncate_str(&saved.name, 14),
-                enabled,
-                truncate_str(&schedule, 9),
-                truncate_str(&pane, 4),
-                truncate_str(&last_run, 12),
-                err,
-                truncate_str(&saved.query, 32),
-            );
             if idx == selected_saved {
                 saved_lines.push(Line::styled(
                     line,
@@ -1925,11 +2096,23 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    // Split results area into list + detail
-    let result_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[3]);
+    // Split results area into list + detail — responsive layout
+    let search_stacked = area.width < 96 || area.height < 18;
+    let search_detail_height = if area.height >= 22 { 8 } else { 6 };
+    let result_chunks = if search_stacked {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(chunks[3].height.saturating_sub(search_detail_height)),
+                Constraint::Length(search_detail_height),
+            ])
+            .split(chunks[3])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(chunks[3])
+    };
 
     let selected = state
         .search_selected_index
@@ -1982,38 +2165,58 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     // Detail panel for selected result
     let detail_block = Block::default()
-        .title("Match Context")
+        .title(if search_stacked {
+            "Selected Match"
+        } else {
+            "Match Context"
+        })
         .borders(Borders::ALL);
     let detail_inner = detail_block.inner(result_chunks[1]);
     detail_block.render(result_chunks[1], buf);
 
     if let Some(result) = state.search_results.get(selected) {
-        let details = vec![
-            Line::from(vec![
-                Span::styled("Pane: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(result.pane_id.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("Rank: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{:.4}", result.rank)),
-            ]),
-            Line::from(vec![
-                Span::styled("Captured: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(result.timestamp.to_string()),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Snippet (redacted):",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(result.snippet.clone()),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Saved search keys:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from("Ctrl+N next, Ctrl+P prev, Ctrl+R run, Ctrl+E toggle enable"),
-        ];
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let details = if search_stacked {
+            vec![
+                Line::from(truncate_str(
+                    &format!("P{} rank={:.2} {}", result.pane_id, result.rank, result.timestamp),
+                    detail_width,
+                )),
+                Line::from(truncate_str(&result.snippet, detail_width)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    truncate_str("Ctrl+N/P=saved, Ctrl+R=run", detail_width),
+                    Style::default().fg(Color::Gray),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled("Pane: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(result.pane_id.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Rank: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{:.4}", result.rank)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Captured: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(result.timestamp.to_string()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Snippet (redacted):",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(result.snippet.clone()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Saved search keys:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from("Ctrl+N next, Ctrl+P prev, Ctrl+R run, Ctrl+E toggle enable"),
+            ]
+        };
         Paragraph::new(details).render(detail_inner, buf);
     }
 }
@@ -2116,6 +2319,9 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    let triage_compact = area.width < 96;
+    let triage_ultra_compact = area.width < 68;
+    let row_width = usize::from(inner.width.saturating_sub(1)).max(1);
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in state.triage_items.iter().enumerate() {
         let severity_style = match item.severity.as_str() {
@@ -2124,32 +2330,37 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             "info" => Style::default().fg(Color::Blue),
             _ => Style::default().fg(Color::Gray),
         };
-        if i == state.triage_selected_index {
-            let row = format!(
+
+        let raw_line = if triage_ultra_compact {
+            format!(
+                "[{:5}] {}",
+                truncate_str(&item.severity, 5),
+                truncate_str(&item.title, 40),
+            )
+        } else if triage_compact {
+            format!(
+                "[{:7}] {} | {}",
+                truncate_str(&item.severity, 7),
+                truncate_str(&item.section, 6),
+                truncate_str(&item.title, 50),
+            )
+        } else {
+            format!(
                 "[{:7}] {} | {}",
                 truncate_str(&item.severity, 7),
                 truncate_str(&item.section, 8),
                 truncate_str(&item.title, 80),
-            );
-            lines.push(Line::styled(
-                row,
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            )
+        };
+
+        let style = if i == state.triage_selected_index {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
         } else {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{:7}]", truncate_str(&item.severity, 7)),
-                    severity_style,
-                ),
-                Span::raw(format!(
-                    " {} | {}",
-                    truncate_str(&item.section, 8),
-                    truncate_str(&item.title, 80),
-                )),
-            ]));
-        }
+            severity_style
+        };
+        lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
     }
 
     let list = Paragraph::new(lines);
@@ -2212,7 +2423,11 @@ pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 
     // Details + actions panel
     let detail_block = Block::default()
-        .title("Details / Actions (Enter or 1-9 to run, m to mute, e to expand)")
+        .title(if triage_compact {
+            "Actions (Enter=run, m=mute, e=expand)"
+        } else {
+            "Details / Actions (Enter or 1-9 to run, m to mute, e to expand)"
+        })
         .borders(Borders::ALL);
     let detail_inner = detail_block.inner(chunks[detail_chunk_idx]);
     detail_block.render(chunks[detail_chunk_idx], buf);
@@ -2266,55 +2481,92 @@ const fn timeline_zoom_label(zoom: u8) -> &'static str {
 
 /// Render the help view
 pub fn render_help_view(area: Rect, buf: &mut Buffer) {
-    let help_text = vec![
-        Line::from(Span::styled(
-            "FrankenTerm Operator TUI",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Global Keybindings:",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  q          Quit"),
-        Line::from("  ?          Show this help"),
-        Line::from("  r          Refresh current view"),
-        Line::from("  Tab        Next view"),
-        Line::from("  Shift+Tab  Previous view"),
-        Line::from("  1-8        Jump to view by number"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "List Navigation:",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  j / Down   Move selection down"),
-        Line::from("  k / Up     Move selection up"),
-        Line::from("  Enter      Run primary action (triage)"),
-        Line::from("  1-9        Run action by number (triage)"),
-        Line::from("  m          Mute selected event (triage)"),
-        Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
-        Line::from("  [Panes] u=unhandled-only, b=bookmarked-only, a=agent, d=domain"),
-        Line::from("  [Panes] p=cycle ruleset profile, Enter=apply selected profile"),
-        Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
-        Line::from("  [History] type text to filter, u=undoable-only"),
-        Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
-        Line::from("  [Search] Ctrl+F toggle fast-only mode"),
-        Line::from("  [Timeline] j/k select event, +/- widen or narrow window"),
-        Line::from("  [Triage] e=expand/collapse workflow progress"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Views:",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        Line::from("  1. Home    System overview and health"),
-        Line::from("  2. Panes   List observed panes"),
-        Line::from("  3. Events  Recent detection events"),
-        Line::from("  4. Triage  Prioritized issues + actions"),
-        Line::from("  5. History Audit action timeline"),
-        Line::from("  6. Search  Full-text search"),
-        Line::from("  7. Help    This screen"),
-        Line::from("  8. Timeline Cross-pane event timeline"),
-    ];
+    let compact = area.width < 96;
+    let help_text = if compact {
+        vec![
+            Line::from(Span::styled(
+                "FrankenTerm TUI",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Keys:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  q=quit  ?=help  r=refresh"),
+            Line::from("  Tab/S-Tab=views  1-8=jump"),
+            Line::from("  j/k=nav  Enter=action"),
+            Line::from("  m=mute  e=expand"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Per-view:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  Panes: u/b/a/d filter, p=profile"),
+            Line::from("  Events: digits=filter, u=unhandled"),
+            Line::from("  History: text=filter, u=undoable"),
+            Line::from("  Search: C-N/P=saved, C-R=run"),
+            Line::from("  Timeline: +/-=zoom"),
+            Line::from("  Triage: 1-9=action, e=expand"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Views:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  1.Home 2.Panes 3.Events 4.Triage"),
+            Line::from("  5.History 6.Search 7.Help 8.Timeline"),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "FrankenTerm Operator TUI",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Global Keybindings:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  q          Quit"),
+            Line::from("  ?          Show this help"),
+            Line::from("  r          Refresh current view"),
+            Line::from("  Tab        Next view"),
+            Line::from("  Shift+Tab  Previous view"),
+            Line::from("  1-8        Jump to view by number"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "List Navigation:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  j / Down   Move selection down"),
+            Line::from("  k / Up     Move selection up"),
+            Line::from("  Enter      Run primary action (triage)"),
+            Line::from("  1-9        Run action by number (triage)"),
+            Line::from("  m          Mute selected event (triage)"),
+            Line::from("  [Panes] type text to filter, Backspace to edit, Esc to clear"),
+            Line::from("  [Panes] u=unhandled-only, b=bookmarked-only, a=agent, d=domain"),
+            Line::from("  [Panes] p=cycle ruleset profile, Enter=apply selected profile"),
+            Line::from("  [Events] type digits to filter by pane/rule, u=unhandled-only"),
+            Line::from("  [History] type text to filter, u=undoable-only"),
+            Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
+            Line::from("  [Search] Ctrl+F toggle fast-only mode"),
+            Line::from("  [Timeline] j/k select event, +/- widen or narrow window"),
+            Line::from("  [Triage] e=expand/collapse workflow progress"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Views:",
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )),
+            Line::from("  1. Home    System overview and health"),
+            Line::from("  2. Panes   List observed panes"),
+            Line::from("  3. Events  Recent detection events"),
+            Line::from("  4. Triage  Prioritized issues + actions"),
+            Line::from("  5. History Audit action timeline"),
+            Line::from("  6. Search  Full-text search"),
+            Line::from("  7. Help    This screen"),
+            Line::from("  8. Timeline Cross-pane event timeline"),
+        ]
+    };
 
     let help =
         Paragraph::new(help_text).block(Block::default().title("Help").borders(Borders::ALL));
