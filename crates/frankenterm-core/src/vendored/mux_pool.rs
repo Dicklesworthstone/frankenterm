@@ -1419,13 +1419,20 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            pool.health_check()
+            let err = pool
+                .health_check()
                 .await
                 .expect_err("health check should fail");
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::SocketNotFound(_))
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
             assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
         });
     }
 
@@ -1448,13 +1455,20 @@ mod tests {
             let pool = MuxPool::new(config);
             let cx = crate::cx::for_testing();
 
-            pool.health_check_with_cx(&cx)
+            let err = pool
+                .health_check_with_cx(&cx)
                 .await
                 .expect_err("health_check_with_cx should fail");
+            assert!(matches!(
+                err,
+                MuxPoolError::Mux(DirectMuxError::SocketNotFound(_))
+            ));
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
             assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
         });
     }
 
@@ -1534,14 +1548,17 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            pool.health_check_with_cx(&cx)
+            let err = pool
+                .health_check_with_cx(&cx)
                 .await
                 .expect_err("health_check_with_cx should fail without recovery");
+            assert!(matches!(err, MuxPoolError::Mux(_)));
 
             let stats = pool.stats().await;
             assert_eq!(stats.health_checks, 1);
             assert_eq!(stats.health_check_failures, 1);
             assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
             assert_eq!(
                 stats.connections_created, 1,
                 "health_check_with_cx should not reconnect when recovery is disabled"
