@@ -340,7 +340,6 @@ fn traceability_matrix_includes_required_baseline_capabilities() {
                 .expect("required capability ids should be strings")
         })
         .filter(|capability_id| !present.contains(*capability_id))
-        .copied()
         .collect::<Vec<_>>();
 
     assert!(
