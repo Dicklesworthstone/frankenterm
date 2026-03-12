@@ -97,8 +97,7 @@ proptest! {
 
     #[test]
     fn serde_roundtrip_playbook_snapshot(stage in arb_cutover_stage()) {
-        let mut pb = CutoverPlaybook::new("test", 1);
-        // Advance won't work without gates, but snapshot should serialize
+        let pb = CutoverPlaybook::new("test", 1);
         let snap = pb.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         let back: PlaybookSnapshot = serde_json::from_str(&json).unwrap();
