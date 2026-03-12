@@ -13,6 +13,54 @@ flywheel_connectors implements the **Flywheel Connector Protocol (FCP v2)**, a s
 
 **Key assessment**: FCP v2 is a sophisticated security-first connector framework. FrankenTerm should adopt the connector governance model (manifest-based capability control, sandbox enforcement, audit chains) while adapting the transport layer (RaptorQ/Tailscale are mesh-specific).
 
+## Code-Grounded FrankenTerm Baseline (2026-03-11 delta)
+
+FrankenTerm already contains a meaningful in-repo connector-fabric skeleton, so
+this inventory needs to drive convergence work rather than describe a purely
+hypothetical future system.
+
+- `crates/frankenterm-core/src/connector_host_runtime.rs`: deterministic host
+  runtime config, lifecycle phases, sandbox decisions, capability envelopes,
+  runtime budgets, and auditable operation envelopes.
+- `crates/frankenterm-core/src/connector_registry.rs` +
+  `crates/frankenterm-core/src/connector_bundles.rs`: signed bundle/registry
+  trust model, ingestion pipeline, and tiered packaging seams.
+- `crates/frankenterm-core/src/connector_sdk.rs`,
+  `crates/frankenterm-core/src/connector_event_model.rs`,
+  `crates/frankenterm-core/src/connector_inbound_bridge.rs`,
+  `crates/frankenterm-core/src/connector_outbound_bridge.rs`: execution SDK and
+  bridge/event contracts between ft and external connectors.
+- `crates/frankenterm-core/src/connector_credential_broker.rs` +
+  `crates/frankenterm-core/src/connector_data_classification.rs`: secret
+  brokering, sensitivity tiers, provenance, and redaction constraints.
+- `crates/frankenterm-core/src/connector_lifecycle.rs`,
+  `crates/frankenterm-core/src/connector_reliability.rs`,
+  `crates/frankenterm-core/src/canary_rollout_controller.rs`: rollout,
+  health, rollback, and reliability controls.
+- `crates/frankenterm-core/src/connector_mesh.rs`,
+  `crates/frankenterm-core/src/distributed.rs`,
+  `crates/frankenterm-core/src/policy.rs`: multi-host routing/federation seams
+  are already threaded into the policy engine and safety config.
+- `crates/frankenterm-core/src/policy_audit_chain.rs`: tamper-evident audit
+  chain primitives that are the closest current in-repo analogue to FCP audit
+  events and decision receipts.
+
+The practical takeaway is that FrankenTerm already has most of the structural
+seams needed to absorb FCP governance concepts. The hard remaining work is
+making those seams normative and interoperable rather than parallel prototypes.
+
+## Source Implementation Anchors (/dp/flywheel_connectors)
+
+| Source Anchor | Responsibility | FrankenTerm Relevance |
+|---|---|---|
+| `crates/fcp-manifest/src/lib.rs` | Strict TOML manifest parsing, interface hash computation, capability/network validation | Primary source for connector declaration, interface stability, and fail-closed package admission. |
+| `crates/fcp-registry/src/lib.rs` | Registry verification, endorsement, supply-chain validation | Direct precedent for signed bundle trust and connector admission controls. |
+| `crates/fcp-sandbox/src/lib.rs` | OS sandbox profiles, egress policy, deny-by-default network controls | Main source for how strict connector isolation should behave under failure or ambiguity. |
+| `crates/fcp-mesh/src/lib.rs` | Mesh federation, node identity, routing, leases, admission | Relevant for distributed FrankenTerm only; should not dictate local-first architecture. |
+| `crates/fcp-audit/src/lib.rs` + `crates/fcp-core/src/audit.rs` | Audit-event and decision-receipt data structures, hash-linked evidence semantics | Best upstream precedent for strengthening ft policy/connector audit continuity. |
+| `FCP_CDDL_V2.cddl` | Canonical type-level contract for capabilities, approvals, invoke/simulate/subscribe, audit events | Useful for mechanical schema alignment and validating connector contract completeness. |
+| `FCP_Specification_V3.md` | Normative semantics for authority, zones, provenance, durability, host/runtime behavior | Source of the execution/security invariants to preserve even when transport choices differ. |
+
 ---
 
 ## 1. Host Runtime
@@ -293,9 +341,36 @@ FCP-1xxx (Protocol), FCP-2xxx (Auth), FCP-3xxx (Capability), FCP-4xxx (Zone), FC
 - Instant serialization: Don't derive serde on structs with Instant
 - Manifest interface_hash: Recompute when operation/capability signatures change
 
+## 11. Adopt / Adapt / Defer Handoff Matrix
+
+This is the implementation-facing mapping from FCP source concepts to current
+FrankenTerm seams and the downstream tracks that should absorb each concept.
+
+| Capability Family | Decision | FCP Source Anchors | FrankenTerm Anchor(s) | Primary Downstream Tracks |
+|---|---|---|---|---|
+| Manifest schema, interface hash, capability declarations | Adopt | `crates/fcp-manifest/src/lib.rs`, `FCP_CDDL_V2.cddl` | `connector_registry.rs`, `connector_bundles.rs`, `connector_sdk.rs` | `ft-3681t.5.1`, `ft-3681t.5.12`, `ft-3681t.6.1` |
+| Registry endorsement and supply-chain validation | Adopt | `crates/fcp-registry/src/lib.rs` | `connector_registry.rs`, bundle registry, policy trust gates | `ft-3681t.5.9`, `ft-3681t.5.12`, `ft-3681t.6.4` |
+| Sandbox zones and deny-by-default egress | Adapt | `crates/fcp-sandbox/src/lib.rs`, `FCP_Specification_V3.md` | `connector_host_runtime.rs`, `policy.rs`, `connector_governor.rs` | `ft-3681t.5.3`, `ft-3681t.5.4`, `ft-3681t.6.1` |
+| Capability tokens, approvals, holder-proof style anti-replay | Adapt then adopt | `FCP_CDDL_V2.cddl`, `FCP_Specification_V3.md` | `connector_sdk.rs`, `policy.rs`, `approval.rs`, `connector_credential_broker.rs` | `ft-3681t.5.4`, `ft-3681t.5.6`, `ft-3681t.6.*` |
+| Provenance, classification, audit chain, decision receipts | Adopt | `crates/fcp-audit/src/lib.rs`, `crates/fcp-core/src/audit.rs`, `FCP_CDDL_V2.cddl` | `policy_audit_chain.rs`, `connector_data_classification.rs`, `policy.rs` | `ft-3681t.5.14`, `ft-3681t.6.4`, `ft-3681t.7.1` |
+| Mesh federation, placement, RaptorQ-backed transport | Defer for local-first, adapt for distributed mode | `crates/fcp-mesh/src/lib.rs`, `FCP_Specification_V3.md` | `connector_mesh.rs`, `distributed.rs`, headless mux server work | `ft-3681t.2.6`, distributed connector follow-ons in `ft-3681t.5.*` |
+
+## 12. Failure-Mode Obligations To Preserve
+
+The source material makes several failure behaviors normative. FrankenTerm
+should preserve these even when the transport/runtime implementation differs.
+
+| Concern | Required FrankenTerm Behavior | Current Anchor |
+|---|---|---|
+| Manifest mismatch or signature failure | Fail package admission before runtime startup and surface a typed trust error | `connector_registry.rs`, `connector_bundles.rs` |
+| Sandbox ambiguity or egress-policy mismatch | Fail closed, emit auditable reason code, do not attempt best-effort execution | `connector_host_runtime.rs`, `policy.rs` |
+| Credential revocation or approval expiry | Invalidate brokered access immediately and reject subsequent operations deterministically | `connector_credential_broker.rs`, approval/revocation state in `policy.rs` |
+| Canary health regression | Hold or roll back promotion, preserve evidence bundle, do not silently continue in production | `connector_lifecycle.rs`, `canary_rollout_controller.rs`, `connector_reliability.rs` |
+| Audit-chain fork, gap, or sequence violation | Escalate as a security event, quarantine the connector/runtime slice, require operator review | `policy_audit_chain.rs`, compliance/audit surfaces in `policy.rs` |
+
 ---
 
-## Crate Map
+## 13. Crate Map
 
 | Crate | Purpose | FrankenTerm Relevance |
 |-------|---------|----------------------|

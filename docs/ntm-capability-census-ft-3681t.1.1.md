@@ -51,6 +51,22 @@ for NTM-style observability, automation, and machine control, but the remaining
 gaps are concentrated in first-class swarm coordination, native mux/session
 semantics, and a less monolithic command-routing surface.
 
+## Source Implementation Anchors (/dp/ntm)
+
+These are the upstream files that most directly justify the capability census
+ and the preserve/upgrade/drop decisions below.
+
+| Source Anchor | Responsibility | FrankenTerm Relevance |
+|---|---|---|
+| `cmd/ntm/main.go` | Thin binary entrypoint delegating to Cobra CLI | Confirms NTM itself is mostly a routing shell around internal orchestration packages. |
+| `internal/cli/root.go` | Root Cobra command, global flags, startup phases, giant robot-flag surface | Shows the operator and machine API breadth FrankenTerm still needs to decompose more cleanly than NTM did. |
+| `internal/cli/coordinator.go` + `internal/coordinator/coordinator.go` | Session coordinator startup, activity polling, state transitions, alerting | Core preserve target for swarm-state inference and alert generation. |
+| `internal/watcher/file_reservation.go` + `internal/watcher/conflict.go` | TTL file locks, conflict detection, negotiation path | Direct precedent for native reservation/conflict semantics beyond external Agent Mail workflows. |
+| `internal/approval/engine.go` | Approval tokens, SLB/two-person-rule, gated destructive flows | Preserve the approval semantics, but keep them policy-native inside FrankenTerm. |
+| `internal/robot/robot.go` + robot handlers in `internal/cli/root.go` | Machine-readable status/search/assignment/mail/ensemble surfaces | Main evidence for the size of the NTM robot-control plane and why `ft robot` track work must stay contract-driven. |
+| `internal/session/restore.go` + `internal/checkpoint/restore.go` | Checkpoint restore, pane recreation, context reinjection, git drift checks | Preserve the operator recovery workflow, but anchor it to ft snapshots/session restore instead of tmux. |
+| `internal/assign/matcher.go` | Capability matrix, assignment strategies, blocker-aware work routing | Preserve the assignment model, upgrade it with FrankenTerm-native workflow, policy, and telemetry inputs. |
+
 ---
 
 ## Command Taxonomy (150+ commands)
@@ -146,6 +162,22 @@ Strategies: manual, adversarial, consensus, creative, analytical, deliberative, 
 | Configuration and system tooling | `ft config *`, `ft setup`, `ft doctor`, version/build metadata | Parity | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/config.rs`, `crates/frankenterm-core/src/logging.rs` | This area is already serviceable and mostly needs polish rather than new architecture. |
 | Advanced diagnostics | `ft triage`, `ft diag bundle`, replay, forensics, and export surfaces | Superset | `crates/frankenterm-core/src/diagnostic.rs`, `crates/frankenterm-core/src/incident_bundle.rs`, `crates/frankenterm-core/src/forensic_export.rs` | FrankenTerm's evidence-first diagnostics path is broader than NTM's current CLI model. |
 | Multi-project orchestration | distributed mode, headless mux server, future mission control | Gap | `crates/frankenterm-core/src/distributed.rs`, `crates/frankenterm-mux-server*`, `crates/frankenterm-core/src/plan.rs` | Early primitives exist, but there is no finished native equivalent to NTM's multi-project swarm and controller workflow yet. |
+
+## Preserve / Upgrade / Drop Handoff Matrix
+
+This matrix is the action-oriented handoff for downstream implementation beads.
+It is intentionally keyed to upstream source anchors, current FrankenTerm
+surfaces, and the primary tracks that should absorb each capability family.
+
+| Capability Family | Decision | NTM Source Anchors | FrankenTerm Target Surface | Primary Downstream Tracks |
+|---|---|---|---|---|
+| Root CLI and robot routing | Upgrade | `internal/cli/root.go`, `internal/robot/robot.go` | `crates/frankenterm/src/main.rs`, future command-surface decomposition | `ft-3681t.4.*`, `ft-3681t.9.*` |
+| Session coordinator, activity inference, alerts | Preserve then upgrade | `internal/cli/coordinator.go`, `internal/coordinator/coordinator.go` | `runtime.rs`, `ingest.rs`, `events.rs`, `metrics.rs`, `plan.rs` | `ft-3681t.3.*`, `ft-3681t.7.*` |
+| File reservations, conflict handling, approvals | Preserve | `internal/watcher/file_reservation.go`, `internal/watcher/conflict.go`, `internal/approval/engine.go` | `policy.rs`, `approval.rs`, `storage.rs`, workflow locks, reservation-aware robot/MCP flows | `ft-3681t.3.*`, `ft-3681t.6.*` |
+| Checkpoints, restore, context reinjection | Preserve then upgrade | `internal/session/restore.go`, `internal/checkpoint/restore.go` | `snapshot_engine.rs`, `session_restore.rs`, `restore_*`, `session_topology.rs` | `ft-3681t.2.*`, `ft-3681t.8.*` |
+| Capability-based assignment and blocker-aware routing | Preserve then upgrade | `internal/assign/matcher.go` | `swarm_work_queue.rs`, `plan.rs`, mission/runtime scheduling surfaces | `ft-3681t.3.*`, `ft-1i2ge*` |
+| Machine-readable operator APIs | Preserve envelope, upgrade internals | `internal/robot/robot.go`, robot handlers in `internal/cli/root.go` | `robot_types.rs`, `mcp.rs`, `mcp_bridge.rs`, `main.rs` | `ft-3681t.4.*`, `ft-3681t.8.*` |
+| tmux-specific session mechanics and TUI shell | Drop implementation, keep semantics | tmux and Cobra/TUI command surfaces across `internal/cli/*` | native mux, GUI, headless mux server, `ft tui` | `ft-3681t.2.*`, `ft-1memj*` |
 
 ---
 
