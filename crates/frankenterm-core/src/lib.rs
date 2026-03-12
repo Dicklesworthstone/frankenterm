@@ -244,6 +244,7 @@ pub mod namespace_isolation;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
+pub mod ntm_decommission;
 pub mod ntm_importer;
 pub mod ntm_parity;
 pub mod orphan_reaper;
