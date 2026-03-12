@@ -138,6 +138,7 @@ pub mod crash;
 pub mod crdt;
 pub mod cross_pane_correlation;
 pub mod cuckoo_filter;
+pub mod cutover_evidence;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
 pub mod dancing_links;
