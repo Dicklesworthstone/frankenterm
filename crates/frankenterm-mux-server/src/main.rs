@@ -224,15 +224,46 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 
 mod ossl;
 
+fn set_mux_socket_environment(config: &config::ConfigHandle) {
+    // SAFETY: Setting environment variables must happen before worker threads
+    // are spawned to avoid data races. We publish both legacy and ft-specific
+    // socket vars so spawned processes and sibling tools resolve the same mux.
+    if let Some(unix_dom) = config.unix_domains.first() {
+        let socket_path = unix_dom.socket_path();
+        unsafe {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", &socket_path);
+            std::env::set_var("FRANKENTERM_UNIX_SOCKET", &socket_path);
+        }
+    }
+}
+
+fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--daemonize=false")];
+    if opts.skip_config {
+        args.push(OsString::from("-n"));
+    }
+    if let Some(f) = &opts.config_file {
+        args.push(OsString::from("--config-file"));
+        args.push(f.clone());
+    }
+    for (name, value) in &opts.config_override {
+        args.push(OsString::from("--config"));
+        args.push(OsString::from(format!("{name}={value}")));
+    }
+    if let Some(cwd) = &opts.cwd {
+        args.push(OsString::from("--cwd"));
+        args.push(cwd.clone());
+    }
+    if !opts.prog.is_empty() {
+        args.push(OsString::from("--"));
+        args.extend(opts.prog.iter().cloned());
+    }
+    args
+}
+
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
-
-    // SAFETY: Setting environment variables must be done before any worker threads
-    // are spawned to avoid data races and undefined behavior. We set it to the first
-    // unix domain socket path, which will be inherited by any shell processes we spawn.
-    if let Some(unix_dom) = config.unix_domains.first() {
-        unsafe { std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path()) };
-    }
+    set_mux_socket_environment(&config);
 
     for unix_dom in &config.unix_domains {
         let mut listener =
@@ -253,27 +284,8 @@ fn spawn_daemonized_copy(opts: &Opt, config: &config::ConfigHandle) -> anyhow::R
     let mut cmd = Command::new(
         std::env::current_exe().context("resolving current executable for daemonize")?,
     );
-    cmd.arg("--daemonize=false");
-    if opts.skip_config {
-        cmd.arg("-n");
-    }
-    if let Some(f) = &opts.config_file {
-        cmd.arg("--config-file");
-        cmd.arg(f);
-    }
-    for (name, value) in &opts.config_override {
-        cmd.arg("--config");
-        cmd.arg(format!("{name}={value}"));
-    }
-    if let Some(cwd) = &opts.cwd {
-        cmd.arg("--cwd");
-        cmd.arg(cwd);
-    }
-    if !opts.prog.is_empty() {
-        cmd.arg("--");
-        for a in &opts.prog {
-            cmd.arg(a);
-        }
+    for arg in daemonized_child_args(opts) {
+        cmd.arg(arg);
     }
 
     cmd.stdin(Stdio::null());
@@ -290,4 +302,167 @@ fn spawn_daemonized_copy(opts: &Opt, config: &config::ConfigHandle) -> anyhow::R
         .spawn()
         .context("spawning daemonized mux server child")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::{Config, UnixDomain};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestStateGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+    }
+
+    impl Drop for TestStateGuard<'_> {
+        fn drop(&mut self) {
+            reset_test_state();
+        }
+    }
+
+    fn lock_test_state() -> TestStateGuard<'static> {
+        let lock = test_lock().lock().expect("lock");
+        reset_test_state();
+        TestStateGuard { _lock: lock }
+    }
+
+    fn make_opt() -> Opt {
+        Opt {
+            skip_config: false,
+            config_file: None,
+            config_override: Vec::new(),
+            daemonize: false,
+            cwd: None,
+            prog: Vec::new(),
+        }
+    }
+
+    fn make_config_with_unix_domains(domains: Vec<UnixDomain>) -> config::ConfigHandle {
+        let mut config = Config::default_config();
+        config.unix_domains = domains;
+        config::use_this_configuration(config);
+        config::configuration()
+    }
+
+    fn reset_test_state() {
+        config::use_test_configuration();
+        // SAFETY: tests take a global mutex and mutate process env serially.
+        unsafe {
+            std::env::remove_var("WEZTERM_UNIX_SOCKET");
+            std::env::remove_var("FRANKENTERM_UNIX_SOCKET");
+        }
+    }
+
+    #[test]
+    fn set_mux_socket_environment_sets_both_socket_env_vars_from_first_domain() {
+        let _guard = lock_test_state();
+
+        let first_socket = PathBuf::from("/tmp/ft-test-first.sock");
+        let second_socket = PathBuf::from("/tmp/ft-test-second.sock");
+        let handle = make_config_with_unix_domains(vec![
+            UnixDomain {
+                name: "first".to_string(),
+                socket_path: Some(first_socket.clone()),
+                ..UnixDomain::default()
+            },
+            UnixDomain {
+                name: "second".to_string(),
+                socket_path: Some(second_socket),
+                ..UnixDomain::default()
+            },
+        ]);
+
+        set_mux_socket_environment(&handle);
+
+        assert_eq!(
+            std::env::var_os("WEZTERM_UNIX_SOCKET"),
+            Some(first_socket.clone().into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("FRANKENTERM_UNIX_SOCKET"),
+            Some(first_socket.into_os_string())
+        );
+    }
+
+    #[test]
+    fn set_mux_socket_environment_leaves_existing_env_when_no_domains_exist() {
+        let _guard = lock_test_state();
+
+        let sentinel = PathBuf::from("/tmp/ft-existing.sock");
+        // SAFETY: tests take a global mutex and mutate process env serially.
+        unsafe {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", &sentinel);
+            std::env::set_var("FRANKENTERM_UNIX_SOCKET", &sentinel);
+        }
+
+        let handle = make_config_with_unix_domains(Vec::new());
+        set_mux_socket_environment(&handle);
+
+        assert_eq!(
+            std::env::var_os("WEZTERM_UNIX_SOCKET"),
+            Some(sentinel.clone().into_os_string())
+        );
+        assert_eq!(
+            std::env::var_os("FRANKENTERM_UNIX_SOCKET"),
+            Some(sentinel.into_os_string())
+        );
+    }
+
+    #[test]
+    fn daemonized_child_args_forward_cli_state_and_prog_separator() {
+        let mut opts = make_opt();
+        opts.skip_config = true;
+        opts.config_file = Some(OsString::from("/tmp/ft.toml"));
+        opts.config_override = vec![
+            ("mux.enabled".to_string(), "true".to_string()),
+            ("tls.required".to_string(), "false".to_string()),
+        ];
+        opts.cwd = Some(OsString::from("/tmp/workspace"));
+        opts.prog = vec![
+            OsString::from("bash"),
+            OsString::from("-lc"),
+            OsString::from("pwd"),
+        ];
+
+        let args = daemonized_child_args(&opts);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--daemonize=false"),
+                OsString::from("-n"),
+                OsString::from("--config-file"),
+                OsString::from("/tmp/ft.toml"),
+                OsString::from("--config"),
+                OsString::from("mux.enabled=true"),
+                OsString::from("--config"),
+                OsString::from("tls.required=false"),
+                OsString::from("--cwd"),
+                OsString::from("/tmp/workspace"),
+                OsString::from("--"),
+                OsString::from("bash"),
+                OsString::from("-lc"),
+                OsString::from("pwd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemonized_child_args_omit_prog_separator_when_no_prog_is_present() {
+        let opts = make_opt();
+        let args = daemonized_child_args(&opts);
+
+        assert_eq!(args, vec![OsString::from("--daemonize=false")]);
+        assert!(
+            !args.iter().any(|arg| arg == OsStr::new("--")),
+            "separator should only appear when forwarding a child program"
+        );
+    }
 }
