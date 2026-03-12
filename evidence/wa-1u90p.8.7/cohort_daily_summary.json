@@ -1,12 +1,12 @@
 {
   "issue_id": "ft-1u90p.8.7",
-  "checkpoint_date": "2026-03-03",
+  "checkpoint_date": "2026-03-12",
   "decision": "HOLD",
   "decision_reason": [
     "sample sufficiency thresholds not met",
     "no real-user survey responses captured yet",
     "current checkpoint uses fixture-only conformance run",
-    "2026-03-03 guardrail harness rerun passed; HOLD still required due insufficient cohort samples"
+    "2026-03-12 guardrail harness rerun passed; HOLD still required due insufficient cohort samples"
   ],
   "dependencies": {
     "ft-1u90p.7.7": "closed",
@@ -52,10 +52,10 @@
     "artifact_dir": "e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance"
   },
   "validation": {
-    "last_validated_at_utc": "2026-03-03T04:20:24Z",
+    "last_validated_at_utc": "2026-03-12T05:30:13Z",
     "validation_scope": "evidence consistency + decision guardrails",
     "e2e_script": "tests/e2e/test_ft_1u90p_8_7.sh",
-    "latest_log": "tests/e2e/logs/ft_1u90p_8_7_20260302_232023.jsonl",
+    "latest_log": "tests/e2e/logs/ft_1u90p_8_7_20260312_013012.jsonl",
     "checks": [
       "baseline_hold_when_thresholds_unmet",
       "summary_csv_feedback_join_consistency",

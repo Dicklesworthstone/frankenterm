@@ -12,9 +12,26 @@ flywheel_connectors as native subsystems. The program spans 9 epics and 66 leaf
 tasks across native mux, swarm orchestration, robot APIs, connector fabric,
 policy/governance, observability, migration, and operator UX.
 
-**Current state**: Architecture spec (ft-3681t.1.3) is CLOSED. Foundation
-layer (ft-3681t.2.1) is IN_PROGRESS. Discovery beads (.1.1, .1.2) are
-IN_PROGRESS. Everything else awaits the foundation.
+**Current state (historical snapshot)**: The paragraph above reflects the
+original 2026-03-02 planning snapshot that this document was written against.
+
+**Current reality check (2026-03-12, code-grounded)**:
+- Tracker status from raw `.beads/issues.jsonl` now shows epics
+  `ft-3681t.1`, `ft-3681t.2`, `ft-3681t.5`, `ft-3681t.6`, `ft-3681t.8`, and
+  `ft-3681t.9` as CLOSED; `ft-3681t.3`, `ft-3681t.4`, and `ft-3681t.7` remain
+  OPEN as top-level rollups.
+- The swarm-orchestration implementation surface is no longer theoretical:
+  `frankenterm-core` exports `fleet_launcher`, `swarm_work_queue`,
+  `swarm_scheduler`, `mission_loop`, `mission_agent_mail`, and
+  `swarm_pipeline` from `src/lib.rs`.
+- Swarm validation coverage is also present in-tree today via
+  `crates/frankenterm-core/tests/swarm_orchestration_integration.rs`,
+  `crates/frankenterm-core/tests/swarm_simulation_regression.rs`,
+  `crates/frankenterm-core/tests/proptest_mission_loop.rs`, and
+  `crates/frankenterm-core/tests/proptest_swarm_pipeline.rs`.
+- Treat the tables below as the original sequencing model, then cross-check
+  against current bead state before using them for active claim/priority
+  decisions.
 
 ## 2. Execution Tracks
 
@@ -63,6 +80,12 @@ since they share the same mux substrate dependency.
 | 3b | ft-3681t.3.4 | Agent Mail coordination kernel | .3.1 | .3.6 |
 | 3b | ft-3681t.3.7 | Conflict detection/handoff | .3.1 | .3.6 |
 | 3c | ft-3681t.3.6 | Swarm simulation/regression suite | all above | (quality gate) |
+
+**Implementation note (2026-03-12)**: the `ft-3681t.3.1` through
+`ft-3681t.3.7` child beads are all CLOSED in `.beads/issues.jsonl`, and the
+corresponding code/test surfaces are present in the current tree. The parent
+epic `ft-3681t.3` still appears OPEN, so use the child-bead state plus code
+anchors above as the source of truth for what has already landed.
 
 #### Pillar B: Connector Fabric (ft-3681t.5)
 
