@@ -15,8 +15,13 @@
 use proptest::prelude::*;
 
 use frankenterm_core::plan::{
-    ApprovalState, MissionFailureCode, MissionFailureRetryability, MissionFailureTerminality,
-    MissionLifecycleState, MissionLifecycleTransitionKind, Outcome,
+    ApprovalState, AssignmentId, CandidateActionId, DispatchContract, DispatchDryRun,
+    DispatchTarget, MissionActorRole, MissionAgentAvailability, MissionAgentCapabilityProfile,
+    MissionDispatchContract, MissionDispatchExecution, MissionDispatchTarget, MissionFailureCode,
+    MissionFailureRetryability, MissionFailureTerminality, MissionLifecycleDecision,
+    MissionLifecycleState, MissionLifecycleTransitionKind, MissionOwnership, MissionProvenance,
+    Outcome, ReservationIntent, ReservationIntentId, StepAction, TxPrepareOutcome,
+    TxPrepareReport,
 };
 
 // =============================================================================
@@ -418,4 +423,271 @@ fn default_lifecycle_state_is_planning() {
         MissionLifecycleState::default(),
         MissionLifecycleState::Planning
     );
+}
+
+// =============================================================================
+// Serde roundtrip tests for previously untested plan types
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // -- MissionOwnership --
+    #[test]
+    fn ownership_serde_roundtrip(
+        planner in "[a-z]{3,10}",
+        dispatcher in "[a-z]{3,10}",
+        operator in "[a-z]{3,10}",
+    ) {
+        let val = MissionOwnership { planner, dispatcher, operator };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionOwnership = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, restored);
+    }
+
+    // -- MissionProvenance --
+    #[test]
+    fn provenance_serde_roundtrip(
+        bead_id in proptest::option::of("[a-z0-9-]{4,12}"),
+        thread_id in proptest::option::of("[a-z0-9-]{4,12}"),
+        source_command in proptest::option::of("[a-z_ ]{4,20}"),
+        source_sha in proptest::option::of("[a-f0-9]{8}"),
+    ) {
+        let val = MissionProvenance { bead_id, thread_id, source_command, source_sha };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionProvenance = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, restored);
+    }
+
+    // -- MissionProvenance default --
+    #[test]
+    fn provenance_default_all_none(_dummy in 0u8..1) {
+        let val = MissionProvenance::default();
+        prop_assert_eq!(val.bead_id, None);
+        prop_assert_eq!(val.thread_id, None);
+        prop_assert_eq!(val.source_command, None);
+        prop_assert_eq!(val.source_sha, None);
+    }
+
+    // -- ReservationIntentId --
+    #[test]
+    fn reservation_intent_id_serde_roundtrip(id in "[a-z0-9-]{4,20}") {
+        let val = ReservationIntentId(id);
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: ReservationIntentId = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, restored);
+    }
+
+    // -- ReservationIntent --
+    #[test]
+    fn reservation_intent_serde_roundtrip(
+        id in "[a-z0-9-]{4,12}",
+        paths in proptest::collection::vec("[a-z/]{3,15}", 1..4),
+        exclusive in any::<bool>(),
+        reason in proptest::option::of("[a-z ]{3,20}"),
+        ts in 1000i64..i64::MAX / 2,
+        expires in proptest::option::of(1000i64..i64::MAX / 2),
+    ) {
+        let val = ReservationIntent {
+            reservation_id: ReservationIntentId(id),
+            requested_by: MissionActorRole::Dispatcher,
+            paths,
+            exclusive,
+            reason,
+            requested_at_ms: ts,
+            expires_at_ms: expires,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: ReservationIntent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.reservation_id, restored.reservation_id);
+        prop_assert_eq!(val.exclusive, restored.exclusive);
+        prop_assert_eq!(val.paths, restored.paths);
+    }
+
+    // -- DispatchContract --
+    #[test]
+    fn dispatch_contract_serde_roundtrip(
+        candidate in "[a-z0-9-]{4,12}",
+        rationale in "[a-z ]{5,25}",
+    ) {
+        let val = DispatchContract {
+            candidate_id: CandidateActionId(candidate),
+            action: StepAction::SendText { pane_id: 1, text: "hello".into(), paste_mode: None },
+            rationale,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: DispatchContract = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.candidate_id.0, restored.candidate_id.0);
+        prop_assert_eq!(val.rationale, restored.rationale);
+    }
+
+    // -- DispatchTarget --
+    #[test]
+    fn dispatch_target_serde_roundtrip(
+        assignment in "[a-z0-9-]{4,12}",
+        assignee in "[a-z]{3,10}",
+        candidate in "[a-z0-9-]{4,12}",
+    ) {
+        let val = DispatchTarget {
+            assignment_id: AssignmentId(assignment),
+            assignee,
+            candidate_id: CandidateActionId(candidate),
+            approval_state: ApprovalState::NotRequired,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: DispatchTarget = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.assignment_id.0, restored.assignment_id.0);
+        prop_assert_eq!(val.assignee, restored.assignee);
+    }
+
+    // -- DispatchDryRun --
+    #[test]
+    fn dispatch_dry_run_serde_roundtrip(
+        assignment in "[a-z0-9-]{4,12}",
+        would_dispatch in any::<bool>(),
+        ts in 1000i64..i64::MAX / 2,
+    ) {
+        let val = DispatchDryRun {
+            assignment_id: AssignmentId(assignment),
+            would_dispatch,
+            simulated_at_ms: ts,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: DispatchDryRun = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.assignment_id.0, restored.assignment_id.0);
+        prop_assert_eq!(val.would_dispatch, restored.would_dispatch);
+    }
+
+    // -- MissionDispatchContract --
+    #[test]
+    fn mission_dispatch_contract_serde_roundtrip(
+        assignment in "[a-z0-9-]{4,12}",
+        agent in "[a-z]{3,10}",
+    ) {
+        let val = MissionDispatchContract { assignment_id: assignment, target_agent: agent };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionDispatchContract = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.assignment_id, restored.assignment_id);
+        prop_assert_eq!(val.target_agent, restored.target_agent);
+    }
+
+    // -- MissionDispatchTarget --
+    #[test]
+    fn mission_dispatch_target_serde_roundtrip(
+        pane_id in 1u64..1000,
+        workspace in proptest::option::of("[a-z/]{3,15}"),
+    ) {
+        let val = MissionDispatchTarget { pane_id, workspace };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionDispatchTarget = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.pane_id, restored.pane_id);
+        prop_assert_eq!(val.workspace, restored.workspace);
+    }
+
+    // -- MissionDispatchExecution --
+    #[test]
+    fn mission_dispatch_execution_serde_roundtrip(
+        would_succeed in any::<bool>(),
+        reason in proptest::option::of("[a-z ]{3,20}"),
+    ) {
+        let val = MissionDispatchExecution { would_succeed, reason };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionDispatchExecution = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.would_succeed, restored.would_succeed);
+        prop_assert_eq!(val.reason, restored.reason);
+    }
+
+    // -- MissionLifecycleDecision --
+    #[test]
+    fn lifecycle_decision_serde_roundtrip(
+        from in arb_lifecycle_state(),
+        to in arb_lifecycle_state(),
+        decision_path in "[a-z_]{3,15}",
+        reason_code in "[a-z_]{3,15}",
+        error_code in proptest::option::of("[A-Z]{2}-[0-9]{4}"),
+        checkpoint_id in proptest::option::of("[a-z0-9-]{4,12}"),
+    ) {
+        let val = MissionLifecycleDecision {
+            lifecycle_from: from,
+            lifecycle_to: to,
+            decision_path,
+            reason_code,
+            error_code,
+            checkpoint_id,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionLifecycleDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val.lifecycle_from, restored.lifecycle_from);
+        prop_assert_eq!(val.lifecycle_to, restored.lifecycle_to);
+        prop_assert_eq!(val.reason_code, restored.reason_code);
+    }
+
+    // -- MissionAgentAvailability --
+    #[test]
+    fn agent_availability_serde_roundtrip(
+        avail in prop_oneof![
+            Just(MissionAgentAvailability::Ready),
+            "[a-z]{3,10}".prop_map(|r| MissionAgentAvailability::Paused { reason_code: r }),
+            ("[a-z]{3,10}", 1usize..10).prop_map(|(r, m)| MissionAgentAvailability::Degraded {
+                reason_code: r, max_parallel_assignments: m
+            }),
+            "[a-z]{3,10}".prop_map(|r| MissionAgentAvailability::RateLimited { reason_code: r }),
+            "[a-z]{3,10}".prop_map(|r| MissionAgentAvailability::Offline { reason_code: r }),
+        ],
+    ) {
+        let json = serde_json::to_string(&avail).unwrap();
+        let restored: MissionAgentAvailability = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(avail, restored);
+    }
+
+    // -- MissionAgentCapabilityProfile --
+    #[test]
+    fn agent_capability_profile_serde_roundtrip(
+        agent_id in "[a-z]{3,10}",
+        capabilities in proptest::collection::vec("[a-z_]{3,10}", 0..3),
+        lane_affinity in proptest::collection::vec("[a-z]{3,8}", 0..2),
+        current_load in 0usize..10,
+        max_parallel in 1usize..10,
+    ) {
+        let val = MissionAgentCapabilityProfile {
+            agent_id,
+            capabilities,
+            lane_affinity,
+            current_load,
+            max_parallel_assignments: max_parallel,
+            availability: MissionAgentAvailability::Ready,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: MissionAgentCapabilityProfile = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(val, restored);
+    }
+
+    // -- TxPrepareReport --
+    #[test]
+    fn tx_prepare_report_serde_roundtrip(
+        outcome in prop_oneof![
+            Just(TxPrepareOutcome::AllReady),
+            Just(TxPrepareOutcome::Denied),
+            Just(TxPrepareOutcome::Deferred),
+        ],
+    ) {
+        let val = TxPrepareReport { outcome: outcome.clone() };
+        let json = serde_json::to_string(&val).unwrap();
+        let restored: TxPrepareReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(outcome.commit_eligible(), restored.outcome.commit_eligible());
+    }
+
+    // -- TxPrepareOutcome commit_eligible --
+    #[test]
+    fn prepare_outcome_only_all_ready_eligible(
+        outcome in prop_oneof![
+            Just(TxPrepareOutcome::AllReady),
+            Just(TxPrepareOutcome::Denied),
+            Just(TxPrepareOutcome::Deferred),
+        ],
+    ) {
+        let eligible = outcome.commit_eligible();
+        let is_all_ready = matches!(outcome, TxPrepareOutcome::AllReady);
+        prop_assert_eq!(eligible, is_all_ready);
+    }
 }
