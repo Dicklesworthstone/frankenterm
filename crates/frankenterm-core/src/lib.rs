@@ -401,6 +401,7 @@ pub mod suggestions;
 pub mod survival;
 pub mod swarm_pipeline;
 pub mod swarm_scheduler;
+pub mod swarm_command_center;
 pub mod swarm_work_queue;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
