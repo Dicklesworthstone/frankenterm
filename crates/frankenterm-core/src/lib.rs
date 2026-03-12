@@ -92,6 +92,7 @@ pub mod build_coord;
 pub mod byte_compression;
 #[cfg(feature = "subprocess-bridge")]
 pub mod canary_rollout_controller;
+pub mod canary_rehearsal;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
 pub mod capacity_governor;
@@ -151,6 +152,7 @@ pub mod dashboard;
 pub mod dataflow;
 pub mod degradation;
 pub mod dependency_eradication;
+pub mod forbidden_dep_guards;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod diagnostic_redaction;
@@ -445,6 +447,7 @@ pub mod work_stealing_deque;
 pub mod workflows;
 pub mod xor_filter;
 
+pub mod vendored_async_contracts;
 #[cfg(feature = "vendored")]
 pub mod vendored;
 #[cfg(feature = "vendored")]
