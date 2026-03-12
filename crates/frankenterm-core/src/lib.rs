@@ -219,6 +219,7 @@ pub mod lock;
 pub mod lock_orchestration;
 pub mod logging;
 pub mod lru_cache;
+pub mod manifest_dep_eradication;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(feature = "mcp-client")]
@@ -342,6 +343,7 @@ pub mod rope;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
+pub mod runtime_compat_surface_guard;
 pub mod runtime_diagnostics_ux;
 pub mod runtime_health;
 pub mod runtime_performance_contract;
