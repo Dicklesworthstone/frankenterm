@@ -22,15 +22,15 @@ fn arb_workload_category() -> impl Strategy<Value = WorkloadCategory> {
 
 fn arb_pressure_signals() -> impl Strategy<Value = PressureSignals> {
     (
-        0.0..1.0f64,       // cpu_utilization
-        0.0..1.0f64,       // memory_utilization
-        0..5u32,           // active_heavy_workloads
-        0..10u32,          // active_medium_workloads
-        0.0..20.0f64,      // load_average_1m
-        any::<bool>(),     // rch_available
-        0..8u32,           // rch_workers_available
-        0.0..1.0f64,       // io_pressure
-        0..10_000_000u64,  // timestamp_ms
+        0.0..1.0f64,      // cpu_utilization
+        0.0..1.0f64,      // memory_utilization
+        0..5u32,          // active_heavy_workloads
+        0..10u32,         // active_medium_workloads
+        0.0..20.0f64,     // load_average_1m
+        any::<bool>(),    // rch_available
+        0..8u32,          // rch_workers_available
+        0.0..1.0f64,      // io_pressure
+        0..10_000_000u64, // timestamp_ms
     )
         .prop_map(
             |(cpu, mem, heavy, medium, load, rch, workers, io, ts)| PressureSignals {
@@ -213,6 +213,25 @@ proptest! {
         let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
         let is_offload = matches!(decision, GovernorDecision::Offload { .. });
         prop_assert!(is_offload);
+    }
+
+    #[test]
+    fn zero_workers_prevent_rch_offload_even_when_rch_flagged(
+        heavy in 2..5u32,
+    ) {
+        let mut gov = CapacityGovernor::with_defaults();
+        let signals = PressureSignals {
+            cpu_utilization: 0.3,
+            memory_utilization: 0.3,
+            active_heavy_workloads: heavy,
+            rch_available: true,
+            rch_workers_available: 0,
+            ..PressureSignals::default()
+        };
+        let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
+        prop_assert!(!signals.rch_can_offload());
+        let is_throttle = matches!(decision, GovernorDecision::Throttle { .. });
+        prop_assert!(is_throttle);
     }
 
     #[test]

@@ -556,7 +556,8 @@ proptest! {
         // Second message with lower seq
         let e2 = WireEnvelope::new(low_seq, "agent", WirePayload::Gap(gap));
         let result = agg.ingest_envelope(e2).unwrap();
-        prop_assert!(matches!(result, IngestResult::Duplicate { .. }),
+        let check = matches!(result, IngestResult::Duplicate { .. });
+        prop_assert!(check,
             "seq {} after {} should be duplicate", low_seq, high_seq);
 
         prop_assert_eq!(agg.total_accepted(), 1);

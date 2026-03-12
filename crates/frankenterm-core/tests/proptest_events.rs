@@ -936,7 +936,8 @@ proptest! {
         gate.should_notify(&detection, pane_id, None);
         // Second: should be deduplicated
         let result = gate.should_notify(&detection, pane_id, None);
-        prop_assert!(matches!(result, NotifyDecision::Deduplicated { .. }),
+        let check = matches!(result, NotifyDecision::Deduplicated { .. });
+        prop_assert!(check,
             "second event should be deduplicated, got: {:?}", result);
     }
 
@@ -954,11 +955,13 @@ proptest! {
         );
         // Pane A sends
         let r1 = gate.should_notify(&detection, pane_a, None);
-        prop_assert!(matches!(r1, NotifyDecision::Send { .. }),
+        let check_a = matches!(r1, NotifyDecision::Send { .. });
+        prop_assert!(check_a,
             "pane_a should Send, got: {:?}", r1);
         // Pane B also sends (independent)
         let r2 = gate.should_notify(&detection, pane_b, None);
-        prop_assert!(matches!(r2, NotifyDecision::Send { .. }),
+        let check_b = matches!(r2, NotifyDecision::Send { .. });
+        prop_assert!(check_b,
             "pane_b should Send independently, got: {:?}", r2);
     }
 
@@ -1179,9 +1182,11 @@ proptest! {
         // Both should send on first check
         let r1 = gate.should_notify(&d1, pane_id, None);
         let r2 = gate.should_notify(&d2, pane_id, None);
-        prop_assert!(matches!(r1, NotifyDecision::Send { .. }),
+        let check_d1 = matches!(r1, NotifyDecision::Send { .. });
+        prop_assert!(check_d1,
             "d1 first check should Send, got: {:?}", r1);
-        prop_assert!(matches!(r2, NotifyDecision::Send { .. }),
+        let check_d2 = matches!(r2, NotifyDecision::Send { .. });
+        prop_assert!(check_d2,
             "d2 first check should Send, got: {:?}", r2);
     }
 }
