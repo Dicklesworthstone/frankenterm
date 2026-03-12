@@ -460,7 +460,8 @@ proptest! {
         });
         let report = ContinuityReport::from_checks(checks);
         prop_assert!(!report.drill_ready);
-        prop_assert!(matches!(report.overall, ContinuityStatus::Unhealthy(_)));
+        let is_unhealthy = matches!(report.overall, ContinuityStatus::Unhealthy(_));
+        prop_assert!(is_unhealthy);
     }
 
     #[test]
@@ -511,6 +512,7 @@ proptest! {
         }];
         let report = ContinuityReport::from_checks(checks);
         prop_assert!(!report.drill_ready);
-        prop_assert!(matches!(report.overall, ContinuityStatus::Unknown));
+        let is_unknown = matches!(report.overall, ContinuityStatus::Unknown);
+        prop_assert!(is_unknown);
     }
 }
