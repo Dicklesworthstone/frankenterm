@@ -4299,8 +4299,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ActionKind, ActorKind, CompatRuntimeBuilder, Config, McpContext, PaneCapabilities,
-        PaneFilterConfig, PolicySurface, StorageHandle, Tool, WaAccountsRefreshTool,
+        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, McpContext,
+        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
+        WaAccountsRefreshTool,
         WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
         WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
         WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
