@@ -2,7 +2,23 @@
   "schema_version": "1.0.0",
   "artifact": "ntm-fcp-traceability-matrix",
   "bead_id": "ft-3681t.1.5.1",
-  "generated_at_utc": "2026-03-11T22:05:00Z",
+  "generated_at_utc": "2026-03-12T00:27:00Z",
+  "required_capability_ids": [
+    "ft.runtime.observation",
+    "ft.runtime.compatibility_seam",
+    "ft.robot.api.envelope",
+    "ft.patterns.detection",
+    "ft.events.bounded_fanout",
+    "ft.workflow.event_runtime",
+    "ft.policy.authorization",
+    "ft.storage.workflow_audit",
+    "ft.telemetry.unified_schema",
+    "ft.session.snapshot_restore",
+    "ntm.swarm.launcher_weighted",
+    "ntm.work_claim_kernel",
+    "fcp.host_runtime_native",
+    "fcp.connector_bridge_inbound_outbound"
+  ],
   "entries": [
     {
       "capability_id": "ft.runtime.observation",
@@ -208,6 +224,27 @@
       "evidence_notes": "EventBus routes by channel type and tracks subscriber lag/drop telemetry."
     },
     {
+      "capability_id": "ft.workflow.event_runtime",
+      "capability_name": "Event-driven workflow runtime with deterministic lock-mediated execution",
+      "source_domain": "frankenterm",
+      "status": "implemented",
+      "gap_severity": "none",
+      "mapped_bead_ids": [
+        "ft-3681t.3.5"
+      ],
+      "surfaces": [
+        "ft workflow *",
+        "ft robot workflow run",
+        "ft robot workflow status"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm/src/main.rs",
+        "crates/frankenterm-core/src/workflows/engine.rs",
+        "crates/frankenterm-core/src/workflows/runner.rs"
+      ],
+      "evidence_notes": "Workflow execution is already driven from detections through the workflow engine/runner pair, with CLI and robot status/query surfaces riding the same runtime."
+    },
+    {
       "capability_id": "ft.policy.authorization",
       "capability_name": "Action authorization with deny/approval/rate-limit semantics",
       "source_domain": "frankenterm",
@@ -249,6 +286,28 @@
         "crates/frankenterm-core/src/storage.rs"
       ],
       "evidence_notes": "SQLite schema tracks output segments, events, workflows, approvals, and audit actions."
+    },
+    {
+      "capability_id": "ft.telemetry.unified_schema",
+      "capability_name": "Unified telemetry schema with correlation, reason-code, and health enrichment",
+      "source_domain": "frankenterm",
+      "status": "partial",
+      "gap_severity": "low",
+      "mapped_bead_ids": [
+        "ft-3681t.7.1",
+        "ft-e34d9.10.7"
+      ],
+      "surfaces": [
+        "runtime health incident enrichment",
+        "policy metrics dashboard snapshots",
+        "telemetry export/logging"
+      ],
+      "implementation_anchors": [
+        "crates/frankenterm-core/src/runtime_telemetry.rs",
+        "crates/frankenterm-core/src/runtime_health.rs",
+        "crates/frankenterm-core/src/policy_metrics.rs"
+      ],
+      "evidence_notes": "UnifiedTelemetryRecord and the runtime-health enrichment path are live, but full convergence coverage across every downstream subsystem is still being normalized under ft-3681t.7.x."
     },
     {
       "capability_id": "ft.session.snapshot_restore",
@@ -301,30 +360,39 @@
         "ft-3681t.3.2"
       ],
       "surfaces": [
-        "future ft swarm launch/rebalance surfaces"
+        "fleet launch plan metadata",
+        "deterministic phase ordering",
+        "program weight and launch-order queries"
       ],
       "implementation_anchors": [
-        "docs/design/ntm-fcp-convergence-architecture.md"
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/session_profiles.rs",
+        "crates/frankenterm-core/src/mission_loop.rs"
       ],
-      "evidence_notes": "Explicitly tracked in convergence program; awaiting native swarm runtime implementation."
+      "evidence_notes": "FleetLaunchPlan already exposes deterministic slot metadata, phase ordering, program weight rollups, and invariant diagnostics; live launch/rebalance operator surfaces remain downstream."
     },
     {
       "capability_id": "ntm.work_claim_kernel",
       "capability_name": "Dependency-aware work claim and handoff semantics",
       "source_domain": "ntm",
-      "status": "gap",
+      "status": "partial",
       "gap_severity": "medium",
       "mapped_bead_ids": [
         "ft-3681t.3.3",
         "ft-3681t.3.4"
       ],
       "surfaces": [
-        "mission/beads/agent-mail convergence surfaces"
+        "swarm work queue sync",
+        "mission deconfliction/conflict reports",
+        "mission Agent Mail contention signals"
       ],
       "implementation_anchors": [
-        "docs/design/ntm-fcp-convergence-architecture.md"
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/swarm_work_queue.rs",
+        "crates/frankenterm-core/src/mission_loop.rs",
+        "crates/frankenterm-core/src/mission_agent_mail.rs"
       ],
-      "evidence_notes": "Current coordination is externalized to Agent Mail + Beads; native integration remains open."
+      "evidence_notes": "Beads-to-queue sync, claim collision detection, reservation overlap handling, and Agent Mail conflict signaling all exist in-core today; full NTM-parity handoff UX and scheduler integration remain open."
     },
     {
       "capability_id": "fcp.host_runtime_native",
@@ -353,7 +421,7 @@
       "capability_id": "fcp.connector_bridge_inbound_outbound",
       "capability_name": "Connector-to-workflow and workflow-to-connector bridges",
       "source_domain": "fcp",
-      "status": "gap",
+      "status": "partial",
       "gap_severity": "medium",
       "mapped_bead_ids": [
         "ft-3681t.5.6",
@@ -361,12 +429,17 @@
         "ft-3681t.5.8"
       ],
       "surfaces": [
-        "future connector event bus adapters"
+        "connector inbound signal routing",
+        "connector outbound action dispatch",
+        "connector event/audit normalization"
       ],
       "implementation_anchors": [
-        "docs/design/ntm-fcp-convergence-architecture.md"
+        "docs/design/ntm-fcp-convergence-architecture.md",
+        "crates/frankenterm-core/src/connector_inbound_bridge.rs",
+        "crates/frankenterm-core/src/connector_outbound_bridge.rs",
+        "crates/frankenterm-core/src/connector_event_model.rs"
       ],
-      "evidence_notes": "Bridges are specified in architecture contract but not yet implemented."
+      "evidence_notes": "Inbound/outbound bridge primitives, telemetry counters, redaction behavior, and connector event normalization are implemented, but full lifecycle wiring and federated rollout semantics remain downstream."
     }
   ]
 }

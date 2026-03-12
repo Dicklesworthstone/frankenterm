@@ -1,11 +1,11 @@
 # Remote Setup Spec (ft setup remote)
 
 ## Summary
-A guided, idempotent, non-destructive workflow to bootstrap a remote host for compatibility-backend mux usage (current bridge: WezTerm):
+A guided, idempotent, non-destructive workflow to bootstrap a remote host for compatibility-backend mux usage (current bridge: WezTerm + `frankenterm-mux-server`):
 - verify SSH connectivity
 - detect OS + package manager
 - install WezTerm bridge components if missing
-- install and enable `wezterm-mux-server` as a systemd user service (current bridge path)
+- install and enable `frankenterm-mux-server` as a systemd user service
 - enable linger so the mux survives logout
 - optionally install `ft` on the remote
 
@@ -76,7 +76,7 @@ ssh <host> "command -v apt-get || command -v dnf || command -v yum || command -v
 ```
 - Record package manager for later steps.
 
-### 4) Detect WezTerm
+### 4) Detect WezTerm bridge
 Run:
 ```
 ssh <host> "command -v wezterm"
@@ -84,7 +84,7 @@ ssh <host> "wezterm --version"    # if wezterm exists
 ```
 - If missing and `--apply`, proceed to install.
 
-### 5) Install WezTerm (If Missing)
+### 5) Install WezTerm bridge (If Missing)
 Plan depends on package manager:
 
 #### apt (Ubuntu/Debian)
@@ -114,17 +114,17 @@ If no known manager:
 ### 6) Install systemd user service for mux
 Service file path:
 ```
-~/.config/systemd/user/wezterm-mux-server.service
+~/.config/systemd/user/frankenterm-mux-server.service
 ```
 Service content (template):
 ```
 [Unit]
-Description=WezTerm Mux Server
+Description=FrankenTerm Mux Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/wezterm-mux-server --daemonize=false
+ExecStart=/usr/bin/frankenterm-mux-server --daemonize=false
 Restart=on-failure
 RestartSec=2
 
@@ -135,9 +135,9 @@ WantedBy=default.target
 Commands:
 ```
 ssh <host> "mkdir -p ~/.config/systemd/user"
-ssh <host> "cat > ~/.config/systemd/user/wezterm-mux-server.service <<'EOF'\n...EOF"
+ssh <host> "cat > ~/.config/systemd/user/frankenterm-mux-server.service <<'EOF'\n...EOF"
 ssh <host> "systemctl --user daemon-reload"
-ssh <host> "systemctl --user enable --now wezterm-mux-server"
+ssh <host> "systemctl --user enable --now frankenterm-mux-server"
 ```
 
 ### 7) Enable linger (mux survives logout)
@@ -149,7 +149,7 @@ ssh <host> "sudo loginctl enable-linger $USER"
 
 ### 8) Verify service
 ```
-ssh <host> "systemctl --user status wezterm-mux-server"
+ssh <host> "systemctl --user status frankenterm-mux-server"
 ```
 - Parse status; report active/inactive.
 
@@ -162,7 +162,7 @@ ssh <host> "chmod +x ~/.local/bin/ft"
 ```
 - Alternative (if no local binary):
 ```
-ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft"
+ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git frankenterm"
 ```
 
 ---
@@ -192,19 +192,19 @@ ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm
 ## Rollback Plan
 - Disable service:
 ```
-ssh <host> "systemctl --user disable --now wezterm-mux-server"
+ssh <host> "systemctl --user disable --now frankenterm-mux-server"
 ```
-- Remove service file (manual; not automated by ft):
+- Archive service file manually (not automated by ft):
 ```
-ssh <host> "rm ~/.config/systemd/user/wezterm-mux-server.service"
+ssh <host> "mv ~/.config/systemd/user/frankenterm-mux-server.service ~/.config/systemd/user/frankenterm-mux-server.service.disabled"
 ```
 - Disable linger:
 ```
 ssh <host> "sudo loginctl disable-linger $USER"
 ```
-- Remove `ft` binary (manual):
+- Archive `ft` binary manually:
 ```
-ssh <host> "rm ~/.local/bin/ft"
+ssh <host> "mv ~/.local/bin/ft ~/.local/bin/ft.disabled"
 ```
 
 ---

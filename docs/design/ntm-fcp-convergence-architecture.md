@@ -28,11 +28,16 @@ This artifact is intended to remove ambiguity for downstream implementation bead
 | Durable eventing | Persisted events with triage, labels, notes, dedupe keys | `ft events`, `ft robot events` | `crates/frankenterm-core/src/storage.rs` (`events`, `event_labels`, `event_notes`) |
 | Search | Lexical FTS + semantic/hybrid facade | `ft search`, `ft robot search` | `crates/frankenterm-core/src/storage.rs`, `crates/frankenterm-core/src/search/*` |
 | Workflow automation | Event-driven workflows with pane locks and persistence | `ft workflow *`, `ft robot workflow *` | `crates/frankenterm-core/src/workflows/*`, `crates/frankenterm-core/src/events.rs`, `crates/frankenterm-core/src/storage.rs` |
+| Workflow runtime contract | Detection-triggered runner + durable execution engine | `ft workflow *`, `ft robot workflow *` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/workflows/engine.rs`, `crates/frankenterm-core/src/workflows/runner.rs` |
 | Safe mutation gates | Capability/rate-limit/approval policy before send/run | `ft send`, `ft approve`, MCP tools | `crates/frankenterm-core/src/policy.rs`, `crates/frankenterm-core/src/approval.rs`, `crates/frankenterm-core/src/command_guard.rs` |
 | Machine API | Robot envelope + MCP parity | `ft robot *`, `ft mcp serve` | `crates/frankenterm-core/src/robot_types.rs`, `crates/frankenterm-core/src/mcp.rs` |
 | Robot search diagnostics | Explainability + index maintenance surfaces for machine clients | `ft robot search-explain`, `ft robot search-index *` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/search/facade.rs`, `crates/frankenterm-core/src/search_explain.rs` |
 | Agent inventory | Installed/running agent detection exposed to robot callers | `ft robot agents list/running/detect` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/agent_correlator.rs` |
 | Mission and tx introspection | Filtered mission state/decisions plus transaction plan/run/rollback/show | `ft robot mission *`, `ft robot tx *` | `crates/frankenterm/src/main.rs`, `crates/frankenterm-core/src/plan.rs`, `crates/frankenterm-core/src/mcp_missions.rs`, `crates/frankenterm-core/src/tx_plan_compiler.rs` |
+| Swarm launch metadata | Weighted launch plans, phased slot ordering, invariant checks | mission/session launch planning | `crates/frankenterm-core/src/session_profiles.rs`, `crates/frankenterm-core/src/mission_loop.rs` |
+| Work-claim and deconfliction kernel | Beads queue sync, conflict detection, Agent Mail signal emission | mission planning + work assignment | `crates/frankenterm-core/src/swarm_work_queue.rs`, `crates/frankenterm-core/src/mission_loop.rs`, `crates/frankenterm-core/src/mission_agent_mail.rs` |
+| Unified telemetry schema | Cross-plane health/telemetry normalization and rollup | runtime health + policy/connector telemetry | `crates/frankenterm-core/src/runtime_telemetry.rs`, `crates/frankenterm-core/src/runtime_health.rs`, `crates/frankenterm-core/src/policy_metrics.rs` |
+| Connector bridge primitives | Inbound signal routing + outbound event-to-action bridge | connector runtime integration | `crates/frankenterm-core/src/connector_inbound_bridge.rs`, `crates/frankenterm-core/src/connector_outbound_bridge.rs`, `crates/frankenterm-core/src/connector_event_model.rs` |
 | Session continuity | Snapshots/session restore tracks | `ft snapshot *`, `ft session *` | `crates/frankenterm-core/src/snapshot_engine.rs`, `crates/frankenterm-core/src/session_restore.rs` |
 | Reservation/coordination | Pane-level reservations and ownership metadata | `ft reserve`, `ft reservations` | `crates/frankenterm-core/src/storage.rs` (`pane_reservations`), `crates/frankenterm-core/src/policy.rs` |
 | Headless/remote mux | Dedicated mux server + implementation crate | `frankenterm-mux-server` | `crates/frankenterm-mux-server*` |
@@ -74,9 +79,9 @@ This artifact is intended to remove ambiguity for downstream implementation bead
 | Deterministic wait/automation loops | Implemented (`wait-for`, workflows, rules, events) | Superset | Add explicit orchestration contracts for multi-agent mission plans |
 | Safety-gated command execution | Implemented with policy+approval+audit | Superset | Tighten policy-to-connector action mapping once connector fabric lands |
 | Shared machine API for agents | Implemented (`robot` + `mcp`) | Superset | Stabilize schema versioning and backward-compat contract per endpoint |
-| Work claim/coordination primitives | Partially implemented (pane reservations, Agent Mail external) | Gap | Promote work-claim semantics to first-class FrankenTerm mission layer |
+| Work claim/coordination primitives | Partially implemented (queue sync, conflict detection, Agent Mail conflict signals, pane reservations) | Gap | Promote current kernels into a first-class FrankenTerm mission/work-claim layer with stable public contracts |
 | Multi-host swarm federation | Early/feature-gated distributed mode | Gap | Production hardening for reconnect, replay, and failover semantics |
-| Connector-triggered orchestration | Not yet native in core runtime | Gap | Introduce connector runtime and event adapter boundaries |
+| Connector-triggered orchestration | Partially implemented (inbound/outbound bridge primitives + connector event model) | Gap | Promote bridge primitives into a fully policy/audit integrated connector runtime |
 | Mission-level transactionality | Partially present (`tx`/mission commands) | Gap | Unify mission transaction contracts with policy, audit, and rollback evidence |
 
 ## Flywheel Connector Fabric Integration Contract
@@ -146,23 +151,30 @@ This contract now includes a machine-checkable baseline matrix and validation sc
 - Matrix artifact: `docs/design/ntm-fcp-traceability-matrix.json`
 - Rust validator tests: `crates/frankenterm-core/tests/ntm_fcp_traceability_matrix.rs`
 - E2E harness: `tests/e2e/test_ft_3681t_1_5_1_traceability_matrix.sh`
+- Required baseline capability list: `required_capability_ids` in the matrix artifact
 
 ### Validation Commands
 
 Use remote offload for cargo-heavy checks:
 
 ```bash
+rch workers probe --json --all
 rch exec -- cargo test -p frankenterm-core --test ntm_fcp_traceability_matrix --no-default-features -- --nocapture
 tests/e2e/test_ft_3681t_1_5_1_traceability_matrix.sh
 ```
 
+The shell harness treats unreachable `rch` workers as incomplete verification and
+refuses local cargo fallback.
+
 ### Matrix Contract Rules
 
 1. Every entry must have a unique `capability_id`.
-2. High/medium gaps must map to at least one `ft-*` bead.
-3. All `implementation_anchors` must resolve to existing in-repo paths.
-4. `status`/`gap_severity` combinations must be coherent (`gap` cannot have `none`; `implemented` cannot have `medium`/`high`).
-5. This matrix is the baseline artifact for future T1/T2 reconciliation and drift checks.
+2. `required_capability_ids` must be present, unique, and each must map to an entry.
+3. High/medium gaps must map to at least one `ft-*` bead.
+4. All `implementation_anchors` must resolve to existing in-repo paths.
+5. `implemented` and `partial` entries must include at least one non-prose implementation anchor.
+6. `status`/`gap_severity` combinations must be coherent (`gap` cannot have `none`; `implemented` cannot have `medium`/`high`).
+7. This matrix is the baseline artifact for future T1/T2 reconciliation and drift checks.
 
 ## Immediate Follow-On Actions
 
