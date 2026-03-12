@@ -413,6 +413,7 @@ pub mod tx_observability;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
 pub mod undo;
+pub mod unified_telemetry;
 pub mod union_find;
 pub mod user_preferences;
 pub mod utf8_chunked;
