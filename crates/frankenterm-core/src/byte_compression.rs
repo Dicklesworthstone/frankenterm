@@ -125,6 +125,7 @@ impl CompressionStats {
 // =============================================================================
 
 /// Zstd-based byte compressor with optional dictionary support.
+#[derive(Debug)]
 pub struct ByteCompressor {
     config: ByteCompressionConfig,
     dictionary: Option<Vec<u8>>,

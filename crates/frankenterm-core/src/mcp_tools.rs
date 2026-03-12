@@ -4337,6 +4337,25 @@ mod tests {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
                 .await
                 .unwrap();
+            // Ensure pane exists to satisfy foreign key constraint.
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 7,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("test-pane".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .unwrap();
             storage
                 .record_event(crate::storage::StoredEvent {
                     id: 0,
