@@ -1031,6 +1031,25 @@ mod tests {
             let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
                 .await
                 .expect("storage should initialize");
+            // Insert a pane record so the audit_actions FK constraint is satisfied
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id: 9,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: None,
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("pane upsert should succeed");
             record_workflow_step_action(
                 &storage,
                 "handle_compaction",

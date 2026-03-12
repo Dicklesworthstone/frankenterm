@@ -85,6 +85,7 @@ pub mod bayesian_ledger;
 pub mod beads_bridge;
 #[cfg(feature = "subprocess-bridge")]
 pub mod beads_types;
+pub mod beta_feedback_loop;
 pub mod bimap;
 pub mod binomial_heap;
 pub mod bloom_filter;
