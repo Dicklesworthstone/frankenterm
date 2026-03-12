@@ -1947,7 +1947,6 @@ fn ms_u64(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::CompatRuntime;
     use std::cell::Cell;
     use std::sync::Arc;
     #[cfg(not(feature = "asupersync-runtime"))]

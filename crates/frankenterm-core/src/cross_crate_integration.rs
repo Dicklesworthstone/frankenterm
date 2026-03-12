@@ -24,8 +24,6 @@
 //!   └── RecoverySafety (no data loss on failure)
 //! ```
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -651,6 +649,7 @@ impl SuiteReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn standard_scenarios_cover_key_categories() {
