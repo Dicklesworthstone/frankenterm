@@ -19,6 +19,7 @@ fn arb_violation_severity() -> impl Strategy<Value = ViolationSeverity> {
     ]
 }
 
+#[allow(dead_code)]
 fn arb_forbidden_runtime() -> impl Strategy<Value = ForbiddenRuntime> {
     prop_oneof![
         Just(ForbiddenRuntime::Tokio),
