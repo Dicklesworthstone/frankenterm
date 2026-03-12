@@ -229,6 +229,7 @@ pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
+pub mod migration_artifact_contracts;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "subprocess-bridge")]
@@ -427,6 +428,7 @@ pub mod unified_telemetry;
 pub mod union_find;
 pub mod user_preferences;
 pub mod utf8_chunked;
+pub mod ux_scenario_validation;
 pub mod van_emde_boas;
 #[cfg(feature = "vc-export")]
 pub mod vc_export;
