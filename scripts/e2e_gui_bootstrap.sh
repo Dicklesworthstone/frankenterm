@@ -28,6 +28,8 @@ pass_count=0
 fail_count=0
 skip_count=0
 LAST_SKIP_REASON=""
+BUILD_STEP_STATUS="not_run"
+BUILD_STEP_DETAIL=""
 
 mkdir -p "$LOG_DIR"
 
@@ -82,6 +84,16 @@ emit_step_json() {
 
 mark_skip() {
   LAST_SKIP_REASON="$1"
+  return 0
+}
+
+skip_if_build_failed() {
+  local dependent_surface="$1"
+  if [[ "$BUILD_STEP_STATUS" == "failed" ]]; then
+    local detail="${BUILD_STEP_DETAIL:-build step failed}"
+    mark_skip "${detail}; ${dependent_surface}"
+    return 125
+  fi
   return 0
 }
 
@@ -160,25 +172,41 @@ PY
 
 build_gui() {
   if [[ "$SKIP_BUILD" -eq 1 ]]; then
+    BUILD_STEP_STATUS="skipped"
+    BUILD_STEP_DETAIL="build step skipped"
     mark_skip "--skip-build set"
     return 125
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
+    BUILD_STEP_STATUS="dry-run"
+    BUILD_STEP_DETAIL="dry-run"
     run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
       cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"
     return 0
   fi
   if ! require_rch; then
+    BUILD_STEP_STATUS="failed"
+    BUILD_STEP_DETAIL="build step failed (rch not found)"
     log "rch not found at '$RCH_BIN'"
     return 1
   fi
   if ! probe_rch_workers; then
+    BUILD_STEP_STATUS="failed"
+    BUILD_STEP_DETAIL="build step failed (no reachable RCH workers)"
     log "No reachable RCH workers detected; refusing local cargo fallback."
     log "See $RCH_PROBE_LOG for probe details."
     return 1
   fi
-  run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
-    cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"
+  if run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
+    cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
+    BUILD_STEP_STATUS="success"
+    BUILD_STEP_DETAIL=""
+    return 0
+  fi
+
+  BUILD_STEP_STATUS="failed"
+  BUILD_STEP_DETAIL="build step failed (rch cargo build returned non-zero)"
+  return 1
 }
 
 verify_binary_exists() {
@@ -186,6 +214,7 @@ verify_binary_exists() {
     mark_skip "dry-run (binary not materialized)"
     return 125
   fi
+  skip_if_build_failed "GUI binary unavailable" || return $?
   [[ -x "$GUI_BIN" ]]
 }
 
@@ -194,6 +223,7 @@ verify_binary_format() {
     mark_skip "dry-run (binary format check skipped)"
     return 125
   fi
+  skip_if_build_failed "GUI binary unavailable" || return $?
   local file_info
   file_info="$(file "$GUI_BIN")"
   log "$file_info"
@@ -207,10 +237,12 @@ verify_binary_format() {
 }
 
 verify_help_output() {
+  skip_if_build_failed "GUI binary unavailable" || return $?
   run_cmd "$GUI_BIN" --help >/dev/null
 }
 
 verify_version_output() {
+  skip_if_build_failed "GUI binary unavailable" || return $?
   local out
   out="$(run_cmd "$GUI_BIN" --version)"
   [[ -n "$out" ]]
@@ -237,6 +269,7 @@ validate_macos_bundle() {
     mark_skip "dry-run (bundle validation skipped)"
     return 125
   fi
+  skip_if_build_failed "bundle inputs unavailable" || return $?
 
   mkdir -p "$BUNDLE_OUTPUT_DIR"
   run_cmd "$PROJECT_ROOT/scripts/create-macos-bundle.sh" --skip-build --output "$BUNDLE_OUTPUT_DIR"
@@ -266,6 +299,7 @@ launch_gui_smoke() {
     log "[DRY-RUN] $GUI_BIN --skip-config start --always-new-process > $gui_log 2>&1 &"
     return 0
   fi
+  skip_if_build_failed "GUI binary unavailable" || return $?
 
   "$GUI_BIN" --skip-config start --always-new-process >"$gui_log" 2>&1 &
   gui_pid="$!"

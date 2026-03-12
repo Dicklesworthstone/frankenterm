@@ -216,6 +216,18 @@ scenario_e2e_probe_failure_refuses_exec() {
     record_result "e2e_probe_failure_refuses_exec" "false" "missing_guardrail_message" "FAIL_OPEN_MESSAGE_MISSING" "missing fail-closed message"
     return
   fi
+  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (no reachable RCH workers); GUI binary unavailable)' "${stdout_file}"; then
+    record_result "e2e_probe_failure_refuses_exec" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after build failure"
+    return
+  fi
+  if grep -q '\[FAIL\] 2. verify GUI binary exists' "${stdout_file}"; then
+    record_result "e2e_probe_failure_refuses_exec" "false" "cascade_failure_present" "CASCADE_FAILURE_PRESENT" "dependent GUI binary check still failed instead of skipping"
+    return
+  fi
+  if ! grep -q 'Summary: pass=0 fail=1 skip=6 total=7' "${stdout_file}"; then
+    record_result "e2e_probe_failure_refuses_exec" "false" "unexpected_summary" "SUMMARY_MISMATCH" "probe-failure summary did not collapse to a single root-cause failure"
+    return
+  fi
   if ! jq -e '.data[0].status == "connection_failed"' "${probe_log}" >/dev/null; then
     record_result "e2e_probe_failure_refuses_exec" "false" "probe_artifact_missing" "PROBE_LOG_INVALID" "probe artifact missing connection_failed status"
     return

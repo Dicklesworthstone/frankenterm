@@ -92,6 +92,10 @@ fn array_field<'a>(value: &'a Value, key: &str) -> Result<&'a [Value], String> {
         .ok_or_else(|| format!("field `{key}` must be an array"))
 }
 
+fn anchor_is_prose_only(path: &str) -> bool {
+    path.starts_with("docs/design/") || path == "docs/ft-3681t-convergence-architecture.md"
+}
+
 fn validate_matrix_schema(matrix: &Value, root: &Path) -> Result<(), String> {
     let schema_version = string_field(matrix, "schema_version")?;
     if schema_version.trim().is_empty() {
@@ -111,9 +115,25 @@ fn validate_matrix_schema(matrix: &Value, root: &Path) -> Result<(), String> {
     }
 
     let _generated_at = string_field(matrix, "generated_at_utc")?;
+    let required_capability_ids = array_field(matrix, "required_capability_ids")?;
+    if required_capability_ids.is_empty() {
+        return Err("required_capability_ids must not be empty".to_string());
+    }
     let entries = array_field(matrix, "entries")?;
     if entries.is_empty() {
         return Err("entries must not be empty".to_string());
+    }
+
+    let mut required_capability_set = HashSet::new();
+    for required in required_capability_ids {
+        let capability_id = required
+            .as_str()
+            .ok_or_else(|| "required_capability_ids entries must be strings".to_string())?;
+        if !required_capability_set.insert(capability_id.to_string()) {
+            return Err(format!(
+                "duplicate required capability id `{capability_id}`"
+            ));
+        }
     }
 
     let mut seen_capability_ids = HashSet::new();
@@ -191,6 +211,7 @@ fn validate_matrix_schema(matrix: &Value, root: &Path) -> Result<(), String> {
             }
         }
 
+        let mut has_non_prose_anchor = false;
         for anchor in anchors {
             let anchor_path = anchor
                 .as_str()
@@ -201,7 +222,27 @@ fn validate_matrix_schema(matrix: &Value, root: &Path) -> Result<(), String> {
                     "entry `{capability_id}` anchor does not exist: `{anchor_path}`"
                 ));
             }
+            if !anchor_is_prose_only(anchor_path) {
+                has_non_prose_anchor = true;
+            }
         }
+
+        if matches!(status, "implemented" | "partial") && !has_non_prose_anchor {
+            return Err(format!(
+                "entry `{capability_id}` status `{status}` must include at least one code/schema/test anchor"
+            ));
+        }
+    }
+
+    let missing_required = required_capability_set
+        .difference(&seen_capability_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        return Err(format!(
+            "matrix missing required capability ids: {}",
+            missing_required.join(", ")
+        ));
     }
 
     Ok(())
@@ -274,6 +315,42 @@ fn traceability_matrix_mapped_bead_ids_exist_in_beads_export() {
 }
 
 #[test]
+fn traceability_matrix_includes_required_baseline_capabilities() {
+    let root = repo_root();
+    let path = matrix_path(&root);
+    let matrix = load_matrix(&path);
+
+    let required = array_field(&matrix, "required_capability_ids")
+        .expect("required_capability_ids array should exist");
+    let entries = array_field(&matrix, "entries").expect("entries array should exist");
+    let present = entries
+        .iter()
+        .map(|entry| {
+            string_field(entry, "capability_id")
+                .expect("capability_id should exist")
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+
+    let missing = required
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("required capability ids should be strings")
+        })
+        .filter(|capability_id| !present.contains(*capability_id))
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "traceability matrix is missing required baseline capability ids: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
 fn traceability_matrix_validation_detects_unmapped_high_gap() {
     let root = repo_root();
     let path = matrix_path(&root);
@@ -300,5 +377,39 @@ fn traceability_matrix_validation_detects_unmapped_high_gap() {
     assert!(
         err.contains("unmapped high/medium gap"),
         "unexpected error for unmapped gap: {err}"
+    );
+}
+
+#[test]
+fn traceability_matrix_validation_detects_missing_required_capability() {
+    let root = repo_root();
+    let path = matrix_path(&root);
+    let mut matrix = load_matrix(&path);
+
+    let required_capability = matrix
+        .get("required_capability_ids")
+        .and_then(Value::as_array)
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("required_capability_ids should contain at least one capability")
+        .to_string();
+
+    let entries = matrix
+        .get_mut("entries")
+        .and_then(Value::as_array_mut)
+        .expect("entries must be mutable array");
+    entries.retain(|entry| {
+        entry
+            .get("capability_id")
+            .and_then(Value::as_str)
+            .is_none_or(|capability_id| capability_id != required_capability)
+    });
+
+    let err = validate_matrix_schema(&matrix, &root)
+        .expect_err("validator should reject missing required baseline capabilities");
+    assert!(
+        err.contains("matrix missing required capability ids")
+            && err.contains(&required_capability),
+        "unexpected error for missing required capability: {err}"
     );
 }
