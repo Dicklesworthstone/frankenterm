@@ -623,11 +623,14 @@ impl ScopeTree {
     #[must_use]
     pub fn descendants(&self, id: &ScopeId) -> Vec<ScopeId> {
         let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
 
         if let Some(node) = self.nodes.get(id) {
             for cid in &node.children {
-                queue.push_back(cid.clone());
+                if visited.insert(cid.clone()) {
+                    queue.push_back(cid.clone());
+                }
             }
         }
 
@@ -635,7 +638,9 @@ impl ScopeTree {
             result.push(current.clone());
             if let Some(node) = self.nodes.get(&current) {
                 for cid in &node.children {
-                    queue.push_back(cid.clone());
+                    if visited.insert(cid.clone()) {
+                        queue.push_back(cid.clone());
+                    }
                 }
             }
         }
