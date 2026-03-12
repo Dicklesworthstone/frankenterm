@@ -101,6 +101,7 @@ pub mod cass;
 pub mod causal_dag;
 pub mod caut;
 pub mod chaos;
+pub mod chaos_scale_harness;
 pub mod circuit_breaker;
 pub mod cleanup;
 #[cfg(feature = "subprocess-bridge")]
@@ -329,6 +330,7 @@ pub mod rope;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_compat;
+pub mod runtime_diagnostics_ux;
 pub mod runtime_health;
 pub mod runtime_performance_contract;
 pub mod runtime_slo_gates;
