@@ -5,15 +5,11 @@
 //! recovery paths, and structured artifact schema validation.
 
 use frankenterm_core::migration_artifact_contracts::{
-    ArtifactContract, ArtifactType, CollectedArtifact, MigrationManifest, MigrationStep,
-    StepVerification, VerificationReport, VerificationVerdict, standard_artifact_contracts,
+    ArtifactType, CollectedArtifact, MigrationManifest, VerificationReport, VerificationVerdict,
+    standard_artifact_contracts,
 };
-use frankenterm_core::runtime_compat::{
-    self, CompatRuntime, RuntimeBuilder, SurfaceDisposition, SURFACE_CONTRACT_V1,
-};
-use frankenterm_core::runtime_compat_surface_guard::{
-    SurfaceGuardReport, standard_guard_checks, standard_surface_entries,
-};
+use frankenterm_core::runtime_compat::{self, CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_compat_surface_guard::{SurfaceGuardReport, standard_guard_checks};
 
 // =========================================================================
 // Helpers
@@ -537,10 +533,10 @@ fn e2e_surface_guard_and_migration_gate_both_pass() {
     let migration_report = VerificationReport::verify(&manifest, &artifacts);
 
     // Both should pass
-    let guard_ok = guard_report.overall_compliant
+    let _guard_ok = guard_report.overall_compliant
         || guard_report.guard_checks.iter().all(|c| c.compliant);
     assert_eq!(migration_report.verdict, VerificationVerdict::Complete);
-    // guard_ok may or may not be true depending on standard check state
+    // _guard_ok may or may not be true depending on standard check state
     // but we verify both pipelines execute without panicking
 
     // Cross-reference: the dependency-scan artifact would normally verify
