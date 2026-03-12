@@ -76,6 +76,8 @@ Watcher startup currently wires these components in-process:
 - capture relay and queueing
 - persistence + detection (`spawn_persistence_task`)
 - maintenance/retention and snapshot triggers.
+- burst protection on native output via `NativeOutputCoalescer` before segments
+  hit storage/pattern scanning.
 
 Core passive loop contract: observe/store/detect only. Side effects are delegated to workflow/policy layers.
 
@@ -84,6 +86,8 @@ Core passive loop contract: observe/store/detect only. Side effects are delegate
 - `wezterm.rs`: backend adapter trait (`WeztermInterface`) and concrete handle construction.
 - `ingest.rs`: pane discovery, fingerprinting, delta extraction, gap generation, ingest telemetry.
 - `storage.rs`: SQLite schema, migrations, WAL mode, FTS5 index/triggers, writer queue, query APIs.
+- `search/*`: lexical, semantic, and hybrid retrieval services layered on the
+  same storage substrate.
 - `patterns.rs`: rule packs, anchor/regex matching, telemetry, detection objects.
 - `events.rs`: bounded broadcast fanout and typed event stream (`PatternDetected`, `GapDetected`, workflow lifecycle, user-var events).
 - `workflows/`: durable workflow trait/execution engine/runner/locks and step orchestration.
@@ -105,6 +109,9 @@ This schema is the contract behind status/search/events/workflow/audit CLI and r
 ### Robot mode + policy seam
 
 - Robot command handling lives in `crates/frankenterm/src/main.rs` under `RobotCommands`.
+- `crates/frankenterm-core/src/robot_api_contracts.rs` is the clearest machine
+  contract inventory for the current robot surface (search/events/workflow/rules/
+  reservations/mission/tx families).
 - Robot read paths (`state`, `get-text`, `search`, `events`) use WezTerm/storage + policy checks.
 - Robot/action paths (`send`, workflow run, approvals) are routed through policy-gated injectors and workflow runners.
 - MCP mirrors this model through feature-gated core modules (`mcp*` in `frankenterm-core` + `Commands::Mcp` in CLI).
@@ -113,6 +120,9 @@ This schema is the contract behind status/search/events/workflow/audit CLI and r
 
 - Optional surfaces are enabled via crate features (`mcp`, `web`, `distributed`, `metrics`, `tui`, `ftui`, `sync`, `semantic-search`, `native-wezterm`, etc.).
 - Current operational backend remains WezTerm compatibility bridge (`wezterm.rs` + vendored integrations), while native/runtime expansion continues in `frankenterm-core`.
+- Headless mux/server work is already split into `crates/frankenterm-mux-server`
+  and `crates/frankenterm-mux-server-impl`, which means native mux/server
+  evolution is a validation/productization problem more than a bootstrap-one.
 
 ## Deterministic state (OSC 133)
 
