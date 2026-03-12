@@ -138,6 +138,7 @@ pub mod cost_tracker;
 pub mod count_min_sketch;
 pub mod cpu_pressure;
 pub mod crash;
+pub mod crash_persistence_gate;
 pub mod crdt;
 pub mod cross_crate_integration;
 pub mod cross_pane_correlation;
