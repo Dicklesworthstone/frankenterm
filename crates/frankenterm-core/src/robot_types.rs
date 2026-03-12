@@ -997,7 +997,8 @@ pub struct AgentConfigureResultItem {
     pub display_name: String,
     /// What action was taken.
     pub action: String,
-    /// Target file path (relative).
+    /// Target file path; project scope is workspace-relative, global scope is
+    /// absolute when the detected root can be resolved.
     pub filename: String,
     /// Whether a backup was created before modification.
     pub backup_created: bool,
@@ -1034,7 +1035,8 @@ pub struct AgentConfigurePlanItem {
     pub config_kind: String,
     /// Where the file would be placed.
     pub scope: String,
-    /// Target file path (relative).
+    /// Target file path; project scope is workspace-relative, global scope is
+    /// absolute when the detected root can be resolved.
     pub filename: String,
     /// Whether the target file already exists.
     pub file_exists: bool,

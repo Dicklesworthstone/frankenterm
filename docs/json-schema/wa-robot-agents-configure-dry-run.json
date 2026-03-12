@@ -73,7 +73,7 @@
         },
         "filename": {
           "type": "string",
-          "description": "Target file path; project scope is workspace-relative, global scope is absolute"
+          "description": "Target file path; project scope is workspace-relative, global scope is absolute when the detected root can be resolved"
         },
         "file_exists": {
           "type": "boolean",
