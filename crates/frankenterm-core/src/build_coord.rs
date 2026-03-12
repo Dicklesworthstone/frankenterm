@@ -435,12 +435,22 @@ pub fn detect_cargo_command(command: &str) -> Option<&str> {
 #[must_use]
 pub fn command_uses_rch(command: &str) -> bool {
     let tokens = command_tokens(command);
-    let idx = skip_command_prefixes(&tokens, 0);
-    matches!(
-        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
-        (Some(cmd), Some(exec), Some(sep))
-            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
-    )
+    let mut segment_start = 0;
+
+    while segment_start < tokens.len() {
+        let idx = skip_command_prefixes(&tokens, segment_start);
+        if matches!(
+            (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
+            (Some(cmd), Some(exec), Some(sep))
+                if is_rch_binary(cmd) && exec == "exec" && sep == "--"
+        ) {
+            return true;
+        }
+
+        segment_start = next_command_segment_start(&tokens, segment_start);
+    }
+
+    false
 }
 
 /// Returns true when the command is a heavy cargo workload that should be offloaded.
@@ -476,21 +486,31 @@ fn command_tokens(command: &str) -> Vec<String> {
 }
 
 fn cargo_payload_tokens(tokens: &[String]) -> Option<&[String]> {
-    let mut idx = skip_command_prefixes(tokens, 0);
+    let mut segment_start = 0;
 
-    if matches!(
-        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
-        (Some(cmd), Some(exec), Some(sep))
-            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
-    ) {
-        idx += 3;
+    while segment_start < tokens.len() {
+        let mut idx = skip_command_prefixes(tokens, segment_start);
+
+        if matches!(
+            (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
+            (Some(cmd), Some(exec), Some(sep))
+                if is_rch_binary(cmd) && exec == "exec" && sep == "--"
+        ) {
+            idx += 3;
+        }
+
+        idx = skip_command_prefixes(tokens, idx);
+        if matches!(
+            tokens.get(idx).map(String::as_str),
+            Some("cargo" | "cargo-nextest")
+        ) {
+            return Some(&tokens[idx..]);
+        }
+
+        segment_start = next_command_segment_start(tokens, segment_start);
     }
 
-    idx = skip_command_prefixes(tokens, idx);
-    match tokens.get(idx).map(String::as_str) {
-        Some("cargo" | "cargo-nextest") => Some(&tokens[idx..]),
-        _ => None,
-    }
+    None
 }
 
 fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
@@ -521,6 +541,19 @@ fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
     idx
 }
 
+fn next_command_segment_start(tokens: &[String], start: usize) -> usize {
+    let mut idx = start;
+
+    while let Some(token) = tokens.get(idx) {
+        idx += 1;
+        if is_shell_command_separator(token) {
+            break;
+        }
+    }
+
+    idx
+}
+
 fn skip_env_assignments(tokens: &[String], mut idx: usize) -> usize {
     while let Some(token) = tokens.get(idx) {
         if is_env_assignment(token) {
@@ -539,6 +572,10 @@ fn is_env_assignment(token: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_shell_command_separator(token: &str) -> bool {
+    matches!(token, "&&" | "||" | ";" | "|" | "&")
 }
 
 fn is_rch_binary(token: &str) -> bool {
@@ -940,6 +977,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_cargo_command_in_chained_shell_segment() {
+        assert_eq!(
+            detect_cargo_command("cd /tmp && cargo test -p frankenterm-core -- --nocapture"),
+            Some("test")
+        );
+        assert_eq!(
+            detect_cargo_command("pwd ; TMPDIR=/tmp rch exec -- cargo check --help"),
+            Some("check")
+        );
+    }
+
+    #[test]
     fn command_uses_rch_detects_common_prefix_shapes() {
         assert!(command_uses_rch("rch exec -- cargo test --workspace"));
         assert!(command_uses_rch(
@@ -950,6 +999,10 @@ mod tests {
         ));
         assert!(!command_uses_rch("cargo test --workspace"));
         assert!(!command_uses_rch("env CARGO_TARGET_DIR=target cargo test"));
+        assert!(command_uses_rch(
+            "cd /tmp && TMPDIR=/tmp rch exec -- cargo check --help"
+        ));
+        assert!(!command_uses_rch("cd /tmp && cargo test --workspace"));
     }
 
     #[test]
@@ -959,6 +1012,9 @@ mod tests {
         assert!(is_heavy_cargo_command("cargo nextest run"));
         assert!(is_heavy_cargo_command(
             "TMPDIR=/tmp rch exec -- cargo clippy"
+        ));
+        assert!(is_heavy_cargo_command(
+            "cd /tmp && cargo test -p frankenterm-core -- --nocapture"
         ));
         assert!(!is_heavy_cargo_command("cargo fmt --check"));
         assert!(!is_heavy_cargo_command("cargo metadata"));
@@ -975,6 +1031,12 @@ mod tests {
         ));
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- env CARGO_TARGET_DIR=target cargo check --help"
+        ));
+        assert!(requires_rch_offload(
+            "cd /tmp && cargo test -p frankenterm-core -- --nocapture"
+        ));
+        assert!(!requires_rch_offload(
+            "cd /tmp && TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core -- --nocapture"
         ));
     }
 

@@ -6847,12 +6847,37 @@ mod tests {
     }
 
     #[test]
+    fn robot_chained_heavy_cargo_without_rch_requires_approval() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cd /tmp && cargo test -p frankenterm-core -- --nocapture");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some(RCH_HEAVY_COMPUTE_RULE_ID));
+    }
+
+    #[test]
     fn robot_heavy_cargo_with_rch_prefix_is_allowed() {
         let mut engine = PolicyEngine::permissive();
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
             .with_pane(1)
             .with_capabilities(PaneCapabilities::prompt())
             .with_command_text("TMPDIR=/tmp rch exec -- cargo check --help");
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn robot_chained_heavy_cargo_with_rch_prefix_is_allowed() {
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("cd /tmp && TMPDIR=/tmp rch exec -- cargo check --help");
 
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
