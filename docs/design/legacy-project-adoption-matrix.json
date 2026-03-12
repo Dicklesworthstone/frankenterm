@@ -1,0 +1,535 @@
+{
+  "schema_version": "1.0.0",
+  "artifact": "legacy-project-adoption-matrix",
+  "generated_at_utc": "2026-03-11T22:47:00Z",
+  "primary_bead_id": "ft-3681t.1.5",
+  "status_source": ".beads/issues.jsonl",
+  "related_artifacts": [
+    "docs/design/ntm-fcp-traceability-matrix.json",
+    "docs/design/ntm-fcp-convergence-architecture.md",
+    "docs/ft-3681t-convergence-architecture.md"
+  ],
+  "legacy_repo_sync": {
+    "script_path": "scripts/pull-legacy-repos.sh",
+    "script_intent": "daily via cron or launchd",
+    "configured_in_repo": false,
+    "alignment_status": "manual_and_misaligned",
+    "script_repo_roots": [
+      "/dp/ghostty",
+      "/dp/wezterm",
+      "/dp/zellij",
+      "/dp/rio"
+    ],
+    "in_repo_legacy_clones": [
+      "legacy_ghostty",
+      "legacy_wezterm",
+      "legacy_zellij",
+      "legacy_rio"
+    ],
+    "notes": "The helper exists, but no repo-local cron/launchd wiring was found during this pass, and the configured pull targets do not match the in-repo legacy_* checkouts."
+  },
+  "projects": [
+    {
+      "source_project": "ghostty",
+      "legacy_research_status": "closed",
+      "research_bead_ids": [
+        "ft-3bja",
+        "ft-3bja.5"
+      ],
+      "primary_artifacts": [
+        "docs/ghostty-analysis-synthesis.md",
+        "evidence/ghostty"
+      ],
+      "had_preexisting_live_matrix": false,
+      "coverage_before_this_artifact": "partial",
+      "notes": "Primary synthesis doc still uses legacy wa-* bead references."
+    },
+    {
+      "source_project": "zellij",
+      "legacy_research_status": "closed",
+      "research_bead_ids": [
+        "ft-okyhm",
+        "ft-22o1q",
+        "ft-vcjbi",
+        "ft-2apg5",
+        "ft-1pygr",
+        "ft-1xk9j",
+        "ft-1pgzt",
+        "ft-2bai5"
+      ],
+      "primary_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "docs/zellij-analysis.md",
+        "evidence/zellij"
+      ],
+      "had_preexisting_live_matrix": false,
+      "coverage_before_this_artifact": "partial",
+      "notes": "Primary synthesis doc still uses legacy wa-* bead references."
+    },
+    {
+      "source_project": "rio",
+      "legacy_research_status": "closed",
+      "research_bead_ids": [
+        "ft-34sko",
+        "ft-34sko.7",
+        "ft-34sko.8"
+      ],
+      "primary_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio"
+      ],
+      "had_preexisting_live_matrix": true,
+      "coverage_before_this_artifact": "strong"
+    },
+    {
+      "source_project": "wezterm",
+      "legacy_research_status": "closed",
+      "research_bead_ids": [
+        "ft-wyr1",
+        "ft-od8xy"
+      ],
+      "primary_artifacts": [
+        "docs/vendored-wezterm-design.md",
+        "frankenterm/PROVENANCE.md"
+      ],
+      "had_preexisting_live_matrix": false,
+      "coverage_before_this_artifact": "partial",
+      "notes": "Vendored crate base and native-event design are closed, but current product docs still treat WezTerm as an active compatibility bridge."
+    }
+  ],
+  "entries": [
+    {
+      "id": "ghostty.coalesced_notifications",
+      "source_project": "ghostty",
+      "legacy_doc_bead_refs": [
+        "wa-x4rq",
+        "wa-7o4f"
+      ],
+      "idea": "Coalesced wakeups and drain-once notifications",
+      "source_artifacts": [
+        "docs/ghostty-analysis-synthesis.md",
+        "evidence/ghostty/event-system.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-x4rq",
+          "status": "closed"
+        },
+        {
+          "id": "ft-7o4f",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high",
+      "notes": "Both mapped beads are closed and the runtime already documents notification coalescing."
+    },
+    {
+      "id": "ghostty.data_control_plane_split",
+      "source_project": "ghostty",
+      "legacy_doc_bead_refs": [
+        "wa-3dfxb.13",
+        "wa-x4rq"
+      ],
+      "idea": "Separate data-plane deltas from control-plane events",
+      "source_artifacts": [
+        "docs/ghostty-analysis-synthesis.md",
+        "evidence/ghostty/io-pipeline.md",
+        "evidence/ghostty/event-system.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-3dfxb.13",
+          "status": "closed"
+        },
+        {
+          "id": "ft-x4rq",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "partial",
+      "mapping_confidence": "medium",
+      "notes": "Native hooks are closed, but current backend independence is still incomplete."
+    },
+    {
+      "id": "ghostty.memory_budgeting",
+      "source_project": "ghostty",
+      "legacy_doc_bead_refs": [
+        "wa-2ahu0",
+        "wa-8vla",
+        "wa-3axa"
+      ],
+      "idea": "Byte-budgeted memory pressure, eviction, and reuse",
+      "source_artifacts": [
+        "docs/ghostty-analysis-synthesis.md",
+        "evidence/ghostty/memory-architecture.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-2ahu0",
+          "status": "closed"
+        },
+        {
+          "id": "ft-3r5e",
+          "status": "closed"
+        },
+        {
+          "id": "ft-8vla",
+          "status": "in_progress"
+        },
+        {
+          "id": "ft-3axa",
+          "status": "open"
+        }
+      ],
+      "adoption_state": "partial",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.versioned_local_ipc",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-1u9qw"
+      ],
+      "idea": "Versioned local IPC namespace and compatibility handshake",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "evidence/zellij/ipc-protocol.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u9qw",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.bounded_fanout_degradation",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-x4rq",
+        "wa-7o4f",
+        "wa-9dp"
+      ],
+      "idea": "Explicit overload and fanout degradation semantics",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "evidence/zellij/performance-analysis.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-x4rq",
+          "status": "closed"
+        },
+        {
+          "id": "ft-7o4f",
+          "status": "closed"
+        },
+        {
+          "id": "ft-9dp",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.session_index_vs_resurrection",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-rsaf",
+        "wa-3r5e"
+      ],
+      "idea": "Split live session index from resurrection checkpoints",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "evidence/zellij/session-management.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-rsaf",
+          "status": "closed"
+        },
+        {
+          "id": "ft-3r5e",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "medium"
+    },
+    {
+      "id": "zellij.logical_slot_layouts",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-2dd4s.2",
+        "wa-2dd4s.3"
+      ],
+      "idea": "Stable logical slot identity for floating/swap layout reconciliation",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "evidence/zellij/layout-engine-analysis.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-2dd4s.2",
+          "status": "closed"
+        },
+        {
+          "id": "ft-2dd4s.3",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.completion_tokens",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-33uf8"
+      ],
+      "idea": "Cross-subsystem completion tokens and cause-chain context",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-33uf8",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.watcher_clients",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-3jewu"
+      ],
+      "idea": "Watcher clients and per-client view-state model",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-3jewu",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "zellij.capability_gated_extensions",
+      "source_project": "zellij",
+      "legacy_doc_bead_refs": [
+        "wa-dr6zv",
+        "wa-3kxe"
+      ],
+      "idea": "Capability-gated extension actions and mediated side effects",
+      "source_artifacts": [
+        "docs/zellij-analysis-synthesis.md",
+        "evidence/zellij/wasm-plugins.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-dr6zv",
+          "status": "closed"
+        },
+        {
+          "id": "ft-3kxe",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "partial",
+      "mapping_confidence": "medium",
+      "notes": "The enabling epics are closed, but the recommendation spans a broader long-term extension/runtime surface than a single finished feature flag."
+    },
+    {
+      "id": "rio.wakeup_coalescing",
+      "source_project": "rio",
+      "idea": "Canonical wakeup/coalescing contract across ingest, detect, and render",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio/runtime-event-loop.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.5",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.7",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "rio.damage_merge",
+      "source_project": "rio",
+      "idea": "Two-source damage model merge",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio/rendering-pipeline.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.4",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.7",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "rio.sync_update_guardrails",
+      "source_project": "rio",
+      "idea": "Sync-update guardrails and adaptive batch thresholds",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio/performance-analysis.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.5",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.7",
+          "status": "closed"
+        },
+        {
+          "id": "ft-283h4.4",
+          "status": "open"
+        }
+      ],
+      "adoption_state": "partial",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "rio.memory_budget_controller",
+      "source_project": "rio",
+      "idea": "Unified memory budget controller",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.5",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.6",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.7",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "rio.frame_pacing",
+      "source_project": "rio",
+      "idea": "Frame pacing policy tiers",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio/runtime-event-loop.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.4",
+          "status": "closed"
+        },
+        {
+          "id": "ft-1u90p.8",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "rio.effective_config_introspection",
+      "source_project": "rio",
+      "idea": "Effective-config introspection and strict validation mode",
+      "source_artifacts": [
+        "docs/rio-analysis-synthesis.md",
+        "docs/rio-implementation-validation-matrix.md",
+        "evidence/rio/config-platform.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-1u90p.8",
+          "status": "closed"
+        },
+        {
+          "id": "ft-vv3h",
+          "status": "closed"
+        },
+        {
+          "id": "ft-x4bt",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "wezterm.vendored_substrate",
+      "source_project": "wezterm",
+      "idea": "In-tree vendored crate substrate for native mux/gui evolution",
+      "source_artifacts": [
+        "docs/vendored-wezterm-design.md",
+        "frankenterm/PROVENANCE.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-od8xy",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "implemented",
+      "mapping_confidence": "high"
+    },
+    {
+      "id": "wezterm.native_event_contract",
+      "source_project": "wezterm",
+      "idea": "Native event sink and IPC contract for pane output/state events",
+      "source_artifacts": [
+        "docs/vendored-wezterm-design.md"
+      ],
+      "mapped_beads": [
+        {
+          "id": "ft-wyr1",
+          "status": "closed"
+        },
+        {
+          "id": "ft-jgqs",
+          "status": "closed"
+        }
+      ],
+      "adoption_state": "partial",
+      "mapping_confidence": "medium",
+      "notes": "The event contract and listener are closed, but the repo still documents WezTerm as the active compatibility bridge."
+    }
+  ]
+}
