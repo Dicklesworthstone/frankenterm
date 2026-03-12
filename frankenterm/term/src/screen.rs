@@ -447,6 +447,10 @@ impl CursorConsistencyTelemetry {
 }
 
 impl ColdScrollbackReflowWorker {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn begin_intent(&mut self, seqno: SequenceNo, backlog_depth: usize) {
         if let Some(active_intent) = self.active_intent {
             if active_intent != seqno && self.backlog_depth > 0 {
@@ -569,6 +573,10 @@ impl LogicalLineWrapCache {
 }
 
 impl ScrollbackTieringState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn record_spill(&mut self, line_bytes: usize, warm_max_bytes: usize) -> ScrollbackSpillOutcome {
         let mut outcome = ScrollbackSpillOutcome::default();
         let bounded_line_bytes = line_bytes.max(std::mem::size_of::<Line>());
@@ -722,6 +730,9 @@ impl Screen {
 
     fn record_scrollback_spill(&mut self, line: &Line, seqno: SequenceNo) {
         if !self.allow_scrollback {
+            return;
+        }
+        if self.hot_scrollback_size() == 0 {
             return;
         }
         let tier = self.config.scrollback_tier_config();
@@ -2277,8 +2288,8 @@ impl Screen {
                 self.stable_row_index_offset += 1;
             }
         }
-        self.scrollback_tiering.warm_line_bytes.clear();
-        self.scrollback_tiering.warm_bytes = 0;
+        self.scrollback_tiering.reset();
+        self.cold_scrollback_worker.reset();
         // Reclaim memory from the VecDeque after bulk removal.
         // Without this, the ring buffer retains capacity for the
         // evicted scrollback lines indefinitely.
@@ -3580,6 +3591,21 @@ mod tests {
             screen.physical_rows,
             "tiered mode must not override an explicit zero scrollback budget"
         );
+        assert_eq!(
+            screen.scrollback_tiering.warm_spill_lines_total,
+            0,
+            "zero scrollback should not accumulate warm-tier spill telemetry"
+        );
+        assert_eq!(
+            screen.scrollback_tiering.cold_spill_lines_total,
+            0,
+            "zero scrollback should not accumulate cold-tier spill telemetry"
+        );
+        assert_eq!(
+            screen.cold_scrollback_worker.completed_lines_total(),
+            0,
+            "zero scrollback should not drive cold spill worker activity"
+        );
     }
 
     #[test]
@@ -3665,6 +3691,70 @@ mod tests {
                 > 0,
             "cold spill should produce throughput telemetry"
         );
+    }
+
+    #[test]
+    fn erase_scrollback_resets_tiered_scrollback_state_and_worker_metrics() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 2;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=32 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        assert!(
+            screen.scrollback_tiering.warm_spill_lines_total > 0,
+            "test requires pre-existing tier telemetry"
+        );
+        assert!(
+            screen.scrollback_tiering.cold_spill_lines_total > 0,
+            "test requires pre-existing cold spill telemetry"
+        );
+        assert!(
+            screen.cold_scrollback_worker.completed_lines_total() > 0,
+            "test requires pre-existing cold spill worker activity"
+        );
+
+        screen.erase_scrollback();
+
+        assert_eq!(
+            screen.scrollback_rows(),
+            screen.physical_rows,
+            "erase_scrollback should leave only visible rows resident"
+        );
+        assert!(
+            screen.scrollback_tiering.warm_line_bytes.is_empty(),
+            "erase_scrollback should clear warm-tier residency tracking"
+        );
+        assert_eq!(screen.scrollback_tiering.warm_bytes, 0);
+        assert_eq!(screen.scrollback_tiering.warm_spill_lines_total, 0);
+        assert_eq!(screen.scrollback_tiering.warm_spill_bytes_total, 0);
+        assert_eq!(screen.scrollback_tiering.cold_spill_lines_total, 0);
+        assert_eq!(screen.scrollback_tiering.cold_spill_bytes_total, 0);
+        assert_eq!(screen.cold_scrollback_worker.active_intent(), None);
+        assert_eq!(screen.cold_scrollback_worker.backlog_depth(), 0);
+        assert_eq!(screen.cold_scrollback_worker.peak_backlog_depth(), 0);
+        assert_eq!(
+            screen.cold_scrollback_worker.completion_throughput_lines_per_sec(),
+            0
+        );
+        assert_eq!(screen.cold_scrollback_worker.completed_lines_total(), 0);
+        assert_eq!(screen.cold_scrollback_worker.completed_batches_total(), 0);
+        assert_eq!(screen.cold_scrollback_worker.cancellation_count(), 0);
     }
 
     #[test]

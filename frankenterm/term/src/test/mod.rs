@@ -10,9 +10,9 @@ mod csi;
 use crate::color::ColorPalette;
 use crate::screen::{ResizeReadabilityGatePolicy, ResizeWrapPolicy};
 use frankenterm_escape_parser::csi::{Edit, EraseInDisplay, EraseInLine};
-use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
+use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
 use frankenterm_surface::line::MonospaceKpCostModel;
-use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo, SEQ_ZERO};
+use frankenterm_surface::{CursorShape, CursorVisibility, SEQ_ZERO, SequenceNo};
 use k9::assert_equal as assert_eq;
 use std::sync::{Arc, Mutex};
 
@@ -47,10 +47,15 @@ struct TestTerm {
 #[derive(Debug)]
 struct TestTermConfig {
     scrollback: usize,
+    scrollback_tier: crate::config::ScrollbackTierConfig,
 }
 impl TerminalConfiguration for TestTermConfig {
     fn scrollback_size(&self) -> usize {
         self.scrollback
+    }
+
+    fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
+        self.scrollback_tier
     }
 
     fn color_palette(&self) -> ColorPalette {
@@ -60,6 +65,20 @@ impl TerminalConfiguration for TestTermConfig {
 
 impl TestTerm {
     fn new(height: usize, width: usize, scrollback: usize) -> Self {
+        Self::new_with_scrollback_tier(
+            height,
+            width,
+            scrollback,
+            crate::config::ScrollbackTierConfig::default(),
+        )
+    }
+
+    fn new_with_scrollback_tier(
+        height: usize,
+        width: usize,
+        scrollback: usize,
+        scrollback_tier: crate::config::ScrollbackTierConfig,
+    ) -> Self {
         let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
@@ -73,7 +92,10 @@ impl TestTerm {
                 pixel_height: height * 16,
                 dpi: 0,
             },
-            Arc::new(TestTermConfig { scrollback }),
+            Arc::new(TestTermConfig {
+                scrollback,
+                scrollback_tier,
+            }),
             "WezTerm",
             "O_o",
             Box::new(Vec::new()),

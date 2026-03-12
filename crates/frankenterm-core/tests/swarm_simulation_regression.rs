@@ -852,8 +852,9 @@ fn regression_queue_stats_sum_equals_total() {
     let mut queue = SwarmWorkQueue::new(sim_queue_config());
 
     for i in 0..20 {
+        let dep_str = format!("reg-{}", i - 1);
         let deps: Vec<&str> = if i > 0 && i % 5 == 0 {
-            vec![Box::leak(format!("reg-{}", i - 1).into_boxed_str()) as &str]
+            vec![dep_str.as_str()]
         } else {
             vec![]
         };

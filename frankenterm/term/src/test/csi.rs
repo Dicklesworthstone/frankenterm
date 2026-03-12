@@ -401,3 +401,42 @@ fn test_ed_erase_scrollback() {
     term.print("b");
     assert_all_contents(&term, file!(), line!(), &["111", "222", "ab"]);
 }
+
+#[test]
+fn test_ed_erase_scrollback_with_tiering_enabled() {
+    let mut term = TestTerm::new_with_scrollback_tier(
+        3,
+        3,
+        6,
+        crate::config::ScrollbackTierConfig {
+            enabled: true,
+            hot_lines: 1,
+            warm_max_bytes: std::mem::size_of::<Line>(),
+        },
+    );
+    term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na\x1b[3J");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "a"]);
+    term.print("b");
+    assert_all_contents(&term, file!(), line!(), &["111", "222", "ab"]);
+}
+
+#[test]
+fn test_erase_scrollback_and_viewport_with_tiering_enabled() {
+    let mut term = TestTerm::new_with_scrollback_tier(
+        3,
+        3,
+        6,
+        crate::config::ScrollbackTierConfig {
+            enabled: true,
+            hot_lines: 1,
+            warm_max_bytes: std::mem::size_of::<Line>(),
+        },
+    );
+    term.print("abc\r\ndef\r\nghi\r\n111\r\n222\r\na");
+
+    term.erase_scrollback_and_viewport();
+
+    assert_all_contents(&term, file!(), line!(), &["a", "   ", "   "]);
+    term.print("b");
+    assert_all_contents(&term, file!(), line!(), &["ab", "   ", "   "]);
+}
