@@ -11,6 +11,9 @@ SOCKET_PATH="${SOCKET_PATH:-}"
 LOG_PATH="${LOG_PATH:-/tmp/frankenterm-mux-server.e2e.log}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-20}"
 MAX_BINARY_BYTES="${MAX_BINARY_BYTES:-20971520}" # 20 MiB budget
+WATCH_SMOKE_CMD="${WATCH_SMOKE_CMD:-}"
+GUI_CONNECT_CMD="${GUI_CONNECT_CMD:-}"
+TLS_SMOKE_CMD="${TLS_SMOKE_CMD:-}"
 DRY_RUN=0
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -20,6 +23,7 @@ fi
 step_index=0
 pass_count=0
 fail_count=0
+skip_count=0
 server_pid=""
 pane_id=""
 
@@ -56,8 +60,15 @@ run_step() {
     log "[PASS] ${step_index}. ${name} (${duration_ms}ms)"
     return 0
   else
+    local status=$?
     end_ms="$(now_ms)"
     duration_ms=$((end_ms - start_ms))
+    if [[ "$status" -eq 2 ]]; then
+      skip_count=$((skip_count + 1))
+      log "[SKIP] ${step_index}. ${name} (${duration_ms}ms)"
+      return 0
+    fi
+
     fail_count=$((fail_count + 1))
     log "[FAIL] ${step_index}. ${name} (${duration_ms}ms)"
     return 1
@@ -135,7 +146,7 @@ check_binary_size_budget() {
 check_socket() {
   if [[ -z "$SOCKET_PATH" ]]; then
     log "SOCKET_PATH not set; skipping strict socket existence check"
-    return 0
+    return 2
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -150,6 +161,23 @@ check_socket() {
     sleep 1
   done
   return 1
+}
+
+run_configured_smoke() {
+  local cmd="$1"
+  local label="$2"
+
+  if [[ -z "$cmd" ]]; then
+    log "${label} command not configured; skipping"
+    return 2
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "[DRY-RUN] bash -lc $cmd"
+    return 0
+  fi
+
+  bash -lc "$cmd"
 }
 
 robot_state() {
@@ -213,6 +241,18 @@ robot_events() {
   fi
 }
 
+watch_smoke() {
+  run_configured_smoke "$WATCH_SMOKE_CMD" "WATCH_SMOKE_CMD"
+}
+
+gui_connect_smoke() {
+  run_configured_smoke "$GUI_CONNECT_CMD" "GUI_CONNECT_CMD"
+}
+
+tls_smoke() {
+  run_configured_smoke "$TLS_SMOKE_CMD" "TLS_SMOKE_CMD"
+}
+
 graceful_shutdown() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "[DRY-RUN] kill -TERM <server_pid> && wait"
@@ -239,10 +279,13 @@ main() {
   run_step "ft robot state" robot_state || true
   run_step "ft robot send + search" robot_send_and_search || true
   run_step "ft robot events" robot_events || true
+  run_step "ft watch integration" watch_smoke || true
+  run_step "GUI connect smoke" gui_connect_smoke || true
+  run_step "TLS smoke" tls_smoke || true
   run_step "SIGTERM graceful shutdown" graceful_shutdown || true
 
   log ""
-  log "Summary: pass=${pass_count} fail=${fail_count} total=${step_index}"
+  log "Summary: pass=${pass_count} fail=${fail_count} skip=${skip_count} total=${step_index}"
   if [[ "$fail_count" -gt 0 ]]; then
     return 1
   fi
