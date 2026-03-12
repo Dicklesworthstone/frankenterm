@@ -6228,7 +6228,7 @@ fn build_agent_configure_error_plan_item(
         file_exists: false,
         section_exists: false,
         action: "error".to_string(),
-        content_preview: None,
+        content_preview: Some(template.content.clone()),
         error: Some(error),
     }
 }
@@ -6259,9 +6259,18 @@ fn agent_config_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.{stamp}.bak"))
 }
 
+#[derive(Debug)]
+struct AgentConfigApplyError {
+    message: String,
+    backup_created: bool,
+}
+
 fn apply_prepared_agent_config(
     prepared: &PreparedAgentConfig,
-) -> std::result::Result<frankenterm_core::robot_types::AgentConfigureResultItem, String> {
+) -> std::result::Result<
+    frankenterm_core::robot_types::AgentConfigureResultItem,
+    AgentConfigApplyError,
+> {
     if prepared.action == frankenterm_core::agent_config_templates::ConfigAction::Skip {
         return Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
             slug: prepared.slug.clone(),
@@ -6274,19 +6283,22 @@ fn apply_prepared_agent_config(
     }
 
     if let Some(parent) = prepared.target_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create '{}': {err}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|err| AgentConfigApplyError {
+            message: format!("Failed to create '{}': {err}", parent.display()),
+            backup_created: false,
+        })?;
     }
 
     let mut backup_created = false;
     if prepared.target_path.exists() {
         let backup_path = agent_config_backup_path(&prepared.target_path);
-        fs::copy(&prepared.target_path, &backup_path).map_err(|err| {
-            format!(
+        fs::copy(&prepared.target_path, &backup_path).map_err(|err| AgentConfigApplyError {
+            message: format!(
                 "Failed to create backup '{}' from '{}': {err}",
                 backup_path.display(),
                 prepared.target_path.display()
-            )
+            ),
+            backup_created,
         })?;
         backup_created = true;
     }
@@ -6295,11 +6307,12 @@ fn apply_prepared_agent_config(
         prepared.existing_content.as_deref().unwrap_or(""),
         &prepared.template.content,
     );
-    fs::write(&prepared.target_path, merged).map_err(|err| {
-        format!(
+    fs::write(&prepared.target_path, merged).map_err(|err| AgentConfigApplyError {
+        message: format!(
             "Failed to write '{}': {err}",
             prepared.target_path.display()
-        )
+        ),
+        backup_created,
     })?;
 
     Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
@@ -18751,7 +18764,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 agent_slug = %prepared.slug,
                                                                 scope = %robot_agent_config_scope_label(scope),
                                                                 file_path = %prepared.target_path.display(),
-                                                                error = %err,
+                                                                error = %err.message,
+                                                                backup_created = err.backup_created,
                                                                 "agent config apply failed"
                                                             );
                                                             results.push(frankenterm_core::robot_types::AgentConfigureResultItem {
@@ -18759,8 +18773,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 display_name: prepared.display_name.clone(),
                                                                 action: "error".to_string(),
                                                                 filename: prepared.filename.clone(),
-                                                                backup_created: false,
-                                                                error: Some(err),
+                                                                backup_created: err.backup_created,
+                                                                error: Some(err.message),
                                                             });
                                                         }
                                                     }
@@ -45518,6 +45532,48 @@ log_level = "debug"
         assert_eq!(result_item.filename, "AGENTS.md");
         assert_eq!(result_item.action, "error");
         assert_eq!(result_item.error.as_deref(), Some("missing global root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_agent_config_preserves_backup_flag_on_write_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("agent_config_write_error");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+
+        let target = global_root.join(".cursorrules");
+        write_file(&target, "# existing cursor rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&target, permissions).unwrap();
+
+        let err = apply_prepared_agent_config(&prepared).expect_err("write should fail");
+        assert!(
+            err.backup_created,
+            "backup flag should survive write failure"
+        );
+        assert!(
+            err.message.contains("Failed to write"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     // ========================================================================
