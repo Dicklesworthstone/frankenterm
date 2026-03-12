@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use frankenterm_core::command_transport::CommandRouter;
 use frankenterm_core::durable_state::DurableStateManager;
 use frankenterm_core::fleet_launcher::{
-    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec, SlotStatus,
-    StartupStrategy,
+    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec,
+    MetadataProjectionFailure, ProgramDistribution, RegistrySummary, SlotStatus, StartupStrategy,
 };
 use frankenterm_core::session_profiles::{ProfileRegistry, ProfileRole};
 use frankenterm_core::session_topology::{
@@ -624,5 +624,358 @@ proptest! {
         prop_assert!(outcome.successful_slots + outcome.failed_slots <= outcome.total_slots);
         // slot_outcomes len always equals total
         prop_assert_eq!(outcome.slot_outcomes.len() as u32, outcome.total_slots);
+    }
+}
+
+// =============================================================================
+// Serde roundtrips for new query-surface types (ft-3681t.3.1.1)
+// =============================================================================
+
+fn arb_program_distribution() -> impl Strategy<Value = ProgramDistribution> {
+    (
+        prop_oneof![
+            Just("claude-code".to_string()),
+            Just("codex-cli".to_string()),
+            Just("gemini-cli".to_string()),
+        ],
+        0u32..20u32,
+    )
+        .prop_flat_map(|(program, count)| {
+            let indices: Vec<u32> = (0..count).collect();
+            Just(ProgramDistribution {
+                program,
+                slot_count: count,
+                slot_indices: indices,
+            })
+        })
+}
+
+fn arb_metadata_projection_failure() -> impl Strategy<Value = MetadataProjectionFailure> {
+    prop_oneof![
+        "[a-z-]{3,12}".prop_map(|p| MetadataProjectionFailure::ProgramNotFound { program: p }),
+        (0u32..50).prop_map(|p| MetadataProjectionFailure::PhaseNotFound { phase: p }),
+        (0u32..100, 0u32..100)
+            .prop_map(|(i, m)| MetadataProjectionFailure::SlotIndexOutOfBounds { index: i, max: m }),
+        (0u32..50, 0u32..10)
+            .prop_map(|(s, p)| MetadataProjectionFailure::PhaseSlotMismatch {
+                slot_index: s,
+                claimed_phase: p,
+            }),
+        (0u32..50, prop_oneof![Just("label".to_string()), Just("program".to_string())])
+            .prop_map(|(s, f)| MetadataProjectionFailure::InconsistentSlotField {
+                slot_index: s,
+                field: f,
+            }),
+    ]
+}
+
+fn arb_registry_summary() -> impl Strategy<Value = RegistrySummary> {
+    (0..50usize, 0..10usize, 0..10usize, 0..20usize, 0..20usize).prop_map(
+        |(total, sessions, windows, panes, agents)| RegistrySummary {
+            total_entities: total,
+            sessions,
+            windows,
+            panes,
+            agents,
+        },
+    )
+}
+
+fn arb_fleet_launch_error() -> impl Strategy<Value = FleetLaunchError> {
+    prop_oneof![
+        Just(FleetLaunchError::EmptyMix),
+        Just(FleetLaunchError::ZeroWeight),
+        "[a-z-]{3,15}".prop_map(FleetLaunchError::ProfileNotFound),
+        "[a-z-]{3,15}".prop_map(FleetLaunchError::TemplateNotFound),
+        (0u32..50, ".{1,30}").prop_map(|(idx, reason)| FleetLaunchError::RegistrationFailed {
+            slot_index: idx,
+            reason,
+        }),
+        ".{1,40}".prop_map(FleetLaunchError::ValidationFailed),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn serde_roundtrip_program_distribution(pd in arb_program_distribution()) {
+        let json = serde_json::to_string(&pd).unwrap();
+        let back: ProgramDistribution = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(pd, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_metadata_projection_failure(f in arb_metadata_projection_failure()) {
+        let json = serde_json::to_string(&f).unwrap();
+        let back: MetadataProjectionFailure = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(f, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_registry_summary(rs in arb_registry_summary()) {
+        let json = serde_json::to_string(&rs).unwrap();
+        let back: RegistrySummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(rs, back);
+    }
+
+    #[test]
+    fn serde_roundtrip_fleet_launch_error(err in arb_fleet_launch_error()) {
+        let json = serde_json::to_string(&err).unwrap();
+        let back: FleetLaunchError = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(err, back);
+    }
+
+    #[test]
+    fn program_distribution_slot_count_matches_indices(pd in arb_program_distribution()) {
+        prop_assert_eq!(pd.slot_count, pd.slot_indices.len() as u32,
+            "slot_count must equal slot_indices.len()");
+    }
+
+    #[test]
+    fn metadata_projection_failure_display_nonempty(f in arb_metadata_projection_failure()) {
+        let s = f.to_string();
+        prop_assert!(!s.is_empty(), "Display must produce non-empty string");
+    }
+
+    #[test]
+    fn fleet_launch_error_display_nonempty(err in arb_fleet_launch_error()) {
+        let s = err.to_string();
+        prop_assert!(!s.is_empty(), "Display must produce non-empty string");
+    }
+}
+
+// =============================================================================
+// LaunchPlan query method properties (ft-3681t.3.1.1)
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn plan_programs_nonempty(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let programs = plan.programs();
+        prop_assert!(!programs.is_empty(), "plan must have at least one program");
+    }
+
+    #[test]
+    fn plan_programs_are_deduplicated(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let programs = plan.programs();
+        let unique: std::collections::HashSet<&str> = programs.iter().map(|s| s.as_str()).collect();
+        prop_assert_eq!(programs.len(), unique.len(), "programs() must be deduplicated");
+    }
+
+    #[test]
+    fn plan_program_distribution_covers_all_slots(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let dist = plan.program_distribution();
+        let total_from_dist: u32 = dist.iter().map(|d| d.slot_count).sum();
+        prop_assert_eq!(total_from_dist, plan.slots.len() as u32,
+            "program_distribution slot counts must sum to total slots");
+    }
+
+    #[test]
+    fn plan_program_distribution_indices_valid(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let dist = plan.program_distribution();
+        let max_idx = plan.slots.len() as u32;
+        for pd in &dist {
+            for &idx in &pd.slot_indices {
+                prop_assert!(idx < max_idx,
+                    "slot index {} in distribution must be < {}", idx, max_idx);
+            }
+        }
+    }
+
+    #[test]
+    fn plan_program_distribution_no_duplicate_indices(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let dist = plan.program_distribution();
+        let mut all_indices: Vec<u32> = dist.iter()
+            .flat_map(|d| d.slot_indices.iter().copied())
+            .collect();
+        all_indices.sort();
+        let before = all_indices.len();
+        all_indices.dedup();
+        prop_assert_eq!(before, all_indices.len(),
+            "no slot index should appear in multiple program distributions");
+    }
+
+    #[test]
+    fn plan_slots_in_phase_partition(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+
+        let mut total_in_phases = 0usize;
+        for phase in &plan.phases {
+            let phase_slots = plan.slots_in_phase(phase.index);
+            total_in_phases += phase_slots.len();
+            for slot in &phase_slots {
+                prop_assert_eq!(slot.phase, phase.index,
+                    "slots_in_phase must return slots with matching phase");
+            }
+        }
+        prop_assert_eq!(total_in_phases, plan.slots.len(),
+            "slots_in_phase must partition all slots");
+    }
+
+    #[test]
+    fn plan_slot_lookup_by_index(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        for expected_slot in &plan.slots {
+            let found = plan.slot(expected_slot.index);
+            prop_assert!(found.is_some(), "slot({}) must be found", expected_slot.index);
+            prop_assert_eq!(found.unwrap().index, expected_slot.index);
+            prop_assert_eq!(&found.unwrap().label, &expected_slot.label);
+        }
+        // Out-of-bounds should return None
+        prop_assert!(plan.slot(plan.slots.len() as u32).is_none());
+    }
+
+    #[test]
+    fn plan_phase_labels_count_matches(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let labels = plan.phase_labels();
+        prop_assert_eq!(labels.len(), plan.phases.len(),
+            "phase_labels() must return one label per phase");
+    }
+
+    #[test]
+    fn plan_invariant_violations_empty_for_valid_plan(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let violations = plan.invariant_violations();
+        prop_assert!(violations.is_empty(),
+            "a plan from FleetLauncher::plan() should have no invariant violations, got: {:?}",
+            violations);
+    }
+}
+
+// =============================================================================
+// LaunchOutcome query method properties (ft-3681t.3.1.1)
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn outcome_registry_summary_entity_kinds(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let summary = outcome.registry_summary();
+
+        // Total must equal sum of individual kinds
+        prop_assert_eq!(
+            summary.total_entities,
+            summary.sessions + summary.windows + summary.panes + summary.agents,
+            "registry summary entity counts must sum to total"
+        );
+    }
+
+    #[test]
+    fn outcome_registry_summary_panes_match_slots(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let summary = outcome.registry_summary();
+
+        // For a clean launch, pane count equals slot count
+        if outcome.status == FleetLaunchStatus::Complete {
+            prop_assert_eq!(summary.panes, outcome.total_slots as usize,
+                "complete launch must have one pane per slot");
+            prop_assert_eq!(summary.agents, outcome.total_slots as usize,
+                "complete launch must have one agent per slot");
+            prop_assert_eq!(summary.sessions, 1, "one session per fleet");
+            prop_assert_eq!(summary.windows, 1, "one window per fleet");
+        }
+    }
+
+    #[test]
+    fn outcome_successful_outcomes_match_count(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        prop_assert_eq!(
+            outcome.successful_outcomes().len() as u32,
+            outcome.successful_slots,
+            "successful_outcomes() len must match successful_slots"
+        );
+    }
+
+    #[test]
+    fn outcome_failed_outcomes_match_count(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        prop_assert_eq!(
+            outcome.failed_outcomes().len() as u32,
+            outcome.failed_slots,
+            "failed_outcomes() len must match failed_slots"
+        );
+    }
+
+    #[test]
+    fn outcome_partition_covers_all_slots(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        let success = outcome.successful_outcomes().len();
+        let failed = outcome.failed_outcomes().len();
+        let skipped = outcome.skipped_outcomes().len();
+        prop_assert_eq!(
+            success + failed + skipped,
+            outcome.slot_outcomes.len(),
+            "successful + failed + skipped must equal total slot_outcomes"
+        );
+    }
+
+    #[test]
+    fn outcome_is_complete_matches_status(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        prop_assert_eq!(
+            outcome.is_complete(),
+            outcome.status == FleetLaunchStatus::Complete,
+            "is_complete() must agree with status == Complete"
+        );
+    }
+
+    #[test]
+    fn outcome_successful_outcomes_all_registered(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+
+        for o in outcome.successful_outcomes() {
+            prop_assert_eq!(o.status, SlotStatus::Registered,
+                "successful outcomes must all be Registered");
+            prop_assert!(o.error.is_none(),
+                "successful outcomes must have no error");
+        }
     }
 }
