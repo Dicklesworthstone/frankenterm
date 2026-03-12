@@ -14,6 +14,14 @@ SCENARIO_ID="ft_1i2ge_6_8_impact_attribution"
 CORRELATION_ID="ft-1i2ge.6.8-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.jsonl"
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-ft-1i2ge-6-8-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 emit_log() {
   local outcome="$1"
@@ -59,94 +67,164 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.smoke.log"
+
+run_rch() {
+  TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+  run_rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
+}
+
+probe_has_reachable_workers() {
+  grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback_in_logs() {
+  local decision_path="$1"
+  local artifact_path="$2"
+  local input_summary="$3"
+  if grep -Eq "$RCH_FAIL_OPEN_REGEX" "$artifact_path" 2>/dev/null; then
+    emit_log "failed" "${decision_path}" "rch_local_fallback_detected" "RCH-LOCAL-FALLBACK" \
+      "$(basename "${artifact_path}")" "${input_summary}"
+    echo "rch fell back to local execution during ${decision_path}; refusing offload policy violation." >&2
+    exit 3
+  fi
+}
+
+run_rch_cargo_logged() {
+  local decision_path="$1"
+  local artifact_path="$2"
+  shift 2
+
+  set +e
+  (
+    cd "${ROOT_DIR}"
+    run_rch_cargo "$@"
+  ) 2>&1 | tee "${artifact_path}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  check_rch_fallback_in_logs "${decision_path}" "${artifact_path}" "rch cargo ${*}"
+  return "${rc}"
+}
+
+if ! command -v rch >/dev/null 2>&1; then
+  emit_log "failed" "execution_preflight" "rch_required_missing" "RCH-E001" \
+    "$(basename "${LOG_FILE}")" "rch is required for cargo execution in this scenario"
+  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
+  exit 1
+fi
+
+set +e
+run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+probe_rc=$?
+set -e
+if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+  emit_log "failed" "execution_preflight" "rch_workers_unhealthy" "RCH-E100" \
+    "$(basename "${RCH_PROBE_LOG}")" "rch workers are unavailable; refusing local cargo execution"
+  echo "rch workers are unavailable; refusing local cargo execution." >&2
+  exit 1
+fi
+emit_log "running" "execution_preflight" "rch_workers_healthy" "none" \
+  "$(basename "${RCH_PROBE_LOG}")" "rch workers probe reported reachable capacity"
+
+set +e
+run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+smoke_rc=$?
+set -e
+check_rch_fallback_in_logs "execution_preflight" "${RCH_SMOKE_LOG}" "rch remote smoke check (cargo check --help)"
+if [[ ${smoke_rc} -ne 0 ]]; then
+  emit_log "failed" "execution_preflight" "rch_remote_smoke_failed" "RCH-E101" \
+    "$(basename "${RCH_SMOKE_LOG}")" "rch remote smoke failed; refusing local fallback"
+  echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
+  exit 1
+fi
+emit_log "running" "execution_preflight" "rch_remote_smoke_passed" "none" \
+  "$(basename "${RCH_SMOKE_LOG}")" "verified remote rch exec path before running cargo checks"
+
 # ── Test 1: Compile check ──────────────────────────────────────────
 emit_log "running" "compile_check" "cargo_check" "none" \
   "none" "cargo check impact attribution tests"
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-6-8-${RUN_ID}" \
-    cargo check -p frankenterm-core --features subprocess-bridge \
-    --test mission_impact_attribution 2>&1
-) > "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.compile.log" 2>&1
-compile_rc=$?
-set -e
+compile_log="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.compile.log"
+if run_rch_cargo_logged "compile_check" "${compile_log}" \
+  check -p frankenterm-core --features subprocess-bridge --test mission_impact_attribution; then
+  compile_rc=0
+else
+  compile_rc=$?
+fi
 
 if [[ ${compile_rc} -ne 0 ]]; then
   emit_log "failed" "compile_check" "compilation_error" "COMPILE_FAIL" \
-    "ft_1i2ge_6_8_${RUN_ID}.compile.log" "cargo check failed"
+    "$(basename "${compile_log}")" "cargo check failed"
   echo "FAIL: compilation error" >&2
   exit 1
 fi
 emit_log "passed" "compile_check" "compilation_ok" "none" \
-  "ft_1i2ge_6_8_${RUN_ID}.compile.log" "compilation succeeded"
+  "$(basename "${compile_log}")" "compilation succeeded"
 
 # ── Test 2: Impact attribution tests pass ──────────────────────────
 emit_log "running" "impact_tests" "cargo_test" "none" \
   "none" "run impact attribution tests"
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-6-8-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge \
-    --test mission_impact_attribution 2>&1
-) > "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests.log" 2>&1
-test_rc=$?
-set -e
+tests_log="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests.log"
+if run_rch_cargo_logged "impact_tests" "${tests_log}" \
+  test -p frankenterm-core --features subprocess-bridge --test mission_impact_attribution; then
+  test_rc=0
+else
+  test_rc=$?
+fi
 
 if [[ ${test_rc} -ne 0 ]]; then
   emit_log "failed" "impact_tests" "test_failure" "TEST_FAIL" \
-    "ft_1i2ge_6_8_${RUN_ID}.tests.log" "impact attribution tests failed"
+    "$(basename "${tests_log}")" "impact attribution tests failed"
   echo "FAIL: impact attribution tests" >&2
   exit 1
 fi
 
-impact_count=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests.log" || echo 0)
-
+impact_count=$(grep -c "ok$" "${tests_log}" || echo 0)
 if [[ ${impact_count} -lt 20 ]]; then
   emit_log "failed" "impact_tests" "insufficient_test_coverage" "COVERAGE_LOW" \
-    "ft_1i2ge_6_8_${RUN_ID}.tests.log" \
+    "$(basename "${tests_log}")" \
     "only ${impact_count} impact tests passed (expected >=20)"
   echo "FAIL: insufficient impact test coverage (${impact_count} < 20)" >&2
   exit 1
 fi
 emit_log "passed" "impact_tests" "all_tests_ok" "none" \
-  "ft_1i2ge_6_8_${RUN_ID}.tests.log" \
+  "$(basename "${tests_log}")" \
   "${impact_count} impact attribution tests passed"
 
 # ── Test 3: Clippy clean ──────────────────────────────────────────
 emit_log "running" "clippy_check" "cargo_clippy" "none" \
   "none" "verify zero clippy warnings in impact attribution tests"
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-6-8-${RUN_ID}" \
-    cargo clippy -p frankenterm-core --features subprocess-bridge \
-    --test mission_impact_attribution 2>&1
-) > "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.clippy.log" 2>&1
-clippy_rc=$?
-set -e
+clippy_log="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.clippy.log"
+if run_rch_cargo_logged "clippy_check" "${clippy_log}" \
+  clippy -p frankenterm-core --features subprocess-bridge --test mission_impact_attribution; then
+  clippy_rc=0
+else
+  clippy_rc=$?
+fi
 
-impact_warnings=$(grep -c "mission_impact_attribution.rs" "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.clippy.log" || echo 0)
+impact_warnings=$(grep -c "mission_impact_attribution.rs" "${clippy_log}" || echo 0)
 if [[ ${impact_warnings} -gt 0 ]]; then
   emit_log "failed" "clippy_check" "clippy_warnings" "CLIPPY_WARN" \
-    "ft_1i2ge_6_8_${RUN_ID}.clippy.log" \
+    "$(basename "${clippy_log}")" \
     "${impact_warnings} clippy warnings in mission_impact_attribution.rs"
   echo "FAIL: clippy warnings in mission_impact_attribution.rs" >&2
   exit 1
 fi
 emit_log "passed" "clippy_check" "clippy_clean" "none" \
-  "ft_1i2ge_6_8_${RUN_ID}.clippy.log" "zero clippy warnings"
+  "$(basename "${clippy_log}")" "zero clippy warnings"
 
 # ── Test 4: Impact category coverage ───────────────────────────────
 emit_log "running" "category_coverage" "coverage_check" "none" \
   "none" "validate all impact categories covered"
 
 missing_categories=0
-
 for pattern in \
   "baseline_" \
   "impact_" \
@@ -155,7 +233,7 @@ for pattern in \
   "manual_\|override_\|autopilot_\|mixed_" \
   "report_" \
   "determinism_"; do
-  if ! grep -q "${pattern}.*ok" "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests.log"; then
+  if ! grep -q "${pattern}.*ok" "${tests_log}"; then
     echo "MISSING: ${pattern}" >&2
     missing_categories=$((missing_categories + 1))
   fi
@@ -163,54 +241,49 @@ done
 
 if [[ ${missing_categories} -gt 0 ]]; then
   emit_log "failed" "category_coverage" "missing_categories" "COVERAGE_MISSING" \
-    "ft_1i2ge_6_8_${RUN_ID}.tests.log" \
+    "$(basename "${tests_log}")" \
     "${missing_categories} impact categories missing"
   echo "FAIL: ${missing_categories} impact categories missing" >&2
   exit 1
 fi
 emit_log "passed" "category_coverage" "all_categories_covered" "none" \
-  "ft_1i2ge_6_8_${RUN_ID}.tests.log" "all impact categories covered"
+  "$(basename "${tests_log}")" "all impact categories covered"
 
 # ── Test 5: Determinism check ────────────────────────────────────
 emit_log "running" "determinism" "repeat_run" "none" \
   "none" "verify impact attribution results are deterministic"
 
-set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-6-8-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge \
-    --test mission_impact_attribution 2>&1
-) > "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log" 2>&1
-repeat_rc=$?
-set -e
+tests_repeat_log="${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log"
+if run_rch_cargo_logged "determinism" "${tests_repeat_log}" \
+  test -p frankenterm-core --features subprocess-bridge --test mission_impact_attribution; then
+  repeat_rc=0
+else
+  repeat_rc=$?
+fi
 
 if [[ ${repeat_rc} -ne 0 ]]; then
   emit_log "failed" "determinism" "repeat_run_failed" "REPEAT_FAIL" \
-    "ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log" "repeat run failed"
+    "$(basename "${tests_repeat_log}")" "repeat run failed"
   echo "FAIL: repeat test run" >&2
   exit 1
 fi
 
-pass_count_1=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests.log" || echo 0)
-pass_count_2=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log" || echo 0)
+pass_count_1=$(grep -c "ok$" "${tests_log}" || echo 0)
+pass_count_2=$(grep -c "ok$" "${tests_repeat_log}" || echo 0)
 if [[ ${pass_count_1} -ne ${pass_count_2} ]]; then
   emit_log "failed" "determinism" "count_mismatch" "DETERMINISM_FAIL" \
-    "ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log" \
+    "$(basename "${tests_repeat_log}")" \
     "pass count diverged: ${pass_count_1} vs ${pass_count_2}"
   echo "FAIL: non-deterministic test counts" >&2
   exit 1
 fi
 emit_log "passed" "determinism" "repeat_run_stable" "none" \
-  "ft_1i2ge_6_8_${RUN_ID}.tests_repeat.log" \
+  "$(basename "${tests_repeat_log}")" \
   "test counts stable: ${pass_count_1} == ${pass_count_2}"
 
 # ── Suite complete ─────────────────────────────────────────────────
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "$(basename "${LOG_FILE}")" \
   "validated impact attribution: compilation, ${impact_count} tests, clippy, category coverage, determinism"
-
-# Cleanup ephemeral target dir.
-rm -rf "${ROOT_DIR}/target-e2e-1i2ge-6-8-${RUN_ID}" 2>/dev/null || true
 
 echo "ft-1i2ge.6.8 e2e passed. Logs: ${LOG_FILE_REL}"
