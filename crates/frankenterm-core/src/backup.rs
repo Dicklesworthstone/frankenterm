@@ -885,6 +885,9 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 Some(VirtualTableRestoreStrategy::DumpRows) => {
                     dump_rows_as_inserts(&conn, &mut file, &table.name, true)?;
                 }
+                Some(VirtualTableRestoreStrategy::DumpShadowTables) => {
+                    dump_fts5_shadow_tables(&conn, &mut file, &table.name)?;
+                }
                 None => {}
             }
         }
@@ -1017,6 +1020,7 @@ struct DumpSchema {
 enum VirtualTableRestoreStrategy {
     DumpRows,
     RebuildExternalContent,
+    DumpShadowTables,
 }
 
 fn dump_rows_as_inserts<W: Write>(
@@ -1107,6 +1111,44 @@ fn dump_rows_as_inserts<W: Write>(
     Ok(())
 }
 
+/// Dump FTS5 shadow tables for contentless virtual tables.
+///
+/// Contentless FTS5 tables (`content=''`) don't store the original text, so
+/// `SELECT * FROM fts_table` returns empty strings. The only way to back up
+/// the index is to dump the underlying shadow tables directly.
+fn dump_fts5_shadow_tables<W: Write>(
+    conn: &Connection,
+    writer: &mut W,
+    table_name: &str,
+) -> Result<()> {
+    let write_err = |e: std::io::Error| {
+        Error::Storage(crate::StorageError::Database(format!(
+            "SQL dump write failed: {e}"
+        )))
+    };
+
+    writeln!(writer, "PRAGMA writable_schema=ON;").map_err(&write_err)?;
+
+    for suffix in &["config", "content", "data", "docsize", "idx"] {
+        let shadow_name = format!("{table_name}_{suffix}");
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                [&shadow_name],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            let quoted = quote_identifier(&shadow_name);
+            writeln!(writer, "DELETE FROM {quoted};").map_err(&write_err)?;
+            dump_rows_as_inserts(conn, writer, &shadow_name, false)?;
+        }
+    }
+
+    writeln!(writer, "PRAGMA writable_schema=OFF;").map_err(&write_err)?;
+    Ok(())
+}
+
 fn virtual_table_restore_strategy(create_sql: &str) -> VirtualTableRestoreStrategy {
     let lowered = create_sql.to_ascii_lowercase();
     if !lowered.contains("using fts5") {
@@ -1115,7 +1157,8 @@ fn virtual_table_restore_strategy(create_sql: &str) -> VirtualTableRestoreStrate
 
     match find_fts5_option_value(&lowered, "content") {
         Some(content) if !content.is_empty() => VirtualTableRestoreStrategy::RebuildExternalContent,
-        _ => VirtualTableRestoreStrategy::DumpRows,
+        Some(_) => VirtualTableRestoreStrategy::DumpShadowTables, // content='' → contentless
+        None => VirtualTableRestoreStrategy::DumpRows,            // internal content (default FTS5)
     }
 }
 
@@ -1706,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_dump_restores_contentless_fts_by_replaying_rows() {
+    fn sql_dump_restores_contentless_fts_via_shadow_tables() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("contentless.db");
         let _conn = create_test_db_with_contentless_fts(&db_path);
@@ -1717,8 +1760,11 @@ mod tests {
 
         let sql_dump = fs::read_to_string(&sql_path).unwrap();
         assert!(sql_dump.contains("CREATE VIRTUAL TABLE notes_fts USING fts5"));
-        assert!(!sql_dump.contains("INSERT INTO \"notes_fts\"(\"notes_fts\") VALUES('rebuild');"));
-        assert!(sql_dump.contains("INSERT INTO \"notes_fts\" (\"rowid\", \"title\", \"body\")"));
+        // Contentless FTS5 should NOT replay virtual table rows (they'd be empty strings).
+        assert!(!sql_dump.contains("INSERT INTO \"notes_fts\" (\"rowid\""));
+        // Instead, shadow tables are dumped directly.
+        assert!(sql_dump.contains("PRAGMA writable_schema=ON;"));
+        assert!(sql_dump.contains("DELETE FROM \"notes_fts_data\""));
 
         let restored_path = tmp.path().join("contentless-restored.db");
         let restored = Connection::open(&restored_path).unwrap();
@@ -2135,12 +2181,12 @@ mod tests {
     }
 
     #[test]
-    fn virtual_table_restore_strategy_replays_rows_for_contentless_tables() {
+    fn virtual_table_restore_strategy_dumps_shadow_tables_for_contentless() {
         assert_eq!(
             virtual_table_restore_strategy(
                 "CREATE VIRTUAL TABLE notes_fts USING fts5(title, body, content='')"
             ),
-            VirtualTableRestoreStrategy::DumpRows
+            VirtualTableRestoreStrategy::DumpShadowTables
         );
     }
 
