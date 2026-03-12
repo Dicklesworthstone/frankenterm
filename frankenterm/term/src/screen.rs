@@ -65,6 +65,28 @@ pub struct Screen {
     forced_rollback_cause: Option<LastGoodFrameRollbackCause>,
 }
 
+#[cfg_attr(feature = "use_serde", derive(Deserialize, Serialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TieredScrollbackStatus {
+    pub tiering_enabled: bool,
+    pub configured_scrollback_rows: usize,
+    pub configured_hot_lines: usize,
+    pub configured_warm_max_bytes: usize,
+    pub visible_rows: usize,
+    pub in_memory_scrollback_rows: usize,
+    pub warm_resident_lines: usize,
+    pub warm_resident_bytes: usize,
+    pub warm_spill_lines_total: u64,
+    pub warm_spill_bytes_total: u64,
+    pub cold_spill_lines_total: u64,
+    pub cold_spill_bytes_total: u64,
+    pub cold_worker_peak_backlog_depth: usize,
+    pub cold_worker_completion_throughput_lines_per_sec: u64,
+    pub cold_worker_completed_lines_total: u64,
+    pub cold_worker_completed_batches_total: u64,
+    pub cold_worker_cancellation_count: u64,
+}
+
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
 const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
@@ -1836,9 +1858,60 @@ impl Screen {
         &mut self.lines[idx]
     }
 
-    /// Returns the number of occupied rows of scrollback
+    /// Returns the number of rows currently retained in memory, including the
+    /// visible viewport and any in-memory scrollback rows.
     pub fn scrollback_rows(&self) -> usize {
         self.lines.len()
+    }
+
+    /// Returns the number of in-memory scrollback rows retained above the
+    /// visible viewport.
+    pub fn in_memory_scrollback_rows(&self) -> usize {
+        self.lines.len().saturating_sub(self.physical_rows)
+    }
+
+    /// Returns a stable snapshot of the tiered scrollback state for telemetry,
+    /// diagnostics, and future GUI surfaces.
+    pub fn tiered_scrollback_status(&self) -> TieredScrollbackStatus {
+        let tier = self.config.scrollback_tier_config();
+        let tiering_enabled = self.allow_scrollback && tier.enabled;
+        let configured_scrollback_rows = if self.allow_scrollback {
+            self.config.scrollback_size()
+        } else {
+            0
+        };
+
+        TieredScrollbackStatus {
+            tiering_enabled,
+            configured_scrollback_rows,
+            configured_hot_lines: if tiering_enabled {
+                self.hot_scrollback_size()
+            } else {
+                0
+            },
+            configured_warm_max_bytes: if tiering_enabled {
+                self.tiered_scrollback_warm_max_bytes()
+            } else {
+                0
+            },
+            visible_rows: self.physical_rows,
+            in_memory_scrollback_rows: self.in_memory_scrollback_rows(),
+            warm_resident_lines: self.scrollback_tiering.warm_resident_lines(),
+            warm_resident_bytes: self.scrollback_tiering.warm_bytes,
+            warm_spill_lines_total: self.scrollback_tiering.warm_spill_lines_total,
+            warm_spill_bytes_total: self.scrollback_tiering.warm_spill_bytes_total,
+            cold_spill_lines_total: self.scrollback_tiering.cold_spill_lines_total,
+            cold_spill_bytes_total: self.scrollback_tiering.cold_spill_bytes_total,
+            cold_worker_peak_backlog_depth: self.cold_scrollback_worker.peak_backlog_depth(),
+            cold_worker_completion_throughput_lines_per_sec: self
+                .cold_scrollback_worker
+                .completion_throughput_lines_per_sec(),
+            cold_worker_completed_lines_total: self.cold_scrollback_worker.completed_lines_total,
+            cold_worker_completed_batches_total: self
+                .cold_scrollback_worker
+                .completed_batches_total,
+            cold_worker_cancellation_count: self.cold_scrollback_worker.cancellation_count(),
+        }
     }
 
     /// Sets a line dirty.  The line is relative to the visible origin.
@@ -3755,6 +3828,105 @@ mod tests {
         assert_eq!(screen.cold_scrollback_worker.completed_lines_total(), 0);
         assert_eq!(screen.cold_scrollback_worker.completed_batches_total(), 0);
         assert_eq!(screen.cold_scrollback_worker.cancellation_count(), 0);
+    }
+
+    #[test]
+    fn tiered_scrollback_status_reports_current_config_and_metrics() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 2;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=32 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        let status = screen.tiered_scrollback_status();
+        assert!(status.tiering_enabled);
+        assert_eq!(status.configured_scrollback_rows, 10);
+        assert_eq!(status.configured_hot_lines, 2);
+        assert_eq!(status.configured_warm_max_bytes, warm_max_bytes);
+        assert_eq!(status.visible_rows, 2);
+        assert!(
+            status.in_memory_scrollback_rows <= 2,
+            "hot tier should bound the in-memory scrollback rows"
+        );
+        assert_eq!(
+            status.warm_spill_lines_total,
+            status.cold_spill_lines_total + status.warm_resident_lines as u64
+        );
+        assert_eq!(
+            status.warm_spill_bytes_total,
+            status.cold_spill_bytes_total + status.warm_resident_bytes as u64
+        );
+        assert_eq!(
+            status.cold_worker_completed_lines_total,
+            status.cold_spill_lines_total
+        );
+        assert!(
+            status.cold_worker_completed_batches_total > 0,
+            "cold spill should produce completion batches"
+        );
+        assert!(
+            status.cold_worker_completion_throughput_lines_per_sec > 0,
+            "cold spill should record throughput telemetry"
+        );
+    }
+
+    #[test]
+    fn erase_scrollback_resets_tiered_scrollback_status_but_keeps_config() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 2;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=32 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+        screen.erase_scrollback();
+
+        let status = screen.tiered_scrollback_status();
+        assert!(status.tiering_enabled);
+        assert_eq!(status.configured_scrollback_rows, 10);
+        assert_eq!(status.configured_hot_lines, 2);
+        assert_eq!(status.configured_warm_max_bytes, warm_max_bytes);
+        assert_eq!(status.visible_rows, 2);
+        assert_eq!(status.in_memory_scrollback_rows, 0);
+        assert_eq!(status.warm_resident_lines, 0);
+        assert_eq!(status.warm_resident_bytes, 0);
+        assert_eq!(status.warm_spill_lines_total, 0);
+        assert_eq!(status.warm_spill_bytes_total, 0);
+        assert_eq!(status.cold_spill_lines_total, 0);
+        assert_eq!(status.cold_spill_bytes_total, 0);
+        assert_eq!(status.cold_worker_peak_backlog_depth, 0);
+        assert_eq!(status.cold_worker_completion_throughput_lines_per_sec, 0);
+        assert_eq!(status.cold_worker_completed_lines_total, 0);
+        assert_eq!(status.cold_worker_completed_batches_total, 0);
+        assert_eq!(status.cold_worker_cancellation_count, 0);
     }
 
     #[test]
