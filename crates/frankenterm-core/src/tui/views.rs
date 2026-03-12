@@ -16,7 +16,7 @@ use super::query::{
     EventView, HealthStatus, HistoryEntryView, PaneBookmarkView, PaneView, RulesetProfileState,
     SavedSearchView, SearchResultView, TriageItemView, WorkflowProgressView,
 };
-use super::view_adapters::{DashboardModel, adapt_dashboard};
+use super::view_adapters::{DashboardModel, TimelineRow, adapt_dashboard};
 use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
@@ -212,6 +212,12 @@ pub struct ViewState {
     pub saved_search_selected_index: usize,
     /// Active workflows for progress display
     pub workflows: Vec<WorkflowProgressView>,
+    /// Unified timeline rows for the Timeline view.
+    pub timeline_rows: Vec<TimelineRow>,
+    /// Selected timeline row.
+    pub timeline_selected_index: usize,
+    /// Timeline zoom/window level.
+    pub timeline_zoom: u8,
     /// Expanded workflow index in triage view (None = collapsed)
     pub triage_expanded: Option<usize>,
     /// Bookmark records for panes.
@@ -2246,11 +2252,23 @@ fn epoch_ms_ago(ts: i64) -> i64 {
     now_ms.saturating_sub(ts)
 }
 
+#[must_use]
+const fn timeline_zoom_label(zoom: u8) -> &'static str {
+    match zoom {
+        0 => "30m",
+        1 => "1h",
+        2 => "2h",
+        3 => "6h",
+        4 => "12h",
+        _ => "24h",
+    }
+}
+
 /// Render the help view
 pub fn render_help_view(area: Rect, buf: &mut Buffer) {
     let help_text = vec![
         Line::from(Span::styled(
-            "WezTerm Automata TUI",
+            "FrankenTerm Operator TUI",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -2263,7 +2281,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  r          Refresh current view"),
         Line::from("  Tab        Next view"),
         Line::from("  Shift+Tab  Previous view"),
-        Line::from("  1-7        Jump to view by number"),
+        Line::from("  1-8        Jump to view by number"),
         Line::from(""),
         Line::from(Span::styled(
             "List Navigation:",
@@ -2281,6 +2299,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  [History] type text to filter, u=undoable-only"),
         Line::from("  [Search] Ctrl+N/Ctrl+P select saved, Ctrl+R run, Ctrl+E toggle"),
         Line::from("  [Search] Ctrl+F toggle fast-only mode"),
+        Line::from("  [Timeline] j/k select event, +/- widen or narrow window"),
         Line::from("  [Triage] e=expand/collapse workflow progress"),
         Line::from(""),
         Line::from(Span::styled(
@@ -2288,7 +2307,7 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
             Style::default().add_modifier(Modifier::UNDERLINED),
         )),
         Line::from("  1. Home    System overview and health"),
-        Line::from("  2. Panes   List all WezTerm panes"),
+        Line::from("  2. Panes   List observed panes"),
         Line::from("  3. Events  Recent detection events"),
         Line::from("  4. Triage  Prioritized issues + actions"),
         Line::from("  5. History Audit action timeline"),
@@ -2302,25 +2321,243 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
     help.render(area, buf);
 }
 
-/// Render a placeholder for the Timeline view in the ratatui backend.
-///
-/// Full timeline rendering is implemented in the ftui backend; this stub
-/// provides basic UI so the ratatui backend compiles and displays a message.
-pub fn render_timeline_placeholder(area: Rect, buf: &mut Buffer) {
-    let text = vec![
+/// Render the timeline view with a responsive list/detail layout.
+pub fn render_timeline_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let stacked_mode = area.width < 96 || area.height < 18;
+    let ultra_compact = area.width < 68;
+    let detail_height = if area.height >= 22 { 10 } else { 8 };
+    let chunks = if stacked_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(area.height.saturating_sub(detail_height)),
+                Constraint::Length(detail_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area)
+    };
+
+    let selected_index = state
+        .timeline_selected_index
+        .min(state.timeline_rows.len().saturating_sub(1));
+    let selected_row = state.timeline_rows.get(selected_index);
+
+    let list_block = Block::default()
+        .title(format!(
+            "Timeline ({}){}",
+            state.timeline_rows.len(),
+            if stacked_mode { " [compact]" } else { "" }
+        ))
+        .borders(Borders::ALL);
+    let list_inner = list_block.inner(chunks[0]);
+    list_block.render(chunks[0], buf);
+
+    let list_header_height = if ultra_compact || list_inner.height < 6 {
+        2
+    } else {
+        3
+    };
+    let list_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_header_height), Constraint::Min(1)])
+        .split(list_inner);
+
+    let header_width = usize::from(list_chunks[0].width.saturating_sub(1)).max(1);
+    let columns = if ultra_compact {
+        "time pane sev type"
+    } else if stacked_mode {
+        "time pane sev type corr"
+    } else {
+        "time pane sev type handled corr"
+    };
+    let summary = if stacked_mode {
+        format!(
+            "window={}  j/k nav  +/- zoom  corr=*",
+            timeline_zoom_label(state.timeline_zoom),
+        )
+    } else {
+        format!(
+            "window={}  j/k select  +/- widen/narrow  corr=*",
+            timeline_zoom_label(state.timeline_zoom),
+        )
+    };
+    Paragraph::new(vec![
+        Line::from(truncate_str(columns, header_width)),
         Line::from(Span::styled(
-            "Timeline",
-            Style::default().add_modifier(Modifier::BOLD),
+            truncate_str(&summary, header_width),
+            Style::default().fg(Color::Gray),
         )),
-        Line::from(""),
-        Line::from("  Cross-pane event timeline with correlation markers."),
-        Line::from("  Full rendering available in the ftui backend."),
-        Line::from(""),
-        Line::from("  Keys: j/k=nav  +/-=zoom  8=jump here"),
-    ];
-    let block =
-        Paragraph::new(text).block(Block::default().title("Timeline").borders(Borders::ALL));
-    block.render(area, buf);
+    ])
+    .render(list_chunks[0], buf);
+
+    if state.timeline_rows.is_empty() {
+        Paragraph::new(Span::styled(
+            "No timeline events in the current window.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(list_chunks[1], buf);
+    } else {
+        let row_width = usize::from(list_chunks[1].width.saturating_sub(1)).max(1);
+        let mut lines: Vec<Line> = Vec::with_capacity(state.timeline_rows.len());
+        for (pos, row) in state.timeline_rows.iter().enumerate() {
+            let corr_marker = if row.correlation_label.is_empty() {
+                "-"
+            } else {
+                "*"
+            };
+            let raw_line = if ultra_compact {
+                format!(
+                    "{:>8} {:6} {:7} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 7),
+                    truncate_str(&row.event_type, 14),
+                )
+            } else if stacked_mode {
+                format!(
+                    "{:>8} {:6} {:7} {:12} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 7),
+                    truncate_str(&row.event_type, 12),
+                    corr_marker,
+                )
+            } else {
+                format!(
+                    "{:>8} {:6} {:8} {:12} {:8} {}",
+                    truncate_str(&row.timestamp, 8),
+                    truncate_str(&row.pane_label, 6),
+                    truncate_str(&row.severity_label, 8),
+                    truncate_str(&row.event_type, 12),
+                    truncate_str(&row.handled_label, 8),
+                    corr_marker,
+                )
+            };
+            let style = if pos == selected_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if row.severity_label.eq_ignore_ascii_case("error") {
+                Style::default().fg(Color::Red)
+            } else if row.severity_label.eq_ignore_ascii_case("warning") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(truncate_str(&raw_line, row_width), style));
+        }
+        Paragraph::new(lines).render(list_chunks[1], buf);
+    }
+
+    let detail_block = Block::default()
+        .title(if stacked_mode {
+            "Selected Event"
+        } else {
+            "Event Details"
+        })
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(row) = selected_row {
+        let detail_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let compact_details = stacked_mode || detail_inner.height < 10 || detail_inner.width < 36;
+        let correlation = if row.correlation_label.is_empty() {
+            "none".to_string()
+        } else {
+            row.correlation_label.clone()
+        };
+        let mut details: Vec<Line> = Vec::new();
+
+        if compact_details {
+            details.push(Line::from(truncate_str(
+                &format!("{}  {}", row.timestamp, row.pane_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("{} | {}", row.severity_label, row.event_type),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent {} | {}", row.agent_label, row.handled_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Corr {}", correlation),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Summary:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&row.summary, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str("Keys: j/k nav | +/- zoom", detail_width),
+                Style::default().fg(Color::Gray),
+            )));
+        } else {
+            details.push(Line::from(truncate_str(
+                &format!("Event ID: {}", row.id),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Timestamp: {}", row.timestamp),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Pane: {}", row.pane_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Agent: {}", row.agent_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Type: {}", row.event_type),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Severity: {}", row.severity_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Handled: {}", row.handled_label),
+                detail_width,
+            )));
+            details.push(Line::from(truncate_str(
+                &format!("Correlations: {}", correlation),
+                detail_width,
+            )));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                "Summary:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            details.push(Line::from(truncate_str(&row.summary, detail_width)));
+            details.push(Line::from(""));
+            details.push(Line::from(Span::styled(
+                truncate_str(
+                    "Keys: j/k=select event, +/-=widen/narrow timeline window",
+                    detail_width,
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+
+        Paragraph::new(details).render(detail_inner, buf);
+    } else {
+        Paragraph::new(Span::styled(
+            "No timeline event selected.",
+            Style::default().fg(Color::Yellow),
+        ))
+        .render(detail_inner, buf);
+    }
 }
 
 /// Truncate a string to max length, adding ellipsis if needed
@@ -2344,6 +2581,28 @@ mod tests {
     use crate::circuit_breaker::CircuitBreakerStatus;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+
+    fn read_row(area: Rect, buf: &Buffer, row: u16) -> String {
+        let y = area.y + row;
+        let mut text = String::new();
+        for x in area.x..area.x + area.width {
+            text.push_str(buf[(x, y)].symbol());
+        }
+        text
+    }
+
+    fn buffer_text(area: Rect, buf: &Buffer) -> String {
+        let mut text = String::new();
+        for row in 0..area.height {
+            text.push_str(&read_row(area, buf, row));
+            text.push('\n');
+        }
+        text
+    }
+
+    fn first_row_containing(area: Rect, buf: &Buffer, needle: &str) -> Option<u16> {
+        (0..area.height).find(|row| read_row(area, buf, *row).contains(needle))
+    }
 
     #[test]
     fn view_navigation_wraps() {
@@ -3299,6 +3558,70 @@ mod tests {
         render_help_view(area, &mut buf);
     }
 
+    #[test]
+    fn render_help_view_lists_eight_views_and_timeline_controls() {
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        render_help_view(area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("FrankenTerm Operator TUI"));
+        assert!(text.contains("1-8        Jump to view by number"));
+        assert!(text.contains("[Timeline] j/k select event, +/- widen or narrow window"));
+        assert!(text.contains("8. Timeline Cross-pane event timeline"));
+    }
+
+    fn timeline_row(id: &str, severity: &str, correlation_label: &str) -> TimelineRow {
+        TimelineRow {
+            id: id.to_string(),
+            timestamp: "2026-03-11 20:15".to_string(),
+            pane_label: "P7".to_string(),
+            agent_label: "codex".to_string(),
+            event_type: "usage_limit".to_string(),
+            severity_label: severity.to_string(),
+            handled_label: "OPEN".to_string(),
+            correlation_label: correlation_label.to_string(),
+            summary: "Rate limit reached while the operator dashboard was open.".to_string(),
+            severity_style: crate::tui::ftui_compat::StyleSpec::new(),
+            agent_style: crate::tui::ftui_compat::StyleSpec::new(),
+            handled_style: crate::tui::ftui_compat::StyleSpec::new(),
+            correlation_style: crate::tui::ftui_compat::StyleSpec::new(),
+        }
+    }
+
+    #[test]
+    fn render_timeline_view_narrow_stacks_detail_below_list() {
+        let mut state = ViewState::default();
+        state.timeline_rows = vec![
+            timeline_row("evt-1", "error", "failover"),
+            timeline_row("evt-2", "warning", ""),
+        ];
+        let area = Rect::new(0, 0, 80, 22);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let detail_row = first_row_containing(area, &buf, "Selected Event")
+            .expect("compact timeline layout should still show stacked detail title");
+        assert!(
+            detail_row >= 10,
+            "compact timeline detail should stack below list, got row {detail_row}"
+        );
+    }
+
+    #[test]
+    fn render_timeline_view_wide_shows_event_details() {
+        let mut state = ViewState::default();
+        state.timeline_rows = vec![timeline_row("evt-1", "error", "failover")];
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        render_timeline_view(&state, area, &mut buf);
+
+        let text = buffer_text(area, &buf);
+        assert!(text.contains("Timeline (1)"));
+        assert!(text.contains("Event Details"));
+        assert!(text.contains("Correlations: failover"));
+    }
+
     // --- Triage edge cases ---
 
     #[test]
@@ -3569,6 +3892,7 @@ mod tests {
         render_triage_view(&state, area, &mut buf);
         render_search_view(&state, area, &mut buf);
         render_help_view(area, &mut buf);
+        render_timeline_view(&state, area, &mut buf);
         // None should panic at small terminal size
     }
 

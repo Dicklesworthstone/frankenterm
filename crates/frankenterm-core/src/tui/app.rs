@@ -23,11 +23,12 @@ use ratatui::{
 };
 
 use super::query::{EventFilters, QueryClient, QueryError};
+use super::view_adapters::adapt_timeline_event;
 use super::views::{
     SearchProgressPhase, View, ViewState, filtered_event_indices, filtered_history_indices,
     filtered_pane_indices, render_events_view, render_help_view, render_history_view,
-    render_home_view, render_panes_view, render_search_view, render_tabs,
-    render_timeline_placeholder, render_triage_view,
+    render_home_view, render_panes_view, render_search_view, render_tabs, render_timeline_view,
+    render_triage_view,
 };
 
 /// Application configuration
@@ -239,7 +240,8 @@ impl<Q: QueryClient> App<Q> {
             View::History => self.handle_history_key(key),
             View::Triage => self.handle_triage_key(key),
             View::Search => self.handle_search_key(key),
-            View::Home | View::Help | View::Timeline => {}
+            View::Timeline => self.handle_timeline_key(key),
+            View::Home | View::Help => {}
         }
     }
 
@@ -559,6 +561,84 @@ impl<Q: QueryClient> App<Q> {
         }
     }
 
+    /// Handle key events in the timeline view.
+    fn handle_timeline_key(&mut self, key: KeyEvent) {
+        let timeline_len = self.view_state.timeline_rows.len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if timeline_len > 0 {
+                    self.view_state.timeline_selected_index =
+                        (self.view_state.timeline_selected_index + 1) % timeline_len;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if timeline_len > 0 {
+                    self.view_state.timeline_selected_index = self
+                        .view_state
+                        .timeline_selected_index
+                        .checked_sub(1)
+                        .unwrap_or(timeline_len - 1);
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                if self.view_state.timeline_zoom < 5 {
+                    self.view_state.timeline_zoom += 1;
+                    self.refresh_timeline_data();
+                }
+            }
+            KeyCode::Char('-') => {
+                let next_zoom = self.view_state.timeline_zoom.saturating_sub(1);
+                if next_zoom != self.view_state.timeline_zoom {
+                    self.view_state.timeline_zoom = next_zoom;
+                    self.refresh_timeline_data();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    const fn timeline_window_ms(zoom: u8) -> i64 {
+        match zoom {
+            0 => 30 * 60 * 1000,
+            1 => 60 * 60 * 1000,
+            2 => 2 * 60 * 60 * 1000,
+            3 => 6 * 60 * 60 * 1000,
+            4 => 12 * 60 * 60 * 1000,
+            _ => 24 * 60 * 60 * 1000,
+        }
+    }
+
+    fn refresh_timeline_data(&mut self) {
+        match self
+            .query_client
+            .get_timeline(Self::timeline_window_ms(self.view_state.timeline_zoom), 50)
+        {
+            Ok(timeline) => {
+                self.view_state.timeline_rows = timeline
+                    .events
+                    .iter()
+                    .map(adapt_timeline_event)
+                    .collect::<Vec<_>>();
+                if self.view_state.timeline_rows.is_empty() {
+                    self.view_state.timeline_selected_index = 0;
+                } else if self.view_state.timeline_selected_index
+                    >= self.view_state.timeline_rows.len()
+                {
+                    self.view_state.timeline_selected_index =
+                        self.view_state.timeline_rows.len() - 1;
+                }
+            }
+            Err(QueryError::DatabaseNotInitialized(_)) => {
+                self.view_state.timeline_rows.clear();
+                self.view_state.timeline_selected_index = 0;
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to load timeline: {e}"));
+            }
+        }
+    }
+
     /// Execute FTS search using query client
     fn execute_search(&mut self) {
         let query = self.view_state.search_query.trim().to_string();
@@ -776,6 +856,8 @@ impl<Q: QueryClient> App<Q> {
             }
         }
 
+        self.refresh_timeline_data();
+
         self.last_refresh = Instant::now();
     }
 
@@ -801,7 +883,7 @@ impl<Q: QueryClient> App<Q> {
             View::Triage => render_triage_view(&self.view_state, chunks[1], buf),
             View::Search => render_search_view(&self.view_state, chunks[1], buf),
             View::Help => render_help_view(chunks[1], buf),
-            View::Timeline => render_timeline_placeholder(chunks[1], buf),
+            View::Timeline => render_timeline_view(&self.view_state, chunks[1], buf),
         }
     }
 
@@ -904,10 +986,14 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{
+        CorrelationRef, CorrelationType, PaneInfo as TimelinePaneInfo, Timeline, TimelineEvent,
+    };
     use crate::tui::query::{
         EventView, HealthStatus, HistoryEntryView, PaneView, SearchResultView, WorkflowProgressView,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::{Arc, Mutex};
 
     struct TestQueryClient;
 
@@ -1652,6 +1738,9 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Help);
 
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE));
+        assert_eq!(app.current_view, View::Timeline);
+
         app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(app.current_view, View::Home);
     }
@@ -1841,6 +1930,162 @@ mod tests {
         app.refresh_data();
         // TestQueryClient returns 1 pane, so selected_index should reset
         assert_eq!(app.view_state.selected_index, 0);
+    }
+
+    fn sample_timeline() -> Timeline {
+        Timeline {
+            start: 1_700_000_000_000,
+            end: 1_700_000_120_000,
+            events: vec![
+                TimelineEvent {
+                    id: 100,
+                    timestamp: 1_700_000_030_000,
+                    pane_info: TimelinePaneInfo {
+                        pane_id: 7,
+                        pane_uuid: None,
+                        agent_type: Some("codex".to_string()),
+                        domain: "local".to_string(),
+                        cwd: Some("/tmp/codex".to_string()),
+                        title: Some("codex-main".to_string()),
+                    },
+                    rule_id: "codex.usage.reached".to_string(),
+                    event_type: "usage_limit".to_string(),
+                    severity: "warning".to_string(),
+                    confidence: 0.93,
+                    handled: None,
+                    correlations: vec![CorrelationRef {
+                        id: "corr-1".to_string(),
+                        correlation_type: CorrelationType::Failover,
+                    }],
+                    summary: Some("Usage limit reached; failover likely needed.".to_string()),
+                },
+                TimelineEvent {
+                    id: 101,
+                    timestamp: 1_700_000_090_000,
+                    pane_info: TimelinePaneInfo {
+                        pane_id: 8,
+                        pane_uuid: None,
+                        agent_type: Some("claude".to_string()),
+                        domain: "ssh".to_string(),
+                        cwd: Some("/tmp/claude".to_string()),
+                        title: Some("claude-recovery".to_string()),
+                    },
+                    rule_id: "claude_code.session.started".to_string(),
+                    event_type: "session_started".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 0.88,
+                    handled: None,
+                    correlations: Vec::new(),
+                    summary: Some("Recovery session started on a standby pane.".to_string()),
+                },
+            ],
+            correlations: Vec::new(),
+            total_count: 2,
+            has_more: false,
+        }
+    }
+
+    struct TimelineQueryClient {
+        requested_windows: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl QueryClient for TimelineQueryClient {
+        fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
+            Ok(vec![pane(7, "codex-main", Some("codex"), 1)])
+        }
+
+        fn list_events(&self, _: &EventFilters) -> Result<Vec<EventView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn health(&self) -> Result<HealthStatus, QueryError> {
+            Ok(HealthStatus {
+                watcher_running: true,
+                db_accessible: true,
+                wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
+                pane_count: 2,
+                event_count: 2,
+                last_capture_ts: Some(1_700_000_090_000),
+            })
+        }
+
+        fn is_watcher_running(&self) -> bool {
+            true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
+        }
+
+        fn list_active_workflows(&self) -> Result<Vec<WorkflowProgressView>, QueryError> {
+            Ok(Vec::new())
+        }
+
+        fn get_timeline(&self, last_ms: i64, _limit: usize) -> Result<Timeline, QueryError> {
+            self.requested_windows.lock().unwrap().push(last_ms);
+            Ok(sample_timeline())
+        }
+    }
+
+    #[test]
+    fn refresh_data_populates_timeline_rows() {
+        let requested_windows = Arc::new(Mutex::new(Vec::new()));
+        let client = TimelineQueryClient {
+            requested_windows: Arc::clone(&requested_windows),
+        };
+        let mut app = App::new(client, AppConfig::default());
+
+        app.refresh_data();
+
+        assert_eq!(app.view_state.timeline_rows.len(), 2);
+        assert_eq!(app.view_state.timeline_rows[0].pane_label, "P7");
+        assert_eq!(
+            app.view_state.timeline_rows[0].correlation_label,
+            "failover"
+        );
+        assert_eq!(app.view_state.timeline_rows[1].agent_label, "claude");
+        assert_eq!(
+            requested_windows.lock().unwrap().as_slice(),
+            &[30 * 60 * 1000]
+        );
+    }
+
+    #[test]
+    fn timeline_view_keys_navigate_and_zoom() {
+        let requested_windows = Arc::new(Mutex::new(Vec::new()));
+        let client = TimelineQueryClient {
+            requested_windows: Arc::clone(&requested_windows),
+        };
+        let mut app = App::new(client, AppConfig::default());
+        app.refresh_data();
+        app.current_view = View::Timeline;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_selected_index, 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_zoom, 1);
+        assert_eq!(app.view_state.timeline_selected_index, 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_selected_index, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.view_state.timeline_zoom, 0);
+
+        assert_eq!(
+            requested_windows.lock().unwrap().as_slice(),
+            &[30 * 60 * 1000, 60 * 60 * 1000, 30 * 60 * 1000]
+        );
     }
 
     #[test]
@@ -2061,6 +2306,10 @@ mod tests {
         fn list_action_history(&self, _limit: usize) -> Result<Vec<HistoryEntryView>, QueryError> {
             Ok(fixture_history())
         }
+
+        fn get_timeline(&self, _last_ms: i64, _limit: usize) -> Result<Timeline, QueryError> {
+            Ok(sample_timeline())
+        }
     }
 
     /// Extract text content from a Buffer as a vector of line strings.
@@ -2258,6 +2507,7 @@ mod tests {
             View::History,
             View::Search,
             View::Help,
+            View::Timeline,
         ];
 
         for &(width, height) in &sizes {
