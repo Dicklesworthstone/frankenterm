@@ -60,6 +60,7 @@ use crate::connector_host_runtime::{
 use crate::diagnostic_redaction::DiagnosticFieldPolicy;
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
+use crate::swarm_work_queue::QueueStats;
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -1331,6 +1332,96 @@ impl UnifiedTelemetryRecord {
             redaction_strategy: RedactionStrategy::Passthrough,
             attributes,
         }
+    }
+
+    /// Normalize a [`QueueStats`] snapshot into the shared record shape.
+    ///
+    /// Health tier is derived from failure rate, blocked ratio, and queue depth.
+    #[must_use]
+    pub fn from_queue_stats(stats: &QueueStats, now_ms: u64) -> Self {
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "total_items".to_string(),
+            serde_json::json!(stats.total_items),
+        );
+        attributes.insert("blocked".to_string(), serde_json::json!(stats.blocked));
+        attributes.insert("ready".to_string(), serde_json::json!(stats.ready));
+        attributes.insert(
+            "in_progress".to_string(),
+            serde_json::json!(stats.in_progress),
+        );
+        attributes.insert("completed".to_string(), serde_json::json!(stats.completed));
+        attributes.insert("failed".to_string(), serde_json::json!(stats.failed));
+        attributes.insert("cancelled".to_string(), serde_json::json!(stats.cancelled));
+        attributes.insert(
+            "active_agents".to_string(),
+            serde_json::json!(stats.active_agents),
+        );
+
+        let terminal = stats.completed + stats.failed + stats.cancelled;
+        let failure_rate = if terminal > 0 {
+            stats.failed as f64 / terminal as f64
+        } else {
+            0.0
+        };
+        let non_terminal = stats.total_items.saturating_sub(terminal);
+        let blocked_ratio = if non_terminal > 0 {
+            stats.blocked as f64 / non_terminal as f64
+        } else {
+            0.0
+        };
+        attributes.insert("failure_rate".to_string(), serde_json::json!(failure_rate));
+        attributes.insert(
+            "blocked_ratio".to_string(),
+            serde_json::json!(blocked_ratio),
+        );
+
+        let health_tier = if failure_rate >= 0.5 {
+            HealthTier::Black
+        } else if failure_rate >= 0.2 || blocked_ratio >= 0.8 {
+            HealthTier::Red
+        } else if failure_rate >= 0.05 || blocked_ratio >= 0.5 {
+            HealthTier::Yellow
+        } else {
+            HealthTier::Green
+        };
+
+        let failure_class = if failure_rate >= 0.5 {
+            Some(FailureClass::Permanent)
+        } else if failure_rate >= 0.1 {
+            Some(FailureClass::Degraded)
+        } else if blocked_ratio >= 0.8 {
+            Some(FailureClass::Overload)
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Runtime,
+            record_id: format!("queue-stats:{now_ms}"),
+            source_schema_version: None,
+            timestamp_ms: now_ms,
+            component: "swarm.work_queue".to_string(),
+            reason_code: "swarm.queue.snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("swarm:work_queue".to_string()),
+            health_tier,
+            failure_class,
+            sensitivity: DataSensitivity::Internal,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
+}
+
+impl From<&QueueStats> for UnifiedTelemetryRecord {
+    fn from(stats: &QueueStats) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self::from_queue_stats(stats, now_ms)
     }
 }
 
@@ -4440,5 +4531,112 @@ mod tests {
         let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8500);
         // failure_ratio = 5/25 = 0.20, saturation = 4/4 = 1.0 → Red
         assert_eq!(record.health_tier, HealthTier::Red);
+    }
+
+    // ── QueueStats adapter ──
+
+    #[test]
+    fn queue_stats_adapter_healthy() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: 20,
+            blocked: 2,
+            ready: 5,
+            in_progress: 3,
+            completed: 10,
+            failed: 0,
+            cancelled: 0,
+            active_agents: 4,
+            completion_log_size: 10,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+        assert_eq!(record.component, "swarm.work_queue");
+        assert_eq!(record.reason_code, "swarm.queue.snapshot");
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        assert_eq!(record.source, UnifiedTelemetrySource::Runtime);
+        assert_eq!(record.scope_id.as_deref(), Some("swarm:work_queue"));
+        assert_eq!(record.attributes["total_items"], serde_json::json!(20));
+        assert_eq!(record.attributes["active_agents"], serde_json::json!(4));
+    }
+
+    #[test]
+    fn queue_stats_high_failure_is_black() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: 20,
+            blocked: 0,
+            ready: 0,
+            in_progress: 0,
+            completed: 5,
+            failed: 15,
+            cancelled: 0,
+            active_agents: 2,
+            completion_log_size: 20,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+        // failure_rate = 15/20 = 0.75 → Black
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Permanent));
+    }
+
+    #[test]
+    fn queue_stats_high_blocked_ratio_red() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: 20,
+            blocked: 9,
+            ready: 1,
+            in_progress: 0,
+            completed: 10,
+            failed: 0,
+            cancelled: 0,
+            active_agents: 1,
+            completion_log_size: 10,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+        // non_terminal = 20 - 10 = 10, blocked_ratio = 9/10 = 0.9 → Red
+        assert_eq!(record.health_tier, HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Overload));
+    }
+
+    #[test]
+    fn queue_stats_moderate_failure_yellow() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: 30,
+            blocked: 2,
+            ready: 3,
+            in_progress: 5,
+            completed: 18,
+            failed: 2,
+            cancelled: 0,
+            active_agents: 3,
+            completion_log_size: 20,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+        // failure_rate = 2/20 = 0.10 → Yellow (>= 0.05)
+        assert_eq!(record.health_tier, HealthTier::Yellow);
+        assert_eq!(record.failure_class, Some(FailureClass::Degraded));
+    }
+
+    #[test]
+    fn queue_stats_from_trait() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats::default();
+        let record = UnifiedTelemetryRecord::from(&stats);
+        assert_eq!(record.component, "swarm.work_queue");
+    }
+
+    #[test]
+    fn queue_stats_empty_queue_green() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats::default();
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        // Verify all counters are zero
+        assert_eq!(record.attributes["total_items"], serde_json::json!(0));
+        assert_eq!(record.attributes["failed"], serde_json::json!(0));
     }
 }
