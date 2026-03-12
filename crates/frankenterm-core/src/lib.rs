@@ -202,6 +202,7 @@ pub mod identity_graph;
 pub mod incident_bundle;
 pub mod ingest;
 pub mod input_reserve;
+pub mod intervention_console;
 pub mod interval_tree;
 #[cfg(unix)]
 pub mod ipc;
