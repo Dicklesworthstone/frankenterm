@@ -59,6 +59,7 @@ use crate::connector_host_runtime::{
 };
 use crate::diagnostic_redaction::DiagnosticFieldPolicy;
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
+use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -1117,6 +1118,220 @@ impl UnifiedTelemetryRecord {
             attributes,
         }
     }
+
+    /// Normalize a [`MuxPoolStats`] snapshot into the shared record shape.
+    ///
+    /// Health tier is derived from connection failure ratios and pool saturation.
+    #[cfg(all(feature = "vendored", unix))]
+    #[must_use]
+    pub fn from_mux_pool_stats(stats: &crate::vendored::MuxPoolStats, now_ms: u64) -> Self {
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "max_size".to_string(),
+            serde_json::json!(stats.pool.max_size),
+        );
+        attributes.insert(
+            "idle_count".to_string(),
+            serde_json::json!(stats.pool.idle_count),
+        );
+        attributes.insert(
+            "active_count".to_string(),
+            serde_json::json!(stats.pool.active_count),
+        );
+        attributes.insert(
+            "connections_created".to_string(),
+            serde_json::json!(stats.connections_created),
+        );
+        attributes.insert(
+            "connections_failed".to_string(),
+            serde_json::json!(stats.connections_failed),
+        );
+        attributes.insert(
+            "health_checks".to_string(),
+            serde_json::json!(stats.health_checks),
+        );
+        attributes.insert(
+            "health_check_failures".to_string(),
+            serde_json::json!(stats.health_check_failures),
+        );
+        attributes.insert(
+            "recovery_attempts".to_string(),
+            serde_json::json!(stats.recovery_attempts),
+        );
+        attributes.insert(
+            "recovery_successes".to_string(),
+            serde_json::json!(stats.recovery_successes),
+        );
+        attributes.insert(
+            "permanent_failures".to_string(),
+            serde_json::json!(stats.permanent_failures),
+        );
+        attributes.insert(
+            "total_acquired".to_string(),
+            serde_json::json!(stats.pool.total_acquired),
+        );
+        attributes.insert(
+            "total_timeouts".to_string(),
+            serde_json::json!(stats.pool.total_timeouts),
+        );
+
+        // Derive health tier from connection reliability.
+        let total_attempts = stats.connections_created + stats.connections_failed;
+        let failure_ratio = if total_attempts > 0 {
+            stats.connections_failed as f64 / total_attempts as f64
+        } else {
+            0.0
+        };
+        let saturation = if stats.pool.max_size > 0 {
+            stats.pool.active_count as f64 / stats.pool.max_size as f64
+        } else {
+            0.0
+        };
+        let health_tier = if stats.permanent_failures > 0 || failure_ratio >= 0.5 {
+            HealthTier::Black
+        } else if failure_ratio >= 0.2 || saturation >= 0.95 {
+            HealthTier::Red
+        } else if failure_ratio >= 0.05 || saturation >= 0.80 {
+            HealthTier::Yellow
+        } else {
+            HealthTier::Green
+        };
+
+        let failure_class = if stats.permanent_failures > 0 {
+            Some(FailureClass::Permanent)
+        } else if stats.connections_failed > 0 {
+            Some(FailureClass::Transient)
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Runtime,
+            record_id: format!("mux-pool-stats:{now_ms}"),
+            source_schema_version: None,
+            timestamp_ms: now_ms,
+            component: "mux.pool".to_string(),
+            reason_code: "mux.pool.snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("mux:pool".to_string()),
+            health_tier,
+            failure_class,
+            sensitivity: DataSensitivity::Internal,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
+
+    /// Normalize a [`SchedulerSnapshot`] into the shared record shape.
+    ///
+    /// Health tier is derived from circuit breaker state and recent scale history.
+    #[must_use]
+    pub fn from_scheduler_snapshot(snapshot: &SchedulerSnapshot, now_ms: u64) -> Self {
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "fleet_agents".to_string(),
+            serde_json::json!(snapshot.agent_first_seen.len()),
+        );
+        attributes.insert(
+            "consecutive_scale_ops".to_string(),
+            serde_json::json!(snapshot.consecutive_scale_ops),
+        );
+        attributes.insert(
+            "circuit_breaker_tripped".to_string(),
+            serde_json::json!(snapshot.circuit_breaker_tripped_at.is_some()),
+        );
+        attributes.insert(
+            "scale_history_len".to_string(),
+            serde_json::json!(snapshot.scale_history.len()),
+        );
+        attributes.insert("sequence".to_string(), serde_json::json!(snapshot.sequence));
+        attributes.insert(
+            "last_evaluation_ms".to_string(),
+            serde_json::json!(snapshot.last_evaluation_ms),
+        );
+        attributes.insert(
+            "last_scale_up_ms".to_string(),
+            serde_json::json!(snapshot.last_scale_up_ms),
+        );
+        attributes.insert(
+            "last_scale_down_ms".to_string(),
+            serde_json::json!(snapshot.last_scale_down_ms),
+        );
+
+        // Aggregate per-agent failure rates for fleet-wide health assessment.
+        let total_completed: u32 = snapshot.agent_completed.values().sum();
+        let total_failed: u32 = snapshot.agent_failed.values().sum();
+        let total_work = total_completed + total_failed;
+        let fleet_failure_rate = if total_work > 0 {
+            total_failed as f64 / total_work as f64
+        } else {
+            0.0
+        };
+        attributes.insert(
+            "total_completed".to_string(),
+            serde_json::json!(total_completed),
+        );
+        attributes.insert("total_failed".to_string(), serde_json::json!(total_failed));
+        attributes.insert(
+            "fleet_failure_rate".to_string(),
+            serde_json::json!(fleet_failure_rate),
+        );
+
+        // Count recent scale event types for anomaly detection.
+        let scale_up_count = snapshot
+            .scale_history
+            .iter()
+            .filter(|e| matches!(e.event_type, ScaleEventType::ScaleUp))
+            .count();
+        let scale_down_count = snapshot
+            .scale_history
+            .iter()
+            .filter(|e| matches!(e.event_type, ScaleEventType::ScaleDown))
+            .count();
+        attributes.insert("scale_ups".to_string(), serde_json::json!(scale_up_count));
+        attributes.insert(
+            "scale_downs".to_string(),
+            serde_json::json!(scale_down_count),
+        );
+
+        // Health tier: circuit breaker tripped is Black; high failure rate is Red;
+        // high consecutive ops is Yellow; otherwise Green.
+        let health_tier = if snapshot.circuit_breaker_tripped_at.is_some() {
+            HealthTier::Black
+        } else if fleet_failure_rate >= 0.5 {
+            HealthTier::Red
+        } else if snapshot.consecutive_scale_ops >= snapshot.config.max_consecutive_scale_ops / 2 {
+            HealthTier::Yellow
+        } else {
+            HealthTier::Green
+        };
+
+        let failure_class = if snapshot.circuit_breaker_tripped_at.is_some() {
+            Some(FailureClass::Overload)
+        } else if fleet_failure_rate >= 0.2 {
+            Some(FailureClass::Degraded)
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: UNIFIED_TELEMETRY_SCHEMA_VERSION.to_string(),
+            source: UnifiedTelemetrySource::Runtime,
+            record_id: format!("scheduler-snapshot:{}:{}", snapshot.sequence, now_ms),
+            source_schema_version: None,
+            timestamp_ms: now_ms,
+            component: "swarm.scheduler".to_string(),
+            reason_code: "swarm.scheduler.snapshot".to_string(),
+            correlation_id: None,
+            scope_id: Some("swarm:scheduler".to_string()),
+            health_tier,
+            failure_class,
+            sensitivity: DataSensitivity::Internal,
+            redaction_strategy: RedactionStrategy::Passthrough,
+            attributes,
+        }
+    }
 }
 
 impl From<&RuntimeTelemetryEvent> for UnifiedTelemetryRecord {
@@ -1158,6 +1373,27 @@ impl From<&crate::policy_metrics::PolicyMetricsDashboard> for UnifiedTelemetryRe
 impl From<&crate::policy_compliance::ComplianceSnapshot> for UnifiedTelemetryRecord {
     fn from(snapshot: &crate::policy_compliance::ComplianceSnapshot) -> Self {
         Self::from_compliance_snapshot(snapshot)
+    }
+}
+
+impl From<&SchedulerSnapshot> for UnifiedTelemetryRecord {
+    fn from(snapshot: &SchedulerSnapshot) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self::from_scheduler_snapshot(snapshot, now_ms)
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl From<&crate::vendored::MuxPoolStats> for UnifiedTelemetryRecord {
+    fn from(stats: &crate::vendored::MuxPoolStats) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self::from_mux_pool_stats(stats, now_ms)
     }
 }
 
@@ -3949,10 +4185,7 @@ mod tests {
         assert_eq!(record.component, "policy.compliance_engine");
         assert_eq!(record.health_tier, HealthTier::Green);
         assert!(record.failure_class.is_none());
-        assert_eq!(
-            record.attributes["total_evaluations"],
-            serde_json::json!(1)
-        );
+        assert_eq!(record.attributes["total_evaluations"], serde_json::json!(1));
     }
 
     #[test]
@@ -3962,5 +4195,250 @@ mod tests {
         let snap = engine.snapshot(5000);
         let record = UnifiedTelemetryRecord::from(&snap);
         assert_eq!(record.component, "policy.compliance_engine");
+    }
+
+    // ── Scheduler snapshot adapter ──
+
+    #[test]
+    fn scheduler_snapshot_adapter_healthy() {
+        use crate::swarm_scheduler::*;
+        let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+        let snap = scheduler.snapshot();
+        let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+        assert_eq!(record.component, "swarm.scheduler");
+        assert_eq!(record.reason_code, "swarm.scheduler.snapshot");
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        assert_eq!(record.source, UnifiedTelemetrySource::Runtime);
+        assert_eq!(record.scope_id.as_deref(), Some("swarm:scheduler"));
+        assert_eq!(record.attributes["fleet_agents"], serde_json::json!(0));
+        assert_eq!(
+            record.attributes["consecutive_scale_ops"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            record.attributes["circuit_breaker_tripped"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn scheduler_snapshot_circuit_breaker_is_black() {
+        use crate::swarm_scheduler::*;
+        let mut config = SchedulerConfig::default();
+        config.max_consecutive_scale_ops = 2;
+        let scheduler = SwarmScheduler::new(config);
+        let mut snap = scheduler.snapshot();
+        snap.circuit_breaker_tripped_at = Some(8000);
+        let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Overload));
+    }
+
+    #[test]
+    fn scheduler_snapshot_high_failure_rate() {
+        use crate::swarm_scheduler::*;
+        let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+        let mut snap = scheduler.snapshot();
+        snap.agent_completed.insert("agent-1".to_string(), 10);
+        snap.agent_failed.insert("agent-1".to_string(), 20);
+        let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+        assert_eq!(record.health_tier, HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Degraded));
+        // failure rate = 20 / (10+20) ≈ 0.667
+        let rate = record.attributes["fleet_failure_rate"].as_f64().unwrap();
+        assert!(rate > 0.6 && rate < 0.7);
+    }
+
+    #[test]
+    fn scheduler_snapshot_from_trait() {
+        use crate::swarm_scheduler::*;
+        let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+        let snap = scheduler.snapshot();
+        let record = UnifiedTelemetryRecord::from(&snap);
+        assert_eq!(record.component, "swarm.scheduler");
+    }
+
+    #[test]
+    fn scheduler_snapshot_scale_event_counts() {
+        use crate::swarm_scheduler::*;
+        let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+        let mut snap = scheduler.snapshot();
+        snap.scale_history.push(ScaleEvent {
+            event_type: ScaleEventType::ScaleUp,
+            timestamp_ms: 1000,
+            reason: "high pressure".to_string(),
+            fleet_size_before: 2,
+            fleet_size_after: 4,
+            decision: SchedulerDecision::ScaleUp {
+                additional_agents: 2,
+                reason: "high pressure".to_string(),
+            },
+        });
+        snap.scale_history.push(ScaleEvent {
+            event_type: ScaleEventType::ScaleDown,
+            timestamp_ms: 2000,
+            reason: "low pressure".to_string(),
+            fleet_size_before: 4,
+            fleet_size_after: 2,
+            decision: SchedulerDecision::ScaleDown {
+                remove_agents: vec!["agent-3".to_string(), "agent-4".to_string()],
+                reason: "low pressure".to_string(),
+            },
+        });
+        let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+        assert_eq!(record.attributes["scale_ups"], serde_json::json!(1));
+        assert_eq!(record.attributes["scale_downs"], serde_json::json!(1));
+        assert_eq!(record.attributes["scale_history_len"], serde_json::json!(2));
+    }
+
+    // ── MuxPoolStats adapter ──
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_stats_adapter_healthy() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 8,
+                idle_count: 6,
+                active_count: 2,
+                total_acquired: 100,
+                total_returned: 98,
+                total_evicted: 0,
+                total_timeouts: 0,
+            },
+            connections_created: 10,
+            connections_failed: 0,
+            health_checks: 50,
+            health_check_failures: 0,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            permanent_failures: 0,
+        };
+        let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 7000);
+        assert_eq!(record.component, "mux.pool");
+        assert_eq!(record.reason_code, "mux.pool.snapshot");
+        assert_eq!(record.health_tier, HealthTier::Green);
+        assert!(record.failure_class.is_none());
+        assert_eq!(record.source, UnifiedTelemetrySource::Runtime);
+        assert_eq!(record.scope_id.as_deref(), Some("mux:pool"));
+        assert_eq!(record.attributes["max_size"], serde_json::json!(8));
+        assert_eq!(
+            record.attributes["connections_created"],
+            serde_json::json!(10)
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_stats_permanent_failure_is_black() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 8,
+                idle_count: 0,
+                active_count: 0,
+                total_acquired: 10,
+                total_returned: 10,
+                total_evicted: 0,
+                total_timeouts: 5,
+            },
+            connections_created: 5,
+            connections_failed: 5,
+            health_checks: 10,
+            health_check_failures: 10,
+            recovery_attempts: 5,
+            recovery_successes: 0,
+            permanent_failures: 3,
+        };
+        let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8000);
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Permanent));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_stats_transient_failures_yellow() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 10,
+                idle_count: 5,
+                active_count: 3,
+                total_acquired: 50,
+                total_returned: 47,
+                total_evicted: 0,
+                total_timeouts: 0,
+            },
+            connections_created: 19,
+            connections_failed: 1,
+            health_checks: 20,
+            health_check_failures: 1,
+            recovery_attempts: 1,
+            recovery_successes: 1,
+            permanent_failures: 0,
+        };
+        let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8000);
+        assert_eq!(record.health_tier, HealthTier::Yellow);
+        assert_eq!(record.failure_class, Some(FailureClass::Transient));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_stats_from_trait() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 4,
+                idle_count: 2,
+                active_count: 1,
+                total_acquired: 10,
+                total_returned: 9,
+                total_evicted: 0,
+                total_timeouts: 0,
+            },
+            connections_created: 5,
+            connections_failed: 0,
+            health_checks: 10,
+            health_check_failures: 0,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            permanent_failures: 0,
+        };
+        let record = UnifiedTelemetryRecord::from(&stats);
+        assert_eq!(record.component, "mux.pool");
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_stats_high_saturation_red() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 4,
+                idle_count: 0,
+                active_count: 4,
+                total_acquired: 100,
+                total_returned: 96,
+                total_evicted: 0,
+                total_timeouts: 2,
+            },
+            connections_created: 20,
+            connections_failed: 5,
+            health_checks: 30,
+            health_check_failures: 2,
+            recovery_attempts: 3,
+            recovery_successes: 2,
+            permanent_failures: 0,
+        };
+        let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8500);
+        // failure_ratio = 5/25 = 0.20, saturation = 4/4 = 1.0 → Red
+        assert_eq!(record.health_tier, HealthTier::Red);
     }
 }
