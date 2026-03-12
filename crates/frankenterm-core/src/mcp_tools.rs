@@ -1,6 +1,6 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -4282,6 +4282,8 @@ impl ToolHandler for WaEventsLabelTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use tempfile::TempDir;
 

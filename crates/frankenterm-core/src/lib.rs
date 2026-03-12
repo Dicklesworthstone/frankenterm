@@ -145,6 +145,7 @@ pub mod dancing_links;
 pub mod dashboard;
 pub mod dataflow;
 pub mod degradation;
+pub mod dependency_eradication;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod diagnostic_redaction;
