@@ -1345,12 +1345,12 @@ mod tests {
         adapter.capture_lifecycle(1, RecorderLifecyclePhase::PaneOpened, None, json!({}));
 
         let events = sink.events();
-        let mut keys: Vec<_> = events.iter().map(|(_, mk)| mk.clone()).collect();
-        keys.sort();
+        let mut kinds: Vec<_> = events.iter().map(|(_, mk)| mk.stream_kind).collect();
+        kinds.sort();
 
         // Lifecycle (rank 0) should sort before Egress (rank 3)
-        assert_eq!(keys[0].stream_kind, StreamKind::Lifecycle);
-        assert_eq!(keys[1].stream_kind, StreamKind::Egress);
+        assert_eq!(kinds[0], StreamKind::Lifecycle);
+        assert_eq!(kinds[1], StreamKind::Egress);
     }
 
     // --- Default source ---

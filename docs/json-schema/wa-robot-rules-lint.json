@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-rules-lint.json",
+  "title": "WA Robot Rules Lint Response",
+  "description": "Schema for the data field when calling 'wa robot rules lint'. Validates rule definitions for errors and warnings.",
+  "type": "object",
+  "required": ["total_rules", "rules_checked", "errors", "warnings", "passed"],
+  "properties": {
+    "total_rules": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of rules in the registry"
+    },
+    "rules_checked": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of rules that were linted"
+    },
+    "errors": {
+      "type": "array",
+      "description": "Lint errors (blocking issues)",
+      "items": {
+        "$ref": "#/$defs/lint_issue"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Lint warnings (non-blocking issues)",
+      "items": {
+        "$ref": "#/$defs/lint_issue"
+      }
+    },
+    "fixture_coverage": {
+      "oneOf": [
+        { "$ref": "#/$defs/fixture_coverage" },
+        { "type": "null" }
+      ],
+      "description": "Optional fixture coverage statistics"
+    },
+    "passed": {
+      "type": "boolean",
+      "description": "Whether all rules passed linting"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "lint_issue": {
+      "type": "object",
+      "description": "Individual lint finding",
+      "required": ["rule_id", "category", "message"],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "description": "ID of the rule with the issue"
+        },
+        "category": {
+          "type": "string",
+          "description": "Issue category (e.g., style, error, semantic)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable issue description"
+        },
+        "suggestion": {
+          "type": "string",
+          "description": "Optional suggestion for fixing the issue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "fixture_coverage": {
+      "type": "object",
+      "description": "Fixture coverage statistics for rules",
+      "required": ["rules_with_fixtures", "rules_without_fixtures", "total_fixtures"],
+      "properties": {
+        "rules_with_fixtures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of rules that have test fixtures"
+        },
+        "rules_without_fixtures": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Rule IDs missing test fixtures"
+        },
+        "total_fixtures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of test fixtures across all rules"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
