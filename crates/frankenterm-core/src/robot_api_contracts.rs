@@ -570,6 +570,11 @@ impl ContractMatrix {
 
         out
     }
+
+    /// Render a pretty JSON snapshot for deterministic artifact capture.
+    pub fn render_json_snapshot(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
 }
 
 // =============================================================================
@@ -667,6 +672,11 @@ impl ContractExecution {
             }
         }
         map
+    }
+
+    /// Render a pretty JSON execution trace for artifact logs.
+    pub fn render_json_trace(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
     }
 }
 
@@ -851,6 +861,48 @@ impl ContractReport {
 
         out
     }
+
+    /// Render a pretty JSON report for deterministic contract artifacts.
+    pub fn render_json_report(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+/// Deterministic export bundle for robot contract artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractExportArtifacts {
+    /// Pretty JSON snapshot of the contract matrix.
+    pub matrix_json: String,
+    /// Markdown coverage matrix for human review.
+    pub coverage_markdown: String,
+    /// Pretty JSON trace of a passing baseline execution.
+    pub execution_trace_json: String,
+    /// Pretty JSON summary report of that execution.
+    pub report_json: String,
+}
+
+/// Render the canonical robot contract artifacts for audit and replay evidence.
+pub fn standard_contract_export_artifacts() -> Result<ContractExportArtifacts, serde_json::Error> {
+    let matrix = standard_contract_matrix();
+    let mut execution = ContractExecution::new(&matrix.matrix_id, "baseline-pass", 0);
+
+    for check in &matrix.checks {
+        execution.record(CheckResult::pass(
+            &check.check_id,
+            check.surface,
+            check.category,
+        ));
+    }
+    execution.complete(250);
+
+    let report = ContractReport::from_execution(&execution);
+
+    Ok(ContractExportArtifacts {
+        matrix_json: matrix.render_json_snapshot()?,
+        coverage_markdown: matrix.render_coverage_matrix(),
+        execution_trace_json: execution.render_json_trace()?,
+        report_json: report.render_json_report()?,
+    })
 }
 
 // =============================================================================
@@ -1367,6 +1419,21 @@ mod tests {
     }
 
     #[test]
+    fn contract_export_artifacts_render_json_snapshots() {
+        let artifacts = standard_contract_export_artifacts().unwrap();
+        let matrix: ContractMatrix = serde_json::from_str(&artifacts.matrix_json).unwrap();
+        let execution: ContractExecution =
+            serde_json::from_str(&artifacts.execution_trace_json).unwrap();
+        let report: ContractReport = serde_json::from_str(&artifacts.report_json).unwrap();
+
+        assert_eq!(matrix.check_count(), standard_contract_matrix().check_count());
+        assert_eq!(execution.failed(), 0);
+        assert_eq!(report.verdict, ContractVerdict::Compatible);
+        assert!(artifacts.coverage_markdown.contains("Coverage:"));
+        assert!(artifacts.coverage_markdown.contains("100%"));
+    }
+
+    #[test]
     fn report_serde_roundtrip() {
         let mut exec = ContractExecution::new("m", "r", 0);
         exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
@@ -1376,6 +1443,29 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let report2: ContractReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report2.verdict, report.verdict);
+    }
+
+    #[test]
+    fn contract_export_artifacts_preserve_failure_metadata() {
+        let mut exec = ContractExecution::new("robot-api", "run-fail", 0);
+        let mut result = CheckResult::fail(
+            "schema-get-text",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+            "missing required field",
+        );
+        result.missing_fields = vec!["pane_id".into(), "text".into()];
+        exec.record(result);
+        exec.complete(100);
+
+        let report = ContractReport::from_execution(&exec);
+        let json = report.render_json_report().unwrap();
+        let reparsed: ContractReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(reparsed.failures.len(), 1);
+        assert!(reparsed.failures[0].suggested_fix.contains("pane_id"));
+        assert!(reparsed.failures[0].suggested_fix.contains("text"));
+        assert_eq!(reparsed.verdict, ContractVerdict::Incompatible);
     }
 
     // ---- E2E lifecycle ----

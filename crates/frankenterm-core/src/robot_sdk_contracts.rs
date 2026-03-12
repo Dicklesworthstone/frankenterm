@@ -285,6 +285,8 @@ pub struct SdkMethod {
 pub struct SdkParam {
     /// Parameter name.
     pub name: String,
+    /// Serialized field name used on the wire.
+    pub wire_name: String,
     /// Type in the target language.
     pub param_type: String,
     /// Whether optional.
@@ -323,7 +325,8 @@ impl SdkSurface {
         for spec in specs {
             let method_name = match self.language {
                 SdkLanguage::Python | SdkLanguage::Rust => spec.command.replace('-', "_"),
-                SdkLanguage::TypeScript | SdkLanguage::Go => to_camel_case(&spec.command),
+                SdkLanguage::TypeScript => to_camel_case(&spec.command),
+                SdkLanguage::Go => to_pascal_case(&spec.command),
             };
 
             let params: Vec<SdkParam> = spec
@@ -332,8 +335,10 @@ impl SdkSurface {
                 .map(|f| SdkParam {
                     name: match self.language {
                         SdkLanguage::Python | SdkLanguage::Rust => f.name.clone(),
-                        SdkLanguage::TypeScript | SdkLanguage::Go => to_camel_case(&f.name),
+                        SdkLanguage::TypeScript => to_camel_case(&f.name),
+                        SdkLanguage::Go => to_pascal_case(&f.name),
                     },
+                    wire_name: f.name.clone(),
                     param_type: map_type_to_language(&f.field_type, self.language),
                     optional: !f.required,
                     default: String::new(),
@@ -344,7 +349,7 @@ impl SdkSurface {
                 method_name,
                 command: spec.command.clone(),
                 params,
-                return_type: format!("RobotResponse<{}>", spec.command.replace('-', "_")),
+                return_type: format!("{}Response", to_pascal_case(&spec.command)),
                 is_async: true,
                 doc: spec.description.clone(),
             });
@@ -355,6 +360,27 @@ impl SdkSurface {
     #[must_use]
     pub fn method_count(&self) -> usize {
         self.methods.len()
+    }
+
+    /// Deterministic artifact filename for the generated client surface.
+    #[must_use]
+    pub fn artifact_filename(&self) -> String {
+        format!(
+            "frankenterm_client_{}{}",
+            self.language.label().to_ascii_lowercase(),
+            self.language.extension()
+        )
+    }
+
+    /// Render a self-describing SDK client stub for audit and artifact capture.
+    #[must_use]
+    pub fn render_client_source(&self) -> String {
+        match self.language {
+            SdkLanguage::Python => render_python_client(self),
+            SdkLanguage::TypeScript => render_typescript_client(self),
+            SdkLanguage::Rust => render_rust_client(self),
+            SdkLanguage::Go => render_go_client(self),
+        }
     }
 }
 
@@ -374,6 +400,19 @@ fn to_camel_case(s: &str) -> String {
             result.push(c);
         }
     }
+    result
+}
+
+/// Convert kebab-case or snake_case to PascalCase.
+fn to_pascal_case(s: &str) -> String {
+    let camel = to_camel_case(s);
+    let mut chars = camel.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = String::new();
+    result.push(first.to_ascii_uppercase());
+    result.push_str(chars.as_str());
     result
 }
 
@@ -423,6 +462,213 @@ fn map_type_to_language(ft: &FieldType, lang: SdkLanguage) -> String {
         (FieldType::Json, SdkLanguage::Rust) => "serde_json::Value".into(),
         (FieldType::Json, SdkLanguage::Go) => "interface{}".into(),
     }
+}
+
+fn render_python_client(surface: &SdkSurface) -> String {
+    let mut out = String::from("from __future__ import annotations\n\nfrom typing import Any\n\n");
+
+    for return_type in unique_return_types(surface) {
+        out.push_str(&format!("{return_type} = dict[str, Any]\n"));
+    }
+
+    out.push_str(
+        "\n\nclass FrankentermClient:\n    async def _call(self, command: str, payload: dict[str, Any]) -> Any:\n        raise NotImplementedError(\"transport not wired\")\n",
+    );
+
+    for method in &surface.methods {
+        out.push_str(&format!(
+            "\n    async def {}({}) -> {}:\n        \"\"\"{}\"\"\"\n        return await self._call(\"{}\", {})\n",
+            method.method_name,
+            render_python_params(&method.params),
+            method.return_type,
+            method.doc,
+            method.command,
+            render_python_payload(&method.params),
+        ));
+    }
+
+    out
+}
+
+fn render_typescript_client(surface: &SdkSurface) -> String {
+    let mut out = String::from(
+        "export type JsonPayload = Record<string, unknown>;\n\n",
+    );
+
+    for return_type in unique_return_types(surface) {
+        out.push_str(&format!("export type {return_type} = unknown;\n"));
+    }
+
+    out.push_str(
+        "\nexport class FrankentermClient {\n  protected async call(command: string, payload: JsonPayload): Promise<unknown> {\n    throw new Error(`transport not wired for ${command}`);\n  }\n",
+    );
+
+    for method in &surface.methods {
+        out.push_str(&format!(
+            "\n  async {}({}): Promise<{}> {{\n    return this.call(\"{}\", {}) as Promise<{}>;\n  }}\n",
+            method.method_name,
+            render_typescript_params(&method.params),
+            method.return_type,
+            method.command,
+            render_typescript_payload(&method.params),
+            method.return_type,
+        ));
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn render_rust_client(surface: &SdkSurface) -> String {
+    let mut out = String::from("use serde_json::json;\n\n");
+
+    for return_type in unique_return_types(surface) {
+        out.push_str(&format!("pub type {return_type} = serde_json::Value;\n"));
+    }
+
+    out.push_str(
+        "\npub struct FrankentermClient;\n\nimpl FrankentermClient {\n    async fn call(&self, _command: &str, _payload: serde_json::Value) -> serde_json::Value {\n        unimplemented!(\"transport not wired\")\n    }\n",
+    );
+
+    for method in &surface.methods {
+        out.push_str(&format!(
+            "\n    pub async fn {}(&self{}) -> {} {{\n        self.call(\"{}\", {}).await\n    }}\n",
+            method.method_name,
+            render_rust_params(&method.params),
+            method.return_type,
+            method.command,
+            render_rust_payload(&method.params),
+        ));
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn render_go_client(surface: &SdkSurface) -> String {
+    let mut out = String::from("package frankenterm\n\n");
+
+    for return_type in unique_return_types(surface) {
+        out.push_str(&format!("type {return_type} = map[string]interface{{}}\n"));
+    }
+
+    out.push_str(
+        "\ntype FrankentermClient struct{}\n\nfunc (c *FrankentermClient) call(command string, payload map[string]interface{}) (map[string]interface{}, error) {\n\tpanic(\"transport not wired\")\n}\n",
+    );
+
+    for method in &surface.methods {
+        out.push_str(&format!(
+            "\nfunc (c *FrankentermClient) {}({}) ({}, error) {{\n\tresult, err := c.call(\"{}\", {})\n\tif err != nil {{\n\t\treturn nil, err\n\t}}\n\treturn result, nil\n}}\n",
+            method.method_name,
+            render_go_params(&method.params),
+            method.return_type,
+            method.command,
+            render_go_payload(&method.params),
+        ));
+    }
+
+    out
+}
+
+fn unique_return_types(surface: &SdkSurface) -> Vec<String> {
+    let mut seen = BTreeMap::new();
+    for method in &surface.methods {
+        seen.insert(method.return_type.clone(), ());
+    }
+    seen.into_keys().collect()
+}
+
+fn render_python_params(params: &[SdkParam]) -> String {
+    let mut rendered = vec!["self".to_string()];
+    for param in params {
+        if param.optional {
+            rendered.push(format!("{}: {} | None = None", param.name, param.param_type));
+        } else {
+            rendered.push(format!("{}: {}", param.name, param.param_type));
+        }
+    }
+    rendered.join(", ")
+}
+
+fn render_typescript_params(params: &[SdkParam]) -> String {
+    params
+        .iter()
+        .map(|param| {
+            if param.optional {
+                format!("{}?: {}", param.name, param.param_type)
+            } else {
+                format!("{}: {}", param.name, param.param_type)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_rust_params(params: &[SdkParam]) -> String {
+    params
+        .iter()
+        .map(|param| format!(", {}: {}", param.name, param.param_type))
+        .collect::<String>()
+}
+
+fn render_go_params(params: &[SdkParam]) -> String {
+    params
+        .iter()
+        .map(|param| format!("{} {}", param.name, param.param_type))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_python_payload(params: &[SdkParam]) -> String {
+    if params.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut out = String::from("{\n");
+    for param in params {
+        out.push_str(&format!("            \"{}\": {},\n", param.wire_name, param.name));
+    }
+    out.push_str("        }");
+    out
+}
+
+fn render_typescript_payload(params: &[SdkParam]) -> String {
+    if params.is_empty() {
+        return "{}".to_string();
+    }
+
+    let mut out = String::from("{\n");
+    for param in params {
+        out.push_str(&format!("      \"{}\": {},\n", param.wire_name, param.name));
+    }
+    out.push_str("    }");
+    out
+}
+
+fn render_rust_payload(params: &[SdkParam]) -> String {
+    if params.is_empty() {
+        return "json!({})".to_string();
+    }
+
+    let mut out = String::from("json!({\n");
+    for param in params {
+        out.push_str(&format!("            \"{}\": {},\n", param.wire_name, param.name));
+    }
+    out.push_str("        })");
+    out
+}
+
+fn render_go_payload(params: &[SdkParam]) -> String {
+    if params.is_empty() {
+        return "map[string]interface{}{}".to_string();
+    }
+
+    let mut out = String::from("map[string]interface{}{\n");
+    for param in params {
+        out.push_str(&format!("\t\t\"{}\": {},\n", param.wire_name, param.name));
+    }
+    out.push_str("\t}");
+    out
 }
 
 // =============================================================================
@@ -632,6 +878,45 @@ impl NtmCompatShim {
             },
         }
     }
+
+    /// Render a Markdown migration report suitable for artifact capture.
+    #[must_use]
+    pub fn render_markdown_summary(&self) -> String {
+        let mut out = String::from("# NTM Compatibility Summary\n\n");
+        let summary = self.readiness_summary();
+        out.push_str(&format!(
+            "- Total commands: {}\n- Fully compatible: {}\n- Mapped compatibility: {}\n- Partial compatibility: {}\n- Migration coverage: {:.2}%\n\n",
+            summary.total,
+            summary.full,
+            summary.mapped,
+            summary.partial,
+            summary.migration_coverage * 100.0,
+        ));
+        out.push_str("| ft command | NTM command | compatibility | notes |\n");
+        out.push_str("|------------|-------------|---------------|-------|\n");
+
+        for entry in self.entries.values() {
+            let ntm_command = if entry.ntm_command.is_empty() {
+                "n/a"
+            } else {
+                entry.ntm_command.as_str()
+            };
+            let notes = if entry.notes.is_empty() {
+                "none"
+            } else {
+                entry.notes.as_str()
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                entry.ft_command,
+                ntm_command,
+                entry.compat_level.label(),
+                notes,
+            ));
+        }
+
+        out
+    }
 }
 
 impl Default for NtmCompatShim {
@@ -775,6 +1060,27 @@ impl ReplayTestSuiteResult {
     }
 }
 
+/// Deterministic artifact bundle for machine-contract evidence capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractArtifactBundle {
+    /// Pretty-printed endpoint catalog JSON.
+    pub endpoint_specs_json: String,
+    /// Markdown compatibility report.
+    pub ntm_compat_markdown: String,
+    /// Generated client stubs keyed by deterministic filename.
+    pub sdk_sources: BTreeMap<String, String>,
+    /// Pretty-printed replay test manifest JSON.
+    pub replay_tests_json: String,
+}
+
+impl ContractArtifactBundle {
+    /// Number of generated SDK source artifacts.
+    #[must_use]
+    pub fn sdk_count(&self) -> usize {
+        self.sdk_sources.len()
+    }
+}
+
 // =============================================================================
 // Standard factories
 // =============================================================================
@@ -835,6 +1141,48 @@ pub fn standard_ntm_compat_shim() -> NtmCompatShim {
 
     shim.migration_ready = true;
     shim
+}
+
+/// Standard replay contract tests for core robot workflows.
+#[must_use]
+pub fn standard_replay_contract_tests() -> Vec<ReplayContractTest> {
+    vec![
+        ReplayContractTest::new(
+            "replay-get-text",
+            "get-text",
+            "deterministic get-text replay",
+        )
+        .with_fixtures("fixtures/get-text-input.json", "fixtures/get-text-expected.json"),
+        ReplayContractTest::new("replay-search", "search", "deterministic search replay")
+            .with_fixtures("fixtures/search-input.json", "fixtures/search-expected.json"),
+        ReplayContractTest::new("replay-events", "events", "deterministic events replay")
+            .with_fixtures("fixtures/events-input.json", "fixtures/events-expected.json"),
+    ]
+}
+
+/// Render the standard machine-contract artifacts for export and auditing.
+pub fn standard_contract_artifacts() -> Result<ContractArtifactBundle, serde_json::Error> {
+    let specs = core_endpoint_specs();
+    let shim = standard_ntm_compat_shim();
+
+    let mut sdk_sources = BTreeMap::new();
+    for language in [
+        SdkLanguage::Python,
+        SdkLanguage::TypeScript,
+        SdkLanguage::Rust,
+        SdkLanguage::Go,
+    ] {
+        let mut sdk = SdkSurface::new(language, "frankenterm-client");
+        sdk.generate_from_specs(&specs);
+        sdk_sources.insert(sdk.artifact_filename(), sdk.render_client_source());
+    }
+
+    Ok(ContractArtifactBundle {
+        endpoint_specs_json: serde_json::to_string_pretty(&specs)?,
+        ntm_compat_markdown: shim.render_markdown_summary(),
+        sdk_sources,
+        replay_tests_json: serde_json::to_string_pretty(&standard_replay_contract_tests())?,
+    })
 }
 
 /// Create standard endpoint specs for core pane operations.
@@ -962,6 +1310,7 @@ mod tests {
         ts_sdk.generate_from_specs(&specs);
 
         assert_eq!(ts_sdk.methods[0].method_name, "getText");
+        assert_eq!(ts_sdk.methods[0].params[0].wire_name, "pane_id");
     }
 
     #[test]
@@ -1033,6 +1382,15 @@ mod tests {
         assert!(summary.no_equivalent > 0);
         assert!(summary.migration_coverage > 0.0);
         assert!(summary.migration_coverage < 1.0);
+    }
+
+    #[test]
+    fn standard_shim_markdown_summary() {
+        let shim = standard_ntm_compat_shim();
+        let markdown = shim.render_markdown_summary();
+        assert!(markdown.contains("# NTM Compatibility Summary"));
+        assert!(markdown.contains("| ft command | NTM command | compatibility | notes |"));
+        assert!(markdown.contains("| get-text | get-text | full | none |"));
     }
 
     #[test]
@@ -1111,6 +1469,37 @@ mod tests {
         let json = serde_json::to_string(&sdk).unwrap();
         let sdk2: SdkSurface = serde_json::from_str(&json).unwrap();
         assert_eq!(sdk2.method_count(), sdk.method_count());
+    }
+
+    #[test]
+    fn contract_artifact_bundle_renders_deterministic_exports() {
+        let bundle = standard_contract_artifacts().unwrap();
+        assert_eq!(bundle.sdk_count(), 4);
+        assert!(bundle.endpoint_specs_json.contains("\"command\": \"get-text\""));
+        assert!(bundle.ntm_compat_markdown.contains("Migration coverage"));
+        assert!(bundle.replay_tests_json.contains("replay-get-text"));
+        assert!(bundle
+            .sdk_sources
+            .keys()
+            .all(|filename| filename.starts_with("frankenterm_client_")));
+    }
+
+    #[test]
+    fn contract_artifact_bundle_sdk_sources_include_wire_keys() {
+        let bundle = standard_contract_artifacts().unwrap();
+        let python = bundle
+            .sdk_sources
+            .get("frankenterm_client_python.py")
+            .unwrap();
+        let typescript = bundle
+            .sdk_sources
+            .get("frankenterm_client_typescript.ts")
+            .unwrap();
+        let rust = bundle.sdk_sources.get("frankenterm_client_rust.rs").unwrap();
+
+        assert!(python.contains("\"pane_id\": pane_id"));
+        assert!(typescript.contains("\"pane_id\": paneId"));
+        assert!(rust.contains("\"pane_id\": pane_id"));
     }
 
     // ---- E2E ----
