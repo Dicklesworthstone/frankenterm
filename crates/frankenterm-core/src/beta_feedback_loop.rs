@@ -593,6 +593,7 @@ impl BetaLoopController {
             Some(prev) => {
                 self.stage = prev;
                 self.transition_count += 1;
+                self.last_decision = None; // Require fresh evaluation before next advance
                 true
             }
             None => false,
@@ -968,6 +969,28 @@ mod tests {
         assert!(ctrl.rollback_stage());
         assert_eq!(ctrl.stage(), BetaStage::Baseline);
         assert!(!ctrl.rollback_stage()); // Can't go below Baseline
+    }
+
+    #[test]
+    fn advance_blocked_after_rollback() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        // Promote to InternalBeta
+        ctrl.last_decision = Some(PromotionDecision::Promote);
+        assert!(ctrl.advance_stage());
+        assert_eq!(ctrl.stage(), BetaStage::InternalBeta);
+        // Collect good data and get a Promote decision
+        for i in 0..10 {
+            ctrl.record_observation(good_observation("alice", i * 100));
+            ctrl.record_feedback(positive_feedback("bob", i * 100));
+        }
+        let eval = ctrl.evaluate(2000);
+        assert_eq!(eval.decision, PromotionDecision::Promote);
+        // Roll back — should invalidate the Promote decision
+        assert!(ctrl.rollback_stage());
+        assert_eq!(ctrl.stage(), BetaStage::Baseline);
+        // advance_stage must fail: rollback cleared last_decision
+        assert!(!ctrl.advance_stage());
+        assert_eq!(ctrl.stage(), BetaStage::Baseline);
     }
 
     #[test]
