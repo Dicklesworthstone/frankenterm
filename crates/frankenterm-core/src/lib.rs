@@ -332,6 +332,7 @@ pub mod restore_process;
 pub mod restore_scrollback;
 pub mod retry;
 pub mod ring_buffer;
+pub mod robot_api_contracts;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
 pub mod robot_idempotency;
