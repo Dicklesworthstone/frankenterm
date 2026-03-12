@@ -1041,6 +1041,8 @@ pub struct AgentConfigurePlanItem {
     /// Whether the target file already exists.
     pub file_exists: bool,
     /// Whether the FrankenTerm section already exists in the file.
+    /// When planning fails before the file can be inspected, `false` may also
+    /// mean the section presence is unknown.
     pub section_exists: bool,
     /// What action would be taken.
     pub action: String,

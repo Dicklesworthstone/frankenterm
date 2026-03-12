@@ -81,7 +81,7 @@
         },
         "section_exists": {
           "type": "boolean",
-          "description": "Whether the target file already contains a FrankenTerm-managed section"
+          "description": "Whether the target file already contains a FrankenTerm-managed section; false may also mean the section presence was unknown because planning failed before the file could be inspected"
         },
         "action": {
           "type": "string",

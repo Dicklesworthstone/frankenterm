@@ -6211,6 +6211,18 @@ fn fallback_agent_config_filename(
     }
 }
 
+fn fallback_agent_config_file_exists(
+    entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
+    scope: RobotAgentConfigScope,
+    workspace_root: &Path,
+) -> bool {
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    let template = frankenterm_core::agent_config_templates::generate_template(&provider);
+    resolve_agent_config_target_path(entry, scope, workspace_root, &template)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
 fn build_agent_configure_error_plan_item(
     entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
     scope: RobotAgentConfigScope,
@@ -6225,7 +6237,7 @@ fn build_agent_configure_error_plan_item(
         config_kind: agent_config_kind_label(template.kind).to_string(),
         scope: robot_agent_config_scope_label(scope).to_string(),
         filename: fallback_agent_config_filename(entry, scope, workspace_root),
-        file_exists: false,
+        file_exists: fallback_agent_config_file_exists(entry, scope, workspace_root),
         section_exists: false,
         action: "error".to_string(),
         content_preview: Some(template.content.clone()),
@@ -45574,6 +45586,48 @@ log_level = "debug"
             "unexpected error: {}",
             err.message
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_error_plan_marks_existing_file_when_target_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("agent_config_plan_error");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+
+        let target = global_root.join(".cursorrules");
+        write_file(&target, "# existing cursor rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&target, permissions).unwrap();
+
+        let err = prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root)
+            .unwrap_err();
+        assert!(err.contains("Failed to read"), "unexpected error: {err}");
+
+        let plan_item = build_agent_configure_error_plan_item(
+            &entry,
+            RobotAgentConfigScope::Global,
+            &workspace_root,
+            err,
+        );
+        assert!(plan_item.file_exists);
+        assert_eq!(plan_item.action, "error");
     }
 
     // ========================================================================
