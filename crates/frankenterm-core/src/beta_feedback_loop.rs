@@ -991,7 +991,7 @@ mod tests {
             ctrl.record_observation(good_observation("alice", i * 100));
             ctrl.record_feedback(positive_feedback("bob", i * 100));
         }
-        ctrl.evaluate(1000);
+        let _ = ctrl.evaluate(1000);
         let snap = ctrl.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         let rt: BetaLoopSnapshot = serde_json::from_str(&json).unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
         for i in 0..10 {
             ctrl.record_observation(good_observation("alice", i * 100));
         }
-        ctrl.evaluate(1000);
+        let _ = ctrl.evaluate(1000);
         let snap = ctrl.snapshot();
         assert_eq!(snap.stage, BetaStage::InternalBeta);
         assert_eq!(snap.total_observations, 10);
@@ -1023,7 +1023,7 @@ mod tests {
             ctrl.record_observation(good_observation("alice", i * 100));
             ctrl.record_feedback(positive_feedback("bob", i * 100));
         }
-        ctrl.evaluate(1000);
+        let _ = ctrl.evaluate(1000);
         ctrl.reset();
         let snap = ctrl.snapshot();
         assert_eq!(snap.stage, BetaStage::Baseline);
@@ -1174,9 +1174,9 @@ mod tests {
     fn evaluation_count_increments() {
         let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
         ctrl.stage = BetaStage::InternalBeta;
-        ctrl.evaluate(1000);
-        ctrl.evaluate(2000);
-        ctrl.evaluate(3000);
+        let _ = ctrl.evaluate(1000);
+        let _ = ctrl.evaluate(2000);
+        let _ = ctrl.evaluate(3000);
         assert_eq!(ctrl.snapshot().evaluation_count, 3);
     }
 }
