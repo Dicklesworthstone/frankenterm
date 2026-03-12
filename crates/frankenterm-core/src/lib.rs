@@ -145,6 +145,7 @@ pub mod cross_crate_integration;
 pub mod cross_pane_correlation;
 pub mod cuckoo_filter;
 pub mod cutover_evidence;
+pub mod cutover_playbook;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
 pub mod dancing_links;
