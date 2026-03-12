@@ -1488,16 +1488,17 @@ mod tests {
     #[test]
     fn throttle_allows_first_update() {
         let mut throttle = UpdateThrottle::new(100);
-        assert!(throttle.should_update(0));
+        // First call at time >= min_interval succeeds (last_update_ms starts at 0).
+        assert!(throttle.should_update(100));
     }
 
     #[test]
     fn throttle_blocks_too_frequent_updates() {
         let mut throttle = UpdateThrottle::new(100);
-        throttle.should_update(0);
-        assert!(!throttle.should_update(50)); // too soon
+        assert!(throttle.should_update(1000)); // first call at realistic timestamp
+        assert!(!throttle.should_update(1050)); // too soon (50ms < 100ms)
         assert_eq!(throttle.skipped_count, 1);
-        assert!(throttle.should_update(100)); // exactly at interval
+        assert!(throttle.should_update(1100)); // exactly at interval
     }
 
     // ---- LatencyBudget ----

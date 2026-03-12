@@ -802,7 +802,7 @@ mod tests {
         guard.evict_expired(1150); // only "1" expired (1000 + 100 = 1100 < 1150)
         assert_eq!(guard.len(), 2);
 
-        guard.evict_expired(1301); // "2" expired (1050 + 100 = 1150 < 1301), "3" still alive
+        guard.evict_expired(1300); // "2" expired (1300 - 1050 = 250 > 100), "3" alive (1300 - 1200 = 100, not > 100)
         assert_eq!(guard.len(), 1);
     }
 

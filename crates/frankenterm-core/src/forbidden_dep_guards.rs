@@ -570,7 +570,7 @@ mod tests {
             line_number: 5,
             line_content: "// tokio legacy shim".into(),
             severity: ViolationSeverity::Warning,
-            in_test_context: false,
+            in_test_context: true, // test context so standard DG-01 guard doesn't block
             runtime: ForbiddenRuntime::Tokio,
         }
     }
