@@ -96,6 +96,12 @@ impl Default for PressureSignals {
 }
 
 impl PressureSignals {
+    /// Whether `rch` has real offload capacity right now.
+    #[must_use]
+    pub fn rch_can_offload(&self) -> bool {
+        self.rch_available && self.rch_workers_available > 0
+    }
+
     /// Derive a health tier from the current pressure signals.
     #[must_use]
     pub fn health_tier(&self) -> HealthTier {
@@ -162,22 +168,13 @@ impl Default for CapacityGovernorConfig {
 #[serde(rename_all = "snake_case", tag = "action")]
 pub enum GovernorDecision {
     /// Allow the workload to proceed immediately.
-    Allow {
-        reason: String,
-    },
+    Allow { reason: String },
     /// Throttle: delay execution by the specified duration.
-    Throttle {
-        delay_ms: u64,
-        reason: String,
-    },
+    Throttle { delay_ms: u64, reason: String },
     /// Offload: redirect to rch for remote execution.
-    Offload {
-        reason: String,
-    },
+    Offload { reason: String },
     /// Block: reject the workload entirely.
-    Block {
-        reason: String,
-    },
+    Block { reason: String },
     /// Operator override: allow regardless of pressure.
     Override {
         operator: String,
@@ -398,7 +395,7 @@ impl CapacityGovernor {
         if category == WorkloadCategory::Heavy
             && signals.active_heavy_workloads >= self.config.max_concurrent_heavy
         {
-            if self.config.prefer_rch_offload && signals.rch_available {
+            if self.config.prefer_rch_offload && signals.rch_can_offload() {
                 return GovernorDecision::Offload {
                     reason: format!(
                         "heavy concurrency limit ({}/{}), rch available ({} workers)",
@@ -435,7 +432,7 @@ impl CapacityGovernor {
             if signals.cpu_utilization >= self.config.cpu_throttle_threshold
                 || signals.memory_utilization >= self.config.memory_throttle_threshold
             {
-                if self.config.prefer_rch_offload && signals.rch_available {
+                if self.config.prefer_rch_offload && signals.rch_can_offload() {
                     return GovernorDecision::Offload {
                         reason: format!(
                             "elevated pressure: cpu={:.0}% mem={:.0}%, rch available",
@@ -629,7 +626,10 @@ mod tests {
             original_decision, ..
         } = &decision
         {
-            assert!(matches!(**original_decision, GovernorDecision::Block { .. }));
+            assert!(matches!(
+                **original_decision,
+                GovernorDecision::Block { .. }
+            ));
         }
     }
 
@@ -721,6 +721,47 @@ mod tests {
 
         signals.memory_utilization = 0.96;
         assert_eq!(signals.health_tier(), HealthTier::Black);
+    }
+
+    #[test]
+    fn rch_can_offload_requires_availability_and_workers() {
+        let mut signals = default_signals();
+        assert!(!signals.rch_can_offload());
+
+        signals.rch_available = true;
+        assert!(!signals.rch_can_offload());
+
+        signals.rch_workers_available = 2;
+        assert!(signals.rch_can_offload());
+
+        signals.rch_available = false;
+        assert!(!signals.rch_can_offload());
+    }
+
+    #[test]
+    fn zero_rch_workers_throttle_instead_of_offload_at_concurrency_limit() {
+        let mut gov = CapacityGovernor::with_defaults();
+        let mut signals = default_signals();
+        signals.active_heavy_workloads = 2;
+        signals.rch_available = true;
+        signals.rch_workers_available = 0;
+
+        let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
+        assert!(matches!(decision, GovernorDecision::Throttle { .. }));
+        assert_eq!(gov.telemetry().offloaded, 0);
+        assert_eq!(gov.telemetry().throttled, 1);
+    }
+
+    #[test]
+    fn zero_rch_workers_throttle_under_elevated_pressure() {
+        let mut gov = CapacityGovernor::with_defaults();
+        let mut signals = default_signals();
+        signals.cpu_utilization = 0.85;
+        signals.rch_available = true;
+        signals.rch_workers_available = 0;
+
+        let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
+        assert!(matches!(decision, GovernorDecision::Throttle { .. }));
     }
 
     #[test]
