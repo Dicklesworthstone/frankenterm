@@ -3432,17 +3432,17 @@ enum SetupCommands {
         #[arg(long)]
         yes: bool,
 
-        /// Install wa on the remote host
+        /// Install ft on the remote host
         #[arg(long)]
-        install_wa: bool,
+        install_ft: bool,
 
-        /// Path to local wa binary for scp
+        /// Path to local ft binary for scp
         #[arg(long)]
-        wa_path: Option<PathBuf>,
+        ft_path: Option<PathBuf>,
 
-        /// Install wa from git (optional tag or revision)
+        /// Install ft from git (optional tag or revision)
         #[arg(long)]
-        wa_version: Option<String>,
+        ft_version: Option<String>,
 
         /// Timeout per remote command (seconds)
         #[arg(long, default_value = "30")]
@@ -25395,18 +25395,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     SetupCommands::Remote {
                         host,
                         yes,
-                        install_wa,
-                        wa_path,
-                        wa_version,
+                        install_ft,
+                        ft_path,
+                        ft_version,
                         timeout_secs,
                     } => {
                         let options = RemoteSetupOptions {
                             apply,
                             dry_run,
                             yes,
-                            install_wa,
-                            wa_path: wa_path.as_deref(),
-                            wa_version: wa_version.as_deref(),
+                            install_ft,
+                            ft_path: ft_path.as_deref(),
+                            ft_version: ft_version.as_deref(),
                             timeout_secs,
                             verbose: cli.verbose,
                         };
@@ -35900,7 +35900,7 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
     Ok(())
 }
 
-/// Generate a systemd unit for the WezTerm mux server using the resolved binary path.
+/// Generate a systemd unit for the FrankenTerm mux server using the resolved binary path.
 fn remote_mux_service_unit(mux_path: &str) -> String {
     format!(
         r"[Unit]
@@ -35930,9 +35930,9 @@ struct RemoteSetupOptions<'a> {
     apply: bool,
     dry_run: bool,
     yes: bool,
-    install_wa: bool,
-    wa_path: Option<&'a Path>,
-    wa_version: Option<&'a str>,
+    install_ft: bool,
+    ft_path: Option<&'a Path>,
+    ft_version: Option<&'a str>,
     timeout_secs: u64,
     verbose: u8,
 }
@@ -36384,8 +36384,8 @@ where
         println!("• Would run: sudo loginctl enable-linger $USER");
     }
 
-    // Step 6: Optional wa install
-    if options.install_wa {
+    // Step 6: Optional ft install
+    if options.install_ft {
         if apply_changes {
             run_remote_step(
                 "Ensure ~/.local/bin exists",
@@ -36398,28 +36398,28 @@ where
                 true,
             )?;
 
-            if let Some(path) = options.wa_path {
+            if let Some(path) = options.ft_path {
                 if !path.exists() {
-                    anyhow::bail!("wa_path does not exist: {}", path.display());
+                    anyhow::bail!("ft_path does not exist: {}", path.display());
                 }
                 let scp_status = std::process::Command::new("scp")
                     .arg(path)
-                    .arg(format!("{host}:~/.local/bin/wa"))
+                    .arg(format!("{host}:~/.local/bin/ft"))
                     .status()?;
                 if !scp_status.success() {
                     anyhow::bail!("scp failed with status {:?}", scp_status.code());
                 }
                 run_remote_step(
-                    "chmod +x ~/.local/bin/wa",
+                    "chmod +x ~/.local/bin/ft",
                     host,
-                    "chmod +x ~/.local/bin/wa",
+                    "chmod +x ~/.local/bin/ft",
                     timeout,
                     runner,
                     &redactor,
                     options.verbose,
                     true,
                 )?;
-            } else if let Some(version) = options.wa_version {
+            } else if let Some(version) = options.ft_version {
                 let install_cmd = if version.eq_ignore_ascii_case("git") {
                     "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git frankenterm"
                         .to_string()
@@ -36430,7 +36430,7 @@ where
                     )
                 };
                 run_remote_step(
-                    "Install wa via cargo",
+                    "Install ft via cargo",
                     host,
                     &install_cmd,
                     timeout,
@@ -36440,16 +36440,16 @@ where
                     true,
                 )?;
             } else {
-                println!("⚠ --install-wa set but no --wa-path or --wa-version provided.");
+                println!("⚠ --install-ft set but no --ft-path or --ft-version provided.");
             }
         } else {
-            println!("• Would install wa on remote host");
-            if let Some(path) = options.wa_path {
+            println!("• Would install ft on remote host");
+            if let Some(path) = options.ft_path {
                 println!("  Would scp {}", path.display());
-            } else if let Some(version) = options.wa_version {
+            } else if let Some(version) = options.ft_version {
                 println!("  Would cargo install frankenterm ({version})");
             } else {
-                println!("  Provide --wa-path or --wa-version to install wa");
+                println!("  Provide --ft-path or --ft-version to install ft");
             }
         }
     }
@@ -40597,9 +40597,9 @@ log_level = "debug"
             apply: false,
             dry_run: true,
             yes: true,
-            install_wa: true,
-            wa_path: None,
-            wa_version: Some("git"),
+            install_ft: true,
+            ft_path: None,
+            ft_version: Some("git"),
             timeout_secs: 5,
             verbose: 0,
         };
