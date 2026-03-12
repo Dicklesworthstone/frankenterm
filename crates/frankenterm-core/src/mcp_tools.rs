@@ -11,8 +11,21 @@ use crate::mcp_framework::{
 };
 use crate::policy::PolicySurface;
 
-#[allow(clippy::wildcard_imports)]
-use super::mcp_types::*;
+use super::mcp_types::{
+    AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
+    EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
+    McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope, McpEventItem,
+    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionAssignmentCounters,
+    McpMissionControlData, McpMissionExplainData, McpMissionStateData, McpPaneState,
+    McpReleaseData, McpReservationInfo, McpReservationsData, McpReserveData, McpRuleItem,
+    McpRuleMatchItem, McpRuleTraceInfo, McpRulesListData, McpRulesTestData, McpSearchData,
+    McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
+    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
+    MissionPauseParams, MissionResumeParams, MissionStateParams, ReleaseParams, ReservationsParams,
+    ReserveParams, RulesListParams, RulesTestParams, SearchParams, SendParams, StateParams,
+    TxPlanParams, TxRollbackParams, TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams,
+    apply_tail_truncation, now_ms,
+};
 #[allow(unused_imports)]
 use super::{
     AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
@@ -23,7 +36,7 @@ use super::{
     InjectionResult, MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
     MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
     MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, McpEnvelope, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig,
+    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig,
     PaneInfo, PaneReservation, PaneWaiter, PaneWorkflowLockManager, PatternEngine, PolicyDecision,
     PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
     StorageHandle, UnifiedSearchMode, WaitMatcher, WaitOptions, WaitResult, WeztermError,
@@ -4282,9 +4295,21 @@ impl ToolHandler for WaEventsLabelTool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
-    use super::*;
+    use super::{
+        ActionKind, ActorKind, CompatRuntimeBuilder, Config, McpContext, PaneCapabilities,
+        PaneFilterConfig, PolicySurface, StorageHandle, Tool, WaAccountsRefreshTool,
+        WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
+        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
+        WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
+        mcp_get_text_policy_input, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+    };
     use tempfile::TempDir;
 
     fn db_path() -> Arc<PathBuf> {
