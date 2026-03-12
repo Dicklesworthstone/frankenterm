@@ -260,7 +260,7 @@ impl GapRiskAssessment {
         };
         let has_remediation_path = !entry.mapped_bead_ids.is_empty();
         let risk_score = if has_remediation_path {
-            (base_score - 0.2).max(0.0)
+            (base_score - 0.2_f64).max(0.0_f64)
         } else {
             base_score
         };
@@ -641,22 +641,25 @@ impl VerificationPack {
     }
 
     fn check_coverage(&mut self) {
+        // Collect coverage data and checks into locals to avoid borrow conflicts.
+        let mut coverage_entries = Vec::new();
+        let mut coverage_checks = Vec::new();
+
         // Build per-domain buckets.
-        let mut buckets: BTreeMap<&str, Vec<&CapabilityEntry>> = BTreeMap::new();
-        for entry in &self.matrix.entries {
-            buckets
-                .entry(entry.domain().label())
-                .or_default()
-                .push(entry);
-        }
-
-        for (label, entries) in &buckets {
-            self.domain_coverage
-                .push(DomainCoverage::compute(label, entries));
-        }
-
-        // VCK-COV-001: overall weighted coverage >= 50 %
         {
+            let mut buckets: BTreeMap<&str, Vec<&CapabilityEntry>> = BTreeMap::new();
+            for entry in &self.matrix.entries {
+                buckets
+                    .entry(entry.domain().label())
+                    .or_default()
+                    .push(entry);
+            }
+
+            for (label, entries) in &buckets {
+                coverage_entries.push(DomainCoverage::compute(label, entries));
+            }
+
+            // VCK-COV-001: overall weighted coverage >= 50 %
             let (total, weighted_sum) =
                 self.matrix
                     .entries
@@ -675,7 +678,7 @@ impl VerificationPack {
                 weighted_sum / total as f64 * 100.0
             };
             let ok = overall_pct >= 50.0;
-            self.push(if ok {
+            coverage_checks.push(if ok {
                 VerificationCheck::pass(
                     "VCK-COV-001",
                     "overall coverage >= 50%",
@@ -690,10 +693,8 @@ impl VerificationPack {
                     VerificationCategory::Coverage,
                 )
             });
-        }
 
-        // VCK-COV-002: each expected domain has at least one entry
-        {
+            // VCK-COV-002: each expected domain has at least one entry
             let all_domains = ["ft", "ntm", "fcp"];
             let missing_domains: Vec<&str> = all_domains
                 .iter()
@@ -701,7 +702,7 @@ impl VerificationPack {
                 .filter(|d| !buckets.contains_key(d))
                 .collect();
             let ok = missing_domains.is_empty();
-            self.push(if ok {
+            coverage_checks.push(if ok {
                 VerificationCheck::pass(
                     "VCK-COV-002",
                     "each domain (ft/ntm/fcp) has at least one entry",
@@ -716,6 +717,11 @@ impl VerificationPack {
                     VerificationCategory::Coverage,
                 )
             });
+        }
+
+        self.domain_coverage.extend(coverage_entries);
+        for check in coverage_checks {
+            self.push(check);
         }
     }
 
@@ -800,7 +806,7 @@ impl VerificationPack {
     pub fn summary(&self) -> String {
         let total = self.checks.len();
         let passed = self.checks.iter().filter(|c| c.passed).count();
-        let failed = total - passed;
+        let _failed = total - passed;
         let verdict_str = match self.pack_verdict {
             PackVerdict::Complete => "COMPLETE",
             PackVerdict::ConditionalPass => "CONDITIONAL_PASS",
