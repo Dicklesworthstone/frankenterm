@@ -102,49 +102,57 @@ pub fn standard_invariants() -> Vec<PersistenceInvariant> {
             id: PersistenceInvariantId::CaptureFlush,
             description: "Capture pipeline flushes all buffered output before checkpoint".into(),
             protected_resource: "Pane output deltas in capture buffer".into(),
-            verification_method: "Compare buffered count before crash with persisted count after recovery".into(),
+            verification_method:
+                "Compare buffered count before crash with persisted count after recovery".into(),
             data_loss_risk: true,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::SessionCheckpoint,
             description: "Session state is recoverable from last checkpoint".into(),
             protected_resource: "Pane layout, positions, and metadata".into(),
-            verification_method: "Restore session after crash and diff with pre-crash snapshot".into(),
+            verification_method: "Restore session after crash and diff with pre-crash snapshot"
+                .into(),
             data_loss_risk: true,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::SearchIndexSync,
             description: "Search index is consistent with storage after recovery".into(),
             protected_resource: "FTS5 search index and backing SQLite rows".into(),
-            verification_method: "Query known-ingested content and verify all expected results appear".into(),
+            verification_method:
+                "Query known-ingested content and verify all expected results appear".into(),
             data_loss_risk: false,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::EventQueueDrain,
             description: "Acknowledged events are durably committed".into(),
             protected_resource: "Event bus queue entries with delivery acknowledgement".into(),
-            verification_method: "Count acknowledged events before crash; verify all present after recovery".into(),
+            verification_method:
+                "Count acknowledged events before crash; verify all present after recovery".into(),
             data_loss_risk: true,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::ControlPlaneAck,
             description: "Control-plane operations are committed before acknowledgement".into(),
             protected_resource: "Pane operations (split, close, resize) state".into(),
-            verification_method: "Issue operation, receive ack, crash, verify operation state persisted".into(),
+            verification_method:
+                "Issue operation, receive ack, crash, verify operation state persisted".into(),
             data_loss_risk: false,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::WalFsync,
             description: "WAL entries are fsync'd before commit acknowledgement".into(),
             protected_resource: "Write-ahead log entries".into(),
-            verification_method: "Write entry, receive commit ack, power-kill, verify WAL entry present".into(),
+            verification_method:
+                "Write entry, receive commit ack, power-kill, verify WAL entry present".into(),
             data_loss_risk: true,
         },
         PersistenceInvariant {
             id: PersistenceInvariantId::TransactionAtomicity,
-            description: "In-flight transactions are either fully committed or fully rolled back".into(),
+            description: "In-flight transactions are either fully committed or fully rolled back"
+                .into(),
             protected_resource: "Multi-step storage operations".into(),
-            verification_method: "Start multi-step op, crash mid-way, verify no partial state".into(),
+            verification_method: "Start multi-step op, crash mid-way, verify no partial state"
+                .into(),
             data_loss_risk: true,
         },
     ]
@@ -299,9 +307,7 @@ pub fn standard_recovery_scenarios() -> Vec<RecoveryScenario> {
             scenario_id: "CRASH-007-corrupted".into(),
             crash_type: CrashScenarioType::CorruptedCheckpoint,
             description: "Corrupted checkpoint file at startup".into(),
-            validates_invariants: vec![
-                PersistenceInvariantId::SessionCheckpoint,
-            ],
+            validates_invariants: vec![PersistenceInvariantId::SessionCheckpoint],
             expected_outcome: RecoveryOutcome::GracefulFailure,
         },
     ]
@@ -399,7 +405,11 @@ impl PersistenceGateReport {
         let passed_scenarios = results.iter().filter(|r| r.met_expectation).count();
         let failed_scenarios = total_scenarios - passed_scenarios;
         let any_data_loss = results.iter().any(|r| r.has_data_loss());
-        let max_recovery_time_ms = results.iter().map(|r| r.recovery_time_ms).max().unwrap_or(0);
+        let max_recovery_time_ms = results
+            .iter()
+            .map(|r| r.recovery_time_ms)
+            .max()
+            .unwrap_or(0);
 
         let verdict = if any_data_loss {
             PersistenceGateVerdict::Fail
@@ -436,19 +446,33 @@ impl PersistenceGateReport {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("=== Crash Persistence Gate: {} ===", self.report_id));
+        lines.push(format!(
+            "=== Crash Persistence Gate: {} ===",
+            self.report_id
+        ));
         lines.push(format!("Verdict: {:?}", self.verdict));
         lines.push(format!(
             "Scenarios: {}/{} passed",
             self.passed_scenarios, self.total_scenarios
         ));
         lines.push(format!("Data loss detected: {}", self.any_data_loss));
-        lines.push(format!("Max recovery time: {}ms", self.max_recovery_time_ms));
+        lines.push(format!(
+            "Max recovery time: {}ms",
+            self.max_recovery_time_ms
+        ));
 
         lines.push(String::new());
         for result in &self.results {
-            let status = if result.met_expectation { "PASS" } else { "FAIL" };
-            let data_loss = if result.has_data_loss() { " [DATA LOSS]" } else { "" };
+            let status = if result.met_expectation {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            let data_loss = if result.has_data_loss() {
+                " [DATA LOSS]"
+            } else {
+                ""
+            };
             lines.push(format!(
                 "  [{}] {} ({}) — {}/{} invariants held, recovery {}ms{}",
                 status,
@@ -540,8 +564,10 @@ mod tests {
     #[test]
     fn gate_report_all_pass() {
         let scenarios = standard_recovery_scenarios();
-        let results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
         let report = PersistenceGateReport::evaluate(results);
         assert_eq!(report.verdict, PersistenceGateVerdict::Pass);
         assert!(!report.any_data_loss);
@@ -550,11 +576,16 @@ mod tests {
     #[test]
     fn gate_report_fail_on_data_loss() {
         let scenarios = standard_recovery_scenarios();
-        let mut results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let mut results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
 
         // Simulate data loss in sigkill scenario.
-        if let Some(r) = results.iter_mut().find(|r| r.crash_type == CrashScenarioType::Sigkill) {
+        if let Some(r) = results
+            .iter_mut()
+            .find(|r| r.crash_type == CrashScenarioType::Sigkill)
+        {
             r.met_expectation = false;
             if let Some(inv) = r.invariant_results.iter_mut().find(|i| i.data_loss) {
                 inv.held = false;
@@ -569,11 +600,16 @@ mod tests {
     #[test]
     fn gate_report_conditional_on_non_critical_failure() {
         let scenarios = standard_recovery_scenarios();
-        let mut results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let mut results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
 
         // Fail a scenario but only on non-data-loss invariant.
-        if let Some(r) = results.iter_mut().find(|r| r.crash_type == CrashScenarioType::RestartLoop) {
+        if let Some(r) = results
+            .iter_mut()
+            .find(|r| r.crash_type == CrashScenarioType::RestartLoop)
+        {
             r.met_expectation = false;
             // SearchIndexSync is not data_loss_risk.
             for inv in &mut r.invariant_results {
@@ -595,14 +631,12 @@ mod tests {
             met_expectation: false,
             actual_outcome: RecoveryOutcome::PartialRecovery,
             expected_outcome: RecoveryOutcome::FullRecovery,
-            invariant_results: vec![
-                InvariantResult {
-                    invariant_id: PersistenceInvariantId::CaptureFlush,
-                    held: false,
-                    evidence: "Data lost".into(),
-                    data_loss: true,
-                },
-            ],
+            invariant_results: vec![InvariantResult {
+                invariant_id: PersistenceInvariantId::CaptureFlush,
+                held: false,
+                evidence: "Data lost".into(),
+                data_loss: true,
+            }],
             recovery_time_ms: 1000,
         };
         assert!(result.has_data_loss());
@@ -616,14 +650,12 @@ mod tests {
             met_expectation: true,
             actual_outcome: RecoveryOutcome::FullRecovery,
             expected_outcome: RecoveryOutcome::FullRecovery,
-            invariant_results: vec![
-                InvariantResult {
-                    invariant_id: PersistenceInvariantId::CaptureFlush,
-                    held: true,
-                    evidence: "OK".into(),
-                    data_loss: true,
-                },
-            ],
+            invariant_results: vec![InvariantResult {
+                invariant_id: PersistenceInvariantId::CaptureFlush,
+                held: true,
+                evidence: "OK".into(),
+                data_loss: true,
+            }],
             recovery_time_ms: 100,
         };
         assert!(!result.has_data_loss());
@@ -632,8 +664,10 @@ mod tests {
     #[test]
     fn max_recovery_time_tracked() {
         let scenarios = standard_recovery_scenarios();
-        let mut results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let mut results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
         results[0].recovery_time_ms = 5000;
         let report = PersistenceGateReport::evaluate(results);
         assert_eq!(report.max_recovery_time_ms, 5000);
@@ -667,8 +701,10 @@ mod tests {
     #[test]
     fn render_summary_shows_pass() {
         let scenarios = standard_recovery_scenarios();
-        let results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
         let report = PersistenceGateReport::evaluate(results);
         let summary = report.render_summary();
         assert!(summary.contains("Pass"));
@@ -678,9 +714,14 @@ mod tests {
     #[test]
     fn render_summary_shows_data_loss() {
         let scenarios = standard_recovery_scenarios();
-        let mut results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
-        if let Some(r) = results.iter_mut().find(|r| r.crash_type == CrashScenarioType::Sigkill) {
+        let mut results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
+        if let Some(r) = results
+            .iter_mut()
+            .find(|r| r.crash_type == CrashScenarioType::Sigkill)
+        {
             r.met_expectation = false;
             if let Some(inv) = r.invariant_results.iter_mut().find(|i| i.data_loss) {
                 inv.held = false;
@@ -694,8 +735,10 @@ mod tests {
     #[test]
     fn serde_roundtrip_gate_report() {
         let scenarios = standard_recovery_scenarios();
-        let results: Vec<ScenarioResult> =
-            scenarios.iter().map(|s| passing_scenario_result(s)).collect();
+        let results: Vec<ScenarioResult> = scenarios
+            .iter()
+            .map(|s| passing_scenario_result(s))
+            .collect();
         let report = PersistenceGateReport::evaluate(results);
         let json = serde_json::to_string(&report).expect("serialize");
         let restored: PersistenceGateReport = serde_json::from_str(&json).expect("deserialize");
@@ -721,7 +764,13 @@ mod tests {
     #[test]
     fn clean_shutdown_validates_all_invariants() {
         let scenarios = standard_recovery_scenarios();
-        let clean = scenarios.iter().find(|s| s.crash_type == CrashScenarioType::CleanShutdown).unwrap();
-        assert_eq!(clean.validates_invariants.len(), PersistenceInvariantId::all().len());
+        let clean = scenarios
+            .iter()
+            .find(|s| s.crash_type == CrashScenarioType::CleanShutdown)
+            .unwrap();
+        assert_eq!(
+            clean.validates_invariants.len(),
+            PersistenceInvariantId::all().len()
+        );
     }
 }

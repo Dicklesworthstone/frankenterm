@@ -58,19 +58,15 @@ fn arb_field_type() -> impl Strategy<Value = FieldType> {
 }
 
 fn arb_field_spec() -> impl Strategy<Value = FieldSpec> {
-    (
-        "[a-z_]{1,20}",
-        arb_field_type_leaf(),
-        ".*",
-        any::<bool>(),
-    )
-        .prop_map(|(name, field_type, desc, required)| {
+    ("[a-z_]{1,20}", arb_field_type_leaf(), ".*", any::<bool>()).prop_map(
+        |(name, field_type, desc, required)| {
             if required {
                 FieldSpec::required(name, field_type, desc)
             } else {
                 FieldSpec::optional(name, field_type, desc)
             }
-        })
+        },
+    )
 }
 
 fn arb_endpoint_spec() -> impl Strategy<Value = EndpointSpec> {
@@ -584,12 +580,18 @@ fn standard_shim_has_expected_coverage() {
     assert!(summary.total > 0, "standard shim should have entries");
 
     // Category sums match
-    let sum = summary.full + summary.mapped + summary.partial
-        + summary.incompatible + summary.no_equivalent;
+    let sum = summary.full
+        + summary.mapped
+        + summary.partial
+        + summary.incompatible
+        + summary.no_equivalent;
     assert_eq!(sum, summary.total);
 
     // Coverage should be > 0
-    assert!(summary.migration_coverage > 0.0, "should have some coverage");
+    assert!(
+        summary.migration_coverage > 0.0,
+        "should have some coverage"
+    );
 
     // The standard shim registers 7 full + 2 mapped + 10 no-equivalent = 19 total
     assert_eq!(summary.total, 19);
@@ -606,7 +608,11 @@ fn standard_replay_tests_are_blocking() {
     let tests = standard_replay_contract_tests();
     assert!(!tests.is_empty());
     for test in &tests {
-        assert!(test.blocking, "standard tests should be blocking: {}", test.test_id);
+        assert!(
+            test.blocking,
+            "standard tests should be blocking: {}",
+            test.test_id
+        );
         assert!(!test.test_id.is_empty());
         assert!(!test.command.is_empty());
     }
@@ -623,8 +629,11 @@ fn standard_contract_artifacts_render_successfully() {
     // Each SDK source should contain the class name
     for (filename, source) in &bundle.sdk_sources {
         assert!(!filename.is_empty());
-        assert!(source.contains("FrankentermClient"),
-            "SDK source for {} should contain FrankentermClient", filename);
+        assert!(
+            source.contains("FrankentermClient"),
+            "SDK source for {} should contain FrankentermClient",
+            filename
+        );
     }
 }
 
@@ -639,14 +648,22 @@ fn core_endpoint_specs_have_sane_structure() {
 
         // GET should not be a mutation
         if spec.method == HttpMethod::Get {
-            assert!(!spec.is_mutation, "GET endpoints should not be mutations: {}", spec.command);
+            assert!(
+                !spec.is_mutation,
+                "GET endpoints should not be mutations: {}",
+                spec.command
+            );
         }
 
         // Mutations should have POST/PUT/DELETE
         if spec.is_mutation {
             assert!(
-                matches!(spec.method, HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete),
-                "mutations should use POST/PUT/DELETE: {}", spec.command
+                matches!(
+                    spec.method,
+                    HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete
+                ),
+                "mutations should use POST/PUT/DELETE: {}",
+                spec.command
             );
         }
     }

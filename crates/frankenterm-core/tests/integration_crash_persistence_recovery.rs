@@ -20,9 +20,7 @@ use frankenterm_core::crash_persistence_gate::{
     PersistenceInvariantId, RecoveryOutcome, ScenarioResult, standard_invariants,
     standard_recovery_scenarios,
 };
-use frankenterm_core::durable_state::{
-    CheckpointTrigger, DurableStateManager,
-};
+use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateManager};
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
     MuxPaneLifecycleState,
@@ -71,13 +69,7 @@ fn invariant_failed(id: PersistenceInvariantId, data_loss: bool) -> InvariantRes
 }
 
 fn make_pane_identity(workspace: &str, pane_id: u64) -> LifecycleIdentity {
-    LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        workspace,
-        "default",
-        pane_id,
-        0,
-    )
+    LifecycleIdentity::new(LifecycleEntityKind::Pane, workspace, "default", pane_id, 0)
 }
 
 // =========================================================================
@@ -108,12 +100,7 @@ fn all_invariant_ids_have_unique_as_str() {
     let mut seen = std::collections::HashSet::new();
     for id in all_ids {
         let s = id.as_str();
-        assert!(
-            seen.insert(s),
-            "duplicate as_str for {:?}: {}",
-            id,
-            s
-        );
+        assert!(seen.insert(s), "duplicate as_str for {:?}: {}", id, s);
     }
 }
 
@@ -239,20 +226,18 @@ fn gate_all_pass_returns_pass_verdict() {
 
 #[test]
 fn gate_data_loss_triggers_fail() {
-    let results = vec![
-        make_scenario_result(
-            "CRASH-002-sigkill",
-            CrashScenarioType::Sigkill,
-            false,
-            RecoveryOutcome::DegradedRecovery,
-            RecoveryOutcome::PartialRecovery,
-            vec![
-                invariant_held(PersistenceInvariantId::SessionCheckpoint, true),
-                invariant_failed(PersistenceInvariantId::CaptureFlush, true), // data_loss=true
-            ],
-            100,
-        ),
-    ];
+    let results = vec![make_scenario_result(
+        "CRASH-002-sigkill",
+        CrashScenarioType::Sigkill,
+        false,
+        RecoveryOutcome::DegradedRecovery,
+        RecoveryOutcome::PartialRecovery,
+        vec![
+            invariant_held(PersistenceInvariantId::SessionCheckpoint, true),
+            invariant_failed(PersistenceInvariantId::CaptureFlush, true), // data_loss=true
+        ],
+        100,
+    )];
 
     let report = PersistenceGateReport::evaluate(results);
     assert_eq!(report.verdict, PersistenceGateVerdict::Fail);
@@ -265,20 +250,18 @@ fn gate_data_loss_triggers_fail() {
 
 #[test]
 fn gate_non_data_loss_failure_conditional_pass() {
-    let results = vec![
-        make_scenario_result(
-            "CRASH-005-io-fault",
-            CrashScenarioType::IoFaultDuringCheckpoint,
-            false,
-            RecoveryOutcome::DegradedRecovery,
-            RecoveryOutcome::PartialRecovery,
-            vec![
-                invariant_held(PersistenceInvariantId::WalFsync, true),
-                invariant_failed(PersistenceInvariantId::SearchIndexSync, false), // not data_loss
-            ],
-            200,
-        ),
-    ];
+    let results = vec![make_scenario_result(
+        "CRASH-005-io-fault",
+        CrashScenarioType::IoFaultDuringCheckpoint,
+        false,
+        RecoveryOutcome::DegradedRecovery,
+        RecoveryOutcome::PartialRecovery,
+        vec![
+            invariant_held(PersistenceInvariantId::WalFsync, true),
+            invariant_failed(PersistenceInvariantId::SearchIndexSync, false), // not data_loss
+        ],
+        200,
+    )];
 
     let report = PersistenceGateReport::evaluate(results);
     assert_eq!(report.verdict, PersistenceGateVerdict::ConditionalPass);
@@ -292,22 +275,26 @@ fn gate_non_data_loss_failure_conditional_pass() {
 
 #[test]
 fn report_summary_contains_verdict_and_counts() {
-    let results = vec![
-        make_scenario_result(
-            "test-scenario",
-            CrashScenarioType::CleanShutdown,
+    let results = vec![make_scenario_result(
+        "test-scenario",
+        CrashScenarioType::CleanShutdown,
+        true,
+        RecoveryOutcome::FullRecovery,
+        RecoveryOutcome::FullRecovery,
+        vec![invariant_held(
+            PersistenceInvariantId::SessionCheckpoint,
             true,
-            RecoveryOutcome::FullRecovery,
-            RecoveryOutcome::FullRecovery,
-            vec![invariant_held(PersistenceInvariantId::SessionCheckpoint, true)],
-            10,
-        ),
-    ];
+        )],
+        10,
+    )];
 
     let report = PersistenceGateReport::evaluate(results);
     let summary = report.render_summary();
     assert!(summary.contains("Pass"), "summary should contain verdict");
-    assert!(summary.contains("1/1"), "summary should contain passed/total");
+    assert!(
+        summary.contains("1/1"),
+        "summary should contain passed/total"
+    );
     assert!(summary.contains("Data loss detected: false"));
 }
 
@@ -336,7 +323,10 @@ fn persistence_gate_report_serde_roundtrip() {
             true,
             RecoveryOutcome::FullRecovery,
             RecoveryOutcome::FullRecovery,
-            vec![invariant_held(PersistenceInvariantId::TransactionAtomicity, true)],
+            vec![invariant_held(
+                PersistenceInvariantId::TransactionAtomicity,
+                true,
+            )],
             75,
         ),
     ];
@@ -419,7 +409,10 @@ fn scenario_data_loss_detection_only_on_failed_data_loss_invariants() {
         false,
         RecoveryOutcome::DegradedRecovery,
         RecoveryOutcome::PartialRecovery,
-        vec![invariant_failed(PersistenceInvariantId::SearchIndexSync, false)],
+        vec![invariant_failed(
+            PersistenceInvariantId::SearchIndexSync,
+            false,
+        )],
         50,
     );
     assert!(!non_critical.has_data_loss());
@@ -450,7 +443,11 @@ fn checkpoint_rollback_recovery_pipeline() {
     for i in 0..3 {
         let identity = make_pane_identity("ws-1", i);
         registry
-            .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000 + i)
+            .register_entity(
+                identity,
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                1000 + i,
+            )
             .unwrap();
     }
 
@@ -469,7 +466,11 @@ fn checkpoint_rollback_recovery_pipeline() {
     // Phase 3: Simulate state changes (risky operation)
     let new_pane = make_pane_identity("ws-1", 10);
     registry
-        .register_entity(new_pane, LifecycleState::Pane(MuxPaneLifecycleState::Running), 2000)
+        .register_entity(
+            new_pane,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            2000,
+        )
         .unwrap();
 
     // Phase 4: Simulate crash — state is now 4 panes but we want 3
@@ -478,7 +479,10 @@ fn checkpoint_rollback_recovery_pipeline() {
         .rollback(cp1_id, &mut registry, "simulated crash recovery")
         .unwrap();
     assert_eq!(rollback.target_checkpoint_id, cp1_id);
-    assert_eq!(rollback.restored_entity_count + rollback.removed_entity_count, 1);
+    assert_eq!(
+        rollback.restored_entity_count + rollback.removed_entity_count,
+        1
+    );
 
     // Phase 5: Verify recovery — should have exactly 3 entities again
     let snapshot = registry.snapshot();
@@ -492,7 +496,10 @@ fn checkpoint_rollback_recovery_pipeline() {
         HashMap::new(),
     );
     assert_eq!(cp2.entities.len(), 3);
-    assert!(cp2.id > cp1_id, "post-recovery checkpoint should have higher ID");
+    assert!(
+        cp2.id > cp1_id,
+        "post-recovery checkpoint should have higher ID"
+    );
 }
 
 // =========================================================================
@@ -506,7 +513,11 @@ fn rollback_to_rolled_back_checkpoint_rejected() {
 
     let identity = make_pane_identity("ws-1", 0);
     registry
-        .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000)
+        .register_entity(
+            identity,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            1000,
+        )
         .unwrap();
 
     let cp1 = manager.checkpoint(
@@ -533,7 +544,10 @@ fn rollback_to_rolled_back_checkpoint_rejected() {
 
     // Attempting to rollback to cp2 (which was marked rolled_back) should fail
     let result = manager.rollback(cp2_id, &mut registry, "rollback to rolled-back cp");
-    assert!(result.is_err(), "rollback to already rolled-back checkpoint should be rejected");
+    assert!(
+        result.is_err(),
+        "rollback to already rolled-back checkpoint should be rejected"
+    );
 }
 
 // =========================================================================
@@ -561,7 +575,11 @@ fn durable_state_json_roundtrip() {
     for i in 0..5 {
         let identity = make_pane_identity("ws-roundtrip", i);
         registry
-            .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000 + i)
+            .register_entity(
+                identity,
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                1000 + i,
+            )
             .unwrap();
     }
 
@@ -620,20 +638,38 @@ fn checkpoint_diff_detects_changes() {
     for i in 0..2 {
         let identity = make_pane_identity("ws-diff", i);
         registry
-            .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000)
+            .register_entity(
+                identity,
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                1000,
+            )
             .unwrap();
     }
-    let cp1 = manager.checkpoint(&registry, "state-1", CheckpointTrigger::Manual, HashMap::new());
+    let cp1 = manager.checkpoint(
+        &registry,
+        "state-1",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     let cp1_id = cp1.id;
 
     // Add a third pane
     let new_pane = make_pane_identity("ws-diff", 2);
     registry
-        .register_entity(new_pane, LifecycleState::Pane(MuxPaneLifecycleState::Running), 2000)
+        .register_entity(
+            new_pane,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            2000,
+        )
         .unwrap();
 
     // Checkpoint 2: 3 panes
-    let cp2 = manager.checkpoint(&registry, "state-2", CheckpointTrigger::Manual, HashMap::new());
+    let cp2 = manager.checkpoint(
+        &registry,
+        "state-2",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     let cp2_id = cp2.id;
 
     let diff = manager.diff(cp1_id, cp2_id).unwrap();
@@ -658,7 +694,11 @@ fn full_pipeline_checkpoint_crash_gate_verdict() {
     for i in 0..5 {
         let identity = make_pane_identity("production", i);
         registry
-            .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000)
+            .register_entity(
+                identity,
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                1000,
+            )
             .unwrap();
     }
     let cp = manager.checkpoint(
@@ -673,13 +713,19 @@ fn full_pipeline_checkpoint_crash_gate_verdict() {
     for i in 100..102 {
         let identity = make_pane_identity("production", i);
         registry
-            .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Closed), 3000)
+            .register_entity(
+                identity,
+                LifecycleState::Pane(MuxPaneLifecycleState::Closed),
+                3000,
+            )
             .unwrap();
     }
     assert_eq!(registry.snapshot().len(), 7);
 
     // Rollback to pre-crash state
-    let rollback = manager.rollback(cp_id, &mut registry, "crash recovery").unwrap();
+    let rollback = manager
+        .rollback(cp_id, &mut registry, "crash recovery")
+        .unwrap();
 
     // Verify recovery
     let recovered = registry.snapshot();
@@ -734,7 +780,10 @@ fn gate_all_fail_no_data_loss_conditional_pass() {
                 false,
                 RecoveryOutcome::DegradedRecovery,
                 RecoveryOutcome::FullRecovery,
-                vec![invariant_failed(PersistenceInvariantId::SearchIndexSync, false)],
+                vec![invariant_failed(
+                    PersistenceInvariantId::SearchIndexSync,
+                    false,
+                )],
                 100,
             )
         })
@@ -811,10 +860,20 @@ fn checkpoint_ids_monotonic_across_rollbacks() {
     let mut registry = LifecycleRegistry::new();
     let mut manager = DurableStateManager::new();
 
-    let cp1 = manager.checkpoint(&registry, "first", CheckpointTrigger::Manual, HashMap::new());
+    let cp1 = manager.checkpoint(
+        &registry,
+        "first",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     let id1 = cp1.id;
 
-    let cp2 = manager.checkpoint(&registry, "second", CheckpointTrigger::Manual, HashMap::new());
+    let cp2 = manager.checkpoint(
+        &registry,
+        "second",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     let id2 = cp2.id;
     assert!(id2 > id1);
 
@@ -822,9 +881,19 @@ fn checkpoint_ids_monotonic_across_rollbacks() {
     manager.rollback(id1, &mut registry, "rollback").unwrap();
 
     // New checkpoint after rollback should still have monotonically increasing ID
-    let cp3 = manager.checkpoint(&registry, "post-rollback", CheckpointTrigger::PostRecovery, HashMap::new());
+    let cp3 = manager.checkpoint(
+        &registry,
+        "post-rollback",
+        CheckpointTrigger::PostRecovery,
+        HashMap::new(),
+    );
     let id3 = cp3.id;
-    assert!(id3 > id2, "checkpoint ID should be monotonic: {} > {}", id3, id2);
+    assert!(
+        id3 > id2,
+        "checkpoint ID should be monotonic: {} > {}",
+        id3,
+        id2
+    );
 }
 
 // =========================================================================
@@ -838,16 +907,29 @@ fn diff_from_current_detects_live_changes() {
 
     let identity = make_pane_identity("ws-live", 0);
     registry
-        .register_entity(identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 1000)
+        .register_entity(
+            identity,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            1000,
+        )
         .unwrap();
 
-    let cp = manager.checkpoint(&registry, "baseline", CheckpointTrigger::Manual, HashMap::new());
+    let cp = manager.checkpoint(
+        &registry,
+        "baseline",
+        CheckpointTrigger::Manual,
+        HashMap::new(),
+    );
     let cp_id = cp.id;
 
     // Add new entity to live registry (not checkpointed)
     let new_identity = make_pane_identity("ws-live", 1);
     registry
-        .register_entity(new_identity, LifecycleState::Pane(MuxPaneLifecycleState::Running), 2000)
+        .register_entity(
+            new_identity,
+            LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            2000,
+        )
         .unwrap();
 
     let diff = manager.diff_from_current(cp_id, &registry).unwrap();
@@ -897,7 +979,10 @@ fn composite_gate_evaluation_mixed_results() {
             true,
             RecoveryOutcome::FullRecovery,
             RecoveryOutcome::FullRecovery,
-            vec![invariant_held(PersistenceInvariantId::TransactionAtomicity, true)],
+            vec![invariant_held(
+                PersistenceInvariantId::TransactionAtomicity,
+                true,
+            )],
             30,
         ),
     ];

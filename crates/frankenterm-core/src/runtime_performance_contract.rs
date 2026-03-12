@@ -185,7 +185,9 @@ impl RuntimePerformanceContract {
     /// Look up a contract by operation ID.
     #[must_use]
     pub fn get(&self, operation_id: &str) -> Option<&OperationContract> {
-        self.operations.iter().find(|o| o.operation_id == operation_id)
+        self.operations
+            .iter()
+            .find(|o| o.operation_id == operation_id)
     }
 
     /// All critical operations.
@@ -424,7 +426,9 @@ impl BenchmarkSuite {
     /// Find baseline for a given operation.
     #[must_use]
     pub fn baseline_for(&self, operation_id: &str) -> Option<&OperationBenchmark> {
-        self.baseline.iter().find(|b| b.operation_id == operation_id)
+        self.baseline
+            .iter()
+            .find(|b| b.operation_id == operation_id)
     }
 
     /// Find current for a given operation.
@@ -595,10 +599,7 @@ pub struct RegressionReport {
 impl RegressionReport {
     /// Evaluate all operations in the contract against a benchmark suite.
     #[must_use]
-    pub fn evaluate(
-        contract: &RuntimePerformanceContract,
-        suite: &BenchmarkSuite,
-    ) -> Self {
+    pub fn evaluate(contract: &RuntimePerformanceContract, suite: &BenchmarkSuite) -> Self {
         let mut results = Vec::new();
 
         for op in &contract.operations {
@@ -652,10 +653,7 @@ impl RegressionReport {
 
     /// Convert results into `BenchmarkComparison` items for cutover evidence.
     #[must_use]
-    pub fn to_benchmark_comparisons(
-        &self,
-        suite: &BenchmarkSuite,
-    ) -> Vec<BenchmarkComparison> {
+    pub fn to_benchmark_comparisons(&self, suite: &BenchmarkSuite) -> Vec<BenchmarkComparison> {
         let mut comparisons = Vec::new();
 
         for result in &self.results {
@@ -710,7 +708,10 @@ impl RegressionReport {
                 .regression_ratio
                 .map(|r| format!(" (ratio: {:.2}x)", r))
                 .unwrap_or_default();
-            lines.push(format!("  [{}] {}{}", status, result.operation_id, regression));
+            lines.push(format!(
+                "  [{}] {}{}",
+                status, result.operation_id, regression
+            ));
             for reason in &result.failure_reasons {
                 lines.push(format!("       → {}", reason));
             }
@@ -732,7 +733,13 @@ mod tests {
         RuntimePerformanceContract::standard()
     }
 
-    fn passing_benchmark(op_id: &str, p50: f64, p95: f64, p99: f64, throughput: f64) -> OperationBenchmark {
+    fn passing_benchmark(
+        op_id: &str,
+        p50: f64,
+        p95: f64,
+        p99: f64,
+        throughput: f64,
+    ) -> OperationBenchmark {
         OperationBenchmark {
             operation_id: op_id.into(),
             latency: PercentileThresholds::new(p50, p95, p99),
@@ -743,7 +750,13 @@ mod tests {
         }
     }
 
-    fn baseline_benchmark(op_id: &str, p50: f64, p95: f64, p99: f64, throughput: f64) -> OperationBenchmark {
+    fn baseline_benchmark(
+        op_id: &str,
+        p50: f64,
+        p95: f64,
+        p99: f64,
+        throughput: f64,
+    ) -> OperationBenchmark {
         OperationBenchmark {
             operation_id: op_id.into(),
             latency: PercentileThresholds::new(p50, p95, p99),
@@ -774,7 +787,11 @@ mod tests {
         assert!(critical.len() >= 8);
         assert!(critical.iter().any(|o| o.operation_id == "robot.get-text"));
         assert!(critical.iter().any(|o| o.operation_id == "robot.send"));
-        assert!(critical.iter().any(|o| o.operation_id == "lifecycle.startup"));
+        assert!(
+            critical
+                .iter()
+                .any(|o| o.operation_id == "lifecycle.startup")
+        );
     }
 
     #[test]
@@ -958,7 +975,13 @@ mod tests {
         let mut suite = BenchmarkSuite::new("test-suite");
         suite.add_current(passing_benchmark("critical.op", 50.0, 100.0, 200.0, 0.0));
         // Non-critical fails.
-        suite.add_current(passing_benchmark("non-critical.op", 60.0, 120.0, 250.0, 0.0));
+        suite.add_current(passing_benchmark(
+            "non-critical.op",
+            60.0,
+            120.0,
+            250.0,
+            0.0,
+        ));
 
         let report = RegressionReport::evaluate(&contract, &suite);
         assert_eq!(report.verdict, RegressionVerdict::ConditionalPass);
@@ -1021,7 +1044,10 @@ mod tests {
         for op in &contract.operations {
             let t = &op.latency_target;
             suite.add_current(passing_benchmark(
-                &op.operation_id, t.p50_ms * 0.5, t.p95_ms * 0.5, t.p99_ms * 0.5,
+                &op.operation_id,
+                t.p50_ms * 0.5,
+                t.p95_ms * 0.5,
+                t.p99_ms * 0.5,
                 op.throughput_min_ops_sec.max(1.0) * 2.0,
             ));
         }
@@ -1071,7 +1097,10 @@ mod tests {
         for op in &contract.operations {
             let t = &op.latency_target;
             suite.add_current(passing_benchmark(
-                &op.operation_id, t.p50_ms * 0.5, t.p95_ms * 0.5, t.p99_ms * 0.5,
+                &op.operation_id,
+                t.p50_ms * 0.5,
+                t.p95_ms * 0.5,
+                t.p99_ms * 0.5,
                 op.throughput_min_ops_sec.max(1.0) * 2.0,
             ));
         }

@@ -218,7 +218,11 @@ pub struct ScenarioResult {
 impl ScenarioResult {
     /// Create a passing result.
     #[must_use]
-    pub fn pass(scenario_id: impl Into<String>, category: ScenarioCategory, duration_ms: u64) -> Self {
+    pub fn pass(
+        scenario_id: impl Into<String>,
+        category: ScenarioCategory,
+        duration_ms: u64,
+    ) -> Self {
         Self {
             scenario_id: scenario_id.into(),
             category,
@@ -253,7 +257,11 @@ impl ScenarioResult {
 
     /// Create a skipped result.
     #[must_use]
-    pub fn skipped(scenario_id: impl Into<String>, category: ScenarioCategory, reason: impl Into<String>) -> Self {
+    pub fn skipped(
+        scenario_id: impl Into<String>,
+        category: ScenarioCategory,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             scenario_id: scenario_id.into(),
             category,
@@ -523,7 +531,10 @@ impl RehearsalExecution {
     /// Fail count.
     #[must_use]
     pub fn failed(&self) -> usize {
-        self.results.iter().filter(|r| r.outcome.is_failure()).count()
+        self.results
+            .iter()
+            .filter(|r| r.outcome.is_failure())
+            .count()
     }
 
     /// Skip count.
@@ -548,9 +559,10 @@ impl RehearsalExecution {
     /// Whether all blocking scenarios passed.
     #[must_use]
     pub fn blocking_pass(&self) -> bool {
-        !self.results.iter().any(|r| {
-            r.category.is_blocking() && r.outcome.is_failure()
-        })
+        !self
+            .results
+            .iter()
+            .any(|r| r.category.is_blocking() && r.outcome.is_failure())
     }
 }
 
@@ -679,7 +691,10 @@ impl RehearsalReport {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("# Rehearsal Report: {} (run {})\n\n", self.suite_id, self.run_id));
+        out.push_str(&format!(
+            "# Rehearsal Report: {} (run {})\n\n",
+            self.suite_id, self.run_id
+        ));
         out.push_str(&format!(
             "Verdict: {:?}\nEnvironment: {}\nDuration: {}ms\n\n",
             self.verdict, self.environment, self.duration_ms
@@ -1001,13 +1016,28 @@ mod tests {
     #[test]
     fn suite_by_category() {
         let mut suite = RehearsalSuite::new("test", "Test");
-        suite.add_scenario(RehearsalScenario::new("s1", ScenarioCategory::ParityCheck, "a"));
-        suite.add_scenario(RehearsalScenario::new("s2", ScenarioCategory::ParityCheck, "b"));
-        suite.add_scenario(RehearsalScenario::new("s3", ScenarioCategory::RollbackDrill, "c"));
+        suite.add_scenario(RehearsalScenario::new(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            "a",
+        ));
+        suite.add_scenario(RehearsalScenario::new(
+            "s2",
+            ScenarioCategory::ParityCheck,
+            "b",
+        ));
+        suite.add_scenario(RehearsalScenario::new(
+            "s3",
+            ScenarioCategory::RollbackDrill,
+            "c",
+        ));
 
         assert_eq!(suite.by_category(ScenarioCategory::ParityCheck).len(), 2);
         assert_eq!(suite.by_category(ScenarioCategory::RollbackDrill).len(), 1);
-        assert_eq!(suite.by_category(ScenarioCategory::ShadowComparison).len(), 0);
+        assert_eq!(
+            suite.by_category(ScenarioCategory::ShadowComparison).len(),
+            0
+        );
     }
 
     // ---- RehearsalExecution ----
@@ -1015,10 +1045,27 @@ mod tests {
     #[test]
     fn execution_counters() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 1000);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
-        exec.record(ScenarioResult::pass("s2", ScenarioCategory::ShadowComparison, 200));
-        exec.record(ScenarioResult::fail("s3", ScenarioCategory::ImporterValidation, 50, "import error"));
-        exec.record(ScenarioResult::skipped("s4", ScenarioCategory::RollbackDrill, "precondition unmet"));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
+        exec.record(ScenarioResult::pass(
+            "s2",
+            ScenarioCategory::ShadowComparison,
+            200,
+        ));
+        exec.record(ScenarioResult::fail(
+            "s3",
+            ScenarioCategory::ImporterValidation,
+            50,
+            "import error",
+        ));
+        exec.record(ScenarioResult::skipped(
+            "s4",
+            ScenarioCategory::RollbackDrill,
+            "precondition unmet",
+        ));
         exec.complete(2000);
 
         assert_eq!(exec.passed(), 2);
@@ -1031,7 +1078,11 @@ mod tests {
     #[test]
     fn execution_blocking_pass_with_non_blocking_failure() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         // ImporterValidation is non-blocking
         exec.record(ScenarioResult::fail(
             "s2",
@@ -1061,8 +1112,16 @@ mod tests {
     #[test]
     fn report_ready_verdict() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
-        exec.record(ScenarioResult::pass("s2", ScenarioCategory::RollbackDrill, 200));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
+        exec.record(ScenarioResult::pass(
+            "s2",
+            ScenarioCategory::RollbackDrill,
+            200,
+        ));
         exec.complete(500);
 
         let report = RehearsalReport::from_execution(&exec);
@@ -1074,7 +1133,11 @@ mod tests {
     #[test]
     fn report_conditional_on_non_blocking_failure() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         exec.record(ScenarioResult::fail(
             "s2",
             ScenarioCategory::ImporterValidation,
@@ -1108,7 +1171,11 @@ mod tests {
     #[test]
     fn report_not_ready_on_drill_target_miss() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         exec.drill_metrics = Some(DrillMetrics {
             time_to_recovery_ms: 120_000,
             target_ttr_ms: 60_000, // miss
@@ -1129,7 +1196,11 @@ mod tests {
     #[test]
     fn report_not_ready_on_divergence_over_budget() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         exec.divergence_metrics = Some(DivergenceMetrics::compute(1000, 50, 0.01));
         exec.complete(500);
 
@@ -1141,7 +1212,11 @@ mod tests {
     #[test]
     fn report_render_summary() {
         let mut exec = RehearsalExecution::new("suite-1", "run-1", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         exec.complete(500);
 
         let report = RehearsalReport::from_execution(&exec);
@@ -1216,7 +1291,11 @@ mod tests {
     #[test]
     fn report_serde_roundtrip() {
         let mut exec = RehearsalExecution::new("s", "r", "test", 0);
-        exec.record(ScenarioResult::pass("s1", ScenarioCategory::ParityCheck, 100));
+        exec.record(ScenarioResult::pass(
+            "s1",
+            ScenarioCategory::ParityCheck,
+            100,
+        ));
         exec.complete(500);
         let report = RehearsalReport::from_execution(&exec);
 
@@ -1230,7 +1309,8 @@ mod tests {
     #[test]
     fn e2e_full_rehearsal_lifecycle() {
         let suite = standard_rehearsal_suite();
-        let mut exec = RehearsalExecution::new(&suite.suite_id, "run-001", &suite.environment, 1000);
+        let mut exec =
+            RehearsalExecution::new(&suite.suite_id, "run-001", &suite.environment, 1000);
         exec.executed_by = "PinkForge".into();
 
         // Execute all scenarios (simulate)

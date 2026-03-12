@@ -957,7 +957,10 @@ fn cfm_drain_single_fault() {
         20,
         |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
     );
-    assert!(result.all_passed, "drain/single_db_write failed: {result:?}");
+    assert!(
+        result.all_passed,
+        "drain/single_db_write failed: {result:?}"
+    );
 }
 
 #[test]
@@ -1012,10 +1015,7 @@ fn cfm_channel_timeout_race() {
         15,
         |runtime, state| channel_pipeline_workload(runtime, state, 3, 2),
     );
-    assert!(
-        result.all_passed,
-        "channel/timeout_race failed: {result:?}"
-    );
+    assert!(result.all_passed, "channel/timeout_race failed: {result:?}");
 }
 
 #[test]
@@ -1027,10 +1027,7 @@ fn cfm_mutation_partial_io() {
         15,
         |runtime, state| shared_mutation_workload(runtime, state, 4, 3),
     );
-    assert!(
-        result.all_passed,
-        "mutation/partial_io failed: {result:?}"
-    );
+    assert!(result.all_passed, "mutation/partial_io failed: {result:?}");
 }
 
 #[test]
@@ -1057,10 +1054,7 @@ fn cfm_drain_timeout_race() {
         15,
         |runtime, state| shutdown_drain_workload(runtime, state, 3, 2),
     );
-    assert!(
-        result.all_passed,
-        "drain/timeout_race failed: {result:?}"
-    );
+    assert!(result.all_passed, "drain/timeout_race failed: {result:?}");
 }
 
 // =============================================================================
@@ -1110,7 +1104,10 @@ fn cfm_scenario_rate_limit_wait() {
     state.assert_invariants("cfm_scenario_rate_limit_wait");
     // After rate limit exhausts (3 failures), remaining ops should succeed
     let succeeded = state.ops_succeeded.load(Ordering::SeqCst);
-    assert!(succeeded > 0, "at least some ops should succeed after rate limit");
+    assert!(
+        succeeded > 0,
+        "at least some ops should succeed after rate limit"
+    );
 
     FaultInjector::reset_global();
 }
@@ -1476,12 +1473,30 @@ where
 #[test]
 #[ignore] // CI slice: thorough — run with `cargo test -- --ignored cfm_full_telemetry_matrix`
 fn cfm_full_telemetry_matrix() {
-    let workloads: Vec<(&str, Box<dyn Fn(&mut LabRuntime, &Arc<SharedWorkloadState>) + Send + Sync>)> = vec![
-        ("pool", Box::new(|rt, st| pool_acquire_release_workload(rt, st, 4))),
-        ("channel", Box::new(|rt, st| channel_pipeline_workload(rt, st, 3, 2))),
-        ("mutation", Box::new(|rt, st| shared_mutation_workload(rt, st, 4, 3))),
-        ("dispatch", Box::new(|rt, st| event_dispatch_workload(rt, st, 5))),
-        ("drain", Box::new(|rt, st| shutdown_drain_workload(rt, st, 3, 2))),
+    let workloads: Vec<(
+        &str,
+        Box<dyn Fn(&mut LabRuntime, &Arc<SharedWorkloadState>) + Send + Sync>,
+    )> = vec![
+        (
+            "pool",
+            Box::new(|rt, st| pool_acquire_release_workload(rt, st, 4)),
+        ),
+        (
+            "channel",
+            Box::new(|rt, st| channel_pipeline_workload(rt, st, 3, 2)),
+        ),
+        (
+            "mutation",
+            Box::new(|rt, st| shared_mutation_workload(rt, st, 4, 3)),
+        ),
+        (
+            "dispatch",
+            Box::new(|rt, st| event_dispatch_workload(rt, st, 5)),
+        ),
+        (
+            "drain",
+            Box::new(|rt, st| shutdown_drain_workload(rt, st, 3, 2)),
+        ),
     ];
 
     let profiles: Vec<(&str, Vec<(FaultPoint, FaultMode)>)> = vec![

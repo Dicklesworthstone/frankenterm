@@ -70,11 +70,7 @@ fn detection(rule_id: &str, agent_type: AgentType) -> Detection {
 }
 
 /// Build a pattern `Detection` with a session ID in extracted data.
-fn detection_with_session(
-    rule_id: &str,
-    agent_type: AgentType,
-    session_id: &str,
-) -> Detection {
+fn detection_with_session(rule_id: &str, agent_type: AgentType, session_id: &str) -> Detection {
     Detection {
         rule_id: rule_id.to_string(),
         agent_type,
@@ -152,10 +148,7 @@ fn lifecycle_state_transitions_across_pane() {
     let pane_id = 10;
 
     // Phase 1: Agent starts (banner)
-    correlator.ingest_detections(
-        pane_id,
-        &[detection("core.codex:banner", AgentType::Codex)],
-    );
+    correlator.ingest_detections(pane_id, &[detection("core.codex:banner", AgentType::Codex)]);
     let meta = correlator.get_metadata(pane_id).unwrap();
     assert_eq!(meta.state.as_deref(), Some("starting"));
 
@@ -223,10 +216,7 @@ fn lifecycle_approval_and_auth_error_states() {
     // Auth error state
     correlator.ingest_detections(
         2,
-        &[detection(
-            "core.codex:auth.api_key_error",
-            AgentType::Codex,
-        )],
+        &[detection("core.codex:auth.api_key_error", AgentType::Codex)],
     );
     assert_eq!(
         correlator.get_metadata(2).unwrap().state.as_deref(),
@@ -245,7 +235,10 @@ fn pattern_detection_has_priority_over_title() {
     // First detect via patterns (highest priority)
     correlator.ingest_detections(
         5,
-        &[detection("core.claude_code:tool_use", AgentType::ClaudeCode)],
+        &[detection(
+            "core.claude_code:tool_use",
+            AgentType::ClaudeCode,
+        )],
     );
 
     // Then try title-based detection for same pane with different agent
@@ -297,10 +290,7 @@ fn inventory_running_field_reflects_current_panes() {
         1,
         &[detection("core.claude_code:banner", AgentType::ClaudeCode)],
     );
-    correlator.ingest_detections(
-        2,
-        &[detection("core.codex:tool_use", AgentType::Codex)],
-    );
+    correlator.ingest_detections(2, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
     let inv = correlator.inventory();
     assert_eq!(inv.running.len(), 2);
@@ -343,10 +333,7 @@ fn pane_state_changes_do_not_affect_other_panes() {
         1,
         &[detection("core.claude_code:banner", AgentType::ClaudeCode)],
     );
-    correlator.ingest_detections(
-        2,
-        &[detection("core.codex:tool_use", AgentType::Codex)],
-    );
+    correlator.ingest_detections(2, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
     // Update pane 1 state
     correlator.ingest_detections(
@@ -559,12 +546,12 @@ fn e2e_swarm_scenario_heterogeneous_fleet() {
 
     correlator.ingest_detections(
         0,
-        &[detection("core.claude_code:tool_use", AgentType::ClaudeCode)],
+        &[detection(
+            "core.claude_code:tool_use",
+            AgentType::ClaudeCode,
+        )],
     );
-    correlator.ingest_detections(
-        1,
-        &[detection("core.codex:tool_use", AgentType::Codex)],
-    );
+    correlator.ingest_detections(1, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
     // Verify working states
     assert_eq!(
@@ -583,11 +570,7 @@ fn e2e_swarm_scenario_heterogeneous_fleet() {
 
     // Session ID preserved through state updates
     assert_eq!(
-        correlator
-            .get_metadata(0)
-            .unwrap()
-            .session_id
-            .as_deref(),
+        correlator.get_metadata(0).unwrap().session_id.as_deref(),
         Some("cc-main-session")
     );
 
@@ -602,7 +585,10 @@ fn e2e_swarm_scenario_heterogeneous_fleet() {
     );
     correlator.ingest_detections(
         1,
-        &[detection("core.codex:auth.device_code_prompt", AgentType::Codex)],
+        &[detection(
+            "core.codex:auth.device_code_prompt",
+            AgentType::Codex,
+        )],
     );
 
     assert_eq!(
@@ -618,17 +604,17 @@ fn e2e_swarm_scenario_heterogeneous_fleet() {
 
     correlator.ingest_detections(
         0,
-        &[detection("core.claude_code:tool_use", AgentType::ClaudeCode)],
+        &[detection(
+            "core.claude_code:tool_use",
+            AgentType::ClaudeCode,
+        )],
     );
     assert_eq!(
         correlator.get_metadata(0).unwrap().state.as_deref(),
         Some("working")
     );
 
-    correlator.ingest_detections(
-        1,
-        &[detection("core.codex:cost_summary", AgentType::Codex)],
-    );
+    correlator.ingest_detections(1, &[detection("core.codex:cost_summary", AgentType::Codex)]);
     assert_eq!(
         correlator.get_metadata(1).unwrap().state.as_deref(),
         Some("idle")
@@ -651,10 +637,7 @@ fn e2e_swarm_scenario_agent_replacement() {
     let mut correlator = AgentCorrelator::new();
 
     // Agent starts on pane 0
-    correlator.ingest_detections(
-        0,
-        &[detection("core.codex:banner", AgentType::Codex)],
-    );
+    correlator.ingest_detections(0, &[detection("core.codex:banner", AgentType::Codex)]);
     assert_eq!(correlator.get_metadata(0).unwrap().agent_type, "codex");
 
     // Agent exits
@@ -731,10 +714,7 @@ fn wezterm_and_unknown_agents_filtered_from_inventory() {
         1,
         &[detection("core.wezterm:mux.event", AgentType::Wezterm)],
     );
-    correlator.ingest_detections(
-        2,
-        &[detection("unknown:event", AgentType::Unknown)],
-    );
+    correlator.ingest_detections(2, &[detection("unknown:event", AgentType::Unknown)]);
 
     assert_eq!(correlator.tracked_pane_count(), 0);
     assert!(correlator.inventory().running.is_empty());
@@ -790,17 +770,10 @@ fn session_id_preserved_when_new_detection_has_none() {
     );
 
     // Second detection without session ID should preserve original
-    correlator.ingest_detections(
-        1,
-        &[detection("core.codex:tool_use", AgentType::Codex)],
-    );
+    correlator.ingest_detections(1, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
     assert_eq!(
-        correlator
-            .get_metadata(1)
-            .unwrap()
-            .session_id
-            .as_deref(),
+        correlator.get_metadata(1).unwrap().session_id.as_deref(),
         Some("original-session")
     );
 }
@@ -828,11 +801,7 @@ fn session_id_updated_when_new_session_provided() {
     );
 
     assert_eq!(
-        correlator
-            .get_metadata(1)
-            .unwrap()
-            .session_id
-            .as_deref(),
+        correlator.get_metadata(1).unwrap().session_id.as_deref(),
         Some("sess-2")
     );
 }
@@ -873,16 +842,13 @@ fn metadata_agent_type_field_uses_legacy_strings() {
         1,
         &[detection("core.claude_code:banner", AgentType::ClaudeCode)],
     );
-    correlator.ingest_detections(
-        2,
-        &[detection("core.codex:banner", AgentType::Codex)],
-    );
-    correlator.ingest_detections(
-        3,
-        &[detection("core.gemini:banner", AgentType::Gemini)],
-    );
+    correlator.ingest_detections(2, &[detection("core.codex:banner", AgentType::Codex)]);
+    correlator.ingest_detections(3, &[detection("core.gemini:banner", AgentType::Gemini)]);
 
-    assert_eq!(correlator.get_metadata(1).unwrap().agent_type, "claude_code");
+    assert_eq!(
+        correlator.get_metadata(1).unwrap().agent_type,
+        "claude_code"
+    );
     assert_eq!(correlator.get_metadata(2).unwrap().agent_type, "codex");
     assert_eq!(correlator.get_metadata(3).unwrap().agent_type, "gemini");
 }

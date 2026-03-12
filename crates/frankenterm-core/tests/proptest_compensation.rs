@@ -14,9 +14,9 @@
 
 use frankenterm_core::plan::{
     MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
-    TxCompensation, TxCompensationOutcome, TxCompensationReport, TxCompensationStepInput,
-    TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId,
-    execute_commit_phase, execute_compensation_phase,
+    TxCompensation, TxCompensationOutcome, TxCompensationReport, TxCompensationStepInput, TxId,
+    TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId, execute_commit_phase,
+    execute_compensation_phase,
 };
 use proptest::prelude::*;
 

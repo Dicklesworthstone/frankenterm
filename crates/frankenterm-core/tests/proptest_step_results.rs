@@ -21,18 +21,24 @@ fn arb_text_match() -> impl Strategy<Value = TextMatch> {
 
 fn arb_wait_condition() -> impl Strategy<Value = WaitCondition> {
     prop_oneof![
-        (prop::option::of(any::<u64>()), "[a-z_]{3,15}").prop_map(|(pane_id, rule_id)| {
-            WaitCondition::Pattern { pane_id, rule_id }
-        }),
+        (prop::option::of(any::<u64>()), "[a-z_]{3,15}")
+            .prop_map(|(pane_id, rule_id)| { WaitCondition::Pattern { pane_id, rule_id } }),
         (prop::option::of(any::<u64>()), 100u64..120_000).prop_map(
-            |(pane_id, idle_threshold_ms)| { WaitCondition::PaneIdle { pane_id, idle_threshold_ms } }
+            |(pane_id, idle_threshold_ms)| {
+                WaitCondition::PaneIdle {
+                    pane_id,
+                    idle_threshold_ms,
+                }
+            }
         ),
-        (prop::option::of(any::<u64>()), 100u64..120_000).prop_map(
-            |(pane_id, stable_for_ms)| { WaitCondition::StableTail { pane_id, stable_for_ms } }
-        ),
-        (prop::option::of(any::<u64>()), arb_text_match()).prop_map(|(pane_id, matcher)| {
-            WaitCondition::TextMatch { pane_id, matcher }
+        (prop::option::of(any::<u64>()), 100u64..120_000).prop_map(|(pane_id, stable_for_ms)| {
+            WaitCondition::StableTail {
+                pane_id,
+                stable_for_ms,
+            }
         }),
+        (prop::option::of(any::<u64>()), arb_text_match())
+            .prop_map(|(pane_id, matcher)| { WaitCondition::TextMatch { pane_id, matcher } }),
         (100u64..120_000).prop_map(|duration_ms| WaitCondition::Sleep { duration_ms }),
         "[a-z_]{3,15}".prop_map(|key| WaitCondition::External { key }),
     ]

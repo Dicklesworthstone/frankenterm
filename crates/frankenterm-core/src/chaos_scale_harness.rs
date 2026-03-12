@@ -278,9 +278,7 @@ impl ChaosScaleHarness {
             failure_classes: Vec::new(),
             slos: default_slos(),
             context_registry: ContextBudgetRegistry::new(ContextBudgetConfig::default()),
-            reliability_registry: ReliabilityRegistry::new(
-                ConnectorReliabilityConfig::default(),
-            ),
+            reliability_registry: ReliabilityRegistry::new(ConnectorReliabilityConfig::default()),
             governor: CapacityGovernor::with_defaults(),
         }
     }
@@ -380,9 +378,9 @@ impl ChaosScaleHarness {
             .failure_classes
             .contains(&FailureClass::CascadingFailure);
 
-        let ops_per_connector =
-            self.profile.event_burst_rate as u64 * self.profile.duration_ms / 1000
-                / self.profile.connector_count.max(1) as u64;
+        let ops_per_connector = self.profile.event_burst_rate as u64 * self.profile.duration_ms
+            / 1000
+            / self.profile.connector_count.max(1) as u64;
 
         let mut total_ops: u64 = 0;
         let mut total_success: u64 = 0;
@@ -927,7 +925,10 @@ mod tests {
         let mut harness_recover = ChaosScaleHarness::new(ScaleProfile::small());
         let report_recover = harness_recover.run();
 
-        assert!(report_recover.connector_stress.success_rate > report_fail.connector_stress.success_rate);
+        assert!(
+            report_recover.connector_stress.success_rate
+                > report_fail.connector_stress.success_rate
+        );
         assert!(report_recover.overall_pass);
     }
 

@@ -193,7 +193,8 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             scenario_id: "INT-CLI-001".into(),
             category: ScenarioCategory::UserCli,
             title: "CLI status command end-to-end".into(),
-            description: "Validates ft status traverses binary→core→vendored boundaries correctly".into(),
+            description: "Validates ft status traverses binary→core→vendored boundaries correctly"
+                .into(),
             steps: vec![
                 ScenarioStep {
                     step: 1,
@@ -236,7 +237,6 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             boundaries_exercised: vec![CrateBoundary::BinaryToCore, CrateBoundary::CoreToVendored],
             includes_fault_injection: false,
         },
-
         // Robot-mode workflows
         IntegrationScenario {
             scenario_id: "INT-ROBOT-001".into(),
@@ -285,7 +285,6 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             boundaries_exercised: vec![CrateBoundary::CoreToVendored, CrateBoundary::CoreToRuntime],
             includes_fault_injection: false,
         },
-
         // Watch pipeline
         IntegrationScenario {
             scenario_id: "INT-WATCH-001".into(),
@@ -315,15 +314,13 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
                     fault_injection: false,
                 },
             ],
-            assertions: vec![
-                ContractAssertion {
-                    assertion_id: "INT-WATCH-001-A1".into(),
-                    description: "Captured content searchable within 1 capture cycle".into(),
-                    contract_type: ContractType::StateConsistency,
-                    passed: true,
-                    evidence: "Content indexed and returned in first search after capture".into(),
-                },
-            ],
+            assertions: vec![ContractAssertion {
+                assertion_id: "INT-WATCH-001-A1".into(),
+                description: "Captured content searchable within 1 capture cycle".into(),
+                contract_type: ContractType::StateConsistency,
+                passed: true,
+                evidence: "Content indexed and returned in first search after capture".into(),
+            }],
             boundaries_exercised: vec![
                 CrateBoundary::CoreToVendored,
                 CrateBoundary::VendoredToCore,
@@ -331,13 +328,13 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             ],
             includes_fault_injection: false,
         },
-
         // Degraded path
         IntegrationScenario {
             scenario_id: "INT-DEGRADED-001".into(),
             category: ScenarioCategory::DegradedPath,
             title: "Operation under mux server timeout".into(),
-            description: "Validates graceful degradation when vendored mux operations time out".into(),
+            description: "Validates graceful degradation when vendored mux operations time out"
+                .into(),
             steps: vec![
                 ScenarioStep {
                     step: 1,
@@ -380,13 +377,13 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             boundaries_exercised: vec![CrateBoundary::CoreToVendored],
             includes_fault_injection: true,
         },
-
         // Cancellation
         IntegrationScenario {
             scenario_id: "INT-CANCEL-001".into(),
             category: ScenarioCategory::CancellationPath,
             title: "Mid-operation cancellation cleanup".into(),
-            description: "Validates resource cleanup when operations are cancelled mid-flight".into(),
+            description: "Validates resource cleanup when operations are cancelled mid-flight"
+                .into(),
             steps: vec![
                 ScenarioStep {
                     step: 1,
@@ -429,13 +426,13 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
             boundaries_exercised: vec![CrateBoundary::CoreToVendored, CrateBoundary::CoreToRuntime],
             includes_fault_injection: false,
         },
-
         // Restart/Recovery
         IntegrationScenario {
             scenario_id: "INT-RESTART-001".into(),
             category: ScenarioCategory::RestartRecovery,
             title: "Session recovery after restart".into(),
-            description: "Validates session state survives process restart across crate boundaries".into(),
+            description: "Validates session state survives process restart across crate boundaries"
+                .into(),
             steps: vec![
                 ScenarioStep {
                     step: 1,
@@ -455,7 +452,8 @@ pub fn standard_scenarios() -> Vec<IntegrationScenario> {
                     step: 3,
                     description: "Verify session recovery".into(),
                     crate_boundary: Some(CrateBoundary::CoreToVendored),
-                    expected_outcome: "Panes reconnected, capture resumed, search state intact".into(),
+                    expected_outcome: "Panes reconnected, capture resumed, search state intact"
+                        .into(),
                     fault_injection: false,
                 },
             ],
@@ -599,10 +597,17 @@ impl SuiteReport {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("=== Cross-Crate Integration Suite: {} ===", self.report_id));
+        lines.push(format!(
+            "=== Cross-Crate Integration Suite: {} ===",
+            self.report_id
+        ));
         lines.push(format!(
             "Result: {}",
-            if self.overall_pass { "ALL PASS" } else { "FAILURES" }
+            if self.overall_pass {
+                "ALL PASS"
+            } else {
+                "FAILURES"
+            }
         ));
         lines.push(format!(
             "Scenarios: {}/{} passed",
@@ -610,18 +615,29 @@ impl SuiteReport {
         ));
         lines.push(format!(
             "Boundaries: {}",
-            self.boundaries_covered.iter().map(|b| b.label()).collect::<Vec<_>>().join(", ")
+            self.boundaries_covered
+                .iter()
+                .map(|b| b.label())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         lines.push(format!(
             "Fault injection: {}",
-            if self.fault_injection_exercised { "exercised" } else { "not exercised" }
+            if self.fault_injection_exercised {
+                "exercised"
+            } else {
+                "not exercised"
+            }
         ));
 
         let gaps = self.coverage_gaps();
         if !gaps.is_empty() {
             lines.push(format!(
                 "Coverage gaps: {}",
-                gaps.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
+                gaps.iter()
+                    .map(|c| c.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -654,8 +670,7 @@ mod tests {
     #[test]
     fn standard_scenarios_cover_key_categories() {
         let scenarios = standard_scenarios();
-        let categories: Vec<ScenarioCategory> =
-            scenarios.iter().map(|s| s.category).collect();
+        let categories: Vec<ScenarioCategory> = scenarios.iter().map(|s| s.category).collect();
         assert!(categories.contains(&ScenarioCategory::UserCli));
         assert!(categories.contains(&ScenarioCategory::RobotMode));
         assert!(categories.contains(&ScenarioCategory::WatchPipeline));
@@ -681,7 +696,11 @@ mod tests {
                 }
             }
         }
-        assert!(all_boundaries.len() >= 4, "expected >= 4 boundaries, got {}", all_boundaries.len());
+        assert!(
+            all_boundaries.len() >= 4,
+            "expected >= 4 boundaries, got {}",
+            all_boundaries.len()
+        );
     }
 
     #[test]
@@ -709,7 +728,11 @@ mod tests {
         let scenarios = standard_scenarios();
         let report = SuiteReport::from_scenarios(&scenarios);
         assert!(!report.boundaries_covered.is_empty());
-        assert!(report.boundaries_covered.contains(&CrateBoundary::CoreToVendored));
+        assert!(
+            report
+                .boundaries_covered
+                .contains(&CrateBoundary::CoreToVendored)
+        );
     }
 
     #[test]
@@ -753,7 +776,11 @@ mod tests {
     fn all_scenarios_have_assertions() {
         let scenarios = standard_scenarios();
         for s in &scenarios {
-            assert!(!s.assertions.is_empty(), "{} has no assertions", s.scenario_id);
+            assert!(
+                !s.assertions.is_empty(),
+                "{} has no assertions",
+                s.scenario_id
+            );
         }
     }
 
@@ -847,7 +874,10 @@ mod tests {
         let scenarios = standard_scenarios();
         let mut by_cat: BTreeMap<String, Vec<&IntegrationScenario>> = BTreeMap::new();
         for s in &scenarios {
-            by_cat.entry(s.category.label().to_string()).or_default().push(s);
+            by_cat
+                .entry(s.category.label().to_string())
+                .or_default()
+                .push(s);
         }
         assert!(by_cat.len() >= 5);
     }

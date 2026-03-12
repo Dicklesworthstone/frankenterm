@@ -21,12 +21,14 @@ fn arb_surface_api_entry() -> impl Strategy<Value = SurfaceApiEntry> {
         "[a-z ]{5,40}",
         proptest::option::of("[a-z ]{5,30}"),
     )
-        .prop_map(|(api_name, disposition, rationale, replacement)| SurfaceApiEntry {
-            api_name,
-            disposition: disposition.to_string(),
-            rationale,
-            replacement,
-        })
+        .prop_map(
+            |(api_name, disposition, rationale, replacement)| SurfaceApiEntry {
+                api_name,
+                disposition: disposition.to_string(),
+                rationale,
+                replacement,
+            },
+        )
 }
 
 fn arb_unwrapped_call_site() -> impl Strategy<Value = UnwrappedCallSite> {
@@ -110,29 +112,26 @@ fn arb_surface_guard_report() -> impl Strategy<Value = SurfaceGuardReport> {
         proptest::collection::vec(arb_surface_regression(), 0..3),
         proptest::collection::vec(arb_unwrapped_call_site(), 0..3),
     )
-        .prop_map(
-            |(report_id, ts, entries, checks, regressions, sites)| {
-                let total = checks.len();
-                let compliant_count = checks.iter().filter(|c| c.compliant).count();
-                let compliance_rate = if total == 0 {
-                    1.0
-                } else {
-                    compliant_count as f64 / total as f64
-                };
-                let overall_compliant =
-                    regressions.is_empty() && checks.iter().all(|c| c.compliant);
-                SurfaceGuardReport {
-                    report_id,
-                    generated_at_ms: ts,
-                    surface_entries: entries,
-                    guard_checks: checks,
-                    regressions,
-                    unwrapped_call_sites: sites,
-                    overall_compliant,
-                    compliance_rate,
-                }
-            },
-        )
+        .prop_map(|(report_id, ts, entries, checks, regressions, sites)| {
+            let total = checks.len();
+            let compliant_count = checks.iter().filter(|c| c.compliant).count();
+            let compliance_rate = if total == 0 {
+                1.0
+            } else {
+                compliant_count as f64 / total as f64
+            };
+            let overall_compliant = regressions.is_empty() && checks.iter().all(|c| c.compliant);
+            SurfaceGuardReport {
+                report_id,
+                generated_at_ms: ts,
+                surface_entries: entries,
+                guard_checks: checks,
+                regressions,
+                unwrapped_call_sites: sites,
+                overall_compliant,
+                compliance_rate,
+            }
+        })
 }
 
 // =========================================================================

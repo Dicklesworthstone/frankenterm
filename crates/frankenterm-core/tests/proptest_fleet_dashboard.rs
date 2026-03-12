@@ -21,7 +21,6 @@ fn arb_fleet_alert_severity() -> impl Strategy<Value = FleetAlertSeverity> {
     ]
 }
 
-
 fn make_ingest_payload() -> SubsystemPayload {
     SubsystemPayload::Ingest(IngestPayload {
         snapshot: frankenterm_core::tailer::SchedulerSnapshot {

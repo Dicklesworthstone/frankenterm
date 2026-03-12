@@ -826,8 +826,8 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let socket_path = dir.path().join("stale.sock");
             // Create a stale socket file via std::os::unix::net (no cleanup on drop)
-            let std_listener = std::os::unix::net::UnixListener::bind(&socket_path)
-                .expect("bind std socket");
+            let std_listener =
+                std::os::unix::net::UnixListener::bind(&socket_path).expect("bind std socket");
             drop(std_listener);
             assert!(
                 socket_path.exists(),

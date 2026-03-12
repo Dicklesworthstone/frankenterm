@@ -62,12 +62,8 @@ fn arb_scenario() -> impl Strategy<Value = RehearsalScenario> {
 }
 
 fn _arb_scenario_result(outcome: ScenarioOutcome) -> impl Strategy<Value = ScenarioResult> {
-    (
-        "[a-z-]{3,15}",
-        arb_scenario_category(),
-        0..10000u64,
-    )
-        .prop_map(move |(id, cat, dur)| match outcome {
+    ("[a-z-]{3,15}", arb_scenario_category(), 0..10000u64).prop_map(move |(id, cat, dur)| {
+        match outcome {
             ScenarioOutcome::Pass => ScenarioResult::pass(&id, cat, dur),
             ScenarioOutcome::Fail => ScenarioResult::fail(&id, cat, dur, "test failure"),
             ScenarioOutcome::Skipped => ScenarioResult::skipped(&id, cat, "skipped"),
@@ -76,7 +72,8 @@ fn _arb_scenario_result(outcome: ScenarioOutcome) -> impl Strategy<Value = Scena
                 r.outcome = ScenarioOutcome::Timeout;
                 r
             }
-        })
+        }
+    })
 }
 
 // =============================================================================

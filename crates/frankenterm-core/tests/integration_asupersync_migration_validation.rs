@@ -6,10 +6,10 @@
 //! cross-module runtime consistency.
 
 use frankenterm_core::runtime_compat::{
-    self, CompatRuntime, RuntimeBuilder, SurfaceDisposition, SURFACE_CONTRACT_V1,
+    self, CompatRuntime, RuntimeBuilder, SURFACE_CONTRACT_V1, SurfaceDisposition,
 };
 use frankenterm_core::runtime_compat_surface_guard::{
-    allowed_raw_runtime_files, standard_guard_checks, standard_surface_entries, SurfaceGuardReport,
+    SurfaceGuardReport, allowed_raw_runtime_files, standard_guard_checks, standard_surface_entries,
 };
 
 // =========================================================================
@@ -223,8 +223,7 @@ fn sleep_completes() {
 #[test]
 fn timeout_succeeds_for_fast_future() {
     run_async(async {
-        let result =
-            runtime_compat::timeout(std::time::Duration::from_secs(5), async { 99 }).await;
+        let result = runtime_compat::timeout(std::time::Duration::from_secs(5), async { 99 }).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 99);
     });

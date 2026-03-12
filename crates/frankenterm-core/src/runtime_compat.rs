@@ -3421,8 +3421,7 @@ mod tests {
 
     #[test]
     fn process_command_nonexistent_binary() {
-        let result = std::process::Command::new("nonexistent_binary_xyz_123")
-            .output();
+        let result = std::process::Command::new("nonexistent_binary_xyz_123").output();
         assert!(result.is_err());
     }
 

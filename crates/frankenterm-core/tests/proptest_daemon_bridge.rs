@@ -53,16 +53,16 @@ fn arb_daemon_bridge_config() -> impl Strategy<Value = DaemonBridgeConfig> {
 
 fn arb_daemon_bridge_metrics() -> impl Strategy<Value = DaemonBridgeMetrics> {
     (
-        any::<u64>(),       // total_submitted
-        any::<u64>(),       // total_batches
-        any::<u64>(),       // total_texts_batched
-        any::<u64>(),       // interactive_submissions
-        any::<u64>(),       // background_submissions
-        0.0f64..10_000.0,   // avg_batch_size (realistic range)
-        any::<u64>(),       // early_dispatches
-        any::<u64>(),       // deadline_dispatches
-        any::<u64>(),       // full_batch_dispatches
-        any::<u64>(),       // timeout_dispatches
+        any::<u64>(),     // total_submitted
+        any::<u64>(),     // total_batches
+        any::<u64>(),     // total_texts_batched
+        any::<u64>(),     // interactive_submissions
+        any::<u64>(),     // background_submissions
+        0.0f64..10_000.0, // avg_batch_size (realistic range)
+        any::<u64>(),     // early_dispatches
+        any::<u64>(),     // deadline_dispatches
+        any::<u64>(),     // full_batch_dispatches
+        any::<u64>(),     // timeout_dispatches
     )
         .prop_flat_map(|t| {
             (
@@ -117,9 +117,12 @@ fn arb_string() -> impl Strategy<Value = String> {
 }
 
 fn arb_single_embed_entry() -> impl Strategy<Value = SingleEmbedEntry> {
-    (any::<u64>(), arb_string(), proptest::option::of(arb_string())).prop_map(
-        |(id, text, model)| SingleEmbedEntry { id, text, model },
+    (
+        any::<u64>(),
+        arb_string(),
+        proptest::option::of(arb_string()),
     )
+        .prop_map(|(id, text, model)| SingleEmbedEntry { id, text, model })
 }
 
 fn arb_single_embed_result() -> impl Strategy<Value = SingleEmbedResult> {

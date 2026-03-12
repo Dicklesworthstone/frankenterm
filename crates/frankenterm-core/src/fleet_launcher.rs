@@ -382,7 +382,10 @@ impl LaunchPlan {
     /// Return slots belonging to a specific phase.
     #[must_use]
     pub fn slots_in_phase(&self, phase_index: u32) -> Vec<&LaunchSlot> {
-        self.slots.iter().filter(|s| s.phase == phase_index).collect()
+        self.slots
+            .iter()
+            .filter(|s| s.phase == phase_index)
+            .collect()
     }
 
     /// Return slot by index, or `None` if out of bounds.
@@ -2098,7 +2101,11 @@ mod tests {
         let launcher = FleetLauncher::new(&reg);
         let spec = basic_spec(
             "prog-test",
-            vec![agent_mix("claude", 2), agent_mix("codex", 1), agent_mix("claude", 1)],
+            vec![
+                agent_mix("claude", 2),
+                agent_mix("codex", 1),
+                agent_mix("claude", 1),
+            ],
         );
         let plan = launcher.plan(&spec).unwrap();
         let programs = plan.programs();
@@ -2207,8 +2214,7 @@ mod tests {
         let mut lifecycle = LifecycleRegistry::new();
         let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
         let json = serde_json::to_string(&outcome).expect("serialize LaunchOutcome");
-        let back: LaunchOutcome =
-            serde_json::from_str(&json).expect("deserialize LaunchOutcome");
+        let back: LaunchOutcome = serde_json::from_str(&json).expect("deserialize LaunchOutcome");
         assert_eq!(back.name, outcome.name);
         assert_eq!(back.total_slots, outcome.total_slots);
         assert_eq!(back.successful_slots, outcome.successful_slots);
@@ -2331,8 +2337,7 @@ mod tests {
         ];
         for f in &failures {
             let json = serde_json::to_string(f).expect("serialize");
-            let back: MetadataProjectionFailure =
-                serde_json::from_str(&json).expect("deserialize");
+            let back: MetadataProjectionFailure = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, f.clone());
         }
     }

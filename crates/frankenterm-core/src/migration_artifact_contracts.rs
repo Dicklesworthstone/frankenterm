@@ -114,10 +114,22 @@ pub fn standard_artifact_contracts() -> Vec<ArtifactContract> {
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("suite_id".into(), "Unique benchmark suite identifier".into());
-                f.insert("baseline".into(), "Pre-migration baseline measurements".into());
-                f.insert("current".into(), "Post-migration current measurements".into());
-                f.insert("verdict".into(), "Pass/ConditionalPass/Fail regression verdict".into());
+                f.insert(
+                    "suite_id".into(),
+                    "Unique benchmark suite identifier".into(),
+                );
+                f.insert(
+                    "baseline".into(),
+                    "Pre-migration baseline measurements".into(),
+                );
+                f.insert(
+                    "current".into(),
+                    "Post-migration current measurements".into(),
+                );
+                f.insert(
+                    "verdict".into(),
+                    "Pass/ConditionalPass/Fail regression verdict".into(),
+                );
                 f
             },
             mandatory: true,
@@ -155,8 +167,14 @@ pub fn standard_artifact_contracts() -> Vec<ArtifactContract> {
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("scan_verdict".into(), "Clean/CleanWithNotes/Violations".into());
-                f.insert("violations_count".into(), "Number of forbidden dependency matches".into());
+                f.insert(
+                    "scan_verdict".into(),
+                    "Clean/CleanWithNotes/Violations".into(),
+                );
+                f.insert(
+                    "violations_count".into(),
+                    "Number of forbidden dependency matches".into(),
+                );
                 f
             },
             mandatory: true,
@@ -173,26 +191,37 @@ pub fn standard_artifact_contracts() -> Vec<ArtifactContract> {
                 f
             },
             mandatory: true,
-            proof_statement: "All regression guards pass, preventing dependency re-introduction".into(),
+            proof_statement: "All regression guards pass, preventing dependency re-introduction"
+                .into(),
         },
         ArtifactContract {
             artifact_type: ArtifactType::SoakResult,
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("matrix_cells".into(), "Number of soak matrix cells executed".into());
-                f.insert("confidence_verdict".into(), "Confident/ConditionallyConfident/NotConfident".into());
+                f.insert(
+                    "matrix_cells".into(),
+                    "Number of soak matrix cells executed".into(),
+                );
+                f.insert(
+                    "confidence_verdict".into(),
+                    "Confident/ConditionallyConfident/NotConfident".into(),
+                );
                 f
             },
             mandatory: false,
-            proof_statement: "System survives sustained workload without invariant violations".into(),
+            proof_statement: "System survives sustained workload without invariant violations"
+                .into(),
         },
         ArtifactContract {
             artifact_type: ArtifactType::RecoveryResult,
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("scenarios_run".into(), "Number of crash/recovery scenarios".into());
+                f.insert(
+                    "scenarios_run".into(),
+                    "Number of crash/recovery scenarios".into(),
+                );
                 f.insert("data_loss_detected".into(), "Boolean: any data loss".into());
                 f.insert("gate_verdict".into(), "Pass/ConditionalPass/Fail".into());
                 f
@@ -205,32 +234,49 @@ pub fn standard_artifact_contracts() -> Vec<ArtifactContract> {
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("templates_certified".into(), "Number of certified diagnostic templates".into());
-                f.insert("overall_pass".into(), "Boolean: all failure classes covered".into());
+                f.insert(
+                    "templates_certified".into(),
+                    "Number of certified diagnostic templates".into(),
+                );
+                f.insert(
+                    "overall_pass".into(),
+                    "Boolean: all failure classes covered".into(),
+                );
                 f
             },
             mandatory: true,
-            proof_statement: "All runtime failure classes have actionable diagnostic templates".into(),
+            proof_statement: "All runtime failure classes have actionable diagnostic templates"
+                .into(),
         },
         ArtifactContract {
             artifact_type: ArtifactType::IntegrationSuiteReport,
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("scenarios_run".into(), "Number of integration scenarios".into());
-                f.insert("boundaries_covered".into(), "Crate boundaries exercised".into());
+                f.insert(
+                    "scenarios_run".into(),
+                    "Number of integration scenarios".into(),
+                );
+                f.insert(
+                    "boundaries_covered".into(),
+                    "Crate boundaries exercised".into(),
+                );
                 f.insert("overall_pass".into(), "Boolean: all scenarios pass".into());
                 f
             },
             mandatory: true,
-            proof_statement: "Cross-crate behavior is correct across all integration scenarios".into(),
+            proof_statement: "Cross-crate behavior is correct across all integration scenarios"
+                .into(),
         },
         ArtifactContract {
             artifact_type: ArtifactType::LogBundle,
             schema_version: "1.0.0".into(),
             required_fields: {
                 let mut f = BTreeMap::new();
-                f.insert("correlation_ids".into(), "Trace correlation IDs for all scenarios".into());
+                f.insert(
+                    "correlation_ids".into(),
+                    "Trace correlation IDs for all scenarios".into(),
+                );
                 f.insert("log_format".into(), "Structured log format (JSONL)".into());
                 f
             },
@@ -294,7 +340,8 @@ impl MigrationManifest {
                     step_id: "STEP-02-test".into(),
                     order: 2,
                     title: "Test suite execution".into(),
-                    description: "Run full test suite including unit, integration, and property tests".into(),
+                    description:
+                        "Run full test suite including unit, integration, and property tests".into(),
                     produces: vec![ArtifactType::TestReport],
                     gate_step: true,
                 },
@@ -302,7 +349,8 @@ impl MigrationManifest {
                     step_id: "STEP-03-bench".into(),
                     order: 3,
                     title: "Performance benchmarks".into(),
-                    description: "Run baseline and current benchmarks for all user-facing operations".into(),
+                    description:
+                        "Run baseline and current benchmarks for all user-facing operations".into(),
                     produces: vec![ArtifactType::BenchmarkResult],
                     gate_step: true,
                 },
@@ -326,7 +374,8 @@ impl MigrationManifest {
                     step_id: "STEP-06-recovery".into(),
                     order: 6,
                     title: "Crash/restart recovery".into(),
-                    description: "Execute crash/restart scenarios and verify persistence invariants".into(),
+                    description:
+                        "Execute crash/restart scenarios and verify persistence invariants".into(),
                     produces: vec![ArtifactType::RecoveryResult],
                     gate_step: true,
                 },
@@ -488,9 +537,17 @@ impl VerificationReport {
             .collect();
 
         let verdict = if mandatory_missing.is_empty()
-            && step_results.iter().filter(|s| {
-                manifest.steps.iter().find(|ms| ms.step_id == s.step_id).map(|ms| ms.gate_step).unwrap_or(false)
-            }).all(|s| s.passed)
+            && step_results
+                .iter()
+                .filter(|s| {
+                    manifest
+                        .steps
+                        .iter()
+                        .find(|ms| ms.step_id == s.step_id)
+                        .map(|ms| ms.gate_step)
+                        .unwrap_or(false)
+                })
+                .all(|s| s.passed)
         {
             if step_results.iter().all(|s| s.passed) {
                 VerificationVerdict::Complete
@@ -516,7 +573,10 @@ impl VerificationReport {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!("=== Migration Verification: {} ===", self.report_id));
+        lines.push(format!(
+            "=== Migration Verification: {} ===",
+            self.report_id
+        ));
         lines.push(format!("Verdict: {:?}", self.verdict));
         lines.push(format!(
             "Artifacts: {}/{} collected",
@@ -526,7 +586,11 @@ impl VerificationReport {
         if !self.mandatory_missing.is_empty() {
             lines.push(format!(
                 "Mandatory missing: {}",
-                self.mandatory_missing.iter().map(|a| a.label()).collect::<Vec<_>>().join(", ")
+                self.mandatory_missing
+                    .iter()
+                    .map(|a| a.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -538,7 +602,11 @@ impl VerificationReport {
             } else {
                 format!(
                     " (missing: {})",
-                    step.missing_artifacts.iter().map(|a| a.label()).collect::<Vec<_>>().join(", ")
+                    step.missing_artifacts
+                        .iter()
+                        .map(|a| a.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             };
             lines.push(format!("  [{}] {}{}", status, step.step_id, missing));
@@ -611,14 +679,12 @@ mod tests {
     fn verification_incomplete_when_mandatory_missing() {
         let manifest = MigrationManifest::standard();
         // Only provide non-mandatory artifacts.
-        let artifacts = vec![
-            CollectedArtifact {
-                artifact_type: ArtifactType::SoakResult,
-                location: "artifacts/soak.json".into(),
-                schema_valid: true,
-                content_pass: true,
-            },
-        ];
+        let artifacts = vec![CollectedArtifact {
+            artifact_type: ArtifactType::SoakResult,
+            location: "artifacts/soak.json".into(),
+            schema_valid: true,
+            content_pass: true,
+        }];
         let report = VerificationReport::verify(&manifest, &artifacts);
         assert_eq!(report.verdict, VerificationVerdict::Incomplete);
         assert!(!report.mandatory_missing.is_empty());
@@ -683,7 +749,12 @@ mod tests {
     fn steps_ordered() {
         let manifest = MigrationManifest::standard();
         for (i, step) in manifest.steps.iter().enumerate() {
-            assert_eq!(step.order as usize, i + 1, "step {} out of order", step.step_id);
+            assert_eq!(
+                step.order as usize,
+                i + 1,
+                "step {} out of order",
+                step.step_id
+            );
         }
     }
 
@@ -691,7 +762,11 @@ mod tests {
     fn all_steps_produce_artifacts() {
         let manifest = MigrationManifest::standard();
         for step in &manifest.steps {
-            assert!(!step.produces.is_empty(), "{} produces no artifacts", step.step_id);
+            assert!(
+                !step.produces.is_empty(),
+                "{} produces no artifacts",
+                step.step_id
+            );
         }
     }
 
@@ -736,7 +811,11 @@ mod tests {
     fn contracts_have_required_fields() {
         let contracts = standard_artifact_contracts();
         for c in &contracts {
-            assert!(!c.required_fields.is_empty(), "{:?} has no required fields", c.artifact_type);
+            assert!(
+                !c.required_fields.is_empty(),
+                "{:?} has no required fields",
+                c.artifact_type
+            );
             assert!(!c.proof_statement.is_empty());
         }
     }

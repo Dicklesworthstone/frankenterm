@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::dependency_eradication::{
-    standard_forbidden_patterns, ForbiddenImport, ForbiddenRuntime, ScanReport, ViolationSeverity,
+    ForbiddenImport, ForbiddenRuntime, ScanReport, ViolationSeverity, standard_forbidden_patterns,
 };
 use frankenterm_core::forbidden_dep_guards::*;
 
@@ -38,7 +38,13 @@ fn arb_guard_config() -> impl Strategy<Value = GuardConfig> {
         any::<bool>(),
     )
         .prop_map(
-            |(fail_on_severity, allow_test_exceptions, max_warnings, enforce_feature_flags, cargo_deny_integration)| {
+            |(
+                fail_on_severity,
+                allow_test_exceptions,
+                max_warnings,
+                enforce_feature_flags,
+                cargo_deny_integration,
+            )| {
                 GuardConfig {
                     fail_on_severity,
                     allow_test_exceptions,

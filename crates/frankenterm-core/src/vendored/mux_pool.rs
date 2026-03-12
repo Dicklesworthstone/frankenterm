@@ -215,13 +215,24 @@ impl MuxPool {
         let (conn, guard) = result.into_parts();
         let client = match conn {
             Some(c) => {
-                tracing::trace!(subsystem = "mux_pool", event = "acquire", source = "idle", "reused idle mux connection");
+                tracing::trace!(
+                    subsystem = "mux_pool",
+                    event = "acquire",
+                    source = "idle",
+                    "reused idle mux connection"
+                );
                 c
             }
             None => match DirectMuxClient::connect_with_cx(cx, self.mux_config.clone()).await {
                 Ok(client) => {
                     let count = self.connections_created.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::debug!(subsystem = "mux_pool", event = "acquire", source = "new", total_created = count, "created new mux connection");
+                    tracing::debug!(
+                        subsystem = "mux_pool",
+                        event = "acquire",
+                        source = "new",
+                        total_created = count,
+                        "created new mux connection"
+                    );
                     client
                 }
                 Err(e) => {
@@ -243,13 +254,24 @@ impl MuxPool {
         let (conn, guard) = result.into_parts();
         let client = match conn {
             Some(c) => {
-                tracing::trace!(subsystem = "mux_pool", event = "acquire", source = "idle", "reused idle mux connection");
+                tracing::trace!(
+                    subsystem = "mux_pool",
+                    event = "acquire",
+                    source = "idle",
+                    "reused idle mux connection"
+                );
                 c
             }
             None => match DirectMuxClient::connect(self.mux_config.clone()).await {
                 Ok(client) => {
                     let count = self.connections_created.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::debug!(subsystem = "mux_pool", event = "acquire", source = "new", total_created = count, "created new mux connection");
+                    tracing::debug!(
+                        subsystem = "mux_pool",
+                        event = "acquire",
+                        source = "new",
+                        total_created = count,
+                        "created new mux connection"
+                    );
                     client
                 }
                 Err(e) => {
@@ -264,7 +286,11 @@ impl MuxPool {
 
     /// Return a healthy client to the pool for reuse.
     async fn return_client(&self, client: DirectMuxClient) {
-        tracing::trace!(subsystem = "mux_pool", event = "release", "returned mux connection to pool");
+        tracing::trace!(
+            subsystem = "mux_pool",
+            event = "release",
+            "returned mux connection to pool"
+        );
         self.pool.put(client).await;
     }
 
@@ -700,7 +726,13 @@ impl MuxPool {
         let check_num = self.health_checks.fetch_add(1, Ordering::Relaxed) + 1;
         match self.list_panes().await {
             Ok(_) => {
-                tracing::debug!(subsystem = "mux_pool", event = "health_check", outcome = "pass", check_num, "mux pool health check passed");
+                tracing::debug!(
+                    subsystem = "mux_pool",
+                    event = "health_check",
+                    outcome = "pass",
+                    check_num,
+                    "mux pool health check passed"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -717,7 +749,13 @@ impl MuxPool {
         let check_num = self.health_checks.fetch_add(1, Ordering::Relaxed) + 1;
         match self.list_panes_with_cx(cx).await {
             Ok(_) => {
-                tracing::debug!(subsystem = "mux_pool", event = "health_check", outcome = "pass", check_num, "mux pool health check passed");
+                tracing::debug!(
+                    subsystem = "mux_pool",
+                    event = "health_check",
+                    outcome = "pass",
+                    check_num,
+                    "mux pool health check passed"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -732,14 +770,23 @@ impl MuxPool {
     pub async fn evict_idle(&self) -> usize {
         let evicted = self.pool.evict_idle().await;
         if evicted > 0 {
-            tracing::debug!(subsystem = "mux_pool", event = "evict_idle", evicted, "evicted idle mux connections");
+            tracing::debug!(
+                subsystem = "mux_pool",
+                event = "evict_idle",
+                evicted,
+                "evicted idle mux connections"
+            );
         }
         evicted
     }
 
     /// Clear all idle connections from the pool.
     pub async fn clear(&self) {
-        tracing::debug!(subsystem = "mux_pool", event = "clear", "clearing all idle mux connections");
+        tracing::debug!(
+            subsystem = "mux_pool",
+            event = "clear",
+            "clearing all idle mux connections"
+        );
         self.pool.clear().await;
     }
 

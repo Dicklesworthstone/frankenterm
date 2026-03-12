@@ -145,9 +145,7 @@ impl AlertCondition {
                     .get(&key)
                     .map_or(false, |h| health_at_or_below(*h, *threshold))
             }
-            Self::RedactionCeilingAbove { threshold } => {
-                snapshot.redaction_ceiling >= *threshold
-            }
+            Self::RedactionCeilingAbove { threshold } => snapshot.redaction_ceiling >= *threshold,
             Self::UnhealthyEnvelopeCount { max_count } => {
                 let count = snapshot
                     .envelopes
@@ -413,10 +411,7 @@ pub struct FleetAlertSummary {
 
 impl FleetDashboardView {
     /// Build a dashboard view from a fleet snapshot and alert manager state.
-    pub fn from_snapshot(
-        snapshot: &UnifiedFleetSnapshot,
-        manager: &FleetAlertManager,
-    ) -> Self {
+    pub fn from_snapshot(snapshot: &UnifiedFleetSnapshot, manager: &FleetAlertManager) -> Self {
         let now_ms = epoch_ms();
 
         let mut layer_envelope_counts: HashMap<String, usize> = HashMap::new();
@@ -629,9 +624,7 @@ fn format_alert_summary(policy: &FleetAlertPolicy, snapshot: &UnifiedFleetSnapsh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unified_telemetry::{
-        EnvelopeBuilder, IngestPayload, SubsystemPayload,
-    };
+    use crate::unified_telemetry::{EnvelopeBuilder, IngestPayload, SubsystemPayload};
 
     fn sample_time() -> u64 {
         1_710_000_000_000
@@ -764,9 +757,7 @@ mod tests {
         let snap = degraded_snapshot();
         let fired = manager.evaluate(&snap);
         assert!(!fired.is_empty());
-        let degraded_alert = fired
-            .iter()
-            .find(|a| a.class_id == "fleet.health.degraded");
+        let degraded_alert = fired.iter().find(|a| a.class_id == "fleet.health.degraded");
         assert!(degraded_alert.is_some());
     }
 
@@ -814,13 +805,21 @@ mod tests {
 
         // Acknowledge
         assert!(manager.acknowledge(alert_id, "operator-1"));
-        let a = manager.all_alerts().iter().find(|a| a.alert_id == alert_id).unwrap();
+        let a = manager
+            .all_alerts()
+            .iter()
+            .find(|a| a.alert_id == alert_id)
+            .unwrap();
         assert!(a.is_acked());
         assert!(a.is_active()); // Still active until resolved
 
         // Resolve
         assert!(manager.resolve(alert_id, "Root cause identified and fixed"));
-        let a = manager.all_alerts().iter().find(|a| a.alert_id == alert_id).unwrap();
+        let a = manager
+            .all_alerts()
+            .iter()
+            .find(|a| a.alert_id == alert_id)
+            .unwrap();
         assert!(!a.is_active());
         assert!(a.resolution_note.is_some());
     }
@@ -963,7 +962,11 @@ mod tests {
         let policies = default_policies();
         let mut seen = std::collections::HashSet::new();
         for p in &policies {
-            assert!(seen.insert(&p.class_id), "duplicate class_id: {}", p.class_id);
+            assert!(
+                seen.insert(&p.class_id),
+                "duplicate class_id: {}",
+                p.class_id
+            );
         }
     }
 
@@ -985,10 +988,25 @@ mod tests {
 
     #[test]
     fn health_at_or_below_ranking() {
-        assert!(health_at_or_below(HealthStatus::Unhealthy, HealthStatus::Unhealthy));
-        assert!(health_at_or_below(HealthStatus::Unhealthy, HealthStatus::Degraded));
-        assert!(!health_at_or_below(HealthStatus::Healthy, HealthStatus::Degraded));
-        assert!(health_at_or_below(HealthStatus::Degraded, HealthStatus::Degraded));
-        assert!(health_at_or_below(HealthStatus::Unknown, HealthStatus::Unknown));
+        assert!(health_at_or_below(
+            HealthStatus::Unhealthy,
+            HealthStatus::Unhealthy
+        ));
+        assert!(health_at_or_below(
+            HealthStatus::Unhealthy,
+            HealthStatus::Degraded
+        ));
+        assert!(!health_at_or_below(
+            HealthStatus::Healthy,
+            HealthStatus::Degraded
+        ));
+        assert!(health_at_or_below(
+            HealthStatus::Degraded,
+            HealthStatus::Degraded
+        ));
+        assert!(health_at_or_below(
+            HealthStatus::Unknown,
+            HealthStatus::Unknown
+        ));
     }
 }

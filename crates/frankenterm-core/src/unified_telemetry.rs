@@ -433,11 +433,9 @@ impl UnifiedFleetSnapshot {
             *entry = entry.worst(env.health);
         }
 
-        let redaction_ceiling = envelopes
-            .iter()
-            .fold(RedactionLabel::Public, |acc, e| {
-                acc.max_restriction(e.redaction.label)
-            });
+        let redaction_ceiling = envelopes.iter().fold(RedactionLabel::Public, |acc, e| {
+            acc.max_restriction(e.redaction.label)
+        });
 
         Self {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -677,11 +675,26 @@ mod tests {
 
     #[test]
     fn health_status_worst() {
-        assert_eq!(HealthStatus::Healthy.worst(HealthStatus::Healthy), HealthStatus::Healthy);
-        assert_eq!(HealthStatus::Healthy.worst(HealthStatus::Degraded), HealthStatus::Degraded);
-        assert_eq!(HealthStatus::Degraded.worst(HealthStatus::Unknown), HealthStatus::Unknown);
-        assert_eq!(HealthStatus::Unknown.worst(HealthStatus::Unhealthy), HealthStatus::Unhealthy);
-        assert_eq!(HealthStatus::Unhealthy.worst(HealthStatus::Healthy), HealthStatus::Unhealthy);
+        assert_eq!(
+            HealthStatus::Healthy.worst(HealthStatus::Healthy),
+            HealthStatus::Healthy
+        );
+        assert_eq!(
+            HealthStatus::Healthy.worst(HealthStatus::Degraded),
+            HealthStatus::Degraded
+        );
+        assert_eq!(
+            HealthStatus::Degraded.worst(HealthStatus::Unknown),
+            HealthStatus::Unknown
+        );
+        assert_eq!(
+            HealthStatus::Unknown.worst(HealthStatus::Unhealthy),
+            HealthStatus::Unhealthy
+        );
+        assert_eq!(
+            HealthStatus::Unhealthy.worst(HealthStatus::Healthy),
+            HealthStatus::Unhealthy
+        );
     }
 
     // -- EnvelopeBuilder --
@@ -792,16 +805,13 @@ mod tests {
             snap.layer_health.get("policy"),
             Some(&HealthStatus::Healthy)
         );
-        assert_eq!(
-            snap.layer_health.get("mux"),
-            Some(&HealthStatus::Degraded)
-        );
+        assert_eq!(snap.layer_health.get("mux"), Some(&HealthStatus::Degraded));
     }
 
     #[test]
     fn fleet_snapshot_filter_by_layer() {
-        let e1 = EnvelopeBuilder::new(SubsystemLayer::Swarm, sample_time())
-            .build(SubsystemPayload::Ingest(IngestPayload {
+        let e1 = EnvelopeBuilder::new(SubsystemLayer::Swarm, sample_time()).build(
+            SubsystemPayload::Ingest(IngestPayload {
                 snapshot: crate::tailer::SchedulerSnapshot {
                     budget_active: false,
                     max_captures_per_sec: 0,
@@ -813,41 +823,40 @@ mod tests {
                     total_throttle_events: 0,
                     tracked_panes: 0,
                 },
-            }));
-        let e2 = EnvelopeBuilder::new(SubsystemLayer::Policy, sample_time())
-            .build(SubsystemPayload::Ingest(IngestPayload {
-                snapshot: crate::tailer::SchedulerSnapshot {
-                    budget_active: false,
-                    max_captures_per_sec: 0,
-                    max_bytes_per_sec: 0,
-                    captures_remaining: 0,
-                    bytes_remaining: 0,
-                    total_rate_limited: 0,
-                    total_byte_budget_exceeded: 0,
-                    total_throttle_events: 0,
-                    tracked_panes: 0,
-                },
-            }));
-        let e3 = EnvelopeBuilder::new(SubsystemLayer::Swarm, sample_time())
-            .build(SubsystemPayload::Ingest(IngestPayload {
-                snapshot: crate::tailer::SchedulerSnapshot {
-                    budget_active: false,
-                    max_captures_per_sec: 0,
-                    max_bytes_per_sec: 0,
-                    captures_remaining: 0,
-                    bytes_remaining: 0,
-                    total_rate_limited: 0,
-                    total_byte_budget_exceeded: 0,
-                    total_throttle_events: 0,
-                    tracked_panes: 0,
-                },
-            }));
-
-        let snap = UnifiedFleetSnapshot::from_envelopes(
-            sample_time(),
-            vec![e1, e2, e3],
-            vec![],
+            }),
         );
+        let e2 = EnvelopeBuilder::new(SubsystemLayer::Policy, sample_time()).build(
+            SubsystemPayload::Ingest(IngestPayload {
+                snapshot: crate::tailer::SchedulerSnapshot {
+                    budget_active: false,
+                    max_captures_per_sec: 0,
+                    max_bytes_per_sec: 0,
+                    captures_remaining: 0,
+                    bytes_remaining: 0,
+                    total_rate_limited: 0,
+                    total_byte_budget_exceeded: 0,
+                    total_throttle_events: 0,
+                    tracked_panes: 0,
+                },
+            }),
+        );
+        let e3 = EnvelopeBuilder::new(SubsystemLayer::Swarm, sample_time()).build(
+            SubsystemPayload::Ingest(IngestPayload {
+                snapshot: crate::tailer::SchedulerSnapshot {
+                    budget_active: false,
+                    max_captures_per_sec: 0,
+                    max_bytes_per_sec: 0,
+                    captures_remaining: 0,
+                    bytes_remaining: 0,
+                    total_rate_limited: 0,
+                    total_byte_budget_exceeded: 0,
+                    total_throttle_events: 0,
+                    tracked_panes: 0,
+                },
+            }),
+        );
+
+        let snap = UnifiedFleetSnapshot::from_envelopes(sample_time(), vec![e1, e2, e3], vec![]);
 
         assert_eq!(snap.envelopes_for_layer(SubsystemLayer::Swarm).len(), 2);
         assert_eq!(snap.envelopes_for_layer(SubsystemLayer::Policy).len(), 1);

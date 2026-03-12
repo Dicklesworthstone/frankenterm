@@ -536,8 +536,12 @@ impl ConnectorTestbed {
         // Send to provider.
         self.telemetry.provider_requests += 1;
         let provider_outcome = if let Some(provider) = self.providers.get_mut(provider_id) {
-            let outcome =
-                provider.receive_request(connector_id, &action.action_kind.to_string(), now_ms, seed);
+            let outcome = provider.receive_request(
+                connector_id,
+                &action.action_kind.to_string(),
+                now_ms,
+                seed,
+            );
             if !matches!(outcome, MockProviderOutcome::Success) {
                 self.telemetry.provider_failures += 1;
                 self.governor.record_outcome(connector_id, false, now_ms);
@@ -958,9 +962,15 @@ mod tests {
 
     #[test]
     fn chaos_scenario_kind_display() {
-        assert_eq!(ChaosScenarioKind::ProviderOutage.to_string(), "provider_outage");
+        assert_eq!(
+            ChaosScenarioKind::ProviderOutage.to_string(),
+            "provider_outage"
+        );
         assert_eq!(ChaosScenarioKind::ErrorStorm.to_string(), "error_storm");
-        assert_eq!(ChaosScenarioKind::IngestionFlood.to_string(), "ingestion_flood");
+        assert_eq!(
+            ChaosScenarioKind::IngestionFlood.to_string(),
+            "ingestion_flood"
+        );
     }
 
     #[test]
@@ -1141,9 +1151,6 @@ mod tests {
             MockProviderOutcome::SimulatedFailure.to_string(),
             "simulated_failure"
         );
-        assert_eq!(
-            MockProviderOutcome::RateLimited.to_string(),
-            "rate_limited"
-        );
+        assert_eq!(MockProviderOutcome::RateLimited.to_string(), "rate_limited");
     }
 }

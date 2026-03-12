@@ -60,7 +60,7 @@ fn sim_queue_config() -> WorkQueueConfig {
 
 fn sim_scheduler_config() -> SchedulerConfig {
     SchedulerConfig {
-        scale_up_cooldown_ms: 0,      // no cooldown for simulation
+        scale_up_cooldown_ms: 0, // no cooldown for simulation
         scale_down_cooldown_ms: 0,
         min_fleet_size: 2,
         max_fleet_size: 50,
@@ -90,13 +90,7 @@ fn noop_pipeline_step(label: &str) -> PipelineStep {
 }
 
 /// Structured log emitter for simulation events.
-fn emit_sim_log(
-    scenario_id: &str,
-    correlation_id: &str,
-    metric: &str,
-    value: &str,
-    outcome: &str,
-) {
+fn emit_sim_log(scenario_id: &str, correlation_id: &str, metric: &str, value: &str, outcome: &str) {
     let payload = serde_json::json!({
         "timestamp": "2026-03-11T00:00:00Z",
         "component": "swarm_simulation.regression",
@@ -161,7 +155,13 @@ fn sim_burst_enqueue_100_items_status_consistency() {
     assert_eq!(stats.blocked, 20, "all dependent items should be blocked");
 
     emit_sim_log(scenario, "burst-001", "total_items", "100", "pass");
-    emit_sim_log(scenario, "burst-001", "ready_count", &stats.ready.to_string(), "pass");
+    emit_sim_log(
+        scenario,
+        "burst-001",
+        "ready_count",
+        &stats.ready.to_string(),
+        "pass",
+    );
 }
 
 /// S2: Sustained high-throughput: enqueue → assign → complete 200 items across 5 agents.
@@ -181,7 +181,10 @@ fn sim_sustained_throughput_200_items_5_agents() {
     let mut round = 0u32;
     while completed < 200 {
         round += 1;
-        assert!(round <= 100, "should not require more than 100 rounds for 200 items with 5 agents");
+        assert!(
+            round <= 100,
+            "should not require more than 100 rounds for 200 items with 5 agents"
+        );
         let ready = queue.ready_items();
         if ready.is_empty() {
             break;
@@ -202,7 +205,13 @@ fn sim_sustained_throughput_200_items_5_agents() {
     assert_eq!(stats.in_progress, 0);
 
     emit_sim_log(scenario, "throughput-001", "items_completed", "200", "pass");
-    emit_sim_log(scenario, "throughput-001", "rounds", &round.to_string(), "pass");
+    emit_sim_log(
+        scenario,
+        "throughput-001",
+        "rounds",
+        &round.to_string(),
+        "pass",
+    );
 }
 
 /// S3: Load spike: queue is idle, then 50 items arrive at once.
@@ -215,7 +224,10 @@ fn sim_load_spike_triggers_scale_up() {
 
     // Initially idle
     let d1 = scheduler.evaluate(&mut queue, 1000);
-    assert!(matches!(d1, SchedulerDecision::Noop { .. }), "empty queue → noop");
+    assert!(
+        matches!(d1, SchedulerDecision::Noop { .. }),
+        "empty queue → noop"
+    );
 
     // Spike: 50 items arrive
     for i in 0..50 {
@@ -228,7 +240,9 @@ fn sim_load_spike_triggers_scale_up() {
     scheduler.register_agent(&s("agent-0"), 1000);
     scheduler.register_agent(&s("agent-1"), 1000);
     for i in 0..6 {
-        queue.assign(&format!("spike-{i}"), &format!("agent-{}", i % 2)).unwrap();
+        queue
+            .assign(&format!("spike-{i}"), &format!("agent-{}", i % 2))
+            .unwrap();
     }
 
     let d2 = scheduler.evaluate(&mut queue, 5000);
@@ -240,7 +254,13 @@ fn sim_load_spike_triggers_scale_up() {
         "high pressure should trigger scale-up or assignment, got {d2:?}"
     );
 
-    emit_sim_log(scenario, "spike-001", "decision", &format!("{d2:?}"), "pass");
+    emit_sim_log(
+        scenario,
+        "spike-001",
+        "decision",
+        &format!("{d2:?}"),
+        "pass",
+    );
 }
 
 /// S4: Cooldown after spike — queue drains, scheduler should recommend scale-down.
@@ -258,7 +278,9 @@ fn sim_post_spike_cooldown_recommends_scale_down() {
 
     // 5 items, 10 agents → very low utilization
     for i in 0..5 {
-        queue.enqueue(work_item(&format!("low-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("low-{i}"), 0, &[]))
+            .unwrap();
     }
     for i in 0..10 {
         scheduler.register_agent(&format!("agent-{i}"), 1000);
@@ -279,9 +301,18 @@ fn sim_post_spike_cooldown_recommends_scale_down() {
         "post-spike should produce scale-down, noop, or assign remaining: got {decision:?}"
     );
 
-    emit_sim_log(scenario, "cooldown-001", "decision_type",
-        if is_scale_down { "scale_down" } else if is_assign { "assign" } else { "noop" },
-        "pass"
+    emit_sim_log(
+        scenario,
+        "cooldown-001",
+        "decision_type",
+        if is_scale_down {
+            "scale_down"
+        } else if is_assign {
+            "assign"
+        } else {
+            "noop"
+        },
+        "pass",
     );
 }
 
@@ -294,7 +325,11 @@ fn sim_deep_dag_chain_serial_unblocking() {
     queue.enqueue(work_item("chain-0", 0, &[])).unwrap();
     for i in 1..50 {
         queue
-            .enqueue(work_item(&format!("chain-{i}"), 0, &[&format!("chain-{}", i - 1)]))
+            .enqueue(work_item(
+                &format!("chain-{i}"),
+                0,
+                &[&format!("chain-{}", i - 1)],
+            ))
             .unwrap();
     }
 
@@ -361,8 +396,12 @@ fn sim_heartbeat_timeout_reclaims_stale_items() {
     let mut queue = SwarmWorkQueue::new(config);
 
     for i in 0..5 {
-        queue.enqueue(work_item(&format!("stale-{i}"), 0, &[])).unwrap();
-        queue.assign(&format!("stale-{i}"), &s("slow-agent")).unwrap();
+        queue
+            .enqueue(work_item(&format!("stale-{i}"), 0, &[]))
+            .unwrap();
+        queue
+            .assign(&format!("stale-{i}"), &s("slow-agent"))
+            .unwrap();
     }
 
     // Simulate time passing beyond heartbeat timeout
@@ -376,7 +415,11 @@ fn sim_heartbeat_timeout_reclaims_stale_items() {
         "reclaim-001",
         "reclaimed_count",
         &reclaimed.len().to_string(),
-        if reclaimed.is_empty() { "info_no_reclaim_yet" } else { "pass" },
+        if reclaimed.is_empty() {
+            "info_no_reclaim_yet"
+        } else {
+            "pass"
+        },
     );
 }
 
@@ -388,27 +431,49 @@ fn sim_multi_agent_failure_queue_consistency() {
 
     // 15 items assigned across 3 agents
     for i in 0..15 {
-        queue.enqueue(work_item(&format!("multi-{i}"), 0, &[])).unwrap();
-        queue.assign(&format!("multi-{i}"), &format!("agent-{}", i % 3)).unwrap();
+        queue
+            .enqueue(work_item(&format!("multi-{i}"), 0, &[]))
+            .unwrap();
+        queue
+            .assign(&format!("multi-{i}"), &format!("agent-{}", i % 3))
+            .unwrap();
     }
 
     // Agents 0 and 1 "fail" — mark their items as failed
     for i in (0..15).filter(|i| i % 3 != 2) {
         queue
-            .fail(&format!("multi-{i}"), &format!("agent-{}", i % 3), Some("agent crash".to_string()))
+            .fail(
+                &format!("multi-{i}"),
+                &format!("agent-{}", i % 3),
+                Some("agent crash".to_string()),
+            )
             .unwrap();
     }
 
     let stats = queue.stats();
     // Agent 2's items (5 items) still in-progress
-    assert_eq!(stats.in_progress, 5, "agent-2's items should remain in-progress");
+    assert_eq!(
+        stats.in_progress, 5,
+        "agent-2's items should remain in-progress"
+    );
     assert_eq!(stats.failed, 10, "agents 0 and 1 items should be failed");
 
     // Queue invariant: total items accounted for
-    let total = stats.ready + stats.blocked + stats.in_progress + stats.completed + stats.failed + stats.cancelled;
+    let total = stats.ready
+        + stats.blocked
+        + stats.in_progress
+        + stats.completed
+        + stats.failed
+        + stats.cancelled;
     assert_eq!(total, 15, "all items must be accounted for");
 
-    emit_sim_log(scenario, "multi-fail-001", "failed_count", &stats.failed.to_string(), "pass");
+    emit_sim_log(
+        scenario,
+        "multi-fail-001",
+        "failed_count",
+        &stats.failed.to_string(),
+        "pass",
+    );
 }
 
 /// S9: Failure rate suppresses scaling when above threshold.
@@ -424,7 +489,9 @@ fn sim_high_failure_rate_suppresses_scale_up() {
 
     // Enqueue 20 items
     for i in 0..20 {
-        queue.enqueue(work_item(&format!("fr-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("fr-{i}"), 0, &[]))
+            .unwrap();
     }
 
     // Register agents with high failure rate
@@ -435,7 +502,9 @@ fn sim_high_failure_rate_suppresses_scale_up() {
         queue.assign(&format!("fr-{i}"), &agent).unwrap();
         // Fail 4 out of 6
         if i < 4 {
-            queue.fail(&format!("fr-{i}"), &agent, Some("test fail".to_string())).unwrap();
+            queue
+                .fail(&format!("fr-{i}"), &agent, Some("test fail".to_string()))
+                .unwrap();
             scheduler.record_failure(&agent);
         } else {
             queue.complete(&format!("fr-{i}"), &agent, None).unwrap();
@@ -481,7 +550,9 @@ fn sim_cascading_dependency_failure() {
 
     // Fail "a"
     queue.assign(&s("a"), &s("agent-0")).unwrap();
-    queue.fail(&s("a"), &s("agent-0"), Some("fatal error".to_string())).unwrap();
+    queue
+        .fail(&s("a"), &s("agent-0"), Some("fatal error".to_string()))
+        .unwrap();
 
     // Complete "b"
     queue.assign(&s("b"), &s("agent-1")).unwrap();
@@ -495,7 +566,13 @@ fn sim_cascading_dependency_failure() {
         "c should remain blocked when dependency a has failed"
     );
 
-    emit_sim_log(scenario, "cascade-001", "c_status", &format!("{status_c:?}"), "pass");
+    emit_sim_log(
+        scenario,
+        "cascade-001",
+        "c_status",
+        &format!("{status_c:?}"),
+        "pass",
+    );
 }
 
 // =============================================================================
@@ -509,12 +586,16 @@ fn sim_snapshot_restore_continues_processing() {
     let mut queue = SwarmWorkQueue::new(sim_queue_config());
 
     for i in 0..10 {
-        queue.enqueue(work_item(&format!("snap-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("snap-{i}"), 0, &[]))
+            .unwrap();
     }
     // Assign and complete first 5
     for i in 0..5 {
         queue.assign(&format!("snap-{i}"), &s("agent-0")).unwrap();
-        queue.complete(&format!("snap-{i}"), &s("agent-0"), None).unwrap();
+        queue
+            .complete(&format!("snap-{i}"), &s("agent-0"), None)
+            .unwrap();
     }
 
     // Snapshot
@@ -525,18 +606,34 @@ fn sim_snapshot_restore_continues_processing() {
 
     // Verify state
     let stats = restored.stats();
-    assert_eq!(stats.completed, 5, "5 items should be completed after restore");
-    assert_eq!(stats.ready, 5, "5 items should still be ready after restore");
+    assert_eq!(
+        stats.completed, 5,
+        "5 items should be completed after restore"
+    );
+    assert_eq!(
+        stats.ready, 5,
+        "5 items should still be ready after restore"
+    );
 
     // Continue processing from restored state
     for i in 5..10 {
-        restored.assign(&format!("snap-{i}"), &s("agent-1")).unwrap();
-        restored.complete(&format!("snap-{i}"), &s("agent-1"), None).unwrap();
+        restored
+            .assign(&format!("snap-{i}"), &s("agent-1"))
+            .unwrap();
+        restored
+            .complete(&format!("snap-{i}"), &s("agent-1"), None)
+            .unwrap();
     }
 
     assert_eq!(restored.stats().completed, 10);
 
-    emit_sim_log(scenario, "restore-001", "completed_after_restore", "10", "pass");
+    emit_sim_log(
+        scenario,
+        "restore-001",
+        "completed_after_restore",
+        "10",
+        "pass",
+    );
 }
 
 /// S12: Scheduler state survives snapshot/restore cycle.
@@ -548,7 +645,9 @@ fn sim_scheduler_snapshot_restore_preserves_history() {
 
     // Drive some decisions to build history
     for i in 0..10 {
-        queue.enqueue(work_item(&format!("sched-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("sched-{i}"), 0, &[]))
+            .unwrap();
     }
     scheduler.register_agent(&s("agent-0"), 1000);
     for i in 0..3 {
@@ -561,14 +660,24 @@ fn sim_scheduler_snapshot_restore_preserves_history() {
     let snap = scheduler.snapshot();
     let restored = SwarmScheduler::restore(snap);
 
-    assert_eq!(restored.sequence(), seq_before, "sequence should be preserved");
+    assert_eq!(
+        restored.sequence(),
+        seq_before,
+        "sequence should be preserved"
+    );
     assert_eq!(
         restored.scale_history().len(),
         scheduler.scale_history().len(),
         "scale history length should match"
     );
 
-    emit_sim_log(scenario, "sched-snap-001", "sequence_preserved", &seq_before.to_string(), "pass");
+    emit_sim_log(
+        scenario,
+        "sched-snap-001",
+        "sequence_preserved",
+        &seq_before.to_string(),
+        "pass",
+    );
 }
 
 /// S13: Work reassignment after failure — item becomes ready again via retry mechanism.
@@ -583,7 +692,13 @@ fn sim_reassignment_after_failure() {
 
     queue.enqueue(work_item("retry-me", 0, &[])).unwrap();
     queue.assign(&s("retry-me"), &s("agent-bad")).unwrap();
-    queue.fail(&s("retry-me"), &s("agent-bad"), Some("transient error".to_string())).unwrap();
+    queue
+        .fail(
+            &s("retry-me"),
+            &s("agent-bad"),
+            Some("transient error".to_string()),
+        )
+        .unwrap();
 
     // After failure, item may be retryable depending on implementation
     let status = queue.item_status(&s("retry-me")).unwrap();
@@ -604,11 +719,15 @@ fn sim_full_recovery_cycle() {
     let mut queue = SwarmWorkQueue::new(sim_queue_config());
 
     queue.enqueue(work_item("recover-1", 0, &[])).unwrap();
-    queue.enqueue(work_item("recover-2", 0, &["recover-1"])).unwrap();
+    queue
+        .enqueue(work_item("recover-2", 0, &["recover-1"]))
+        .unwrap();
 
     // First attempt fails
     queue.assign(&s("recover-1"), &s("agent-fail")).unwrap();
-    queue.fail(&s("recover-1"), &s("agent-fail"), Some("crash".to_string())).unwrap();
+    queue
+        .fail(&s("recover-1"), &s("agent-fail"), Some("crash".to_string()))
+        .unwrap();
 
     // Check if the item can be re-enqueued or is terminal
     let status = queue.item_status(&s("recover-1")).unwrap();
@@ -622,7 +741,13 @@ fn sim_full_recovery_cycle() {
         );
     }
 
-    emit_sim_log(scenario, "recovery-001", "recover1_status", &format!("{status:?}"), "pass");
+    emit_sim_log(
+        scenario,
+        "recovery-001",
+        "recover1_status",
+        &format!("{status:?}"),
+        "pass",
+    );
 }
 
 /// S15: Beads JSONL import → queue sync simulation.
@@ -669,7 +794,9 @@ fn sim_fairness_gini_coefficient_under_balanced_load() {
 
     // Enqueue 100 items
     for i in 0..100 {
-        queue.enqueue(work_item(&format!("fair-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("fair-{i}"), 0, &[]))
+            .unwrap();
     }
 
     // Round-robin assignment (perfect fairness)
@@ -688,7 +815,13 @@ fn sim_fairness_gini_coefficient_under_balanced_load() {
         "round-robin should yield near-perfect fairness (gini={gini:.4})"
     );
 
-    emit_sim_log(scenario, "gini-001", "gini_coefficient", &format!("{gini:.4}"), "pass");
+    emit_sim_log(
+        scenario,
+        "gini-001",
+        "gini_coefficient",
+        &format!("{gini:.4}"),
+        "pass",
+    );
 }
 
 /// S17: Fairness degrades under skewed assignment.
@@ -698,9 +831,18 @@ fn sim_fairness_gini_skewed_assignment() {
     // Simulate skewed: agent-0 gets 90 items, agents 1-3 get ~3 each
     let completions = [90u32, 4, 3, 3];
     let gini = gini_coefficient(&completions);
-    assert!(gini > 0.3, "skewed distribution should have high Gini (got {gini:.4})");
+    assert!(
+        gini > 0.3,
+        "skewed distribution should have high Gini (got {gini:.4})"
+    );
 
-    emit_sim_log(scenario, "gini-skew-001", "gini_coefficient", &format!("{gini:.4}"), "pass");
+    emit_sim_log(
+        scenario,
+        "gini-skew-001",
+        "gini_coefficient",
+        &format!("{gini:.4}"),
+        "pass",
+    );
 }
 
 /// S18: Throughput metric — items completed per scheduler evaluation round.
@@ -711,7 +853,9 @@ fn sim_throughput_per_evaluation_round() {
     let mut queue = SwarmWorkQueue::new(sim_queue_config());
 
     for i in 0..30 {
-        queue.enqueue(work_item(&format!("tput-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("tput-{i}"), 0, &[]))
+            .unwrap();
     }
 
     scheduler.register_agent(&s("agent-0"), 1000);
@@ -727,8 +871,12 @@ fn sim_throughput_per_evaluation_round() {
         if let SchedulerDecision::AssignWork { ref assignments } = decision {
             for assignment in assignments {
                 if queue.item_status(&assignment.item_id) == Some(WorkItemStatus::Ready) {
-                    queue.assign(&assignment.item_id, &assignment.agent_id).unwrap();
-                    queue.complete(&assignment.item_id, &assignment.agent_id, None).unwrap();
+                    queue
+                        .assign(&assignment.item_id, &assignment.agent_id)
+                        .unwrap();
+                    queue
+                        .complete(&assignment.item_id, &assignment.agent_id, None)
+                        .unwrap();
                     total_assigned += 1;
                     scheduler.record_completion(&assignment.agent_id);
                 }
@@ -737,7 +885,11 @@ fn sim_throughput_per_evaluation_round() {
         rounds += 1;
     }
 
-    let throughput = if rounds > 0 { total_assigned as f64 / rounds as f64 } else { 0.0 };
+    let throughput = if rounds > 0 {
+        total_assigned as f64 / rounds as f64
+    } else {
+        0.0
+    };
 
     emit_sim_log(
         scenario,
@@ -764,13 +916,17 @@ fn sim_scheduler_decision_stability() {
 
     // Moderate load: 15 items, 3 agents
     for i in 0..15 {
-        queue.enqueue(work_item(&format!("stab-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("stab-{i}"), 0, &[]))
+            .unwrap();
     }
     for i in 0..3 {
         scheduler.register_agent(&format!("agent-{i}"), 1000);
     }
     for i in 0..9 {
-        queue.assign(&format!("stab-{i}"), &format!("agent-{}", i % 3)).unwrap();
+        queue
+            .assign(&format!("stab-{i}"), &format!("agent-{}", i % 3))
+            .unwrap();
     }
 
     let mut decisions = Vec::new();
@@ -798,13 +954,7 @@ fn sim_scheduler_decision_stability() {
         &changes.to_string(),
         "pass",
     );
-    emit_sim_log(
-        scenario,
-        "stability-001",
-        "total_evaluations",
-        "20",
-        "pass",
-    );
+    emit_sim_log(scenario, "stability-001", "total_evaluations", "20", "pass");
 }
 
 /// S20: Queue pressure computation accuracy under various loads.
@@ -823,10 +973,15 @@ fn sim_queue_pressure_accuracy() {
 
     // 10 items, none assigned
     for i in 0..10 {
-        queue.enqueue(work_item(&format!("press-{i}"), 0, &[])).unwrap();
+        queue
+            .enqueue(work_item(&format!("press-{i}"), 0, &[]))
+            .unwrap();
     }
     let p1 = compute_queue_pressure(&queue);
-    assert!(p1.ready_ratio > 0.0, "ready items should produce nonzero ratio");
+    assert!(
+        p1.ready_ratio > 0.0,
+        "ready items should produce nonzero ratio"
+    );
     assert_eq!(p1.pending_items, 10);
 
     // Assign 5
@@ -834,11 +989,26 @@ fn sim_queue_pressure_accuracy() {
         queue.assign(&format!("press-{i}"), &s("agent-0")).unwrap();
     }
     let p2 = compute_queue_pressure(&queue);
-    assert!(p2.utilization > 0.0, "assigned items should produce nonzero utilization");
+    assert!(
+        p2.utilization > 0.0,
+        "assigned items should produce nonzero utilization"
+    );
     assert_eq!(p2.active_agents, 1);
 
-    emit_sim_log(scenario, "pressure-001", "p0_ready_ratio", &format!("{:.2}", p0.ready_ratio), "pass");
-    emit_sim_log(scenario, "pressure-001", "p2_utilization", &format!("{:.2}", p2.utilization), "pass");
+    emit_sim_log(
+        scenario,
+        "pressure-001",
+        "p0_ready_ratio",
+        &format!("{:.2}", p0.ready_ratio),
+        "pass",
+    );
+    emit_sim_log(
+        scenario,
+        "pressure-001",
+        "p2_utilization",
+        &format!("{:.2}", p2.utilization),
+        "pass",
+    );
 }
 
 // =============================================================================
@@ -858,7 +1028,9 @@ fn regression_queue_stats_sum_equals_total() {
         } else {
             vec![]
         };
-        queue.enqueue(work_item(&format!("reg-{i}"), i % 3, &deps)).unwrap();
+        queue
+            .enqueue(work_item(&format!("reg-{i}"), i % 3, &deps))
+            .unwrap();
     }
 
     // Assign some
@@ -872,11 +1044,17 @@ fn regression_queue_stats_sum_equals_total() {
     queue.complete(&s("reg-0"), &s("agent-0"), None).unwrap();
     queue.complete(&s("reg-1"), &s("agent-0"), None).unwrap();
     // Fail one
-    queue.fail(&s("reg-2"), &s("agent-0"), Some("error".to_string())).unwrap();
+    queue
+        .fail(&s("reg-2"), &s("agent-0"), Some("error".to_string()))
+        .unwrap();
 
     let stats = queue.stats();
-    let total = stats.ready + stats.blocked + stats.in_progress
-        + stats.completed + stats.failed + stats.cancelled;
+    let total = stats.ready
+        + stats.blocked
+        + stats.in_progress
+        + stats.completed
+        + stats.failed
+        + stats.cancelled;
     assert_eq!(total, 20, "stats sum must equal total items");
 
     emit_sim_log(scenario, "sum-001", "stats_sum", &total.to_string(), "pass");
@@ -899,7 +1077,13 @@ fn regression_completed_items_never_ready() {
         "completed item must never appear in ready_items()"
     );
 
-    emit_sim_log(scenario, "noready-001", "completed_in_ready", "false", "pass");
+    emit_sim_log(
+        scenario,
+        "noready-001",
+        "completed_in_ready",
+        "false",
+        "pass",
+    );
 }
 
 /// S23: Priority ordering is stable across enqueue order.
@@ -924,7 +1108,13 @@ fn regression_priority_ordering_stable() {
         );
     }
 
-    emit_sim_log(scenario, "priostable-001", "ordering", &format!("{priorities:?}"), "pass");
+    emit_sim_log(
+        scenario,
+        "priostable-001",
+        "ordering",
+        &format!("{priorities:?}"),
+        "pass",
+    );
 }
 
 /// S24: Cycle detection prevents all direct cycles.
@@ -938,12 +1128,24 @@ fn regression_cycle_detection_covers_all_direct_cycles() {
     queue.enqueue(work_item("z", 0, &["y"])).unwrap();
 
     // All backward edges should be detected
-    assert!(queue.would_create_cycle(&s("x"), &[s("y")]), "x←y is a cycle");
-    assert!(queue.would_create_cycle(&s("x"), &[s("z")]), "x←z is a transitive cycle");
-    assert!(queue.would_create_cycle(&s("y"), &[s("z")]), "y←z is a cycle");
+    assert!(
+        queue.would_create_cycle(&s("x"), &[s("y")]),
+        "x←y is a cycle"
+    );
+    assert!(
+        queue.would_create_cycle(&s("x"), &[s("z")]),
+        "x←z is a transitive cycle"
+    );
+    assert!(
+        queue.would_create_cycle(&s("y"), &[s("z")]),
+        "y←z is a cycle"
+    );
 
     // Forward edges are not cycles
-    assert!(!queue.would_create_cycle(&s("z"), &[s("x")]), "z→x is not a new cycle (already exists)");
+    assert!(
+        !queue.would_create_cycle(&s("z"), &[s("x")]),
+        "z→x is not a new cycle (already exists)"
+    );
 
     emit_sim_log(scenario, "cycle-001", "cycles_detected", "3", "pass");
 }
@@ -970,8 +1172,13 @@ fn regression_ownership_enforcement() {
     assert_eq!(assignment.agent_slot, "rightful-owner");
 
     // Rightful owner can complete
-    queue.complete(&s("owned"), &s("rightful-owner"), None).unwrap();
-    assert_eq!(queue.item_status(&s("owned")), Some(WorkItemStatus::Completed));
+    queue
+        .complete(&s("owned"), &s("rightful-owner"), None)
+        .unwrap();
+    assert_eq!(
+        queue.item_status(&s("owned")),
+        Some(WorkItemStatus::Completed)
+    );
 
     emit_sim_log(scenario, "ownership-001", "enforcement", "strict", "pass");
 }
@@ -1047,11 +1254,15 @@ fn sim_pipeline_multi_compensation_all_fire() {
 
     // Both compensations should have fired
     assert!(
-        execution.compensations_executed.contains(&"undo-env".to_string()),
+        execution
+            .compensations_executed
+            .contains(&"undo-env".to_string()),
         "undo-env compensation should fire"
     );
     assert!(
-        execution.compensations_executed.contains(&"undo-deploy".to_string()),
+        execution
+            .compensations_executed
+            .contains(&"undo-deploy".to_string()),
         "undo-deploy compensation should fire"
     );
 
@@ -1105,7 +1316,13 @@ fn sim_pipeline_exponential_backoff_recovery() {
         "Command::empty should fail all attempts"
     );
 
-    emit_sim_log(scenario, "backoff-001", "attempts", &outcome.attempts.to_string(), "pass");
+    emit_sim_log(
+        scenario,
+        "backoff-001",
+        "attempts",
+        &outcome.attempts.to_string(),
+        "pass",
+    );
 }
 
 /// S28: Hook-driven abort halts pipeline early.
@@ -1268,7 +1485,10 @@ fn sim_pipeline_large_stress_test() {
         .filter(|o| o.status == StepStatus::Succeeded || o.status == StepStatus::Compensated)
         .count();
 
-    assert!(succeeded_count >= 19, "at least 19 steps should have run before failure");
+    assert!(
+        succeeded_count >= 19,
+        "at least 19 steps should have run before failure"
+    );
 
     // Compensations should have fired for completed even-numbered steps
     assert!(

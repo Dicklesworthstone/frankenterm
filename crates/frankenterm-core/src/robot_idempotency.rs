@@ -114,7 +114,12 @@ pub struct MutationRecord {
 impl MutationRecord {
     /// Create a new record for a successful execution.
     #[must_use]
-    pub fn success(key: MutationKey, response_payload: Option<String>, elapsed_ms: u64, now_ms: u64) -> Self {
+    pub fn success(
+        key: MutationKey,
+        response_payload: Option<String>,
+        elapsed_ms: u64,
+        now_ms: u64,
+    ) -> Self {
         Self {
             key,
             success: true,
@@ -326,9 +331,7 @@ impl MutationGuard {
         // Skip caching failures if configured
         if !success && !self.config.cache_failures {
             self.telemetry.failures_seen += 1;
-            return MutationOutcome::Executed {
-                key: key_str,
-            };
+            return MutationOutcome::Executed { key: key_str };
         }
 
         if !success {
@@ -342,12 +345,7 @@ impl MutationGuard {
         let record = if success {
             MutationRecord::success(key, response_payload, elapsed_ms, now_ms)
         } else {
-            MutationRecord::failure(
-                key,
-                error_message.unwrap_or_default(),
-                elapsed_ms,
-                now_ms,
-            )
+            MutationRecord::failure(key, error_message.unwrap_or_default(), elapsed_ms, now_ms)
         };
 
         self.records.insert(key_str.clone(), record);
@@ -363,7 +361,8 @@ impl MutationGuard {
         let ttl = self.config.ttl_ms;
         let before_len = self.records.len();
 
-        self.records.retain(|_, record| !record.is_expired(now_ms, ttl));
+        self.records
+            .retain(|_, record| !record.is_expired(now_ms, ttl));
         self.insertion_order
             .retain(|k| self.records.contains_key(k));
 
@@ -597,7 +596,7 @@ mod tests {
         let key = MutationKey::derive("test", "data");
         let record = MutationRecord::success(key, None, 1, 1000);
         assert!(!record.is_expired(1500, 1000)); // 500ms < 1000ms TTL
-        assert!(record.is_expired(2001, 1000));  // 1001ms > 1000ms TTL
+        assert!(record.is_expired(2001, 1000)); // 1001ms > 1000ms TTL
         assert!(!record.is_expired(2000, 1000)); // exactly at boundary
     }
 
@@ -666,7 +665,10 @@ mod tests {
         let _ = guard.record(key.clone(), true, Some("ok".into()), None, 5, 1000);
         let outcome = guard.record(key, true, Some("ok".into()), None, 5, 1001);
         assert!(outcome.is_deduplicated());
-        if let MutationOutcome::Deduplicated { submission_count, .. } = outcome {
+        if let MutationOutcome::Deduplicated {
+            submission_count, ..
+        } = outcome
+        {
             assert_eq!(submission_count, 2);
         }
         assert_eq!(guard.len(), 1); // still 1 record
@@ -679,7 +681,10 @@ mod tests {
         let _ = guard.record(key.clone(), true, None, None, 1, 1000);
         let _ = guard.record(key.clone(), true, None, None, 1, 1001);
         let outcome = guard.record(key, true, None, None, 1, 1002);
-        if let MutationOutcome::Deduplicated { submission_count, .. } = outcome {
+        if let MutationOutcome::Deduplicated {
+            submission_count, ..
+        } = outcome
+        {
             assert_eq!(submission_count, 3);
         } else {
             panic!("expected Deduplicated");
@@ -748,11 +753,27 @@ mod tests {
         // Capacity is 3, so oldest 2 should be evicted
         assert_eq!(guard.len(), 3);
         // Keys 0 and 1 should be gone
-        assert!(guard.get_record(MutationKey::derive("test", "0").as_str()).is_none());
-        assert!(guard.get_record(MutationKey::derive("test", "1").as_str()).is_none());
+        assert!(
+            guard
+                .get_record(MutationKey::derive("test", "0").as_str())
+                .is_none()
+        );
+        assert!(
+            guard
+                .get_record(MutationKey::derive("test", "1").as_str())
+                .is_none()
+        );
         // Keys 2, 3, 4 should remain
-        assert!(guard.get_record(MutationKey::derive("test", "2").as_str()).is_some());
-        assert!(guard.get_record(MutationKey::derive("test", "4").as_str()).is_some());
+        assert!(
+            guard
+                .get_record(MutationKey::derive("test", "2").as_str())
+                .is_some()
+        );
+        assert!(
+            guard
+                .get_record(MutationKey::derive("test", "4").as_str())
+                .is_some()
+        );
     }
 
     #[test]
@@ -782,7 +803,10 @@ mod tests {
         // Retry with same key should be deduplicated
         let outcome = guard.record(key, true, None, None, 1, 1001);
         assert!(outcome.is_deduplicated());
-        if let MutationOutcome::Deduplicated { original_success, .. } = outcome {
+        if let MutationOutcome::Deduplicated {
+            original_success, ..
+        } = outcome
+        {
             assert!(!original_success); // original was failure
         }
     }

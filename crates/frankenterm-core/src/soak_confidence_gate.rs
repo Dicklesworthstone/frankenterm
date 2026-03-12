@@ -87,10 +87,7 @@ impl JourneyCategory {
     pub fn is_critical(&self) -> bool {
         matches!(
             self,
-            Self::Watch
-                | Self::RobotOrchestration
-                | Self::SessionPersistence
-                | Self::RestartCycle
+            Self::Watch | Self::RobotOrchestration | Self::SessionPersistence | Self::RestartCycle
         )
     }
 }
@@ -133,12 +130,8 @@ pub enum WorkloadProfile {
 
 impl WorkloadProfile {
     /// All defined workload profiles.
-    pub const ALL: &'static [WorkloadProfile] = &[
-        Self::Steady,
-        Self::Burst,
-        Self::Mixed,
-        Self::Degraded,
-    ];
+    pub const ALL: &'static [WorkloadProfile] =
+        &[Self::Steady, Self::Burst, Self::Mixed, Self::Degraded];
 }
 
 /// Failure injection intensity for soak scenarios.
@@ -156,12 +149,8 @@ pub enum FailureInjectionProfile {
 
 impl FailureInjectionProfile {
     /// All defined injection profiles.
-    pub const ALL: &'static [FailureInjectionProfile] = &[
-        Self::None,
-        Self::Light,
-        Self::Heavy,
-        Self::Cascade,
-    ];
+    pub const ALL: &'static [FailureInjectionProfile] =
+        &[Self::None, Self::Light, Self::Heavy, Self::Cascade];
 }
 
 // =============================================================================
@@ -252,9 +241,7 @@ impl SoakMatrix {
     /// Total number of cells in the matrix (scenarios × workloads × injections).
     #[must_use]
     pub fn cell_count(&self) -> usize {
-        self.scenarios.len()
-            * self.workload_profiles.len()
-            * self.injection_profiles.len()
+        self.scenarios.len() * self.workload_profiles.len() * self.injection_profiles.len()
     }
 
     /// Generate the execution plan from this matrix.
@@ -265,10 +252,7 @@ impl SoakMatrix {
             for workload in &self.workload_profiles {
                 for injection in &self.injection_profiles {
                     cells.push(SoakCell {
-                        cell_id: format!(
-                            "{}/{:?}/{:?}",
-                            scenario.scenario_id, workload, injection
-                        ),
+                        cell_id: format!("{}/{:?}/{:?}", scenario.scenario_id, workload, injection),
                         scenario_id: scenario.scenario_id.clone(),
                         category: scenario.category,
                         workload: *workload,
@@ -513,9 +497,7 @@ impl SoakExecutionResult {
                     == telemetry.tasks_completed + telemetry.tasks_cancelled,
                 evidence: format!(
                     "spawned={}, completed={}, cancelled={}",
-                    telemetry.tasks_spawned,
-                    telemetry.tasks_completed,
-                    telemetry.tasks_cancelled
+                    telemetry.tasks_spawned, telemetry.tasks_completed, telemetry.tasks_cancelled
                 ),
                 mandatory: true,
             },
@@ -523,22 +505,16 @@ impl SoakExecutionResult {
                 invariant_id: "SOAK-INV-02".into(),
                 description: "No deadlocks — all cells completed within timeout".into(),
                 passed: telemetry.deadlock_detected_count == 0,
-                evidence: format!(
-                    "deadlocks_detected={}",
-                    telemetry.deadlock_detected_count
-                ),
+                evidence: format!("deadlocks_detected={}", telemetry.deadlock_detected_count),
                 mandatory: true,
             },
             SoakInvariantCheck {
                 invariant_id: "SOAK-INV-03".into(),
                 description: "No message loss — ops_attempted == ops_succeeded + ops_failed".into(),
-                passed: telemetry.ops_attempted
-                    == telemetry.ops_succeeded + telemetry.ops_failed,
+                passed: telemetry.ops_attempted == telemetry.ops_succeeded + telemetry.ops_failed,
                 evidence: format!(
                     "attempted={}, succeeded={}, failed={}",
-                    telemetry.ops_attempted,
-                    telemetry.ops_succeeded,
-                    telemetry.ops_failed
+                    telemetry.ops_attempted, telemetry.ops_succeeded, telemetry.ops_failed
                 ),
                 mandatory: true,
             },
@@ -546,18 +522,14 @@ impl SoakExecutionResult {
                 invariant_id: "SOAK-INV-04".into(),
                 description: "No unbounded latency — p95 < 5000ms across all cells".into(),
                 passed: telemetry.max_p95_latency_ms < 5000.0,
-                evidence: format!(
-                    "max_p95_latency_ms={:.1}",
-                    telemetry.max_p95_latency_ms
-                ),
+                evidence: format!("max_p95_latency_ms={:.1}", telemetry.max_p95_latency_ms),
                 mandatory: true,
             },
             SoakInvariantCheck {
                 invariant_id: "SOAK-INV-05".into(),
                 description: "Recovery completeness — all fault-injected cells attempted recovery"
                     .into(),
-                passed: telemetry.faults_injected == 0
-                    || telemetry.recoveries > 0,
+                passed: telemetry.faults_injected == 0 || telemetry.recoveries > 0,
                 evidence: format!(
                     "faults_injected={}, recoveries={}",
                     telemetry.faults_injected, telemetry.recoveries
@@ -658,10 +630,7 @@ impl ConfidenceGate {
         let pass_rate = results.pass_rate();
         checks.push(GateCondition {
             condition_id: "CONF-01-pass-rate".into(),
-            description: format!(
-                "Pass rate >= {:.0}%",
-                self.min_pass_rate * 100.0
-            ),
+            description: format!("Pass rate >= {:.0}%", self.min_pass_rate * 100.0),
             passed: pass_rate >= self.min_pass_rate,
             measured: format!("{:.1}%", pass_rate * 100.0),
             blocking: true,
@@ -691,10 +660,7 @@ impl ConfidenceGate {
         let error_rate = results.aggregate_error_rate();
         checks.push(GateCondition {
             condition_id: "CONF-04-error-rate".into(),
-            description: format!(
-                "Error rate <= {:.1}%",
-                self.max_error_rate * 100.0
-            ),
+            description: format!("Error rate <= {:.1}%", self.max_error_rate * 100.0),
             passed: error_rate <= self.max_error_rate,
             measured: format!("{:.2}%", error_rate * 100.0),
             blocking: false,
@@ -708,20 +674,14 @@ impl ConfidenceGate {
             .fold(0.0_f64, f64::max);
         checks.push(GateCondition {
             condition_id: "CONF-05-latency".into(),
-            description: format!(
-                "Max p95 latency <= {:.0}ms",
-                self.max_p95_latency_ms
-            ),
+            description: format!("Max p95 latency <= {:.0}ms", self.max_p95_latency_ms),
             passed: max_latency <= self.max_p95_latency_ms,
             measured: format!("{max_latency:.1}ms"),
             blocking: false,
         });
 
         // Determine verdict.
-        let blocking_check_failures = checks
-            .iter()
-            .filter(|c| c.blocking && !c.passed)
-            .count();
+        let blocking_check_failures = checks.iter().filter(|c| c.blocking && !c.passed).count();
         let non_blocking_failures = checks.iter().filter(|c| !c.blocking && !c.passed).count();
 
         let decision = if blocking_check_failures > 0 {
@@ -819,10 +779,7 @@ impl ConfidenceVerdict {
     #[must_use]
     pub fn render_summary(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!(
-            "=== Confidence Verdict: {:?} ===",
-            self.decision
-        ));
+        lines.push(format!("=== Confidence Verdict: {:?} ===", self.decision));
         lines.push(format!(
             "Cells: {}/{} passed ({:.1}%)",
             self.cells_passed,
@@ -1003,7 +960,11 @@ mod tests {
         assert_eq!(invariants.len(), 5);
         // All should pass.
         for inv in &invariants {
-            assert!(inv.passed, "Invariant {} failed: {}", inv.invariant_id, inv.evidence);
+            assert!(
+                inv.passed,
+                "Invariant {} failed: {}",
+                inv.invariant_id, inv.evidence
+            );
         }
     }
 
@@ -1130,9 +1091,7 @@ mod tests {
 
     #[test]
     fn test_verdict_render_summary() {
-        let results = sample_results(vec![
-            passing_cell("c1", JourneyCategory::Watch, true),
-        ]);
+        let results = sample_results(vec![passing_cell("c1", JourneyCategory::Watch, true)]);
         let gate = ConfidenceGate::standard();
         let verdict = gate.evaluate(&results);
         let summary = verdict.render_summary();
@@ -1196,12 +1155,9 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip() {
-        let results = sample_results(vec![
-            passing_cell("c1", JourneyCategory::Watch, true),
-        ]);
+        let results = sample_results(vec![passing_cell("c1", JourneyCategory::Watch, true)]);
         let json = serde_json::to_string(&results).expect("serialize");
-        let restored: SoakExecutionResult =
-            serde_json::from_str(&json).expect("deserialize");
+        let restored: SoakExecutionResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.cell_results.len(), 1);
         assert_eq!(restored.invariant_checks.len(), 5);
     }

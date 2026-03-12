@@ -16,9 +16,13 @@ use std::time::Duration;
 fn arb_drill_kind() -> impl Strategy<Value = DrillKind> {
     prop_oneof![
         Just(DrillKind::ColdStart),
-        (0..1000u32).prop_map(|f| DrillKind::PartialFailure { failure_fraction: f }),
+        (0..1000u32).prop_map(|f| DrillKind::PartialFailure {
+            failure_fraction: f
+        }),
         Just(DrillKind::CascadingFailure),
-        (1..3600u64).prop_map(|s| DrillKind::TimeTravel { lookback: Duration::from_secs(s) }),
+        (1..3600u64).prop_map(|s| DrillKind::TimeTravel {
+            lookback: Duration::from_secs(s)
+        }),
         (1..500u64).prop_map(|c| DrillKind::ScaleRecovery { pane_count: c }),
         "[a-z-]{3,15}".prop_map(DrillKind::Custom),
     ]

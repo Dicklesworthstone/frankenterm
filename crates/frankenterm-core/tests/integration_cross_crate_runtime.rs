@@ -13,7 +13,7 @@ use frankenterm_core::asupersync_observability::{
     AsupersyncObservabilityConfig, AsupersyncTelemetrySnapshot,
 };
 use frankenterm_core::cross_crate_integration::{
-    CrateBoundary, ScenarioCategory, standard_scenarios, SuiteReport,
+    CrateBoundary, ScenarioCategory, SuiteReport, standard_scenarios,
 };
 use frankenterm_core::runtime_diagnostics_ux::{
     CertificationReport, DiagnosticCatalog, render_diagnostic,
@@ -22,13 +22,13 @@ use frankenterm_core::runtime_health::{
     CheckStatus, RemediationEffort, RemediationHint, RuntimeDoctorReport, RuntimeHealthCheck,
     StatusCounts,
 };
-use frankenterm_core::runtime_telemetry::RuntimePhase;
 use frankenterm_core::runtime_performance_contract::{
     PercentileThresholds, RuntimePerformanceContract,
 };
 use frankenterm_core::runtime_slo_gates::{
     GateReport, GateVerdict, RuntimeSloSample, standard_alert_policy, standard_runtime_slos,
 };
+use frankenterm_core::runtime_telemetry::RuntimePhase;
 use frankenterm_core::runtime_telemetry::{FailureClass, HealthTier};
 
 // =========================================================================
@@ -85,7 +85,11 @@ fn slo_evaluation_non_critical_breach_conditional_pass() {
 
     let report = GateReport::evaluate(&slos, &samples, &policy);
     // Should be ConditionalPass (non-critical breach) or Pass if all non-critical happen to satisfy
-    assert_ne!(report.verdict, GateVerdict::Fail, "only non-critical breaches should not Fail");
+    assert_ne!(
+        report.verdict,
+        GateVerdict::Fail,
+        "only non-critical breaches should not Fail"
+    );
 }
 
 // =========================================================================
@@ -98,7 +102,10 @@ fn slo_evaluation_critical_breach_yields_fail() {
     let policy = standard_alert_policy();
 
     // Find a critical SLO and breach it
-    let critical_slo = slos.iter().find(|s| s.critical).expect("should have critical SLO");
+    let critical_slo = slos
+        .iter()
+        .find(|s| s.critical)
+        .expect("should have critical SLO");
 
     let samples = vec![RuntimeSloSample {
         slo_id: critical_slo.id,
@@ -180,7 +187,12 @@ fn health_checks_produce_valid_doctor_report() {
         overall_tier: HealthTier::Yellow,
         phase: RuntimePhase::Running,
         checks: checks.clone(),
-        status_counts: StatusCounts { pass: 1, warn: 1, fail: 0, skip: 0 },
+        status_counts: StatusCounts {
+            pass: 1,
+            warn: 1,
+            fail: 0,
+            skip: 0,
+        },
         total_duration_us: 100,
         telemetry_snapshot: None,
     };
@@ -220,10 +232,8 @@ fn standard_scenarios_cover_all_boundaries() {
 #[test]
 fn standard_scenarios_cover_multiple_categories() {
     let scenarios = standard_scenarios();
-    let categories: std::collections::HashSet<&ScenarioCategory> = scenarios
-        .iter()
-        .map(|s| &s.category)
-        .collect();
+    let categories: std::collections::HashSet<&ScenarioCategory> =
+        scenarios.iter().map(|s| &s.category).collect();
     assert!(
         categories.len() >= 3,
         "should cover at least 3 scenario categories, got {}",
@@ -286,14 +296,20 @@ fn standard_contract_covers_main_categories() {
 fn percentile_thresholds_satisfied_by_faster() {
     let target = PercentileThresholds::new(50.0, 100.0, 200.0);
     let actual = PercentileThresholds::new(25.0, 50.0, 100.0);
-    assert!(target.satisfied_by(&actual), "faster actuals should satisfy target");
+    assert!(
+        target.satisfied_by(&actual),
+        "faster actuals should satisfy target"
+    );
 }
 
 #[test]
 fn percentile_thresholds_not_satisfied_by_slower() {
     let target = PercentileThresholds::new(50.0, 100.0, 200.0);
     let actual = PercentileThresholds::new(100.0, 200.0, 400.0);
-    assert!(!target.satisfied_by(&actual), "slower actuals should not satisfy target");
+    assert!(
+        !target.satisfied_by(&actual),
+        "slower actuals should not satisfy target"
+    );
 }
 
 #[test]
@@ -315,8 +331,14 @@ fn diagnostic_catalog_certification_pipeline() {
     let catalog = DiagnosticCatalog::standard();
     let report = CertificationReport::certify(&catalog);
 
-    assert!(report.overall_pass, "standard catalog should pass certification");
-    assert_eq!(report.pass_count, 10, "should certify all 10 failure classes");
+    assert!(
+        report.overall_pass,
+        "standard catalog should pass certification"
+    );
+    assert_eq!(
+        report.pass_count, 10,
+        "should certify all 10 failure classes"
+    );
     assert!(report.missing_classes.is_empty());
 
     // Serde roundtrip the certification report
@@ -506,7 +528,7 @@ fn recovery_failures_yield_black_tier() {
         permit_timeouts: 0,
         permit_max_wait_us: 0,
         recovery_attempts: 10,
-        recovery_successes: 3,  // < 50% success
+        recovery_successes: 3, // < 50% success
         recovery_failures: 7,
         recovery_latency_max_ms: 5000,
         health_samples: 0,
@@ -521,7 +543,11 @@ fn recovery_failures_yield_black_tier() {
     };
 
     let tier = snap.overall_health_tier(&config);
-    assert_eq!(tier, HealthTier::Black, "majority recovery failures should yield Black");
+    assert_eq!(
+        tier,
+        HealthTier::Black,
+        "majority recovery failures should yield Black"
+    );
 }
 
 // =========================================================================

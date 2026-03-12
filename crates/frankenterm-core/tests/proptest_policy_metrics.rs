@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use frankenterm_core::policy_metrics::{
     HealthIndicator, HealthStatus, MetricSample, MetricTimeSeries, MetricUnit,
-    PolicyMetricsCollector, PolicyMetricsCounters, PolicyMetricsDashboard,
-    PolicyMetricsThresholds, PolicySubsystemInput, SubsystemMetricSummary,
+    PolicyMetricsCollector, PolicyMetricsCounters, PolicyMetricsDashboard, PolicyMetricsThresholds,
+    PolicySubsystemInput, SubsystemMetricSummary,
 };
 
 // =============================================================================
@@ -72,7 +72,15 @@ fn arb_subsystem_metric_summary() -> impl Strategy<Value = SubsystemMetricSummar
         any::<u32>(),
     )
         .prop_map(
-            |(subsystem, health, evaluations, denials, denial_rate_pct, active_quarantines, active_violations)| {
+            |(
+                subsystem,
+                health,
+                evaluations,
+                denials,
+                denial_rate_pct,
+                active_quarantines,
+                active_violations,
+            )| {
                 SubsystemMetricSummary {
                     subsystem,
                     health,
@@ -134,16 +142,14 @@ fn arb_policy_metrics_thresholds() -> impl Strategy<Value = PolicyMetricsThresho
         0..=1000u32,
         0..=1000u32,
     )
-        .prop_map(
-            |(dw, dc, qw, qc, vw, vc)| PolicyMetricsThresholds {
-                denial_rate_warning_pct: dw,
-                denial_rate_critical_pct: dc,
-                quarantine_warning_count: qw,
-                quarantine_critical_count: qc,
-                violation_warning_count: vw,
-                violation_critical_count: vc,
-            },
-        )
+        .prop_map(|(dw, dc, qw, qc, vw, vc)| PolicyMetricsThresholds {
+            denial_rate_warning_pct: dw,
+            denial_rate_critical_pct: dc,
+            quarantine_warning_count: qw,
+            quarantine_critical_count: qc,
+            violation_warning_count: vw,
+            violation_critical_count: vc,
+        })
 }
 
 fn arb_policy_metrics_dashboard() -> impl Strategy<Value = PolicyMetricsDashboard> {

@@ -480,11 +480,8 @@ impl ExplainabilityConsole {
     pub fn query(&mut self, query: &TraceQuery) -> TraceResult {
         self.telemetry.queries_executed += 1;
 
-        let matching: Vec<&DecisionTrace> = self
-            .traces
-            .iter()
-            .filter(|t| query.matches(t))
-            .collect();
+        let matching: Vec<&DecisionTrace> =
+            self.traces.iter().filter(|t| query.matches(t)).collect();
 
         let total_count = matching.len();
         self.telemetry.traces_matched += total_count as u64;
@@ -496,7 +493,11 @@ impl ExplainabilityConsole {
         let traces: Vec<DecisionTrace> = matching
             .into_iter()
             .skip(query.offset)
-            .take(if query.limit == 0 { usize::MAX } else { query.limit })
+            .take(if query.limit == 0 {
+                usize::MAX
+            } else {
+                query.limit
+            })
             .cloned()
             .collect();
 
@@ -579,10 +580,7 @@ impl ExplainabilityConsole {
             DecisionOutcome::RequireApproval => "REQUIRE_APPROVAL",
         };
 
-        let rule_str = trace
-            .rule_id
-            .as_deref()
-            .unwrap_or("(no rule)");
+        let rule_str = trace.rule_id.as_deref().unwrap_or("(no rule)");
 
         let mut lines = vec![
             format!(
@@ -738,12 +736,24 @@ mod tests {
     #[test]
     fn console_ingest_assigns_trace_id() {
         let mut console = ExplainabilityConsole::new(100);
-        let trace = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(1), 1000);
+        let trace = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(1),
+            1000,
+        );
         let id = console.ingest(trace);
         assert_eq!(id, 1);
         assert_eq!(console.len(), 1);
 
-        let trace2 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, Some(2), 1001);
+        let trace2 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            Some(2),
+            1001,
+        );
         let id2 = console.ingest(trace2);
         assert_eq!(id2, 2);
     }
@@ -752,7 +762,13 @@ mod tests {
     fn console_capacity_eviction() {
         let mut console = ExplainabilityConsole::new(3);
         for i in 0..5 {
-            let trace = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(i as u64), 1000 + i);
+            let trace = make_trace(
+                ActionKind::SendText,
+                DecisionOutcome::Allow,
+                TraceSource::Policy,
+                Some(i as u64),
+                1000 + i,
+            );
             console.ingest(trace);
         }
         assert_eq!(console.len(), 3);
@@ -765,7 +781,13 @@ mod tests {
     #[test]
     fn console_get_trace_by_id() {
         let mut console = ExplainabilityConsole::new(100);
-        let trace = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(42), 1000);
+        let trace = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(42),
+            1000,
+        );
         let id = console.ingest(trace);
         let found = console.get_trace(id).unwrap();
         assert_eq!(found.pane_id, Some(42));
@@ -783,7 +805,13 @@ mod tests {
     fn query_all() {
         let mut console = ExplainabilityConsole::new(100);
         for i in 0..5 {
-            let trace = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(i), 1000 + i);
+            let trace = make_trace(
+                ActionKind::SendText,
+                DecisionOutcome::Allow,
+                TraceSource::Policy,
+                Some(i),
+                1000 + i,
+            );
             console.ingest(trace);
         }
         let result = console.query(&TraceQuery::all(10));
@@ -794,9 +822,27 @@ mod tests {
     #[test]
     fn query_by_pane() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(1), 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, Some(2), 1001));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(1), 1002));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(1),
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            Some(2),
+            1001,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(1),
+            1002,
+        ));
 
         let result = console.query(&TraceQuery::for_pane(1, 10));
         assert_eq!(result.total_count, 2);
@@ -805,21 +851,62 @@ mod tests {
     #[test]
     fn query_denials_only() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1001));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1002));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1001,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1002,
+        ));
 
         let result = console.query(&TraceQuery::denials(10));
         assert_eq!(result.total_count, 2);
-        assert!(result.traces.iter().all(|t| t.outcome == DecisionOutcome::Deny));
+        assert!(
+            result
+                .traces
+                .iter()
+                .all(|t| t.outcome == DecisionOutcome::Deny)
+        );
     }
 
     #[test]
     fn query_by_source() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Connector, None, 1001));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Workflow, None, 1002));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Connector,
+            None,
+            1001,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Workflow,
+            None,
+            1002,
+        ));
 
         let query = TraceQuery {
             source: Some(TraceSource::Connector),
@@ -833,9 +920,27 @@ mod tests {
     #[test]
     fn query_by_time_range() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 2000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 3000));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            2000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            3000,
+        ));
 
         let query = TraceQuery {
             since_ms: Some(1500),
@@ -852,15 +957,33 @@ mod tests {
     fn query_by_severity() {
         let mut console = ExplainabilityConsole::new(100);
 
-        let mut t1 = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000);
+        let mut t1 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        );
         t1.severity = TraceSeverity::Info;
         console.ingest(t1);
 
-        let mut t2 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1001);
+        let mut t2 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1001,
+        );
         t2.severity = TraceSeverity::Denied;
         console.ingest(t2);
 
-        let mut t3 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1002);
+        let mut t3 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1002,
+        );
         t3.severity = TraceSeverity::Critical;
         console.ingest(t3);
 
@@ -877,7 +1000,13 @@ mod tests {
     fn query_pagination() {
         let mut console = ExplainabilityConsole::new(100);
         for i in 0..10 {
-            console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000 + i));
+            console.ingest(make_trace(
+                ActionKind::SendText,
+                DecisionOutcome::Allow,
+                TraceSource::Policy,
+                None,
+                1000 + i,
+            ));
         }
 
         let query = TraceQuery {
@@ -897,15 +1026,33 @@ mod tests {
     fn correlation_groups_traces() {
         let mut console = ExplainabilityConsole::new(100);
 
-        let mut t1 = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000);
+        let mut t1 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        );
         t1.correlation_id = Some("op-123".to_string());
         let id1 = console.ingest(t1);
 
-        let mut t2 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Connector, None, 1001);
+        let mut t2 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Connector,
+            None,
+            1001,
+        );
         t2.correlation_id = Some("op-123".to_string());
         console.ingest(t2);
 
-        let mut t3 = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1002);
+        let mut t3 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1002,
+        );
         t3.correlation_id = Some("op-456".to_string());
         console.ingest(t3);
 
@@ -918,11 +1065,23 @@ mod tests {
     fn correlation_query() {
         let mut console = ExplainabilityConsole::new(100);
 
-        let mut t1 = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000);
+        let mut t1 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        );
         t1.correlation_id = Some("op-123".to_string());
         console.ingest(t1);
 
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1001));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1001,
+        ));
 
         let result = console.query(&TraceQuery::by_correlation("op-123", 10));
         assert_eq!(result.total_count, 1);
@@ -933,16 +1092,36 @@ mod tests {
     #[test]
     fn link_traces_creates_causal_edge() {
         let mut console = ExplainabilityConsole::new(100);
-        let id1 = console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1000));
-        let id2 = console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1001));
+        let id1 = console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        let id2 = console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1001,
+        ));
 
-        let linked = console.link_traces(id2, id1, CausalRelationship::RetryOf, Some("retry after denial".into()));
+        let linked = console.link_traces(
+            id2,
+            id1,
+            CausalRelationship::RetryOf,
+            Some("retry after denial".into()),
+        );
         assert!(linked);
 
         let trace = console.get_trace(id2).unwrap();
         assert_eq!(trace.causal_links.len(), 1);
         assert_eq!(trace.causal_links[0].related_trace_id, id1);
-        assert_eq!(trace.causal_links[0].relationship, CausalRelationship::RetryOf);
+        assert_eq!(
+            trace.causal_links[0].relationship,
+            CausalRelationship::RetryOf
+        );
     }
 
     #[test]
@@ -994,9 +1173,27 @@ mod tests {
     #[test]
     fn summary_counts_by_outcome() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1001));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1002));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1001,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1002,
+        ));
 
         let result = console.query(&TraceQuery::all(10));
         assert_eq!(result.summary.by_outcome.get("allow"), Some(&2));
@@ -1006,9 +1203,27 @@ mod tests {
     #[test]
     fn summary_tracks_pane_ids() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(1), 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(3), 1001));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, Some(1), 1002));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(1),
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(3),
+            1001,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            Some(1),
+            1002,
+        ));
 
         let result = console.query(&TraceQuery::all(10));
         assert_eq!(result.summary.pane_ids, vec![1, 3]);
@@ -1017,9 +1232,27 @@ mod tests {
     #[test]
     fn summary_time_range() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 3000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 2000));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            3000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            2000,
+        ));
 
         let result = console.query(&TraceQuery::all(10));
         assert_eq!(result.summary.earliest_ms, Some(1000));
@@ -1030,7 +1263,13 @@ mod tests {
 
     #[test]
     fn render_trace_contains_key_info() {
-        let mut trace = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, Some(42), 1000);
+        let mut trace = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            Some(42),
+            1000,
+        );
         trace.trace_id = 7;
         trace.rule_id = Some("safety.alt_screen".into());
         trace.reason = "Alt screen is active".into();
@@ -1045,7 +1284,13 @@ mod tests {
 
     #[test]
     fn render_trace_shows_causal_links() {
-        let mut trace = make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000);
+        let mut trace = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        );
         trace.trace_id = 5;
         trace.causal_links.push(CausalLink {
             related_trace_id: 3,
@@ -1064,8 +1309,20 @@ mod tests {
     #[test]
     fn telemetry_tracks_ingestion() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1001));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1001,
+        ));
 
         assert_eq!(console.telemetry().traces_ingested, 2);
     }
@@ -1074,7 +1331,13 @@ mod tests {
     fn telemetry_tracks_evictions() {
         let mut console = ExplainabilityConsole::new(2);
         for i in 0..5 {
-            console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000 + i));
+            console.ingest(make_trace(
+                ActionKind::SendText,
+                DecisionOutcome::Allow,
+                TraceSource::Policy,
+                None,
+                1000 + i,
+            ));
         }
         assert_eq!(console.telemetry().traces_evicted, 3);
     }
@@ -1082,7 +1345,13 @@ mod tests {
     #[test]
     fn telemetry_tracks_queries() {
         let mut console = ExplainabilityConsole::new(100);
-        console.ingest(make_trace(ActionKind::SendText, DecisionOutcome::Allow, TraceSource::Policy, None, 1000));
+        console.ingest(make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Allow,
+            TraceSource::Policy,
+            None,
+            1000,
+        ));
         let _ = console.query(&TraceQuery::all(10));
         let _ = console.query(&TraceQuery::all(10));
         assert_eq!(console.telemetry().queries_executed, 2);
@@ -1093,7 +1362,13 @@ mod tests {
 
     #[test]
     fn decision_trace_serde_roundtrip() {
-        let mut trace = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, Some(42), 1000);
+        let mut trace = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            Some(42),
+            1000,
+        );
         trace.trace_id = 1;
         trace.rule_id = Some("test.rule".into());
         trace.context.insert("key".into(), "value".into());
@@ -1151,11 +1426,23 @@ mod tests {
     #[test]
     fn query_by_rule_id() {
         let mut console = ExplainabilityConsole::new(100);
-        let mut t1 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1000);
+        let mut t1 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1000,
+        );
         t1.rule_id = Some("safety.alt_screen".into());
         console.ingest(t1);
 
-        let mut t2 = make_trace(ActionKind::SendText, DecisionOutcome::Deny, TraceSource::Policy, None, 1001);
+        let mut t2 = make_trace(
+            ActionKind::SendText,
+            DecisionOutcome::Deny,
+            TraceSource::Policy,
+            None,
+            1001,
+        );
         t2.rule_id = Some("safety.rate_limit".into());
         console.ingest(t2);
 

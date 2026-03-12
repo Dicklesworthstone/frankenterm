@@ -285,9 +285,7 @@ impl ScanReport {
     pub fn by_runtime(&self) -> BTreeMap<String, Vec<&ForbiddenImport>> {
         let mut map: BTreeMap<String, Vec<&ForbiddenImport>> = BTreeMap::new();
         for v in &self.violations {
-            map.entry(v.runtime.label().into())
-                .or_default()
-                .push(v);
+            map.entry(v.runtime.label().into()).or_default().push(v);
         }
         map
     }
@@ -295,7 +293,10 @@ impl ScanReport {
     /// Whether the scan is clean enough for cutover.
     #[must_use]
     pub fn is_cutover_ready(&self) -> bool {
-        matches!(self.verdict, ScanVerdict::Clean | ScanVerdict::CleanWithNotes)
+        matches!(
+            self.verdict,
+            ScanVerdict::Clean | ScanVerdict::CleanWithNotes
+        )
     }
 }
 
@@ -346,9 +347,7 @@ impl RegressionGuardSet {
     /// Create an empty guard set.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            guards: Vec::new(),
-        }
+        Self { guards: Vec::new() }
     }
 
     /// Add a guard.
@@ -558,7 +557,11 @@ pub enum MigrationStatus {
 impl MigrationReport {
     /// Create a new migration report.
     #[must_use]
-    pub fn new(migration_id: impl Into<String>, scan: ScanReport, guards: RegressionGuardSet) -> Self {
+    pub fn new(
+        migration_id: impl Into<String>,
+        scan: ScanReport,
+        guards: RegressionGuardSet,
+    ) -> Self {
         let status = if !scan.is_cutover_ready() || !guards.all_pass() {
             MigrationStatus::InProgress
         } else {
@@ -714,17 +717,15 @@ mod tests {
 
     #[test]
     fn test_scan_report_with_violations() {
-        let violations = vec![
-            ForbiddenImport {
-                pattern_id: "FP-01".into(),
-                file_path: "src/foo.rs".into(),
-                line_number: 5,
-                line_content: "use tokio::runtime;".into(),
-                severity: ViolationSeverity::Critical,
-                in_test_context: false,
-                runtime: ForbiddenRuntime::Tokio,
-            },
-        ];
+        let violations = vec![ForbiddenImport {
+            pattern_id: "FP-01".into(),
+            file_path: "src/foo.rs".into(),
+            line_number: 5,
+            line_content: "use tokio::runtime;".into(),
+            severity: ViolationSeverity::Critical,
+            in_test_context: false,
+            runtime: ForbiddenRuntime::Tokio,
+        }];
 
         let report = ScanReport::from_violations(100, 5000, 9, violations);
         assert_eq!(report.verdict, ScanVerdict::Violations);
@@ -734,17 +735,15 @@ mod tests {
 
     #[test]
     fn test_scan_report_test_only_is_clean_with_notes() {
-        let violations = vec![
-            ForbiddenImport {
-                pattern_id: "FP-03".into(),
-                file_path: "src/foo.rs".into(),
-                line_number: 10,
-                line_content: "#[tokio::test]".into(),
-                severity: ViolationSeverity::Error,
-                in_test_context: true,
-                runtime: ForbiddenRuntime::Tokio,
-            },
-        ];
+        let violations = vec![ForbiddenImport {
+            pattern_id: "FP-03".into(),
+            file_path: "src/foo.rs".into(),
+            line_number: 10,
+            line_content: "#[tokio::test]".into(),
+            severity: ViolationSeverity::Error,
+            in_test_context: true,
+            runtime: ForbiddenRuntime::Tokio,
+        }];
 
         let report = ScanReport::from_violations(100, 5000, 9, violations);
         assert_eq!(report.verdict, ScanVerdict::CleanWithNotes);
@@ -753,17 +752,15 @@ mod tests {
 
     #[test]
     fn test_scan_report_info_only_is_clean_with_notes() {
-        let violations = vec![
-            ForbiddenImport {
-                pattern_id: "FP-INFO".into(),
-                file_path: "src/compat.rs".into(),
-                line_number: 1,
-                line_content: "// compatibility shim for tokio".into(),
-                severity: ViolationSeverity::Info,
-                in_test_context: false,
-                runtime: ForbiddenRuntime::Tokio,
-            },
-        ];
+        let violations = vec![ForbiddenImport {
+            pattern_id: "FP-INFO".into(),
+            file_path: "src/compat.rs".into(),
+            line_number: 1,
+            line_content: "// compatibility shim for tokio".into(),
+            severity: ViolationSeverity::Info,
+            in_test_context: false,
+            runtime: ForbiddenRuntime::Tokio,
+        }];
 
         let report = ScanReport::from_violations(100, 5000, 9, violations);
         assert_eq!(report.verdict, ScanVerdict::CleanWithNotes);

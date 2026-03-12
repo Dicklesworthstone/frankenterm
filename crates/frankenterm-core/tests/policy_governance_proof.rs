@@ -10,8 +10,7 @@
 //! 7. Audit chain tamper-evidence — chain invariant holds across operations
 
 use frankenterm_core::policy::{
-    ActionKind, ActorKind, ApprovalStatus, ForensicQuery, PolicyDecision,
-    PolicyEngine, PolicyInput,
+    ActionKind, ActorKind, ApprovalStatus, ForensicQuery, PolicyDecision, PolicyEngine, PolicyInput,
 };
 use frankenterm_core::policy_quarantine::{
     ComponentKind, KillSwitchLevel, QuarantineReason, QuarantineSeverity,
@@ -104,7 +103,10 @@ fn proof_kill_switch_overrides_everything() {
 
     // Verify connector works first
     let input = connector_input("payment-api");
-    assert!(is_allowed(&engine.authorize(&input)), "should be allowed before kill switch");
+    assert!(
+        is_allowed(&engine.authorize(&input)),
+        "should be allowed before kill switch"
+    );
 
     // Trip emergency halt
     engine.trip_kill_switch(
@@ -179,11 +181,9 @@ fn proof_revocation_overrides_namespace() {
 
     // Bind connector to ns-b
     let ns_b = TenantNamespace::new("org-b").unwrap();
-    engine.namespace_registry_mut().bind(
-        NamespacedResourceKind::Connector,
-        "payment-api",
-        ns_b,
-    );
+    engine
+        .namespace_registry_mut()
+        .bind(NamespacedResourceKind::Connector, "payment-api", ns_b);
 
     // Revoke the connector
     engine.revoke_resource("connector", "payment-api", "compromised", "sec-team", 1000);
@@ -250,7 +250,15 @@ fn proof_approval_state_machine_no_skip() {
     let mut engine = make_engine();
 
     // Submit → Pending
-    let id = engine.submit_approval("deploy", "bot", "prod", "need deploy", "rule.deploy", 1000, 0);
+    let id = engine.submit_approval(
+        "deploy",
+        "bot",
+        "prod",
+        "need deploy",
+        "rule.deploy",
+        1000,
+        0,
+    );
     let tracker = engine.approval_tracker();
     let entry = tracker.get(&id).expect("should find approval");
     assert_eq!(entry.status, ApprovalStatus::Pending);
@@ -328,7 +336,10 @@ fn proof_revocation_instantly_blocks_authorize() {
     let input = connector_input("slack-webhook");
 
     // Allowed before revocation
-    assert!(is_allowed(&engine.authorize(&input)), "allowed before revoke");
+    assert!(
+        is_allowed(&engine.authorize(&input)),
+        "allowed before revoke"
+    );
 
     // Revoke
     engine.revoke_resource("connector", "slack-webhook", "compromised", "sec", 1000);
@@ -572,10 +583,7 @@ fn proof_restricted_quarantine_allows_reads_denies_writes() {
     // Writes should be denied
     let write = pane_write_input(50);
     let d = engine.authorize(&write);
-    assert!(
-        is_denied(&d),
-        "Restricted quarantine must deny writes"
-    );
+    assert!(is_denied(&d), "Restricted quarantine must deny writes");
     assert_eq!(deny_rule(&d), Some("policy.quarantine"));
 }
 
@@ -602,7 +610,11 @@ fn proof_quarantine_release_restores_access() {
     let input = pane_read_input(60);
     let d = engine.authorize(&input);
     assert!(is_denied(&d), "Isolated quarantine denies reads too");
-    assert_eq!(deny_rule(&d), Some("policy.quarantine"), "denied by quarantine");
+    assert_eq!(
+        deny_rule(&d),
+        Some("policy.quarantine"),
+        "denied by quarantine"
+    );
 
     // Release
     engine
@@ -703,7 +715,10 @@ fn proof_audit_chain_entries_not_empty() {
 
     // Verify actor and description are non-empty
     for entry in &report.audit_trail {
-        assert!(!entry.actor.is_empty(), "audit entry actor must not be empty");
+        assert!(
+            !entry.actor.is_empty(),
+            "audit entry actor must not be empty"
+        );
         assert!(
             !entry.description.is_empty(),
             "audit entry description must not be empty"
@@ -825,7 +840,10 @@ fn proof_cascading_governance_actions_all_audited() {
     assert!(!report.approvals.is_empty(), "approval tracked");
     assert!(!report.revocations.is_empty(), "revocation tracked");
     assert!(!report.quarantine_active.is_empty(), "quarantine tracked");
-    assert!(report.audit_trail.len() >= 4, "at least 4 audit trail entries (revoke, quarantine, kill-switch, quarantine compliance)");
+    assert!(
+        report.audit_trail.len() >= 4,
+        "at least 4 audit trail entries (revoke, quarantine, kill-switch, quarantine compliance)"
+    );
 }
 
 #[test]

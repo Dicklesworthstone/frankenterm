@@ -70,7 +70,18 @@ fn arb_observability_config() -> impl Strategy<Value = AsupersyncObservabilityCo
         64..1024u64,
     )
         .prop_map(
-            |(enabled, sample_ms, scope_y, scope_r, depth, queue_w, queue_c, cancel_w, cancel_c, chan_d)| {
+            |(
+                enabled,
+                sample_ms,
+                scope_y,
+                scope_r,
+                depth,
+                queue_w,
+                queue_c,
+                cancel_w,
+                cancel_c,
+                chan_d,
+            )| {
                 AsupersyncObservabilityConfig {
                     enabled,
                     sample_interval_ms: sample_ms,
@@ -98,9 +109,21 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = AsupersyncTelemetrySnapshot
         // Scope tree
         (0..10_000u64, 0..10_000u64, 0..100u64, 0..5_000u64),
         // Tasks
-        (0..100_000u64, 0..100_000u64, 0..10_000u64, 0..100u64, 0..100u64),
+        (
+            0..100_000u64,
+            0..100_000u64,
+            0..10_000u64,
+            0..100u64,
+            0..100u64,
+        ),
         // Cancellation
-        (0..10_000u64, 0..10_000u64, 0..1_000_000u64, 0..100_000u64, 0..1_000u64),
+        (
+            0..10_000u64,
+            0..10_000u64,
+            0..1_000_000u64,
+            0..100_000u64,
+            0..1_000u64,
+        ),
         // Channels + locks
         (0..100_000u64, 0..100_000u64, 0..1_000u64, 0..1_000u64),
         // Locks cont
@@ -110,7 +133,13 @@ fn arb_telemetry_snapshot() -> impl Strategy<Value = AsupersyncTelemetrySnapshot
         // Recovery
         (0..1_000u64, 0..1_000u64, 0..100u64, 0..10_000u64),
         // Health + gate
-        (0..10_000u64, 0..10_000u64, 0..5_000u64, 0..2_000u64, 0..500u64),
+        (
+            0..10_000u64,
+            0..10_000u64,
+            0..5_000u64,
+            0..2_000u64,
+            0..500u64,
+        ),
         (0..10_000u64, 0..10_000u64, 0..5_000u64, 0..2_000u64),
     )
         .prop_map(
@@ -167,14 +196,16 @@ fn arb_slo_breach_summary() -> impl Strategy<Value = SloBreachSummary> {
         arb_runtime_alert_tier(),
         any::<bool>(),
     )
-        .prop_map(|(slo_id, measured, target, duration, alert_tier, critical)| SloBreachSummary {
-            slo_id,
-            measured,
-            target,
-            breach_duration_ms: duration,
-            alert_tier,
-            critical,
-        })
+        .prop_map(
+            |(slo_id, measured, target, duration, alert_tier, critical)| SloBreachSummary {
+                slo_id,
+                measured,
+                target,
+                breach_duration_ms: duration,
+                alert_tier,
+                critical,
+            },
+        )
 }
 
 fn arb_incident_context() -> impl Strategy<Value = AsupersyncIncidentContext> {

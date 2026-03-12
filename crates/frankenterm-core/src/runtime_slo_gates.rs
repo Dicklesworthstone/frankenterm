@@ -545,15 +545,11 @@ impl GateReport {
         let satisfied_count = results.iter().filter(|r| r.satisfied).count();
         let breached_count = total_slos - satisfied_count;
 
-        let critical_results: Vec<&SloGateResult> =
-            results.iter().filter(|r| r.critical).collect();
+        let critical_results: Vec<&SloGateResult> = results.iter().filter(|r| r.critical).collect();
         let critical_satisfied = critical_results.iter().filter(|r| r.satisfied).count();
         let critical_breached = critical_results.len() - critical_satisfied;
 
-        let max_alert_tier = results
-            .iter()
-            .filter_map(|r| r.alert_tier)
-            .max();
+        let max_alert_tier = results.iter().filter_map(|r| r.alert_tier).max();
 
         let verdict = if breached_count == 0 {
             GateVerdict::Pass
@@ -685,11 +681,7 @@ mod tests {
         let slos = standard_runtime_slos();
         let all_ids = RuntimeSloId::all();
         for id in all_ids {
-            assert!(
-                slos.iter().any(|s| s.id == *id),
-                "missing SLO for {:?}",
-                id
-            );
+            assert!(slos.iter().any(|s| s.id == *id), "missing SLO for {:?}", id);
         }
     }
 
@@ -697,7 +689,11 @@ mod tests {
     fn standard_slos_have_at_least_4_critical() {
         let slos = standard_runtime_slos();
         let critical_count = slos.iter().filter(|s| s.critical).count();
-        assert!(critical_count >= 4, "expected >= 4 critical SLOs, got {}", critical_count);
+        assert!(
+            critical_count >= 4,
+            "expected >= 4 critical SLOs, got {}",
+            critical_count
+        );
     }
 
     #[test]
@@ -781,7 +777,10 @@ mod tests {
             .collect();
 
         // Breach the critical cancellation latency SLO.
-        if let Some(s) = samples.iter_mut().find(|s| s.slo_id == RuntimeSloId::CancellationLatency) {
+        if let Some(s) = samples
+            .iter_mut()
+            .find(|s| s.slo_id == RuntimeSloId::CancellationLatency)
+        {
             s.measured = 100.0; // target is 50ms
         }
 
@@ -801,7 +800,10 @@ mod tests {
             .collect();
 
         // Breach a non-critical SLO (queue backlog).
-        if let Some(s) = samples.iter_mut().find(|s| s.slo_id == RuntimeSloId::QueueBacklogDepth) {
+        if let Some(s) = samples
+            .iter_mut()
+            .find(|s| s.slo_id == RuntimeSloId::QueueBacklogDepth)
+        {
             s.measured = 2000.0; // target is 1000
         }
 
@@ -822,7 +824,10 @@ mod tests {
             .collect();
 
         // Breach task leak (Deadlock class → Page tier).
-        if let Some(s) = samples.iter_mut().find(|s| s.slo_id == RuntimeSloId::TaskLeakRate) {
+        if let Some(s) = samples
+            .iter_mut()
+            .find(|s| s.slo_id == RuntimeSloId::TaskLeakRate)
+        {
             s.measured = 0.01; // target is 0.001
         }
 
@@ -865,7 +870,10 @@ mod tests {
             .map(|s| good_sample(s.id, s.target * 0.5))
             .collect();
 
-        if let Some(s) = samples.iter_mut().find(|s| s.slo_id == RuntimeSloId::CancellationLatency) {
+        if let Some(s) = samples
+            .iter_mut()
+            .find(|s| s.slo_id == RuntimeSloId::CancellationLatency)
+        {
             s.measured = 100.0;
         }
 
@@ -939,7 +947,11 @@ mod tests {
         let samples = vec![bad_sample(RuntimeSloId::CancellationLatency, 100.0)];
 
         let report = GateReport::evaluate(&slos, &samples, &policy);
-        let result = report.results.iter().find(|r| r.slo_id == RuntimeSloId::CancellationLatency).unwrap();
+        let result = report
+            .results
+            .iter()
+            .find(|r| r.slo_id == RuntimeSloId::CancellationLatency)
+            .unwrap();
         assert_eq!(result.budget_remaining, 0.0);
     }
 
@@ -950,7 +962,11 @@ mod tests {
         let samples = vec![good_sample(RuntimeSloId::CancellationLatency, 10.0)];
 
         let report = GateReport::evaluate(&slos, &samples, &policy);
-        let result = report.results.iter().find(|r| r.slo_id == RuntimeSloId::CancellationLatency).unwrap();
+        let result = report
+            .results
+            .iter()
+            .find(|r| r.slo_id == RuntimeSloId::CancellationLatency)
+            .unwrap();
         assert!(result.budget_remaining > 0.0);
     }
 }

@@ -268,8 +268,7 @@ impl EradicationPlan {
                 severity: ViolationSeverity::Error,
             },
             action: EradicationAction::MigrateToAsupersync,
-            rationale: "GUI event loop uses smol for async; migrate to asupersync block_on."
-                .into(),
+            rationale: "GUI event loop uses smol for async; migrate to asupersync block_on.".into(),
             migration_feature: Some("async-asupersync".into()),
             completed: false,
         });
@@ -310,8 +309,7 @@ impl EradicationPlan {
                 severity: ViolationSeverity::Error,
             },
             action: EradicationAction::MigrateToAsupersync,
-            rationale: "Mux server uses smol executor; replace with asupersync runtime."
-                .into(),
+            rationale: "Mux server uses smol executor; replace with asupersync runtime.".into(),
             migration_feature: Some("async-asupersync".into()),
             completed: false,
         });
@@ -397,8 +395,7 @@ impl EradicationPlan {
                 severity: ViolationSeverity::Warning,
             },
             action: EradicationAction::FeatureGate,
-            rationale: "UDS crate gated behind default-on feature; flip default to off."
-                .into(),
+            rationale: "UDS crate gated behind default-on feature; flip default to off.".into(),
             migration_feature: Some("async-io-backend".into()),
             completed: false,
         });
@@ -819,11 +816,7 @@ impl AlignmentReport {
         let feature_ratio = if self.feature_alignments.is_empty() {
             1.0_f64
         } else {
-            let aligned = self
-                .feature_alignments
-                .iter()
-                .filter(|a| a.aligned)
-                .count();
+            let aligned = self.feature_alignments.iter().filter(|a| a.aligned).count();
             aligned as f64 / self.feature_alignments.len() as f64
         };
 
@@ -848,10 +841,7 @@ impl AlignmentReport {
             self.plan.completed_steps(),
             self.plan.total_steps(),
             self.plan.progress_pct(),
-            self.feature_alignments
-                .iter()
-                .filter(|a| a.aligned)
-                .count(),
+            self.feature_alignments.iter().filter(|a| a.aligned).count(),
             self.feature_alignments.len(),
             self.surface_status.all_transitional_resolved(),
             self.readiness_score,
@@ -980,14 +970,8 @@ mod tests {
     fn standard_plan_covers_all_runtimes() {
         let plan = EradicationPlan::standard();
         let runtimes = plan.findings_by_runtime();
-        assert!(
-            runtimes.contains_key("tokio"),
-            "plan missing tokio entries"
-        );
-        assert!(
-            runtimes.contains_key("smol"),
-            "plan missing smol entries"
-        );
+        assert!(runtimes.contains_key("tokio"), "plan missing tokio entries");
+        assert!(runtimes.contains_key("smol"), "plan missing smol entries");
         assert!(
             runtimes.contains_key("async-io"),
             "plan missing async-io entries"
@@ -1158,7 +1142,15 @@ mod tests {
         let crate_names: Vec<&str> = alignments.iter().map(|a| a.crate_name.as_str()).collect();
 
         // All expected crates are present
-        for expected in &["codec", "ssh", "config", "promise", "uds", "async_ossl", "mux"] {
+        for expected in &[
+            "codec",
+            "ssh",
+            "config",
+            "promise",
+            "uds",
+            "async_ossl",
+            "mux",
+        ] {
             assert!(
                 crate_names.contains(expected),
                 "missing alignment for crate: {}",
@@ -1287,7 +1279,10 @@ mod tests {
         report.finalize();
 
         let summary = report.summary();
-        assert!(summary.contains("summary-test"), "report_id missing from summary");
+        assert!(
+            summary.contains("summary-test"),
+            "report_id missing from summary"
+        );
         assert!(summary.contains("steps complete"), "step info missing");
         assert!(
             summary.contains("NOT ALIGNED") || summary.contains("ALIGNED"),

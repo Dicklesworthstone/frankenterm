@@ -126,7 +126,7 @@ impl PromotionCriteria {
     #[must_use]
     pub fn production() -> Self {
         Self {
-            min_soak_ms: 3_600_000,  // 1 hour
+            min_soak_ms: 3_600_000, // 1 hour
             min_pass_rate: 0.99,
             max_error_rate: 0.01,
             max_p95_latency_ms: 500,
@@ -139,7 +139,7 @@ impl PromotionCriteria {
     #[must_use]
     pub fn rehearsal() -> Self {
         Self {
-            min_soak_ms: 60_000,  // 1 minute
+            min_soak_ms: 60_000, // 1 minute
             min_pass_rate: 0.95,
             max_error_rate: 0.05,
             max_p95_latency_ms: 2000,
@@ -363,7 +363,11 @@ pub struct DrillStep {
 impl DrillStep {
     /// Create a passing step.
     #[must_use]
-    pub fn pass(step_id: impl Into<String>, description: impl Into<String>, elapsed_ms: u64) -> Self {
+    pub fn pass(
+        step_id: impl Into<String>,
+        description: impl Into<String>,
+        elapsed_ms: u64,
+    ) -> Self {
         Self {
             step_id: step_id.into(),
             description: description.into(),
@@ -756,9 +760,7 @@ pub fn evaluate_rollback_triggers(
                     RollbackTriggerType::DisruptionBudgetExceeded => {
                         metrics.disruption_events as f64
                     }
-                    RollbackTriggerType::HealthCheckFailures => {
-                        metrics.health_check_failure_rate
-                    }
+                    RollbackTriggerType::HealthCheckFailures => metrics.health_check_failure_rate,
                     RollbackTriggerType::OperatorManual => 1.0,
                 },
                 threshold: trigger.threshold,
@@ -829,7 +831,10 @@ pub struct PromotionCheck {
 
 /// Evaluate whether a cohort is ready for promotion.
 #[must_use]
-pub fn evaluate_promotion(criteria: &PromotionCriteria, metrics: &SoakMetrics) -> PromotionEvaluation {
+pub fn evaluate_promotion(
+    criteria: &PromotionCriteria,
+    metrics: &SoakMetrics,
+) -> PromotionEvaluation {
     let mut checks = Vec::new();
 
     checks.push(PromotionCheck {
@@ -1085,7 +1090,11 @@ mod tests {
         };
         let eval = evaluate_promotion(&criteria, &metrics);
         assert!(!eval.approved);
-        let soak_check = eval.checks.iter().find(|c| c.name == "soak-duration").unwrap();
+        let soak_check = eval
+            .checks
+            .iter()
+            .find(|c| c.name == "soak-duration")
+            .unwrap();
         assert!(!soak_check.passed);
     }
 
@@ -1117,7 +1126,11 @@ mod tests {
         };
         let eval = evaluate_promotion(&criteria, &metrics);
         assert!(!eval.approved);
-        let human_check = eval.checks.iter().find(|c| c.name == "human-approval").unwrap();
+        let human_check = eval
+            .checks
+            .iter()
+            .find(|c| c.name == "human-approval")
+            .unwrap();
         assert!(!human_check.passed);
     }
 
@@ -1151,7 +1164,11 @@ mod tests {
         };
         let fired = evaluate_rollback_triggers(&triggers, &metrics);
         assert!(!fired.is_empty());
-        assert!(fired.iter().any(|t| t.trigger_type == RollbackTriggerType::ErrorRateSpike));
+        assert!(
+            fired
+                .iter()
+                .any(|t| t.trigger_type == RollbackTriggerType::ErrorRateSpike)
+        );
     }
 
     #[test]
@@ -1166,7 +1183,11 @@ mod tests {
             operator_triggered: false,
         };
         let fired = evaluate_rollback_triggers(&triggers, &metrics);
-        assert!(fired.iter().any(|t| t.trigger_type == RollbackTriggerType::LatencySpike));
+        assert!(
+            fired
+                .iter()
+                .any(|t| t.trigger_type == RollbackTriggerType::LatencySpike)
+        );
     }
 
     #[test]
@@ -1190,7 +1211,11 @@ mod tests {
             operator_triggered: true,
         };
         let fired = evaluate_rollback_triggers(&triggers, &metrics);
-        assert!(fired.iter().any(|t| t.trigger_type == RollbackTriggerType::OperatorManual));
+        assert!(
+            fired
+                .iter()
+                .any(|t| t.trigger_type == RollbackTriggerType::OperatorManual)
+        );
     }
 
     #[test]
@@ -1235,7 +1260,7 @@ mod tests {
             recovery_time_ms: None,
         };
         assert!(!acc.within_budget(&DisruptionBudget::production())); // 200 > 100.
-        assert!(acc.within_budget(&DisruptionBudget::rehearsal()));   // 200 < 500.
+        assert!(acc.within_budget(&DisruptionBudget::rehearsal())); // 200 < 500.
     }
 
     #[test]
@@ -1247,7 +1272,7 @@ mod tests {
             recovery_time_ms: Some(120_000), // 2 minutes.
         };
         assert!(!acc.within_budget(&DisruptionBudget::production())); // 120s > 60s.
-        assert!(acc.within_budget(&DisruptionBudget::rehearsal()));   // 120s < 300s.
+        assert!(acc.within_budget(&DisruptionBudget::rehearsal())); // 120s < 300s.
     }
 
     // --- Drill result tests ---
@@ -1320,7 +1345,10 @@ mod tests {
             .iter()
             .filter(|c| c.independent_rollback)
             .count();
-        assert_eq!(plan.total_drill_count(), plan.drill_types.len() * rollback_cohorts);
+        assert_eq!(
+            plan.total_drill_count(),
+            plan.drill_types.len() * rollback_cohorts
+        );
     }
 
     // --- Rehearsal report tests ---
@@ -1352,12 +1380,8 @@ mod tests {
             },
         ];
 
-        let report = RehearsalReport::from_drills(
-            "plan-1",
-            1000,
-            drills,
-            &DisruptionBudget::rehearsal(),
-        );
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
 
         assert_eq!(report.verdict, RehearsalVerdict::Ready);
         assert_eq!(report.drills_passed(), 2);
@@ -1378,12 +1402,8 @@ mod tests {
             failure_reason: Some("emergency stop hung".into()),
         }];
 
-        let report = RehearsalReport::from_drills(
-            "plan-1",
-            1000,
-            drills,
-            &DisruptionBudget::rehearsal(),
-        );
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
 
         assert_eq!(report.verdict, RehearsalVerdict::NotReady);
         assert_eq!(report.drills_failed(), 1);
@@ -1399,7 +1419,7 @@ mod tests {
             ended_at_ms: 2000,
             steps: vec![DrillStep::pass("s1", "ok", 1000)],
             disruption: DisruptionAccounting {
-                latency_increase_ms: 600,   // Over 500ms rehearsal budget.
+                latency_increase_ms: 600, // Over 500ms rehearsal budget.
                 error_rate_increase: 0.0,
                 disruption_events: 0,
                 recovery_time_ms: None,
@@ -1408,12 +1428,8 @@ mod tests {
             failure_reason: None,
         }];
 
-        let report = RehearsalReport::from_drills(
-            "plan-1",
-            1000,
-            drills,
-            &DisruptionBudget::rehearsal(),
-        );
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
 
         assert_eq!(report.verdict, RehearsalVerdict::Conditional);
     }
@@ -1432,12 +1448,8 @@ mod tests {
             failure_reason: None,
         }];
 
-        let report = RehearsalReport::from_drills(
-            "plan-1",
-            1000,
-            drills,
-            &DisruptionBudget::rehearsal(),
-        );
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
 
         let rendered = report.render_summary();
         assert!(rendered.contains("Rehearsal Report"));
@@ -1483,7 +1495,8 @@ mod tests {
             },
         ];
 
-        let report = RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
         let mut telem = RehearsalTelemetry::new();
         telem.record_rehearsal(&report);
 
@@ -1618,7 +1631,8 @@ mod tests {
             failure_reason: None,
         }];
 
-        let report = RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
+        let report =
+            RehearsalReport::from_drills("plan-1", 1000, drills, &DisruptionBudget::rehearsal());
         let json = serde_json::to_string(&report).expect("serialize");
         let restored: RehearsalReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.plan_id, "plan-1");
@@ -1686,12 +1700,8 @@ mod tests {
         }
 
         // 3. Create report.
-        let report = RehearsalReport::from_drills(
-            &plan.plan_id,
-            1000,
-            all_drills,
-            &plan.disruption_budget,
-        );
+        let report =
+            RehearsalReport::from_drills(&plan.plan_id, 1000, all_drills, &plan.disruption_budget);
 
         assert_eq!(report.verdict, RehearsalVerdict::Ready);
         assert!(report.drills_passed() >= 4);
@@ -1755,7 +1765,12 @@ mod tests {
                 ended_at_ms: 10000,
                 steps: vec![
                     DrillStep::pass("emergency-trigger", "trigger e-stop", 500),
-                    DrillStep::fail("emergency-verify", "verify e-stop effect", 5000, "panes still running"),
+                    DrillStep::fail(
+                        "emergency-verify",
+                        "verify e-stop effect",
+                        5000,
+                        "panes still running",
+                    ),
                 ],
                 disruption: DisruptionAccounting {
                     latency_increase_ms: 200,
@@ -1768,12 +1783,8 @@ mod tests {
             },
         ];
 
-        let report = RehearsalReport::from_drills(
-            &plan.plan_id,
-            1000,
-            drills,
-            &plan.disruption_budget,
-        );
+        let report =
+            RehearsalReport::from_drills(&plan.plan_id, 1000, drills, &plan.disruption_budget);
 
         assert_eq!(report.verdict, RehearsalVerdict::NotReady);
         assert_eq!(report.drills_failed(), 1);

@@ -467,15 +467,14 @@ impl DriftTriageWorkflow {
         }
 
         // JSON structure comparison (if both outputs parse as JSON)
-        let json_structure_match =
-            if let (Ok(ntm_json), Ok(ft_json)) = (
-                serde_json::from_str::<serde_json::Value>(ntm_stdout),
-                serde_json::from_str::<serde_json::Value>(ft_stdout),
-            ) {
-                Some(json_keys_match(&ntm_json, &ft_json))
-            } else {
-                None
-            };
+        let json_structure_match = if let (Ok(ntm_json), Ok(ft_json)) = (
+            serde_json::from_str::<serde_json::Value>(ntm_stdout),
+            serde_json::from_str::<serde_json::Value>(ft_stdout),
+        ) {
+            Some(json_keys_match(&ntm_json, &ft_json))
+        } else {
+            None
+        };
 
         // Performance comparison
         let ntm_ms = dual.ntm.duration_ms;
@@ -568,7 +567,8 @@ impl DriftTriageWorkflow {
         let mut ids = Vec::new();
 
         for divergence in &verdict.divergences {
-            let (category, severity, action) = classify_divergence(divergence, &verdict.performance);
+            let (category, severity, action) =
+                classify_divergence(divergence, &verdict.performance);
 
             let blocks_cutover = severity >= DriftSeverity::High && divergence.is_blocking;
 
@@ -618,12 +618,7 @@ impl DriftTriageWorkflow {
     }
 
     /// Triage an item — classify and assign owner.
-    pub fn triage_item(
-        &mut self,
-        item_id: u64,
-        owner: Option<String>,
-        notes: &str,
-    ) -> bool {
+    pub fn triage_item(&mut self, item_id: u64, owner: Option<String>, notes: &str) -> bool {
         if let Some(item) = self.items.iter_mut().find(|i| i.item_id == item_id) {
             item.resolution_status = ResolutionStatus::Triaged;
             item.owner = owner;
@@ -637,12 +632,7 @@ impl DriftTriageWorkflow {
     }
 
     /// Resolve a triage item.
-    pub fn resolve_item(
-        &mut self,
-        item_id: u64,
-        status: ResolutionStatus,
-        notes: &str,
-    ) -> bool {
+    pub fn resolve_item(&mut self, item_id: u64, status: ResolutionStatus, notes: &str) -> bool {
         if let Some(item) = self.items.iter_mut().find(|i| i.item_id == item_id) {
             item.resolution_status = status;
             if !notes.is_empty() {
@@ -800,12 +790,10 @@ impl DriftTriageWorkflow {
         };
 
         let summary = match decision {
-            CutoverDecision::Go => format!(
-                "GO: All gates pass. {total_resolved} resolved, {total_deferred} deferred."
-            ),
-            CutoverDecision::NoGo => format!(
-                "NO-GO: {open_blocking} blocking divergences remain."
-            ),
+            CutoverDecision::Go => {
+                format!("GO: All gates pass. {total_resolved} resolved, {total_deferred} deferred.")
+            }
+            CutoverDecision::NoGo => format!("NO-GO: {open_blocking} blocking divergences remain."),
             CutoverDecision::ReviewRequired => format!(
                 "REVIEW: No blocking divergences but {open_high_priority} high-priority \
                  and {untriaged_count} untriaged items remain."
@@ -850,9 +838,7 @@ fn json_keys_match(a: &serde_json::Value, b: &serde_json::Value) -> bool {
             let keys_b: std::collections::HashSet<&String> = mb.keys().collect();
             keys_a == keys_b
         }
-        (serde_json::Value::Array(va), serde_json::Value::Array(vb)) => {
-            va.len() == vb.len()
-        }
+        (serde_json::Value::Array(va), serde_json::Value::Array(vb)) => va.len() == vb.len(),
         _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
@@ -871,26 +857,52 @@ fn classify_divergence(
             } else {
                 DriftSeverity::Low
             };
-            (DriftCategory::Performance, severity, DriftAction::Investigate)
+            (
+                DriftCategory::Performance,
+                severity,
+                DriftAction::Investigate,
+            )
         }
         Some("EXIT_CODE_MISMATCH") => {
             if div.is_blocking {
-                (DriftCategory::Behavioral, DriftSeverity::Critical, DriftAction::FixFt)
+                (
+                    DriftCategory::Behavioral,
+                    DriftSeverity::Critical,
+                    DriftAction::FixFt,
+                )
             } else {
-                (DriftCategory::Behavioral, DriftSeverity::High, DriftAction::Investigate)
+                (
+                    DriftCategory::Behavioral,
+                    DriftSeverity::High,
+                    DriftAction::Investigate,
+                )
             }
         }
         Some("STDOUT_MISMATCH") => {
             if div.is_blocking {
-                (DriftCategory::Behavioral, DriftSeverity::High, DriftAction::FixFt)
+                (
+                    DriftCategory::Behavioral,
+                    DriftSeverity::High,
+                    DriftAction::FixFt,
+                )
             } else {
-                (DriftCategory::Format, DriftSeverity::Medium, DriftAction::Investigate)
+                (
+                    DriftCategory::Format,
+                    DriftSeverity::Medium,
+                    DriftAction::Investigate,
+                )
             }
         }
-        Some("STDERR_MISMATCH") => {
-            (DriftCategory::Format, DriftSeverity::Low, DriftAction::Accept)
-        }
-        _ => (DriftCategory::Behavioral, DriftSeverity::Medium, DriftAction::Investigate),
+        Some("STDERR_MISMATCH") => (
+            DriftCategory::Format,
+            DriftSeverity::Low,
+            DriftAction::Accept,
+        ),
+        _ => (
+            DriftCategory::Behavioral,
+            DriftSeverity::Medium,
+            DriftAction::Investigate,
+        ),
     }
 }
 

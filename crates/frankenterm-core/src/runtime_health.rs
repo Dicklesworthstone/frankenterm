@@ -924,9 +924,11 @@ pub fn checks_from_policy_dashboard(
         let (status, tier, failure_class) = match indicator.status {
             HealthStatus::Healthy => (CheckStatus::Pass, HealthTier::Green, None),
             HealthStatus::Warning => (CheckStatus::Warn, HealthTier::Yellow, None),
-            HealthStatus::Critical => {
-                (CheckStatus::Fail, HealthTier::Red, Some(FailureClass::Safety))
-            }
+            HealthStatus::Critical => (
+                CheckStatus::Fail,
+                HealthTier::Red,
+                Some(FailureClass::Safety),
+            ),
             HealthStatus::Unknown => (CheckStatus::Skip, HealthTier::Black, None),
         };
 
@@ -969,8 +971,10 @@ pub fn checks_from_policy_dashboard(
                 }
                 "compliance_violations" => {
                     check.remediation.push(
-                        RemediationHint::text("Investigate and remediate active compliance violations")
-                            .effort(RemediationEffort::High),
+                        RemediationHint::text(
+                            "Investigate and remediate active compliance violations",
+                        )
+                        .effort(RemediationEffort::High),
                     );
                 }
                 "audit_chain_integrity" => {
@@ -1698,7 +1702,12 @@ mod tests {
         let checks = checks_from_policy_dashboard(&dash);
         assert_eq!(checks.len(), 5);
         for check in &checks {
-            assert_eq!(check.status, CheckStatus::Pass, "check {} should pass", check.check_id);
+            assert_eq!(
+                check.status,
+                CheckStatus::Pass,
+                "check {} should pass",
+                check.check_id
+            );
         }
     }
 
@@ -1709,7 +1718,10 @@ mod tests {
         collector.update_kill_switch(true);
         let dash = collector.dashboard(1000);
         let checks = checks_from_policy_dashboard(&dash);
-        let ks = checks.iter().find(|c| c.check_id == "policy.kill_switch").unwrap();
+        let ks = checks
+            .iter()
+            .find(|c| c.check_id == "policy.kill_switch")
+            .unwrap();
         assert_eq!(ks.status, CheckStatus::Fail);
         assert_eq!(ks.tier, HealthTier::Red);
         assert!(!ks.remediation.is_empty());
@@ -1729,7 +1741,10 @@ mod tests {
         );
         let dash = collector.dashboard(1000);
         let checks = checks_from_policy_dashboard(&dash);
-        let dr = checks.iter().find(|c| c.check_id == "policy.denial_rate").unwrap();
+        let dr = checks
+            .iter()
+            .find(|c| c.check_id == "policy.denial_rate")
+            .unwrap();
         assert_eq!(dr.status, CheckStatus::Warn);
         assert_eq!(dr.tier, HealthTier::Yellow);
     }
@@ -1741,7 +1756,10 @@ mod tests {
         collector.update_audit_chain(50, false);
         let dash = collector.dashboard(1000);
         let checks = checks_from_policy_dashboard(&dash);
-        let chain = checks.iter().find(|c| c.check_id == "policy.audit_chain_integrity").unwrap();
+        let chain = checks
+            .iter()
+            .find(|c| c.check_id == "policy.audit_chain_integrity")
+            .unwrap();
         assert_eq!(chain.status, CheckStatus::Fail);
         assert_eq!(chain.failure_class, Some(FailureClass::Corruption));
     }

@@ -495,13 +495,19 @@ impl ContractMatrix {
     /// Checks for a given surface.
     #[must_use]
     pub fn checks_for_surface(&self, surface: ApiSurface) -> Vec<&ContractCheck> {
-        self.checks.iter().filter(|c| c.surface == surface).collect()
+        self.checks
+            .iter()
+            .filter(|c| c.surface == surface)
+            .collect()
     }
 
     /// Checks for a given category.
     #[must_use]
     pub fn checks_for_category(&self, category: CheckCategory) -> Vec<&ContractCheck> {
-        self.checks.iter().filter(|c| c.category == category).collect()
+        self.checks
+            .iter()
+            .filter(|c| c.category == category)
+            .collect()
     }
 
     /// Blocking check count.
@@ -539,7 +545,11 @@ impl ContractMatrix {
         out.push_str("|---------|--------|-------------|--------|------------|-------|-------------|----------|\n");
 
         for surface in ApiSurface::ALL {
-            let checks: Vec<&ContractCheck> = self.checks.iter().filter(|c| c.surface == *surface).collect();
+            let checks: Vec<&ContractCheck> = self
+                .checks
+                .iter()
+                .filter(|c| c.surface == *surface)
+                .collect();
             let has = |cat: CheckCategory| -> &str {
                 if checks.iter().any(|c| c.category == cat) {
                     "Y"
@@ -647,7 +657,10 @@ impl ContractExecution {
     /// Whether all blocking checks passed.
     #[must_use]
     pub fn blocking_pass(&self) -> bool {
-        !self.results.iter().any(|r| r.blocking && r.outcome == CheckOutcome::Fail)
+        !self
+            .results
+            .iter()
+            .any(|r| r.blocking && r.outcome == CheckOutcome::Fail)
     }
 
     /// Pass rate (excluding skipped).
@@ -847,7 +860,11 @@ impl ContractReport {
         if !self.failures.is_empty() {
             out.push_str("\nFailures:\n");
             for f in &self.failures {
-                let tag = if f.blocking { "[BLOCKING]" } else { "[advisory]" };
+                let tag = if f.blocking {
+                    "[BLOCKING]"
+                } else {
+                    "[advisory]"
+                };
                 out.push_str(&format!(
                     "  {} {} ({}): {}\n    Fix: {}\n",
                     tag,
@@ -921,7 +938,10 @@ pub fn standard_contract_matrix() -> ContractMatrix {
                 format!("env-{}", surface.command_name()),
                 *surface,
                 CheckCategory::EnvelopeContract,
-                format!("{}: RobotResponse envelope has ok+data|error", surface.command_name()),
+                format!(
+                    "{}: RobotResponse envelope has ok+data|error",
+                    surface.command_name()
+                ),
             )
             .with_required_fields(&["ok", "version", "elapsed_ms", "now"]),
         );
@@ -1010,7 +1030,10 @@ pub fn standard_contract_matrix() -> ContractMatrix {
                 format!("idem-{}", surface.command_name()),
                 *surface,
                 CheckCategory::Idempotency,
-                format!("{}: repeated mutations are safely deduplicated", surface.command_name()),
+                format!(
+                    "{}: repeated mutations are safely deduplicated",
+                    surface.command_name()
+                ),
             ));
         }
     }
@@ -1022,7 +1045,10 @@ pub fn standard_contract_matrix() -> ContractMatrix {
                 format!("ntm-{}", surface.command_name()),
                 *surface,
                 CheckCategory::NtmCompatibility,
-                format!("{}: ft-native response is NTM-compatible", surface.command_name()),
+                format!(
+                    "{}: ft-native response is NTM-compatible",
+                    surface.command_name()
+                ),
             ));
         }
     }
@@ -1037,14 +1063,12 @@ pub fn standard_contract_matrix() -> ContractMatrix {
         )
         .with_required_fields(&["code", "message"]),
     );
-    matrix.register(
-        ContractCheck::new(
-            "err-unknown-command",
-            ApiSurface::Why,
-            CheckCategory::ErrorContract,
-            "Unknown commands produce structured error, not crash",
-        ),
-    );
+    matrix.register(ContractCheck::new(
+        "err-unknown-command",
+        ApiSurface::Why,
+        CheckCategory::ErrorContract,
+        "Unknown commands produce structured error, not crash",
+    ));
 
     // Replay correctness
     matrix.register(ContractCheck::new(
@@ -1106,10 +1130,15 @@ mod tests {
 
     #[test]
     fn check_builder() {
-        let check = ContractCheck::new("test", ApiSurface::GetText, CheckCategory::SchemaStability, "desc")
-            .advisory()
-            .with_required_fields(&["ok", "data"])
-            .with_deterministic_fields(&["text"]);
+        let check = ContractCheck::new(
+            "test",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+            "desc",
+        )
+        .advisory()
+        .with_required_fields(&["ok", "data"])
+        .with_deterministic_fields(&["text"]);
 
         assert!(!check.blocking);
         assert_eq!(check.required_fields.len(), 2);
@@ -1123,7 +1152,12 @@ mod tests {
         let pass = CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability);
         assert_eq!(pass.outcome, CheckOutcome::Pass);
 
-        let fail = CheckResult::fail("c2", ApiSurface::Search, CheckCategory::Determinism, "nondeterministic");
+        let fail = CheckResult::fail(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::Determinism,
+            "nondeterministic",
+        );
         assert_eq!(fail.outcome, CheckOutcome::Fail);
         assert_eq!(fail.error, "nondeterministic");
     }
@@ -1148,7 +1182,10 @@ mod tests {
 
         assert_eq!(matrix.check_count(), 2);
         assert_eq!(matrix.checks_for_surface(ApiSurface::GetText).len(), 1);
-        assert_eq!(matrix.checks_for_category(CheckCategory::Determinism).len(), 1);
+        assert_eq!(
+            matrix.checks_for_category(CheckCategory::Determinism).len(),
+            1
+        );
     }
 
     #[test]
@@ -1256,8 +1293,17 @@ mod tests {
     #[test]
     fn execution_counters() {
         let mut exec = ContractExecution::new("matrix-1", "run-1", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
-        exec.record(CheckResult::fail("c2", ApiSurface::Search, CheckCategory::Determinism, "err"));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
+        exec.record(CheckResult::fail(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::Determinism,
+            "err",
+        ));
         exec.complete(100);
 
         assert_eq!(exec.passed(), 1);
@@ -1268,10 +1314,18 @@ mod tests {
     #[test]
     fn execution_blocking_pass() {
         let mut exec = ContractExecution::new("m", "r", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
 
-        let mut advisory_fail =
-            CheckResult::fail("c2", ApiSurface::Search, CheckCategory::Determinism, "minor");
+        let mut advisory_fail = CheckResult::fail(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::Determinism,
+            "minor",
+        );
         advisory_fail.blocking = false;
         exec.record(advisory_fail);
 
@@ -1310,8 +1364,16 @@ mod tests {
     #[test]
     fn report_compatible_verdict() {
         let mut exec = ContractExecution::new("m", "r", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
-        exec.record(CheckResult::pass("c2", ApiSurface::Search, CheckCategory::Determinism));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
+        exec.record(CheckResult::pass(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::Determinism,
+        ));
         exec.complete(100);
 
         let report = ContractReport::from_execution(&exec);
@@ -1322,10 +1384,18 @@ mod tests {
     #[test]
     fn report_conditionally_compatible() {
         let mut exec = ContractExecution::new("m", "r", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
 
-        let mut advisory =
-            CheckResult::fail("c2", ApiSurface::Search, CheckCategory::Determinism, "minor");
+        let mut advisory = CheckResult::fail(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::Determinism,
+            "minor",
+        );
         advisory.blocking = false;
         exec.record(advisory);
         exec.complete(100);
@@ -1370,8 +1440,16 @@ mod tests {
     #[test]
     fn report_category_summary() {
         let mut exec = ContractExecution::new("m", "r", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
-        exec.record(CheckResult::pass("c2", ApiSurface::Search, CheckCategory::SchemaStability));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
+        exec.record(CheckResult::pass(
+            "c2",
+            ApiSurface::Search,
+            CheckCategory::SchemaStability,
+        ));
         exec.record(CheckResult::fail(
             "c3",
             ApiSurface::Events,
@@ -1388,7 +1466,11 @@ mod tests {
     #[test]
     fn report_render_summary() {
         let mut exec = ContractExecution::new("robot-api", "run-001", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
         exec.complete(100);
 
         let report = ContractReport::from_execution(&exec);
@@ -1426,7 +1508,10 @@ mod tests {
             serde_json::from_str(&artifacts.execution_trace_json).unwrap();
         let report: ContractReport = serde_json::from_str(&artifacts.report_json).unwrap();
 
-        assert_eq!(matrix.check_count(), standard_contract_matrix().check_count());
+        assert_eq!(
+            matrix.check_count(),
+            standard_contract_matrix().check_count()
+        );
         assert_eq!(execution.failed(), 0);
         assert_eq!(report.verdict, ContractVerdict::Compatible);
         assert!(artifacts.coverage_markdown.contains("Coverage:"));
@@ -1436,7 +1521,11 @@ mod tests {
     #[test]
     fn report_serde_roundtrip() {
         let mut exec = ContractExecution::new("m", "r", 0);
-        exec.record(CheckResult::pass("c1", ApiSurface::GetText, CheckCategory::SchemaStability));
+        exec.record(CheckResult::pass(
+            "c1",
+            ApiSurface::GetText,
+            CheckCategory::SchemaStability,
+        ));
         exec.complete(100);
 
         let report = ContractReport::from_execution(&exec);
@@ -1526,7 +1615,11 @@ mod tests {
                 result.blocking = false; // advisory
                 exec.record(result);
             } else {
-                exec.record(CheckResult::pass(&check.check_id, check.surface, check.category));
+                exec.record(CheckResult::pass(
+                    &check.check_id,
+                    check.surface,
+                    check.category,
+                ));
             }
         }
         exec.complete(5000);
@@ -1538,11 +1631,18 @@ mod tests {
         assert!(!report.blocking_pass);
 
         // Check suggested fixes are present
-        assert!(report.failures.iter().any(|f| f.suggested_fix.contains("version")));
-        assert!(report
-            .failures
-            .iter()
-            .any(|f| f.suggested_fix.contains("elapsed_ms")));
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.suggested_fix.contains("version"))
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.suggested_fix.contains("elapsed_ms"))
+        );
 
         // Render includes failure details
         let summary = report.render_summary();

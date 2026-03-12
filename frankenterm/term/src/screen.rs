@@ -3665,13 +3665,11 @@ mod tests {
             "tiered mode must not override an explicit zero scrollback budget"
         );
         assert_eq!(
-            screen.scrollback_tiering.warm_spill_lines_total,
-            0,
+            screen.scrollback_tiering.warm_spill_lines_total, 0,
             "zero scrollback should not accumulate warm-tier spill telemetry"
         );
         assert_eq!(
-            screen.scrollback_tiering.cold_spill_lines_total,
-            0,
+            screen.scrollback_tiering.cold_spill_lines_total, 0,
             "zero scrollback should not accumulate cold-tier spill telemetry"
         );
         assert_eq!(
@@ -3822,7 +3820,9 @@ mod tests {
         assert_eq!(screen.cold_scrollback_worker.backlog_depth(), 0);
         assert_eq!(screen.cold_scrollback_worker.peak_backlog_depth(), 0);
         assert_eq!(
-            screen.cold_scrollback_worker.completion_throughput_lines_per_sec(),
+            screen
+                .cold_scrollback_worker
+                .completion_throughput_lines_per_sec(),
             0
         );
         assert_eq!(screen.cold_scrollback_worker.completed_lines_total(), 0);

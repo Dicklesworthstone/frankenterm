@@ -57,7 +57,6 @@ pub struct AsupersyncObservabilityConfig {
     pub sample_interval_ms: u64,
 
     // ── Scope tree thresholds ────────────────────────────────────────────
-
     /// Maximum expected active scope count before Yellow tier.
     #[serde(default = "default_scope_yellow")]
     pub scope_count_yellow: u64,
@@ -71,7 +70,6 @@ pub struct AsupersyncObservabilityConfig {
     pub scope_depth_warn: u32,
 
     // ── Task queue thresholds ────────────────────────────────────────────
-
     /// Queue backlog depth threshold for warning.
     #[serde(default = "default_queue_warn")]
     pub queue_backlog_warn: u64,
@@ -81,7 +79,6 @@ pub struct AsupersyncObservabilityConfig {
     pub queue_backlog_critical: u64,
 
     // ── Cancellation thresholds ──────────────────────────────────────────
-
     /// Cancellation latency p99 threshold (ms) for warning.
     #[serde(default = "default_cancel_warn_ms")]
     pub cancel_latency_warn_ms: u64,
@@ -91,13 +88,11 @@ pub struct AsupersyncObservabilityConfig {
     pub cancel_latency_critical_ms: u64,
 
     // ── Channel thresholds ───────────────────────────────────────────────
-
     /// Maximum channel depth before backpressure warning.
     #[serde(default = "default_channel_depth_warn")]
     pub channel_depth_warn: u64,
 
     // ── Task leak thresholds ─────────────────────────────────────────────
-
     /// Maximum task leak ratio before warning.
     #[serde(default = "default_leak_ratio_warn")]
     pub task_leak_ratio_warn: f64,
@@ -107,19 +102,16 @@ pub struct AsupersyncObservabilityConfig {
     pub task_leak_ratio_critical: f64,
 
     // ── Lock contention ──────────────────────────────────────────────────
-
     /// Lock contention ratio above which to warn (0.0-1.0).
     #[serde(default = "default_lock_contention_warn")]
     pub lock_contention_warn: f64,
 
     // ── Recovery ─────────────────────────────────────────────────────────
-
     /// Maximum recovery time (ms) before critical alert.
     #[serde(default = "default_recovery_time_critical_ms")]
     pub recovery_time_critical_ms: u64,
 
     // ── Gate policy ──────────────────────────────────────────────────────
-
     /// Whether automated gate enforcement is active.
     #[serde(default = "default_true")]
     pub gate_enforcement_enabled: bool,
@@ -788,7 +780,10 @@ fn check_scope_tree(
         RuntimeHealthCheck::pass(
             "asupersync.scope_tree",
             "Asupersync Scope Tree",
-            &format!("Scope tree healthy: {active} active, depth {}", snapshot.scope_max_depth),
+            &format!(
+                "Scope tree healthy: {active} active, depth {}",
+                snapshot.scope_max_depth
+            ),
         )
     }
 }
@@ -914,9 +909,7 @@ fn check_cancellation(
             failure_class: Some(FailureClass::Timeout),
             duration_us: 0,
         }
-    } else if max_ms >= config.cancel_latency_warn_ms
-        || snapshot.cancel_grace_expirations > 0
-    {
+    } else if max_ms >= config.cancel_latency_warn_ms || snapshot.cancel_grace_expirations > 0 {
         RuntimeHealthCheck {
             check_id: "asupersync.cancellation".into(),
             display_name: "Asupersync Cancellation".into(),
@@ -1033,8 +1026,10 @@ fn check_lock_contention(
                 format!("timeout_failures: {}", snapshot.lock_timeout_failures),
             ],
             remediation: vec![
-                RemediationHint::text("Reduce critical section duration or use finer-grained locks")
-                    .effort(RemediationEffort::High),
+                RemediationHint::text(
+                    "Reduce critical section duration or use finer-grained locks",
+                )
+                .effort(RemediationEffort::High),
                 RemediationHint::text("Consider lock-free alternatives (AtomicU64, channels)")
                     .effort(RemediationEffort::High),
             ],
@@ -1377,10 +1372,7 @@ impl AsupersyncObservabilityMonitor {
             "── Cancellation ──".to_string(),
             format!("  Requests: {}", snapshot.cancel_requests),
             format!("  Max latency: {}us", snapshot.cancel_latency_max_us),
-            format!(
-                "  Grace expirations: {}",
-                snapshot.cancel_grace_expirations
-            ),
+            format!("  Grace expirations: {}", snapshot.cancel_grace_expirations),
             String::new(),
             "── Channels ──".to_string(),
             format!("  Sends: {}", snapshot.channel_sends),
@@ -1403,10 +1395,7 @@ impl AsupersyncObservabilityMonitor {
         ];
 
         if report.critical_breached > 0 {
-            lines.push(format!(
-                "  CRITICAL breaches: {}",
-                report.critical_breached
-            ));
+            lines.push(format!("  CRITICAL breaches: {}", report.critical_breached));
         }
 
         lines.join("\n")
@@ -1556,7 +1545,10 @@ mod tests {
         let snap = telem.snapshot();
         let cfg = AsupersyncObservabilityConfig::default();
         let checks = evaluate_asupersync_health(&snap, &cfg);
-        let scope_check = checks.iter().find(|c| c.check_id == "asupersync.scope_tree").unwrap();
+        let scope_check = checks
+            .iter()
+            .find(|c| c.check_id == "asupersync.scope_tree")
+            .unwrap();
         assert_eq!(scope_check.status, CheckStatus::Warn);
     }
 
@@ -1567,7 +1559,10 @@ mod tests {
         let snap = telem.snapshot();
         let cfg = AsupersyncObservabilityConfig::default();
         let checks = evaluate_asupersync_health(&snap, &cfg);
-        let scope_check = checks.iter().find(|c| c.check_id == "asupersync.scope_tree").unwrap();
+        let scope_check = checks
+            .iter()
+            .find(|c| c.check_id == "asupersync.scope_tree")
+            .unwrap();
         assert_eq!(scope_check.status, CheckStatus::Fail);
         assert_eq!(scope_check.failure_class, Some(FailureClass::Overload));
     }
@@ -1608,7 +1603,9 @@ mod tests {
         telem.tasks_leaked.fetch_add(1, Ordering::Relaxed);
         telem.cancel_requests.fetch_add(50, Ordering::Relaxed);
         telem.cancel_completions.fetch_add(50, Ordering::Relaxed);
-        telem.cancel_latency_sum_us.fetch_add(5000, Ordering::Relaxed);
+        telem
+            .cancel_latency_sum_us
+            .fetch_add(5000, Ordering::Relaxed);
         telem.record_cancel_latency_us(200);
         telem.channel_sends.fetch_add(5000, Ordering::Relaxed);
         let snap = telem.snapshot();
@@ -1626,8 +1623,14 @@ mod tests {
     #[test]
     fn gate_report_evaluates_slos() {
         let monitor = AsupersyncObservabilityMonitor::with_defaults();
-        monitor.telemetry().tasks_spawned.fetch_add(100, Ordering::Relaxed);
-        monitor.telemetry().tasks_completed.fetch_add(99, Ordering::Relaxed);
+        monitor
+            .telemetry()
+            .tasks_spawned
+            .fetch_add(100, Ordering::Relaxed);
+        monitor
+            .telemetry()
+            .tasks_completed
+            .fetch_add(99, Ordering::Relaxed);
         let report = monitor.evaluate_slos();
         // Should have at least task leak and queue backlog SLOs
         assert!(report.total_slos >= 2);
@@ -1645,7 +1648,10 @@ mod tests {
     #[test]
     fn monitor_records_gate_verdicts() {
         let monitor = AsupersyncObservabilityMonitor::with_defaults();
-        monitor.telemetry().tasks_spawned.fetch_add(100, Ordering::Relaxed);
+        monitor
+            .telemetry()
+            .tasks_spawned
+            .fetch_add(100, Ordering::Relaxed);
         let _report = monitor.evaluate_slos();
         let snap = monitor.snapshot();
         assert_eq!(snap.gate_evaluations, 1);

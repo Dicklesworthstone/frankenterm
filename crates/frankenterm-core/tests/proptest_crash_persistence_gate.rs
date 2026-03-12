@@ -50,14 +50,18 @@ fn arb_gate_verdict() -> impl Strategy<Value = PersistenceGateVerdict> {
 }
 
 fn arb_invariant_result() -> impl Strategy<Value = InvariantResult> {
-    (arb_persistence_invariant_id(), any::<bool>(), ".*", any::<bool>()).prop_map(
-        |(id, held, evidence, data_loss)| InvariantResult {
+    (
+        arb_persistence_invariant_id(),
+        any::<bool>(),
+        ".*",
+        any::<bool>(),
+    )
+        .prop_map(|(id, held, evidence, data_loss)| InvariantResult {
             invariant_id: id,
             held,
             evidence,
             data_loss,
-        },
-    )
+        })
 }
 
 fn arb_scenario_result() -> impl Strategy<Value = ScenarioResult> {

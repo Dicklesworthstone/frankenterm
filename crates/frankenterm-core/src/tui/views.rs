@@ -1497,10 +1497,7 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 detail_width,
             )));
             details.push(Line::from(vec![
-                Span::styled(
-                    truncate_str(&event.severity, 10),
-                    severity_style,
-                ),
+                Span::styled(truncate_str(&event.severity, 10), severity_style),
                 Span::raw(" | "),
                 Span::styled(handled_label, handled_style),
             ]));
@@ -1543,10 +1540,7 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 Span::styled(handled_label, handled_style),
             ]));
             details.push(Line::from(format!("Triage: {triage}")));
-            details.push(Line::from(format!(
-                "Labels: {}",
-                truncate_str(&labels, 60)
-            )));
+            details.push(Line::from(format!("Labels: {}", truncate_str(&labels, 60))));
             details.push(Line::from(format!("Note: {}", truncate_str(note, 60))));
             details.push(Line::from(""));
             details.push(Line::from(Span::styled(
@@ -1818,10 +1812,7 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 detail_width,
             )));
             details.push(Line::from(truncate_str(
-                &format!(
-                    "{} | {} | {}",
-                    entry.action_kind, entry.result, undo_status
-                ),
+                &format!("{} | {} | {}", entry.action_kind, entry.result, undo_status),
                 detail_width,
             )));
             details.push(Line::from(truncate_str(
@@ -1865,10 +1856,7 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 details.push(Line::from(format!("Undo Strategy: {}", strategy)));
             }
             if let Some(hint) = &entry.undo_hint {
-                details.push(Line::from(format!(
-                    "Undo Hint: {}",
-                    truncate_str(hint, 80)
-                )));
+                details.push(Line::from(format!("Undo Hint: {}", truncate_str(hint, 80))));
             }
             if !entry.summary.is_empty() {
                 details.push(Line::from(format!(
@@ -1883,12 +1871,8 @@ pub fn render_history_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             if let Some(workflow_id) = &entry.workflow_id {
-                details.push(Line::from(format!(
-                    "  ft history --workflow {workflow_id}"
-                )));
-                details.push(Line::from(format!(
-                    "  ft workflow status {workflow_id}"
-                )));
+                details.push(Line::from(format!("  ft history --workflow {workflow_id}")));
+                details.push(Line::from(format!("  ft workflow status {workflow_id}")));
             }
             if let Some(pane_id) = entry.pane_id {
                 details.push(Line::from(format!(
@@ -2179,7 +2163,10 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         let details = if search_stacked {
             vec![
                 Line::from(truncate_str(
-                    &format!("P{} rank={:.2} {}", result.pane_id, result.rank, result.timestamp),
+                    &format!(
+                        "P{} rank={:.2} {}",
+                        result.pane_id, result.rank, result.timestamp
+                    ),
                     detail_width,
                 )),
                 Line::from(truncate_str(&result.snippet, detail_width)),

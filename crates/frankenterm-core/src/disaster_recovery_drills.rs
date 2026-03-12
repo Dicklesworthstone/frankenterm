@@ -432,8 +432,7 @@ impl DrillRunner {
     /// Add the standard baseline suite (cold start + partial + cascading).
     pub fn add_baseline_suite(&mut self) {
         self.scenarios.push(DrillScenario::cold_start());
-        self.scenarios
-            .push(DrillScenario::partial_failure(250)); // 25%
+        self.scenarios.push(DrillScenario::partial_failure(250)); // 25%
         self.scenarios.push(DrillScenario::cascading_failure());
     }
 
@@ -486,10 +485,7 @@ impl DrillRunner {
                 ));
             }
             if !met {
-                errors.push(format!(
-                    "RTO exceeded by {}ms",
-                    target.delta(actual)
-                ));
+                errors.push(format!("RTO exceeded by {}ms", target.delta(actual)));
             }
             met
         });
@@ -517,8 +513,7 @@ impl DrillRunner {
         });
 
         // Evaluate completeness
-        let completeness_met =
-            metrics.completeness_permille >= scenario.min_completeness_permille;
+        let completeness_met = metrics.completeness_permille >= scenario.min_completeness_permille;
         if !completeness_met {
             errors.push(format!(
                 "completeness {:.1}% < required {:.1}%",
@@ -624,8 +619,9 @@ impl DrillRunner {
             }
             total_recovery_ms += r.metrics.recovery_time_ms;
             total_completeness += r.metrics.completeness_permille as u64;
-            summary.worst_recovery_time_ms =
-                summary.worst_recovery_time_ms.max(r.metrics.recovery_time_ms);
+            summary.worst_recovery_time_ms = summary
+                .worst_recovery_time_ms
+                .max(r.metrics.recovery_time_ms);
         }
 
         if !self.results.is_empty() {
@@ -646,7 +642,7 @@ impl DrillRunner {
     fn simulate_metrics(&self, scenario: &DrillScenario) -> DrillMetrics {
         match &scenario.kind {
             DrillKind::ColdStart => DrillMetrics {
-                recovery_time_ms: 45_000, // 45s simulated
+                recovery_time_ms: 45_000,     // 45s simulated
                 data_loss_window_ms: 120_000, // 2min simulated
                 completeness_permille: 980,
                 panes_attempted: 10,
@@ -680,7 +676,7 @@ impl DrillRunner {
                 }
             }
             DrillKind::CascadingFailure => DrillMetrics {
-                recovery_time_ms: 180_000, // 3min — under 5min target
+                recovery_time_ms: 180_000,    // 3min — under 5min target
                 data_loss_window_ms: 300_000, // 5min — under 10min target
                 completeness_permille: 850,
                 panes_attempted: 15,
@@ -787,9 +783,15 @@ impl ContinuityReport {
         let drill_ready = checks.iter().all(|c| c.status.is_healthy());
         let overall = if drill_ready {
             ContinuityStatus::Healthy
-        } else if checks.iter().any(|c| matches!(c.status, ContinuityStatus::Unhealthy(_))) {
+        } else if checks
+            .iter()
+            .any(|c| matches!(c.status, ContinuityStatus::Unhealthy(_)))
+        {
             ContinuityStatus::Unhealthy("one or more subsystems unhealthy".into())
-        } else if checks.iter().all(|c| matches!(c.status, ContinuityStatus::Unknown)) {
+        } else if checks
+            .iter()
+            .all(|c| matches!(c.status, ContinuityStatus::Unknown))
+        {
             ContinuityStatus::Unknown
         } else {
             ContinuityStatus::Warning("some subsystems have warnings".into())
@@ -858,15 +860,23 @@ mod tests {
             "partial-failure(250‰)"
         );
         assert_eq!(DrillKind::CascadingFailure.to_string(), "cascading-failure");
-        assert!(DrillKind::TimeTravel {
-            lookback: Duration::from_secs(60)
-        }
-        .to_string()
-        .contains("60s"));
-        assert!(DrillKind::ScaleRecovery { pane_count: 100 }
+        assert!(
+            DrillKind::TimeTravel {
+                lookback: Duration::from_secs(60)
+            }
             .to_string()
-            .contains("100"));
-        assert!(DrillKind::Custom("test".into()).to_string().contains("test"));
+            .contains("60s")
+        );
+        assert!(
+            DrillKind::ScaleRecovery { pane_count: 100 }
+                .to_string()
+                .contains("100")
+        );
+        assert!(
+            DrillKind::Custom("test".into())
+                .to_string()
+                .contains("test")
+        );
     }
 
     #[test]
@@ -902,7 +912,10 @@ mod tests {
 
     #[test]
     fn verdict_combine() {
-        assert_eq!(DrillVerdict::Pass.combine(DrillVerdict::Pass), DrillVerdict::Pass);
+        assert_eq!(
+            DrillVerdict::Pass.combine(DrillVerdict::Pass),
+            DrillVerdict::Pass
+        );
         assert_eq!(
             DrillVerdict::Pass.combine(DrillVerdict::Degraded),
             DrillVerdict::Degraded
@@ -911,7 +924,10 @@ mod tests {
             DrillVerdict::Degraded.combine(DrillVerdict::Fail),
             DrillVerdict::Fail
         );
-        assert_eq!(DrillVerdict::Fail.combine(DrillVerdict::Pass), DrillVerdict::Fail);
+        assert_eq!(
+            DrillVerdict::Fail.combine(DrillVerdict::Pass),
+            DrillVerdict::Fail
+        );
         assert_eq!(
             DrillVerdict::Skipped.combine(DrillVerdict::Pass),
             DrillVerdict::Skipped
@@ -967,7 +983,12 @@ mod tests {
     #[test]
     fn partial_failure_scenario() {
         let s = DrillScenario::partial_failure(300);
-        assert!(matches!(s.kind, DrillKind::PartialFailure { failure_fraction: 300 }));
+        assert!(matches!(
+            s.kind,
+            DrillKind::PartialFailure {
+                failure_fraction: 300
+            }
+        ));
         assert_eq!(s.min_completeness_permille, 700);
     }
 
@@ -987,7 +1008,10 @@ mod tests {
     #[test]
     fn scale_recovery_scenario() {
         let s = DrillScenario::scale_recovery(200);
-        assert!(matches!(s.kind, DrillKind::ScaleRecovery { pane_count: 200 }));
+        assert!(matches!(
+            s.kind,
+            DrillKind::ScaleRecovery { pane_count: 200 }
+        ));
     }
 
     // ── DrillRunner ──
@@ -1067,9 +1091,9 @@ mod tests {
         metrics_map.insert(
             "dr-cold-start".to_string(),
             DrillMetrics {
-                recovery_time_ms: 999_999, // way over 2-minute RTO
+                recovery_time_ms: 999_999,    // way over 2-minute RTO
                 data_loss_window_ms: 999_999, // way over 5-minute RPO
-                completeness_permille: 100, // 10% — way under 95%
+                completeness_permille: 100,   // 10% — way under 95%
                 ..Default::default()
             },
         );

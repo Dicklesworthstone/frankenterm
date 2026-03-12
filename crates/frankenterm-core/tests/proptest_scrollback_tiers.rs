@@ -45,35 +45,37 @@ fn arb_tier() -> impl Strategy<Value = ScrollbackTier> {
 
 fn arb_config() -> impl Strategy<Value = ScrollbackConfig> {
     (
-        10usize..=5000,           // hot_lines
-        4usize..=512,             // page_size
-        1024usize..=10_000_000,   // warm_max_bytes
+        10usize..=5000,         // hot_lines
+        4usize..=512,           // page_size
+        1024usize..=10_000_000, // warm_max_bytes
         arb_compression_level(),
-        prop::bool::ANY,          // cold_eviction_enabled
+        prop::bool::ANY, // cold_eviction_enabled
     )
-        .prop_map(|(hot_lines, page_size, warm_max_bytes, compression, cold_eviction_enabled)| {
-            ScrollbackConfig {
-                hot_lines,
-                page_size,
-                warm_max_bytes,
-                compression,
-                cold_eviction_enabled,
-            }
-        })
+        .prop_map(
+            |(hot_lines, page_size, warm_max_bytes, compression, cold_eviction_enabled)| {
+                ScrollbackConfig {
+                    hot_lines,
+                    page_size,
+                    warm_max_bytes,
+                    compression,
+                    cold_eviction_enabled,
+                }
+            },
+        )
 }
 
 fn arb_snapshot() -> impl Strategy<Value = ScrollbackTierSnapshot> {
     (
-        0usize..=10_000,    // hot_lines
-        0usize..=500,       // warm_pages
+        0usize..=10_000,     // hot_lines
+        0usize..=500,        // warm_pages
         0usize..=50_000_000, // warm_bytes
-        0usize..=100_000,   // warm_lines
-        0u64..=1_000_000,   // cold_lines
-        0u64..=10_000,      // cold_pages
-        0u64..=10_000_000,  // total_lines_added
+        0usize..=100_000,    // warm_lines
+        0u64..=1_000_000,    // cold_lines
+        0u64..=10_000,       // cold_pages
+        0u64..=10_000_000,   // total_lines_added
     )
-        .prop_map(|(hot_lines, warm_pages, warm_bytes, warm_lines, cold_lines, cold_pages, total_lines_added)| {
-            ScrollbackTierSnapshot {
+        .prop_map(
+            |(
                 hot_lines,
                 warm_pages,
                 warm_bytes,
@@ -81,8 +83,18 @@ fn arb_snapshot() -> impl Strategy<Value = ScrollbackTierSnapshot> {
                 cold_lines,
                 cold_pages,
                 total_lines_added,
-            }
-        })
+            )| {
+                ScrollbackTierSnapshot {
+                    hot_lines,
+                    warm_pages,
+                    warm_bytes,
+                    warm_lines,
+                    cold_lines,
+                    cold_pages,
+                    total_lines_added,
+                }
+            },
+        )
 }
 
 /// Generate a line of given approximate length.

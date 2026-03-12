@@ -682,7 +682,8 @@ impl LiveView {
     pub fn sort(&mut self) {
         match self.sort_by {
             LiveViewSort::Activity => {
-                self.panes.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+                self.panes
+                    .sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
             }
             LiveViewSort::Health => {
                 self.panes.sort_by_key(|p| match p.health {
@@ -696,8 +697,11 @@ impl LiveView {
                 self.panes.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
             }
             LiveViewSort::CpuUsage => {
-                self.panes
-                    .sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
+                self.panes.sort_by(|a, b| {
+                    b.cpu_percent
+                        .partial_cmp(&a.cpu_percent)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             LiveViewSort::AlertCount => {
                 self.panes.sort_by(|a, b| b.alert_count.cmp(&a.alert_count));
@@ -1074,26 +1078,38 @@ pub struct CommandCenterSnapshot {
 pub fn register_standard_actions(palette: &mut CommandPalette) {
     // Fleet Control
     palette.register(
-        PaletteAction::new("fleet-pause", "Pause all agent panes", ActionCategory::FleetControl)
-            .requires_role(OperatorLevel::SeniorOperator)
-            .destructive()
-            .with_shortcut("Ctrl+Shift+P")
-            .with_tags(&["pause", "stop", "halt", "fleet"])
-            .with_description("Pause event processing on all agent panes"),
+        PaletteAction::new(
+            "fleet-pause",
+            "Pause all agent panes",
+            ActionCategory::FleetControl,
+        )
+        .requires_role(OperatorLevel::SeniorOperator)
+        .destructive()
+        .with_shortcut("Ctrl+Shift+P")
+        .with_tags(&["pause", "stop", "halt", "fleet"])
+        .with_description("Pause event processing on all agent panes"),
     );
     palette.register(
-        PaletteAction::new("fleet-resume", "Resume all agent panes", ActionCategory::FleetControl)
-            .requires_role(OperatorLevel::SeniorOperator)
-            .with_shortcut("Ctrl+Shift+R")
-            .with_tags(&["resume", "start", "unpause", "fleet"])
-            .with_description("Resume event processing on all agent panes"),
+        PaletteAction::new(
+            "fleet-resume",
+            "Resume all agent panes",
+            ActionCategory::FleetControl,
+        )
+        .requires_role(OperatorLevel::SeniorOperator)
+        .with_shortcut("Ctrl+Shift+R")
+        .with_tags(&["resume", "start", "unpause", "fleet"])
+        .with_description("Resume event processing on all agent panes"),
     );
     palette.register(
-        PaletteAction::new("fleet-scale", "Scale fleet size", ActionCategory::FleetControl)
-            .requires_role(OperatorLevel::Admin)
-            .destructive()
-            .with_tags(&["scale", "resize", "add", "remove", "fleet"])
-            .with_description("Adjust the number of agent panes in the fleet"),
+        PaletteAction::new(
+            "fleet-scale",
+            "Scale fleet size",
+            ActionCategory::FleetControl,
+        )
+        .requires_role(OperatorLevel::Admin)
+        .destructive()
+        .with_tags(&["scale", "resize", "add", "remove", "fleet"])
+        .with_description("Adjust the number of agent panes in the fleet"),
     );
 
     // Pane Management
@@ -1111,25 +1127,37 @@ pub fn register_standard_actions(palette: &mut CommandPalette) {
             .with_description("Close a specific pane"),
     );
     palette.register(
-        PaletteAction::new("pane-restart", "Restart pane", ActionCategory::PaneManagement)
-            .requires_role(OperatorLevel::Operator)
-            .with_tags(&["restart", "reboot", "pane", "refresh"])
-            .with_description("Restart a pane process"),
+        PaletteAction::new(
+            "pane-restart",
+            "Restart pane",
+            ActionCategory::PaneManagement,
+        )
+        .requires_role(OperatorLevel::Operator)
+        .with_tags(&["restart", "reboot", "pane", "refresh"])
+        .with_description("Restart a pane process"),
     );
 
     // Agent Lifecycle
     palette.register(
-        PaletteAction::new("agent-spawn", "Spawn new agent", ActionCategory::AgentLifecycle)
-            .requires_role(OperatorLevel::Operator)
-            .with_tags(&["spawn", "new", "create", "agent", "launch"])
-            .with_description("Launch a new agent in a fresh pane"),
+        PaletteAction::new(
+            "agent-spawn",
+            "Spawn new agent",
+            ActionCategory::AgentLifecycle,
+        )
+        .requires_role(OperatorLevel::Operator)
+        .with_tags(&["spawn", "new", "create", "agent", "launch"])
+        .with_description("Launch a new agent in a fresh pane"),
     );
     palette.register(
-        PaletteAction::new("agent-terminate", "Terminate agent", ActionCategory::AgentLifecycle)
-            .requires_role(OperatorLevel::SeniorOperator)
-            .destructive()
-            .with_tags(&["terminate", "kill", "stop", "agent"])
-            .with_description("Gracefully terminate an agent"),
+        PaletteAction::new(
+            "agent-terminate",
+            "Terminate agent",
+            ActionCategory::AgentLifecycle,
+        )
+        .requires_role(OperatorLevel::SeniorOperator)
+        .destructive()
+        .with_tags(&["terminate", "kill", "stop", "agent"])
+        .with_description("Gracefully terminate an agent"),
     );
 
     // Policy & Safety
@@ -1145,25 +1173,37 @@ pub fn register_standard_actions(palette: &mut CommandPalette) {
         .with_description("Quarantine a component from executing actions"),
     );
     palette.register(
-        PaletteAction::new("policy-approve", "Approve pending action", ActionCategory::PolicySafety)
-            .requires_role(OperatorLevel::Operator)
-            .with_tags(&["approve", "allow", "permit", "action"])
-            .with_description("Approve a pending action requiring operator confirmation"),
+        PaletteAction::new(
+            "policy-approve",
+            "Approve pending action",
+            ActionCategory::PolicySafety,
+        )
+        .requires_role(OperatorLevel::Operator)
+        .with_tags(&["approve", "allow", "permit", "action"])
+        .with_description("Approve a pending action requiring operator confirmation"),
     );
 
     // Diagnostics
     palette.register(
-        PaletteAction::new("diag-health", "System health check", ActionCategory::Diagnostics)
-            .requires_role(OperatorLevel::Observer)
-            .with_shortcut("Ctrl+H")
-            .with_tags(&["health", "status", "doctor", "check"])
-            .with_description("Run ft doctor health check"),
+        PaletteAction::new(
+            "diag-health",
+            "System health check",
+            ActionCategory::Diagnostics,
+        )
+        .requires_role(OperatorLevel::Observer)
+        .with_shortcut("Ctrl+H")
+        .with_tags(&["health", "status", "doctor", "check"])
+        .with_description("Run ft doctor health check"),
     );
     palette.register(
-        PaletteAction::new("diag-logs", "View structured logs", ActionCategory::Diagnostics)
-            .requires_role(OperatorLevel::Observer)
-            .with_tags(&["logs", "trace", "debug", "structured"])
-            .with_description("View recent structured log entries"),
+        PaletteAction::new(
+            "diag-logs",
+            "View structured logs",
+            ActionCategory::Diagnostics,
+        )
+        .requires_role(OperatorLevel::Observer)
+        .with_tags(&["logs", "trace", "debug", "structured"])
+        .with_description("View recent structured log entries"),
     );
 
     // Session Management
@@ -1306,7 +1346,8 @@ mod tests {
 
     #[test]
     fn match_score_label_contains() {
-        let action = PaletteAction::new("fp", "Pause All Fleet Panes", ActionCategory::FleetControl);
+        let action =
+            PaletteAction::new("fp", "Pause All Fleet Panes", ActionCategory::FleetControl);
         let score = action.match_score("pause");
         assert!(score >= 50);
     }
@@ -1361,9 +1402,11 @@ mod tests {
             PaletteAction::new("fleet-pause", "Pause Fleet", ActionCategory::FleetControl)
                 .with_tags(&["pause"]),
         );
-        palette.register(
-            PaletteAction::new("pane-focus", "Focus Pane", ActionCategory::PaneManagement),
-        );
+        palette.register(PaletteAction::new(
+            "pane-focus",
+            "Focus Pane",
+            ActionCategory::PaneManagement,
+        ));
 
         let results = palette.search("pause");
         assert!(!results.is_empty());
@@ -1543,8 +1586,16 @@ mod tests {
     fn standard_keybindings_non_empty() {
         let bindings = standard_keybindings();
         assert!(bindings.len() >= 10);
-        assert!(bindings.iter().any(|b| b.action == KeyAction::TogglePalette));
-        assert!(bindings.iter().any(|b| b.action == KeyAction::EmergencyStop));
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.action == KeyAction::TogglePalette)
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.action == KeyAction::EmergencyStop)
+        );
     }
 
     // ---- SwarmCommandCenter ----
@@ -1629,7 +1680,10 @@ mod tests {
 
         let json = serde_json::to_string(&center).unwrap();
         let center2: SwarmCommandCenter = serde_json::from_str(&json).unwrap();
-        assert_eq!(center2.palette.action_count(), center.palette.action_count());
+        assert_eq!(
+            center2.palette.action_count(),
+            center.palette.action_count()
+        );
     }
 
     #[test]

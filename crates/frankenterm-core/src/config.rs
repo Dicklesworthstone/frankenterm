@@ -1625,13 +1625,15 @@ impl Default for SafetyConfig {
             quarantine: crate::policy_quarantine::QuarantineConfig::default(),
             audit_chain: crate::policy_audit_chain::AuditChainConfig::default(),
             compliance: crate::policy_compliance::ComplianceConfig::default(),
-            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(),
+            credential_broker: crate::connector_credential_broker::CredentialBrokerConfig::default(
+            ),
             lifecycle_manager: crate::connector_lifecycle::LifecycleManagerConfig::default(),
             data_classifier: crate::connector_data_classification::ClassifierConfig::default(),
             connector_governor: crate::connector_governor::ConnectorGovernorConfig::default(),
             connector_registry: crate::connector_registry::ConnectorRegistryConfig::default(),
             connector_host_runtime: crate::connector_host_runtime::ConnectorHostConfig::default(),
-            connector_reliability: crate::connector_reliability::ConnectorReliabilityConfig::default(),
+            connector_reliability:
+                crate::connector_reliability::ConnectorReliabilityConfig::default(),
             bundle_registry: crate::connector_bundles::BundleRegistryConfig::default(),
             connector_mesh: crate::connector_mesh::ConnectorMeshConfig::default(),
             ingestion_pipeline: crate::connector_bundles::IngestionPipelineConfig::default(),

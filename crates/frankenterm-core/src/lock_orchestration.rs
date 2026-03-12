@@ -266,12 +266,7 @@ impl WaitGraph {
         None
     }
 
-    fn dfs_cycle(
-        &self,
-        node: &str,
-        visited: &mut HashSet<String>,
-        path: &mut Vec<String>,
-    ) -> bool {
+    fn dfs_cycle(&self, node: &str, visited: &mut HashSet<String>, path: &mut Vec<String>) -> bool {
         if !visited.insert(node.to_string()) {
             // Already visited — cycle found
             path.push(node.to_string());
@@ -425,9 +420,7 @@ impl LockOrchestrator {
 
             // Deadlock detection: would adding waiter→holder create a cycle?
             if self.config.deadlock_detection {
-                inner
-                    .wait_graph
-                    .add_edge(&holder.agent_id, &held_by);
+                inner.wait_graph.add_edge(&holder.agent_id, &held_by);
                 if let Some(cycle) = inner.wait_graph.find_cycle_from(&holder.agent_id) {
                     // Remove the speculative edge
                     inner.wait_graph.remove_waiter(&holder.agent_id);
@@ -646,10 +639,7 @@ impl LockOrchestrator {
         let now_ms = OrchestratorInner::now_ms();
 
         // Verify source holds the lock
-        let entry = inner
-            .locks
-            .get(resource)
-            .ok_or(HandoffError::LockNotHeld)?;
+        let entry = inner.locks.get(resource).ok_or(HandoffError::LockNotHeld)?;
 
         if entry.holder.agent_id != source_agent {
             return Err(HandoffError::NotHolder {
@@ -1092,7 +1082,11 @@ mod tests {
     #[test]
     fn group_acquire_all_free() {
         let o = orch();
-        let resources = vec![ResourceId::Pane(1), ResourceId::Pane(2), ResourceId::Pane(3)];
+        let resources = vec![
+            ResourceId::Pane(1),
+            ResourceId::Pane(2),
+            ResourceId::Pane(3),
+        ];
         let result = o.try_acquire_group(&resources, holder("a"), None);
         assert!(result.is_all_acquired());
         for r in &resources {
@@ -1106,7 +1100,11 @@ mod tests {
         // Pre-lock one resource
         o.try_acquire(ResourceId::Pane(2), holder("b"), None);
 
-        let resources = vec![ResourceId::Pane(1), ResourceId::Pane(2), ResourceId::Pane(3)];
+        let resources = vec![
+            ResourceId::Pane(1),
+            ResourceId::Pane(2),
+            ResourceId::Pane(3),
+        ];
         let result = o.try_acquire_group(&resources, holder("a"), None);
         match result {
             GroupLockResult::PartialFailure { failures } => {
@@ -1127,7 +1125,11 @@ mod tests {
             ..Default::default()
         };
         let o = LockOrchestrator::new(config);
-        let resources = vec![ResourceId::Pane(1), ResourceId::Pane(2), ResourceId::Pane(3)];
+        let resources = vec![
+            ResourceId::Pane(1),
+            ResourceId::Pane(2),
+            ResourceId::Pane(3),
+        ];
         let result = o.try_acquire_group(&resources, holder("a"), None);
         assert!(!result.is_all_acquired());
     }
@@ -1435,27 +1437,39 @@ mod tests {
 
     #[test]
     fn handoff_error_display() {
-        assert_eq!(HandoffError::LockNotHeld.to_string(), "resource is not locked");
-        assert!(HandoffError::NotHolder {
-            actual_holder: "X".into()
-        }
-        .to_string()
-        .contains("X"));
+        assert_eq!(
+            HandoffError::LockNotHeld.to_string(),
+            "resource is not locked"
+        );
+        assert!(
+            HandoffError::NotHolder {
+                actual_holder: "X".into()
+            }
+            .to_string()
+            .contains("X")
+        );
         assert_eq!(
             HandoffError::HandoffNotFound.to_string(),
             "handoff not found"
         );
-        assert!(HandoffError::WrongTarget {
-            expected: "Y".into()
-        }
-        .to_string()
-        .contains("Y"));
-        assert!(HandoffError::InvalidState {
-            current: HandoffState::Accepted
-        }
-        .to_string()
-        .contains("Accepted"));
-        assert_eq!(HandoffError::Expired.to_string(), "handoff deadline expired");
+        assert!(
+            HandoffError::WrongTarget {
+                expected: "Y".into()
+            }
+            .to_string()
+            .contains("Y")
+        );
+        assert!(
+            HandoffError::InvalidState {
+                current: HandoffState::Accepted
+            }
+            .to_string()
+            .contains("Accepted")
+        );
+        assert_eq!(
+            HandoffError::Expired.to_string(),
+            "handoff deadline expired"
+        );
     }
 
     // ── HandoffRecord serde ──
@@ -1547,11 +1561,7 @@ mod tests {
     #[test]
     fn zero_ttl_no_expiry() {
         let o = orch();
-        o.try_acquire(
-            ResourceId::Pane(1),
-            holder("a"),
-            Some(Duration::ZERO),
-        );
+        o.try_acquire(ResourceId::Pane(1), holder("a"), Some(Duration::ZERO));
         std::thread::sleep(Duration::from_millis(5));
         assert!(o.is_locked(&ResourceId::Pane(1)).is_some());
     }
@@ -1593,9 +1603,10 @@ mod tests {
     fn acquire_release_many_resources() {
         let o = orch();
         for i in 0..200 {
-            assert!(o
-                .try_acquire(ResourceId::Pane(i), holder("a"), None)
-                .is_acquired());
+            assert!(
+                o.try_acquire(ResourceId::Pane(i), holder("a"), None)
+                    .is_acquired()
+            );
         }
         assert_eq!(o.active_locks().len(), 200);
         assert_eq!(o.release_all("a"), 200);

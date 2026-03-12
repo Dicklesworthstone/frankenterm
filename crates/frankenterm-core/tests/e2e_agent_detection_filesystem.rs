@@ -79,14 +79,13 @@ mod filesystem_detection {
     fn detect_all_9_agents_with_fixtures() {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         assert_eq!(report.format_version, 1);
         assert!(!report.generated_at.is_empty());
@@ -110,21 +109,24 @@ mod filesystem_detection {
     fn detect_no_agents_empty_home() {
         let (_tmp, overrides) = fixture_missing_agents(ALL_SLUGS);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed even with no agents");
+            })
+            .expect("detection should succeed even with no agents");
 
         assert_eq!(report.summary.detected_count, 0);
         assert_eq!(report.summary.total_count, 9);
 
         // All entries should be present but not detected
         for entry in &report.installed_agents {
-            assert!(!entry.detected, "agent {} should not be detected", entry.slug);
+            assert!(
+                !entry.detected,
+                "agent {} should not be detected",
+                entry.slug
+            );
             assert!(
                 entry.root_paths.is_empty(),
                 "agent {} should have no root paths",
@@ -170,14 +172,13 @@ mod filesystem_detection {
             });
         }
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         assert_eq!(report.summary.detected_count, 3);
         assert_eq!(report.summary.total_count, 9);
@@ -189,7 +190,10 @@ mod filesystem_detection {
                 .find(|e| e.slug == *slug)
                 .unwrap_or_else(|| panic!("missing entry for {slug}"));
             assert!(entry.detected, "{slug} should be detected");
-            assert!(!entry.root_paths.is_empty(), "{slug} should have root paths");
+            assert!(
+                !entry.root_paths.is_empty(),
+                "{slug} should have root paths"
+            );
         }
 
         for slug in not_installed {
@@ -211,14 +215,13 @@ mod filesystem_detection {
         for slug in ALL_SLUGS {
             let (_tmp, overrides) = fixture_with_agents(&[slug]);
 
-            let report = frankenterm_core::agent_detection::detect_installed_agents(
-                &AgentDetectOptions {
+            let report =
+                frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                     only_connectors: Some(vec![slug.to_string()]),
                     include_undetected: true,
                     root_overrides: overrides,
-                },
-            )
-            .unwrap_or_else(|e| panic!("detection failed for {slug}: {e}"));
+                })
+                .unwrap_or_else(|e| panic!("detection failed for {slug}: {e}"));
 
             assert_eq!(
                 report.summary.detected_count, 1,
@@ -245,14 +248,13 @@ mod filesystem_detection {
     fn detection_evidence_strings_per_agent() {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         for entry in &report.installed_agents {
             if entry.detected {
@@ -283,14 +285,13 @@ mod filesystem_detection {
     fn missing_agent_evidence_mentions_missing_root() {
         let (_tmp, overrides) = fixture_missing_agents(&["claude"]);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude".to_string()]),
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         let claude = &report.installed_agents[0];
         assert!(!claude.detected);
@@ -331,8 +332,8 @@ mod filesystem_detection {
             });
         }
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec![
                     "claude".into(),
                     "codex".into(),
@@ -341,9 +342,8 @@ mod filesystem_detection {
                 ]),
                 include_undetected: false,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         // Only detected agents should be in the list
         assert_eq!(report.installed_agents.len(), 2);
@@ -369,14 +369,13 @@ mod filesystem_detection {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
         let start = std::time::Instant::now();
-        let _report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let _report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
         let elapsed = start.elapsed();
 
         assert!(
@@ -394,14 +393,13 @@ mod filesystem_detection {
     fn detection_report_serde_roundtrip() {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         let json = serde_json::to_string(&report).expect("serialize report");
         let back: InstalledAgentDetectionReport =
@@ -410,13 +408,12 @@ mod filesystem_detection {
         assert_eq!(back.format_version, report.format_version);
         assert_eq!(back.summary.detected_count, report.summary.detected_count);
         assert_eq!(back.summary.total_count, report.summary.total_count);
-        assert_eq!(
-            back.installed_agents.len(),
-            report.installed_agents.len()
-        );
+        assert_eq!(back.installed_agents.len(), report.installed_agents.len());
 
-        for (original, roundtripped) in
-            report.installed_agents.iter().zip(back.installed_agents.iter())
+        for (original, roundtripped) in report
+            .installed_agents
+            .iter()
+            .zip(back.installed_agents.iter())
         {
             assert_eq!(original.slug, roundtripped.slug);
             assert_eq!(original.detected, roundtripped.detected);
@@ -432,14 +429,13 @@ mod filesystem_detection {
     fn detection_report_json_has_expected_fields() {
         let (_tmp, overrides) = fixture_with_agents(&["claude"]);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude".to_string()]),
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         let json: serde_json::Value = serde_json::to_value(&report).expect("serialize");
 
@@ -470,13 +466,11 @@ mod filesystem_detection {
 
     #[test]
     fn unknown_connector_in_only_connectors_rejected() {
-        let err = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
-                only_connectors: Some(vec!["not-a-real-agent".to_string()]),
-                include_undetected: true,
-                root_overrides: vec![],
-            },
-        )
+        let err = frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["not-a-real-agent".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![],
+        })
         .expect_err("should reject unknown connector");
 
         let msg = format!("{err}");
@@ -498,17 +492,16 @@ mod filesystem_detection {
         let claude_dir = tmp.path().join(".claude-code-alias");
         std::fs::create_dir_all(&claude_dir).expect("create dir");
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude-code".to_string()]),
                 include_undetected: true,
                 root_overrides: vec![AgentDetectRootOverride {
                     slug: "claude-code".to_string(),
                     root: claude_dir,
                 }],
-            },
-        )
-        .expect("detection should succeed with alias");
+            })
+            .expect("detection should succeed with alias");
 
         // Should resolve to canonical "claude"
         assert_eq!(report.installed_agents.len(), 1);
@@ -529,8 +522,8 @@ mod filesystem_detection {
         std::fs::create_dir_all(&root1).expect("create root1");
         std::fs::create_dir_all(&root2).expect("create root2");
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude".to_string()]),
                 include_undetected: true,
                 root_overrides: vec![
@@ -543,9 +536,8 @@ mod filesystem_detection {
                         root: root2.clone(),
                     },
                 ],
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         let claude = &report.installed_agents[0];
         assert!(claude.detected);
@@ -563,14 +555,13 @@ mod filesystem_detection {
     #[test]
     fn empty_overrides_probes_default_paths() {
         // With no overrides, should probe real filesystem (may or may not find agents)
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: None,
                 include_undetected: true,
                 root_overrides: vec![],
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         // Should always return all 9 connectors when include_undetected=true
         assert_eq!(report.summary.total_count, 9);
@@ -595,14 +586,13 @@ mod filesystem_detection {
     fn only_connectors_limits_scan_scope() {
         let (_tmp, overrides) = fixture_with_agents(ALL_SLUGS);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude".to_string(), "gemini".to_string()]),
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         assert_eq!(report.summary.total_count, 2);
         assert_eq!(report.installed_agents.len(), 2);
@@ -635,14 +625,13 @@ mod filesystem_detection {
     fn generated_at_is_valid_rfc3339() {
         let (_tmp, overrides) = fixture_with_agents(&["claude"]);
 
-        let report = frankenterm_core::agent_detection::detect_installed_agents(
-            &AgentDetectOptions {
+        let report =
+            frankenterm_core::agent_detection::detect_installed_agents(&AgentDetectOptions {
                 only_connectors: Some(vec!["claude".to_string()]),
                 include_undetected: true,
                 root_overrides: overrides,
-            },
-        )
-        .expect("detection should succeed");
+            })
+            .expect("detection should succeed");
 
         // Parse as RFC3339 — chrono or manual check
         assert!(
@@ -665,13 +654,16 @@ mod filesystem_detection {
 #[cfg(feature = "agent-detection")]
 mod inventory_cache {
     use frankenterm_core::agent_correlator::{
-        installed_inventory_cached, installed_inventory_refresh, InstalledAgentInventoryEntry,
+        InstalledAgentInventoryEntry, installed_inventory_cached, installed_inventory_refresh,
     };
 
     #[test]
     fn installed_inventory_cached_returns_entries() {
         let result = installed_inventory_cached();
-        assert!(result.is_ok(), "cached inventory should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "cached inventory should succeed: {result:?}"
+        );
         let entries = result.unwrap();
         // Should have entries for all known connectors
         assert!(
@@ -710,7 +702,11 @@ mod inventory_cache {
         // Verify structure matches
         for (r, c) in refreshed.iter().zip(cached.iter()) {
             assert_eq!(r.slug, c.slug, "slugs should match");
-            assert_eq!(r.detected, c.detected, "detected should match for {}", r.slug);
+            assert_eq!(
+                r.detected, c.detected,
+                "detected should match for {}",
+                r.slug
+            );
         }
     }
 
@@ -781,9 +777,7 @@ mod feature_disabled {
 
 #[cfg(feature = "agent-detection")]
 mod integration_enrichment {
-    use frankenterm_core::agent_correlator::{
-        AgentCorrelator, AgentInventory, DetectionSource,
-    };
+    use frankenterm_core::agent_correlator::{AgentCorrelator, AgentInventory, DetectionSource};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
 
     fn detection(rule_id: &str, agent_type: AgentType) -> Detection {
@@ -806,12 +800,12 @@ mod integration_enrichment {
         // Add running agents via pattern detection
         correlator.ingest_detections(
             1,
-            &[detection("core.claude_code:tool_use", AgentType::ClaudeCode)],
+            &[detection(
+                "core.claude_code:tool_use",
+                AgentType::ClaudeCode,
+            )],
         );
-        correlator.ingest_detections(
-            2,
-            &[detection("core.codex:banner", AgentType::Codex)],
-        );
+        correlator.ingest_detections(2, &[detection("core.codex:banner", AgentType::Codex)]);
 
         let inventory = correlator.inventory();
 
@@ -831,7 +825,10 @@ mod integration_enrichment {
         let mut correlator = AgentCorrelator::new();
         correlator.ingest_detections(
             1,
-            &[detection("core.claude_code:tool_use", AgentType::ClaudeCode)],
+            &[detection(
+                "core.claude_code:tool_use",
+                AgentType::ClaudeCode,
+            )],
         );
 
         let inventory = correlator.inventory();
@@ -845,10 +842,7 @@ mod integration_enrichment {
     #[test]
     fn inventory_json_schema_stability() {
         let mut correlator = AgentCorrelator::new();
-        correlator.ingest_detections(
-            1,
-            &[detection("core.codex:tool_use", AgentType::Codex)],
-        );
+        correlator.ingest_detections(1, &[detection("core.codex:tool_use", AgentType::Codex)]);
 
         let inventory = correlator.inventory();
         let json: serde_json::Value = serde_json::to_value(&inventory).expect("serialize");
@@ -944,7 +938,10 @@ mod pane_state_classification {
     #[test]
     fn active_state_with_recent_output() {
         let ts = agent_timestamps(99_000, 95_000, false);
-        assert_eq!(ts.classify(100_000, &default_config()), AgentPaneState::Active);
+        assert_eq!(
+            ts.classify(100_000, &default_config()),
+            AgentPaneState::Active
+        );
     }
 
     #[test]
@@ -984,7 +981,10 @@ mod pane_state_classification {
     fn idle_state_no_activity() {
         // Both output and input very old (90s+ ago)
         let ts = agent_timestamps(10_000, 10_000, false);
-        assert_eq!(ts.classify(100_000, &default_config()), AgentPaneState::Idle);
+        assert_eq!(
+            ts.classify(100_000, &default_config()),
+            AgentPaneState::Idle
+        );
     }
 
     #[test]
@@ -1086,10 +1086,7 @@ mod pane_state_classification {
             serde_json::to_value(AgentPaneState::Stuck).unwrap(),
             "stuck"
         );
-        assert_eq!(
-            serde_json::to_value(AgentPaneState::Idle).unwrap(),
-            "idle"
-        );
+        assert_eq!(serde_json::to_value(AgentPaneState::Idle).unwrap(), "idle");
         assert_eq!(
             serde_json::to_value(AgentPaneState::Human).unwrap(),
             "human"

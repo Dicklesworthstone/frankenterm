@@ -201,10 +201,7 @@ impl EvidencePackage {
             } else {
                 CheckStatus::Fail
             },
-            detail: format!(
-                "{} unresolved P1",
-                self.incidents.unresolved_p1_count()
-            ),
+            detail: format!("{} unresolved P1", self.incidents.unresolved_p1_count()),
             blocking: true,
         });
 
@@ -283,9 +280,9 @@ impl EvidencePackage {
             GoNoGoDecision::Conditional => format!(
                 "{total_warnings} warnings, {total_failures} non-blocking failures. Review required."
             ),
-            GoNoGoDecision::NoGo => format!(
-                "{blocking_failures} blocking gate(s) failed. Migration blocked."
-            ),
+            GoNoGoDecision::NoGo => {
+                format!("{blocking_failures} blocking gate(s) failed. Migration blocked.")
+            }
         };
 
         GoNoGoVerdict {
@@ -545,8 +542,7 @@ impl PrerequisiteGate {
     /// Check if all prerequisites are closed.
     #[must_use]
     pub fn all_closed(&self) -> bool {
-        !self.prerequisites.is_empty()
-            && self.prerequisites.values().all(|e| e.closed)
+        !self.prerequisites.is_empty() && self.prerequisites.values().all(|e| e.closed)
     }
 
     /// Number of closed prerequisites.
@@ -625,9 +621,7 @@ impl RegressionGuardSuite {
     /// Create an empty suite.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            guards: Vec::new(),
-        }
+        Self { guards: Vec::new() }
     }
 
     /// Add a guard result.
@@ -704,9 +698,7 @@ impl PersistenceProofSuite {
     /// Create an empty suite.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            proofs: Vec::new(),
-        }
+        Self { proofs: Vec::new() }
     }
 
     /// Record a persistence proof.
@@ -736,9 +728,7 @@ impl PersistenceProofSuite {
     #[must_use]
     pub fn has_deterministic_recovery(&self) -> bool {
         self.proofs.iter().any(|p| {
-            p.verified
-                && p.state_hash_before.is_some()
-                && p.state_hash_before == p.state_hash_after
+            p.verified && p.state_hash_before.is_some() && p.state_hash_before == p.state_hash_after
         })
     }
 }
@@ -783,9 +773,7 @@ impl TestGateSummary {
     /// Create an empty summary.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            suites: Vec::new(),
-        }
+        Self { suites: Vec::new() }
     }
 
     /// Record a test suite result.
@@ -797,11 +785,7 @@ impl TestGateSummary {
     #[must_use]
     pub fn pass_rate(&self) -> f64 {
         let total_passed: u64 = self.suites.iter().map(|s| s.passed).sum();
-        let total_run: u64 = self
-            .suites
-            .iter()
-            .map(|s| s.passed + s.failed)
-            .sum();
+        let total_run: u64 = self.suites.iter().map(|s| s.passed + s.failed).sum();
         if total_run == 0 {
             0.0
         } else {
@@ -872,7 +856,11 @@ impl BenchmarkComparison {
     #[must_use]
     pub fn ratio(&self) -> f64 {
         if self.before == 0.0 {
-            return if self.after == 0.0 { 1.0 } else { f64::INFINITY };
+            return if self.after == 0.0 {
+                1.0
+            } else {
+                f64::INFINITY
+            };
         }
         self.after / self.before
     }
@@ -1024,7 +1012,10 @@ impl IncidentRegistry {
             .iter()
             .filter(|i| {
                 i.priority == 1
-                    && !matches!(i.status, IncidentStatus::Resolved | IncidentStatus::FalsePositive)
+                    && !matches!(
+                        i.status,
+                        IncidentStatus::Resolved | IncidentStatus::FalsePositive
+                    )
             })
             .count()
     }
@@ -1035,7 +1026,10 @@ impl IncidentRegistry {
         self.incidents
             .iter()
             .filter(|i| {
-                !matches!(i.status, IncidentStatus::Resolved | IncidentStatus::FalsePositive)
+                !matches!(
+                    i.status,
+                    IncidentStatus::Resolved | IncidentStatus::FalsePositive
+                )
             })
             .count()
     }
@@ -1288,14 +1282,8 @@ impl GoNoGoVerdict {
     #[must_use]
     pub fn render_report(&self) -> String {
         let mut lines = Vec::new();
-        lines.push(format!(
-            "=== Go/No-Go Verdict: {} ===",
-            self.migration_id
-        ));
-        lines.push(format!(
-            "Decision: {:?}",
-            self.decision
-        ));
+        lines.push(format!("=== Go/No-Go Verdict: {} ===", self.migration_id));
+        lines.push(format!("Decision: {:?}", self.decision));
         lines.push(format!("Rationale: {}", self.rationale));
         lines.push(String::new());
         lines.push("--- Checklist ---".to_string());

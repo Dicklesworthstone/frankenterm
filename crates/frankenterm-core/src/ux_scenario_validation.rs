@@ -1002,8 +1002,16 @@ mod tests {
     #[test]
     fn scenario_specs_have_nonempty_phases() {
         for spec in standard_scenarios() {
-            assert!(!spec.phases.is_empty(), "scenario {} has no phases", spec.scenario_id);
-            assert!(spec.required_phase_count() > 0, "scenario {} has no required phases", spec.scenario_id);
+            assert!(
+                !spec.phases.is_empty(),
+                "scenario {} has no phases",
+                spec.scenario_id
+            );
+            assert!(
+                spec.required_phase_count() > 0,
+                "scenario {} has no required phases",
+                spec.scenario_id
+            );
             assert_eq!(spec.total_phase_count(), spec.phases.len());
         }
     }
@@ -1014,7 +1022,12 @@ mod tests {
             let mut ids: Vec<&str> = spec.phases.iter().map(|p| p.phase_id.as_str()).collect();
             ids.sort();
             ids.dedup();
-            assert_eq!(ids.len(), spec.phases.len(), "duplicate phase IDs in {}", spec.scenario_id);
+            assert_eq!(
+                ids.len(),
+                spec.phases.len(),
+                "duplicate phase IDs in {}",
+                spec.scenario_id
+            );
         }
     }
 
@@ -1392,9 +1405,9 @@ mod tests {
             ended_at_ms: 5000,
             phase_results: vec![
                 PhaseResult::success("intv-01-identify", 300),
-                PhaseResult::success("intv-02-pause", 400),      // Execute step in Intervention
+                PhaseResult::success("intv-02-pause", 400), // Execute step in Intervention
                 PhaseResult::success("intv-03-investigate", 800),
-                PhaseResult::success("intv-04-recover", 600),    // Recover step
+                PhaseResult::success("intv-04-recover", 600), // Recover step
                 PhaseResult::success("intv-05-verify", 500),
             ],
             verdict: ScenarioVerdict::Pass,
@@ -1476,7 +1489,10 @@ mod tests {
         telem.record_execution(&spec, &execution);
 
         assert_eq!(telem.total_friction_events, 2);
-        assert_eq!(*telem.friction_by_category.get("missing-info").unwrap_or(&0), 2);
+        assert_eq!(
+            *telem.friction_by_category.get("missing-info").unwrap_or(&0),
+            2
+        );
     }
 
     #[test]
@@ -1582,7 +1598,11 @@ mod tests {
 
         let eval = GoNoGoEvaluation::evaluate(&telem, &UxThresholds::release_gate());
         assert!(!eval.go);
-        let completion_check = eval.checks.iter().find(|c| c.name == "task-completion-rate").unwrap();
+        let completion_check = eval
+            .checks
+            .iter()
+            .find(|c| c.name == "task-completion-rate")
+            .unwrap();
         assert!(!completion_check.passed);
     }
 
@@ -1608,7 +1628,11 @@ mod tests {
 
         let eval = GoNoGoEvaluation::evaluate(&telem, &UxThresholds::release_gate());
         assert!(!eval.go);
-        let latency_check = eval.checks.iter().find(|c| c.name == "p95-latency-ms").unwrap();
+        let latency_check = eval
+            .checks
+            .iter()
+            .find(|c| c.name == "p95-latency-ms")
+            .unwrap();
         assert!(!latency_check.passed);
     }
 

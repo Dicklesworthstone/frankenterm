@@ -190,14 +190,14 @@ fn arb_ingestion_telemetry_snapshot() -> impl Strategy<Value = IngestionTelemetr
         0..10000usize,
         arb_ingestion_pipeline_config(),
     )
-        .prop_map(
-            |(captured_at_ms, counters, chain_length, config)| IngestionTelemetrySnapshot {
+        .prop_map(|(captured_at_ms, counters, chain_length, config)| {
+            IngestionTelemetrySnapshot {
                 captured_at_ms,
                 counters,
                 audit_chain_length: chain_length,
                 pipeline_config: config,
-            },
-        )
+            }
+        })
 }
 
 fn arb_bundle_audit_action() -> impl Strategy<Value = BundleAuditAction> {
@@ -231,11 +231,9 @@ fn arb_bundle_audit_entry() -> impl Strategy<Value = BundleAuditEntry> {
 }
 
 fn arb_bundle_registry_config() -> impl Strategy<Value = BundleRegistryConfig> {
-    (1..1000usize, 1..5000usize).prop_map(|(max_bundles, max_audit_entries)| {
-        BundleRegistryConfig {
-            max_bundles,
-            max_audit_entries,
-        }
+    (1..1000usize, 1..5000usize).prop_map(|(max_bundles, max_audit_entries)| BundleRegistryConfig {
+        max_bundles,
+        max_audit_entries,
     })
 }
 
@@ -247,15 +245,15 @@ fn arb_bundle_registry_telemetry() -> impl Strategy<Value = BundleRegistryTeleme
         any::<u64>(),
         any::<u64>(),
     )
-        .prop_map(
-            |(registered, removed, updated, validations, failures)| BundleRegistryTelemetry {
+        .prop_map(|(registered, removed, updated, validations, failures)| {
+            BundleRegistryTelemetry {
                 bundles_registered: registered,
                 bundles_removed: removed,
                 bundles_updated: updated,
                 validations_run: validations,
                 validation_failures: failures,
-            },
-        )
+            }
+        })
 }
 
 fn arb_bundle_registry_snapshot() -> impl Strategy<Value = BundleRegistrySnapshot> {

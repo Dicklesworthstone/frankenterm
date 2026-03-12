@@ -654,14 +654,18 @@ fn arb_metadata_projection_failure() -> impl Strategy<Value = MetadataProjection
     prop_oneof![
         "[a-z-]{3,12}".prop_map(|p| MetadataProjectionFailure::ProgramNotFound { program: p }),
         (0u32..50).prop_map(|p| MetadataProjectionFailure::PhaseNotFound { phase: p }),
-        (0u32..100, 0u32..100)
-            .prop_map(|(i, m)| MetadataProjectionFailure::SlotIndexOutOfBounds { index: i, max: m }),
-        (0u32..50, 0u32..10)
-            .prop_map(|(s, p)| MetadataProjectionFailure::PhaseSlotMismatch {
-                slot_index: s,
-                claimed_phase: p,
-            }),
-        (0u32..50, prop_oneof![Just("label".to_string()), Just("program".to_string())])
+        (0u32..100, 0u32..100).prop_map(|(i, m)| MetadataProjectionFailure::SlotIndexOutOfBounds {
+            index: i,
+            max: m
+        }),
+        (0u32..50, 0u32..10).prop_map(|(s, p)| MetadataProjectionFailure::PhaseSlotMismatch {
+            slot_index: s,
+            claimed_phase: p,
+        }),
+        (
+            0u32..50,
+            prop_oneof![Just("label".to_string()), Just("program".to_string())]
+        )
             .prop_map(|(s, f)| MetadataProjectionFailure::InconsistentSlotField {
                 slot_index: s,
                 field: f,

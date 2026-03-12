@@ -21,7 +21,8 @@ fn arb_wait_condition_leaf() -> impl Strategy<Value = WaitCondition> {
         Just(WaitCondition::AnyEvent),
         "[a-z.]{3,20}".prop_map(|s| WaitCondition::RuleId { rule_id: s }),
         any::<u64>().prop_map(|p| WaitCondition::PaneDetection { pane_id: p }),
-        proptest::option::of(any::<u64>()).prop_map(|p| WaitCondition::PaneDiscovered { pane_id: p }),
+        proptest::option::of(any::<u64>())
+            .prop_map(|p| WaitCondition::PaneDiscovered { pane_id: p }),
         any::<u64>().prop_map(|p| WaitCondition::PaneDisappeared { pane_id: p }),
         proptest::option::of("[a-z]{3,10}".prop_map(|s| s))
             .prop_map(|w| WaitCondition::WorkflowCompleted { workflow_id: w }),

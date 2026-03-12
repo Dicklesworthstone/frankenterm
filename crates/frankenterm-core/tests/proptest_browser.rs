@@ -13,12 +13,12 @@ use proptest::prelude::*;
 
 use frankenterm_core::browser::{
     BootstrapMethod, BrowserConfig, ProfileMetadata,
+    anthropic_auth::{AnthropicAuthConfig, AnthropicPageSelectors},
     bootstrap::{BootstrapConfig, BootstrapResult},
     google_auth::{GoogleAuthConfig, GooglePageSelectors},
-    anthropic_auth::{AnthropicAuthConfig, AnthropicPageSelectors},
     openai_device::{
-        AuthFlowFailureKind, AuthFlowResult, ArtifactKind,
-        OpenAiDeviceAuthConfig, DevicePageSelectors,
+        ArtifactKind, AuthFlowFailureKind, AuthFlowResult, DevicePageSelectors,
+        OpenAiDeviceAuthConfig,
     },
 };
 
@@ -39,14 +39,20 @@ fn arb_selector() -> impl Strategy<Value = String> {
 }
 
 fn arb_browser_config() -> impl Strategy<Value = BrowserConfig> {
-    (any::<bool>(), 1000u64..120_000, 1000u64..120_000, arb_string()).prop_map(
-        |(headless, navigation_timeout_ms, page_load_timeout_ms, browser_type)| BrowserConfig {
-            headless,
-            navigation_timeout_ms,
-            page_load_timeout_ms,
-            browser_type,
-        },
+    (
+        any::<bool>(),
+        1000u64..120_000,
+        1000u64..120_000,
+        arb_string(),
     )
+        .prop_map(
+            |(headless, navigation_timeout_ms, page_load_timeout_ms, browser_type)| BrowserConfig {
+                headless,
+                navigation_timeout_ms,
+                page_load_timeout_ms,
+                browser_type,
+            },
+        )
 }
 
 fn arb_bootstrap_method() -> impl Strategy<Value = BootstrapMethod> {
@@ -66,7 +72,14 @@ fn arb_profile_metadata() -> impl Strategy<Value = ProfileMetadata> {
         0u64..10_000,
     )
         .prop_map(
-            |(service, account, bootstrapped_at, bootstrap_method, last_used_at, automated_use_count)| {
+            |(
+                service,
+                account,
+                bootstrapped_at,
+                bootstrap_method,
+                last_used_at,
+                automated_use_count,
+            )| {
                 ProfileMetadata {
                     service,
                     account,
@@ -88,7 +101,13 @@ fn arb_bootstrap_config() -> impl Strategy<Value = BootstrapConfig> {
         prop::collection::vec("[a-z ]{5,20}", 0..3),
     )
         .prop_map(
-            |(login_url, timeout_ms, poll_interval_ms, success_url_prefixes, success_text_markers)| {
+            |(
+                login_url,
+                timeout_ms,
+                poll_interval_ms,
+                success_url_prefixes,
+                success_text_markers,
+            )| {
                 BootstrapConfig {
                     login_url,
                     timeout_ms,
@@ -129,15 +148,16 @@ fn arb_auth_flow_failure_kind() -> impl Strategy<Value = AuthFlowFailureKind> {
 
 fn arb_auth_flow_result() -> impl Strategy<Value = AuthFlowResult> {
     prop_oneof![
-        (0u64..600_000)
-            .prop_map(|elapsed_ms| AuthFlowResult::Success { elapsed_ms }),
+        (0u64..600_000).prop_map(|elapsed_ms| AuthFlowResult::Success { elapsed_ms }),
         (
             "[a-z ]{5,30}",
             prop::option::of("[a-z/]{5,20}".prop_map(PathBuf::from)),
         )
-            .prop_map(|(reason, artifacts_dir)| AuthFlowResult::InteractiveBootstrapRequired {
-                reason,
-                artifacts_dir,
+            .prop_map(|(reason, artifacts_dir)| {
+                AuthFlowResult::InteractiveBootstrapRequired {
+                    reason,
+                    artifacts_dir,
+                }
             }),
         (
             "[a-z ]{5,30}",

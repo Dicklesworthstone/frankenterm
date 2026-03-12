@@ -612,10 +612,7 @@ impl NtmImporter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            unsupported_coordinator_modes: vec![
-                "cluster".to_string(),
-                "distributed".to_string(),
-            ],
+            unsupported_coordinator_modes: vec!["cluster".to_string(), "distributed".to_string()],
         }
     }
 
@@ -683,9 +680,7 @@ impl NtmImporter {
                     severity: ImportSeverity::Error,
                     source_path: source_id.clone(),
                     code: "UNSUPPORTED_COORDINATOR_MODE".to_string(),
-                    message: format!(
-                        "Coordinator mode '{mode}' is not supported in FrankenTerm"
-                    ),
+                    message: format!("Coordinator mode '{mode}' is not supported in FrankenTerm"),
                     remediation: Some(
                         "Use 'swarm' or 'interactive' mode instead. Distributed coordination \
                          is handled natively by the FrankenTerm swarm scheduler."
@@ -752,10 +747,7 @@ impl NtmImporter {
                 });
                 profiles.push(TranslatedSessionProfile {
                     name: format!("{}-{}-default", session.name, window.name),
-                    description: format!(
-                        "Default profile for empty NTM window '{}'",
-                        window.name
-                    ),
+                    description: format!("Default profile for empty NTM window '{}'", window.name),
                     role: "dev_shell".to_string(),
                     spawn_command: None,
                     environment: session.environment.clone(),
@@ -763,10 +755,7 @@ impl NtmImporter {
                     resource_hints: TranslatedResourceHints::default(),
                     layout_template: Some(format!("{}-{}", session.name, window.name)),
                     bootstrap_commands: Vec::new(),
-                    tags: vec![
-                        format!("imported:ntm"),
-                        format!("session:{}", session.name),
-                    ],
+                    tags: vec![format!("imported:ntm"), format!("session:{}", session.name)],
                 });
             }
         }
@@ -784,10 +773,7 @@ impl NtmImporter {
             });
             profiles.push(TranslatedSessionProfile {
                 name: session.name.clone(),
-                description: format!(
-                    "Imported from NTM session '{}' (no windows)",
-                    session.name
-                ),
+                description: format!("Imported from NTM session '{}' (no windows)", session.name),
                 role: "dev_shell".to_string(),
                 spawn_command: None,
                 environment: session.environment.clone(),
@@ -834,10 +820,7 @@ impl NtmImporter {
     }
 
     /// Build a layout tree from NTM pane definitions.
-    fn build_layout_tree(
-        panes: &[NtmPane],
-        layout_hint: Option<&str>,
-    ) -> TranslatedLayoutNode {
+    fn build_layout_tree(panes: &[NtmPane], layout_hint: Option<&str>) -> TranslatedLayoutNode {
         if panes.len() == 1 {
             return TranslatedLayoutNode::Slot {
                 role: panes[0].role.clone(),
@@ -901,10 +884,7 @@ impl NtmImporter {
         let mut env = session.environment.clone();
         env.extend(pane.environment.clone());
 
-        let pane_label = pane
-            .role
-            .as_deref()
-            .unwrap_or("pane");
+        let pane_label = pane.role.as_deref().unwrap_or("pane");
 
         TranslatedSessionProfile {
             name: format!("{}-{}-{}", session.name, window.name, pane_label),
@@ -1074,11 +1054,7 @@ impl NtmImporter {
                     .to_string();
                 let timeout_ms = step
                     .timeout_secs
-                    .or_else(|| {
-                        step.params
-                            .get("timeout_secs")
-                            .and_then(|v| v.as_u64())
-                    })
+                    .or_else(|| step.params.get("timeout_secs").and_then(|v| v.as_u64()))
                     .map(|s| s * 1000);
                 TranslatedStepType::WaitFor {
                     pattern,
@@ -1144,10 +1120,7 @@ impl NtmImporter {
 
         let translated = TranslatedWorkflowStep {
             name: step.name.clone(),
-            description: format!(
-                "Imported step '{}' (action: {})",
-                step.name, step.action
-            ),
+            description: format!("Imported step '{}' (action: {})", step.name, step.action),
             step_type,
         };
 
@@ -1155,9 +1128,7 @@ impl NtmImporter {
     }
 
     /// Translate NTM configuration to FrankenTerm config fragment.
-    fn translate_config(
-        config: &NtmConfig,
-    ) -> (TranslatedConfig, ImportItemResult) {
+    fn translate_config(config: &NtmConfig) -> (TranslatedConfig, ImportItemResult) {
         let source_id = "config".to_string();
         let mut result = ImportItemResult::new(&source_id, "config");
 
@@ -1325,10 +1296,7 @@ mod tests {
             steps: vec![NtmWorkflowStep {
                 name: "send-check".to_string(),
                 action: "send_text".to_string(),
-                params: HashMap::from([(
-                    "text".to_string(),
-                    json!("health_check --verbose"),
-                )]),
+                params: HashMap::from([("text".to_string(), json!("health_check --verbose"))]),
                 conditions: Vec::new(),
                 timeout_secs: Some(30),
             }],
@@ -1372,7 +1340,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: NtmConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.log_level, back.log_level);
-        assert_eq!(config.safety.rate_limit_per_minute, back.safety.rate_limit_per_minute);
+        assert_eq!(
+            config.safety.rate_limit_per_minute,
+            back.safety.rate_limit_per_minute
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1674,9 +1645,18 @@ mod tests {
         let tw = translated.unwrap();
         assert_eq!(tw.name, "auto-restart");
         assert_eq!(tw.steps.len(), 3);
-        assert!(matches!(tw.steps[0].step_type, TranslatedStepType::SendText { .. }));
-        assert!(matches!(tw.steps[1].step_type, TranslatedStepType::WaitFor { .. }));
-        assert!(matches!(tw.steps[2].step_type, TranslatedStepType::Assert { .. }));
+        assert!(matches!(
+            tw.steps[0].step_type,
+            TranslatedStepType::SendText { .. }
+        ));
+        assert!(matches!(
+            tw.steps[1].step_type,
+            TranslatedStepType::WaitFor { .. }
+        ));
+        assert!(matches!(
+            tw.steps[2].step_type,
+            TranslatedStepType::Assert { .. }
+        ));
         assert_eq!(tw.timeout_ms, 120_000);
         assert_eq!(tw.max_concurrent, 1);
     }
@@ -1865,7 +1845,10 @@ mod tests {
         let (translated, result) = NtmImporter::translate_config(&config);
 
         assert_eq!(translated.untranslated.len(), 1);
-        assert_eq!(translated.untranslated.get("custom_setting").unwrap(), &json!(42));
+        assert_eq!(
+            translated.untranslated.get("custom_setting").unwrap(),
+            &json!(42)
+        );
         let info = result
             .findings
             .iter()
@@ -1941,10 +1924,12 @@ mod tests {
 
         // Config import produces findings for hooks, robot auth, and untranslated keys.
         assert!(!bundle.report.finding_summary.is_empty());
-        assert!(bundle
-            .report
-            .finding_summary
-            .contains_key("HOOKS_NEED_WORKFLOW_MIGRATION"));
+        assert!(
+            bundle
+                .report
+                .finding_summary
+                .contains_key("HOOKS_NEED_WORKFLOW_MIGRATION")
+        );
     }
 
     #[test]

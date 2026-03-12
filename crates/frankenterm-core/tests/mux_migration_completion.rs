@@ -332,10 +332,7 @@ fn pool_and_mux_client_concurrent_operations() {
             let cx = cx.clone();
             handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
                 let conn = pool.acquire(&cx).await.expect("acquire");
-                let text = client
-                    .get_pane_text(&cx, pane_id)
-                    .await
-                    .expect("get text");
+                let text = client.get_pane_text(&cx, pane_id).await.expect("get text");
                 assert_eq!(text, format!("output-{pane_id}"));
                 pool.release(&cx, conn).await.expect("release");
             }));

@@ -59,8 +59,8 @@ fn arb_ntm_session() -> impl Strategy<Value = NtmSession> {
         ])),
         any::<bool>(),
     )
-        .prop_map(|(name, workspace, windows, coordinator_mode, auto_start)| {
-            NtmSession {
+        .prop_map(
+            |(name, workspace, windows, coordinator_mode, auto_start)| NtmSession {
                 name,
                 workspace,
                 windows,
@@ -69,8 +69,8 @@ fn arb_ntm_session() -> impl Strategy<Value = NtmSession> {
                 auto_start,
                 safety_overrides: HashMap::new(),
                 extra: HashMap::new(),
-            }
-        })
+            },
+        )
 }
 
 fn arb_ntm_workflow_trigger() -> impl Strategy<Value = NtmWorkflowTrigger> {

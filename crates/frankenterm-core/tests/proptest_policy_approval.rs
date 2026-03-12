@@ -21,20 +21,32 @@ fn arb_approval_status() -> impl Strategy<Value = ApprovalStatus> {
 
 fn arb_approval_entry() -> impl Strategy<Value = ApprovalEntry> {
     (
-        "[a-z0-9-]{1,20}",  // approval_id
-        "[a-z_]{1,15}",     // action
-        "[a-z_]{1,15}",     // actor
-        "[a-z0-9_]{1,20}",  // resource
-        "[a-z ]{1,30}",     // reason
-        "[a-z0-9.]{1,20}",  // rule_id
-        any::<u64>(),        // requested_at_ms
-        any::<u64>(),        // expires_at_ms
+        "[a-z0-9-]{1,20}", // approval_id
+        "[a-z_]{1,15}",    // action
+        "[a-z_]{1,15}",    // actor
+        "[a-z0-9_]{1,20}", // resource
+        "[a-z ]{1,30}",    // reason
+        "[a-z0-9.]{1,20}", // rule_id
+        any::<u64>(),      // requested_at_ms
+        any::<u64>(),      // expires_at_ms
         arb_approval_status(),
-        "[a-z_]{0,15}",     // decided_by
-        any::<u64>(),        // decided_at_ms
+        "[a-z_]{0,15}", // decided_by
+        any::<u64>(),   // decided_at_ms
     )
         .prop_map(
-            |(id, action, actor, resource, reason, rule_id, req_at, exp_at, status, decided_by, dec_at)| {
+            |(
+                id,
+                action,
+                actor,
+                resource,
+                reason,
+                rule_id,
+                req_at,
+                exp_at,
+                status,
+                decided_by,
+                dec_at,
+            )| {
                 ApprovalEntry {
                     approval_id: id,
                     action,
@@ -63,27 +75,25 @@ fn arb_approval_tracker_snapshot() -> impl Strategy<Value = ApprovalTrackerSnaps
         any::<usize>(),
     )
         .prop_map(
-            |(total, pending, approved, rejected, expired, revoked, max)| {
-                ApprovalTrackerSnapshot {
-                    total,
-                    pending,
-                    approved,
-                    rejected,
-                    expired,
-                    revoked,
-                    max_entries: max,
-                }
+            |(total, pending, approved, rejected, expired, revoked, max)| ApprovalTrackerSnapshot {
+                total,
+                pending,
+                approved,
+                rejected,
+                expired,
+                revoked,
+                max_entries: max,
             },
         )
 }
 
 fn arb_approval_request() -> impl Strategy<Value = ApprovalRequest> {
     (
-        "[a-z0-9]{4,8}",  // allow_once_code
-        "[a-f0-9]{64}",   // allow_once_full_hash
-        any::<i64>(),      // expires_at
-        "[a-z ]{1,30}",   // summary
-        "[a-z -]{1,30}",  // command
+        "[a-z0-9]{4,8}", // allow_once_code
+        "[a-f0-9]{64}",  // allow_once_full_hash
+        any::<i64>(),    // expires_at
+        "[a-z ]{1,30}",  // summary
+        "[a-z -]{1,30}", // command
     )
         .prop_map(|(code, hash, expires, summary, command)| ApprovalRequest {
             allow_once_code: code,
@@ -351,23 +361,25 @@ proptest! {
 
 fn arb_revocation_record() -> impl Strategy<Value = RevocationRecord> {
     (
-        "[a-z0-9-]{1,20}",  // revocation_id
-        "[a-z_]{1,15}",     // resource_type
-        "[a-z0-9_]{1,20}",  // resource_id
-        "[a-z ]{1,30}",     // reason
-        "[a-z_]{1,15}",     // revoked_by
-        any::<u64>(),        // revoked_at_ms
-        any::<bool>(),       // active
+        "[a-z0-9-]{1,20}", // revocation_id
+        "[a-z_]{1,15}",    // resource_type
+        "[a-z0-9_]{1,20}", // resource_id
+        "[a-z ]{1,30}",    // reason
+        "[a-z_]{1,15}",    // revoked_by
+        any::<u64>(),      // revoked_at_ms
+        any::<bool>(),     // active
     )
-        .prop_map(|(id, rtype, rid, reason, by, at, active)| RevocationRecord {
-            revocation_id: id,
-            resource_type: rtype,
-            resource_id: rid,
-            reason,
-            revoked_by: by,
-            revoked_at_ms: at,
-            active,
-        })
+        .prop_map(
+            |(id, rtype, rid, reason, by, at, active)| RevocationRecord {
+                revocation_id: id,
+                resource_type: rtype,
+                resource_id: rid,
+                reason,
+                revoked_by: by,
+                revoked_at_ms: at,
+                active,
+            },
+        )
 }
 
 fn arb_revocation_registry_snapshot() -> impl Strategy<Value = RevocationRegistrySnapshot> {

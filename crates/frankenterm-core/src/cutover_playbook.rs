@@ -766,7 +766,12 @@ impl CutoverPlaybook {
 
         self.current_stage = to;
         self.halted = true;
-        self.halt_reason = format!("Rollback from {} to {}: {}", from.label(), to.label(), reason);
+        self.halt_reason = format!(
+            "Rollback from {} to {}: {}",
+            from.label(),
+            to.label(),
+            reason
+        );
         self.telemetry.rollback_count += 1;
     }
 
@@ -903,8 +908,12 @@ pub fn standard_playbook(migration_id: impl Into<String>) -> CutoverPlaybook {
 
     // Stage 0 (Preflight) gates
     pb.register_gate(
-        StageGate::new("G-01", GateCategory::Parity, "Blocking parity scenarios 100% pass")
-            .for_stage(CutoverStage::Preflight),
+        StageGate::new(
+            "G-01",
+            GateCategory::Parity,
+            "Blocking parity scenarios 100% pass",
+        )
+        .for_stage(CutoverStage::Preflight),
     );
     pb.register_gate(
         StageGate::new(
@@ -1052,7 +1061,10 @@ mod tests {
     fn stage_navigation() {
         assert_eq!(CutoverStage::Preflight.next(), Some(CutoverStage::Shadow));
         assert_eq!(CutoverStage::Default.next(), None);
-        assert_eq!(CutoverStage::Shadow.previous(), Some(CutoverStage::Preflight));
+        assert_eq!(
+            CutoverStage::Shadow.previous(),
+            Some(CutoverStage::Preflight)
+        );
         assert_eq!(CutoverStage::Preflight.previous(), None);
     }
 
@@ -1182,7 +1194,11 @@ mod tests {
         // No gates, but approval required for Preflight -> Shadow
         let result = pb.try_advance(1000, "test");
         assert!(!result.advanced);
-        assert!(result.missing_approvals.contains(&ApproverRole::MigrationLead));
+        assert!(
+            result
+                .missing_approvals
+                .contains(&ApproverRole::MigrationLead)
+        );
     }
 
     #[test]
@@ -1216,7 +1232,11 @@ mod tests {
 
         let result = pb.try_advance(1000, "test");
         assert!(!result.advanced);
-        assert!(result.blocking_gates.contains(&"ALREADY_AT_FINAL_STAGE".to_string()));
+        assert!(
+            result
+                .blocking_gates
+                .contains(&"ALREADY_AT_FINAL_STAGE".to_string())
+        );
     }
 
     #[test]
@@ -1227,7 +1247,11 @@ mod tests {
 
         let result = pb.try_advance(1000, "test");
         assert!(!result.advanced);
-        assert!(result.blocking_gates.contains(&"PLAYBOOK_HALTED".to_string()));
+        assert!(
+            result
+                .blocking_gates
+                .contains(&"PLAYBOOK_HALTED".to_string())
+        );
     }
 
     // ---- Rollback ----

@@ -705,7 +705,10 @@ impl SessionWorkflowExplorer {
         details.insert("execution_id".to_string(), execution_id.to_string());
         details.insert("workflow".to_string(), workflow_name.to_string());
         details.insert("step_index".to_string(), step_index.to_string());
-        details.insert("outcome".to_string(), format!("{:?}", outcome).to_lowercase());
+        details.insert(
+            "outcome".to_string(),
+            format!("{:?}", outcome).to_lowercase(),
+        );
 
         let event = TimelineEvent {
             event_id: 0,
@@ -878,7 +881,10 @@ impl SessionWorkflowExplorer {
             .iter()
             .filter(|e| {
                 e.category == EventCategory::PolicyDecision
-                    && e.details.get("outcome").map(|o| o == "deny" || o == "Deny").unwrap_or(false)
+                    && e.details
+                        .get("outcome")
+                        .map(|o| o == "deny" || o == "Deny")
+                        .unwrap_or(false)
             })
             .count();
 
@@ -941,7 +947,10 @@ impl SessionWorkflowExplorer {
             .iter()
             .filter(|e| {
                 e.category == EventCategory::PolicyDecision
-                    && e.details.get("outcome").map(|o| o == "deny" || o == "Deny").unwrap_or(false)
+                    && e.details
+                        .get("outcome")
+                        .map(|o| o == "deny" || o == "Deny")
+                        .unwrap_or(false)
             })
             .map(|e| ExtractedEvent::from(*e))
             .collect();
@@ -1050,16 +1059,12 @@ impl SessionWorkflowExplorer {
 
             match summary.earliest_ms {
                 None => summary.earliest_ms = Some(event.timestamp_ms),
-                Some(e) if event.timestamp_ms < e => {
-                    summary.earliest_ms = Some(event.timestamp_ms)
-                }
+                Some(e) if event.timestamp_ms < e => summary.earliest_ms = Some(event.timestamp_ms),
                 _ => {}
             }
             match summary.latest_ms {
                 None => summary.latest_ms = Some(event.timestamp_ms),
-                Some(l) if event.timestamp_ms > l => {
-                    summary.latest_ms = Some(event.timestamp_ms)
-                }
+                Some(l) if event.timestamp_ms > l => summary.latest_ms = Some(event.timestamp_ms),
                 _ => {}
             }
         }
@@ -1554,14 +1559,8 @@ mod tests {
     #[test]
     fn ingest_policy_decision_allow() {
         let mut explorer = SessionWorkflowExplorer::new(100);
-        let id = explorer.ingest_policy_decision(
-            Some(1),
-            "allow",
-            "No restrictions",
-            None,
-            1000,
-            None,
-        );
+        let id =
+            explorer.ingest_policy_decision(Some(1), "allow", "No restrictions", None, 1000, None);
         let event = explorer.get_event(id).unwrap();
         assert_eq!(event.severity, EventSeverity::Info);
         assert!(!event.is_intervention_point);
@@ -1808,13 +1807,7 @@ mod tests {
     #[test]
     fn extract_interventions() {
         let mut explorer = SessionWorkflowExplorer::new(100);
-        explorer.ingest_intervention(
-            Some(1),
-            "Ctrl-C sent",
-            EventSource::Robot,
-            1000,
-            None,
-        );
+        explorer.ingest_intervention(Some(1), "Ctrl-C sent", EventSource::Robot, 1000, None);
         explorer.ingest(make_event(
             EventCategory::Output,
             EventSeverity::Info,
@@ -1830,22 +1823,8 @@ mod tests {
     #[test]
     fn extract_policy_denials() {
         let mut explorer = SessionWorkflowExplorer::new(100);
-        explorer.ingest_policy_decision(
-            Some(1),
-            "deny",
-            "Alt screen",
-            None,
-            1000,
-            None,
-        );
-        explorer.ingest_policy_decision(
-            Some(1),
-            "allow",
-            "No restrictions",
-            None,
-            1001,
-            None,
-        );
+        explorer.ingest_policy_decision(Some(1), "deny", "Alt screen", None, 1000, None);
+        explorer.ingest_policy_decision(Some(1), "allow", "No restrictions", None, 1001, None);
 
         let extraction = explorer.extract(0, 2000);
         assert_eq!(extraction.denials.len(), 1);

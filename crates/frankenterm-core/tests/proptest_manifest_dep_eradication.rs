@@ -6,8 +6,8 @@
 
 use frankenterm_core::dependency_eradication::{ForbiddenRuntime, ViolationSeverity};
 use frankenterm_core::manifest_dep_eradication::{
-    AlignmentReport, DepCondition, DepSection, EradicationAction, EradicationPlan,
-    EradicationStep, FeatureAlignment, ManifestFinding, standard_feature_alignments,
+    AlignmentReport, DepCondition, DepSection, EradicationAction, EradicationPlan, EradicationStep,
+    FeatureAlignment, ManifestFinding, standard_feature_alignments,
 };
 use proptest::prelude::*;
 
@@ -73,7 +73,16 @@ fn arb_manifest_finding() -> impl Strategy<Value = ManifestFinding> {
         arb_violation_severity(),
     )
         .prop_map(
-            |(crate_name, manifest_path, dep_name, runtime, section, condition, features, severity)| {
+            |(
+                crate_name,
+                manifest_path,
+                dep_name,
+                runtime,
+                section,
+                condition,
+                features,
+                severity,
+            )| {
                 ManifestFinding {
                     crate_name,
                     manifest_path,
@@ -96,13 +105,15 @@ fn arb_eradication_step() -> impl Strategy<Value = EradicationStep> {
         proptest::option::of("[a-z-]{3,15}"),
         any::<bool>(),
     )
-        .prop_map(|(finding, action, rationale, migration_feature, completed)| EradicationStep {
-            finding,
-            action,
-            rationale,
-            migration_feature,
-            completed,
-        })
+        .prop_map(
+            |(finding, action, rationale, migration_feature, completed)| EradicationStep {
+                finding,
+                action,
+                rationale,
+                migration_feature,
+                completed,
+            },
+        )
 }
 
 fn arb_eradication_plan() -> impl Strategy<Value = EradicationPlan> {
@@ -257,7 +268,11 @@ proptest! {
 fn standard_plan_has_expected_steps() {
     let plan = EradicationPlan::standard();
     // At least 18 steps (may grow as crates are audited)
-    assert!(plan.total_steps() >= 18, "expected at least 18 steps, got {}", plan.total_steps());
+    assert!(
+        plan.total_steps() >= 18,
+        "expected at least 18 steps, got {}",
+        plan.total_steps()
+    );
 }
 
 #[test]
@@ -270,7 +285,10 @@ fn standard_plan_no_steps_completed() {
 fn standard_plan_has_critical_remaining() {
     let plan = EradicationPlan::standard();
     let critical = plan.critical_remaining();
-    assert!(!critical.is_empty(), "standard plan should have critical steps");
+    assert!(
+        !critical.is_empty(),
+        "standard plan should have critical steps"
+    );
 }
 
 #[test]
@@ -280,7 +298,10 @@ fn standard_plan_covers_all_runtimes() {
     assert!(by_runtime.contains_key("tokio"), "should cover tokio");
     assert!(by_runtime.contains_key("smol"), "should cover smol");
     assert!(by_runtime.contains_key("async-io"), "should cover async-io");
-    assert!(by_runtime.contains_key("async-executor"), "should cover async-executor");
+    assert!(
+        by_runtime.contains_key("async-executor"),
+        "should cover async-executor"
+    );
 }
 
 // =========================================================================

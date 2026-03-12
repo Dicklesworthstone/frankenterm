@@ -129,7 +129,11 @@ fn e2e_missing_benchmark_result_fails_gate() {
     let report = VerificationReport::verify(&manifest, &artifacts);
 
     assert_eq!(report.verdict, VerificationVerdict::Incomplete);
-    assert!(report.mandatory_missing.contains(&ArtifactType::BenchmarkResult));
+    assert!(
+        report
+            .mandatory_missing
+            .contains(&ArtifactType::BenchmarkResult)
+    );
 }
 
 #[test]
@@ -188,7 +192,10 @@ fn e2e_benchmark_content_failure_fails_step() {
         .iter()
         .find(|s| s.step_id.contains("bench"))
         .unwrap();
-    assert!(!bench_step.passed, "benchmark step should fail on content failure");
+    assert!(
+        !bench_step.passed,
+        "benchmark step should fail on content failure"
+    );
     assert!(!bench_step.content_passing);
     assert!(bench_step.schemas_valid);
 }
@@ -218,7 +225,10 @@ fn e2e_schema_failure_fails_step() {
         .iter()
         .find(|s| s.step_id.contains("scan"))
         .unwrap();
-    assert!(!scan_step.passed, "scan step should fail on schema validation");
+    assert!(
+        !scan_step.passed,
+        "scan step should fail on schema validation"
+    );
     assert!(!scan_step.schemas_valid);
 }
 
@@ -312,7 +322,10 @@ fn e2e_missing_log_bundle_status() {
             report.verdict,
             VerificationVerdict::PartiallyComplete | VerificationVerdict::Complete
         );
-        assert!(check, "missing non-mandatory LogBundle should not make gate Incomplete");
+        assert!(
+            check,
+            "missing non-mandatory LogBundle should not make gate Incomplete"
+        );
     }
 }
 
@@ -533,8 +546,8 @@ fn e2e_surface_guard_and_migration_gate_both_pass() {
     let migration_report = VerificationReport::verify(&manifest, &artifacts);
 
     // Both should pass
-    let _guard_ok = guard_report.overall_compliant
-        || guard_report.guard_checks.iter().all(|c| c.compliant);
+    let _guard_ok =
+        guard_report.overall_compliant || guard_report.guard_checks.iter().all(|c| c.compliant);
     assert_eq!(migration_report.verdict, VerificationVerdict::Complete);
     // _guard_ok may or may not be true depending on standard check state
     // but we verify both pipelines execute without panicking

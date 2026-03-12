@@ -225,7 +225,13 @@ fn arb_testbed_snapshot() -> impl Strategy<Value = TestbedSnapshot> {
         0usize..100,
     )
         .prop_map(
-            |(captured_at_ms, counters, provider_count, escape_result_count, audit_chain_length)| {
+            |(
+                captured_at_ms,
+                counters,
+                provider_count,
+                escape_result_count,
+                audit_chain_length,
+            )| {
                 TestbedSnapshot {
                     captured_at_ms,
                     counters,

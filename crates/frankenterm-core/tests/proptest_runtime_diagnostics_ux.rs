@@ -5,8 +5,8 @@
 //! `TemplateCheck`, and `CertificationReport`.
 
 use frankenterm_core::runtime_diagnostics_ux::{
-    render_diagnostic, CertificationReport, DiagnosticCatalog, DiagnosticTemplate,
-    RemediationStep, RenderedDiagnostic, TemplateCheck,
+    CertificationReport, DiagnosticCatalog, DiagnosticTemplate, RemediationStep,
+    RenderedDiagnostic, TemplateCheck, render_diagnostic,
 };
 use frankenterm_core::runtime_telemetry::FailureClass;
 use proptest::prelude::*;
@@ -38,15 +38,15 @@ fn arb_remediation_step() -> impl Strategy<Value = RemediationStep> {
         "[a-z ]{1,50}",
         any::<bool>(),
     )
-        .prop_map(|(step, instruction, command, expected_outcome, robot_safe)| {
-            RemediationStep {
+        .prop_map(
+            |(step, instruction, command, expected_outcome, robot_safe)| RemediationStep {
                 step,
                 instruction,
                 command,
                 expected_outcome,
                 robot_safe,
-            }
-        })
+            },
+        )
 }
 
 fn arb_diagnostic_template() -> impl Strategy<Value = DiagnosticTemplate> {
@@ -60,7 +60,15 @@ fn arb_diagnostic_template() -> impl Strategy<Value = DiagnosticTemplate> {
         any::<bool>(),
     )
         .prop_map(
-            |(failure_class, cause_summary, user_impact, remediation_steps, escalation_hint, error_code, certified)| {
+            |(
+                failure_class,
+                cause_summary,
+                user_impact,
+                remediation_steps,
+                escalation_hint,
+                error_code,
+                certified,
+            )| {
                 DiagnosticTemplate {
                     failure_class,
                     cause_summary,
@@ -88,7 +96,18 @@ fn arb_template_check() -> impl Strategy<Value = TemplateCheck> {
         any::<bool>(),
     )
         .prop_map(
-            |(failure_class, has_cause, has_impact, has_remediation, has_robot_safe_step, has_command, has_escalation, has_error_code, is_certified, passed)| {
+            |(
+                failure_class,
+                has_cause,
+                has_impact,
+                has_remediation,
+                has_robot_safe_step,
+                has_command,
+                has_escalation,
+                has_error_code,
+                is_certified,
+                passed,
+            )| {
                 TemplateCheck {
                     failure_class,
                     has_cause,

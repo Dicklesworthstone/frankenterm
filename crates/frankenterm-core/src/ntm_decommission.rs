@@ -546,10 +546,7 @@ pub fn standard_documentation_index() -> DocumentationIndex {
         category: DocCategory::OperatorPlaybook,
         path: "docs/operator/fleet-launch.md".into(),
         complete: true,
-        topics: vec![
-            "fleet-launch".into(),
-            "agent-swarm-orchestration".into(),
-        ],
+        topics: vec!["fleet-launch".into(), "agent-swarm-orchestration".into()],
     });
     index.add(DocEntry {
         doc_id: "DOC-03".into(),
@@ -720,7 +717,10 @@ impl DecommissionPlan {
     /// Count of active (not yet migrated) dependencies.
     #[must_use]
     pub fn active_dependency_count(&self) -> usize {
-        self.dependencies.iter().filter(|d| d.status.is_active()).count()
+        self.dependencies
+            .iter()
+            .filter(|d| d.status.is_active())
+            .count()
     }
 
     /// Count of migrated dependencies.
@@ -728,7 +728,12 @@ impl DecommissionPlan {
     pub fn migrated_dependency_count(&self) -> usize {
         self.dependencies
             .iter()
-            .filter(|d| matches!(d.status, DependencyStatus::Migrated | DependencyStatus::Retired))
+            .filter(|d| {
+                matches!(
+                    d.status,
+                    DependencyStatus::Migrated | DependencyStatus::Retired
+                )
+            })
             .count()
     }
 
@@ -758,7 +763,11 @@ impl DecommissionPlan {
     pub fn is_ready(&self) -> bool {
         self.active_dependency_count() == 0
             && self.documentation.all_topics_covered()
-            && self.phases.iter().take(self.phases.len().saturating_sub(1)).all(|p| p.complete)
+            && self
+                .phases
+                .iter()
+                .take(self.phases.len().saturating_sub(1))
+                .all(|p| p.complete)
     }
 
     /// Render a human-readable summary.
@@ -880,7 +889,12 @@ impl DecommissionPlan {
             completed_phases: self.completed_phases(),
             total_phases: self.phases.len(),
             doc_coverage_rate: self.documentation.coverage_rate(),
-            missing_topics: self.documentation.missing_topics().iter().map(|s| s.to_string()).collect(),
+            missing_topics: self
+                .documentation
+                .missing_topics()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ready: self.is_ready(),
             audit_entries: self.audit.len(),
         }
@@ -922,7 +936,13 @@ mod tests {
         assert_eq!(active.status, DependencyStatus::Active);
         assert!(active.migration_target.is_none());
 
-        let migrated = NtmDependency::migrated("D2", "test", NtmComponentCategory::CliSurface, "target", "evidence");
+        let migrated = NtmDependency::migrated(
+            "D2",
+            "test",
+            NtmComponentCategory::CliSurface,
+            "target",
+            "evidence",
+        );
         assert_eq!(migrated.status, DependencyStatus::Migrated);
         assert_eq!(migrated.migration_target.as_deref(), Some("target"));
     }
@@ -962,7 +982,11 @@ mod tests {
     #[test]
     fn standard_docs_cover_all_topics() {
         let index = standard_documentation_index();
-        assert!(index.all_topics_covered(), "missing: {:?}", index.missing_topics());
+        assert!(
+            index.all_topics_covered(),
+            "missing: {:?}",
+            index.missing_topics()
+        );
         assert_eq!(index.coverage_rate(), 1.0);
     }
 

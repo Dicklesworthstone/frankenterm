@@ -543,8 +543,8 @@ pub fn standard_build_guards() -> Vec<BuildScriptGuard> {
 mod tests {
     use super::*;
     use crate::dependency_eradication::{
-        standard_forbidden_patterns, ForbiddenImport, ForbiddenRuntime, ScanReport,
-        ViolationSeverity,
+        ForbiddenImport, ForbiddenRuntime, ScanReport, ViolationSeverity,
+        standard_forbidden_patterns,
     };
 
     // ------------------------------------------------------------------

@@ -1751,7 +1751,10 @@ mod tests {
     #[test]
     fn warning_status_lines_single_degraded() {
         let lines = vec!["shard timeout".to_string()];
-        assert_eq!(warning_status_from_lines(&lines), Some(HealthStatus::Degraded));
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Degraded)
+        );
     }
 
     #[test]
@@ -1761,7 +1764,10 @@ mod tests {
             "shard 1 critical: circuit open".to_string(),
             "shard 2 degraded: high latency".to_string(),
         ];
-        assert_eq!(warning_status_from_lines(&lines), Some(HealthStatus::Critical));
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Critical)
+        );
     }
 
     #[test]
@@ -1777,7 +1783,10 @@ mod tests {
     fn warning_status_lines_no_keywords_yields_degraded() {
         // Non-empty lines without recognized keywords default to Degraded
         let lines = vec!["some informational note".to_string()];
-        assert_eq!(warning_status_from_lines(&lines), Some(HealthStatus::Degraded));
+        assert_eq!(
+            warning_status_from_lines(&lines),
+            Some(HealthStatus::Degraded)
+        );
     }
 
     // -- MuxWatchdog warning-driven check() tests (ft-1360.1) ─────
@@ -1804,10 +1813,8 @@ mod tests {
     fn mux_watchdog_hung_on_deadlock_warning() {
         run_async_test(async {
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.set_watchdog_warnings(vec![
-                "mux server deadlock detected in shard 2".to_string(),
-            ])
-            .await;
+            mock.set_watchdog_warnings(vec!["mux server deadlock detected in shard 2".to_string()])
+                .await;
             let wezterm: crate::wezterm::WeztermHandle = mock;
             let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
 
@@ -1848,10 +1855,8 @@ mod tests {
             // we need to use a failing mock. However MockWezterm always succeeds on list_panes.
             // Instead, test that consecutive failures at threshold = Critical is NOT downgraded
             // by adding only "degraded" warnings.
-            mock.set_watchdog_warnings(vec![
-                "informational note with no keywords".to_string(),
-            ])
-            .await;
+            mock.set_watchdog_warnings(vec!["informational note with no keywords".to_string()])
+                .await;
             let wezterm: crate::wezterm::WeztermHandle = mock;
             let config = MuxWatchdogConfig {
                 failure_threshold: 2,
@@ -1871,10 +1876,8 @@ mod tests {
     fn mux_watchdog_report_includes_warning_elevated_status() {
         run_async_test(async {
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.set_watchdog_warnings(vec![
-                "shard 3 critical: pane leak detected".to_string(),
-            ])
-            .await;
+            mock.set_watchdog_warnings(vec!["shard 3 critical: pane leak detected".to_string()])
+                .await;
             let wezterm: crate::wezterm::WeztermHandle = mock;
             let mut watchdog = MuxWatchdog::new(MuxWatchdogConfig::default(), wezterm);
 

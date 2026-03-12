@@ -621,13 +621,8 @@ impl IngestionPipeline {
         let entity_ref = event.rule_id();
 
         // Append to audit chain.
-        self.audit_chain.append(
-            kind,
-            &event.connector_id,
-            &description,
-            &entity_ref,
-            now_ms,
-        );
+        self.audit_chain
+            .append(kind, &event.connector_id, &description, &entity_ref, now_ms);
 
         self.telemetry.events_recorded += 1;
         IngestionOutcome::Recorded
@@ -891,12 +886,12 @@ impl BundleRegistry {
         actor: &str,
         now_ms: u64,
     ) -> Result<ConnectorBundle, BundleRegistryError> {
-        let bundle = self
-            .bundles
-            .remove(bundle_id)
-            .ok_or_else(|| BundleRegistryError::NotFound {
-                bundle_id: bundle_id.to_string(),
-            })?;
+        let bundle =
+            self.bundles
+                .remove(bundle_id)
+                .ok_or_else(|| BundleRegistryError::NotFound {
+                    bundle_id: bundle_id.to_string(),
+                })?;
         self.telemetry.bundles_removed += 1;
         self.record_audit(BundleAuditAction::Removed, bundle_id, actor, now_ms, "");
         Ok(bundle)
@@ -929,10 +924,7 @@ impl BundleRegistry {
     /// Find bundles by tier.
     #[must_use]
     pub fn find_by_tier(&self, tier: BundleTier) -> Vec<&ConnectorBundle> {
-        self.bundles
-            .values()
-            .filter(|b| b.tier == tier)
-            .collect()
+        self.bundles.values().filter(|b| b.tier == tier).collect()
     }
 
     /// Find bundles by category.
@@ -1275,8 +1267,7 @@ mod tests {
 
     #[test]
     fn connector_entry_serde_roundtrip() {
-        let entry = BundleConnectorEntry::required("conn-slack", "Slack")
-            .with_min_version("1.0.0");
+        let entry = BundleConnectorEntry::required("conn-slack", "Slack").with_min_version("1.0.0");
         let json = serde_json::to_string(&entry).unwrap();
         let back: BundleConnectorEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry, back);
@@ -1361,7 +1352,8 @@ mod tests {
 
     #[test]
     fn validate_empty_id() {
-        let bundle = ConnectorBundle::new("", "Test", BundleTier::Tier1, BundleCategory::General, 0);
+        let bundle =
+            ConnectorBundle::new("", "Test", BundleTier::Tier1, BundleCategory::General, 0);
         let result = validate_bundle(&bundle);
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("bundle_id")));
@@ -1475,7 +1467,8 @@ mod tests {
             max_audit_entries: 10,
         };
         let mut reg = BundleRegistry::new(config);
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         let err = reg
             .register(tier1_comms_bundle(2000), "a", 2000)
             .unwrap_err();
@@ -1485,7 +1478,8 @@ mod tests {
     #[test]
     fn registry_find_by_tier() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         let tier1 = reg.find_by_tier(BundleTier::Tier1);
         assert_eq!(tier1.len(), 2);
@@ -1496,7 +1490,8 @@ mod tests {
     #[test]
     fn registry_find_by_category() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         let source = reg.find_by_category(BundleCategory::SourceControl);
         assert_eq!(source.len(), 1);
@@ -1507,7 +1502,8 @@ mod tests {
     #[test]
     fn registry_find_by_package() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         let github = reg.find_by_package("conn-github");
         assert_eq!(github.len(), 1);
@@ -1535,7 +1531,8 @@ mod tests {
             max_audit_entries: 2,
         };
         let mut reg = BundleRegistry::new(config);
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         reg.register(tier1_observability_bundle(3000), "a", 3000)
             .unwrap();
@@ -1546,7 +1543,8 @@ mod tests {
     #[test]
     fn registry_telemetry() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         let t = reg.telemetry();
         assert_eq!(t.bundles_registered, 1);
         assert_eq!(t.validations_run, 1);
@@ -1555,7 +1553,8 @@ mod tests {
     #[test]
     fn registry_snapshot() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         let snap = reg.snapshot(3000);
         assert_eq!(snap.bundle_count, 2);
@@ -1566,7 +1565,8 @@ mod tests {
     #[test]
     fn registry_bundle_ids() {
         let mut reg = BundleRegistry::new(BundleRegistryConfig::default());
-        reg.register(tier1_devtools_bundle(1000), "a", 1000).unwrap();
+        reg.register(tier1_devtools_bundle(1000), "a", 1000)
+            .unwrap();
         reg.register(tier1_comms_bundle(2000), "a", 2000).unwrap();
         let ids = reg.bundle_ids();
         assert_eq!(ids.len(), 2);
@@ -1581,7 +1581,12 @@ mod tests {
     #[test]
     fn ingest_records_event() {
         let mut pipeline = IngestionPipeline::new(IngestionPipelineConfig::default());
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         let outcome = pipeline.ingest(&event, 1000);
         assert_eq!(outcome, IngestionOutcome::Recorded);
         assert_eq!(pipeline.telemetry().events_received, 1);
@@ -1596,7 +1601,12 @@ mod tests {
             ..Default::default()
         };
         let mut pipeline = IngestionPipeline::new(config);
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         let outcome = pipeline.ingest(&event, 1000);
         assert_eq!(outcome, IngestionOutcome::Filtered);
         assert_eq!(pipeline.telemetry().events_filtered, 1);
@@ -1609,7 +1619,12 @@ mod tests {
             ..Default::default()
         };
         let mut pipeline = IngestionPipeline::new(config);
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         let outcome = pipeline.ingest(&event, 1000);
         assert_eq!(outcome, IngestionOutcome::Filtered);
     }
@@ -1626,7 +1641,12 @@ mod tests {
     #[test]
     fn ingest_rejects_empty_event_id() {
         let mut pipeline = IngestionPipeline::new(IngestionPipelineConfig::default());
-        let mut event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let mut event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         event.event_id = String::new();
         let outcome = pipeline.ingest(&event, 1000);
         assert!(matches!(outcome, IngestionOutcome::Rejected { .. }));
@@ -1639,7 +1659,12 @@ mod tests {
             ..Default::default()
         };
         let mut pipeline = IngestionPipeline::new(config);
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         assert_eq!(pipeline.ingest(&event, 1000), IngestionOutcome::Recorded);
         assert_eq!(pipeline.ingest(&event, 1001), IngestionOutcome::Recorded);
         // Third in same second window → rejected.
@@ -1697,7 +1722,12 @@ mod tests {
     #[test]
     fn ingest_snapshot() {
         let mut pipeline = IngestionPipeline::new(IngestionPipelineConfig::default());
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         pipeline.ingest(&event, 1000);
         let snap = pipeline.snapshot(2000);
         assert_eq!(snap.captured_at_ms, 2000);
@@ -1708,7 +1738,12 @@ mod tests {
     #[test]
     fn ingest_export_formats() {
         let mut pipeline = IngestionPipeline::new(IngestionPipelineConfig::default());
-        let event = sample_event("conn-github", "push", EventDirection::Inbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "conn-github",
+            "push",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
         pipeline.ingest(&event, 1000);
         let json = pipeline.export_json();
         assert!(json.contains("conn-github"));
@@ -1718,31 +1753,65 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_as_config_change() {
-        let event = sample_event("c", "init", EventDirection::Lifecycle, CanonicalSeverity::Info);
+        let event = sample_event(
+            "c",
+            "init",
+            EventDirection::Lifecycle,
+            CanonicalSeverity::Info,
+        );
         assert_eq!(classify_audit_kind(&event), AuditEntryKind::ConfigChange);
     }
 
     #[test]
     fn classify_credential_event() {
-        let event = sample_event("c", "credential_rotated", EventDirection::Inbound, CanonicalSeverity::Info);
-        assert_eq!(classify_audit_kind(&event), AuditEntryKind::CredentialAction);
+        let event = sample_event(
+            "c",
+            "credential_rotated",
+            EventDirection::Inbound,
+            CanonicalSeverity::Info,
+        );
+        assert_eq!(
+            classify_audit_kind(&event),
+            AuditEntryKind::CredentialAction
+        );
     }
 
     #[test]
     fn classify_quarantine_event() {
-        let event = sample_event("c", "quarantine_applied", EventDirection::Outbound, CanonicalSeverity::Critical);
-        assert_eq!(classify_audit_kind(&event), AuditEntryKind::QuarantineAction);
+        let event = sample_event(
+            "c",
+            "quarantine_applied",
+            EventDirection::Outbound,
+            CanonicalSeverity::Critical,
+        );
+        assert_eq!(
+            classify_audit_kind(&event),
+            AuditEntryKind::QuarantineAction
+        );
     }
 
     #[test]
     fn classify_compliance_violation() {
-        let event = sample_event("c", "policy_violation", EventDirection::Inbound, CanonicalSeverity::Warning);
-        assert_eq!(classify_audit_kind(&event), AuditEntryKind::ComplianceViolation);
+        let event = sample_event(
+            "c",
+            "policy_violation",
+            EventDirection::Inbound,
+            CanonicalSeverity::Warning,
+        );
+        assert_eq!(
+            classify_audit_kind(&event),
+            AuditEntryKind::ComplianceViolation
+        );
     }
 
     #[test]
     fn classify_default_policy_decision() {
-        let event = sample_event("c", "action_completed", EventDirection::Outbound, CanonicalSeverity::Info);
+        let event = sample_event(
+            "c",
+            "action_completed",
+            EventDirection::Outbound,
+            CanonicalSeverity::Info,
+        );
         assert_eq!(classify_audit_kind(&event), AuditEntryKind::PolicyDecision);
     }
 
@@ -1802,7 +1871,9 @@ mod tests {
         let outcomes = vec![
             IngestionOutcome::Recorded,
             IngestionOutcome::Filtered,
-            IngestionOutcome::Rejected { reason: "test".to_string() },
+            IngestionOutcome::Rejected {
+                reason: "test".to_string(),
+            },
         ];
         for outcome in outcomes {
             let json = serde_json::to_string(&outcome).unwrap();

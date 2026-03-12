@@ -105,7 +105,14 @@ pub enum SloSeverity {
 impl SloDefinition {
     /// Create a latency SLO (measured <= target).
     #[must_use]
-    pub fn latency(id: &str, name: &str, subsystem: &str, percentile: u8, target_ms: f64, window_ms: u64) -> Self {
+    pub fn latency(
+        id: &str,
+        name: &str,
+        subsystem: &str,
+        percentile: u8,
+        target_ms: f64,
+        window_ms: u64,
+    ) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -121,7 +128,13 @@ impl SloDefinition {
 
     /// Create an error-rate SLO (measured <= target).
     #[must_use]
-    pub fn error_rate(id: &str, name: &str, subsystem: &str, max_rate: f64, window_ms: u64) -> Self {
+    pub fn error_rate(
+        id: &str,
+        name: &str,
+        subsystem: &str,
+        max_rate: f64,
+        window_ms: u64,
+    ) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -137,7 +150,13 @@ impl SloDefinition {
 
     /// Create an availability SLO (measured >= target).
     #[must_use]
-    pub fn availability(id: &str, name: &str, subsystem: &str, min_availability: f64, window_ms: u64) -> Self {
+    pub fn availability(
+        id: &str,
+        name: &str,
+        subsystem: &str,
+        min_availability: f64,
+        window_ms: u64,
+    ) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -276,15 +295,12 @@ impl SloEvaluator {
                 SloMetric::LatencyMs { percentile } => {
                     let mut values: Vec<f64> = window_samples.iter().map(|s| s.value).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let idx = ((*percentile as f64 / 100.0) * (values.len() as f64 - 1.0)).ceil() as usize;
+                    let idx = ((*percentile as f64 / 100.0) * (values.len() as f64 - 1.0)).ceil()
+                        as usize;
                     values[idx.min(values.len() - 1)]
                 }
-                SloMetric::ErrorRate => {
-                    bad_count as f64 / sample_count as f64
-                }
-                SloMetric::Availability => {
-                    good_count as f64 / sample_count as f64
-                }
+                SloMetric::ErrorRate => bad_count as f64 / sample_count as f64,
+                SloMetric::Availability => good_count as f64 / sample_count as f64,
                 SloMetric::Throughput | SloMetric::QueueDepth | SloMetric::Custom { .. } => {
                     // Use the latest sample value
                     window_samples.last().map(|s| s.value).unwrap_or(0.0)
@@ -537,7 +553,11 @@ impl SloAuditReport {
         ];
 
         if !self.alert_fidelity.is_empty() {
-            let avg_f1: f64 = self.alert_fidelity.iter().map(|a| a.f1_score()).sum::<f64>()
+            let avg_f1: f64 = self
+                .alert_fidelity
+                .iter()
+                .map(|a| a.f1_score())
+                .sum::<f64>()
                 / self.alert_fidelity.len() as f64;
             lines.push(format!("  Alert F1 (avg): {avg_f1:.3}"));
         }
@@ -615,7 +635,8 @@ mod tests {
 
     #[test]
     fn slo_availability_factory() {
-        let slo = SloDefinition::availability("avail.mux", "Mux availability", "mux", 0.999, 86_400_000);
+        let slo =
+            SloDefinition::availability("avail.mux", "Mux availability", "mux", 0.999, 86_400_000);
         assert_eq!(slo.target, 0.999);
         assert_eq!(slo.comparison, SloComparison::GreaterOrEqual);
         assert!((slo.error_budget - 0.001).abs() < 1e-9);
@@ -626,7 +647,9 @@ mod tests {
     #[test]
     fn evaluator_no_samples_returns_conforming() {
         let mut eval = SloEvaluator::new(1000);
-        eval.register(SloDefinition::availability("test", "Test", "sys", 0.99, 60_000));
+        eval.register(SloDefinition::availability(
+            "test", "Test", "sys", 0.99, 60_000,
+        ));
         let result = eval.evaluate("test", 60_000).unwrap();
         // No samples → measured 0.0, target 0.99, >= comparison fails
         // Actually with no samples, measured = 0.0 which is NOT >= 0.99
@@ -679,7 +702,9 @@ mod tests {
     #[test]
     fn evaluator_availability_conforming() {
         let mut eval = SloEvaluator::new(1000);
-        eval.register(SloDefinition::availability("avail", "Avail", "sys", 0.99, 60_000));
+        eval.register(SloDefinition::availability(
+            "avail", "Avail", "sys", 0.99, 60_000,
+        ));
 
         // 1000 samples, 995 good → 99.5% availability
         for i in 0..1000 {
@@ -699,7 +724,9 @@ mod tests {
     #[test]
     fn evaluator_latency_percentile() {
         let mut eval = SloEvaluator::new(1000);
-        eval.register(SloDefinition::latency("p99", "P99", "sys", 99, 100.0, 60_000));
+        eval.register(SloDefinition::latency(
+            "p99", "P99", "sys", 99, 100.0, 60_000,
+        ));
 
         // 100 samples: 0..99ms, p99 should be ~99ms
         for i in 0..100 {
@@ -754,8 +781,12 @@ mod tests {
     #[test]
     fn evaluator_evaluate_all() {
         let mut eval = SloEvaluator::new(1000);
-        eval.register(SloDefinition::error_rate("err1", "Err1", "sys", 0.05, 60_000));
-        eval.register(SloDefinition::error_rate("err2", "Err2", "sys", 0.05, 60_000));
+        eval.register(SloDefinition::error_rate(
+            "err1", "Err1", "sys", 0.05, 60_000,
+        ));
+        eval.register(SloDefinition::error_rate(
+            "err2", "Err2", "sys", 0.05, 60_000,
+        ));
 
         for slo_id in &["err1", "err2"] {
             for i in 0..10 {

@@ -51,14 +51,18 @@ fn _arb_drill_step(passed: bool) -> impl Strategy<Value = DrillStep> {
 }
 
 fn arb_disruption_accounting() -> impl Strategy<Value = DisruptionAccounting> {
-    (0..500u64, 0.0..0.5f64, 0..10u32, prop::option::of(0..60000u64)).prop_map(
-        |(lat, err, events, recovery)| DisruptionAccounting {
+    (
+        0..500u64,
+        0.0..0.5f64,
+        0..10u32,
+        prop::option::of(0..60000u64),
+    )
+        .prop_map(|(lat, err, events, recovery)| DisruptionAccounting {
             latency_increase_ms: lat,
             error_rate_increase: err,
             disruption_events: events,
             recovery_time_ms: recovery,
-        },
-    )
+        })
 }
 
 // =============================================================================

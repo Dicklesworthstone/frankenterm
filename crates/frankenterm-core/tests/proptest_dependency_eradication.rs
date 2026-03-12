@@ -653,6 +653,10 @@ fn standard_patterns_unique_ids() {
 fn standard_patterns_all_have_exclude_paths() {
     let patterns = standard_forbidden_patterns();
     for p in &patterns {
-        assert!(!p.exclude_paths.is_empty(), "pattern {} has no exclude paths", p.pattern_id);
+        assert!(
+            !p.exclude_paths.is_empty(),
+            "pattern {} has no exclude paths",
+            p.pattern_id
+        );
     }
 }

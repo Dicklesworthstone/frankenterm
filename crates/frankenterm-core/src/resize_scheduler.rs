@@ -3171,7 +3171,8 @@ mod tests {
         // deferring pane 1 and accumulating aging credit.
         for i in 0..4 {
             let seq = (i + 1) as u64;
-            let _ = scheduler.submit_intent(intent(2, seq, ResizeWorkClass::Interactive, 1, 100 + i));
+            let _ =
+                scheduler.submit_intent(intent(2, seq, ResizeWorkClass::Interactive, 1, 100 + i));
             let _ = scheduler.schedule_frame();
             assert!(scheduler.complete_active(2, seq));
         }

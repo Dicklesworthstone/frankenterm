@@ -42,20 +42,26 @@ fn _arb_cell_result(passed: bool) -> impl Strategy<Value = CellResult> {
         0.0..0.5f64,
         0.0..500.0f64,
     )
-        .prop_map(move |(id, cat, wl, inj, blocking, dur, err_rate, p95)| CellResult {
-            cell_id: id,
-            category: cat,
-            workload: wl,
-            injection: inj,
-            passed,
-            blocking,
-            duration_ms: dur,
-            failure_reason: if passed { None } else { Some("test fail".into()) },
-            error_rate: err_rate,
-            p95_latency_ms: p95,
-            seed: None,
-            telemetry: CellTelemetry::default(),
-        })
+        .prop_map(
+            move |(id, cat, wl, inj, blocking, dur, err_rate, p95)| CellResult {
+                cell_id: id,
+                category: cat,
+                workload: wl,
+                injection: inj,
+                passed,
+                blocking,
+                duration_ms: dur,
+                failure_reason: if passed {
+                    None
+                } else {
+                    Some("test fail".into())
+                },
+                error_rate: err_rate,
+                p95_latency_ms: p95,
+                seed: None,
+                telemetry: CellTelemetry::default(),
+            },
+        )
 }
 
 // =============================================================================

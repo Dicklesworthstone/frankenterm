@@ -212,8 +212,8 @@ impl SurfaceGuardReport {
             compliant_count as f64 / total as f64
         };
 
-        self.overall_compliant = self.regressions.is_empty()
-            && self.guard_checks.iter().all(|c| c.compliant);
+        self.overall_compliant =
+            self.regressions.is_empty() && self.guard_checks.iter().all(|c| c.compliant);
     }
 
     /// One-line summary of the report.
@@ -575,7 +575,10 @@ mod tests {
         let json = serde_json::to_string(&r).expect("serialize");
         let restored: SurfaceRegression = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.regression_id, "SR-001");
-        assert_eq!(restored.regression_type, RegressionType::DirectRuntimeImport);
+        assert_eq!(
+            restored.regression_type,
+            RegressionType::DirectRuntimeImport
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -669,7 +672,11 @@ mod tests {
             report.add_guard_check(SurfaceGuardCheck {
                 check_id: "x".into(),
                 api_name: "x".into(),
-                disposition: if compliant { "Keep".into() } else { "Retire".into() },
+                disposition: if compliant {
+                    "Keep".into()
+                } else {
+                    "Retire".into()
+                },
                 wrapper_exists: true,
                 call_sites_wrapped: 0,
                 call_sites_unwrapped: 0,
@@ -692,7 +699,11 @@ mod tests {
     #[test]
     fn standard_guard_checks_count() {
         let checks = standard_guard_checks();
-        assert_eq!(checks.len(), 15, "expected exactly 15 standard guard checks");
+        assert_eq!(
+            checks.len(),
+            15,
+            "expected exactly 15 standard guard checks"
+        );
     }
 
     // -------------------------------------------------------------------------

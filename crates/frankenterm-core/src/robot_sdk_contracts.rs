@@ -170,7 +170,10 @@ impl EndpointSpec {
             command: command.into(),
             method,
             description: description.into(),
-            is_mutation: matches!(method, HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete),
+            is_mutation: matches!(
+                method,
+                HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete
+            ),
             request_fields: Vec::new(),
             response_fields: Vec::new(),
             error_codes: Vec::new(),
@@ -491,9 +494,7 @@ fn render_python_client(surface: &SdkSurface) -> String {
 }
 
 fn render_typescript_client(surface: &SdkSurface) -> String {
-    let mut out = String::from(
-        "export type JsonPayload = Record<string, unknown>;\n\n",
-    );
+    let mut out = String::from("export type JsonPayload = Record<string, unknown>;\n\n");
 
     for return_type in unique_return_types(surface) {
         out.push_str(&format!("export type {return_type} = unknown;\n"));
@@ -582,7 +583,10 @@ fn render_python_params(params: &[SdkParam]) -> String {
     let mut rendered = vec!["self".to_string()];
     for param in params {
         if param.optional {
-            rendered.push(format!("{}: {} | None = None", param.name, param.param_type));
+            rendered.push(format!(
+                "{}: {} | None = None",
+                param.name, param.param_type
+            ));
         } else {
             rendered.push(format!("{}: {}", param.name, param.param_type));
         }
@@ -626,7 +630,10 @@ fn render_python_payload(params: &[SdkParam]) -> String {
 
     let mut out = String::from("{\n");
     for param in params {
-        out.push_str(&format!("            \"{}\": {},\n", param.wire_name, param.name));
+        out.push_str(&format!(
+            "            \"{}\": {},\n",
+            param.wire_name, param.name
+        ));
     }
     out.push_str("        }");
     out
@@ -652,7 +659,10 @@ fn render_rust_payload(params: &[SdkParam]) -> String {
 
     let mut out = String::from("json!({\n");
     for param in params {
-        out.push_str(&format!("            \"{}\": {},\n", param.wire_name, param.name));
+        out.push_str(&format!(
+            "            \"{}\": {},\n",
+            param.wire_name, param.name
+        ));
     }
     out.push_str("        })");
     out
@@ -849,9 +859,21 @@ impl NtmCompatShim {
     #[must_use]
     pub fn readiness_summary(&self) -> CompatSummary {
         let total = self.entries.len();
-        let full = self.entries.values().filter(|e| e.compat_level == CompatLevel::Full).count();
-        let mapped = self.entries.values().filter(|e| e.compat_level == CompatLevel::MappedCompat).count();
-        let partial = self.entries.values().filter(|e| e.compat_level == CompatLevel::Partial).count();
+        let full = self
+            .entries
+            .values()
+            .filter(|e| e.compat_level == CompatLevel::Full)
+            .count();
+        let mapped = self
+            .entries
+            .values()
+            .filter(|e| e.compat_level == CompatLevel::MappedCompat)
+            .count();
+        let partial = self
+            .entries
+            .values()
+            .filter(|e| e.compat_level == CompatLevel::Partial)
+            .count();
         let incompatible = self
             .entries
             .values()
@@ -1035,18 +1057,23 @@ pub struct ReplayTestSuiteResult {
 impl ReplayTestSuiteResult {
     /// Compute from results and test definitions.
     #[must_use]
-    pub fn from_results(suite_id: impl Into<String>, results: Vec<ReplayTestResult>, tests: &[ReplayContractTest]) -> Self {
+    pub fn from_results(
+        suite_id: impl Into<String>,
+        results: Vec<ReplayTestResult>,
+        tests: &[ReplayContractTest],
+    ) -> Self {
         let total = results.len();
         let passed = results.iter().filter(|r| r.passed).count();
         let failed = total - passed;
-        let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 1.0 };
+        let pass_rate = if total > 0 {
+            passed as f64 / total as f64
+        } else {
+            1.0
+        };
 
-        let blocking_pass = !results.iter().any(|r| {
-            !r.passed
-                && tests
-                    .iter()
-                    .any(|t| t.test_id == r.test_id && t.blocking)
-        });
+        let blocking_pass = !results
+            .iter()
+            .any(|r| !r.passed && tests.iter().any(|t| t.test_id == r.test_id && t.blocking));
 
         Self {
             suite_id: suite_id.into(),
@@ -1152,11 +1179,20 @@ pub fn standard_replay_contract_tests() -> Vec<ReplayContractTest> {
             "get-text",
             "deterministic get-text replay",
         )
-        .with_fixtures("fixtures/get-text-input.json", "fixtures/get-text-expected.json"),
+        .with_fixtures(
+            "fixtures/get-text-input.json",
+            "fixtures/get-text-expected.json",
+        ),
         ReplayContractTest::new("replay-search", "search", "deterministic search replay")
-            .with_fixtures("fixtures/search-input.json", "fixtures/search-expected.json"),
+            .with_fixtures(
+                "fixtures/search-input.json",
+                "fixtures/search-expected.json",
+            ),
         ReplayContractTest::new("replay-events", "events", "deterministic events replay")
-            .with_fixtures("fixtures/events-input.json", "fixtures/events-expected.json"),
+            .with_fixtures(
+                "fixtures/events-input.json",
+                "fixtures/events-expected.json",
+            ),
     ]
 }
 
@@ -1192,43 +1228,108 @@ pub fn core_endpoint_specs() -> Vec<EndpointSpec> {
 
     let mut get_text = EndpointSpec::new("get-text", HttpMethod::Get, "Retrieve pane text content")
         .ntm_compatible();
-    get_text.add_request_field(FieldSpec::required("pane_id", FieldType::Integer, "Target pane ID"));
-    get_text.add_request_field(FieldSpec::optional("tail_lines", FieldType::Integer, "Lines from end"));
-    get_text.add_response_field(FieldSpec::required("pane_id", FieldType::Integer, "Pane ID"));
-    get_text.add_response_field(FieldSpec::required("text", FieldType::String, "Pane content"));
-    get_text.add_response_field(FieldSpec::required("tail_lines", FieldType::Integer, "Lines returned"));
-    get_text.add_response_field(FieldSpec::required("truncated", FieldType::Boolean, "Whether truncated"));
+    get_text.add_request_field(FieldSpec::required(
+        "pane_id",
+        FieldType::Integer,
+        "Target pane ID",
+    ));
+    get_text.add_request_field(FieldSpec::optional(
+        "tail_lines",
+        FieldType::Integer,
+        "Lines from end",
+    ));
+    get_text.add_response_field(FieldSpec::required(
+        "pane_id",
+        FieldType::Integer,
+        "Pane ID",
+    ));
+    get_text.add_response_field(FieldSpec::required(
+        "text",
+        FieldType::String,
+        "Pane content",
+    ));
+    get_text.add_response_field(FieldSpec::required(
+        "tail_lines",
+        FieldType::Integer,
+        "Lines returned",
+    ));
+    get_text.add_response_field(FieldSpec::required(
+        "truncated",
+        FieldType::Boolean,
+        "Whether truncated",
+    ));
     specs.push(get_text);
 
     let mut send_text =
         EndpointSpec::new("send-text", HttpMethod::Post, "Send keystrokes to a pane")
             .ntm_compatible();
-    send_text.add_request_field(FieldSpec::required("pane_id", FieldType::Integer, "Target pane"));
-    send_text.add_request_field(FieldSpec::required("text", FieldType::String, "Text to send"));
-    send_text.add_response_field(FieldSpec::required("pane_id", FieldType::Integer, "Pane ID"));
-    send_text.add_response_field(FieldSpec::required("injection", FieldType::Json, "Injection details"));
+    send_text.add_request_field(FieldSpec::required(
+        "pane_id",
+        FieldType::Integer,
+        "Target pane",
+    ));
+    send_text.add_request_field(FieldSpec::required(
+        "text",
+        FieldType::String,
+        "Text to send",
+    ));
+    send_text.add_response_field(FieldSpec::required(
+        "pane_id",
+        FieldType::Integer,
+        "Pane ID",
+    ));
+    send_text.add_response_field(FieldSpec::required(
+        "injection",
+        FieldType::Json,
+        "Injection details",
+    ));
     specs.push(send_text);
 
-    let mut state = EndpointSpec::new("state", HttpMethod::Get, "List pane states").ntm_compatible();
+    let mut state =
+        EndpointSpec::new("state", HttpMethod::Get, "List pane states").ntm_compatible();
     state.add_response_field(FieldSpec::required(
         "panes",
         FieldType::Array(Box::new(FieldType::Object(Vec::new()))),
         "Pane state list",
     ));
-    state.add_response_field(FieldSpec::required("tail_lines", FieldType::Integer, "Tail lines"));
+    state.add_response_field(FieldSpec::required(
+        "tail_lines",
+        FieldType::Integer,
+        "Tail lines",
+    ));
     specs.push(state);
 
     let mut search = EndpointSpec::new("search", HttpMethod::Get, "Search pane content");
-    search.add_request_field(FieldSpec::required("query", FieldType::String, "Search query"));
-    search.add_request_field(FieldSpec::optional("limit", FieldType::Integer, "Max results"));
-    search.add_response_field(FieldSpec::required("query", FieldType::String, "Original query"));
+    search.add_request_field(FieldSpec::required(
+        "query",
+        FieldType::String,
+        "Search query",
+    ));
+    search.add_request_field(FieldSpec::optional(
+        "limit",
+        FieldType::Integer,
+        "Max results",
+    ));
+    search.add_response_field(FieldSpec::required(
+        "query",
+        FieldType::String,
+        "Original query",
+    ));
     search.add_response_field(FieldSpec::required(
         "results",
         FieldType::Array(Box::new(FieldType::Object(Vec::new()))),
         "Search hits",
     ));
-    search.add_response_field(FieldSpec::required("total_hits", FieldType::Integer, "Total matches"));
-    search.add_response_field(FieldSpec::required("limit", FieldType::Integer, "Applied limit"));
+    search.add_response_field(FieldSpec::required(
+        "total_hits",
+        FieldType::Integer,
+        "Total matches",
+    ));
+    search.add_response_field(FieldSpec::required(
+        "limit",
+        FieldType::Integer,
+        "Applied limit",
+    ));
     specs.push(search);
 
     specs
@@ -1266,8 +1367,8 @@ mod tests {
         assert!(req.required);
         assert_eq!(req.name, "pane_id");
 
-        let opt = FieldSpec::optional("limit", FieldType::Integer, "Max results")
-            .with_example("100");
+        let opt =
+            FieldSpec::optional("limit", FieldType::Integer, "Max results").with_example("100");
         assert!(!opt.required);
         assert_eq!(opt.example, "100");
     }
@@ -1315,15 +1416,30 @@ mod tests {
 
     #[test]
     fn sdk_type_mapping() {
-        assert_eq!(map_type_to_language(&FieldType::String, SdkLanguage::Python), "str");
-        assert_eq!(map_type_to_language(&FieldType::String, SdkLanguage::TypeScript), "string");
-        assert_eq!(map_type_to_language(&FieldType::String, SdkLanguage::Rust), "String");
         assert_eq!(
-            map_type_to_language(&FieldType::Array(Box::new(FieldType::Integer)), SdkLanguage::Rust),
+            map_type_to_language(&FieldType::String, SdkLanguage::Python),
+            "str"
+        );
+        assert_eq!(
+            map_type_to_language(&FieldType::String, SdkLanguage::TypeScript),
+            "string"
+        );
+        assert_eq!(
+            map_type_to_language(&FieldType::String, SdkLanguage::Rust),
+            "String"
+        );
+        assert_eq!(
+            map_type_to_language(
+                &FieldType::Array(Box::new(FieldType::Integer)),
+                SdkLanguage::Rust
+            ),
             "Vec<i64>"
         );
         assert_eq!(
-            map_type_to_language(&FieldType::Optional(Box::new(FieldType::Boolean)), SdkLanguage::Go),
+            map_type_to_language(
+                &FieldType::Optional(Box::new(FieldType::Boolean)),
+                SdkLanguage::Go
+            ),
             "*bool"
         );
     }
@@ -1335,7 +1451,10 @@ mod tests {
         assert_eq!(to_camel_case("get-text"), "getText");
         assert_eq!(to_camel_case("batch-get-text"), "batchGetText");
         assert_eq!(to_camel_case("search"), "search");
-        assert_eq!(to_camel_case("search_pipeline_status"), "searchPipelineStatus");
+        assert_eq!(
+            to_camel_case("search_pipeline_status"),
+            "searchPipelineStatus"
+        );
     }
 
     // ---- NtmCompatShim ----
@@ -1475,13 +1594,19 @@ mod tests {
     fn contract_artifact_bundle_renders_deterministic_exports() {
         let bundle = standard_contract_artifacts().unwrap();
         assert_eq!(bundle.sdk_count(), 4);
-        assert!(bundle.endpoint_specs_json.contains("\"command\": \"get-text\""));
+        assert!(
+            bundle
+                .endpoint_specs_json
+                .contains("\"command\": \"get-text\"")
+        );
         assert!(bundle.ntm_compat_markdown.contains("Migration coverage"));
         assert!(bundle.replay_tests_json.contains("replay-get-text"));
-        assert!(bundle
-            .sdk_sources
-            .keys()
-            .all(|filename| filename.starts_with("frankenterm_client_")));
+        assert!(
+            bundle
+                .sdk_sources
+                .keys()
+                .all(|filename| filename.starts_with("frankenterm_client_"))
+        );
     }
 
     #[test]
@@ -1495,7 +1620,10 @@ mod tests {
             .sdk_sources
             .get("frankenterm_client_typescript.ts")
             .unwrap();
-        let rust = bundle.sdk_sources.get("frankenterm_client_rust.rs").unwrap();
+        let rust = bundle
+            .sdk_sources
+            .get("frankenterm_client_rust.rs")
+            .unwrap();
 
         assert!(python.contains("\"pane_id\": pane_id"));
         assert!(typescript.contains("\"pane_id\": paneId"));
@@ -1557,12 +1685,25 @@ mod tests {
     fn e2e_replay_contract_suite() {
         // Define replay tests for core commands
         let tests = vec![
-            ReplayContractTest::new("replay-get-text", "get-text", "get-text deterministic replay")
-                .with_fixtures("fixtures/get-text-input.json", "fixtures/get-text-expected.json"),
+            ReplayContractTest::new(
+                "replay-get-text",
+                "get-text",
+                "get-text deterministic replay",
+            )
+            .with_fixtures(
+                "fixtures/get-text-input.json",
+                "fixtures/get-text-expected.json",
+            ),
             ReplayContractTest::new("replay-search", "search", "search deterministic replay")
-                .with_fixtures("fixtures/search-input.json", "fixtures/search-expected.json"),
+                .with_fixtures(
+                    "fixtures/search-input.json",
+                    "fixtures/search-expected.json",
+                ),
             ReplayContractTest::new("replay-events", "events", "events deterministic replay")
-                .with_fixtures("fixtures/events-input.json", "fixtures/events-expected.json"),
+                .with_fixtures(
+                    "fixtures/events-input.json",
+                    "fixtures/events-expected.json",
+                ),
         ];
 
         // Simulate all passing

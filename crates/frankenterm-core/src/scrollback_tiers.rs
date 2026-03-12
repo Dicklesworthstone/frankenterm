@@ -208,7 +208,9 @@ impl TieredScrollback {
     /// Returns `None` if the page is out of range or decompression fails.
     #[must_use]
     pub fn warm_page_lines(&self, page_offset: usize) -> Option<Vec<String>> {
-        let page = self.warm.get(self.warm.len().checked_sub(1 + page_offset)?)?;
+        let page = self
+            .warm
+            .get(self.warm.len().checked_sub(1 + page_offset)?)?;
         decompress_page(&self.compressor, page)
     }
 
@@ -239,11 +241,7 @@ impl TieredScrollback {
     /// Total lines across all tiers (hot + warm + cold).
     #[must_use]
     pub fn total_line_count(&self) -> u64 {
-        let warm_lines: u64 = self
-            .warm
-            .iter()
-            .map(|p| p.line_count as u64)
-            .sum();
+        let warm_lines: u64 = self.warm.iter().map(|p| p.line_count as u64).sum();
         self.hot.len() as u64 + warm_lines + self.cold_line_count
     }
 
@@ -461,7 +459,10 @@ mod tests {
         }
         assert_eq!(sb.hot_len(), 10);
         assert_eq!(sb.warm_page_count(), 0);
-        assert_eq!(sb.tail(3), vec!["line-000007", "line-000008", "line-000009"]);
+        assert_eq!(
+            sb.tail(3),
+            vec!["line-000007", "line-000008", "line-000009"]
+        );
     }
 
     #[test]
@@ -736,7 +737,11 @@ mod tests {
 
     #[test]
     fn scrollback_tier_serde_roundtrip() {
-        for tier in &[ScrollbackTier::Hot, ScrollbackTier::Warm, ScrollbackTier::Cold] {
+        for tier in &[
+            ScrollbackTier::Hot,
+            ScrollbackTier::Warm,
+            ScrollbackTier::Cold,
+        ] {
             let json = serde_json::to_string(tier).unwrap();
             let back: ScrollbackTier = serde_json::from_str(&json).unwrap();
             assert_eq!(*tier, back);
@@ -787,7 +792,9 @@ mod tests {
         for _ in 0..200 {
             let mut sb = TieredScrollback::new(config.clone());
             for i in 0..1000 {
-                sb.push_line(format!("pane output line {i}: some typical terminal content here"));
+                sb.push_line(format!(
+                    "pane output line {i}: some typical terminal content here"
+                ));
             }
             total_warm_bytes += sb.warm_total_bytes();
             total_hot_chars += sb.hot.iter().map(String::len).sum::<usize>();

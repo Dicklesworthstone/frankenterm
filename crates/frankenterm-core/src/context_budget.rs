@@ -345,9 +345,9 @@ impl ContextBudgetRegistry {
 
     /// Get or create a tracker for the given pane.
     pub fn tracker_mut(&mut self, pane_id: u64) -> &mut ContextBudgetTracker {
-        self.trackers.entry(pane_id).or_insert_with(|| {
-            ContextBudgetTracker::new(pane_id, self.default_config.clone())
-        })
+        self.trackers
+            .entry(pane_id)
+            .or_insert_with(|| ContextBudgetTracker::new(pane_id, self.default_config.clone()))
     }
 
     /// Get a tracker reference (if exists).
@@ -387,8 +387,7 @@ impl ContextBudgetRegistry {
         let avg_utilization = if pane_snapshots.is_empty() {
             0.0
         } else {
-            pane_snapshots.iter().map(|s| s.utilization).sum::<f64>()
-                / pane_snapshots.len() as f64
+            pane_snapshots.iter().map(|s| s.utilization).sum::<f64>() / pane_snapshots.len() as f64
         };
 
         ContextBudgetSnapshot {
@@ -459,14 +458,38 @@ mod tests {
 
     #[test]
     fn pressure_tier_from_utilization() {
-        assert_eq!(ContextPressureTier::from_utilization(0.0), ContextPressureTier::Green);
-        assert_eq!(ContextPressureTier::from_utilization(0.49), ContextPressureTier::Green);
-        assert_eq!(ContextPressureTier::from_utilization(0.50), ContextPressureTier::Yellow);
-        assert_eq!(ContextPressureTier::from_utilization(0.74), ContextPressureTier::Yellow);
-        assert_eq!(ContextPressureTier::from_utilization(0.75), ContextPressureTier::Red);
-        assert_eq!(ContextPressureTier::from_utilization(0.89), ContextPressureTier::Red);
-        assert_eq!(ContextPressureTier::from_utilization(0.90), ContextPressureTier::Black);
-        assert_eq!(ContextPressureTier::from_utilization(1.0), ContextPressureTier::Black);
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.0),
+            ContextPressureTier::Green
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.49),
+            ContextPressureTier::Green
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.50),
+            ContextPressureTier::Yellow
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.74),
+            ContextPressureTier::Yellow
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.75),
+            ContextPressureTier::Red
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.89),
+            ContextPressureTier::Red
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(0.90),
+            ContextPressureTier::Black
+        );
+        assert_eq!(
+            ContextPressureTier::from_utilization(1.0),
+            ContextPressureTier::Black
+        );
     }
 
     #[test]

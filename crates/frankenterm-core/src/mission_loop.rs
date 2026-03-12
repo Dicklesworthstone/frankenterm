@@ -29,9 +29,10 @@ use std::time::Instant;
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
-    extract_planner_features, score_candidates, solve_assignments, Assignment, AssignmentSet,
-    PlannerExtractionConfig, PlannerExtractionContext, PlannerExtractionReport, RejectedCandidate,
-    RejectionReason, SafetyGate, ScorerConfig, ScorerInput, ScorerReport, SolverConfig,
+    Assignment, AssignmentSet, PlannerExtractionConfig, PlannerExtractionContext,
+    PlannerExtractionReport, RejectedCandidate, RejectionReason, SafetyGate, ScorerConfig,
+    ScorerInput, ScorerReport, SolverConfig, extract_planner_features, score_candidates,
+    solve_assignments,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -3435,15 +3436,21 @@ mod tests {
         );
         assert_eq!(report.conflicts[0].reason_code, "reservation_overlap");
         assert_eq!(report.conflicts[0].error_code, "FTM2001");
-        assert!(report.conflicts[0]
-            .conflicting_paths
-            .contains(&"src/plan.rs".to_string()));
-        assert!(report.conflicts[0]
-            .involved_agents
-            .contains(&"agent1".to_string()));
-        assert!(report.conflicts[0]
-            .involved_agents
-            .contains(&"agent2".to_string()));
+        assert!(
+            report.conflicts[0]
+                .conflicting_paths
+                .contains(&"src/plan.rs".to_string())
+        );
+        assert!(
+            report.conflicts[0]
+                .involved_agents
+                .contains(&"agent1".to_string())
+        );
+        assert!(
+            report.conflicts[0]
+                .involved_agents
+                .contains(&"agent2".to_string())
+        );
     }
 
     #[test]
@@ -3476,9 +3483,11 @@ mod tests {
             "resource_reservation_overlap"
         );
         assert_eq!(report.conflicts[0].error_code, "FTM2004");
-        assert!(report.conflicts[0]
-            .conflicting_paths
-            .contains(&"pane:alpha".to_string()));
+        assert!(
+            report.conflicts[0]
+                .conflicting_paths
+                .contains(&"pane:alpha".to_string())
+        );
     }
 
     #[test]
@@ -4127,14 +4136,18 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
 
         assert!(!report.messages.is_empty());
-        assert!(report
-            .messages
-            .iter()
-            .all(|m| m.body.contains("- role: `participant`")));
-        assert!(report
-            .messages
-            .iter()
-            .all(|m| m.body.contains("- action: `await_manual_resolution`")));
+        assert!(
+            report
+                .messages
+                .iter()
+                .all(|m| m.body.contains("- role: `participant`"))
+        );
+        assert!(
+            report
+                .messages
+                .iter()
+                .all(|m| m.body.contains("- action: `await_manual_resolution`"))
+        );
     }
 
     #[test]
@@ -4322,10 +4335,12 @@ mod tests {
         let report = ml.detect_conflicts(&aset, &[], &[], 5000, &issues);
         // Two conflicts: agent2 vs winner and agent3 vs winner.
         assert_eq!(report.conflicts.len(), 2);
-        assert!(report
-            .conflicts
-            .iter()
-            .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim));
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .all(|c| c.conflict_type == ConflictType::ConcurrentBeadClaim)
+        );
     }
 
     #[test]
@@ -4581,9 +4596,11 @@ mod tests {
         assert_eq!(report.assignment_table[0].agent_id, "alpha");
         assert_eq!(report.assignment_table[0].total_assignments, 10);
         assert_eq!(report.assignment_table[0].active_beads, 2);
-        assert!(report.assignment_table[0]
-            .active_bead_ids
-            .contains(&"bead-a".to_string()));
+        assert!(
+            report.assignment_table[0]
+                .active_bead_ids
+                .contains(&"bead-a".to_string())
+        );
     }
 
     #[test]

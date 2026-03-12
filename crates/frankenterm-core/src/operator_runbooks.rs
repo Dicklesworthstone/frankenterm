@@ -453,7 +453,8 @@ pub fn standard_registry() -> RunbookRegistry {
                 precondition: Some("Resources verified".into()),
                 expected_outcome: Some("Profile selected".into()),
                 decision_support: Some(DecisionOverlay {
-                    context: "Choose fleet size based on available resources and task complexity".into(),
+                    context: "Choose fleet size based on available resources and task complexity"
+                        .into(),
                     options: vec![
                         DecisionOption {
                             option_id: "small".into(),
@@ -462,16 +463,23 @@ pub fn standard_registry() -> RunbookRegistry {
                             risk_score: 10,
                             benefit: "Minimal resource impact".into(),
                             recommended: false,
-                            telemetry_refs: vec!["cpu_utilization".into(), "memory_utilization".into()],
+                            telemetry_refs: vec![
+                                "cpu_utilization".into(),
+                                "memory_utilization".into(),
+                            ],
                         },
                         DecisionOption {
                             option_id: "medium".into(),
                             label: "Medium Fleet (16-32 agents)".into(),
-                            description: "Balanced resource usage, suitable for parallel work".into(),
+                            description: "Balanced resource usage, suitable for parallel work"
+                                .into(),
                             risk_score: 30,
                             benefit: "Good parallelism with manageable overhead".into(),
                             recommended: true,
-                            telemetry_refs: vec!["cpu_utilization".into(), "memory_utilization".into()],
+                            telemetry_refs: vec![
+                                "cpu_utilization".into(),
+                                "memory_utilization".into(),
+                            ],
                         },
                         DecisionOption {
                             option_id: "large".into(),
@@ -480,11 +488,19 @@ pub fn standard_registry() -> RunbookRegistry {
                             risk_score: 60,
                             benefit: "Maximum throughput for large tasks".into(),
                             recommended: false,
-                            telemetry_refs: vec!["cpu_utilization".into(), "memory_utilization".into(), "io_pressure".into()],
+                            telemetry_refs: vec![
+                                "cpu_utilization".into(),
+                                "memory_utilization".into(),
+                                "io_pressure".into(),
+                            ],
                         },
                     ],
                     policy_refs: vec!["capacity_governor".into()],
-                    telemetry_fields: vec!["cpu_utilization".into(), "memory_utilization".into(), "active_panes".into()],
+                    telemetry_fields: vec![
+                        "cpu_utilization".into(),
+                        "memory_utilization".into(),
+                        "active_panes".into(),
+                    ],
                 }),
                 min_role: OperatorRole::Operator,
                 caution: Some("Large fleets may trigger capacity governor throttling".into()),
@@ -627,7 +643,8 @@ pub fn standard_registry() -> RunbookRegistry {
         steps: vec![
             RunbookStep {
                 step_id: "ctx-01".into(),
-                instruction: "Check context budget dashboard for panes in Yellow/Red/Black pressure".into(),
+                instruction:
+                    "Check context budget dashboard for panes in Yellow/Red/Black pressure".into(),
                 step_type: StepType::Observe,
                 precondition: None,
                 expected_outcome: Some("Pressure tier distribution known".into()),
@@ -774,7 +791,9 @@ mod tests {
             telemetry_fields: vec![],
         };
 
-        let rec = overlay.recommended_option().expect("should have recommendation");
+        let rec = overlay
+            .recommended_option()
+            .expect("should have recommendation");
         assert_eq!(rec.option_id, "b");
     }
 
@@ -823,14 +842,22 @@ mod tests {
     #[test]
     fn runbook_estimated_time() {
         let registry = standard_registry();
-        let launch = registry.runbooks.iter().find(|r| r.runbook_id == "RB-001-fleet-launch").unwrap();
+        let launch = registry
+            .runbooks
+            .iter()
+            .find(|r| r.runbook_id == "RB-001-fleet-launch")
+            .unwrap();
         assert!(launch.estimated_total_seconds() > 0);
     }
 
     #[test]
     fn runbook_decision_steps() {
         let registry = standard_registry();
-        let launch = registry.runbooks.iter().find(|r| r.runbook_id == "RB-001-fleet-launch").unwrap();
+        let launch = registry
+            .runbooks
+            .iter()
+            .find(|r| r.runbook_id == "RB-001-fleet-launch")
+            .unwrap();
         let decisions = launch.decision_steps();
         assert!(!decisions.is_empty());
         assert!(decisions[0].decision_support.is_some());
@@ -839,7 +866,11 @@ mod tests {
     #[test]
     fn runbook_role_filtering() {
         let registry = standard_registry();
-        let launch = registry.runbooks.iter().find(|r| r.runbook_id == "RB-001-fleet-launch").unwrap();
+        let launch = registry
+            .runbooks
+            .iter()
+            .find(|r| r.runbook_id == "RB-001-fleet-launch")
+            .unwrap();
 
         // Operator can access all steps.
         let op_steps = launch.steps_for_role(&OperatorRole::Operator);
@@ -854,7 +885,11 @@ mod tests {
         let registry = standard_registry();
         let incident = registry.incident_runbooks();
         assert!(!incident.is_empty());
-        assert!(incident.iter().any(|r| r.runbook_id == "RB-002-emergency-response"));
+        assert!(
+            incident
+                .iter()
+                .any(|r| r.runbook_id == "RB-002-emergency-response")
+        );
     }
 
     #[test]
@@ -903,7 +938,11 @@ mod tests {
     #[test]
     fn tutorial_step_count() {
         let registry = standard_registry();
-        let gs = registry.tutorials.iter().find(|t| t.tutorial_id == "TUT-001-getting-started").unwrap();
+        let gs = registry
+            .tutorials
+            .iter()
+            .find(|t| t.tutorial_id == "TUT-001-getting-started")
+            .unwrap();
         assert_eq!(gs.step_count(), 3);
         assert!(gs.estimated_total_seconds() > 0);
     }
@@ -965,8 +1004,13 @@ mod tests {
         let decisions = emergency.decision_steps();
         assert!(!decisions.is_empty());
 
-        let overlay = decisions[0].decision_support.as_ref().expect("should have overlay");
-        let recommended = overlay.recommended_option().expect("should have recommendation");
+        let overlay = decisions[0]
+            .decision_support
+            .as_ref()
+            .expect("should have overlay");
+        let recommended = overlay
+            .recommended_option()
+            .expect("should have recommendation");
         assert_eq!(recommended.option_id, "targeted");
 
         // 5. Verify risk-sorted options.
@@ -1006,6 +1050,9 @@ mod tests {
             .iter()
             .find(|t| t.tutorial_id == "TUT-002-incident-response")
             .expect("should have incident response");
-        assert!(ir.prerequisites.contains(&"TUT-001-getting-started".to_string()));
+        assert!(
+            ir.prerequisites
+                .contains(&"TUT-001-getting-started".to_string())
+        );
     }
 }

@@ -22,20 +22,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use frankenterm_core::vendored_async_contracts::{
-    AsyncBoundaryContract, BoundaryDirection,
-    ContractCategory, ContractCompliance, ContractEvidence, EvidenceType, standard_contracts,
+    AsyncBoundaryContract, BoundaryDirection, ContractCategory, ContractCompliance,
+    ContractEvidence, EvidenceType, standard_contracts,
 };
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-fn emit_contract_log(
-    scenario_id: &str,
-    contract_id: &str,
-    check: &str,
-    outcome: &str,
-) {
+fn emit_contract_log(scenario_id: &str, contract_id: &str, check: &str, outcome: &str) {
     let payload = serde_json::json!({
         "timestamp": "2026-03-11T00:00:00Z",
         "component": "vendored_async_contract.verification",
@@ -103,14 +98,8 @@ fn v02_ownership_futures_scope_bounded_contract() {
 fn v03_ownership_no_detached_spawns_in_vendored_source() {
     // This test performs static analysis by reading vendored source files
     // and checking for disallowed patterns
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
-    let mux_client_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_client.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
+    let mux_client_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_client.rs");
 
     for path in &[mux_pool_path, mux_client_path] {
         if let Ok(contents) = std::fs::read_to_string(path) {
@@ -167,10 +156,7 @@ fn v05_cancellation_drop_implies_cancel_contract() {
 /// V6: Static analysis: vendored modules use runtime_compat::timeout, not raw tokio timeout.
 #[test]
 fn v06_cancellation_vendored_uses_compat_timeout() {
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
         // Check for runtime_compat timeout usage
@@ -237,10 +223,7 @@ fn v08_channeling_non_lossy_close_contract() {
 #[test]
 fn v09_channeling_no_raw_tokio_channels_in_vendored() {
     for file_name in &["mux_pool.rs", "mux_client.rs"] {
-        let path = format!(
-            "{}/src/vendored/{file_name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = format!("{}/src/vendored/{file_name}", env!("CARGO_MANIFEST_DIR"));
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
             let raw_mpsc = contents.matches("tokio::sync::mpsc").count();
@@ -295,10 +278,7 @@ fn v11_error_mapping_context_preservation_contract() {
 /// V12: Static analysis: MuxPoolError has From impl for vendored error types.
 #[test]
 fn v12_error_mapping_from_impl_exists_in_vendored() {
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
         // Check for From<...> impl for error type mapping
@@ -308,7 +288,12 @@ fn v12_error_mapping_from_impl_exists_in_vendored() {
             "mux_pool should have at least one From impl for error mapping"
         );
 
-        emit_contract_log("v12", "ABC-ERR-001", "from_impl_count", &format!("pass:count={from_impls}"));
+        emit_contract_log(
+            "v12",
+            "ABC-ERR-001",
+            "from_impl_count",
+            &format!("pass:count={from_impls}"),
+        );
     }
 }
 
@@ -333,20 +318,22 @@ fn v13_backpressure_propagation_contract() {
 /// V14: Static analysis: mux_pool uses semaphore-based concurrency control.
 #[test]
 fn v14_backpressure_semaphore_present_in_pool() {
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
-        let semaphore_refs = contents.matches("Semaphore").count()
-            + contents.matches("semaphore").count();
+        let semaphore_refs =
+            contents.matches("Semaphore").count() + contents.matches("semaphore").count();
         assert!(
             semaphore_refs >= 2,
             "mux_pool must use semaphore for concurrency control (found {semaphore_refs} refs)"
         );
 
-        emit_contract_log("v14", "ABC-BP-001", "semaphore_check", &format!("pass:refs={semaphore_refs}"));
+        emit_contract_log(
+            "v14",
+            "ABC-BP-001",
+            "semaphore_check",
+            &format!("pass:refs={semaphore_refs}"),
+        );
     }
 }
 
@@ -375,10 +362,7 @@ fn v15_timeout_core_overrides_vendored_contract() {
 /// V16: Static analysis: vendored code accepts Cx/Budget for timeout.
 #[test]
 fn v16_timeout_cx_budget_threading_in_vendored() {
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
         // Check for _with_cx methods (explicit Cx threading)
@@ -388,7 +372,12 @@ fn v16_timeout_cx_budget_threading_in_vendored() {
             "mux_pool should have multiple _with_cx methods for timeout/cx threading (found {cx_methods})"
         );
 
-        emit_contract_log("v16", "ABC-TO-001", "cx_threading", &format!("pass:cx_methods={cx_methods}"));
+        emit_contract_log(
+            "v16",
+            "ABC-TO-001",
+            "cx_threading",
+            &format!("pass:cx_methods={cx_methods}"),
+        );
     }
 }
 
@@ -430,10 +419,7 @@ fn v18_task_lifecycle_no_detached_production_paths() {
 /// V19: Static analysis: runtime_compat module exports task::spawn with JoinHandle.
 #[test]
 fn v19_task_lifecycle_spawn_returns_join_handle() {
-    let compat_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/runtime_compat.rs"
-    );
+    let compat_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_compat.rs");
 
     if let Ok(contents) = std::fs::read_to_string(compat_path) {
         let join_handle_refs = contents.matches("JoinHandle").count();
@@ -444,12 +430,14 @@ fn v19_task_lifecycle_spawn_returns_join_handle() {
 
         let spawn_refs = contents.matches("pub fn spawn").count()
             + contents.matches("pub async fn spawn").count();
-        assert!(
-            spawn_refs >= 1,
-            "runtime_compat must export spawn function"
-        );
+        assert!(spawn_refs >= 1, "runtime_compat must export spawn function");
 
-        emit_contract_log("v19", "ABC-TL-001", "join_handle_exports", &format!("pass:jh={join_handle_refs},spawn={spawn_refs}"));
+        emit_contract_log(
+            "v19",
+            "ABC-TL-001",
+            "join_handle_exports",
+            &format!("pass:jh={join_handle_refs},spawn={spawn_refs}"),
+        );
     }
 }
 
@@ -481,8 +469,14 @@ fn v20_compliance_from_evidence_all_pass() {
     ];
 
     let compliance = ContractCompliance::from_evidence(contract, evidence);
-    assert!(compliance.compliant, "all-pass evidence should yield compliant");
-    assert!((compliance.coverage - 1.0).abs() < 0.001, "coverage should be 1.0");
+    assert!(
+        compliance.compliant,
+        "all-pass evidence should yield compliant"
+    );
+    assert!(
+        (compliance.coverage - 1.0).abs() < 0.001,
+        "coverage should be 1.0"
+    );
 
     emit_contract_log("v20", "infra", "compliance_all_pass", "pass");
 }
@@ -511,8 +505,14 @@ fn v21_compliance_from_evidence_with_failure() {
     ];
 
     let compliance = ContractCompliance::from_evidence(contract, evidence);
-    assert!(!compliance.compliant, "any failure should yield non-compliant");
-    assert!((compliance.coverage - 0.5).abs() < 0.001, "coverage should be 0.5");
+    assert!(
+        !compliance.compliant,
+        "any failure should yield non-compliant"
+    );
+    assert!(
+        (compliance.coverage - 0.5).abs() < 0.001,
+        "coverage should be 0.5"
+    );
 
     emit_contract_log("v21", "infra", "compliance_partial_fail", "pass");
 }
@@ -524,8 +524,14 @@ fn v22_compliance_empty_evidence_non_compliant() {
     let contract = contracts[0].clone();
 
     let compliance = ContractCompliance::from_evidence(contract, vec![]);
-    assert!(!compliance.compliant, "no evidence should yield non-compliant");
-    assert!((compliance.coverage - 0.0).abs() < 0.001, "coverage should be 0.0");
+    assert!(
+        !compliance.compliant,
+        "no evidence should yield non-compliant"
+    );
+    assert!(
+        (compliance.coverage - 0.0).abs() < 0.001,
+        "coverage should be 0.0"
+    );
 
     emit_contract_log("v22", "infra", "empty_evidence", "pass");
 }
@@ -614,16 +620,15 @@ fn v25_mapping_contract_id_format_consistent() {
 #[test]
 fn v26_drift_no_direct_tokio_imports_in_vendored() {
     for file_name in &["mux_pool.rs", "mux_client.rs"] {
-        let path = format!(
-            "{}/src/vendored/{file_name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = format!("{}/src/vendored/{file_name}", env!("CARGO_MANIFEST_DIR"));
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
             // Count direct `use tokio::` that are NOT inside cfg(not(...)) blocks
             // Simple heuristic: count all `use tokio::` and check they're cfg-gated
             let tokio_uses = contents.matches("use tokio::").count();
-            let cfg_not_asupersync = contents.matches("cfg(not(feature = \"asupersync-runtime\"))").count();
+            let cfg_not_asupersync = contents
+                .matches("cfg(not(feature = \"asupersync-runtime\"))")
+                .count();
 
             // In fully migrated code, tokio uses should be <= cfg_not gates
             // (every tokio use should be behind a not(asupersync) gate)
@@ -640,10 +645,7 @@ fn v26_drift_no_direct_tokio_imports_in_vendored() {
 /// V27: runtime_compat surface contract count is stable.
 #[test]
 fn v27_drift_surface_contract_count_stable() {
-    let compat_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/runtime_compat.rs"
-    );
+    let compat_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_compat.rs");
 
     if let Ok(contents) = std::fs::read_to_string(compat_path) {
         // Count SURFACE_CONTRACT_V1 entries
@@ -653,17 +655,19 @@ fn v27_drift_surface_contract_count_stable() {
             "SURFACE_CONTRACT_V1 should have >= 10 entries (found {surface_entries})"
         );
 
-        emit_contract_log("v27", "drift", "surface_contract_count", &format!("pass:entries={surface_entries}"));
+        emit_contract_log(
+            "v27",
+            "drift",
+            "surface_contract_count",
+            &format!("pass:entries={surface_entries}"),
+        );
     }
 }
 
 /// V28: Vendored modules reference runtime_compat (not raw runtime primitives).
 #[test]
 fn v28_drift_vendored_uses_runtime_compat() {
-    let mux_pool_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/vendored/mux_pool.rs"
-    );
+    let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
         let compat_refs = contents.matches("runtime_compat").count();
@@ -674,7 +678,8 @@ fn v28_drift_vendored_uses_runtime_compat() {
 
         // Check for sleep, timeout usage patterns
         let sleep_refs = contents.matches("sleep(").count() + contents.matches("sleep (").count();
-        let timeout_refs = contents.matches("timeout(").count() + contents.matches("timeout (").count();
+        let timeout_refs =
+            contents.matches("timeout(").count() + contents.matches("timeout (").count();
 
         emit_contract_log(
             "v28",

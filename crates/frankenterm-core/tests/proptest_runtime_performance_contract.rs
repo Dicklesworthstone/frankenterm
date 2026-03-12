@@ -66,14 +66,16 @@ fn arb_operation_benchmark(op_id: String) -> impl Strategy<Value = OperationBenc
         100..10_000u64,
         prop::option::of(100..5000u64),
     )
-        .prop_map(move |(latency, throughput, samples, startup)| OperationBenchmark {
-            operation_id: op_id.clone(),
-            latency,
-            throughput_ops_sec: throughput,
-            samples,
-            startup_ms: startup,
-            label: "test".into(),
-        })
+        .prop_map(
+            move |(latency, throughput, samples, startup)| OperationBenchmark {
+                operation_id: op_id.clone(),
+                latency,
+                throughput_ops_sec: throughput,
+                samples,
+                startup_ms: startup,
+                label: "test".into(),
+            },
+        )
 }
 
 // =============================================================================

@@ -91,9 +91,9 @@ pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
 pub mod byte_compression;
+pub mod canary_rehearsal;
 #[cfg(feature = "subprocess-bridge")]
 pub mod canary_rollout_controller;
-pub mod canary_rehearsal;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
 pub mod capacity_governor;
@@ -154,13 +154,12 @@ pub mod dashboard;
 pub mod dataflow;
 pub mod degradation;
 pub mod dependency_eradication;
-pub mod forbidden_dep_guards;
 pub mod desktop_notify;
 pub mod diagnostic;
 pub mod diagnostic_redaction;
-pub mod disaster_recovery_drills;
 pub mod diagram_render;
 pub mod differential_snapshot;
+pub mod disaster_recovery_drills;
 pub mod disjoint_intervals;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_ballast;
@@ -182,8 +181,8 @@ pub mod error;
 pub mod error_clustering;
 pub mod error_codes;
 pub mod event_id;
-pub mod event_templates;
 pub mod event_stream;
+pub mod event_templates;
 pub mod events;
 pub mod ewma;
 pub mod exp_histogram;
@@ -197,6 +196,7 @@ pub mod fenwick_tree;
 pub mod fibonacci_heap;
 pub mod fleet_dashboard;
 pub mod fleet_launcher;
+pub mod forbidden_dep_guards;
 pub mod forensic_export;
 pub mod gc;
 pub mod graph_scoring;
@@ -206,8 +206,8 @@ pub mod identity_graph;
 pub mod incident_bundle;
 pub mod ingest;
 pub mod input_reserve;
-pub mod intervention_console;
 pub mod interval_tree;
+pub mod intervention_console;
 #[cfg(unix)]
 pub mod ipc;
 pub mod kalman_watchdog;
@@ -234,10 +234,10 @@ pub mod mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
-pub mod migration_artifact_contracts;
-pub mod migration_rehearsal;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod migration_artifact_contracts;
+pub mod migration_rehearsal;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_agent_mail;
 #[cfg(feature = "subprocess-bridge")]
@@ -337,8 +337,8 @@ pub mod ring_buffer;
 pub mod robot_api_contracts;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
-pub mod robot_sdk_contracts;
 pub mod robot_idempotency;
+pub mod robot_sdk_contracts;
 pub mod robot_types;
 pub mod rope;
 pub mod rulesets;
@@ -374,13 +374,13 @@ pub mod session_dna;
 pub mod session_pane_state;
 pub mod session_profiles;
 pub mod session_restore;
-pub mod session_workflow_explorer;
 #[cfg(feature = "session-resume")]
 pub mod session_resume;
 pub mod session_retention;
 #[cfg(feature = "redis-session")]
 pub mod session_store;
 pub mod session_topology;
+pub mod session_workflow_explorer;
 pub mod setup;
 #[cfg(feature = "subprocess-bridge")]
 pub mod shadow_mode_evaluator;
@@ -390,9 +390,9 @@ pub mod shortest_path;
 pub mod simd_scan;
 pub mod skip_list;
 pub mod sliding_window;
-pub mod soak_confidence_gate;
 pub mod slo_conformance;
 pub mod snapshot_engine;
+pub mod soak_confidence_gate;
 pub mod sparse_table;
 pub mod spectral;
 pub mod splay_tree;
@@ -406,9 +406,9 @@ pub mod subprocess_bridge;
 pub mod suffix_array;
 pub mod suggestions;
 pub mod survival;
+pub mod swarm_command_center;
 pub mod swarm_pipeline;
 pub mod swarm_scheduler;
-pub mod swarm_command_center;
 pub mod swarm_work_queue;
 pub mod tailer;
 #[cfg(feature = "recorder-lexical")]
@@ -459,9 +459,9 @@ pub mod work_stealing_deque;
 pub mod workflows;
 pub mod xor_filter;
 
-pub mod vendored_async_contracts;
 #[cfg(feature = "vendored")]
 pub mod vendored;
+pub mod vendored_async_contracts;
 #[cfg(feature = "vendored")]
 pub mod vendored_migration_map;
 

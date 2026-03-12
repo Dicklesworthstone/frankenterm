@@ -1877,7 +1877,19 @@ fn arb_approval_entry() -> impl Strategy<Value = ApprovalEntry> {
         any::<u64>(),
     )
         .prop_map(
-            |(id, action, actor, resource, reason, rule_id, req_at, exp_at, status, decided_by, decided_at)| {
+            |(
+                id,
+                action,
+                actor,
+                resource,
+                reason,
+                rule_id,
+                req_at,
+                exp_at,
+                status,
+                decided_by,
+                decided_at,
+            )| {
                 ApprovalEntry {
                     approval_id: id,
                     action,
@@ -1909,15 +1921,17 @@ fn arb_revocation_record() -> impl Strategy<Value = RevocationRecord> {
         any::<u64>(),
         any::<bool>(),
     )
-        .prop_map(|(id, rtype, rid, reason, by, at, active)| RevocationRecord {
-            revocation_id: id,
-            resource_type: rtype,
-            resource_id: rid,
-            reason,
-            revoked_by: by,
-            revoked_at_ms: at,
-            active,
-        })
+        .prop_map(
+            |(id, rtype, rid, reason, by, at, active)| RevocationRecord {
+                revocation_id: id,
+                resource_type: rtype,
+                resource_id: rid,
+                reason,
+                revoked_by: by,
+                revoked_at_ms: at,
+                active,
+            },
+        )
 }
 
 fn arb_forensic_audit_entry() -> impl Strategy<Value = ForensicAuditEntry> {
@@ -1929,14 +1943,16 @@ fn arb_forensic_audit_entry() -> impl Strategy<Value = ForensicAuditEntry> {
         "[a-z_]{3,15}",
         "[a-f0-9]{16,64}",
     )
-        .prop_map(|(ts, kind, actor, desc, surface, hash)| ForensicAuditEntry {
-            timestamp_ms: ts,
-            kind,
-            actor,
-            description: desc,
-            surface,
-            hash,
-        })
+        .prop_map(
+            |(ts, kind, actor, desc, surface, hash)| ForensicAuditEntry {
+                timestamp_ms: ts,
+                kind,
+                actor,
+                description: desc,
+                surface,
+                hash,
+            },
+        )
 }
 
 fn arb_forensic_namespace_event() -> impl Strategy<Value = ForensicNamespaceEvent> {
@@ -1946,18 +1962,24 @@ fn arb_forensic_namespace_event() -> impl Strategy<Value = ForensicNamespaceEven
         "[a-z.]{3,20}",
         "[a-z_]{3,15}",
         "[a-z0-9]{1,10}",
-        prop_oneof![Just("allow".to_string()), Just("deny".to_string()), Just("audit".to_string())],
+        prop_oneof![
+            Just("allow".to_string()),
+            Just("deny".to_string()),
+            Just("audit".to_string())
+        ],
         "[a-z ]{5,30}",
     )
-        .prop_map(|(ts, src, tgt, kind, id, decision, reason)| ForensicNamespaceEvent {
-            timestamp_ms: ts,
-            source_namespace: src,
-            target_namespace: tgt,
-            resource_kind: kind,
-            resource_id: id,
-            decision,
-            reason,
-        })
+        .prop_map(
+            |(ts, src, tgt, kind, id, decision, reason)| ForensicNamespaceEvent {
+                timestamp_ms: ts,
+                source_namespace: src,
+                target_namespace: tgt,
+                resource_kind: kind,
+                resource_id: id,
+                decision,
+                reason,
+            },
+        )
 }
 
 fn arb_forensic_compliance_summary() -> impl Strategy<Value = ForensicComplianceSummary> {
@@ -1997,7 +2019,18 @@ fn arb_policy_decision_entry() -> impl Strategy<Value = PolicyDecisionEntry> {
         0..100u32,
     )
         .prop_map(
-            |(seq, ts, action, actor, surface, pane_id, decision, rule_id, reason, rules_evaluated)| {
+            |(
+                seq,
+                ts,
+                action,
+                actor,
+                surface,
+                pane_id,
+                decision,
+                rule_id,
+                reason,
+                rules_evaluated,
+            )| {
                 PolicyDecisionEntry {
                     seq,
                     timestamp_ms: ts,

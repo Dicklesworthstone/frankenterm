@@ -136,10 +136,7 @@ fn check_quarantine(engine: &PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
                 active.len(),
             ),
         )
-        .with_evidence(&format!(
-            "quarantined_components: [{}]",
-            active.join(", "),
-        ))
+        .with_evidence(&format!("quarantined_components: [{}]", active.join(", "),))
         .with_remediation(
             RemediationHint::text("Investigate quarantine causes before clearing")
                 .effort(RemediationEffort::Medium),
@@ -150,10 +147,7 @@ fn check_quarantine(engine: &PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
             "Quarantine & Kill Switch",
             &format!("{} component(s) quarantined", active.len()),
         )
-        .with_evidence(&format!(
-            "quarantined: [{}]",
-            active.join(", "),
-        ))
+        .with_evidence(&format!("quarantined: [{}]", active.join(", "),))
     } else {
         RuntimeHealthCheck::pass(
             "policy.quarantine",
@@ -350,8 +344,10 @@ fn check_namespace_isolation(engine: &PolicyEngine) -> RuntimeHealthCheck {
             "Enabled but no namespaces registered — cross-tenant checks have no effect",
         )
         .with_remediation(
-            RemediationHint::text("Register at least one namespace via PolicyEngine::bind_resource_to_namespace")
-                .effort(RemediationEffort::Low),
+            RemediationHint::text(
+                "Register at least one namespace via PolicyEngine::bind_resource_to_namespace",
+            )
+            .effort(RemediationEffort::Low),
         )
     } else {
         RuntimeHealthCheck::pass(
@@ -452,10 +448,7 @@ fn check_connector_lifecycle(engine: &PolicyEngine) -> RuntimeHealthCheck {
         RuntimeHealthCheck::fail(
             "policy.connector_lifecycle",
             "Connector Lifecycle",
-            &format!(
-                "{} connector(s) in failed state",
-                summary.failed,
-            ),
+            &format!("{} connector(s) in failed state", summary.failed,),
         )
         .with_evidence(&format!(
             "total={} running={} stopped={} degraded={} failed={}",
@@ -469,10 +462,7 @@ fn check_connector_lifecycle(engine: &PolicyEngine) -> RuntimeHealthCheck {
         RuntimeHealthCheck::warn(
             "policy.connector_lifecycle",
             "Connector Lifecycle",
-            &format!(
-                "{} connector(s) degraded",
-                summary.degraded,
-            ),
+            &format!("{} connector(s) degraded", summary.degraded,),
         )
         .with_evidence(&format!(
             "total={} running={} stopped={} degraded={}",
@@ -550,7 +540,10 @@ fn check_connector_mesh(engine: &PolicyEngine) -> RuntimeHealthCheck {
         )
         .with_evidence(&format!(
             "hosts={} zones={} successes={} failures={}",
-            snap.hosts_registered, snap.zones_created, snap.routing_successes, snap.routing_failures,
+            snap.hosts_registered,
+            snap.zones_created,
+            snap.routing_successes,
+            snap.routing_failures,
         ))
     } else {
         RuntimeHealthCheck::pass(

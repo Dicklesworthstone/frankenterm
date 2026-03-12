@@ -355,7 +355,10 @@ pub fn render_diagnostic(template: &DiagnosticTemplate) -> RenderedDiagnostic {
 /// Render for human CLI consumption.
 fn render_human(template: &DiagnosticTemplate) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("[{}] {:?}", template.error_code, template.failure_class));
+    lines.push(format!(
+        "[{}] {:?}",
+        template.error_code, template.failure_class
+    ));
     lines.push(format!("Cause: {}", template.cause_summary));
     lines.push(format!("Impact: {}", template.user_impact));
     lines.push(String::new());
@@ -549,10 +552,8 @@ impl CertificationReport {
                     let has_cause = !t.cause_summary.is_empty();
                     let has_impact = !t.user_impact.is_empty();
                     let has_remediation = !t.remediation_steps.is_empty();
-                    let has_robot_safe_step =
-                        t.remediation_steps.iter().any(|s| s.robot_safe);
-                    let has_command =
-                        t.remediation_steps.iter().any(|s| s.command.is_some());
+                    let has_robot_safe_step = t.remediation_steps.iter().any(|s| s.robot_safe);
+                    let has_command = t.remediation_steps.iter().any(|s| s.command.is_some());
                     let has_escalation = !t.escalation_hint.is_empty();
                     let has_error_code = !t.error_code.is_empty();
 
@@ -604,7 +605,11 @@ impl CertificationReport {
         lines.push("=== Diagnostic UX Certification ===".to_string());
         lines.push(format!(
             "Result: {}",
-            if self.overall_pass { "CERTIFIED" } else { "NOT CERTIFIED" }
+            if self.overall_pass {
+                "CERTIFIED"
+            } else {
+                "NOT CERTIFIED"
+            }
         ));
         lines.push(format!(
             "Templates: {}/{} pass",
@@ -644,7 +649,10 @@ impl CertificationReport {
             } else {
                 format!(" ({})", issues.join(", "))
             };
-            lines.push(format!("  [{}] {}{}", status, check.failure_class, issue_str));
+            lines.push(format!(
+                "  [{}] {}{}",
+                status, check.failure_class, issue_str
+            ));
         }
 
         lines.join("\n")
@@ -684,7 +692,11 @@ mod tests {
     fn certification_passes_for_standard_catalog() {
         let catalog = DiagnosticCatalog::standard();
         let report = CertificationReport::certify(&catalog);
-        assert!(report.overall_pass, "certification should pass: {:?}", report.render_summary());
+        assert!(
+            report.overall_pass,
+            "certification should pass: {:?}",
+            report.render_summary()
+        );
         assert!(report.missing_classes.is_empty());
     }
 
@@ -702,7 +714,10 @@ mod tests {
     #[test]
     fn certification_fails_when_not_certified() {
         let mut templates = standard_diagnostic_templates();
-        if let Some(t) = templates.iter_mut().find(|t| t.failure_class == FailureClass::Timeout) {
+        if let Some(t) = templates
+            .iter_mut()
+            .find(|t| t.failure_class == FailureClass::Timeout)
+        {
             t.certified = false;
         }
         let catalog = DiagnosticCatalog::from_templates(templates);
@@ -713,7 +728,10 @@ mod tests {
     #[test]
     fn certification_fails_when_no_remediation() {
         let mut templates = standard_diagnostic_templates();
-        if let Some(t) = templates.iter_mut().find(|t| t.failure_class == FailureClass::Timeout) {
+        if let Some(t) = templates
+            .iter_mut()
+            .find(|t| t.failure_class == FailureClass::Timeout)
+        {
             t.remediation_steps.clear();
         }
         let catalog = DiagnosticCatalog::from_templates(templates);
@@ -724,7 +742,10 @@ mod tests {
     #[test]
     fn render_human_includes_error_code_and_steps() {
         let templates = standard_diagnostic_templates();
-        let timeout = templates.iter().find(|t| t.failure_class == FailureClass::Timeout).unwrap();
+        let timeout = templates
+            .iter()
+            .find(|t| t.failure_class == FailureClass::Timeout)
+            .unwrap();
         let human = render_human(timeout);
         assert!(human.contains("RT-TIMEOUT-001"));
         assert!(human.contains("Remediation:"));
@@ -746,7 +767,10 @@ mod tests {
     #[test]
     fn robot_json_contains_robot_safe_flags() {
         let templates = standard_diagnostic_templates();
-        let timeout = templates.iter().find(|t| t.failure_class == FailureClass::Timeout).unwrap();
+        let timeout = templates
+            .iter()
+            .find(|t| t.failure_class == FailureClass::Timeout)
+            .unwrap();
         let rendered = render_diagnostic(timeout);
         let parsed: serde_json::Value = serde_json::from_str(&rendered.robot_json).unwrap();
         let steps = parsed["remediation"].as_array().unwrap();

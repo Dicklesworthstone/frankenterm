@@ -32,8 +32,8 @@
 //! let condition = WaitCondition::rule_id("codex.usage.reached");
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -526,9 +526,7 @@ impl EventWaiter {
             loop {
                 match subscriber.recv().await {
                     Ok(event) => {
-                        if self.filter.matches_event(&event)
-                            && self.condition.matches(&event)
-                        {
+                        if self.filter.matches_event(&event) && self.condition.matches(&event) {
                             return event;
                         }
                     }
@@ -999,11 +997,7 @@ mod tests {
         let filter = EventStreamFilter::builder()
             .rule_id("codex.usage.reached".to_string())
             .build();
-        assert!(filter.matches_event(&make_pattern_event(
-            1,
-            "codex.usage.reached",
-            None
-        )));
+        assert!(filter.matches_event(&make_pattern_event(1, "codex.usage.reached", None)));
         assert!(!filter.matches_event(&make_pattern_event(1, "other.rule", None)));
     }
 
@@ -1149,10 +1143,7 @@ mod tests {
     #[test]
     fn wait_any_of_matches_first() {
         let cond = WaitCondition::AnyOf {
-            conditions: vec![
-                WaitCondition::rule_id("a"),
-                WaitCondition::rule_id("b"),
-            ],
+            conditions: vec![WaitCondition::rule_id("a"), WaitCondition::rule_id("b")],
         };
         assert!(cond.matches(&make_pattern_event(1, "a", None)));
         assert!(cond.matches(&make_pattern_event(1, "b", None)));

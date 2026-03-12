@@ -1,7 +1,7 @@
 //! Property tests for migration_artifact_contracts module.
 
-use proptest::prelude::*;
 use frankenterm_core::migration_artifact_contracts::*;
+use proptest::prelude::*;
 
 // =============================================================================
 // Strategies

@@ -317,10 +317,9 @@ impl InterventionConsole {
             InterventionAction::ApproveRequest { request_id } => {
                 self.process_approval(*request_id, true, None, now_ms)
             }
-            InterventionAction::RejectRequest {
-                request_id,
-                reason,
-            } => self.process_approval(*request_id, false, Some(reason.clone()), now_ms),
+            InterventionAction::RejectRequest { request_id, reason } => {
+                self.process_approval(*request_id, false, Some(reason.clone()), now_ms)
+            }
             InterventionAction::EmergencyStop { scope } => {
                 self.emergency_stop = true;
                 self.emergency_scope = Some(*scope);
@@ -370,10 +369,7 @@ impl InterventionConsole {
 
     /// Get the control state of a pane.
     pub fn pane_state(&self, pane_id: u64) -> PaneControlState {
-        self.pane_states
-            .get(&pane_id)
-            .copied()
-            .unwrap_or_default()
+        self.pane_states.get(&pane_id).copied().unwrap_or_default()
     }
 
     /// Register a pane for tracking.
@@ -477,7 +473,10 @@ impl InterventionConsole {
         new_state: PaneControlState,
         _now_ms: u64,
     ) -> InterventionResult {
-        let prev = self.pane_states.insert(pane_id, new_state).unwrap_or_default();
+        let prev = self
+            .pane_states
+            .insert(pane_id, new_state)
+            .unwrap_or_default();
         InterventionResult {
             success: true,
             message: format!("pane {} {:?} → {:?}", pane_id, prev, new_state),
@@ -707,7 +706,10 @@ mod tests {
         let id = console.submit_approval(1, "deploy to prod", RiskLevel::High, 0);
         assert_eq!(console.pending_approvals().len(), 1);
 
-        let r = console.execute("admin", InterventionAction::ApproveRequest { request_id: id });
+        let r = console.execute(
+            "admin",
+            InterventionAction::ApproveRequest { request_id: id },
+        );
         assert!(r.success);
         assert_eq!(console.pending_approvals().len(), 0);
         assert_eq!(console.total_approvals_processed, 1);
@@ -745,9 +747,15 @@ mod tests {
     fn approve_already_approved_fails() {
         let mut console = InterventionConsole::new();
         let id = console.submit_approval(1, "action", RiskLevel::Low, 0);
-        console.execute("admin", InterventionAction::ApproveRequest { request_id: id });
+        console.execute(
+            "admin",
+            InterventionAction::ApproveRequest { request_id: id },
+        );
         // Try to approve again.
-        let r = console.execute("admin", InterventionAction::ApproveRequest { request_id: id });
+        let r = console.execute(
+            "admin",
+            InterventionAction::ApproveRequest { request_id: id },
+        );
         assert!(!r.success);
         assert!(r.message.contains("Approved"));
     }
@@ -892,8 +900,14 @@ mod tests {
         console.execute("admin", InterventionAction::TakeoverPane { pane_id: 2 });
 
         let counts = console.state_counts();
-        assert_eq!(counts.get(&PaneControlState::Active).copied().unwrap_or(0), 1);
-        assert_eq!(counts.get(&PaneControlState::Paused).copied().unwrap_or(0), 1);
+        assert_eq!(
+            counts.get(&PaneControlState::Active).copied().unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            counts.get(&PaneControlState::Paused).copied().unwrap_or(0),
+            1
+        );
         assert_eq!(
             counts
                 .get(&PaneControlState::ManualTakeover)
@@ -960,7 +974,10 @@ mod tests {
         assert!(r.success);
 
         // Operator takes over pane 3 for manual investigation.
-        console.execute("operator-1", InterventionAction::TakeoverPane { pane_id: 3 });
+        console.execute(
+            "operator-1",
+            InterventionAction::TakeoverPane { pane_id: 3 },
+        );
 
         // Agent on pane 1 requests approval for a destructive action.
         let req_id = console.submit_approval(1, "drop database", RiskLevel::Critical, 0);
@@ -988,7 +1005,10 @@ mod tests {
         let counts = console.state_counts();
         // Panes 0,1,4 were Active → now Paused. Pane 2 was Quarantined (stays).
         // Pane 3 was ManualTakeover (stays, not affected by emergency pause of Active panes).
-        assert_eq!(counts.get(&PaneControlState::Paused).copied().unwrap_or(0), 3);
+        assert_eq!(
+            counts.get(&PaneControlState::Paused).copied().unwrap_or(0),
+            3
+        );
         assert_eq!(
             counts
                 .get(&PaneControlState::Quarantined)
