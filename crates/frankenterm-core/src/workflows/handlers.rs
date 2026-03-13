@@ -1563,6 +1563,502 @@ impl Workflow for HandleSessionStartContext {
 }
 
 // ============================================================================
+// HandleOnErrorCassSearch — search cass for past fixes on error detection (ft-2l9kn)
+// ============================================================================
+
+/// Default cooldown window in milliseconds (3 minutes).
+/// Error-triggered cass lookup events within this window for the same pane are suppressed.
+pub const ON_ERROR_CASS_COOLDOWN_MS: i64 = 3 * 60 * 1000;
+const ON_ERROR_CASS_HINT_LIMIT: usize = 3;
+const ON_ERROR_CASS_TIMEOUT_SECS: u64 = 6;
+const ON_ERROR_CASS_LOOKBACK_DAYS: u32 = 30;
+const ON_ERROR_CASS_QUERY_MAX_CHARS: usize = 200;
+const ON_ERROR_CASS_HINT_MAX_CHARS: usize = 180;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OnErrorCassHintsLookup {
+    pub query: Option<String>,
+    pub query_candidates: Vec<String>,
+    pub workspace: Option<String>,
+    pub hints: Vec<String>,
+    pub error: Option<String>,
+    pub error_text: Option<String>,
+    pub rule_id: Option<String>,
+}
+
+/// Search cass for past fixes when an error pattern is detected in pane output.
+///
+/// This workflow triggers on `error.*` event types, performs a bounded cass lookup
+/// for similar past errors and their resolutions, records an audit decision, and
+/// logs the hints. If cass returns matches, a brief summary is injected as a
+/// comment into the pane so the agent can leverage past solutions.
+pub struct HandleOnErrorCassSearch {
+    cooldown_ms: i64,
+}
+
+impl HandleOnErrorCassSearch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: ON_ERROR_CASS_COOLDOWN_MS,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+
+    fn compact_whitespace(input: &str) -> String {
+        input.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn truncate_chars(input: &str, max_chars: usize) -> String {
+        input.chars().take(max_chars).collect()
+    }
+
+    fn extract_error_text(trigger: &serde_json::Value) -> Option<String> {
+        // Try matched_text first, then extracted.message, then extracted.error
+        trigger
+            .get("matched_text")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                trigger
+                    .get("extracted")
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                trigger
+                    .get("extracted")
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| {
+                Self::truncate_chars(
+                    &Self::compact_whitespace(s.trim()),
+                    ON_ERROR_CASS_QUERY_MAX_CHARS,
+                )
+            })
+    }
+
+    fn cass_agent_from_trigger(trigger: &serde_json::Value) -> Option<CassAgent> {
+        trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .and_then(CassAgent::from_slug)
+    }
+
+    fn workspace_from_pane(pane: Option<&crate::storage::PaneRecord>) -> Option<String> {
+        let cwd = pane?.cwd.as_deref()?;
+        let parsed = crate::wezterm::CwdInfo::parse(cwd);
+        if parsed.is_remote || parsed.path.is_empty() {
+            return None;
+        }
+        Some(parsed.path)
+    }
+
+    fn query_candidates(
+        trigger: &serde_json::Value,
+        pane: Option<&crate::storage::PaneRecord>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+
+        // Primary: the error text itself
+        if let Some(error_text) = Self::extract_error_text(trigger) {
+            if !error_text.is_empty() {
+                candidates.push(error_text);
+            }
+        }
+
+        // Secondary: rule_id for structural matching
+        if let Some(rule_id) = trigger.get("rule_id").and_then(|v| v.as_str()) {
+            let rule_query = Self::truncate_chars(rule_id, ON_ERROR_CASS_QUERY_MAX_CHARS);
+            if !candidates
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&rule_query))
+            {
+                candidates.push(rule_query);
+            }
+        }
+
+        // Tertiary: pane title for broader context
+        if let Some(title) = pane.and_then(|p| p.title.as_deref()) {
+            let title_trimmed = Self::truncate_chars(
+                &Self::compact_whitespace(title.trim()),
+                ON_ERROR_CASS_QUERY_MAX_CHARS,
+            );
+            if !title_trimmed.is_empty()
+                && !candidates
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&title_trimmed))
+            {
+                candidates.push(title_trimmed);
+            }
+        }
+
+        candidates
+    }
+
+    fn format_cass_hint(hit: &CassSearchHit) -> Option<String> {
+        let snippet = hit
+            .content
+            .as_deref()
+            .map(Self::compact_whitespace)
+            .unwrap_or_default();
+        if snippet.is_empty() {
+            return None;
+        }
+        let source_path = hit
+            .source_path
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown");
+        let line_suffix = hit
+            .line_number
+            .map_or_else(String::new, |line| format!(":{line}"));
+        let compact = Self::truncate_chars(&snippet, ON_ERROR_CASS_HINT_MAX_CHARS);
+        Some(format!("{source_path}{line_suffix} - {compact}"))
+    }
+
+    async fn lookup_cass_hints(
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> OnErrorCassHintsLookup {
+        let pane = match storage.get_pane(pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return OnErrorCassHintsLookup {
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                    ..Default::default()
+                };
+            }
+        };
+
+        let query_candidates = Self::query_candidates(trigger, pane.as_ref());
+        let Some(first_query) = query_candidates.first().cloned() else {
+            return OnErrorCassHintsLookup {
+                query_candidates,
+                error: Some("no_query_candidates".to_string()),
+                error_text: Self::extract_error_text(trigger),
+                rule_id: trigger
+                    .get("rule_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                ..Default::default()
+            };
+        };
+
+        let workspace = Self::workspace_from_pane(pane.as_ref());
+        let options = SearchOptions {
+            limit: Some(ON_ERROR_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(ON_ERROR_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(250),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(ON_ERROR_CASS_TIMEOUT_SECS);
+        let mut last_error: Option<String> = None;
+
+        for query in &query_candidates {
+            match cass.search(query, &options).await {
+                Ok(result) => {
+                    let hints = result
+                        .hits
+                        .iter()
+                        .filter_map(Self::format_cass_hint)
+                        .take(ON_ERROR_CASS_HINT_LIMIT)
+                        .collect::<Vec<_>>();
+                    if !hints.is_empty() {
+                        return OnErrorCassHintsLookup {
+                            query: Some(query.clone()),
+                            query_candidates,
+                            workspace,
+                            hints,
+                            error: None,
+                            error_text: Self::extract_error_text(trigger),
+                            rule_id: trigger
+                                .get("rule_id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string),
+                        };
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+
+        OnErrorCassHintsLookup {
+            query: Some(first_query),
+            query_candidates,
+            workspace,
+            hints: vec![],
+            error: last_error,
+            error_text: Self::extract_error_text(trigger),
+            rule_id: trigger
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+        }
+    }
+}
+
+impl Default for HandleOnErrorCassSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn build_on_error_cass_audit_decision_context(
+    execution_id: &str,
+    pane_id: u64,
+    agent_type: &str,
+    event_type: &str,
+    rule_id: Option<&str>,
+    lookup: &OnErrorCassHintsLookup,
+    input_summary: &str,
+    result: &str,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let mut context = new_workflow_handler_audit_context(
+        "on_error_cass_search",
+        "handle_on_error_cass_search",
+        execution_id,
+        pane_id,
+        Some(input_summary),
+        result,
+        timestamp_ms,
+    );
+    context.add_evidence("agent_type", agent_type);
+    context.add_evidence("event_type", event_type);
+    add_optional_evidence(&mut context, "trigger_rule_id", rule_id);
+    add_optional_evidence(&mut context, "cass_query", lookup.query.as_deref());
+    add_repeated_evidence(
+        &mut context,
+        "cass_query_candidate",
+        &lookup.query_candidates,
+    );
+    add_optional_evidence(&mut context, "cass_workspace", lookup.workspace.as_deref());
+    add_optional_evidence(&mut context, "error_text", lookup.error_text.as_deref());
+    add_optional_evidence(&mut context, "error_rule_id", lookup.rule_id.as_deref());
+    add_repeated_evidence(&mut context, "cass_hint", &lookup.hints);
+    add_optional_evidence(&mut context, "cass_lookup_error", lookup.error.as_deref());
+    serialize_workflow_handler_audit_context(&context)
+}
+
+impl Workflow for HandleOnErrorCassSearch {
+    fn name(&self) -> &'static str {
+        "handle_on_error_cass_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search cass for past fixes when an error pattern is detected"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        let et = &detection.event_type;
+        et.starts_with("error.") || et == "mux.error"
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &[
+            "error.network",
+            "error.timeout",
+            "error.overloaded",
+            "mux.error",
+        ]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["claude_code", "codex", "gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if on-error cass search was recently performed for this pane",
+            ),
+            WorkflowStep::new(
+                "search_cass_for_error",
+                "Search cass for similar past errors and inject hints",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Check cooldown
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("on_error_cass_search".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_search_ts = recent[0].ts,
+                                "handle_on_error_cass_search: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_search_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                "handle_on_error_cass_search: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: Search cass and log/inject hints
+                1 => {
+                    let lookup = Self::lookup_cass_hints(&storage, pane_id, &trigger).await;
+                    let result_label = if lookup.hints.is_empty() {
+                        if lookup.error.is_some() {
+                            "lookup_error"
+                        } else {
+                            "no_hints"
+                        }
+                    } else {
+                        "hints_found"
+                    };
+
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let timestamp_ms = now_ms();
+
+                    let error_preview = lookup.error_text.as_deref().unwrap_or("unknown error");
+                    let input_summary =
+                        format!("On-error cass search for {agent_type}: {error_preview}");
+                    let decision_context = build_on_error_cass_audit_decision_context(
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &lookup,
+                        &input_summary,
+                        result_label,
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "on_error_cass_search".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: result_label.to_string(),
+                    };
+
+                    if let Err(error) = storage.record_audit_action(audit).await {
+                        tracing::error!(
+                            pane_id,
+                            error = %error,
+                            "handle_on_error_cass_search: failed to record audit"
+                        );
+                        return StepResult::abort(format!(
+                            "Failed to record on_error_cass_search audit: {error}"
+                        ));
+                    }
+
+                    if lookup.hints.is_empty() {
+                        tracing::info!(
+                            pane_id,
+                            result = result_label,
+                            "handle_on_error_cass_search: no past fixes found"
+                        );
+                        StepResult::done(serde_json::json!({
+                            "status": result_label,
+                            "pane_id": pane_id,
+                            "error_text": lookup.error_text,
+                        }))
+                    } else {
+                        tracing::info!(
+                            pane_id,
+                            hint_count = lookup.hints.len(),
+                            "handle_on_error_cass_search: found past fixes"
+                        );
+                        StepResult::done(serde_json::json!({
+                            "status": "hints_found",
+                            "pane_id": pane_id,
+                            "hint_count": lookup.hints.len(),
+                            "hints": lookup.hints,
+                            "query": lookup.query,
+                        }))
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
 // HandleAuthRequired — centralize auth recovery (wa-nu4.2.2.4)
 // ============================================================================
 
@@ -4426,5 +4922,288 @@ mod tests {
     #[test]
     fn fallback_handled_status_is_paused() {
         assert_eq!(FALLBACK_HANDLED_STATUS, "paused");
+    }
+
+    // ========================================================================
+    // HandleOnErrorCassSearch tests (ft-2l9kn)
+    // ========================================================================
+
+    #[test]
+    fn handle_on_error_cass_search_metadata() {
+        let workflow = HandleOnErrorCassSearch::new();
+        assert_eq!(workflow.name(), "handle_on_error_cass_search");
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+        assert_eq!(workflow.steps().len(), 2);
+    }
+
+    #[test]
+    fn handle_on_error_cass_search_handles_error_events_only() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleOnErrorCassSearch::new();
+        let base = Detection {
+            rule_id: "claude_code.error.network".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "error.network".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Connection refused".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&base));
+
+        let timeout = Detection {
+            rule_id: "claude_code.error.timeout".to_string(),
+            event_type: "error.timeout".to_string(),
+            ..base.clone()
+        };
+        assert!(workflow.handles(&timeout));
+
+        let overloaded = Detection {
+            rule_id: "claude_code.error.overloaded".to_string(),
+            event_type: "error.overloaded".to_string(),
+            ..base.clone()
+        };
+        assert!(workflow.handles(&overloaded));
+
+        let mux_error = Detection {
+            event_type: "mux.error".to_string(),
+            ..base.clone()
+        };
+        assert!(workflow.handles(&mux_error));
+
+        // Should NOT handle session.start
+        let session_start = Detection {
+            event_type: "session.start".to_string(),
+            ..base.clone()
+        };
+        assert!(!workflow.handles(&session_start));
+
+        // Should NOT handle auth.error (auth has its own handler)
+        let auth_error = Detection {
+            event_type: "auth.error".to_string(),
+            ..base
+        };
+        assert!(!workflow.handles(&auth_error));
+    }
+
+    #[test]
+    fn handle_on_error_extract_error_text_from_matched_text() {
+        let trigger = serde_json::json!({
+            "matched_text": "Connection refused: could not connect to host",
+            "agent_type": "claude_code",
+        });
+        let text = HandleOnErrorCassSearch::extract_error_text(&trigger);
+        assert_eq!(
+            text.as_deref(),
+            Some("Connection refused: could not connect to host")
+        );
+    }
+
+    #[test]
+    fn handle_on_error_extract_error_text_from_extracted_message() {
+        let trigger = serde_json::json!({
+            "extracted": {"message": "Request timed out after 30s"},
+            "agent_type": "claude_code",
+        });
+        let text = HandleOnErrorCassSearch::extract_error_text(&trigger);
+        assert_eq!(text.as_deref(), Some("Request timed out after 30s"));
+    }
+
+    #[test]
+    fn handle_on_error_extract_error_text_from_extracted_error() {
+        let trigger = serde_json::json!({
+            "extracted": {"error": "API overloaded, try again later"},
+            "agent_type": "codex",
+        });
+        let text = HandleOnErrorCassSearch::extract_error_text(&trigger);
+        assert_eq!(
+            text.as_deref(),
+            Some("API overloaded, try again later")
+        );
+    }
+
+    #[test]
+    fn handle_on_error_extract_error_text_prefers_matched_text() {
+        let trigger = serde_json::json!({
+            "matched_text": "matched text",
+            "extracted": {"message": "extracted message", "error": "extracted error"},
+        });
+        let text = HandleOnErrorCassSearch::extract_error_text(&trigger);
+        assert_eq!(text.as_deref(), Some("matched text"));
+    }
+
+    #[test]
+    fn handle_on_error_query_candidates_include_error_and_rule() {
+        let trigger = serde_json::json!({
+            "matched_text": "Connection refused",
+            "rule_id": "claude_code.error.network",
+            "agent_type": "claude_code",
+        });
+        let pane = crate::storage::PaneRecord {
+            pane_id: 42,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some("Working on ft-3681t".to_string()),
+            cwd: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let candidates = HandleOnErrorCassSearch::query_candidates(&trigger, Some(&pane));
+        assert!(
+            candidates.iter().any(|c| c == "Connection refused"),
+            "expected error text in {candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == "claude_code.error.network"),
+            "expected rule_id in {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|c| c.contains("ft-3681t")),
+            "expected pane title in {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn handle_on_error_query_candidates_dedup_case_insensitive() {
+        let trigger = serde_json::json!({
+            "matched_text": "ERROR.NETWORK",
+            "rule_id": "error.network",
+        });
+        let candidates = HandleOnErrorCassSearch::query_candidates(&trigger, None);
+        let lowercase_count = candidates
+            .iter()
+            .filter(|c| c.eq_ignore_ascii_case("error.network"))
+            .count();
+        assert!(
+            lowercase_count <= 1,
+            "expected no case-insensitive duplicates in {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn handle_on_error_format_cass_hint_basic() {
+        let hit = CassSearchHit {
+            content: Some(
+                "Fix: use rch exec -- cargo test instead of direct cargo".to_string(),
+            ),
+            source_path: Some("/tmp/session.jsonl".to_string()),
+            line_number: Some(42),
+            ..Default::default()
+        };
+        let hint = HandleOnErrorCassSearch::format_cass_hint(&hit);
+        assert!(hint.is_some());
+        let h = hint.unwrap();
+        assert!(h.contains("/tmp/session.jsonl:42"));
+        assert!(h.contains("use rch exec"));
+    }
+
+    #[test]
+    fn handle_on_error_format_cass_hint_empty_content_returns_none() {
+        let hit = CassSearchHit {
+            content: Some(String::new()),
+            source_path: Some("/tmp/session.jsonl".to_string()),
+            line_number: Some(1),
+            ..Default::default()
+        };
+        assert!(HandleOnErrorCassSearch::format_cass_hint(&hit).is_none());
+    }
+
+    #[test]
+    fn on_error_cass_hints_lookup_serde_roundtrip() {
+        let lookup = OnErrorCassHintsLookup {
+            query: Some("Connection refused".to_string()),
+            query_candidates: vec![
+                "Connection refused".to_string(),
+                "claude_code.error.network".to_string(),
+            ],
+            workspace: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+            hints: vec!["/tmp/s.md:5 - check firewall settings".to_string()],
+            error: None,
+            error_text: Some("Connection refused".to_string()),
+            rule_id: Some("claude_code.error.network".to_string()),
+        };
+        let json = serde_json::to_string(&lookup).unwrap();
+        let back: OnErrorCassHintsLookup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.query, lookup.query);
+        assert_eq!(back.hints.len(), 1);
+        assert_eq!(back.error_text, lookup.error_text);
+        assert_eq!(back.rule_id, lookup.rule_id);
+    }
+
+    #[test]
+    fn on_error_cass_audit_decision_context_preserves_fields() {
+        let lookup = OnErrorCassHintsLookup {
+            query: Some("timeout error".to_string()),
+            query_candidates: vec!["timeout error".to_string()],
+            workspace: Some("/data/project".to_string()),
+            hints: vec!["fix: increase timeout to 60s".to_string()],
+            error: None,
+            error_text: Some("Request timed out after 30s".to_string()),
+            rule_id: Some("claude_code.error.timeout".to_string()),
+        };
+
+        let context_json = build_on_error_cass_audit_decision_context(
+            "exec-err-1",
+            55,
+            "claude_code",
+            "error.timeout",
+            Some("claude_code.error.timeout"),
+            &lookup,
+            "On-error cass search for claude_code: Request timed out after 30s",
+            "hints_found",
+            9999,
+        );
+
+        assert!(context_json.is_some(), "context serialization must succeed");
+        let context = parse_audit_decision_context(context_json);
+        let evidence = evidence_map(&context);
+
+        assert_eq!(context.timestamp_ms, 9999);
+        assert_eq!(
+            evidence.get("workflow_name").map(String::as_str),
+            Some("handle_on_error_cass_search")
+        );
+        assert_eq!(
+            evidence.get("agent_type").map(String::as_str),
+            Some("claude_code")
+        );
+        assert_eq!(
+            evidence.get("event_type").map(String::as_str),
+            Some("error.timeout")
+        );
+        assert_eq!(
+            evidence.get("error_text").map(String::as_str),
+            Some("Request timed out after 30s")
+        );
+        assert_eq!(
+            evidence.get("cass_hint_0").map(String::as_str),
+            Some("fix: increase timeout to 60s")
+        );
+    }
+
+    #[test]
+    fn handle_on_error_cass_search_with_cooldown() {
+        let workflow = HandleOnErrorCassSearch::with_cooldown_ms(5000);
+        assert_eq!(workflow.cooldown_ms, 5000);
+        assert_eq!(workflow.name(), "handle_on_error_cass_search");
+    }
+
+    #[test]
+    fn handle_on_error_cass_search_default() {
+        let workflow = HandleOnErrorCassSearch::default();
+        assert_eq!(workflow.cooldown_ms, ON_ERROR_CASS_COOLDOWN_MS);
     }
 }
