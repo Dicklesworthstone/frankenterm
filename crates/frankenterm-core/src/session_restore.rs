@@ -200,12 +200,19 @@ pub fn load_latest_checkpoint(
 ) -> Result<Option<CheckpointData>, RestoreError> {
     let conn = open_conn(db_path)?;
 
-    // Get latest checkpoint
+    // Prefer the latest checkpoint that still has pane state rows.
+    // Restore-created "startup" checkpoints only record pane ID mappings,
+    // so they should not shadow the last usable capture checkpoint.
     let checkpoint_id = conn.query_row(
-        "SELECT id
-         FROM session_checkpoints
-         WHERE session_id = ?1
-         ORDER BY checkpoint_at DESC
+        "SELECT c.id
+         FROM session_checkpoints c
+         WHERE c.session_id = ?1
+         ORDER BY EXISTS(
+             SELECT 1
+             FROM mux_pane_state ps
+             WHERE ps.checkpoint_id = c.id
+         ) DESC,
+         c.checkpoint_at DESC
          LIMIT 1",
         [session_id],
         |row| row.get::<_, i64>(0),
@@ -616,8 +623,8 @@ impl SessionRestorer {
 
     /// Detect unclean sessions that can be restored.
     ///
-    /// Returns the best candidate (most recent checkpoint) or `None` if
-    /// all sessions shut down cleanly.
+    /// Returns the best candidate with the most recent restorable checkpoint,
+    /// or `None` if no unclean session has usable pane-state data.
     pub fn detect(&self) -> Result<Option<SessionCandidate>, RestoreError> {
         let candidates = find_unclean_sessions(&self.db_path)?;
 
@@ -631,15 +638,58 @@ impl SessionRestorer {
             "Detected unclean session(s) from previous run"
         );
 
-        // Pick the most recent (already sorted by last_checkpoint_at DESC).
-        // Safe: we checked `!candidates.is_empty()` above.
-        let Some(best) = candidates.into_iter().next() else {
+        let mut best: Option<(SessionCandidate, u64)> = None;
+        let mut first_error: Option<RestoreError> = None;
+
+        for candidate in candidates {
+            match load_latest_checkpoint(&self.db_path, &candidate.session_id) {
+                Ok(Some(checkpoint)) if !checkpoint.pane_states.is_empty() => {
+                    let checkpoint_at = checkpoint.checkpoint_at;
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, best_checkpoint_at)| checkpoint_at > *best_checkpoint_at)
+                    {
+                        best = Some((candidate, checkpoint_at));
+                    }
+                }
+                Ok(Some(checkpoint)) => {
+                    warn!(
+                        session_id = %candidate.session_id,
+                        checkpoint_id = checkpoint.checkpoint_id,
+                        checkpoint_at = checkpoint.checkpoint_at,
+                        "Skipping unclean session with empty checkpoint data"
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        session_id = %candidate.session_id,
+                        "Skipping unclean session with no checkpoints"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %candidate.session_id,
+                        error = %error,
+                        "Skipping unclean session with unreadable checkpoint data"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        let Some((best, checkpoint_at)) = best else {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            debug!("No restorable unclean sessions found");
             return Ok(None);
         };
 
         info!(
             session_id = %best.session_id,
-            last_checkpoint = ?best.last_checkpoint_at,
+            checkpoint_at,
             ft_version = %best.ft_version,
             "Best restore candidate identified"
         );
@@ -764,23 +814,40 @@ impl SessionRestorer {
             }
         }
 
-        // 5. Mark old session as restored
-        if let Err(e) = mark_session_restored(&self.db_path, &session.session_id) {
+        // 5. Mark the source session clean only after a full restore.
+        if layout_result.failed_panes.is_empty() {
+            if let Err(e) = mark_session_restored(&self.db_path, &session.session_id) {
+                warn!(
+                    session_id = %session.session_id,
+                    error = %e,
+                    "Failed to mark session as restored"
+                );
+            }
+        } else {
             warn!(
                 session_id = %session.session_id,
-                error = %e,
-                "Failed to mark session as restored"
+                restored_panes = layout_result.pane_id_map.len(),
+                failed_panes = layout_result.failed_panes.len(),
+                "Session restore incomplete; leaving source session unclean for retry"
             );
         }
 
         let elapsed = start.elapsed().as_millis() as u64;
+        let failed_panes = layout_result.failed_panes.len();
+        let restore_status = if failed_panes == 0 {
+            "complete"
+        } else {
+            "partial"
+        };
 
         info!(
             session_id = %session.session_id,
             restored = layout_result.pane_id_map.len(),
+            failed = failed_panes,
             total = total_panes,
+            status = restore_status,
             elapsed_ms = elapsed,
-            "Session restore complete"
+            "Session restore finished"
         );
 
         Ok(RestoreSummary {
@@ -847,9 +914,15 @@ impl SessionRestorer {
 /// Format a restore summary for human display.
 pub fn format_restore_summary(summary: &RestoreSummary) -> String {
     let mut out = String::new();
+    let status = if summary.layout_result.failed_panes.is_empty() {
+        "restored"
+    } else {
+        "partially restored"
+    };
     out.push_str(&format!(
-        "Session {} restored: {}/{} panes in {}ms\n",
+        "Session {} {}: {}/{} panes in {}ms\n",
         summary.session_id,
+        status,
         summary.restored_count(),
         summary.total_count(),
         summary.elapsed_ms,
@@ -871,9 +944,144 @@ pub fn format_restore_summary(summary: &RestoreSummary) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::session_pane_state::AgentMetadata;
+    use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
+    use crate::wezterm::{
+        MockWezterm, MoveDirection, SplitDirection, WeztermFuture, WeztermInterface,
+    };
     use rusqlite::params;
+
+    fn run_async_test<F, T>(future: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build session_restore test runtime");
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    struct SplitFailOnceWezterm {
+        inner: MockWezterm,
+        split_calls: AtomicUsize,
+    }
+
+    impl SplitFailOnceWezterm {
+        fn new() -> Self {
+            Self {
+                inner: MockWezterm::new(),
+                split_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl WeztermInterface for SplitFailOnceWezterm {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            self.inner.list_panes()
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            self.inner.get_pane(pane_id)
+        }
+
+        fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+            self.inner.get_text(pane_id, escapes)
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text(pane_id, text)
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text_no_paste(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            no_paste: bool,
+            no_newline: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.inner
+                .send_text_with_options(pane_id, text, no_paste, no_newline)
+        }
+
+        fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+            self.inner.spawn(cwd, domain_name)
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            direction: SplitDirection,
+            cwd: Option<&str>,
+            percent: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            if self.split_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async {
+                    Err(crate::Error::Runtime("simulated split failure".to_string()))
+                });
+            }
+
+            self.inner.split_pane(pane_id, direction, cwd, percent)
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            self.inner.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+            self.inner.zoom_pane(pane_id, zoom)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.inner.circuit_status()
+        }
+    }
 
     fn setup_test_db() -> (String, Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1051,6 +1259,55 @@ mod tests {
     }
 
     #[test]
+    fn load_latest_checkpoint_prefers_usable_capture_over_newer_startup_checkpoint() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-shadowed", false);
+        let capture_cp = insert_checkpoint(&conn, "sess-shadowed", 1000, 1);
+        insert_pane_state(&conn, capture_cp, 42, Some("/real"), Some("bash"));
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+            params![
+                "sess-shadowed",
+                2000i64,
+                1i64,
+                r#"{"old_to_new":{"42":99}}"#,
+            ],
+        )
+        .unwrap();
+
+        let data = load_latest_checkpoint(&db_path, "sess-shadowed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.checkpoint_id, capture_cp);
+        assert_eq!(data.checkpoint_at, 1000);
+        assert_eq!(data.pane_states.len(), 1);
+        assert_eq!(data.pane_states[0].pane_id, 42);
+        assert_eq!(data.pane_states[0].cwd.as_deref(), Some("/real"));
+    }
+
+    #[test]
+    fn load_latest_checkpoint_falls_back_to_newest_empty_checkpoint_when_needed() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-empty-only", false);
+        let old_cp = insert_checkpoint(&conn, "sess-empty-only", 1000, 1);
+        let new_cp = insert_checkpoint(&conn, "sess-empty-only", 2000, 2);
+
+        let data = load_latest_checkpoint(&db_path, "sess-empty-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.checkpoint_id, new_cp);
+        assert_eq!(data.checkpoint_at, 2000);
+        assert!(data.pane_states.is_empty());
+
+        // The older empty checkpoint should not be preferred over the newest
+        // one when neither is actually restorable.
+        assert_ne!(data.checkpoint_id, old_cp);
+    }
+
+    #[test]
     fn load_checkpoint_by_id_returns_none_for_missing_checkpoint() {
         let (db_path, _conn, _dir) = setup_test_db();
         let result = load_checkpoint_by_id(&db_path, 999).unwrap();
@@ -1196,11 +1453,180 @@ mod tests {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-clean", true);
         insert_session(&conn, "sess-crash", false);
+        let cp_id = insert_checkpoint(&conn, "sess-crash", 5000, 1);
+        insert_pane_state(&conn, cp_id, 7, Some("/restore"), Some("bash"));
 
         let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
         let result = restorer.detect().unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().session_id, "sess-crash");
+    }
+
+    #[test]
+    fn session_restorer_detect_skips_unclean_sessions_without_checkpoints() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-empty", false);
+        insert_session(&conn, "sess-restorable", false);
+
+        conn.execute(
+            "UPDATE mux_sessions SET created_at = 3000 WHERE session_id = 'sess-empty'",
+            [],
+        )
+        .unwrap();
+
+        let cp_id = insert_checkpoint(&conn, "sess-restorable", 2000, 1);
+        insert_pane_state(&conn, cp_id, 9, Some("/good"), Some("zsh"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 2000 WHERE session_id = 'sess-restorable'",
+            [],
+        )
+        .unwrap();
+
+        let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
+        let result = restorer.detect().unwrap();
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|candidate| candidate.session_id.as_str()),
+            Some("sess-restorable")
+        );
+    }
+
+    #[test]
+    fn session_restorer_detect_prefers_most_recent_usable_checkpoint() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-shadowed", false);
+        insert_session(&conn, "sess-usable", false);
+
+        let shadowed_capture = insert_checkpoint(&conn, "sess-shadowed", 1000, 1);
+        insert_pane_state(&conn, shadowed_capture, 1, Some("/older"), Some("bash"));
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+            params![
+                "sess-shadowed",
+                4000i64,
+                1i64,
+                r#"{"old_to_new":{"1":11}}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 4000 WHERE session_id = 'sess-shadowed'",
+            [],
+        )
+        .unwrap();
+
+        let usable_capture = insert_checkpoint(&conn, "sess-usable", 2500, 1);
+        insert_pane_state(&conn, usable_capture, 2, Some("/newer"), Some("fish"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 2500 WHERE session_id = 'sess-usable'",
+            [],
+        )
+        .unwrap();
+
+        let restorer = SessionRestorer::new(Arc::new(db_path), SessionRestoreConfig::default());
+        let result = restorer.detect().unwrap();
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|candidate| candidate.session_id.as_str()),
+            Some("sess-usable")
+        );
+    }
+
+    #[test]
+    fn session_restorer_restore_partial_failure_leaves_session_unclean_for_retry() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-partial", false);
+
+        let split_topology = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 0,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 0,
+                    title: None,
+                    active_pane_id: Some(1),
+                    pane_tree: PaneNode::HSplit {
+                        children: vec![
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 1,
+                                    rows: 24,
+                                    cols: 80,
+                                    cwd: Some("/left".to_string()),
+                                    title: None,
+                                    is_active: true,
+                                },
+                            ),
+                            (
+                                0.5,
+                                PaneNode::Leaf {
+                                    pane_id: 2,
+                                    rows: 24,
+                                    cols: 80,
+                                    cwd: Some("/right".to_string()),
+                                    title: None,
+                                    is_active: false,
+                                },
+                            ),
+                        ],
+                    },
+                }],
+                active_tab_index: Some(0),
+            }],
+        };
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json = ?2 WHERE session_id = ?1",
+            params![
+                "sess-partial",
+                split_topology.to_json().expect("serialize split topology"),
+            ],
+        )
+        .unwrap();
+
+        let checkpoint_id = insert_checkpoint(&conn, "sess-partial", 5000, 2);
+        insert_pane_state(&conn, checkpoint_id, 1, Some("/left"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 2, Some("/right"), Some("vim"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-partial'",
+            [],
+        )
+        .unwrap();
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+
+        let wezterm = Arc::new(SplitFailOnceWezterm::new());
+        let summary = run_async_test(restorer.restore(&session, &checkpoint, wezterm)).unwrap();
+
+        assert_eq!(summary.restored_count(), 1);
+        assert_eq!(summary.failed_count(), 1);
+
+        let shutdown_clean: bool = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = 'sess-partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !shutdown_clean,
+            "partial restore should leave the session unclean so it can be retried"
+        );
+
+        let retry_candidate = restorer.detect().unwrap().expect("retryable session");
+        assert_eq!(retry_candidate.session_id, "sess-partial");
     }
 
     #[test]
@@ -1287,8 +1713,38 @@ mod tests {
 
         let text = format_restore_summary(&summary);
         assert!(text.contains("sess-fmt"));
+        assert!(text.contains("restored"));
         assert!(text.contains("2/2"));
         assert!(text.contains("42ms"));
+    }
+
+    #[test]
+    fn restore_summary_format_partial_restore() {
+        let mut layout_result = RestoreResult {
+            pane_id_map: HashMap::new(),
+            failed_panes: Vec::new(),
+            windows_created: 1,
+            tabs_created: 1,
+            panes_created: 2,
+        };
+        layout_result.pane_id_map.insert(0, 5);
+        layout_result
+            .failed_panes
+            .push((1, "split failed".to_string()));
+
+        let summary = RestoreSummary {
+            session_id: "sess-partial-fmt".to_string(),
+            checkpoint_id: 1,
+            layout_result,
+            pane_states: vec![],
+            elapsed_ms: 42,
+        };
+
+        let text = format_restore_summary(&summary);
+        assert!(text.contains("sess-partial-fmt"));
+        assert!(text.contains("partially restored"));
+        assert!(text.contains("1/2"));
+        assert!(text.contains("Failed panes:"));
     }
 
     #[test]
