@@ -15,7 +15,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use frankenterm_core::native_events::{NativeEvent, NativeEventListener};
 use frankenterm_core::runtime_compat::mpsc;
 use frankenterm_core::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-use frankenterm_core::runtime_compat::{mpsc_recv_option, task, timeout};
+use frankenterm_core::runtime_compat::{
+    CompatRuntime, Runtime, RuntimeBuilder, mpsc_recv_option, task, timeout,
+};
 
 mod bench_common;
 
@@ -47,11 +49,11 @@ const NATIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKPRESSURE_EVENTS_PER_BATCH: u64 = 256;
 const BACKPRESSURE_DRAIN_DELAY: Duration = Duration::from_micros(250);
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .expect("create tokio runtime")
+        .expect("create compat runtime")
 }
 
 async fn recv_event_or_panic(event_rx: &mut mpsc::Receiver<NativeEvent>) -> NativeEvent {
@@ -66,32 +68,34 @@ fn bench_native_first_message_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("native_events_latency");
 
     group.bench_function("bench_native_first_message_latency", |b| {
-        b.to_async(&rt).iter(|| async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let socket_path = dir.path().join("native-first.sock");
+        b.iter(|| {
+            rt.block_on(async {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let socket_path = dir.path().join("native-first.sock");
 
-            let listener = NativeEventListener::bind(socket_path.clone())
-                .await
-                .expect("bind native listener");
-            let (event_tx, mut event_rx) = mpsc::channel(32);
-            let shutdown = Arc::new(AtomicBool::new(false));
+                let listener = NativeEventListener::bind(socket_path.clone())
+                    .await
+                    .expect("bind native listener");
+                let (event_tx, mut event_rx) = mpsc::channel(32);
+                let shutdown = Arc::new(AtomicBool::new(false));
 
-            let shutdown_for_task = Arc::clone(&shutdown);
-            let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
+                let shutdown_for_task = Arc::clone(&shutdown);
+                let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
 
-            let mut stream = compat_unix::connect(socket_path)
-                .await
-                .expect("connect to native socket");
-            stream
-                .write_all(format!("{PANE_OUTPUT_LINE}\n").as_bytes())
-                .await
-                .expect("write pane output event");
+                let mut stream = compat_unix::connect(socket_path)
+                    .await
+                    .expect("connect to native socket");
+                stream
+                    .write_all(format!("{PANE_OUTPUT_LINE}\n").as_bytes())
+                    .await
+                    .expect("write pane output event");
 
-            let event = recv_event_or_panic(&mut event_rx).await;
-            black_box(event);
+                let event = recv_event_or_panic(&mut event_rx).await;
+                black_box(event);
 
-            shutdown.store(true, Ordering::SeqCst);
-            let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                shutdown.store(true, Ordering::SeqCst);
+                let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+            });
         });
     });
 
@@ -108,45 +112,50 @@ fn bench_native_batch_throughput(c: &mut Criterion) {
             BenchmarkId::new("bench_native_batch_throughput", events_per_batch),
             &events_per_batch,
             |b, events_per_batch| {
-                b.to_async(&rt).iter(|| async move {
-                    let dir = tempfile::tempdir().expect("tempdir");
-                    let socket_path = dir.path().join("native-batch.sock");
+                let events_per_batch = *events_per_batch;
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let socket_path = dir.path().join("native-batch.sock");
 
-                    let listener = NativeEventListener::bind(socket_path.clone())
-                        .await
-                        .expect("bind native listener");
-                    let (event_tx, mut event_rx) = mpsc::channel(2048);
-                    let shutdown = Arc::new(AtomicBool::new(false));
-
-                    let shutdown_for_task = Arc::clone(&shutdown);
-                    let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
-
-                    let mut stream = compat_unix::connect(socket_path)
-                        .await
-                        .expect("connect to native socket");
-
-                    for i in 0..*events_per_batch {
-                        let line = format!(
-                            r#"{{"type":"pane_output","pane_id":1,"data_b64":"aGVsbG8=","ts":{i}}}"#
-                        );
-                        stream
-                            .write_all(format!("{line}\n").as_bytes())
+                        let listener = NativeEventListener::bind(socket_path.clone())
                             .await
-                            .expect("write pane output event");
-                    }
+                            .expect("bind native listener");
+                        let (event_tx, mut event_rx) = mpsc::channel(2048);
+                        let shutdown = Arc::new(AtomicBool::new(false));
 
-                    for _ in 0..*events_per_batch {
-                        let event = recv_event_or_panic(&mut event_rx).await;
-                        match event {
-                            NativeEvent::PaneOutput { .. } => {}
-                            other => {
-                                panic!("unexpected event while benchmarking throughput: {other:?}")
+                        let shutdown_for_task = Arc::clone(&shutdown);
+                        let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
+
+                        let mut stream = compat_unix::connect(socket_path)
+                            .await
+                            .expect("connect to native socket");
+
+                        for i in 0..events_per_batch {
+                            let line = format!(
+                                r#"{{"type":"pane_output","pane_id":1,"data_b64":"aGVsbG8=","ts":{i}}}"#
+                            );
+                            stream
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .expect("write pane output event");
+                        }
+
+                        for _ in 0..events_per_batch {
+                            let event = recv_event_or_panic(&mut event_rx).await;
+                            match event {
+                                NativeEvent::PaneOutput { .. } => {}
+                                other => {
+                                    panic!(
+                                        "unexpected event while benchmarking throughput: {other:?}"
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    shutdown.store(true, Ordering::SeqCst);
-                    let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                        shutdown.store(true, Ordering::SeqCst);
+                        let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                    });
                 });
             },
         );
@@ -165,37 +174,40 @@ fn bench_native_parse_dispatch_latency(c: &mut Criterion) {
             BenchmarkId::new("bench_native_parse_dispatch_latency", events_per_batch),
             &events_per_batch,
             |b, events_per_batch| {
-                b.to_async(&rt).iter(|| async move {
-                    let dir = tempfile::tempdir().expect("tempdir");
-                    let socket_path = dir.path().join("native-parse.sock");
+                let events_per_batch = *events_per_batch;
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let socket_path = dir.path().join("native-parse.sock");
 
-                    let listener = NativeEventListener::bind(socket_path.clone())
-                        .await
-                        .expect("bind native listener");
-                    let (event_tx, mut event_rx) = mpsc::channel(512);
-                    let shutdown = Arc::new(AtomicBool::new(false));
-
-                    let shutdown_for_task = Arc::clone(&shutdown);
-                    let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
-
-                    let mut stream = compat_unix::connect(socket_path)
-                        .await
-                        .expect("connect to native socket");
-
-                    for i in 0..*events_per_batch {
-                        let line = format!(
-                            r#"{{"type":"pane_output","pane_id":9,"data_b64":"aGVsbG8=","ts":{i}}}"#
-                        );
-                        stream
-                            .write_all(format!("{line}\n").as_bytes())
+                        let listener = NativeEventListener::bind(socket_path.clone())
                             .await
-                            .expect("write pane output event");
-                        let event = recv_event_or_panic(&mut event_rx).await;
-                        black_box(event);
-                    }
+                            .expect("bind native listener");
+                        let (event_tx, mut event_rx) = mpsc::channel(512);
+                        let shutdown = Arc::new(AtomicBool::new(false));
 
-                    shutdown.store(true, Ordering::SeqCst);
-                    let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                        let shutdown_for_task = Arc::clone(&shutdown);
+                        let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
+
+                        let mut stream = compat_unix::connect(socket_path)
+                            .await
+                            .expect("connect to native socket");
+
+                        for i in 0..events_per_batch {
+                            let line = format!(
+                                r#"{{"type":"pane_output","pane_id":9,"data_b64":"aGVsbG8=","ts":{i}}}"#
+                            );
+                            stream
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .expect("write pane output event");
+                            let event = recv_event_or_panic(&mut event_rx).await;
+                            black_box(event);
+                        }
+
+                        shutdown.store(true, Ordering::SeqCst);
+                        let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                    });
                 });
             },
         );
@@ -214,55 +226,59 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
             BenchmarkId::new("bench_native_backpressure_impact", channel_capacity),
             &channel_capacity,
             |b, channel_capacity| {
-                b.to_async(&rt).iter(|| async move {
-                    let dir = tempfile::tempdir().expect("tempdir");
-                    let socket_path = dir.path().join("native-backpressure.sock");
+                let channel_capacity = *channel_capacity;
+                b.iter(|| {
+                    rt.block_on(async move {
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let socket_path = dir.path().join("native-backpressure.sock");
 
-                    let listener = NativeEventListener::bind(socket_path.clone())
-                        .await
-                        .expect("bind native listener");
-                    let (event_tx, mut event_rx) = mpsc::channel(*channel_capacity);
-                    let shutdown = Arc::new(AtomicBool::new(false));
-
-                    let shutdown_for_task = Arc::clone(&shutdown);
-                    let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
-
-                    let consumer = task::spawn(async move {
-                        let mut received = 0_u64;
-                        while let Ok(Some(_event)) = timeout(Duration::from_millis(250), mpsc_recv_option(&mut event_rx))
-                                .await
-                        {
-                            received += 1;
-                            frankenterm_core::runtime_compat::sleep(BACKPRESSURE_DRAIN_DELAY)
-                                .await;
-                            if received >= BACKPRESSURE_EVENTS_PER_BATCH {
-                                break;
-                            }
-                        }
-                        received
-                    });
-
-                    let mut stream = compat_unix::connect(socket_path)
-                        .await
-                        .expect("connect to native socket");
-
-                    for i in 0..BACKPRESSURE_EVENTS_PER_BATCH {
-                        let line = format!(
-                            r#"{{"type":"pane_output","pane_id":11,"data_b64":"aGVsbG8=","ts":{i}}}"#
-                        );
-                        stream
-                            .write_all(format!("{line}\n").as_bytes())
+                        let listener = NativeEventListener::bind(socket_path.clone())
                             .await
-                            .expect("write pane output event");
-                    }
+                            .expect("bind native listener");
+                        let (event_tx, mut event_rx) = mpsc::channel(channel_capacity);
+                        let shutdown = Arc::new(AtomicBool::new(false));
 
-                    shutdown.store(true, Ordering::SeqCst);
-                    let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
-                    let drained_events = match timeout(NATIVE_EVENT_TIMEOUT, consumer).await {
-                        Ok(Ok(count)) => count,
-                        _ => 0,
-                    };
-                    black_box(drained_events);
+                        let shutdown_for_task = Arc::clone(&shutdown);
+                        let listener_task = task::spawn(listener.run(event_tx, shutdown_for_task));
+
+                        let consumer = task::spawn(async move {
+                            let mut received = 0_u64;
+                            while let Ok(Some(_event)) =
+                                timeout(Duration::from_millis(250), mpsc_recv_option(&mut event_rx))
+                                    .await
+                            {
+                                received += 1;
+                                frankenterm_core::runtime_compat::sleep(BACKPRESSURE_DRAIN_DELAY)
+                                    .await;
+                                if received >= BACKPRESSURE_EVENTS_PER_BATCH {
+                                    break;
+                                }
+                            }
+                            received
+                        });
+
+                        let mut stream = compat_unix::connect(socket_path)
+                            .await
+                            .expect("connect to native socket");
+
+                        for i in 0..BACKPRESSURE_EVENTS_PER_BATCH {
+                            let line = format!(
+                                r#"{{"type":"pane_output","pane_id":11,"data_b64":"aGVsbG8=","ts":{i}}}"#
+                            );
+                            stream
+                                .write_all(format!("{line}\n").as_bytes())
+                                .await
+                                .expect("write pane output event");
+                        }
+
+                        shutdown.store(true, Ordering::SeqCst);
+                        let _ = timeout(NATIVE_EVENT_TIMEOUT, listener_task).await;
+                        let drained_events = match timeout(NATIVE_EVENT_TIMEOUT, consumer).await {
+                            Ok(Ok(count)) => count,
+                            _ => 0,
+                        };
+                        black_box(drained_events);
+                    });
                 });
             },
         );

@@ -9,6 +9,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::pool::{Pool, PoolConfig};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use std::time::Duration;
 
 mod bench_common;
@@ -41,11 +42,11 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 #[allow(dead_code)]
 struct DummyConn(u64);
 
-fn make_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn make_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("create compat runtime")
 }
 
 fn bench_pool_construct(c: &mut Criterion) {
@@ -86,14 +87,16 @@ fn bench_acquire_return(c: &mut Criterion) {
             BenchmarkId::from_parameter(max_size),
             &config,
             |b, config| {
-                b.to_async(&rt).iter(|| async {
-                    let pool = Pool::<DummyConn>::new(config.clone());
-                    let result = pool.acquire().await.unwrap();
-                    // Decompose via public API
-                    let (conn, _guard) = result.into_parts();
-                    let conn = conn.unwrap_or(DummyConn(42));
-                    // Return connection to pool
-                    pool.put(conn).await;
+                b.iter(|| {
+                    rt.block_on(async {
+                        let pool = Pool::<DummyConn>::new(config.clone());
+                        let result = pool.acquire().await.unwrap();
+                        // Decompose via public API
+                        let (conn, _guard) = result.into_parts();
+                        let conn = conn.unwrap_or(DummyConn(42));
+                        // Return connection to pool
+                        pool.put(conn).await;
+                    });
                 });
             },
         );
@@ -117,14 +120,16 @@ fn bench_acquire_with_idle(c: &mut Criterion) {
             BenchmarkId::from_parameter(max_size),
             &config,
             |b, config| {
-                b.to_async(&rt).iter(|| async {
-                    let pool = Pool::<DummyConn>::new(config.clone());
-                    // Pre-fill idle queue
-                    pool.put(DummyConn(1)).await;
-                    // Acquire should get the idle connection
-                    let result = pool.acquire().await.unwrap();
-                    assert!(result.has_connection());
-                    let (_conn, _guard) = result.into_parts();
+                b.iter(|| {
+                    rt.block_on(async {
+                        let pool = Pool::<DummyConn>::new(config.clone());
+                        // Pre-fill idle queue
+                        pool.put(DummyConn(1)).await;
+                        // Acquire should get the idle connection
+                        let result = pool.acquire().await.unwrap();
+                        assert!(result.has_connection());
+                        let (_conn, _guard) = result.into_parts();
+                    });
                 });
             },
         );
@@ -144,10 +149,12 @@ fn bench_try_acquire(c: &mut Criterion) {
     };
 
     group.bench_function("available_slot", |b| {
-        b.to_async(&rt).iter(|| async {
-            let pool = Pool::<DummyConn>::new(config.clone());
-            let result = pool.try_acquire().await.unwrap();
-            drop(result);
+        b.iter(|| {
+            rt.block_on(async {
+                let pool = Pool::<DummyConn>::new(config.clone());
+                let result = pool.try_acquire().await.unwrap();
+                drop(result);
+            });
         });
     });
 
@@ -169,9 +176,11 @@ fn bench_pool_stats(c: &mut Criterion) {
             BenchmarkId::from_parameter(max_size),
             &config,
             |b, config| {
-                b.to_async(&rt).iter(|| async {
-                    let pool = Pool::<DummyConn>::new(config.clone());
-                    pool.stats().await
+                b.iter(|| {
+                    rt.block_on(async {
+                        let pool = Pool::<DummyConn>::new(config.clone());
+                        pool.stats().await
+                    })
                 });
             },
         );
@@ -187,20 +196,22 @@ fn bench_idle_eviction(c: &mut Criterion) {
     for &count in &[10, 50, 100] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.to_async(&rt).iter(|| async {
-                let config = PoolConfig {
-                    max_size: count + 10,
-                    // Zero timeout so everything is instantly evictable
-                    idle_timeout: Duration::from_secs(0),
-                    acquire_timeout: Duration::from_secs(5),
-                };
-                let pool = Pool::<DummyConn>::new(config);
-                // Fill idle queue
-                for i in 0..count {
-                    pool.put(DummyConn(i as u64)).await;
-                }
-                // Evict all
-                pool.evict_idle().await
+            b.iter(|| {
+                rt.block_on(async {
+                    let config = PoolConfig {
+                        max_size: count + 10,
+                        // Zero timeout so everything is instantly evictable
+                        idle_timeout: Duration::from_secs(0),
+                        acquire_timeout: Duration::from_secs(5),
+                    };
+                    let pool = Pool::<DummyConn>::new(config);
+                    // Fill idle queue
+                    for i in 0..count {
+                        pool.put(DummyConn(i as u64)).await;
+                    }
+                    // Evict all
+                    pool.evict_idle().await
+                })
             });
         });
     }
@@ -215,17 +226,19 @@ fn bench_pool_clear(c: &mut Criterion) {
     for &count in &[10, 50, 100] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.to_async(&rt).iter(|| async {
-                let config = PoolConfig {
-                    max_size: count + 10,
-                    idle_timeout: Duration::from_secs(300),
-                    acquire_timeout: Duration::from_secs(5),
-                };
-                let pool = Pool::<DummyConn>::new(config);
-                for i in 0..count {
-                    pool.put(DummyConn(i as u64)).await;
-                }
-                pool.clear().await;
+            b.iter(|| {
+                rt.block_on(async {
+                    let config = PoolConfig {
+                        max_size: count + 10,
+                        idle_timeout: Duration::from_secs(300),
+                        acquire_timeout: Duration::from_secs(5),
+                    };
+                    let pool = Pool::<DummyConn>::new(config);
+                    for i in 0..count {
+                        pool.put(DummyConn(i as u64)).await;
+                    }
+                    pool.clear().await;
+                });
             });
         });
     }
