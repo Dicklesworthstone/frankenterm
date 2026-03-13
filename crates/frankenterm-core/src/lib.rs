@@ -435,6 +435,8 @@ pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
 #[cfg(feature = "subprocess-bridge")]
+pub mod tx_execution;
+#[cfg(feature = "subprocess-bridge")]
 pub mod tx_idempotency;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_observability;
