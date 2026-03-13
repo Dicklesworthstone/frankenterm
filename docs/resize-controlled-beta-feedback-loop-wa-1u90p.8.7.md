@@ -73,6 +73,39 @@ All beta feedback must be tagged with exactly one primary category and optional 
 - `session_id` (or anonymized equivalent)
 - `notes_md` (freeform operator note)
 
+## Anomaly and Remediation Taxonomy
+
+The beta evidence package must also maintain an explicit anomaly ledger for every open blocker or regression signal that keeps the rollout in `HOLD` or forces `ROLLBACK`.
+
+### Anomaly Categories
+
+| Code | Category | Definition |
+|---|---|---|
+| `A1` | Sample sufficiency gap | Telemetry/session/feedback volume is below required cohort thresholds |
+| `A2` | Feedback ingestion gap | Checkpoint still relies on fixture/synthetic evidence instead of real-user perception data |
+| `A3` | Perception vs telemetry mismatch | User-reported smoothness issues diverge from the current telemetry picture |
+| `A4` | Regression signal awaiting closure | Repeated `P1`/`P2`/`P4`/`P5` signals remain unresolved |
+| `A5` | Evidence integrity gap | Required joins, owners, remediation state, or evidence links are missing/incomplete |
+
+### Mandatory Metadata per Anomaly
+
+- `anomaly_id` (stable slug or UUID)
+- `category_code` (`A1..A5`)
+- `title`
+- `severity` (`critical`/`high`/`medium`/`low`)
+- `status` (`open`/`investigating`/`mitigated`/`closed`)
+- `blocking_decision` (`GO`/`HOLD`/`ROLLBACK`)
+- `triage_owner`
+- `remediation_owner`
+- `opened_at_utc`
+- `last_updated_at_utc`
+- `summary`
+- `linked_feedback_ids`
+- `linked_artifacts`
+- `close_loop_status`
+- `close_loop_evidence`
+- `tracking_issue_ids`
+
 ## Telemetry-to-Feedback Correlation Contract
 
 Each feedback item must map to a telemetry window and relevant resize metrics.
@@ -117,8 +150,8 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 
 - `evidence/wa-1u90p.8.7/beta_feedback_log.jsonl`
 - `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`
-- `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
-- `evidence/wa-1u90p.8.7/decision_checkpoint_<YYYYMMDD>.md`
+- `evidence/wa-1u90p.8.7/cohort_daily_summary.json` including `anomaly_taxonomy[]` with owners, remediation status, and evidence links
+- `evidence/wa-1u90p.8.7/decision_checkpoint_<YYYYMMDD>.md` mirroring the current open anomalies and close-loop plan
 - `tests/e2e/test_ft_1u90p_8_7.sh`
 - `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
 
@@ -130,6 +163,9 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - e2e evidence guardrail harness revalidated on 2026-03-12 (baseline/negative/recovery)
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
+- Active anomaly ledger:
+  - `sample-sufficiency-gap-2026-03-12` (`A1`, `high`, triage owner `resize-rollout-ops`, remediation owner `beta-program`)
+  - `fixture-only-feedback-source-2026-03-12` (`A2`, `medium`, triage owner `telemetry-correlation`, remediation owner `beta-program`)
 - Evidence:
   - `e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance/`
   - `evidence/wa-1u90p.8.7/beta_feedback_log.jsonl`
@@ -180,6 +216,7 @@ Promotion is allowed only when all are true:
 - Daily:
   - ingest new feedback and classify with taxonomy
   - refresh telemetry correlation artifacts
+  - refresh anomaly owner/remediation state and confirm every open item still has linked evidence
   - publish daily checkpoint status (`GO`/`HOLD`/`ROLLBACK`)
 - Weekly:
   - trend review across tiers/workflows
@@ -209,4 +246,5 @@ tests/e2e/test_ft_1u90p_8_7.sh
 
 1. Controlled beta runs collect statistically useful telemetry and categorized feedback.
 2. Promotion decisions cite both objective SLOs and perception signals.
-3. Findings are documented and feed final release guidance (`ft-1u90p.8.5`, `ft-1u90p.8.6`).
+3. Open anomalies have explicit triage owners, remediation owners, and close-loop evidence.
+4. Findings are documented and feed final release guidance (`ft-1u90p.8.5`, `ft-1u90p.8.6`).
