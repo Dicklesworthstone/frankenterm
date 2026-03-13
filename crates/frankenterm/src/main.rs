@@ -2593,6 +2593,39 @@ enum RobotCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Session checkpoint management (save/list/show/delete/rollback)
+    #[command(visible_aliases = ["ckpt"])]
+    Checkpoint {
+        #[command(subcommand)]
+        command: RobotCheckpointCommands,
+    },
+
+    /// Context-window budget management (status/rotate/history)
+    #[command(visible_aliases = ["ctx"])]
+    Context {
+        #[command(subcommand)]
+        command: RobotContextCommands,
+    },
+
+    /// Dependency-aware work queue operations (claim/release/complete/list/ready/assign)
+    Work {
+        #[command(subcommand)]
+        command: RobotWorkCommands,
+    },
+
+    /// Fleet scaling and rebalancing (status/scale/rebalance/agents)
+    Fleet {
+        #[command(subcommand)]
+        command: RobotFleetCommands,
+    },
+
+    /// Session profile management (list/show/apply/validate)
+    #[command(visible_aliases = ["profiles"])]
+    Profile {
+        #[command(subcommand)]
+        command: RobotProfileCommands,
+    },
 }
 
 /// Robot event triage/annotation subcommands (bd-2gce)
@@ -3125,6 +3158,241 @@ enum RobotTxCommands {
         /// Include full contract payload in response
         #[arg(long)]
         include_contract: bool,
+    },
+}
+
+/// NTM-gap checkpoint subcommands (ft-3681t.4.1)
+#[derive(Subcommand)]
+enum RobotCheckpointCommands {
+    /// Save a checkpoint of the current session state
+    Save {
+        /// Human-readable label for this checkpoint
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Include scrollback content (larger but more complete)
+        #[arg(long)]
+        include_scrollback: bool,
+
+        /// Specific pane IDs to checkpoint (comma-separated; empty = all)
+        #[arg(long, value_delimiter = ',')]
+        pane_ids: Option<Vec<u64>>,
+    },
+    /// List available checkpoints
+    List {
+        /// Maximum number of checkpoints to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+
+        /// Offset for pagination
+        #[arg(long, default_value = "0")]
+        offset: usize,
+    },
+    /// Show details of a specific checkpoint
+    Show {
+        /// Checkpoint ID to show
+        checkpoint_id: String,
+    },
+    /// Delete a checkpoint
+    Delete {
+        /// Checkpoint ID to delete
+        checkpoint_id: String,
+    },
+    /// Rollback to a previous checkpoint
+    Rollback {
+        /// Checkpoint ID to rollback to
+        checkpoint_id: String,
+
+        /// Preview the rollback without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// NTM-gap context subcommands (ft-3681t.4.1)
+#[derive(Subcommand)]
+enum RobotContextCommands {
+    /// Show context budget status for one or all panes
+    Status {
+        /// Specific pane ID (omit for fleet-wide summary)
+        #[arg(long)]
+        pane_id: Option<u64>,
+    },
+    /// Trigger context rotation for a pane
+    Rotate {
+        /// Pane ID to rotate
+        pane_id: u64,
+
+        /// Rotation strategy (agent_default, aggressive, gentle)
+        #[arg(long, default_value = "agent_default")]
+        strategy: String,
+    },
+    /// Get compaction history for a pane
+    History {
+        /// Pane ID
+        pane_id: u64,
+
+        /// Maximum entries to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+}
+
+/// NTM-gap work queue subcommands (ft-3681t.4.1)
+#[derive(Subcommand)]
+enum RobotWorkCommands {
+    /// Claim a work item for an agent
+    Claim {
+        /// Work item ID to claim
+        item_id: String,
+
+        /// Agent slot ID claiming the work
+        #[arg(long)]
+        agent_id: String,
+    },
+    /// Release a claimed work item back to the queue
+    Release {
+        /// Work item ID to release
+        item_id: String,
+
+        /// Reason for release
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Complete a work item
+    Complete {
+        /// Work item ID to complete
+        item_id: String,
+
+        /// Completion summary
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Evidence references (commit hashes, artifact paths)
+        #[arg(long, value_delimiter = ',')]
+        evidence: Option<Vec<String>>,
+    },
+    /// List work items with optional filters
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Filter by assigned agent
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Filter by label
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Maximum items to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show the ready set (items available for claiming)
+    Ready {
+        /// Agent ID for capability-filtered ready set
+        #[arg(long)]
+        agent_id: Option<String>,
+
+        /// Maximum items to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Assign a work item to a specific agent
+    Assign {
+        /// Work item ID
+        item_id: String,
+
+        /// Agent to assign to
+        #[arg(long)]
+        agent_id: String,
+
+        /// Assignment strategy override
+        #[arg(long)]
+        strategy: Option<String>,
+    },
+}
+
+/// NTM-gap fleet subcommands (ft-3681t.4.1)
+#[derive(Subcommand)]
+enum RobotFleetCommands {
+    /// Show fleet status (agents, allocations, health)
+    Status {
+        /// Include per-agent detail (vs summary only)
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Scale agents up or down
+    Scale {
+        /// Target agent program (e.g., "claude_code", "codex")
+        program: String,
+
+        /// Desired count
+        target_count: u32,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Rebalance work across agents
+    Rebalance {
+        /// Rebalance strategy (load_based, capability_based, round_robin)
+        #[arg(long, default_value = "load_based")]
+        strategy: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List agent slots and their assignments
+    Agents {
+        /// Filter by program type
+        #[arg(long)]
+        program: Option<String>,
+
+        /// Filter by state (idle/busy/stalled)
+        #[arg(long)]
+        state: Option<String>,
+    },
+}
+
+/// NTM-gap profile subcommands (ft-3681t.4.1)
+#[derive(Subcommand)]
+enum RobotProfileCommands {
+    /// List available profiles
+    List {
+        /// Filter by role
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Show details of a profile
+    Show {
+        /// Profile name
+        name: String,
+    },
+    /// Apply a profile to spawn or configure panes
+    Apply {
+        /// Profile name to apply
+        name: String,
+
+        /// Number of panes to spawn with this profile
+        #[arg(long, default_value = "1")]
+        count: u32,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate a profile definition
+    Validate {
+        /// Profile name to validate
+        name: String,
     },
 }
 
@@ -8497,6 +8765,33 @@ fn build_robot_context(
     Ok(RobotContext { effective })
 }
 
+/// Build a stub JSON response for an NTM-gap command that has been parsed but
+/// whose handler backend is not yet connected. Returns the parsed command
+/// metadata (family, action, mutation flag, NTM equivalence) so callers can
+/// verify end-to-end CLI→type bridging.
+fn build_ntm_stub_response(
+    cmd: &frankenterm_core::robot_ntm_surface::RobotNtmCommand,
+) -> serde_json::Value {
+    let equivalence = cmd.ntm_equivalence();
+    serde_json::json!({
+        "family": cmd.family_name(),
+        "action": cmd.action_name(),
+        "is_mutation": cmd.is_mutation(),
+        "status": "stub",
+        "message": format!(
+            "NTM command `ft robot {} {}` parsed successfully. Handler implementation pending.",
+            cmd.family_name(),
+            cmd.action_name(),
+        ),
+        "ntm_equivalence": {
+            "ntm_commands": equivalence.ntm_commands,
+            "census_domain": equivalence.census_domain,
+            "classification": equivalence.classification.label(),
+        },
+        "parsed_request": serde_json::to_value(cmd).unwrap_or(serde_json::Value::Null),
+    })
+}
+
 fn build_robot_help() -> RobotHelp {
     RobotHelp {
         commands: vec![
@@ -8619,6 +8914,94 @@ fn build_robot_help() -> RobotHelp {
             RobotCommandInfo {
                 name: "approve",
                 description: "Submit an approval code for a pending action",
+            },
+            RobotCommandInfo {
+                name: "checkpoint save",
+                description: "Save a checkpoint of the current session state (alias: ckpt)",
+            },
+            RobotCommandInfo {
+                name: "checkpoint list",
+                description: "List available checkpoints",
+            },
+            RobotCommandInfo {
+                name: "checkpoint show",
+                description: "Show details of a specific checkpoint",
+            },
+            RobotCommandInfo {
+                name: "checkpoint delete",
+                description: "Delete a checkpoint",
+            },
+            RobotCommandInfo {
+                name: "checkpoint rollback",
+                description: "Rollback to a previous checkpoint",
+            },
+            RobotCommandInfo {
+                name: "context status",
+                description: "Show context budget status for one or all panes (alias: ctx)",
+            },
+            RobotCommandInfo {
+                name: "context rotate",
+                description: "Trigger context rotation for a pane",
+            },
+            RobotCommandInfo {
+                name: "context history",
+                description: "Get compaction history for a pane",
+            },
+            RobotCommandInfo {
+                name: "work claim",
+                description: "Claim a work item for an agent",
+            },
+            RobotCommandInfo {
+                name: "work release",
+                description: "Release a claimed work item back to the queue",
+            },
+            RobotCommandInfo {
+                name: "work complete",
+                description: "Complete a work item",
+            },
+            RobotCommandInfo {
+                name: "work list",
+                description: "List work items with optional filters",
+            },
+            RobotCommandInfo {
+                name: "work ready",
+                description: "Show the ready set (items available for claiming)",
+            },
+            RobotCommandInfo {
+                name: "work assign",
+                description: "Assign a work item to a specific agent",
+            },
+            RobotCommandInfo {
+                name: "fleet status",
+                description: "Show fleet status (agents, allocations, health)",
+            },
+            RobotCommandInfo {
+                name: "fleet scale",
+                description: "Scale agents up or down",
+            },
+            RobotCommandInfo {
+                name: "fleet rebalance",
+                description: "Rebalance work across agents",
+            },
+            RobotCommandInfo {
+                name: "fleet agents",
+                description: "List agent slots and their assignments",
+            },
+            RobotCommandInfo {
+                name: "profile list",
+                description: "List available profiles (alias: profiles)",
+            },
+            RobotCommandInfo {
+                name: "profile show",
+                description: "Show details of a profile",
+            },
+            RobotCommandInfo {
+                name: "profile apply",
+                description: "Apply a profile to spawn or configure panes",
+            },
+            RobotCommandInfo {
+                name: "profile validate",
+                description: "Validate a profile definition",
             },
         ],
         global_flags: vec![
@@ -19490,6 +19873,299 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             let response = RobotResponse::success(payload, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Checkpoint { command } => {
+                            let ntm_cmd = match &command {
+                                RobotCheckpointCommands::Save {
+                                    label,
+                                    include_scrollback,
+                                    pane_ids,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
+                                    frankenterm_core::robot_ntm_surface::CheckpointCommand::Save(
+                                        frankenterm_core::robot_ntm_surface::CheckpointSaveRequest {
+                                            label: label.clone(),
+                                            include_scrollback: *include_scrollback,
+                                            pane_ids: pane_ids.clone().unwrap_or_default(),
+                                        },
+                                    ),
+                                ),
+                                RobotCheckpointCommands::List { limit, offset } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
+                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::List(
+                                            frankenterm_core::robot_ntm_surface::CheckpointListRequest {
+                                                limit: *limit,
+                                                offset: *offset,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotCheckpointCommands::Show { checkpoint_id } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
+                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::Show(
+                                            frankenterm_core::robot_ntm_surface::CheckpointShowRequest {
+                                                checkpoint_id: checkpoint_id.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotCheckpointCommands::Delete { checkpoint_id } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
+                                        frankenterm_core::robot_ntm_surface::CheckpointCommand::Delete(
+                                            frankenterm_core::robot_ntm_surface::CheckpointDeleteRequest {
+                                                checkpoint_id: checkpoint_id.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotCheckpointCommands::Rollback {
+                                    checkpoint_id,
+                                    dry_run,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Checkpoint(
+                                    frankenterm_core::robot_ntm_surface::CheckpointCommand::Rollback(
+                                        frankenterm_core::robot_ntm_surface::CheckpointRollbackRequest {
+                                            checkpoint_id: checkpoint_id.clone(),
+                                            dry_run: *dry_run,
+                                        },
+                                    ),
+                                ),
+                            };
+                            let data = build_ntm_stub_response(&ntm_cmd);
+                            let response = RobotResponse::success(data, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Context { command } => {
+                            let ntm_cmd = match &command {
+                                RobotContextCommands::Status { pane_id } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
+                                        frankenterm_core::robot_ntm_surface::ContextCommand::Status(
+                                            frankenterm_core::robot_ntm_surface::ContextStatusRequest {
+                                                pane_id: *pane_id,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotContextCommands::Rotate { pane_id, strategy } => {
+                                    let strat = match strategy.as_str() {
+                                        "aggressive" => {
+                                            frankenterm_core::robot_ntm_surface::RotationStrategy::Aggressive
+                                        }
+                                        "gentle" => {
+                                            frankenterm_core::robot_ntm_surface::RotationStrategy::Gentle
+                                        }
+                                        _ => {
+                                            frankenterm_core::robot_ntm_surface::RotationStrategy::AgentDefault
+                                        }
+                                    };
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
+                                        frankenterm_core::robot_ntm_surface::ContextCommand::Rotate(
+                                            frankenterm_core::robot_ntm_surface::ContextRotateRequest {
+                                                pane_id: *pane_id,
+                                                strategy: strat,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotContextCommands::History { pane_id, limit } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Context(
+                                        frankenterm_core::robot_ntm_surface::ContextCommand::History(
+                                            frankenterm_core::robot_ntm_surface::ContextHistoryRequest {
+                                                pane_id: *pane_id,
+                                                limit: *limit,
+                                            },
+                                        ),
+                                    )
+                                }
+                            };
+                            let data = build_ntm_stub_response(&ntm_cmd);
+                            let response = RobotResponse::success(data, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Work { command } => {
+                            let ntm_cmd = match &command {
+                                RobotWorkCommands::Claim { item_id, agent_id } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                        frankenterm_core::robot_ntm_surface::WorkCommand::Claim(
+                                            frankenterm_core::robot_ntm_surface::WorkClaimRequest {
+                                                item_id: item_id.clone(),
+                                                agent_id: agent_id.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotWorkCommands::Release { item_id, reason } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                        frankenterm_core::robot_ntm_surface::WorkCommand::Release(
+                                            frankenterm_core::robot_ntm_surface::WorkReleaseRequest {
+                                                item_id: item_id.clone(),
+                                                reason: reason.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotWorkCommands::Complete {
+                                    item_id,
+                                    summary,
+                                    evidence,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                    frankenterm_core::robot_ntm_surface::WorkCommand::Complete(
+                                        frankenterm_core::robot_ntm_surface::WorkCompleteRequest {
+                                            item_id: item_id.clone(),
+                                            summary: summary.clone(),
+                                            evidence: evidence.clone().unwrap_or_default(),
+                                        },
+                                    ),
+                                ),
+                                RobotWorkCommands::List {
+                                    status,
+                                    agent,
+                                    label,
+                                    limit,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                    frankenterm_core::robot_ntm_surface::WorkCommand::List(
+                                        frankenterm_core::robot_ntm_surface::WorkListRequest {
+                                            status_filter: status.clone(),
+                                            agent_filter: agent.clone(),
+                                            label_filter: label.clone(),
+                                            limit: *limit,
+                                        },
+                                    ),
+                                ),
+                                RobotWorkCommands::Ready { agent_id, limit } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                        frankenterm_core::robot_ntm_surface::WorkCommand::Ready(
+                                            frankenterm_core::robot_ntm_surface::WorkReadyRequest {
+                                                agent_id: agent_id.clone(),
+                                                limit: *limit,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotWorkCommands::Assign {
+                                    item_id,
+                                    agent_id,
+                                    strategy,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Work(
+                                    frankenterm_core::robot_ntm_surface::WorkCommand::Assign(
+                                        frankenterm_core::robot_ntm_surface::WorkAssignRequest {
+                                            item_id: item_id.clone(),
+                                            agent_id: agent_id.clone(),
+                                            strategy: strategy.clone(),
+                                        },
+                                    ),
+                                ),
+                            };
+                            let data = build_ntm_stub_response(&ntm_cmd);
+                            let response = RobotResponse::success(data, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Fleet { command } => {
+                            let ntm_cmd = match &command {
+                                RobotFleetCommands::Status { detailed } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
+                                        frankenterm_core::robot_ntm_surface::FleetCommand::Status(
+                                            frankenterm_core::robot_ntm_surface::FleetStatusRequest {
+                                                detailed: *detailed,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotFleetCommands::Scale {
+                                    program,
+                                    target_count,
+                                    dry_run,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
+                                    frankenterm_core::robot_ntm_surface::FleetCommand::Scale(
+                                        frankenterm_core::robot_ntm_surface::FleetScaleRequest {
+                                            program: program.clone(),
+                                            target_count: *target_count,
+                                            dry_run: *dry_run,
+                                        },
+                                    ),
+                                ),
+                                RobotFleetCommands::Rebalance { strategy, dry_run } => {
+                                    let strat = match strategy.as_str() {
+                                        "capability_based" => {
+                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::CapabilityBased
+                                        }
+                                        "round_robin" => {
+                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::RoundRobin
+                                        }
+                                        _ => {
+                                            frankenterm_core::robot_ntm_surface::RebalanceStrategy::LoadBased
+                                        }
+                                    };
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
+                                        frankenterm_core::robot_ntm_surface::FleetCommand::Rebalance(
+                                            frankenterm_core::robot_ntm_surface::FleetRebalanceRequest {
+                                                strategy: strat,
+                                                dry_run: *dry_run,
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotFleetCommands::Agents { program, state } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Fleet(
+                                        frankenterm_core::robot_ntm_surface::FleetCommand::Agents(
+                                            frankenterm_core::robot_ntm_surface::FleetAgentsRequest {
+                                                program_filter: program.clone(),
+                                                state_filter: state.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                            };
+                            let data = build_ntm_stub_response(&ntm_cmd);
+                            let response = RobotResponse::success(data, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Profile { command } => {
+                            let ntm_cmd = match &command {
+                                RobotProfileCommands::List { role, tag } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
+                                        frankenterm_core::robot_ntm_surface::ProfileCommand::List(
+                                            frankenterm_core::robot_ntm_surface::ProfileListRequest {
+                                                role_filter: role.clone(),
+                                                tag_filter: tag.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotProfileCommands::Show { name } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
+                                        frankenterm_core::robot_ntm_surface::ProfileCommand::Show(
+                                            frankenterm_core::robot_ntm_surface::ProfileShowRequest {
+                                                name: name.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                                RobotProfileCommands::Apply {
+                                    name,
+                                    count,
+                                    dry_run,
+                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
+                                    frankenterm_core::robot_ntm_surface::ProfileCommand::Apply(
+                                        frankenterm_core::robot_ntm_surface::ProfileApplyRequest {
+                                            name: name.clone(),
+                                            count: *count,
+                                            env_overrides: std::collections::HashMap::new(),
+                                            dry_run: *dry_run,
+                                        },
+                                    ),
+                                ),
+                                RobotProfileCommands::Validate { name } => {
+                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
+                                        frankenterm_core::robot_ntm_surface::ProfileCommand::Validate(
+                                            frankenterm_core::robot_ntm_surface::ProfileValidateRequest {
+                                                name: name.clone(),
+                                            },
+                                        ),
+                                    )
+                                }
+                            };
+                            let data = build_ntm_stub_response(&ntm_cmd);
+                            let response = RobotResponse::success(data, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {
