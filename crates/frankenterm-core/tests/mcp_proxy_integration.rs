@@ -127,15 +127,24 @@ fn write_discovery_config(
     command: &str,
     args: &[String],
 ) -> PathBuf {
+    write_multi_discovery_config(dir, &[(server_name, command, args.to_vec())])
+}
+
+fn write_multi_discovery_config(dir: &Path, servers: &[(&str, &str, Vec<String>)]) -> PathBuf {
     let config_path = dir.join("mcp-proxy-config.json");
-    let payload = json!({
-        "mcpServers": {
-            server_name: {
-                "command": command,
-                "args": args,
-            }
-        }
-    });
+    let mcp_servers: serde_json::Map<String, serde_json::Value> = servers
+        .iter()
+        .map(|(server_name, command, args)| {
+            (
+                (*server_name).to_string(),
+                json!({
+                    "command": command,
+                    "args": args,
+                }),
+            )
+        })
+        .collect();
+    let payload = json!({ "mcpServers": mcp_servers });
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&payload).expect("serialize discovery config"),
@@ -145,6 +154,10 @@ fn write_discovery_config(
 }
 
 fn make_proxy_config(discovery_path: &Path, server_name: &str) -> Config {
+    make_proxy_config_with_servers(discovery_path, &[server_name])
+}
+
+fn make_proxy_config_with_servers(discovery_path: &Path, server_names: &[&str]) -> Config {
     let mut config = Config::default();
     config.mcp_client.enabled = true;
     config.mcp_client.discovery_enabled = true;
@@ -153,7 +166,10 @@ fn make_proxy_config(discovery_path: &Path, server_name: &str) -> Config {
     config.mcp_client.proxy_enabled = true;
     config.mcp_client.proxy_prefix = "remote".to_string();
     config.mcp_client.proxy_mount_all_discovered = false;
-    config.mcp_client.proxy_servers = vec![server_name.to_string()];
+    config.mcp_client.proxy_servers = server_names
+        .iter()
+        .map(|server_name| (*server_name).to_string())
+        .collect();
     config.mcp_client.proxy_fallback_to_local = true;
     config.mcp_client.proxy_strict = false;
     config
@@ -233,6 +249,45 @@ fn proxy_mounts_remote_tools_with_prefixed_routes() {
     assert!(
         !tool_names.contains("remote/mock/drop_db"),
         "destructive remote tool should be filtered by default"
+    );
+}
+
+#[test]
+fn proxy_does_not_let_failed_server_claim_shared_route_prefix() {
+    init_test_logging();
+    if !python3_available() {
+        eprintln!("Skipping proxy route-prefix regression test: python3 is not available");
+        return;
+    }
+
+    let temp_dir = tempdir().expect("temp dir");
+    let script_path = write_mock_proxy_server_script(temp_dir.path());
+    let discovery_path = write_multi_discovery_config(
+        temp_dir.path(),
+        &[
+            (
+                "GitHub Copilot",
+                "nonexistent_proxy_command_for_ft",
+                Vec::<String>::new(),
+            ),
+            (
+                "GitHub/Copilot",
+                "python3",
+                vec!["-u".to_string(), script_path.display().to_string()],
+            ),
+        ],
+    );
+    let config =
+        make_proxy_config_with_servers(&discovery_path, &["GitHub Copilot", "GitHub/Copilot"]);
+
+    let server = build_server_with_db(&config, None).expect("build proxy-enabled server");
+    let tool_names: BTreeSet<String> = server.tools().into_iter().map(|tool| tool.name).collect();
+
+    eprintln!("Tool names after broken-then-valid shared-prefix servers: {tool_names:?}");
+    assert!(tool_names.contains("wa.state"));
+    assert!(
+        tool_names.contains("remote/github-copilot/echo"),
+        "a failed server must not reserve the shared route prefix and block the later valid server"
     );
 }
 

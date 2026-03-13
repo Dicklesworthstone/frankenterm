@@ -118,24 +118,6 @@ pub(super) fn compose_proxy_tools(
     for server in selected {
         let server_name = server.name.clone();
         let route_prefix = format!("{base_prefix}/{}", sanitize_prefix_segment(&server_name));
-        if !insert_route_prefix(&mut used_route_prefixes, &route_prefix) {
-            let message = format!(
-                "mcp proxy route prefix collision for server '{server_name}': {route_prefix}"
-            );
-            if fail_fast {
-                return Err(crate::error::ConfigError::ValidationError(message).into());
-            }
-            tracing::warn!(
-                target: LOG_TARGET,
-                event = "mcp_proxy_route_prefix_collision",
-                server = %server_name,
-                route_prefix = %route_prefix,
-                fallback_to_local = settings.proxy_fallback_to_local,
-                strict = settings.proxy_strict,
-                "Remote MCP route prefix collision detected; skipping server"
-            );
-            continue;
-        }
         let remote = match FtMcpClient::connect_external(server, settings) {
             Ok(client) => client,
             Err(err) => {
@@ -197,7 +179,7 @@ pub(super) fn compose_proxy_tools(
             continue;
         }
 
-        let mut server_tools = 0usize;
+        let mut mounted_handlers = Vec::new();
         for tool in filtered {
             let external_name = tool.name.clone();
             let exposed_name = format!("{route_prefix}/{}", external_name);
@@ -231,7 +213,43 @@ pub(super) fn compose_proxy_tools(
                     continue;
                 }
             };
+            mounted_handlers.push((exposed_name, handler));
+        }
 
+        if mounted_handlers.is_empty() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "mcp_proxy_no_tools_after_mapping",
+                server = %server_name,
+                route_prefix = %route_prefix,
+                fallback_to_local = settings.proxy_fallback_to_local,
+                strict = settings.proxy_strict,
+                "Remote MCP server had no tools that survived local seam mapping; skipping server"
+            );
+            continue;
+        }
+
+        if !insert_route_prefix(&mut used_route_prefixes, &route_prefix) {
+            let message = format!(
+                "mcp proxy route prefix collision for server '{server_name}': {route_prefix}"
+            );
+            if fail_fast {
+                return Err(crate::error::ConfigError::ValidationError(message).into());
+            }
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "mcp_proxy_route_prefix_collision",
+                server = %server_name,
+                route_prefix = %route_prefix,
+                fallback_to_local = settings.proxy_fallback_to_local,
+                strict = settings.proxy_strict,
+                "Remote MCP route prefix collision detected; skipping server"
+            );
+            continue;
+        }
+
+        let server_tools = mounted_handlers.len();
+        for (exposed_name, handler) in mounted_handlers {
             builder = if let Some(path) = db_path.as_ref() {
                 builder.tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
                     handler,
@@ -241,11 +259,10 @@ pub(super) fn compose_proxy_tools(
             } else {
                 builder.tool(FormatAwareToolHandler::new(handler))
             };
-            server_tools += 1;
-            mounted_tools += 1;
         }
 
         mounted_servers += 1;
+        mounted_tools += server_tools;
         tracing::info!(
             target: LOG_TARGET,
             event = "mcp_proxy_mounted_server",
