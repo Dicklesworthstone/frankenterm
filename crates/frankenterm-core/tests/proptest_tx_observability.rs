@@ -678,3 +678,186 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// Additional serde roundtrip tests for uncovered types
+// =============================================================================
+
+fn arb_to_str() -> impl Strategy<Value = String> {
+    "[a-z]{3,12}".prop_map(String::from)
+}
+
+fn arb_tx_event_kind() -> impl Strategy<Value = TxEventKind> {
+    prop_oneof![
+        Just(TxEventKind::PlanCompiled),
+        Just(TxEventKind::RiskAssessed),
+        Just(TxEventKind::PrepareStarted),
+        Just(TxEventKind::CommitStarted),
+        Just(TxEventKind::StepCommitted),
+        Just(TxEventKind::StepFailed),
+        Just(TxEventKind::CompensationStarted),
+        Just(TxEventKind::BundleExported),
+    ]
+}
+
+fn arb_tx_obs_phase() -> impl Strategy<Value = TxObservabilityPhase> {
+    prop_oneof![
+        Just(TxObservabilityPhase::Plan),
+        Just(TxObservabilityPhase::Prepare),
+        Just(TxObservabilityPhase::Commit),
+        Just(TxObservabilityPhase::Compensate),
+        Just(TxObservabilityPhase::Resume),
+        Just(TxObservabilityPhase::Observability),
+    ]
+}
+
+fn arb_tx_phase() -> impl Strategy<Value = TxPhase> {
+    prop_oneof![
+        Just(TxPhase::Planned),
+        Just(TxPhase::Preparing),
+        Just(TxPhase::Committing),
+        Just(TxPhase::Compensating),
+        Just(TxPhase::Completed),
+        Just(TxPhase::Aborted),
+    ]
+}
+
+fn arb_step_risk() -> impl Strategy<Value = StepRisk> {
+    prop_oneof![
+        Just(StepRisk::Low),
+        Just(StepRisk::Medium),
+        Just(StepRisk::High),
+        Just(StepRisk::Critical),
+    ]
+}
+
+fn arb_bundle_classification() -> impl Strategy<Value = BundleClassification> {
+    prop_oneof![
+        Just(BundleClassification::Internal),
+        Just(BundleClassification::TeamReview),
+        Just(BundleClassification::ExternalAudit),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn to_s01_tx_observability_event_serde(
+        seq in 0u64..1000, kind in arb_tx_event_kind(),
+        phase in arb_tx_obs_phase(), tx_phase in arb_tx_phase(),
+    ) {
+        let event = TxObservabilityEvent {
+            sequence: seq, timestamp_ms: 1_700_000_000_000,
+            kind, reason_code: "tx.test.code".to_string(), phase,
+            execution_id: "exec-1".to_string(), plan_id: "plan-1".to_string(),
+            plan_hash: 42, step_id: "step-1".to_string(),
+            idem_key: "plan-1/step-1/exec".to_string(),
+            tx_phase, chain_hash: "abc".to_string(),
+            agent_id: "agent-0".to_string(), details: HashMap::new(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: TxObservabilityEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.sequence, seq);
+        prop_assert_eq!(&back.plan_id, "plan-1");
+    }
+
+    #[test]
+    fn to_s02_tx_timeline_entry_serde(
+        ts in 1_000_000u64..2_000_000_000_000,
+        kind in arb_tx_event_kind(), phase in arb_tx_obs_phase(),
+    ) {
+        let entry = TxTimelineEntry {
+            timestamp_ms: ts, phase, step_id: "step-1".to_string(),
+            kind, reason_code: "tx.test".to_string(),
+            summary: "test summary".to_string(), agent_id: "a1".to_string(),
+            ordinal: Some(1), record_hash: "hash123".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: TxTimelineEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timestamp_ms, ts);
+        prop_assert_eq!(back.ordinal, Some(1));
+    }
+
+    #[test]
+    fn to_s03_bundle_metadata_serde(
+        generator_name in arb_to_str(), incident in arb_to_str(),
+        cls in arb_bundle_classification(),
+    ) {
+        let meta = BundleMetadata {
+            version: 1, generated_at_ms: 1_700_000_000_000,
+            generator: generator_name.clone(), incident_id: incident.clone(),
+            classification: cls, workspace: "ws-1".to_string(),
+            track: "track-1".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: BundleMetadata = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.generator, &generator_name);
+        prop_assert_eq!(&back.incident_id, &incident);
+    }
+
+    #[test]
+    fn to_s04_ledger_record_summary_serde(
+        ord in 0u64..100, risk in arb_step_risk(), aid in arb_to_str(),
+    ) {
+        let rec = LedgerRecordSummary {
+            ordinal: ord, step_id: "step-0".to_string(),
+            idem_key: "plan/step-0/exec".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            outcome_kind: "success".to_string(),
+            risk, agent_id: aid.clone(),
+            record_hash: "h1".to_string(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: LedgerRecordSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.ordinal, ord);
+        prop_assert_eq!(&back.agent_id, &aid);
+    }
+
+    #[test]
+    fn to_s05_resume_summary_serde(
+        phase in arb_tx_phase(), completed in 0usize..10,
+        failed in 0usize..5, remaining in 0usize..10,
+    ) {
+        let rs = ResumeSummary {
+            execution_id: "exec-1".to_string(),
+            interrupted_phase: phase, completed_count: completed,
+            failed_count: failed, remaining_count: remaining,
+            compensated_count: 0, chain_intact: true,
+            recommendation: "continue_from_checkpoint".to_string(),
+        };
+        let json = serde_json::to_string(&rs).unwrap();
+        let back: ResumeSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.completed_count, completed);
+        prop_assert_eq!(back.failed_count, failed);
+    }
+
+    #[test]
+    fn to_s06_chain_verification_summary_serde(
+        intact in proptest::bool::ANY, total in 0usize..100,
+    ) {
+        let cvs = ChainVerificationSummary {
+            chain_intact: intact, first_break_at: if intact { None } else { Some(5) },
+            missing_ordinals: vec![], total_records: total,
+        };
+        let json = serde_json::to_string(&cvs).unwrap();
+        let back: ChainVerificationSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.chain_intact, intact);
+        prop_assert_eq!(back.total_records, total);
+    }
+
+    #[test]
+    fn to_s07_redaction_metadata_serde(
+        fields in 0usize..50, n_cats in 0usize..5,
+    ) {
+        let cats: Vec<String> = (0..n_cats).map(|i| format!("cat-{i}")).collect();
+        let rm = RedactionMetadata {
+            policy: RedactionPolicy::default(),
+            fields_redacted: fields, categories: cats.clone(),
+        };
+        let json = serde_json::to_string(&rm).unwrap();
+        let back: RedactionMetadata = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.fields_redacted, fields);
+        prop_assert_eq!(back.categories.len(), cats.len());
+    }
+}
