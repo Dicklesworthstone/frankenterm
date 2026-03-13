@@ -567,3 +567,294 @@ fn evidence_summary_serializes() {
     let back: EvidenceSummary = serde_json::from_str(&json).unwrap();
     assert_eq!(back.migration_id, "test");
 }
+
+// =============================================================================
+// Serde roundtrip tests for 19 uncovered types (PinkForge session 16)
+// =============================================================================
+
+
+fn arb_ce_str() -> impl Strategy<Value = String> {
+    "[a-z0-9_]{1,15}"
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn ce_s01_go_no_go_verdict_serde(decision in arb_go_no_go_decision(), rationale in "[a-z ]{5,30}") {
+        let val = GoNoGoVerdict {
+            decision, rationale: rationale.clone(),
+            checklist: GoNoGoChecklist { checks: vec![] },
+            migration_id: "mig-1".to_string(), evaluated_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: GoNoGoVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.rationale, &rationale);
+        prop_assert_eq!(&back.migration_id, "mig-1");
+    }
+
+    #[test]
+    fn ce_s02_prerequisite_gate_serde(key in arb_ce_str(), closed in proptest::bool::ANY) {
+        let mut gate = PrerequisiteGate::new();
+        gate.require(key.clone(), "test prereq");
+        if closed {
+            gate.mark_closed(&key);
+        }
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: PrerequisiteGate = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_count(), 1);
+        if closed {
+            prop_assert!(back.all_closed());
+            prop_assert_eq!(back.closed_count(), 1);
+        } else {
+            prop_assert!(!back.all_closed());
+            prop_assert_eq!(back.closed_count(), 0);
+        }
+    }
+
+    #[test]
+    fn ce_s03_prerequisite_entry_serde(desc in "[a-z ]{5,30}", closed in proptest::bool::ANY) {
+        let entry = PrerequisiteEntry { description: desc.clone(), closed };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: PrerequisiteEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.description, &desc);
+        prop_assert_eq!(back.closed, closed);
+    }
+
+    #[test]
+    fn ce_s04_regression_guard_serde(gid in arb_ce_str(), passed in proptest::bool::ANY) {
+        let guard = RegressionGuard {
+            guard_id: gid.clone(), description: "test guard".to_string(),
+            category: GuardCategory::CompileTime, passed,
+            evidence: "ok".to_string(), command: "cargo test".to_string(),
+        };
+        let json = serde_json::to_string(&guard).unwrap();
+        let back: RegressionGuard = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.guard_id, &gid);
+        prop_assert_eq!(back.passed, passed);
+    }
+
+    #[test]
+    fn ce_s05_persistence_proof_suite_serde(pid in arb_ce_str()) {
+        let suite = PersistenceProofSuite {
+            proofs: vec![PersistenceProof {
+                proof_id: pid.clone(), workflow: "test-wf".to_string(),
+                description: "test proof".to_string(), verified: true,
+                seed: Some(42), state_hash_before: Some("abc".to_string()),
+                state_hash_after: Some("def".to_string()),
+                evidence: "matched".to_string(), command: "ft test".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&suite).unwrap();
+        let back: PersistenceProofSuite = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.proofs.len(), 1);
+        prop_assert_eq!(&back.proofs[0].proof_id, &pid);
+    }
+
+    #[test]
+    fn ce_s06_persistence_proof_serde(pid in arb_ce_str(), verified in proptest::bool::ANY) {
+        let proof = PersistenceProof {
+            proof_id: pid.clone(), workflow: "wf".to_string(),
+            description: "desc".to_string(), verified,
+            seed: None, state_hash_before: None, state_hash_after: None,
+            evidence: "evidence".to_string(), command: "cmd".to_string(),
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        let back: PersistenceProof = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.proof_id, &pid);
+        prop_assert_eq!(back.verified, verified);
+    }
+
+    #[test]
+    fn ce_s07_test_suite_result_serde(name in arb_ce_str(), passed in 0u64..100, failed in 0u64..100) {
+        let result = TestSuiteResult {
+            suite_name: name.clone(), passed, failed, skipped: 0,
+            duration_ms: 5000, seed: Some(42), command: "cargo test".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: TestSuiteResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.suite_name, &name);
+        prop_assert_eq!(back.passed, passed);
+        prop_assert_eq!(back.failed, failed);
+    }
+
+    #[test]
+    fn ce_s08_benchmark_summary_serde(threshold in 0.0f64..1.0) {
+        let summary = BenchmarkSummary {
+            comparisons: vec![BenchmarkComparison {
+                name: "latency".to_string(), metric: "p95".to_string(),
+                before: 10.0, after: 12.0, unit: "ms".to_string(), lower_is_better: true,
+            }],
+            regression_threshold: threshold,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: BenchmarkSummary = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.regression_threshold - threshold).abs() < 1e-10);
+        prop_assert_eq!(back.comparisons.len(), 1);
+    }
+
+    #[test]
+    fn ce_s09_benchmark_comparison_serde(name in arb_ce_str(), before in 0.0f64..1000.0) {
+        let comp = BenchmarkComparison {
+            name: name.clone(), metric: "throughput".to_string(),
+            before, after: before * 1.1, unit: "ops/s".to_string(), lower_is_better: false,
+        };
+        let json = serde_json::to_string(&comp).unwrap();
+        let back: BenchmarkComparison = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert!((back.before - before).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ce_s10_incident_registry_serde(iid in arb_ce_str(), priority in 1u8..5) {
+        let registry = IncidentRegistry {
+            incidents: vec![IncidentRecord {
+                incident_id: iid.clone(), priority, title: "test".to_string(),
+                description: "test incident".to_string(), status: IncidentStatus::Open,
+                root_cause: None, remediation: None,
+                reported_at_ms: 1_700_000_000_000, resolved_at_ms: None,
+                related_beads: vec![],
+            }],
+        };
+        let json = serde_json::to_string(&registry).unwrap();
+        let back: IncidentRegistry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.incidents.len(), 1);
+        prop_assert_eq!(&back.incidents[0].incident_id, &iid);
+        prop_assert_eq!(back.incidents[0].priority, priority);
+    }
+
+    #[test]
+    fn ce_s11_incident_record_serde(iid in arb_ce_str(), status in arb_incident_status()) {
+        let rec = IncidentRecord {
+            incident_id: iid.clone(), priority: 2, title: "test".to_string(),
+            description: "desc".to_string(), status,
+            root_cause: Some("root".to_string()), remediation: Some("fix".to_string()),
+            reported_at_ms: 1_700_000_000_000, resolved_at_ms: Some(1_700_000_060_000),
+            related_beads: vec!["b1".to_string()],
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: IncidentRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.incident_id, &iid);
+    }
+
+    #[test]
+    fn ce_s12_rollback_rehearsal_log_serde(rid in arb_ce_str(), success in proptest::bool::ANY) {
+        let log = RollbackRehearsalLog {
+            rehearsals: vec![RollbackRehearsal {
+                rehearsal_id: rid.clone(), performed_at_ms: 1_700_000_000_000,
+                successful: success, rollback_duration_ms: 5000,
+                data_integrity_preserved: true, notes: "ok".to_string(),
+                command: "ft rollback".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&log).unwrap();
+        let back: RollbackRehearsalLog = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rehearsals.len(), 1);
+        prop_assert_eq!(&back.rehearsals[0].rehearsal_id, &rid);
+        prop_assert_eq!(back.rehearsals[0].successful, success);
+    }
+
+    #[test]
+    fn ce_s13_rollback_rehearsal_serde(rid in arb_ce_str(), dur in 0u64..60_000) {
+        let reh = RollbackRehearsal {
+            rehearsal_id: rid.clone(), performed_at_ms: 1_700_000_000_000,
+            successful: true, rollback_duration_ms: dur,
+            data_integrity_preserved: true, notes: "clean".to_string(),
+            command: "cmd".to_string(),
+        };
+        let json = serde_json::to_string(&reh).unwrap();
+        let back: RollbackRehearsal = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.rehearsal_id, &rid);
+        prop_assert_eq!(back.rollback_duration_ms, dur);
+    }
+
+    #[test]
+    fn ce_s14_soak_outcome_serde(period in arb_ce_str(), conforming in proptest::bool::ANY) {
+        let outcome = SoakOutcome {
+            period_id: period.clone(), start_ms: 1_700_000_000_000,
+            end_ms: 1_700_003_600_000, slo_conforming: conforming,
+            error_rate: 0.001, p95_latency_ms: 42.5,
+            incident_count: 0, rollback_triggered: false,
+            notes: "clean soak".to_string(),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: SoakOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.period_id, &period);
+        prop_assert_eq!(back.slo_conforming, conforming);
+    }
+
+    #[test]
+    fn ce_s15_risk_registry_serde(rid in arb_ce_str(), accepted in proptest::bool::ANY) {
+        let registry = RiskRegistry {
+            risks: vec![RiskRecord {
+                risk_id: rid.clone(), severity: RiskSeverity::Medium,
+                description: "test risk".to_string(), mitigation: Some("mitigate".to_string()),
+                owner: Some("ops".to_string()), follow_up: None,
+                accepted, related_beads: vec!["b1".to_string()],
+            }],
+        };
+        let json = serde_json::to_string(&registry).unwrap();
+        let back: RiskRegistry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.risks.len(), 1);
+        prop_assert_eq!(&back.risks[0].risk_id, &rid);
+        prop_assert_eq!(back.risks[0].accepted, accepted);
+    }
+
+    #[test]
+    fn ce_s16_risk_record_serde(rid in arb_ce_str(), sev in arb_risk_severity()) {
+        let rec = RiskRecord {
+            risk_id: rid.clone(), severity: sev,
+            description: "risk".to_string(), mitigation: None,
+            owner: None, follow_up: None, accepted: false, related_beads: vec![],
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RiskRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.risk_id, &rid);
+    }
+
+    #[test]
+    fn ce_s17_evidence_telemetry_serde(
+        prereqs in 0u64..100, guards in 0u64..100,
+        proofs in 0u64..50, suites in 0u64..50,
+    ) {
+        let tel = EvidenceTelemetry {
+            prerequisite_checks: prereqs, guards_evaluated: guards,
+            persistence_proofs_collected: proofs, test_suites_recorded: suites,
+            benchmarks_recorded: 0, incidents_recorded: 0,
+            rehearsals_recorded: 0, soak_outcomes_recorded: 0,
+            risks_documented: 0, evaluations_performed: 0,
+        };
+        let json = serde_json::to_string(&tel).unwrap();
+        let back: EvidenceTelemetry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.prerequisite_checks, prereqs);
+        prop_assert_eq!(back.guards_evaluated, guards);
+    }
+
+    #[test]
+    fn ce_s18_evidence_package_serde(mid in arb_ce_str(), version in 1u32..10) {
+        let pkg = EvidencePackage {
+            migration_id: mid.clone(), schema_version: version,
+            assembled_at_ms: 1_700_000_000_000,
+            prerequisites: PrerequisiteGate::new(),
+            regression_guards: RegressionGuardSuite { guards: vec![] },
+            persistence_proofs: PersistenceProofSuite { proofs: vec![] },
+            test_gates: TestGateSummary { suites: vec![] },
+            benchmarks: BenchmarkSummary { comparisons: vec![], regression_threshold: 0.1 },
+            incidents: IncidentRegistry { incidents: vec![] },
+            rollback_rehearsals: RollbackRehearsalLog { rehearsals: vec![] },
+            soak_outcomes: vec![],
+            risks: RiskRegistry { risks: vec![] },
+            telemetry: EvidenceTelemetry {
+                prerequisite_checks: 0, guards_evaluated: 0,
+                persistence_proofs_collected: 0, test_suites_recorded: 0,
+                benchmarks_recorded: 0, incidents_recorded: 0,
+                rehearsals_recorded: 0, soak_outcomes_recorded: 0,
+                risks_documented: 0, evaluations_performed: 0,
+            },
+        };
+        let json = serde_json::to_string(&pkg).unwrap();
+        let back: EvidencePackage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.migration_id, &mid);
+        prop_assert_eq!(back.schema_version, version);
+    }
+}
