@@ -4310,6 +4310,7 @@ mod tests {
         mcp_get_text_policy_input, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
     };
+    use crate::mcp_error::MCP_ERR_INVALID_ARGS;
     use crate::plan::{
         MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
         TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep,
