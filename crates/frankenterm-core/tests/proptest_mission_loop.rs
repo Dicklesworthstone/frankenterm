@@ -868,3 +868,401 @@ proptest! {
         );
     }
 }
+
+// ============================================================================
+// Serde roundtrip tests for 26 uncovered data types (PinkForge session 16)
+// ============================================================================
+
+fn arb_ml_str() -> impl Strategy<Value = String> {
+    "[a-z0-9_]{1,15}"
+}
+
+fn arb_operator_override_kind() -> impl Strategy<Value = OperatorOverrideKind> {
+    prop_oneof![
+        (arb_ml_str(), arb_ml_str()).prop_map(|(bead, agent)| {
+            OperatorOverrideKind::Pin { bead_id: bead, target_agent: agent }
+        }),
+        arb_ml_str().prop_map(|b| OperatorOverrideKind::Exclude { bead_id: b }),
+        arb_ml_str().prop_map(|a| OperatorOverrideKind::ExcludeAgent { agent_id: a }),
+        (arb_ml_str(), -100i32..100).prop_map(|(b, d)| {
+            OperatorOverrideKind::Reprioritize { bead_id: b, score_delta: d }
+        }),
+    ]
+}
+
+fn arb_operator_override() -> impl Strategy<Value = OperatorOverride> {
+    (arb_ml_str(), arb_operator_override_kind(), arb_ml_str(), arb_ml_str(), arb_ml_str(), 0i64..2_000_000_000_000)
+        .prop_map(|(id, kind, by, rc, rationale, at)| OperatorOverride {
+            override_id: id, kind, activated_by: by, reason_code: rc,
+            rationale, activated_at_ms: at, expires_at_ms: None, correlation_id: None,
+        })
+}
+
+fn arb_conflict_type() -> impl Strategy<Value = ConflictType> {
+    prop_oneof![
+        Just(ConflictType::FileReservationOverlap),
+        Just(ConflictType::ResourceReservationOverlap),
+        Just(ConflictType::ConcurrentBeadClaim),
+        Just(ConflictType::ActiveClaimCollision),
+    ]
+}
+
+fn arb_conflict_resolution() -> impl Strategy<Value = ConflictResolution> {
+    prop_oneof![
+        (arb_ml_str(), arb_ml_str()).prop_map(|(w, l)| ConflictResolution::AutoResolved {
+            winner_agent: w, loser_agent: l, strategy: DeconflictionStrategy::PriorityWins,
+        }),
+        (0i64..60_000).prop_map(|ms| ConflictResolution::Deferred { retry_after_ms: ms }),
+        Just(ConflictResolution::PendingManualResolution),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // --- Operator override types ---
+
+    #[test]
+    fn ml_s01_operator_override_kind_serde(val in arb_operator_override_kind()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: OperatorOverrideKind = serde_json::from_str(&json).unwrap();
+        // Compare discriminant
+        let check = matches!(
+            (&val, &back),
+            (OperatorOverrideKind::Pin { .. }, OperatorOverrideKind::Pin { .. })
+            | (OperatorOverrideKind::Exclude { .. }, OperatorOverrideKind::Exclude { .. })
+            | (OperatorOverrideKind::ExcludeAgent { .. }, OperatorOverrideKind::ExcludeAgent { .. })
+            | (OperatorOverrideKind::Reprioritize { .. }, OperatorOverrideKind::Reprioritize { .. })
+        );
+        prop_assert!(check);
+    }
+
+    #[test]
+    fn ml_s02_operator_override_serde(val in arb_operator_override()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: OperatorOverride = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.override_id, &val.override_id);
+        prop_assert_eq!(&back.activated_by, &val.activated_by);
+        prop_assert_eq!(back.activated_at_ms, val.activated_at_ms);
+    }
+
+    #[test]
+    fn ml_s03_operator_override_state_serde(val in arb_operator_override()) {
+        let state = OperatorOverrideState {
+            active: vec![val.clone()],
+            history: vec![],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: OperatorOverrideState = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.active.len(), 1);
+        prop_assert_eq!(&back.active[0].override_id, &val.override_id);
+    }
+
+    #[test]
+    fn ml_s04_override_application_summary_serde(expired in 0usize..10) {
+        let summary = OverrideApplicationSummary {
+            excluded_beads: vec!["b1".to_string()],
+            excluded_agents: vec!["a1".to_string()],
+            pinned_assignments: vec![PinnedAssignmentRecord {
+                bead_id: "b2".to_string(), agent_id: "a2".to_string(),
+                override_id: "ov-1".to_string(),
+            }],
+            reprioritized_beads: vec![],
+            expired_overrides: expired,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: OverrideApplicationSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.expired_overrides, expired);
+        prop_assert_eq!(back.excluded_beads.len(), 1);
+    }
+
+    #[test]
+    fn ml_s05_pinned_assignment_record_serde(bead in arb_ml_str(), agent in arb_ml_str()) {
+        let rec = PinnedAssignmentRecord {
+            bead_id: bead.clone(), agent_id: agent.clone(), override_id: "ov-1".to_string(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: PinnedAssignmentRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.bead_id, &bead);
+        prop_assert_eq!(&back.agent_id, &agent);
+    }
+
+    #[test]
+    fn ml_s06_reprioritized_bead_record_serde(bead in arb_ml_str(), delta in -100i32..100) {
+        let rec = ReprioritizedBeadRecord {
+            bead_id: bead.clone(), original_score: 0.5, adjusted_score: 0.5 + delta as f64,
+            delta,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ReprioritizedBeadRecord = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.bead_id, &bead);
+        prop_assert_eq!(back.delta, delta);
+    }
+
+    // --- Conflict detection detail types ---
+
+    #[test]
+    fn ml_s07_assignment_conflict_serde(ct in arb_conflict_type(), cr in arb_conflict_resolution()) {
+        let val = AssignmentConflict {
+            conflict_id: "c-1".to_string(), conflict_type: ct,
+            involved_agents: vec!["a1".to_string(), "a2".to_string()],
+            involved_beads: vec!["b1".to_string()],
+            conflicting_paths: vec!["/src/main.rs".to_string()],
+            detected_at_ms: 1_700_000_000_000, resolution: cr,
+            reason_code: "dup".to_string(), error_code: "ML-100".to_string(),
+        };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: AssignmentConflict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.conflict_id, "c-1");
+        prop_assert_eq!(back.involved_agents.len(), 2);
+    }
+
+    #[test]
+    fn ml_s08_deconfliction_message_serde(recipient in arb_ml_str(), subject in arb_ml_str()) {
+        let msg = DeconflictionMessage {
+            recipient: recipient.clone(), subject: subject.clone(),
+            body: "please release".to_string(), thread_id: "t-1".to_string(),
+            importance: "high".to_string(), conflict_id: "c-1".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: DeconflictionMessage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.recipient, &recipient);
+        prop_assert_eq!(&back.subject, &subject);
+    }
+
+    #[test]
+    fn ml_s09_known_resource_reservation_serde(holder in arb_ml_str(), exclusive in proptest::bool::ANY) {
+        let res = KnownResourceReservation {
+            holder: holder.clone(), resources: vec!["/path".to_string()],
+            exclusive, bead_id: Some("b1".to_string()), expires_at_ms: Some(9999),
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        let back: KnownResourceReservation = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.holder, &holder);
+        prop_assert_eq!(back.exclusive, exclusive);
+    }
+
+    // --- Mission metrics types ---
+
+    #[test]
+    fn ml_s10_mission_metrics_labels_serde(ws in arb_ml_str(), track in arb_ml_str()) {
+        let labels = MissionMetricsLabels { workspace: ws.clone(), track: track.clone() };
+        let json = serde_json::to_string(&labels).unwrap();
+        let back: MissionMetricsLabels = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.workspace, &ws);
+        prop_assert_eq!(&back.track, &track);
+    }
+
+    #[test]
+    fn ml_s11_extraction_summary_serde(total in 0usize..100, ready in 0usize..100) {
+        let es = ExtractionSummary { total_candidates: total, ready_candidates: ready, top_impact_bead: None };
+        let json = serde_json::to_string(&es).unwrap();
+        let back: ExtractionSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_candidates, total);
+        prop_assert_eq!(back.ready_candidates, ready);
+    }
+
+    #[test]
+    fn ml_s12_scorer_summary_serde(scored in 0usize..100, above in 0usize..100) {
+        let ss = ScorerSummary { scored_count: scored, above_threshold_count: above, top_scored_bead: None };
+        let json = serde_json::to_string(&ss).unwrap();
+        let back: ScorerSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.scored_count, scored);
+        prop_assert_eq!(back.above_threshold_count, above);
+    }
+
+    #[test]
+    fn ml_s13_mission_metrics_totals_serde(cycles in 0u64..10000, assignments in 0u64..10000) {
+        let t = MissionMetricsTotals {
+            cycles, assignments, rejections: 0, conflict_rejections: 0,
+            policy_denials: 0, unblocked_transitions: 0, planner_churn_events: 0,
+            assignments_by_agent: HashMap::new(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: MissionMetricsTotals = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cycles, cycles);
+        prop_assert_eq!(back.assignments, assignments);
+    }
+
+    #[test]
+    fn ml_s14_mission_cycle_metrics_sample_serde(
+        cycle_id in 0u64..10000,
+        ts in 0i64..2_000_000_000_000,
+        latency in 0u64..10000,
+    ) {
+        let sample = MissionCycleMetricsSample {
+            cycle_id, timestamp_ms: ts, evaluation_latency_ms: latency,
+            assignments: 5, rejections: 1, conflict_rejections: 0,
+            policy_denials: 0, unblocked_transitions: 2, planner_churn_events: 0,
+            throughput_assignments_per_minute: 10.0, unblock_velocity_per_minute: 4.0,
+            conflict_rate: 0.0, planner_churn_rate: 0.0, policy_deny_rate: 0.0,
+            assignments_by_agent: HashMap::new(),
+            workspace_label: "default".to_string(), track_label: "main".to_string(),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: MissionCycleMetricsSample = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cycle_id, cycle_id);
+        prop_assert_eq!(back.timestamp_ms, ts);
+        prop_assert_eq!(back.evaluation_latency_ms, latency);
+    }
+
+    // --- Operator report types ---
+
+    #[test]
+    fn ml_s15_operator_status_section_serde(cycles in 0u64..10000, total_a in 0u64..10000) {
+        let sec = OperatorStatusSection {
+            cycle_count: cycles, last_evaluation_ms: Some(5000),
+            total_assignments: total_a, total_rejections: 0,
+            pending_trigger_count: 0, phase_label: "running".to_string(),
+        };
+        let json = serde_json::to_string(&sec).unwrap();
+        let back: OperatorStatusSection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cycle_count, cycles);
+        prop_assert_eq!(back.total_assignments, total_a);
+    }
+
+    #[test]
+    fn ml_s16_agent_assignment_row_serde(agent in arb_ml_str(), total in 0u64..100) {
+        let row = AgentAssignmentRow {
+            agent_id: agent.clone(), total_assignments: total,
+            active_beads: 2, active_bead_ids: vec!["b1".to_string(), "b2".to_string()],
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        let back: AgentAssignmentRow = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.agent_id, &agent);
+        prop_assert_eq!(back.total_assignments, total);
+    }
+
+    #[test]
+    fn ml_s17_operator_health_section_serde(overall in arb_ml_str()) {
+        let sec = OperatorHealthSection {
+            throughput_assignments_per_minute: 10.0, unblock_velocity_per_minute: 5.0,
+            conflict_rate: 0.01, planner_churn_rate: 0.0, policy_deny_rate: 0.0,
+            avg_evaluation_latency_ms: 42.5, overall: overall.clone(),
+        };
+        let json = serde_json::to_string(&sec).unwrap();
+        let back: OperatorHealthSection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.overall, &overall);
+        // f64 tolerance
+        prop_assert!((back.avg_evaluation_latency_ms - 42.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ml_s18_operator_conflict_section_serde(detected in 0u64..100, auto_res in 0u64..100) {
+        let sec = OperatorConflictSection {
+            total_detected: detected, total_auto_resolved: auto_res,
+            pending_manual: 0, recent_conflicts: vec![],
+        };
+        let json = serde_json::to_string(&sec).unwrap();
+        let back: OperatorConflictSection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_detected, detected);
+        prop_assert_eq!(back.total_auto_resolved, auto_res);
+    }
+
+    #[test]
+    fn ml_s19_operator_conflict_summary_serde(cid in arb_ml_str()) {
+        let s = OperatorConflictSummary {
+            conflict_id: cid.clone(), conflict_type: "duplicate".to_string(),
+            agents: vec!["a1".to_string()], beads: vec!["b1".to_string()],
+            resolution: "auto".to_string(), reason_code: "dup".to_string(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: OperatorConflictSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.conflict_id, &cid);
+    }
+
+    #[test]
+    fn ml_s20_operator_event_section_serde(retained in 0usize..100, emitted in 0u64..10000) {
+        let sec = OperatorEventSection {
+            retained_events: retained, total_emitted: emitted,
+            by_phase: HashMap::new(), by_kind: HashMap::new(),
+        };
+        let json = serde_json::to_string(&sec).unwrap();
+        let back: OperatorEventSection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.retained_events, retained);
+        prop_assert_eq!(back.total_emitted, emitted);
+    }
+
+    #[test]
+    fn ml_s21_operator_decision_summary_serde(bead in arb_ml_str(), outcome in arb_ml_str()) {
+        let ds = OperatorDecisionSummary {
+            bead_id: bead.clone(), outcome: outcome.clone(),
+            summary: "assigned".to_string(),
+            top_factors: vec![OperatorFactorSummary {
+                dimension: "urgency".to_string(), value: 0.8,
+                polarity: "positive".to_string(), description: "High urgency".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&ds).unwrap();
+        let back: OperatorDecisionSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.bead_id, &bead);
+        prop_assert_eq!(&back.outcome, &outcome);
+        prop_assert_eq!(back.top_factors.len(), 1);
+    }
+
+    #[test]
+    fn ml_s22_operator_factor_summary_serde(dim in arb_ml_str(), polarity in arb_ml_str()) {
+        let fs = OperatorFactorSummary {
+            dimension: dim.clone(), value: 0.75,
+            polarity: polarity.clone(), description: "test factor".to_string(),
+        };
+        let json = serde_json::to_string(&fs).unwrap();
+        let back: OperatorFactorSummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.dimension, &dim);
+        prop_assert_eq!(&back.polarity, &polarity);
+        prop_assert!((back.value - 0.75).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ml_s23_operator_status_report_serde(cycles in 0u64..10000) {
+        let report = OperatorStatusReport {
+            status: OperatorStatusSection {
+                cycle_count: cycles, last_evaluation_ms: None,
+                total_assignments: 0, total_rejections: 0,
+                pending_trigger_count: 0, phase_label: "idle".to_string(),
+            },
+            assignment_table: vec![],
+            health: OperatorHealthSection {
+                throughput_assignments_per_minute: 0.0, unblock_velocity_per_minute: 0.0,
+                conflict_rate: 0.0, planner_churn_rate: 0.0, policy_deny_rate: 0.0,
+                avg_evaluation_latency_ms: 0.0, overall: "healthy".to_string(),
+            },
+            conflicts: OperatorConflictSection {
+                total_detected: 0, total_auto_resolved: 0,
+                pending_manual: 0, recent_conflicts: vec![],
+            },
+            event_summary: OperatorEventSection {
+                retained_events: 0, total_emitted: 0,
+                by_phase: HashMap::new(), by_kind: HashMap::new(),
+            },
+            latest_explanations: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: OperatorStatusReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.status.cycle_count, cycles);
+    }
+
+    // --- MissionDecision (compound type) ---
+
+    #[test]
+    fn ml_s24_mission_decision_serde(cycle_id in 0u64..10000, ts in 0i64..2_000_000_000_000) {
+        let d = MissionDecision {
+            cycle_id, timestamp_ms: ts,
+            trigger: MissionTrigger::CadenceTick,
+            assignment_set: AssignmentSet {
+                assignments: vec![], rejected: vec![],
+                solver_config: SolverConfig::default(),
+            },
+            extraction_summary: ExtractionSummary {
+                total_candidates: 0, ready_candidates: 0, top_impact_bead: None,
+            },
+            scorer_summary: ScorerSummary {
+                scored_count: 0, above_threshold_count: 0, top_scored_bead: None,
+            },
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: MissionDecision = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cycle_id, cycle_id);
+        prop_assert_eq!(back.timestamp_ms, ts);
+    }
+}
