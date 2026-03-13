@@ -5484,6 +5484,101 @@ steps:
         }
     }
 
+    /// Workflow that returns an invalid action plan to exercise early-error cleanup.
+    struct InvalidPlanWorkflow;
+
+    impl Workflow for InvalidPlanWorkflow {
+        fn name(&self) -> &'static str {
+            "invalid_plan"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow with an invalid action plan"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("invalid_plan")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("never_run", "Should never execute")]
+        }
+
+        fn to_action_plan(
+            &self,
+            ctx: &WorkflowContext,
+            execution_id: &str,
+        ) -> Option<crate::plan::ActionPlan> {
+            let pane_id = ctx.pane_id();
+            let invalid_step = crate::plan::StepPlan::new(
+                2,
+                crate::plan::StepAction::SendText {
+                    pane_id,
+                    text: "hello".to_string(),
+                    paste_mode: None,
+                },
+                "Invalid step numbering",
+            );
+
+            Some(
+                crate::plan::ActionPlan::builder(self.description(), "test-workspace")
+                    .add_step(invalid_step)
+                    .metadata(serde_json::json!({
+                        "workflow_name": self.name(),
+                        "execution_id": execution_id,
+                        "pane_id": pane_id,
+                    }))
+                    .created_at(now_ms())
+                    .build(),
+            )
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move { StepResult::abort("Invalid plan workflow should not execute") })
+        }
+    }
+
+    /// Workflow that spends measurable time in a single step so timing logs can be verified.
+    struct SlowStepWorkflow;
+
+    impl Workflow for SlowStepWorkflow {
+        fn name(&self) -> &'static str {
+            "slow_step"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow with a deliberately slow step"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("slow_step")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("slow_step", "Sleep before completing")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => {
+                        sleep(Duration::from_millis(35)).await;
+                        StepResult::done(serde_json::json!({"slept": true}))
+                    }
+                    _ => StepResult::abort("Unexpected step index"),
+                }
+            })
+        }
+    }
+
     /// Workflow that sets prompt capabilities before sending text.
     struct PromptSendWorkflow;
 
@@ -5701,6 +5796,87 @@ steps:
         });
     }
 
+    /// Test: invalid action plans fail the workflow record and release the pane lock.
+    #[test]
+    fn invalid_plan_failure_marks_execution_failed_and_releases_lock() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_invalid_plan_cleanup.db")
+                .to_string_lossy()
+                .to_string();
+
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 430u64;
+
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(InvalidPlanWorkflow));
+
+            let detection = make_test_detection("invalid_plan.trigger");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started(), "Workflow should start");
+
+            let execution_id = start_result.execution_id().unwrap().to_string();
+            assert!(
+                lock_manager.is_locked(pane_id).is_some(),
+                "Lock should be held after starting workflow"
+            );
+
+            let workflow = runner.find_workflow_by_name("invalid_plan").unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, &execution_id, 0)
+                .await;
+
+            match &exec_result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, &execution_id);
+                    assert!(
+                        error.contains("Plan validation failed"),
+                        "Error should mention validation failure: {error}"
+                    );
+                }
+                other => panic!("Expected validation error result, got {other:?}"),
+            }
+
+            assert!(
+                lock_manager.is_locked(pane_id).is_none(),
+                "Lock should be released after validation failure"
+            );
+
+            let record = storage
+                .get_workflow(&execution_id)
+                .await
+                .unwrap()
+                .expect("workflow record should still exist");
+            assert_eq!(record.status, "failed");
+            assert!(
+                record.completed_at.is_some(),
+                "Failure should set completed_at"
+            );
+            assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Plan validation failed")),
+                "Failure reason should be persisted"
+            );
+
+            let incomplete = storage.find_incomplete_workflows().await.unwrap();
+            assert!(
+                !incomplete
+                    .iter()
+                    .any(|workflow| workflow.id == execution_id),
+                "Failed validation should not leave an incomplete workflow behind"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     /// Test: Per-pane lock prevents concurrent workflow execution
     #[test]
     fn per_pane_lock_prevents_concurrent_workflows() {
@@ -5824,6 +6000,58 @@ steps:
             assert_eq!(step_logs[1].result_type, "continue");
             assert_eq!(step_logs[2].result_type, "continue");
             assert_eq!(step_logs[3].result_type, "done");
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: Step timing logs include real execution time rather than near-zero post-hoc stamps.
+    #[test]
+    fn step_logs_capture_elapsed_execution_time() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_step_log_timing.db")
+                .to_string_lossy()
+                .to_string();
+
+            let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 451u64;
+
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(SlowStepWorkflow));
+
+            let detection = make_test_detection("slow_step.log_timing");
+            let start_result = runner.handle_detection(pane_id, &detection, None).await;
+            assert!(start_result.is_started());
+
+            let workflow = runner.find_workflow_by_name("slow_step").unwrap();
+            let execution_id = start_result.execution_id().unwrap();
+            let exec_result = runner
+                .run_workflow(pane_id, workflow, execution_id, 0)
+                .await;
+
+            assert!(
+                exec_result.is_completed(),
+                "Workflow should complete: {exec_result:?}"
+            );
+
+            let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+            assert_eq!(step_logs.len(), 1, "Should have one step log entry");
+
+            let log = &step_logs[0];
+            assert_eq!(log.step_name, "slow_step");
+            assert!(
+                log.duration_ms >= 25,
+                "Duration should reflect the step sleep, got {}ms",
+                log.duration_ms
+            );
+            assert!(
+                log.completed_at - log.started_at >= 25,
+                "Timestamps should span the step execution, got {}ms",
+                log.completed_at - log.started_at
+            );
 
             storage.shutdown().await.unwrap();
         });

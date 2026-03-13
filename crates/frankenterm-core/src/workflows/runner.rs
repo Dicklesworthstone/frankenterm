@@ -449,6 +449,21 @@ impl WorkflowRunner {
                     "Action plan validation failed"
                 );
                 let reason = format!("Plan validation failed: {validation_error}");
+                if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                    tracing::warn!(
+                        execution_id,
+                        error = %e,
+                        "Failed to fail execution after plan validation error"
+                    );
+                }
+                if let Err(e) = self.mark_trigger_event_handled(execution_id, "error").await {
+                    tracing::warn!(
+                        execution_id,
+                        error = %e,
+                        "Failed to mark trigger event as handled after plan validation error"
+                    );
+                }
+                self.lock_manager.release(pane_id, execution_id);
                 record_workflow_terminal_action(
                     &self.storage,
                     &workflow_name,
@@ -483,6 +498,7 @@ impl WorkflowRunner {
             let step_plan = ctx.get_step_plan(current_step).cloned();
             let mut idempotency_skip: Option<(i64, Option<String>)> = None;
             let mut idempotency_abort: Option<String> = None;
+            let step_started_at = now_ms();
 
             if let Some(step_plan) = step_plan.as_ref() {
                 if step_plan.idempotent {
@@ -625,7 +641,6 @@ impl WorkflowRunner {
                     )
                     .ok()
             };
-            let step_started_at = now_ms();
             let step_completed_at = now_ms();
 
             // Persist step log for non-SendText steps
