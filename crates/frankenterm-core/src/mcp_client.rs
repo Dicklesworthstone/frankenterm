@@ -7,12 +7,11 @@
 
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_framework::{
-    FrameworkClient, FrameworkClientBuilder, FrameworkConfigLoader, FrameworkContent,
-    FrameworkMcpError, FrameworkMcpErrorCode, FrameworkServerConfig, FrameworkTool,
+    DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode, OutboundFrameworkClient,
+    OutboundFrameworkError, discover_server_configs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::time::Instant;
 
 const LOG_TARGET: &str = "ft::mcp_client";
@@ -44,19 +43,6 @@ pub struct ExternalServerConfig {
     pub cwd: Option<String>,
     /// Whether the server entry is disabled.
     pub disabled: bool,
-}
-
-impl ExternalServerConfig {
-    fn from_discovered(name: String, cfg: FrameworkServerConfig) -> Self {
-        Self {
-            name,
-            command: cfg.command,
-            args: cfg.args,
-            env: cfg.env,
-            cwd: cfg.cwd,
-            disabled: cfg.disabled,
-        }
-    }
 }
 
 /// Mapped outbound MCP client error.
@@ -110,56 +96,6 @@ pub struct McpClientToolDefinition {
 }
 
 impl McpClientToolDefinition {
-    fn from_framework(tool: FrameworkTool) -> McpClientResult<Self> {
-        Ok(Self {
-            name: tool.name,
-            description: tool.description,
-            input_schema: tool.input_schema,
-            output_schema: tool.output_schema,
-            icon: tool
-                .icon
-                .map(|icon| {
-                    serde_json::to_value(icon)
-                        .map_err(|err| framework_payload_error("remote tool icon", err))
-                })
-                .transpose()?,
-            version: tool.version,
-            tags: tool.tags,
-            annotations: tool
-                .annotations
-                .map(|annotations| {
-                    serde_json::to_value(annotations)
-                        .map_err(|err| framework_payload_error("remote tool annotations", err))
-                })
-                .transpose()?,
-        })
-    }
-
-    pub(crate) fn into_framework(self) -> McpClientResult<FrameworkTool> {
-        Ok(FrameworkTool {
-            name: self.name,
-            description: self.description,
-            input_schema: self.input_schema,
-            output_schema: self.output_schema,
-            icon: self
-                .icon
-                .map(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|err| framework_payload_error("remote tool icon", err))
-                })
-                .transpose()?,
-            version: self.version,
-            tags: self.tags,
-            annotations: self
-                .annotations
-                .map(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|err| framework_payload_error("remote tool annotations", err))
-                })
-                .transpose()?,
-        })
-    }
-
     #[must_use]
     pub fn is_destructive(&self) -> bool {
         self.annotations
@@ -176,14 +112,6 @@ impl McpClientToolDefinition {
 pub struct McpClientContentItem(pub serde_json::Value);
 
 impl McpClientContentItem {
-    fn from_framework(content: FrameworkContent) -> McpClientResult<Self> {
-        roundtrip_framework_payload("remote tool content", content)
-    }
-
-    pub(crate) fn into_framework(self) -> McpClientResult<FrameworkContent> {
-        roundtrip_framework_payload("remote tool content", self)
-    }
-
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         self.0
@@ -197,7 +125,7 @@ impl McpClientContentItem {
 
 /// Outbound MCP client wrapper.
 pub struct FtMcpClient {
-    client: FrameworkClient,
+    client: OutboundFrameworkClient,
     server: ExternalServerConfig,
 }
 
@@ -215,23 +143,8 @@ impl FtMcpClient {
             return Err(server_disabled_error(&server.name));
         }
 
-        let mut builder = FrameworkClientBuilder::new()
-            .client_info("frankenterm-mcp-client", env!("CARGO_PKG_VERSION"))
-            .timeout_ms(settings.timeout_ms)
-            .max_retries(settings.max_retries)
-            .retry_delay_ms(settings.retry_delay_ms);
-
-        if let Some(cwd) = server.cwd.as_ref() {
-            builder = builder.working_dir(cwd);
-        }
-        if !server.env.is_empty() {
-            builder = builder.envs(server.env.clone());
-        }
-
-        let args_ref: Vec<&str> = server.args.iter().map(String::as_str).collect();
         let start = Instant::now();
-        let client = builder
-            .connect_stdio(&server.command, &args_ref)
+        let client = OutboundFrameworkClient::connect_stdio(&server, settings)
             .map_err(|err| map_mcp_error(&server.name, err))?;
 
         tracing::info!(
@@ -264,12 +177,8 @@ impl FtMcpClient {
     /// List tools from the connected server.
     pub fn list_tools(&mut self) -> McpClientResult<Vec<McpClientToolDefinition>> {
         let start = Instant::now();
-        match self.client.list_tools() {
+        match self.client.list_tool_definitions() {
             Ok(tools) => {
-                let tools = tools
-                    .into_iter()
-                    .map(McpClientToolDefinition::from_framework)
-                    .collect::<McpClientResult<Vec<_>>>()?;
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_list_tools",
@@ -281,7 +190,10 @@ impl FtMcpClient {
                 Ok(tools)
             }
             Err(err) => {
-                let mapped = map_mcp_error(&self.server.name, err);
+                let mapped = match err {
+                    OutboundFrameworkError::Transport(err) => map_mcp_error(&self.server.name, err),
+                    OutboundFrameworkError::Mapping(err) => err,
+                };
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_client_list_tools_failed",
@@ -302,12 +214,8 @@ impl FtMcpClient {
         arguments: serde_json::Value,
     ) -> McpClientResult<Vec<McpClientContentItem>> {
         let start = Instant::now();
-        match self.client.call_tool(name, arguments) {
+        match self.client.call_tool_content(name, arguments) {
             Ok(content) => {
-                let content = content
-                    .into_iter()
-                    .map(McpClientContentItem::from_framework)
-                    .collect::<McpClientResult<Vec<_>>>()?;
                 tracing::info!(
                     target: LOG_TARGET,
                     event = "mcp_client_call_tool",
@@ -320,7 +228,10 @@ impl FtMcpClient {
                 Ok(content)
             }
             Err(err) => {
-                let mapped = map_mcp_error(&self.server.name, err);
+                let mapped = match err {
+                    OutboundFrameworkError::Transport(err) => map_mcp_error(&self.server.name, err),
+                    OutboundFrameworkError::Mapping(err) => err,
+                };
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_client_call_tool_failed",
@@ -361,24 +272,10 @@ pub fn discover_servers(config: &Config) -> McpClientResult<Vec<ExternalServerCo
         return Ok(Vec::new());
     }
 
-    let loader = build_loader(settings);
-    let search_paths: Vec<String> = loader
-        .search_paths()
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
-    let merged = loader.load_all();
-
-    let mut discovered: Vec<ExternalServerConfig> = merged
-        .mcp_servers
-        .into_iter()
-        .map(|(name, cfg)| ExternalServerConfig::from_discovered(name, cfg))
-        .collect();
-    discovered.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
+    let DiscoveredFrameworkServers {
+        search_paths,
+        servers: discovered,
+    } = discover_server_configs(settings);
 
     tracing::info!(
         target: LOG_TARGET,
@@ -440,30 +337,6 @@ pub fn select_server(
                 "no enabled outbound MCP servers discovered (check mcp_client discovery paths)",
             )
         })
-}
-
-fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
-    let mut loader = if settings.include_default_paths {
-        FrameworkConfigLoader::new()
-    } else {
-        // include_default_paths=false must avoid any implicit config locations.
-        // At this point discovery_paths is guaranteed non-empty by discover_servers.
-        let mut paths = settings.discovery_paths.iter();
-        let first = paths
-            .next()
-            .expect("discovery_paths must be non-empty when default paths are disabled");
-        let mut loader = FrameworkConfigLoader::from_path(first.clone());
-        for path in paths {
-            loader = loader.with_path(path.clone());
-        }
-        return loader;
-    };
-
-    for path in settings.discovery_paths.iter().rev() {
-        loader = loader.with_priority_path(path.clone());
-    }
-
-    loader
 }
 
 fn client_disabled_error() -> McpClientError {
@@ -529,22 +402,6 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
         | FrameworkMcpErrorCode::PromptNotFound
         | FrameworkMcpErrorCode::Custom(_) => McpClientError::new(ERR_PROTOCOL, base),
     }
-}
-
-fn roundtrip_framework_payload<T, U>(label: &str, payload: T) -> McpClientResult<U>
-where
-    T: Serialize,
-    U: for<'de> Deserialize<'de>,
-{
-    let value = serde_json::to_value(payload).map_err(|err| framework_payload_error(label, err))?;
-    serde_json::from_value(value).map_err(|err| framework_payload_error(label, err))
-}
-
-fn framework_payload_error(label: &str, err: impl Display) -> McpClientError {
-    McpClientError::new(
-        ERR_PROTOCOL,
-        format!("Failed to map {label} across the MCP client seam: {err}"),
-    )
 }
 
 #[cfg(test)]
