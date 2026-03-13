@@ -11,9 +11,12 @@ use std::path::PathBuf;
 use proptest::prelude::*;
 
 use frankenterm_core::workflows::{
-    AuthCassHintsLookup, AuthRecoveryStrategy, DeviceAuthStepOutcome, FallbackNextStepPlan,
-    FallbackReason, ResumeSessionConfig, ResumeSessionOutcome, SessionStartCassHintsLookup,
+    AuthCassHintsLookup, AuthRecoveryStrategy, FallbackNextStepPlan, FallbackReason,
+    OnErrorCassHintsLookup, ResumeSessionConfig, ResumeSessionOutcome,
+    SessionStartCassHintsLookup,
 };
+#[cfg(feature = "browser")]
+use frankenterm_core::workflows::DeviceAuthStepOutcome;
 
 // =============================================================================
 // Strategies
@@ -41,6 +44,31 @@ fn arb_session_start_cass_hints() -> impl Strategy<Value = SessionStartCassHints
                     bead_id,
                     pane_title,
                     pane_cwd,
+                }
+            },
+        )
+}
+
+fn arb_on_error_cass_hints() -> impl Strategy<Value = OnErrorCassHintsLookup> {
+    (
+        prop::option::of("[a-z ]{5,30}"),
+        prop::collection::vec("[a-z ]{5,20}", 0..5),
+        prop::option::of("[a-z/]{5,30}"),
+        prop::collection::vec("[a-z ]{5,30}", 0..5),
+        prop::option::of("[a-z ]{5,30}"),
+        prop::option::of("[a-z ]{5,40}"),
+        prop::option::of("[a-z_.]{5,25}"),
+    )
+        .prop_map(
+            |(query, query_candidates, workspace, hints, error, error_text, rule_id)| {
+                OnErrorCassHintsLookup {
+                    query,
+                    query_candidates,
+                    workspace,
+                    hints,
+                    error,
+                    error_text,
+                    rule_id,
                 }
             },
         )
@@ -76,6 +104,7 @@ fn arb_auth_recovery_strategy() -> impl Strategy<Value = AuthRecoveryStrategy> {
     ]
 }
 
+#[cfg(feature = "browser")]
 fn arb_device_auth_step_outcome() -> impl Strategy<Value = DeviceAuthStepOutcome> {
     prop_oneof![
         (0u64..120_000, "[a-z_]{3,15}").prop_map(|(elapsed_ms, account)| {
@@ -239,14 +268,6 @@ proptest! {
     }
 
     #[test]
-    fn device_auth_step_outcome_serde_roundtrip(val in arb_device_auth_step_outcome()) {
-        let json = serde_json::to_string(&val).unwrap();
-        let back: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
-        let json2 = serde_json::to_string(&back).unwrap();
-        prop_assert_eq!(json, json2);
-    }
-
-    #[test]
     fn resume_session_config_serde_roundtrip(val in arb_resume_session_config()) {
         let json = serde_json::to_string(&val).unwrap();
         let back: ResumeSessionConfig = serde_json::from_str(&json).unwrap();
@@ -336,12 +357,6 @@ proptest! {
     }
 
     #[test]
-    fn device_auth_step_outcome_serializes_with_status_tag(val in arb_device_auth_step_outcome()) {
-        let json = serde_json::to_string(&val).unwrap();
-        prop_assert!(json.contains("\"status\":"));
-    }
-
-    #[test]
     fn resume_session_outcome_serializes_with_status_tag(val in arb_resume_session_outcome()) {
         let json = serde_json::to_string(&val).unwrap();
         prop_assert!(json.contains("\"status\":"));
@@ -362,5 +377,85 @@ proptest! {
         if config.resume_command_template.contains("{session_id}") {
             prop_assert!(result.contains(&session_id));
         }
+    }
+
+    // ========================================================================
+    // OnErrorCassHintsLookup (ft-2l9kn)
+    // ========================================================================
+
+    #[test]
+    fn on_error_cass_hints_lookup_roundtrip(val in arb_on_error_cass_hints()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: OnErrorCassHintsLookup = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.query, val.query);
+        prop_assert_eq!(back.query_candidates.len(), val.query_candidates.len());
+        prop_assert_eq!(back.workspace, val.workspace);
+        prop_assert_eq!(back.hints.len(), val.hints.len());
+        prop_assert_eq!(back.error, val.error);
+        prop_assert_eq!(back.error_text, val.error_text);
+        prop_assert_eq!(back.rule_id, val.rule_id);
+    }
+
+    #[test]
+    fn on_error_cass_hints_lookup_default_is_empty(
+        _dummy in 0..1u8
+    ) {
+        let d = OnErrorCassHintsLookup::default();
+        prop_assert!(d.query.is_none());
+        prop_assert!(d.query_candidates.is_empty());
+        prop_assert!(d.workspace.is_none());
+        prop_assert!(d.hints.is_empty());
+        prop_assert!(d.error.is_none());
+        prop_assert!(d.error_text.is_none());
+        prop_assert!(d.rule_id.is_none());
+    }
+
+    #[test]
+    fn on_error_cass_hints_lookup_with_all_fields_roundtrips(
+        query in "[a-z ]{5,30}",
+        workspace in "[a-z/]{5,30}",
+        error_text in "[a-z ]{5,30}",
+        rule_id in "[a-z_.]{5,25}",
+        hint_count in 0..5usize
+    ) {
+        let hints: Vec<String> = (0..hint_count)
+            .map(|i| format!("/tmp/s.md:{i} - fix hint {i}"))
+            .collect();
+        let lookup = OnErrorCassHintsLookup {
+            query: Some(query.clone()),
+            query_candidates: vec![query.clone(), rule_id.clone()],
+            workspace: Some(workspace),
+            hints,
+            error: None,
+            error_text: Some(error_text),
+            rule_id: Some(rule_id),
+        };
+        let json = serde_json::to_string(&lookup).unwrap();
+        let back: OnErrorCassHintsLookup = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.query.as_deref(), Some(query.as_str()));
+        prop_assert_eq!(back.hints.len(), hint_count);
+    }
+}
+
+// =============================================================================
+// Browser-feature-gated tests (DeviceAuthStepOutcome)
+// =============================================================================
+
+#[cfg(feature = "browser")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn device_auth_step_outcome_serde_roundtrip(val in arb_device_auth_step_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn device_auth_step_outcome_serializes_with_status_tag(val in arb_device_auth_step_outcome()) {
+        let json = serde_json::to_string(&val).unwrap();
+        prop_assert!(json.contains("\"status\":"));
     }
 }
