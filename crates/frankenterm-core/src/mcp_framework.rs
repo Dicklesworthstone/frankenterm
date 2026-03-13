@@ -278,10 +278,19 @@ mod tests {
                     "content": {"type": "array"}
                 }
             })),
-            icon: None,
+            icon: Some(serde_json::json!({
+                "src": "https://example.com/icon.png",
+                "mimeType": "image/png",
+                "sizes": "32x32"
+            })),
             version: Some("1.2.3".to_string()),
             tags: vec!["utility".to_string(), "safe".to_string()],
-            annotations: None,
+            annotations: Some(serde_json::json!({
+                "destructive": true,
+                "idempotent": false,
+                "readOnly": false,
+                "openWorldHint": "accepts arbitrary text"
+            })),
         };
 
         let framework = definition
@@ -292,6 +301,7 @@ mod tests {
             .expect("map tool definition back out of framework type");
 
         assert_eq!(recovered, definition);
+        assert!(recovered.is_destructive());
     }
 
     #[test]

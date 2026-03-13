@@ -1,6 +1,6 @@
 //! Outbound MCP client support (feature: `mcp-client`).
 //!
-//! This module provides a minimal abstraction over `fastmcp` client APIs for:
+//! This module provides a framework-backed outbound MCP client surface for:
 //! - configuration-driven MCP server discovery,
 //! - deterministic server selection,
 //! - outbound tool invocation with mapped errors.
