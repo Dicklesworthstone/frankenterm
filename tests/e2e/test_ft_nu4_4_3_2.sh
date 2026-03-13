@@ -10,8 +10,12 @@ SCENARIO_ID="ft_nu4_4_3_2_wa_agent_streaming"
 CORRELATION_ID="ft-nu4.4.3.2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_summary.json"
-TARGET_DIR="target-rch-ft-nu4-4-3-2-${RUN_ID}"
-REMOTE_TARGET_DIR="/tmp/${TARGET_DIR}"
+REMOTE_SCRATCH_BASENAME="target-rch-ft-nu4-4-3-2-${RUN_ID}"
+# Avoid hard-coding remote scratch under /tmp. Recent bead evidence shows some
+# workers exhaust /tmp while the synced workspace volume still has headroom.
+REMOTE_SCRATCH_ROOT="${RCH_REMOTE_SCRATCH_ROOT:-target/${REMOTE_SCRATCH_BASENAME}}"
+REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-${REMOTE_SCRATCH_ROOT}/tmp}"
+REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-${REMOTE_SCRATCH_ROOT}/cargo-target}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
 
 emit_log() {
@@ -130,6 +134,14 @@ run_rch_guarded() {
     "rch remote execution succeeded"
 }
 
+rch_remote_exec() {
+  local cargo_line="$1"
+  env TMPDIR=/tmp \
+    rch exec -- \
+    env TMPDIR="${REMOTE_TMPDIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+    sh -lc "mkdir -p \"\$TMPDIR\" \"\$CARGO_TARGET_DIR\" && exec ${cargo_line}"
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -138,6 +150,15 @@ emit_log \
   "none" \
   "$(basename "${LOG_FILE}")" \
   "ft-nu4.4.3.2 distributed wa-agent e2e+benchmark validation"
+
+emit_log \
+  "started" \
+  "suite_init" \
+  "remote_scratch_config" \
+  "remote_scratch_paths_selected" \
+  "none" \
+  "$(basename "${LOG_FILE}")" \
+  "remote_scratch_root=${REMOTE_SCRATCH_ROOT}; remote_tmpdir=${REMOTE_TMPDIR}; remote_target_dir=${REMOTE_TARGET_DIR}"
 
 if ! command -v jq >/dev/null 2>&1; then
   fail_now \
@@ -219,10 +240,8 @@ run_rch_guarded \
   "distributed_streaming_e2e_failed" \
   "cargo_test_failed" \
   "${CORE_E2E_LOG}" \
-  env TMPDIR=/tmp \
-    rch exec -- \
-    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo test -p frankenterm-core --features distributed --test distributed_streaming_e2e -- --nocapture
+  rch_remote_exec \
+  'cargo test -p frankenterm-core --features distributed --test distributed_streaming_e2e -- --nocapture'
 
 LISTENER_E2E_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_listener_stream_path.log"
 run_rch_guarded \
@@ -232,10 +251,8 @@ run_rch_guarded \
   "distributed_listener_stream_path_failed" \
   "cargo_test_failed" \
   "${LISTENER_E2E_LOG}" \
-  env TMPDIR=/tmp \
-    rch exec -- \
-    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo test -p frankenterm --features distributed distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query -- --nocapture
+  rch_remote_exec \
+  'cargo test -p frankenterm --features distributed distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query -- --nocapture'
 
 BENCH_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_wa_agent_streaming_bench.log"
 run_rch_guarded \
@@ -245,10 +262,8 @@ run_rch_guarded \
   "wa_agent_streaming_bench_failed" \
   "cargo_bench_failed" \
   "${BENCH_LOG}" \
-  env TMPDIR=/tmp \
-    rch exec -- \
-    env TMPDIR=/tmp CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo bench -p frankenterm-core --features distributed,asupersync-runtime --bench wa_agent_streaming -- --quick
+  rch_remote_exec \
+  'cargo bench -p frankenterm-core --features distributed,asupersync-runtime --bench wa_agent_streaming -- --quick'
 
 emit_log \
   "passed" \
@@ -263,6 +278,9 @@ jq -cn \
   --arg run_id "${RUN_ID}" \
   --arg outcome "passed" \
   --arg correlation_id "${CORRELATION_ID}" \
+  --arg remote_scratch_root "${REMOTE_SCRATCH_ROOT}" \
+  --arg remote_tmpdir "${REMOTE_TMPDIR}" \
+  --arg remote_target_dir "${REMOTE_TARGET_DIR}" \
   --arg core_log "$(basename "${CORE_E2E_LOG}")" \
   --arg listener_log "$(basename "${LISTENER_E2E_LOG}")" \
   --arg bench_log "$(basename "${BENCH_LOG}")" \
@@ -272,6 +290,11 @@ jq -cn \
     run_id: $run_id,
     outcome: $outcome,
     correlation_id: $correlation_id,
+    remote_paths: {
+      scratch_root: $remote_scratch_root,
+      tmpdir: $remote_tmpdir,
+      target_dir: $remote_target_dir
+    },
     artifacts: {
       rch_probe: $rch_probe,
       rch_status: $rch_status,
