@@ -97,6 +97,71 @@ validate_decision_summary() {
   return 0
 }
 
+validate_anomaly_taxonomy() {
+  local summary_path="$1"
+
+  jq -e '
+    .anomaly_taxonomy
+    | type == "array"
+      and length > 0
+      and all(
+        .[];
+        (.anomaly_id | type == "string" and length > 0)
+        and (.category_code | type == "string" and test("^A[1-5]$"))
+        and (.title | type == "string" and length > 0)
+        and (.severity | type == "string" and test("^(critical|high|medium|low)$"))
+        and (.status | type == "string" and test("^(open|investigating|mitigated|closed)$"))
+        and (.blocking_decision | type == "string" and test("^(GO|HOLD|ROLLBACK)$"))
+        and (.triage_owner | type == "string" and length > 0)
+        and (.remediation_owner | type == "string" and length > 0)
+        and (.opened_at_utc | type == "string" and length > 0)
+        and (.last_updated_at_utc | type == "string" and length > 0)
+        and (.summary | type == "string" and length > 0)
+        and (.linked_feedback_ids | type == "array" and length > 0)
+        and (.linked_artifacts | type == "array" and length > 0)
+        and (.close_loop_status | type == "string" and length > 0)
+        and (.close_loop_evidence | type == "array" and length > 0)
+        and (.tracking_issue_ids | type == "array" and index("ft-1u90p.8.7") != null)
+      )
+  ' "${summary_path}" >/dev/null
+}
+
+validate_checkpoint_mirror() {
+  local summary_path="$1"
+  local checkpoint_path="$2"
+  local anomaly_id triage_owner remediation_owner close_loop_status
+
+  [[ -f "${checkpoint_path}" ]] || {
+    echo "missing checkpoint file: ${checkpoint_path}" >&2
+    return 1
+  }
+
+  while IFS=$'\t' read -r anomaly_id triage_owner remediation_owner close_loop_status; do
+    if [[ -z "${anomaly_id}" ]]; then
+      continue
+    fi
+    grep -Fq "${anomaly_id}" "${checkpoint_path}" || {
+      echo "checkpoint missing anomaly id: ${anomaly_id}" >&2
+      return 1
+    }
+    grep -Fq "${triage_owner}" "${checkpoint_path}" || {
+      echo "checkpoint missing triage owner: ${triage_owner}" >&2
+      return 1
+    }
+    grep -Fq "${remediation_owner}" "${checkpoint_path}" || {
+      echo "checkpoint missing remediation owner: ${remediation_owner}" >&2
+      return 1
+    }
+    grep -Fq "${close_loop_status}" "${checkpoint_path}" || {
+      echo "checkpoint missing close-loop status: ${close_loop_status}" >&2
+      return 1
+    }
+  done < <(
+    jq -r '.anomaly_taxonomy[] | [.anomaly_id, .triage_owner, .remediation_owner, .close_loop_status] | @tsv' \
+      "${summary_path}"
+  )
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -131,6 +196,21 @@ for artifact in "${SUMMARY_FILE}" "${FEEDBACK_FILE}" "${CORRELATION_FILE}"; do
     exit 1
   fi
 done
+
+CHECKPOINT_DATE="$(jq -r '.checkpoint_date' "${SUMMARY_FILE}")"
+CHECKPOINT_FILE="${EVIDENCE_DIR}/decision_checkpoint_${CHECKPOINT_DATE//-/}.md"
+
+if [[ ! -f "${CHECKPOINT_FILE}" ]]; then
+  emit_log \
+    "failed" \
+    "suite_init" \
+    "preflight_artifacts" \
+    "missing_checkpoint_artifact" \
+    "artifact_not_found" \
+    "${CHECKPOINT_FILE}" \
+    "Required checkpoint artifact is missing"
+  exit 1
+fi
 
 emit_log \
   "running" \
@@ -235,10 +315,53 @@ emit_log \
   "$(basename "${CORRELATION_FILE}")" \
   "run_id and feedback_id correlation is consistent"
 
+emit_log \
+  "running" \
+  "anomaly_taxonomy" \
+  "owner_remediation_schema" \
+  "none" \
+  "none" \
+  "$(basename "${SUMMARY_FILE}")" \
+  "Validate anomaly owner/remediation schema and checkpoint mirroring"
+
+if ! validate_anomaly_taxonomy "${SUMMARY_FILE}"; then
+  emit_log \
+    "failed" \
+    "anomaly_taxonomy" \
+    "owner_remediation_schema" \
+    "invalid_anomaly_schema" \
+    "anomaly_schema_validation_failed" \
+    "$(basename "${SUMMARY_FILE}")" \
+    "Anomaly taxonomy is missing required owner/status/evidence fields"
+  exit 1
+fi
+
+if ! validate_checkpoint_mirror "${SUMMARY_FILE}" "${CHECKPOINT_FILE}"; then
+  emit_log \
+    "failed" \
+    "anomaly_taxonomy" \
+    "checkpoint_mirror" \
+    "checkpoint_anomaly_mismatch" \
+    "checkpoint_mirror_validation_failed" \
+    "$(basename "${CHECKPOINT_FILE}")" \
+    "Decision checkpoint does not mirror anomaly tracking fields"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "anomaly_taxonomy" \
+  "owner_remediation_schema->checkpoint_mirror" \
+  "anomaly_tracking_valid" \
+  "none" \
+  "$(basename "${CHECKPOINT_FILE}")" \
+  "Anomaly taxonomy includes owners/remediation fields and is mirrored in the checkpoint"
+
 tmp_negative="$(mktemp)"
 tmp_recovery="$(mktemp)"
+tmp_anomaly_negative="$(mktemp)"
 cleanup() {
-  rm -f "${tmp_negative}" "${tmp_recovery}"
+  rm -f "${tmp_negative}" "${tmp_recovery}" "${tmp_anomaly_negative}"
 }
 trap cleanup EXIT
 
@@ -320,10 +443,45 @@ emit_log \
   "$(basename "${tmp_recovery}")" \
   "Recovery path accepted when thresholds are met"
 
+jq \
+  '.anomaly_taxonomy[0].triage_owner = ""
+   | .anomaly_taxonomy[0].linked_artifacts = []' \
+  "${SUMMARY_FILE}" > "${tmp_anomaly_negative}"
+
+emit_log \
+  "running" \
+  "anomaly_negative_guardrail" \
+  "owner_remediation_schema_negative" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_anomaly_negative}")" \
+  "Missing anomaly owner/evidence should be rejected"
+
+if validate_anomaly_taxonomy "${tmp_anomaly_negative}" >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "anomaly_negative_guardrail" \
+    "owner_remediation_schema_negative" \
+    "anomaly_guardrail_not_enforced" \
+    "unexpected_anomaly_schema_pass" \
+    "$(basename "${tmp_anomaly_negative}")" \
+    "Invalid anomaly schema unexpectedly passed"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "anomaly_negative_guardrail" \
+  "owner_remediation_schema_negative" \
+  "anomaly_guardrail_enforced" \
+  "none" \
+  "$(basename "${tmp_anomaly_negative}")" \
+  "Invalid anomaly schema correctly rejected"
+
 emit_log \
   "passed" \
   "suite_complete" \
-  "baseline->consistency->negative_guardrail->recovery_guardrail" \
+  "baseline->consistency->anomaly_schema->negative_guardrail->recovery_guardrail->anomaly_negative_guardrail" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
