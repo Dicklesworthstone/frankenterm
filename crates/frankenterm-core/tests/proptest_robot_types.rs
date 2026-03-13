@@ -1419,3 +1419,1108 @@ proptest! {
         prop_assert_eq!(&back.status, &status);
     }
 }
+
+// ============================================================================
+// Extended coverage: remaining 67 uncovered types (PinkForge session 16)
+// ============================================================================
+
+use frankenterm_core::plan::{
+    ApprovalState, MissionActorRole, MissionLifecycleState, Outcome,
+};
+
+fn arb_short_str2() -> impl Strategy<Value = String> {
+    "[a-z0-9_]{1,15}"
+}
+
+fn arb_mission_lifecycle_state() -> impl Strategy<Value = MissionLifecycleState> {
+    prop_oneof![
+        Just(MissionLifecycleState::Planned),
+        Just(MissionLifecycleState::Planning),
+        Just(MissionLifecycleState::Dispatching),
+        Just(MissionLifecycleState::AwaitingApproval),
+        Just(MissionLifecycleState::Running),
+        Just(MissionLifecycleState::Executing),
+        Just(MissionLifecycleState::RetryPending),
+        Just(MissionLifecycleState::Blocked),
+        Just(MissionLifecycleState::Paused),
+        Just(MissionLifecycleState::Completed),
+        Just(MissionLifecycleState::Cancelled),
+        Just(MissionLifecycleState::Failed),
+    ]
+}
+
+fn arb_mission_actor_role() -> impl Strategy<Value = MissionActorRole> {
+    prop_oneof![
+        Just(MissionActorRole::Planner),
+        Just(MissionActorRole::Dispatcher),
+        Just(MissionActorRole::Operator),
+    ]
+}
+
+fn arb_approval_state() -> impl Strategy<Value = ApprovalState> {
+    prop_oneof![
+        Just(ApprovalState::NotRequired),
+        (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(by, at)| {
+            ApprovalState::Pending { requested_by: by, requested_at_ms: at }
+        }),
+        (arb_short_str2(), 0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(by, at, hash)| {
+            ApprovalState::Approved { approved_by: by, approved_at_ms: at, approval_code_hash: hash }
+        }),
+        (arb_short_str2(), 0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(by, at, reason)| {
+            ApprovalState::Denied { denied_by: by, denied_at_ms: at, reason_code: reason }
+        }),
+        (0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(at, reason)| {
+            ApprovalState::Expired { expired_at_ms: at, reason_code: reason }
+        }),
+    ]
+}
+
+fn arb_outcome() -> impl Strategy<Value = Outcome> {
+    prop_oneof![
+        (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, at)| {
+            Outcome::Success { reason_code: r, completed_at_ms: at }
+        }),
+        (arb_short_str2(), arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, e, at)| {
+            Outcome::Failed { reason_code: r, error_code: e, completed_at_ms: at }
+        }),
+        (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, at)| {
+            Outcome::Cancelled { reason_code: r, completed_at_ms: at }
+        }),
+    ]
+}
+
+fn arb_mission_transition_info() -> impl Strategy<Value = MissionTransitionInfo> {
+    (arb_short_str2(), arb_short_str2()).prop_map(|(kind, to)| MissionTransitionInfo { kind, to })
+}
+
+fn arb_mission_failure_catalog_entry() -> impl Strategy<Value = MissionFailureCatalogEntry> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2())
+        .prop_map(|(rc, ec, term, retry, hh, mh)| MissionFailureCatalogEntry {
+            reason_code: rc, error_code: ec, terminality: term,
+            retryability: retry, human_hint: hh, machine_hint: mh,
+        })
+}
+
+fn arb_mission_assignment_counters() -> impl Strategy<Value = MissionAssignmentCounters> {
+    (0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10)
+        .prop_map(|(pa, ap, dn, ex, su, fa, ca, un)| MissionAssignmentCounters {
+            pending_approval: pa, approved: ap, denied: dn, expired: ex,
+            succeeded: su, failed: fa, cancelled: ca, unresolved: un,
+        })
+}
+
+fn arb_mission_state_filters() -> impl Strategy<Value = MissionStateFilters> {
+    (0usize..100,).prop_map(|(limit,)| MissionStateFilters {
+        mission_state: None, run_state: None, agent_state: None,
+        action_state: None, assignment_id: None, assignee: None, limit,
+    })
+}
+
+fn arb_mission_assignment_data() -> impl Strategy<Value = MissionAssignmentData> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_mission_actor_role(),
+     arb_short_str2(), arb_mission_run_state(), arb_mission_agent_state(),
+     arb_mission_action_state(), arb_approval_state())
+        .prop_map(|(aid, cid, assignee, assigned_by, action_type, run_state, agent_state, action_state, approval_state)| {
+            MissionAssignmentData {
+                assignment_id: aid, candidate_id: cid, assignee, assigned_by,
+                action_type, run_state, agent_state, action_state, approval_state,
+                outcome: None, reason_code: None, error_code: None,
+            }
+        })
+}
+
+fn arb_mission_state_data() -> impl Strategy<Value = MissionStateData> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(),
+     arb_mission_lifecycle_state(), proptest::bool::ANY, 0usize..10, 0usize..10)
+        .prop_map(|(mf, mid, title, hash, ls, matches, cc, ac)| MissionStateData {
+            mission_file: mf, mission_id: mid, title, mission_hash: hash,
+            lifecycle_state: ls, mission_matches_filter: matches,
+            candidate_count: cc, assignment_count: ac,
+            matched_assignment_count: 0, returned_assignment_count: 0,
+            filters: MissionStateFilters {
+                mission_state: None, run_state: None, agent_state: None,
+                action_state: None, assignment_id: None, assignee: None, limit: 100,
+            },
+            assignment_counters: MissionAssignmentCounters::default(),
+            available_transitions: vec![], assignments: vec![],
+        })
+}
+
+fn arb_tx_precondition_data() -> impl Strategy<Value = TxPreconditionData> {
+    (arb_tx_precondition_kind(), arb_short_str2(), proptest::bool::ANY)
+        .prop_map(|(kind, desc, req)| TxPreconditionData { kind, description: desc, required: req })
+}
+
+fn arb_tx_compensating_action_data() -> impl Strategy<Value = TxCompensatingActionData> {
+    (arb_short_str2(), arb_short_str2(), arb_tx_compensation_kind())
+        .prop_map(|(sid, desc, at)| TxCompensatingActionData { step_id: sid, description: desc, action_type: at })
+}
+
+fn arb_tx_risk_summary_data() -> impl Strategy<Value = TxRiskSummaryData> {
+    (0usize..50, 0usize..10, 0usize..5, 0usize..10, arb_tx_step_risk())
+        .prop_map(|(ts, hr, cr, uc, or)| TxRiskSummaryData {
+            total_steps: ts, high_risk_count: hr, critical_risk_count: cr,
+            uncompensated_steps: uc, overall_risk: or,
+        })
+}
+
+fn arb_tx_rejected_edge_data() -> impl Strategy<Value = TxRejectedEdgeData> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2())
+        .prop_map(|(f, t, r)| TxRejectedEdgeData { from_step: f, to_step: t, reason: r })
+}
+
+fn arb_tx_step_data() -> impl Strategy<Value = TxStepData> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_tx_step_risk())
+        .prop_map(|(id, bid, aid, desc, risk)| TxStepData {
+            id, bead_id: bid, agent_id: aid, description: desc,
+            depends_on: vec![], preconditions: vec![], compensations: vec![],
+            risk, score: 0.5,
+        })
+}
+
+fn arb_tx_step_record_data() -> impl Strategy<Value = TxStepRecordData> {
+    (0u64..1000, arb_short_str2(), arb_short_str2(), arb_short_str2(),
+     0u64..2_000_000_000_000, arb_tx_step_outcome(), arb_tx_step_risk(), arb_short_str2(), arb_short_str2())
+        .prop_map(|(ord, sid, idem, eid, ts, outcome, risk, prev, aid)| TxStepRecordData {
+            ordinal: ord, step_id: sid, idem_key: idem, execution_id: eid,
+            timestamp_ms: ts, outcome, risk, prev_hash: prev, agent_id: aid,
+        })
+}
+
+fn arb_tx_chain_verification_data() -> impl Strategy<Value = TxChainVerificationData> {
+    (proptest::bool::ANY, 0usize..100)
+        .prop_map(|(intact, total)| TxChainVerificationData {
+            chain_intact: intact, first_break_at: None, missing_ordinals: vec![], total_records: total,
+        })
+}
+
+fn arb_tx_timeline_entry_data() -> impl Strategy<Value = TxTimelineEntryData> {
+    (0u64..2_000_000_000_000, arb_short_str2(), arb_short_str2(), arb_short_str2(),
+     arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2())
+        .prop_map(|(ts, phase, sid, kind, rc, summary, aid, hash)| TxTimelineEntryData {
+            timestamp_ms: ts, phase, step_id: sid, kind, reason_code: rc,
+            summary, agent_id: aid, ordinal: None, record_hash: hash,
+        })
+}
+
+fn arb_pipeline_watermark_info() -> impl Strategy<Value = PipelineWatermarkInfo> {
+    (0u64..1000, 0i64..2_000_000_000_000, 0u64..100_000)
+        .prop_map(|(pid, last, total)| PipelineWatermarkInfo {
+            pane_id: pid, last_indexed_at_ms: last, total_docs_indexed: total, session_id: None,
+        })
+}
+
+fn arb_rule_item() -> impl Strategy<Value = RuleItem> {
+    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(),
+     0usize..10, proptest::bool::ANY)
+        .prop_map(|(id, at, et, sev, desc, ac, hr)| RuleItem {
+            id, agent_type: at, event_type: et, severity: sev, description: desc,
+            workflow: None, anchor_count: ac, has_regex: hr,
+        })
+}
+
+fn arb_rule_match_item() -> impl Strategy<Value = RuleMatchItem> {
+    (arb_short_str2(), 0usize..1000, 0usize..1000, arb_short_str2())
+        .prop_map(|(rid, s, e, mt)| RuleMatchItem {
+            rule_id: rid, start: s, end: e, matched_text: mt, trace: None,
+        })
+}
+
+fn arb_rule_trace_info() -> impl Strategy<Value = RuleTraceInfo> {
+    (proptest::bool::ANY, proptest::bool::ANY)
+        .prop_map(|(a, r)| RuleTraceInfo { anchors_checked: a, regex_matched: r })
+}
+
+fn arb_workflow_step_log() -> impl Strategy<Value = WorkflowStepLog> {
+    (0usize..100, arb_short_str2(), arb_short_str2(), 0i64..2_000_000_000_000)
+        .prop_map(|(idx, name, rt, started)| WorkflowStepLog {
+            step_index: idx, step_name: name, result_type: rt,
+            step_id: None, step_kind: None, result_data: None, policy_summary: None,
+            verification_refs: None, error_code: None, started_at: started,
+            completed_at: None, duration_ms: None,
+        })
+}
+
+fn arb_workflow_action_plan() -> impl Strategy<Value = WorkflowActionPlan> {
+    (arb_short_str2(), arb_short_str2())
+        .prop_map(|(pid, hash)| WorkflowActionPlan {
+            plan_id: pid, plan_hash: hash, plan: None, created_at: None,
+        })
+}
+
+// ============================================================================
+// Serde roundtrip tests for uncovered types
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // --- Pane / text types ---
+
+    #[test]
+    fn rt67_batch_get_text_data_serde(pane_id in 0u64..1000, lines in 0usize..500) {
+        let data = BatchGetTextData {
+            pane_ids: vec![pane_id],
+            tail_lines: lines,
+            escapes_included: false,
+            results: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: BatchGetTextData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_ids, vec![pane_id]);
+        prop_assert_eq!(back.tail_lines, lines);
+    }
+
+    #[test]
+    fn rt68_state_with_text_data_serde(pane_id in 0u64..1000) {
+        let data = StateWithTextData {
+            panes: vec![PaneStateData {
+                pane_id, pane_uuid: None, tab_id: 0, window_id: 0,
+                domain: "local".to_string(), title: None, cwd: None,
+                observed: true, ignore_reason: None,
+            }],
+            tail_lines: 100,
+            escapes_included: false,
+            pane_text: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: StateWithTextData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.panes.len(), 1);
+        prop_assert_eq!(back.panes[0].pane_id, pane_id);
+    }
+
+    // --- Search types ---
+
+    #[test]
+    fn rt69_search_data_serde(query in "[a-z ]{1,20}", total in 0usize..1000, limit in 1usize..100) {
+        let data = SearchData {
+            query: query.clone(), results: vec![], total_hits: total, limit,
+            pane_filter: None, since_filter: None, until_filter: None,
+            mode: Some("hybrid".to_string()), metrics: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.query, &query);
+        prop_assert_eq!(back.total_hits, total);
+    }
+
+    #[test]
+    fn rt70_explained_search_hit_serde(seg in 0i64..10000, pane in 0u64..100) {
+        let data = ExplainedSearchHit {
+            hit: SearchHit {
+                segment_id: seg, pane_id: pane, seq: 0, captured_at: 1_700_000_000_000,
+                score: 0.95, snippet: None, content: None, semantic_score: None, fusion_rank: None,
+            },
+            scoring: SearchScoringBreakdown {
+                bm25_score: Some(1.5), matching_terms: vec!["test".to_string()],
+                semantic_similarity: None, embedder_tier: None,
+                rrf_rank: None, rrf_score: None, reranker_score: None, final_score: 0.95,
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: ExplainedSearchHit = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.hit.segment_id, seg);
+        prop_assert_eq!(back.hit.pane_id, pane);
+    }
+
+    #[test]
+    fn rt71_search_explain_data_serde(query in "[a-z]{1,15}", mode in "[a-z]{3,10}") {
+        let data = SearchExplainData {
+            query: query.clone(), results: vec![], total_hits: 0, limit: 10,
+            pane_filter: None, mode: mode.clone(), timing: None, tier_metrics: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchExplainData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.query, &query);
+        prop_assert_eq!(&back.mode, &mode);
+    }
+
+    #[test]
+    fn rt72_search_pipeline_status_serde(state in "[a-z]{3,10}", ticks in 0u64..100000) {
+        let data = SearchPipelineStatusData {
+            state: state.clone(), watermarks: vec![], total_ticks: ticks,
+            total_docs_indexed: 0, total_lines_consumed: 0, index_stats: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchPipelineStatusData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.state, &state);
+        prop_assert_eq!(back.total_ticks, ticks);
+    }
+
+    #[test]
+    fn rt73_pipeline_watermark_info_serde(val in arb_pipeline_watermark_info()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: PipelineWatermarkInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.pane_id, val.pane_id);
+        prop_assert_eq!(back.total_docs_indexed, val.total_docs_indexed);
+    }
+
+    #[test]
+    fn rt74_search_pipeline_control_serde(action in "[a-z]{3,10}", success in proptest::bool::ANY) {
+        let data = SearchPipelineControlResult {
+            action: action.clone(), success, state_after: "running".to_string(), message: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchPipelineControlResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.action, &action);
+        prop_assert_eq!(back.success, success);
+    }
+
+    #[test]
+    fn rt75_search_metrics_data_serde(req_mode in "[a-z]{3,10}", eff_mode in "[a-z]{3,10}") {
+        let data = SearchMetricsData {
+            requested_mode: req_mode.clone(), effective_mode: eff_mode.clone(),
+            fallback_reason: None, rrf_k: 60, lexical_weight: 0.5, semantic_weight: 0.5,
+            fusion_backend: "frankensearch_rrf".to_string(),
+            lexical_candidates: 100, semantic_candidates: 50,
+            semantic_cache_hit: false, semantic_latency_ms: 42,
+            semantic_rows_scanned: 1000, semantic_budget_state: "nominal".to_string(),
+            semantic_backoff_until_ms: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchMetricsData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.requested_mode, &req_mode);
+        prop_assert_eq!(&back.effective_mode, &eff_mode);
+    }
+
+    #[test]
+    fn rt76_search_index_reindex_serde(batch in 1usize..1000, scanned in 0usize..10000) {
+        let data = SearchIndexReindexData {
+            batch_size: batch, pane_filter: None, since_filter: None, until_filter: None,
+            scanned_segments: scanned, submitted_docs: 0, accepted_docs: 0,
+            skipped_empty_docs: 0, skipped_duplicate_docs: 0, skipped_cass_docs: 0,
+            skipped_resize_pause_docs: 0, deferred_rate_limited_docs: 0, flushed_docs: 0,
+            expired_docs: 0, evicted_docs: 0, pane_metadata_docs: 0, flush_operations: 0,
+            final_document_count: 0, final_index_size_bytes: 0, source_counts: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: SearchIndexReindexData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.batch_size, batch);
+        prop_assert_eq!(back.scanned_segments, scanned);
+    }
+
+    // --- Events types ---
+
+    #[test]
+    fn rt77_events_data_serde(total in 0usize..1000, limit in 1usize..100) {
+        let data = EventsData {
+            events: vec![], total_count: total, limit,
+            pane_filter: None, rule_id_filter: None, event_type_filter: None,
+            triage_state_filter: None, label_filter: None,
+            unhandled_only: false, since_filter: None, would_handle: false, dry_run: false,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: EventsData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_count, total);
+        prop_assert_eq!(back.limit, limit);
+    }
+
+    #[test]
+    fn rt78_event_would_handle_serde(wf in "[a-z_]{3,15}") {
+        let data = EventWouldHandle {
+            workflow: wf.clone(), preview_command: None, first_step: None,
+            estimated_duration_ms: Some(5000), would_run: Some(true), reason: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: EventWouldHandle = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.workflow, &wf);
+    }
+
+    #[test]
+    fn rt79_event_mutation_data_serde(eid in 0i64..100_000) {
+        let data = EventMutationData {
+            event_id: eid, changed: Some(true),
+            annotations: serde_json::json!({"key": "val"}),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: EventMutationData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.event_id, eid);
+    }
+
+    // --- Agent inventory types ---
+
+    #[test]
+    fn rt80_agent_inventory_data_serde(slug in "[a-z]{3,10}", detected in proptest::bool::ANY) {
+        let data = AgentInventoryData {
+            installed: vec![InstalledAgentInfo {
+                slug: slug.clone(), display_name: None, detected, evidence: vec![],
+                root_paths: vec![], config_path: None, binary_path: None, version: None,
+            }],
+            running: BTreeMap::new(),
+            summary: AgentInventorySummary { installed_count: 1, running_count: 0, configured_count: 0, installed_but_idle_count: 1 },
+            filesystem_detection_available: true,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentInventoryData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.installed[0].slug, &slug);
+        prop_assert_eq!(back.installed[0].detected, detected);
+    }
+
+    #[test]
+    fn rt81_installed_agent_info_serde(slug in "[a-z]{3,10}") {
+        let data = InstalledAgentInfo {
+            slug: slug.clone(), display_name: Some("Test Agent".to_string()),
+            detected: true, evidence: vec!["found binary".to_string()],
+            root_paths: vec!["/usr/local/bin".to_string()],
+            config_path: Some("/home/.config".to_string()), binary_path: None, version: Some("1.0".to_string()),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: InstalledAgentInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.slug, &slug);
+        prop_assert!(back.detected);
+    }
+
+    #[test]
+    fn rt82_running_agent_info_serde(slug in "[a-z]{3,10}", pane in 0u64..1000) {
+        let data = RunningAgentInfo {
+            slug: slug.clone(), display_name: None,
+            state: "working".to_string(), session_id: None,
+            source: "pattern_engine".to_string(), pane_id: pane,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: RunningAgentInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.slug, &slug);
+        prop_assert_eq!(back.pane_id, pane);
+    }
+
+    #[test]
+    fn rt83_agent_detect_refresh_serde(refreshed in proptest::bool::ANY, count in 0usize..20) {
+        let data = AgentDetectRefreshResult {
+            refreshed, detected_count: count, total_probed: 10, message: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentDetectRefreshResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.refreshed, refreshed);
+        prop_assert_eq!(back.detected_count, count);
+    }
+
+    #[test]
+    fn rt84_agent_inventory_summary_serde(ic in 0usize..20, rc in 0usize..20) {
+        let data = AgentInventorySummary {
+            installed_count: ic, running_count: rc, configured_count: 0, installed_but_idle_count: 0,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentInventorySummary = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.installed_count, ic);
+        prop_assert_eq!(back.running_count, rc);
+    }
+
+    // --- Agent configure types ---
+
+    #[test]
+    fn rt85_agent_configure_data_serde(total in 0usize..20) {
+        let data = AgentConfigureData {
+            results: vec![], total, created: 0, updated: 0, skipped: 0, errors: 0,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentConfigureData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total, total);
+    }
+
+    #[test]
+    fn rt86_agent_configure_result_item_serde(slug in "[a-z]{3,10}") {
+        let data = AgentConfigureResultItem {
+            slug: slug.clone(), display_name: "Test".to_string(),
+            action: "created".to_string(), filename: "AGENTS.md".to_string(),
+            backup_created: false, error: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentConfigureResultItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.slug, &slug);
+    }
+
+    #[test]
+    fn rt87_agent_configure_dry_run_serde(total in 0usize..20) {
+        let data = AgentConfigureDryRunData {
+            plan: vec![], total, would_create: 0, would_modify: 0, would_skip: 0, errors: 0,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentConfigureDryRunData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total, total);
+    }
+
+    #[test]
+    fn rt88_agent_configure_plan_item_serde(slug in "[a-z]{3,10}") {
+        let data = AgentConfigurePlanItem {
+            slug: slug.clone(), display_name: "Test".to_string(),
+            config_kind: "claude_md".to_string(), scope: "project".to_string(),
+            filename: "CLAUDE.md".to_string(), file_exists: true,
+            section_exists: false, action: "append".to_string(),
+            content_preview: Some("# FrankenTerm".to_string()), error: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AgentConfigurePlanItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.slug, &slug);
+        prop_assert!(back.file_exists);
+    }
+
+    // --- Mission types ---
+
+    #[test]
+    fn rt89_mission_state_filters_serde(limit in 0usize..1000) {
+        let data = MissionStateFilters {
+            mission_state: Some(MissionLifecycleState::Running),
+            run_state: Some(MissionRunState::Pending),
+            agent_state: None, action_state: None,
+            assignment_id: None, assignee: Some("agent-1".to_string()), limit,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionStateFilters = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.limit, limit);
+    }
+
+    #[test]
+    fn rt90_mission_assignment_data_serde(val in arb_mission_assignment_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MissionAssignmentData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.assignment_id, &val.assignment_id);
+        prop_assert_eq!(back.run_state, val.run_state);
+        prop_assert_eq!(back.agent_state, val.agent_state);
+    }
+
+    #[test]
+    fn rt91_mission_state_data_serde(val in arb_mission_state_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: MissionStateData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.mission_id, &val.mission_id);
+        prop_assert_eq!(back.lifecycle_state, val.lifecycle_state);
+    }
+
+    #[test]
+    fn rt92_mission_decision_data_serde(val in arb_mission_assignment_data()) {
+        let data = MissionDecisionData {
+            assignment: val, candidate_action: None, dispatch_contract: None,
+            dispatch_target: None, dry_run_execution: None, decision_error: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionDecisionData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.assignment.assignment_id, &data.assignment.assignment_id);
+    }
+
+    #[test]
+    fn rt93_mission_decisions_data_serde(val in arb_mission_state_data()) {
+        let data = MissionDecisionsData {
+            mission_file: val.mission_file, mission_id: val.mission_id.clone(),
+            title: val.title, mission_hash: val.mission_hash,
+            lifecycle_state: val.lifecycle_state,
+            mission_matches_filter: val.mission_matches_filter,
+            candidate_count: val.candidate_count, assignment_count: val.assignment_count,
+            matched_assignment_count: 0, returned_assignment_count: 0,
+            filters: val.filters, available_transitions: vec![],
+            failure_catalog: vec![], decisions: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: MissionDecisionsData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.mission_id, &val.mission_id);
+    }
+
+    // --- Transaction types ---
+
+    #[test]
+    fn rt94_tx_precondition_data_serde(val in arb_tx_precondition_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxPreconditionData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.description, &val.description);
+        prop_assert_eq!(back.required, val.required);
+    }
+
+    #[test]
+    fn rt95_tx_compensating_action_serde(val in arb_tx_compensating_action_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxCompensatingActionData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.step_id, &val.step_id);
+    }
+
+    #[test]
+    fn rt96_tx_risk_summary_serde(val in arb_tx_risk_summary_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxRiskSummaryData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_steps, val.total_steps);
+        prop_assert_eq!(back.overall_risk, val.overall_risk);
+    }
+
+    #[test]
+    fn rt97_tx_rejected_edge_serde(val in arb_tx_rejected_edge_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxRejectedEdgeData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.from_step, &val.from_step);
+        prop_assert_eq!(&back.reason, &val.reason);
+    }
+
+    #[test]
+    fn rt98_tx_step_data_serde(val in arb_tx_step_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxStepData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &val.id);
+        prop_assert_eq!(back.risk, val.risk);
+    }
+
+    #[test]
+    fn rt99_tx_plan_data_serde(pid in arb_short_str2(), hash in 0u64..1_000_000) {
+        let data = TxPlanData {
+            plan_id: pid.clone(), plan_hash: hash,
+            steps: vec![], execution_order: vec![], parallel_levels: vec![],
+            risk_summary: TxRiskSummaryData {
+                total_steps: 0, high_risk_count: 0, critical_risk_count: 0,
+                uncompensated_steps: 0, overall_risk: TxStepRisk::Low,
+            },
+            rejected_edges: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxPlanData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.plan_id, &pid);
+        prop_assert_eq!(back.plan_hash, hash);
+    }
+
+    #[test]
+    fn rt100_tx_step_record_serde(val in arb_tx_step_record_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxStepRecordData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.ordinal, val.ordinal);
+        prop_assert_eq!(&back.step_id, &val.step_id);
+    }
+
+    #[test]
+    fn rt101_tx_run_data_serde(eid in arb_short_str2(), pid in arb_short_str2()) {
+        let data = TxRunData {
+            execution_id: eid.clone(), plan_id: pid.clone(), plan_hash: 42,
+            phase: TxPhaseState::Committing, step_count: 3,
+            completed_count: 1, failed_count: 0, skipped_count: 0,
+            records: vec![],
+            chain_verification: TxChainVerificationData {
+                chain_intact: true, first_break_at: None, missing_ordinals: vec![], total_records: 0,
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxRunData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(&back.plan_id, &pid);
+    }
+
+    #[test]
+    fn rt102_tx_resume_data_serde(eid in arb_short_str2(), rec in arb_tx_resume_recommendation()) {
+        let data = TxResumeData {
+            execution_id: eid.clone(), plan_id: "plan-1".to_string(),
+            interrupted_phase: TxPhaseState::Committing,
+            completed_steps: vec!["s1".to_string()],
+            failed_steps: vec![], remaining_steps: vec!["s2".to_string()],
+            compensated_steps: vec![], chain_intact: true,
+            last_hash: "abc123".to_string(), recommendation: rec,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxResumeData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(back.recommendation, rec);
+    }
+
+    #[test]
+    fn rt103_tx_rollback_data_serde(eid in arb_short_str2()) {
+        let data = TxRollbackData {
+            execution_id: eid.clone(), plan_id: "plan-1".to_string(),
+            phase: TxPhaseState::Compensating,
+            compensated_steps: vec!["s1".to_string()],
+            failed_compensations: vec![], total_compensated: 1, total_failed: 0,
+            chain_verification: TxChainVerificationData {
+                chain_intact: true, first_break_at: None, missing_ordinals: vec![], total_records: 1,
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxRollbackData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(back.total_compensated, 1);
+    }
+
+    #[test]
+    fn rt104_tx_timeline_entry_serde(val in arb_tx_timeline_entry_data()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: TxTimelineEntryData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.timestamp_ms, val.timestamp_ms);
+        prop_assert_eq!(&back.step_id, &val.step_id);
+    }
+
+    #[test]
+    fn rt105_tx_show_data_serde(eid in arb_short_str2(), cls in arb_tx_bundle_classification()) {
+        let data = TxShowData {
+            execution_id: eid.clone(), plan_id: "plan-1".to_string(), plan_hash: 42,
+            phase: TxPhaseState::Completed, classification: cls,
+            step_count: 3, record_count: 3, high_risk_count: 0,
+            critical_risk_count: 0, overall_risk: TxStepRisk::Low,
+            chain_intact: true, timeline: vec![], resume: None,
+            records: vec![], redacted_field_count: 0,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: TxShowData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(back.classification, cls);
+    }
+
+    // --- Workflow types ---
+
+    #[test]
+    fn rt106_workflow_list_data_serde(total in 0usize..100) {
+        let data = WorkflowListData {
+            workflows: vec![WorkflowInfo {
+                name: "test".to_string(), enabled: true,
+                trigger_event_types: None, requires_pane: None,
+            }],
+            total, enabled_count: Some(1),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowListData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total, total);
+    }
+
+    #[test]
+    fn rt107_workflow_status_data_serde(eid in arb_short_str2(), name in "[a-z_]{3,15}") {
+        let data = WorkflowStatusData {
+            execution_id: eid.clone(), workflow_name: name.clone(),
+            pane_id: Some(1), trigger_event_id: None,
+            status: "running".to_string(), message: None,
+            started_at: Some(1_700_000_000_000), completed_at: None,
+            current_step: Some(0), total_steps: Some(3),
+            plan: None, created_at: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowStatusData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(&back.workflow_name, &name);
+    }
+
+    #[test]
+    fn rt108_workflow_status_list_serde(count in 0usize..50) {
+        let data = WorkflowStatusListData {
+            executions: vec![], pane_filter: None, active_only: Some(true), count,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowStatusListData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.count, count);
+    }
+
+    #[test]
+    fn rt109_workflow_abort_data_serde(eid in arb_short_str2(), aborted in proptest::bool::ANY) {
+        let data = WorkflowAbortData {
+            execution_id: eid.clone(), aborted, forced: false,
+            workflow_name: Some("test_wf".to_string()), previous_status: Some("running".to_string()),
+            message: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowAbortData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(back.aborted, aborted);
+    }
+
+    #[test]
+    fn rt110_workflow_step_log_serde(val in arb_workflow_step_log()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: WorkflowStepLog = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.step_index, val.step_index);
+        prop_assert_eq!(&back.step_name, &val.step_name);
+    }
+
+    #[test]
+    fn rt111_workflow_action_plan_serde(val in arb_workflow_action_plan()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: WorkflowActionPlan = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.plan_id, &val.plan_id);
+        prop_assert_eq!(&back.plan_hash, &val.plan_hash);
+    }
+
+    #[test]
+    fn rt112_workflow_status_detail_serde(eid in arb_short_str2(), name in "[a-z_]{3,15}") {
+        let data = WorkflowStatusDetailData {
+            execution_id: eid.clone(), workflow_name: name.clone(),
+            pane_id: Some(1), trigger_event_id: None, status: "completed".to_string(),
+            step_name: None, elapsed_ms: Some(100), last_step_result: None,
+            current_step: None, total_steps: Some(3), wait_condition: None,
+            context: None, result: None, error: None,
+            started_at: Some(1_700_000_000_000), updated_at: None,
+            completed_at: Some(1_700_000_000_100), step_logs: None, action_plan: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WorkflowStatusDetailData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.execution_id, &eid);
+        prop_assert_eq!(&back.workflow_name, &name);
+    }
+
+    // --- Rules types ---
+
+    #[test]
+    fn rt113_rules_list_data_serde(val in arb_rule_item()) {
+        let data = RulesListData {
+            rules: vec![val.clone()], pack_filter: None, agent_type_filter: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: RulesListData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rules.len(), 1);
+        prop_assert_eq!(&back.rules[0].id, &val.id);
+    }
+
+    #[test]
+    fn rt114_rule_item_serde(val in arb_rule_item()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: RuleItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &val.id);
+        prop_assert_eq!(back.anchor_count, val.anchor_count);
+        prop_assert_eq!(back.has_regex, val.has_regex);
+    }
+
+    #[test]
+    fn rt115_rules_test_data_serde(tl in 0usize..10000, mc in 0usize..100) {
+        let data = RulesTestData { text_length: tl, match_count: mc, matches: vec![] };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: RulesTestData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.text_length, tl);
+        prop_assert_eq!(back.match_count, mc);
+    }
+
+    #[test]
+    fn rt116_rule_match_item_serde(val in arb_rule_match_item()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: RuleMatchItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.rule_id, &val.rule_id);
+        prop_assert_eq!(back.start, val.start);
+    }
+
+    #[test]
+    fn rt117_rule_trace_info_serde(val in arb_rule_trace_info()) {
+        let json = serde_json::to_string(&val).unwrap();
+        let back: RuleTraceInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.anchors_checked, val.anchors_checked);
+        prop_assert_eq!(back.regex_matched, val.regex_matched);
+    }
+
+    #[test]
+    fn rt118_rule_detail_data_serde(id in arb_short_str2()) {
+        let data = RuleDetailData {
+            id: id.clone(), agent_type: "claude".to_string(),
+            event_type: "error".to_string(), severity: "high".to_string(),
+            description: "test rule".to_string(), anchors: vec!["ERROR".to_string()],
+            regex: Some("error.*".to_string()), workflow: None,
+            manual_fix: None, learn_more_url: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: RuleDetailData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.id, &id);
+    }
+
+    #[test]
+    fn rt119_rules_lint_data_serde(total in 0usize..100, passed in proptest::bool::ANY) {
+        let data = RulesLintData {
+            total_rules: total, rules_checked: total,
+            errors: vec![], warnings: vec![],
+            fixture_coverage: None, passed,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: RulesLintData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_rules, total);
+        prop_assert_eq!(back.passed, passed);
+    }
+
+    #[test]
+    fn rt120_fixture_coverage_serde(with_fix in 0usize..50, total in 0usize..100) {
+        let data = FixtureCoverage {
+            rules_with_fixtures: with_fix,
+            rules_without_fixtures: vec!["rule-1".to_string()],
+            total_fixtures: total,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: FixtureCoverage = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rules_with_fixtures, with_fix);
+        prop_assert_eq!(back.total_fixtures, total);
+    }
+
+    // --- Account types ---
+
+    #[test]
+    fn rt121_accounts_list_data_serde(service in "[a-z]{3,10}", total in 0usize..20) {
+        let data = AccountsListData {
+            accounts: vec![], total, service: service.clone(), pick_preview: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AccountsListData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.service, &service);
+        prop_assert_eq!(back.total, total);
+    }
+
+    #[test]
+    fn rt122_account_pick_preview_serde(reason in "[a-z_ ]{5,30}", candidates in 0usize..20) {
+        let data = AccountPickPreview {
+            selected_account_id: Some("acc-1".to_string()),
+            selected_name: Some("Test".to_string()),
+            selection_reason: reason.clone(),
+            threshold_percent: 20.0, candidates_count: candidates,
+            filtered_count: 0, quota_advisory: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AccountPickPreview = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.selection_reason, &reason);
+        prop_assert_eq!(back.candidates_count, candidates);
+    }
+
+    #[test]
+    fn rt123_account_quota_advisory_serde(avail in "[a-z]{3,10}", blocking in proptest::bool::ANY) {
+        let data = AccountQuotaAdvisoryInfo {
+            availability: avail.clone(), low_quota_threshold_percent: 15.0,
+            selected_percent_remaining: Some(80.0), warning: None, blocking,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AccountQuotaAdvisoryInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.availability, &avail);
+        prop_assert_eq!(back.blocking, blocking);
+    }
+
+    #[test]
+    fn rt124_accounts_refresh_data_serde(service in "[a-z]{3,10}", count in 0usize..10) {
+        let data = AccountsRefreshData {
+            service: service.clone(), refreshed_count: count,
+            refreshed_at: Some("2026-01-01T00:00:00Z".to_string()), accounts: vec![],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: AccountsRefreshData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.service, &service);
+        prop_assert_eq!(back.refreshed_count, count);
+    }
+
+    // --- Reservation types ---
+
+    #[test]
+    fn rt125_reserve_data_serde(pane in 0u64..1000) {
+        let data = ReserveData {
+            reservation: ReservationInfo {
+                id: 1, pane_id: pane, owner_kind: "agent".to_string(),
+                owner_id: "agent-1".to_string(), reason: Some("testing".to_string()),
+                created_at: 1_700_000_000_000, expires_at: 1_700_000_060_000,
+                released_at: None, status: "active".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: ReserveData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.reservation.pane_id, pane);
+    }
+
+    #[test]
+    fn rt126_release_data_serde(rid in 0i64..10000, released in proptest::bool::ANY) {
+        let data = ReleaseData { reservation_id: rid, released };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: ReleaseData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.reservation_id, rid);
+        prop_assert_eq!(back.released, released);
+    }
+
+    #[test]
+    fn rt127_reservations_list_data_serde(total in 0usize..100) {
+        let data = ReservationsListData { reservations: vec![], total };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: ReservationsListData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total, total);
+    }
+
+    // --- Meta / diagnostics types ---
+
+    #[test]
+    fn rt128_why_data_serde(code in "[A-Z]{2}-[0-9]{4}") {
+        let data = WhyData {
+            code: code.clone(), category: "storage".to_string(),
+            title: "Database Locked".to_string(),
+            explanation: "Another process holds the lock.".to_string(),
+            suggestions: Some(vec!["Retry later".to_string()]), see_also: None,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: WhyData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.code, &code);
+    }
+
+    #[test]
+    fn rt129_approve_data_serde(code in "[a-z0-9]{6,10}", valid in proptest::bool::ANY) {
+        let data = ApproveData {
+            code: code.clone(), valid,
+            created_at: Some(1_700_000_000_000), action_kind: Some("send_text".to_string()),
+            pane_id: Some(1), expires_at: Some(1_700_000_060_000),
+            action_fingerprint: None, dry_run: Some(false),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: ApproveData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.code, &code);
+        prop_assert_eq!(back.valid, valid);
+    }
+
+    // --- QuickStart types ---
+
+    #[test]
+    fn rt130_quick_start_data_serde(desc in "[a-z ]{5,30}") {
+        let data = QuickStartData {
+            description: desc.clone(),
+            global_flags: vec![QuickStartGlobalFlag {
+                flag: "--format".to_string(), env_var: None, description: "Output format".to_string(),
+            }],
+            core_loop: vec![QuickStartStep { step: 1, action: "observe".to_string(), command: "ft robot state".to_string() }],
+            commands: vec![QuickStartCommand {
+                name: "state".to_string(), args: "[--pane N]".to_string(),
+                summary: "Get pane state".to_string(), examples: vec!["ft robot state".to_string()],
+            }],
+            tips: vec!["Use --format json".to_string()],
+            error_handling: QuickStartErrorHandling {
+                common_codes: vec![QuickStartErrorCode {
+                    code: "FT-1003".to_string(), meaning: "Pane not found".to_string(),
+                    recovery: "Check pane ID".to_string(),
+                }],
+                safety_notes: vec!["Always check ok field".to_string()],
+            },
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartData = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.description, &desc);
+        prop_assert_eq!(back.global_flags.len(), 1);
+    }
+
+    #[test]
+    fn rt131_quick_start_global_flag_serde(flag in "[a-z-]{2,15}") {
+        let data = QuickStartGlobalFlag {
+            flag: flag.clone(), env_var: Some("FT_FORMAT".to_string()),
+            description: "test flag".to_string(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartGlobalFlag = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.flag, &flag);
+    }
+
+    #[test]
+    fn rt132_quick_start_step_serde(step in 1u8..10, action in "[a-z]{3,10}") {
+        let data = QuickStartStep { step, action: action.clone(), command: "ft robot test".to_string() };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartStep = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.step, step);
+        prop_assert_eq!(&back.action, &action);
+    }
+
+    #[test]
+    fn rt133_quick_start_command_serde(name in "[a-z]{3,10}") {
+        let data = QuickStartCommand {
+            name: name.clone(), args: "--flag".to_string(),
+            summary: "Does a thing".to_string(), examples: vec!["ft robot test".to_string()],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartCommand = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+    }
+
+    #[test]
+    fn rt134_quick_start_error_handling_serde(note in "[a-z ]{5,30}") {
+        let data = QuickStartErrorHandling {
+            common_codes: vec![], safety_notes: vec![note.clone()],
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartErrorHandling = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.safety_notes[0], &note);
+    }
+
+    #[test]
+    fn rt135_quick_start_error_code_serde(code in "[A-Z]{2}-[0-9]{4}") {
+        let data = QuickStartErrorCode {
+            code: code.clone(), meaning: "test".to_string(), recovery: "retry".to_string(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: QuickStartErrorCode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.code, &code);
+    }
+}
