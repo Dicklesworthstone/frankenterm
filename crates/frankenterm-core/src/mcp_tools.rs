@@ -4299,7 +4299,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, McpContext,
+        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content, McpContext,
         PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
         WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
         WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
