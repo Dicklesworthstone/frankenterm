@@ -12,7 +12,7 @@ use crate::storage::{
 };
 use crate::ui_query;
 use crate::{Error, Result, VERSION};
-use asupersync::net::TcpListener;
+// TcpListener used indirectly via server submodule
 use asupersync::stream::Stream;
 #[cfg(test)]
 use serde::Serialize;
@@ -26,8 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::web_framework::{
-    App, BoxFuture, ControlFlow, Handler, Method, Middleware, QueryString, Request, RequestContext,
-    Response, ResponseBody, ServerConfig, ServerError, StartupOutcome, StatusCode, TcpServer,
+    App, BoxFuture, ControlFlow, FrameworkWebRuntime, Method, Middleware, QueryString,
+    Request, RequestContext, Response, ResponseBody, StatusCode,
 };
 
 mod error;
@@ -56,7 +56,7 @@ use handlers::{
     handle_search, health_response,
 };
 use middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
-use server::{handle_server_exit, poke_listener};
+use server::poke_listener;
 pub use server::{run_web_server, start_web_server};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -176,9 +176,7 @@ impl Default for WebServerConfig {
 /// Handle to a running web server.
 pub struct WebServerHandle {
     bound_addr: SocketAddr,
-    server: Arc<TcpServer>,
-    app: Arc<App>,
-    join: task::JoinHandle<std::result::Result<(), ServerError>>,
+    runtime: FrameworkWebRuntime,
 }
 
 impl WebServerHandle {
@@ -190,9 +188,14 @@ impl WebServerHandle {
 
     /// Trigger graceful shutdown and wait for completion.
     pub async fn shutdown(self) -> Result<()> {
-        self.server.shutdown();
-        poke_listener(self.bound_addr);
-        handle_server_exit(self.join.await, &self.server, &self.app).await
+        let WebServerHandle {
+            bound_addr,
+            mut runtime,
+        } = self;
+        runtime.signal_shutdown();
+        poke_listener(bound_addr);
+        let result = runtime.join_handle_mut().await;
+        runtime.finish(result).await
     }
 }
 

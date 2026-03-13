@@ -4,6 +4,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::web_framework::FrameworkWebRuntime;
 
 /// Start the web server and return a handle for shutdown.
 ///
@@ -26,36 +27,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
     }
     let bind_addr = config.bind_addr();
     let app = build_app(config.storage, config.event_bus);
-
-    match app.run_startup_hooks().await {
-        StartupOutcome::Success => {}
-        StartupOutcome::PartialSuccess { warnings } => {
-            warn!(target: "wa.web", warnings, "web startup hooks had warnings");
-        }
-        StartupOutcome::Aborted(err) => {
-            return Err(Error::Runtime(format!(
-                "web startup aborted: {}",
-                err.message
-            )));
-        }
-    }
-
-    let app = Arc::new(app);
-    let listener = TcpListener::bind(bind_addr.clone())
-        .await
-        .map_err(Error::Io)?;
-    let local_addr = listener.local_addr().map_err(Error::Io)?;
-
-    let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
-    let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
-
-    let server_task = {
-        let server = Arc::clone(&server);
-        task::spawn(async move {
-            let cx = crate::cx::for_request();
-            server.serve_on_handler(&cx, listener, handler).await
-        })
-    };
+    let (local_addr, runtime) = FrameworkWebRuntime::start(bind_addr, app).await?;
 
     info!(
         target: "wa.web",
@@ -65,9 +37,7 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 
     Ok(WebServerHandle {
         bound_addr: local_addr,
-        server,
-        app,
-        join: server_task,
+        runtime,
     })
 }
 
@@ -75,22 +45,21 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
         bound_addr,
-        server,
-        app,
-        mut join,
+        mut runtime,
     } = start_web_server(config).await?;
 
     println!("ft web listening on http://{bound_addr}");
 
     select! {
-        result = &mut join => {
-            handle_server_exit(result, &server, &app).await?;
+        result = runtime.join_handle_mut() => {
+            runtime.finish(result).await?;
         }
         shutdown = wait_for_shutdown_signal() => {
             shutdown?;
-            server.shutdown();
+            runtime.signal_shutdown();
             poke_listener(bound_addr);
-            handle_server_exit(join.await, &server, &app).await?;
+            let result = runtime.join_handle_mut().await;
+            runtime.finish(result).await?;
         }
     }
 
@@ -118,30 +87,6 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             .map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
         Ok(())
     }
-}
-
-pub(super) async fn handle_server_exit(
-    result: std::result::Result<std::result::Result<(), ServerError>, task::JoinError>,
-    server: &Arc<TcpServer>,
-    app: &Arc<App>,
-) -> Result<()> {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(ServerError::Shutdown)) => {}
-        Ok(Err(err)) => {
-            return Err(Error::Runtime(format!("web server error: {err}")));
-        }
-        Err(err) => {
-            return Err(Error::Runtime(format!("web server join error: {err}")));
-        }
-    }
-
-    let forced = server.drain().await;
-    if forced > 0 {
-        warn!(target: "wa.web", forced, "web server forced closed connections");
-    }
-    app.run_shutdown_hooks().await;
-    Ok(())
 }
 
 pub(super) fn poke_listener(addr: SocketAddr) {
