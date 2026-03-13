@@ -4310,6 +4310,11 @@ mod tests {
         mcp_get_text_policy_input, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
     };
+    use crate::plan::{
+        MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
+        TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep,
+        TxStepId,
+    };
     use tempfile::TempDir;
 
     fn db_path() -> Arc<PathBuf> {
@@ -4412,6 +4417,101 @@ mod tests {
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.value.as_str())
+    }
+
+    fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
+        let tx_id = TxId("tx:test".to_string());
+        MissionTxContract {
+            tx_version: MISSION_TX_SCHEMA_VERSION,
+            intent: TxIntent {
+                tx_id: tx_id.clone(),
+                requested_by: MissionActorRole::Dispatcher,
+                summary: "tx test".to_string(),
+                correlation_id: "corr:test".to_string(),
+                created_at_ms: 1_700_000_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:test".to_string()),
+                tx_id,
+                steps: vec![
+                    TxStep {
+                        step_id: TxStepId("tx-step:1".to_string()),
+                        ordinal: 1,
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "step-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                        description: "step 1".to_string(),
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:2".to_string()),
+                        ordinal: 2,
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "step-2".to_string(),
+                            paste_mode: Some(false),
+                        },
+                        description: "step 2".to_string(),
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:3".to_string()),
+                        ordinal: 3,
+                        action: StepAction::SendText {
+                            pane_id: 3,
+                            text: "step-3".to_string(),
+                            paste_mode: Some(true),
+                        },
+                        description: "step 3".to_string(),
+                    },
+                ],
+                preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+                compensations: vec![
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:1".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 1,
+                            text: "undo-1".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:2".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 2,
+                            text: "undo-2".to_string(),
+                            paste_mode: Some(false),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:3".to_string()),
+                        action: StepAction::SendText {
+                            pane_id: 3,
+                            text: "undo-3".to_string(),
+                            paste_mode: Some(true),
+                        },
+                    },
+                ],
+            },
+            lifecycle_state: state,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        }
+    }
+
+    fn write_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path::PathBuf {
+        let path = dir.path().join("tx-contract.json");
+        let contract = sample_tx_contract(state);
+        std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
+    fn parse_json_content(contents: Vec<Content>) -> serde_json::Value {
+        assert_eq!(contents.len(), 1, "expected single MCP content item");
+        match &contents[0] {
+            Content::Text { text } => serde_json::from_str(text).expect("valid MCP envelope json"),
+            _ => panic!("expected text content"), // ubs:ignore
+        }
     }
 
     /// Collect definitions for all 29 tools. Guarantees no panics during construction.
@@ -4843,6 +4943,163 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn tx_show_tool_include_contract_returns_embedded_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let tool = WaTxShowTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "include_contract": true
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["tx_id"], "tx:test");
+        assert_eq!(envelope["data"]["plan_id"], "plan:test");
+        assert_eq!(envelope["data"]["lifecycle_state"], "planned");
+        assert_eq!(envelope["data"]["receipt_count"], 0);
+        assert_eq!(
+            envelope["data"]["contract"]["plan"]["steps"]
+                .as_array()
+                .expect("steps array")
+                .len(),
+            3
+        );
+        assert!(
+            !envelope["data"]["legal_transitions"]
+                .as_array()
+                .expect("transitions array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_run_tool_rejects_unknown_fail_step_with_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let tool = WaTxRunTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "fail_step": "tx-step:missing"
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(envelope["error"], "Unknown fail_step: tx-step:missing");
+        assert_eq!(
+            envelope["hint"],
+            "Use step IDs from wa.tx_show(include_contract=true)."
+        );
+    }
+
+    #[test]
+    fn tx_run_tool_partial_failure_triggers_compensation_and_compensated_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let tool = WaTxRunTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "fail_step": "tx-step:2"
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["prepare_report"]["outcome"], "all_ready");
+        assert_eq!(
+            envelope["data"]["commit_report"]["outcome"],
+            "partial_failure"
+        );
+        assert_eq!(
+            envelope["data"]["commit_report"]["failure_boundary"],
+            "tx-step:2"
+        );
+        assert_eq!(envelope["data"]["commit_report"]["committed_count"], 1);
+        assert_eq!(envelope["data"]["commit_report"]["failed_count"], 1);
+        assert_eq!(
+            envelope["data"]["compensation_report"]["outcome"],
+            "fully_rolled_back"
+        );
+        assert_eq!(envelope["data"]["final_state"], "compensated");
+    }
+
+    #[test]
+    fn tx_rollback_tool_returns_compensated_state_for_synthetic_commit_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Committed);
+        let tool = WaTxRollbackTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["tx_id"], "tx:test");
+        assert_eq!(envelope["data"]["final_state"], "compensated");
+        assert_eq!(
+            envelope["data"]["compensation_report"]["outcome"],
+            "fully_rolled_back"
+        );
+        assert_eq!(
+            envelope["data"]["compensation_report"]["compensated_count"],
+            3
+        );
+    }
+
+    #[test]
+    fn tx_rollback_tool_rejects_unknown_compensation_step_with_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Committed);
+        let tool = WaTxRollbackTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "fail_compensation_for_step": "tx-step:missing"
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["error"],
+            "Unknown fail_compensation_for_step: tx-step:missing"
+        );
+        assert_eq!(
+            envelope["hint"],
+            "Use step IDs from wa.tx_show(include_contract=true)."
+        );
     }
 
     #[test]
