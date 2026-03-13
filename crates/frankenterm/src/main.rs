@@ -6078,19 +6078,22 @@ fn resolve_requested_agent_slugs(
 fn resolve_agent_config_root(
     entry: &frankenterm_core::agent_correlator::InstalledAgentInventoryEntry,
 ) -> Option<PathBuf> {
-    entry.root_paths.first().map(PathBuf::from).or_else(|| {
-        entry
-            .config_path
-            .as_ref()
-            .map(PathBuf::from)
-            .and_then(|path| {
-                if path.is_dir() {
-                    Some(path)
-                } else {
-                    path.parent().map(Path::to_path_buf)
-                }
-            })
-    })
+    let provider = frankenterm_core::agent_provider::AgentProvider::from_slug(&entry.slug);
+    entry
+        .config_path
+        .as_ref()
+        .map(PathBuf::from)
+        .and_then(|path| {
+            if path.is_dir() {
+                Some(path)
+            } else {
+                path.parent().map(Path::to_path_buf)
+            }
+        })
+        .or_else(|| {
+            frankenterm_core::agent_correlator::preferred_root_path(&provider, &entry.root_paths)
+                .map(PathBuf::from)
+        })
 }
 
 fn render_agent_config_filename(
@@ -6106,6 +6109,18 @@ fn render_agent_config_filename(
             .to_string(),
         RobotAgentConfigScope::Global => target_path.display().to_string(),
     }
+}
+
+fn agent_config_section_is_present(content: &str) -> bool {
+    let Some(start_idx) =
+        content.find(frankenterm_core::agent_config_templates::SECTION_START_MARKER)
+    else {
+        return false;
+    };
+
+    let search_from =
+        start_idx + frankenterm_core::agent_config_templates::SECTION_START_MARKER.len();
+    content[search_from..].contains(frankenterm_core::agent_config_templates::SECTION_END_MARKER)
 }
 
 fn resolve_agent_config_target_path(
@@ -6145,24 +6160,7 @@ fn prepare_agent_config(
     } else {
         None
     };
-    let file_exists = existing_content.is_some();
-    let section_exists = existing_content.as_deref().is_some_and(|content| {
-        content.contains(frankenterm_core::agent_config_templates::SECTION_START_MARKER)
-    });
-    let action = if !file_exists {
-        frankenterm_core::agent_config_templates::ConfigAction::Create
-    } else if section_exists {
-        if frankenterm_core::agent_config_templates::section_is_current(
-            existing_content.as_deref().unwrap_or(""),
-            &template.content,
-        ) {
-            frankenterm_core::agent_config_templates::ConfigAction::Skip
-        } else {
-            frankenterm_core::agent_config_templates::ConfigAction::Replace
-        }
-    } else {
-        frankenterm_core::agent_config_templates::ConfigAction::Append
-    };
+    let action = classify_agent_config_action(existing_content.as_deref(), &template.content);
 
     Ok(PreparedAgentConfig {
         template,
@@ -6173,6 +6171,29 @@ fn prepare_agent_config(
         display_name: provider.display_name().to_string(),
         slug: entry.slug.clone(),
     })
+}
+
+fn classify_agent_config_action(
+    existing_content: Option<&str>,
+    template_content: &str,
+) -> frankenterm_core::agent_config_templates::ConfigAction {
+    let Some(existing_content) = existing_content else {
+        return frankenterm_core::agent_config_templates::ConfigAction::Create;
+    };
+
+    let section_exists = agent_config_section_is_present(existing_content);
+    if section_exists {
+        if frankenterm_core::agent_config_templates::section_is_current(
+            existing_content,
+            template_content,
+        ) {
+            frankenterm_core::agent_config_templates::ConfigAction::Skip
+        } else {
+            frankenterm_core::agent_config_templates::ConfigAction::Replace
+        }
+    } else {
+        frankenterm_core::agent_config_templates::ConfigAction::Append
+    }
 }
 
 fn build_agent_configure_plan_item(
@@ -6186,9 +6207,10 @@ fn build_agent_configure_plan_item(
         scope: robot_agent_config_scope_label(scope).to_string(),
         filename: prepared.filename.clone(),
         file_exists: prepared.existing_content.is_some(),
-        section_exists: prepared.existing_content.as_deref().is_some_and(|content| {
-            content.contains(frankenterm_core::agent_config_templates::SECTION_START_MARKER)
-        }),
+        section_exists: prepared
+            .existing_content
+            .as_deref()
+            .is_some_and(agent_config_section_is_present),
         action: agent_config_action_label(prepared.action).to_string(),
         content_preview: Some(prepared.template.content.clone()),
         error: None,
@@ -6283,11 +6305,24 @@ fn apply_prepared_agent_config(
     frankenterm_core::robot_types::AgentConfigureResultItem,
     AgentConfigApplyError,
 > {
-    if prepared.action == frankenterm_core::agent_config_templates::ConfigAction::Skip {
+    let current_content = if prepared.target_path.exists() {
+        Some(
+            fs::read_to_string(&prepared.target_path).map_err(|err| AgentConfigApplyError {
+                message: format!("Failed to read '{}': {err}", prepared.target_path.display()),
+                backup_created: false,
+            })?,
+        )
+    } else {
+        None
+    };
+    let actual_action =
+        classify_agent_config_action(current_content.as_deref(), &prepared.template.content);
+
+    if actual_action == frankenterm_core::agent_config_templates::ConfigAction::Skip {
         return Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
             slug: prepared.slug.clone(),
             display_name: prepared.display_name.clone(),
-            action: agent_config_action_label(prepared.action).to_string(),
+            action: agent_config_action_label(actual_action).to_string(),
             filename: prepared.filename.clone(),
             backup_created: false,
             error: None,
@@ -6316,7 +6351,7 @@ fn apply_prepared_agent_config(
     }
 
     let merged = frankenterm_core::agent_config_templates::merge_into_existing(
-        prepared.existing_content.as_deref().unwrap_or(""),
+        current_content.as_deref().unwrap_or(""),
         &prepared.template.content,
     );
     fs::write(&prepared.target_path, merged).map_err(|err| AgentConfigApplyError {
@@ -6330,7 +6365,7 @@ fn apply_prepared_agent_config(
     Ok(frankenterm_core::robot_types::AgentConfigureResultItem {
         slug: prepared.slug.clone(),
         display_name: prepared.display_name.clone(),
-        action: agent_config_action_label(prepared.action).to_string(),
+        action: agent_config_action_label(actual_action).to_string(),
         filename: prepared.filename.clone(),
         backup_created,
         error: None,
@@ -18742,19 +18777,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 &workspace_root,
                                             ) {
                                                 Ok(prepared) => {
-                                                    let planned_action = prepared.action;
                                                     match apply_prepared_agent_config(&prepared) {
                                                         Ok(result) => {
-                                                            match planned_action {
-                                                                frankenterm_core::agent_config_templates::ConfigAction::Create => {
-                                                                    created += 1;
-                                                                }
-                                                                frankenterm_core::agent_config_templates::ConfigAction::Append
-                                                                | frankenterm_core::agent_config_templates::ConfigAction::Replace => {
+                                                            match result.action.as_str() {
+                                                                "create" => created += 1,
+                                                                "append" | "replace" => {
                                                                     updated += 1;
                                                                 }
-                                                                frankenterm_core::agent_config_templates::ConfigAction::Skip => {
-                                                                    skipped += 1;
+                                                                "skip" => skipped += 1,
+                                                                other => {
+                                                                    tracing::warn!(
+                                                                        command = "robot.agents.configure",
+                                                                        agent_slug = %prepared.slug,
+                                                                        scope = %robot_agent_config_scope_label(scope),
+                                                                        action = other,
+                                                                        "unexpected agent config result action"
+                                                                    );
                                                                 }
                                                             }
                                                             tracing::info!(
@@ -18762,7 +18800,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                                 dry_run = false,
                                                                 agent_slug = %prepared.slug,
                                                                 scope = %robot_agent_config_scope_label(scope),
-                                                                action = %agent_config_action_label(planned_action),
+                                                                action = %result.action,
                                                                 file_path = %prepared.target_path.display(),
                                                                 backup_created = result.backup_created,
                                                                 "applied agent config action"
@@ -45511,6 +45549,165 @@ log_level = "debug"
     }
 
     #[test]
+    fn global_scope_agent_config_prefers_existing_config_path_over_first_detected_root() {
+        let root = unique_temp_dir("agent_config_global_prefer_config_path");
+        let workspace_root = root.join("workspace");
+        let stale_root = root.join(".config").join("codex");
+        let active_root = root.join(".codex");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&stale_root).unwrap();
+        std::fs::create_dir_all(&active_root).unwrap();
+
+        let active_config = active_root.join("AGENTS.md");
+        write_file(&active_config, "# existing codex rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![
+                stale_root.display().to_string(),
+                active_root.display().to_string(),
+            ],
+            config_path: Some(active_config.display().to_string()),
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(
+            prepared.target_path, active_config,
+            "existing config path should win over the first detected root"
+        );
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Append
+        );
+    }
+
+    #[test]
+    fn global_scope_agent_config_prefers_provider_root_order_when_config_missing() {
+        let root = unique_temp_dir("agent_config_global_prefer_provider_root_order");
+        let workspace_root = root.join("workspace");
+        let preferred_root = root.join(".cursor");
+        let fallback_root = root.join(".config").join("Cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&preferred_root).unwrap();
+        std::fs::create_dir_all(&fallback_root).unwrap();
+
+        let mut root_paths = vec![
+            preferred_root.display().to_string(),
+            fallback_root.display().to_string(),
+        ];
+        root_paths.sort();
+        assert_eq!(root_paths[0], fallback_root.display().to_string());
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths,
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(prepared.target_path, preferred_root.join(".cursorrules"));
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Create
+        );
+    }
+
+    #[test]
+    fn apply_agent_config_reloads_current_file_before_merge() {
+        let root = unique_temp_dir("agent_config_concurrent_merge");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+
+        let target = global_root.join(".cursorrules");
+        write_file(&target, "# existing cursor rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Append
+        );
+
+        write_file(&target, "# existing cursor rules\n# concurrent change\n");
+
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert_eq!(result.action, "append");
+
+        let updated = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            updated.contains("# concurrent change"),
+            "apply should merge against the current file, not the stale prepared snapshot"
+        );
+        assert!(updated.contains("FrankenTerm Integration"));
+    }
+
+    #[test]
+    fn apply_agent_config_skips_when_file_becomes_current_after_prepare() {
+        let root = unique_temp_dir("agent_config_current_after_prepare");
+        let workspace_root = root.join("workspace");
+        let global_root = root.join(".cursor");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
+
+        let target = global_root.join(".cursorrules");
+        write_file(&target, "# existing cursor rules\n");
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "cursor".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![global_root.display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Global, &workspace_root).unwrap();
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Append
+        );
+
+        let current = frankenterm_core::agent_config_templates::merge_into_existing(
+            "# existing cursor rules\n",
+            &prepared.template.content,
+        );
+        write_file(&target, &current);
+
+        let result = apply_prepared_agent_config(&prepared).unwrap();
+        assert_eq!(result.action, "skip");
+        assert!(
+            !result.backup_created,
+            "live skip should not create a backup"
+        );
+        let final_contents = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(final_contents, current);
+    }
+
+    #[test]
     fn global_scope_agent_config_error_items_use_template_filename_when_root_missing() {
         let root = unique_temp_dir("agent_config_error");
         let workspace_root = root.join("workspace");
@@ -45544,6 +45741,44 @@ log_level = "debug"
         assert_eq!(result_item.filename, "AGENTS.md");
         assert_eq!(result_item.action, "error");
         assert_eq!(result_item.error.as_deref(), Some("missing global root"));
+    }
+
+    #[test]
+    fn malformed_managed_section_is_planned_as_append_not_replace() {
+        let root = unique_temp_dir("agent_config_malformed_section");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+
+        let target = workspace_root.join("AGENTS.md");
+        write_file(
+            &target,
+            "# existing\n\n<!-- frankenterm:start -->\nunterminated managed block\n",
+        );
+
+        let entry = frankenterm_core::agent_correlator::InstalledAgentInventoryEntry {
+            slug: "codex".to_string(),
+            detected: true,
+            evidence: vec![],
+            root_paths: vec![root.join(".codex").display().to_string()],
+            config_path: None,
+            binary_path: None,
+            version: None,
+        };
+
+        let prepared =
+            prepare_agent_config(&entry, RobotAgentConfigScope::Project, &workspace_root).unwrap();
+        assert_eq!(
+            prepared.action,
+            frankenterm_core::agent_config_templates::ConfigAction::Append
+        );
+
+        let plan_item = build_agent_configure_plan_item(&prepared, RobotAgentConfigScope::Project);
+        assert!(plan_item.file_exists);
+        assert!(
+            !plan_item.section_exists,
+            "unterminated managed block should not be treated as a replaceable section"
+        );
+        assert_eq!(plan_item.action, "append");
     }
 
     #[cfg(unix)]

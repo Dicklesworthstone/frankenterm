@@ -500,11 +500,75 @@ fn parse_version_from_evidence(evidence: &[String]) -> Option<String> {
     })
 }
 
+fn preferred_root_suffixes(provider: &AgentProvider) -> &'static [&'static [&'static str]] {
+    match provider {
+        AgentProvider::Claude => &[&[".claude"], &[".config", "claude"]],
+        AgentProvider::Cline => &[&[".cline"], &[".config", "cline"]],
+        AgentProvider::Codex => &[&[".codex"], &[".config", "codex"]],
+        AgentProvider::Cursor => &[&[".cursor"], &[".config", "Cursor"]],
+        AgentProvider::Factory => &[&[".factory-droid"], &[".config", "factory-droid"]],
+        AgentProvider::Gemini => &[&[".gemini"], &[".config", "gemini"]],
+        AgentProvider::GithubCopilot => &[&[".github-copilot"], &[".config", "github-copilot"]],
+        AgentProvider::Opencode => &[&[".opencode"], &[".config", "opencode"]],
+        AgentProvider::Windsurf => &[&[".windsurf"], &[".config", "windsurf"]],
+        _ => &[],
+    }
+}
+
+fn root_precedence(provider: &AgentProvider, root: &str) -> usize {
+    let root_path = std::path::Path::new(root);
+    preferred_root_suffixes(provider)
+        .iter()
+        .position(|parts| {
+            let mut suffix = std::path::PathBuf::new();
+            for part in *parts {
+                suffix.push(part);
+            }
+            root_path.ends_with(&suffix)
+        })
+        .unwrap_or(usize::MAX)
+}
+
+pub fn preferred_root_path<'a>(
+    provider: &AgentProvider,
+    root_paths: &'a [String],
+) -> Option<&'a str> {
+    root_paths
+        .iter()
+        .enumerate()
+        .min_by_key(|(idx, root)| (root_precedence(provider, root), *idx))
+        .map(|(_, root)| root.as_str())
+}
+
+#[cfg(feature = "agent-detection")]
+fn detected_config_path(
+    entry: &crate::agent_detection::InstalledAgentDetectionEntry,
+) -> Option<String> {
+    let provider = AgentProvider::from_slug(&entry.slug);
+    let template = crate::agent_config_templates::generate_template(&provider);
+    let candidate_roots: Vec<String> = entry
+        .root_paths
+        .iter()
+        .filter(|root| {
+            std::path::Path::new(root)
+                .join(&template.filename)
+                .is_file()
+        })
+        .cloned()
+        .collect();
+    preferred_root_path(&provider, &candidate_roots).map(|root| {
+        std::path::Path::new(root)
+            .join(&template.filename)
+            .display()
+            .to_string()
+    })
+}
+
 #[cfg(feature = "agent-detection")]
 fn convert_detection_entry(
     entry: crate::agent_detection::InstalledAgentDetectionEntry,
 ) -> InstalledAgentInventoryEntry {
-    let config_path = entry.root_paths.first().cloned();
+    let config_path = detected_config_path(&entry);
     let version = parse_version_from_evidence(&entry.evidence);
     InstalledAgentInventoryEntry {
         slug: entry.slug,
@@ -1446,6 +1510,109 @@ mod tests {
         assert_eq!(
             metadata_agent_type_for_provider(&AgentProvider::Unknown("x-new".to_string())),
             "x-new"
+        );
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn convert_detection_entry_uses_existing_config_file_in_detected_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("AGENTS.md");
+        std::fs::write(&config_path, "# codex config\n").unwrap();
+
+        let converted =
+            convert_detection_entry(crate::agent_detection::InstalledAgentDetectionEntry {
+                slug: "codex".to_string(),
+                detected: true,
+                evidence: vec!["default root exists".to_string()],
+                root_paths: vec![root.display().to_string()],
+            });
+
+        assert_eq!(
+            converted.config_path.as_deref(),
+            Some(config_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn convert_detection_entry_does_not_treat_root_directory_as_config_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let converted =
+            convert_detection_entry(crate::agent_detection::InstalledAgentDetectionEntry {
+                slug: "codex".to_string(),
+                detected: true,
+                evidence: vec!["default root exists".to_string()],
+                root_paths: vec![root.display().to_string()],
+            });
+
+        assert_eq!(converted.root_paths, vec![root.display().to_string()]);
+        assert!(
+            converted.config_path.is_none(),
+            "root existence alone must not imply a config file exists"
+        );
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn convert_detection_entry_resolves_nested_config_file_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".github-copilot");
+        let nested_dir = root.join(".github");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let config_path = nested_dir.join("copilot-instructions.md");
+        std::fs::write(&config_path, "# copilot config\n").unwrap();
+
+        let converted =
+            convert_detection_entry(crate::agent_detection::InstalledAgentDetectionEntry {
+                slug: "github-copilot".to_string(),
+                detected: true,
+                evidence: vec!["default root exists".to_string()],
+                root_paths: vec![root.display().to_string()],
+            });
+
+        assert_eq!(
+            converted.config_path.as_deref(),
+            Some(config_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn convert_detection_entry_prefers_provider_default_root_order_over_sorted_root_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let preferred_root = temp.path().join(".cursor");
+        let fallback_root = temp.path().join(".config").join("Cursor");
+        std::fs::create_dir_all(&preferred_root).unwrap();
+        std::fs::create_dir_all(&fallback_root).unwrap();
+        let preferred_config = preferred_root.join(".cursorrules");
+        let fallback_config = fallback_root.join(".cursorrules");
+        std::fs::write(&preferred_config, "# preferred cursor config\n").unwrap();
+        std::fs::write(&fallback_config, "# fallback cursor config\n").unwrap();
+
+        let mut root_paths = vec![
+            preferred_root.display().to_string(),
+            fallback_root.display().to_string(),
+        ];
+        root_paths.sort();
+        assert_eq!(root_paths[0], fallback_root.display().to_string());
+
+        let converted =
+            convert_detection_entry(crate::agent_detection::InstalledAgentDetectionEntry {
+                slug: "cursor".to_string(),
+                detected: true,
+                evidence: vec!["multiple roots exist".to_string()],
+                root_paths,
+            });
+
+        assert_eq!(
+            converted.config_path.as_deref(),
+            Some(preferred_config.to_string_lossy().as_ref())
         );
     }
 }

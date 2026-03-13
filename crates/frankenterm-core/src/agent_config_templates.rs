@@ -180,6 +180,14 @@ pub fn generate_templates_for_detected(slugs: &[String]) -> Vec<AgentConfigTempl
         .collect()
 }
 
+fn section_is_present(existing_content: &str) -> bool {
+    let Some(start_idx) = existing_content.find(SECTION_START_MARKER) else {
+        return false;
+    };
+    let search_from = start_idx + SECTION_START_MARKER.len();
+    existing_content[search_from..].contains(SECTION_END_MARKER)
+}
+
 /// Build a dry-run plan for a set of agents.
 ///
 /// The caller provides `file_state` as a closure that returns `(file_exists,
@@ -196,9 +204,7 @@ pub fn build_generation_plan(
             let provider = AgentProvider::from_slug(slug);
             let template = generate_template(&provider);
             let (file_exists, existing_content) = file_state(&template.filename);
-            let section_exists = existing_content
-                .as_deref()
-                .is_some_and(|c| c.contains(SECTION_START_MARKER));
+            let section_exists = existing_content.as_deref().is_some_and(section_is_present);
 
             let action = if !file_exists {
                 ConfigAction::Create
@@ -305,23 +311,23 @@ fn robot_mode_reference() -> &'static str {
 FrankenTerm (`ft`) provides a robot-mode JSON API for agent automation:
 
 ### Search
-- `ft robot search "query" --limit N --format json` — search terminal history
-- `ft robot search "query" --explain` — search with scoring breakdown
+- `ft robot search "query" --limit N` — search terminal history
+- `ft robot search-explain "query"` — explain missing or incomplete search results
 - `ft robot search-index stats` — index health metrics
 
 ### Pane Management
-- `ft robot panes list` — list all panes with metadata
-- `ft robot panes inspect <id>` — detailed pane state
-- `ft robot panes send-text <id> "command"` — send keystrokes to a pane
+- `ft robot state` — list all panes with metadata
+- `ft robot get-text <id>` — read recent output from a pane
+- `ft robot send <id> "command"` — send keystrokes to a pane
 
 ### Agent Inventory
 - `ft robot agents list` — show detected/installed agents
 - `ft robot agents running` — show active agents in panes
 - `ft robot agents detect --refresh` — refresh detection cache
 
-### Session & Status
-- `ft robot status` — overall system status
-- `ft robot sessions list` — list active sessions
+### State & Health
+- `ft robot status` — overall pane/state snapshot (`status` is an alias for `state`)
+- `ft robot health` — watcher and control-plane health snapshot
 
 All commands output JSON by default. Add `--format toon` for token-optimized output."#
 }
@@ -337,7 +343,7 @@ This project uses FrankenTerm (`ft`) as its terminal orchestration platform.
 ## Usage Tips
 
 - Use `ft robot search` to find relevant terminal output from other agents.
-- Use `ft robot panes list` to discover other running agents and their panes.
+- Use `ft robot state` to discover other running agents and their panes.
 - Use `ft robot agents running` to see which agents are currently active.
 - Prefer `ft robot` commands over raw tmux/wezterm commands for automation.",
         robot_mode_reference()
@@ -356,7 +362,7 @@ Agent: {slug}
 ## Usage Tips
 
 - Use `ft robot search` to find relevant terminal output across all panes.
-- Use `ft robot panes list` to discover other running agents.
+- Use `ft robot state` to discover other running agents.
 - Use `ft robot agents running` to see which agents are currently active.
 - Prefer structured `ft robot` JSON commands over raw terminal parsing.",
         display = display,
@@ -376,7 +382,7 @@ This project uses FrankenTerm (`ft`) for terminal orchestration.
 ## Rules
 
 - When you need terminal output from other agents, use `ft robot search`.
-- When you need to interact with other panes, use `ft robot panes send-text`.
+- When you need to interact with other panes, use `ft robot send`.
 - When checking system state, use `ft robot status`.
 - All `ft robot` commands return structured JSON.",
         robot_mode_reference()
@@ -412,7 +418,7 @@ This project uses FrankenTerm (`ft`) for terminal orchestration.
 
 - Use `ft robot` JSON API for terminal automation.
 - Use `ft robot search` to find terminal output across agent sessions.
-- Use `ft robot panes list` for pane discovery.",
+- Use `ft robot state` for pane discovery.",
         robot_mode_reference()
     )
 }
@@ -556,8 +562,18 @@ mod tests {
         let t = generate_template(&AgentProvider::Claude);
         assert_eq!(t.kind, AgentConfigKind::ClaudeMd);
         assert!(t.content.contains("ft robot search"));
-        assert!(t.content.contains("ft robot panes list"));
+        assert!(t.content.contains("ft robot search-explain"));
+        assert!(t.content.contains("ft robot state"));
+        assert!(t.content.contains("ft robot get-text"));
+        assert!(t.content.contains("ft robot send"));
+        assert!(t.content.contains("ft robot health"));
         assert!(t.content.contains("ft robot agents"));
+        assert!(!t.content.contains("ft robot panes list"));
+        assert!(!t.content.contains("ft robot panes inspect"));
+        assert!(!t.content.contains("ft robot panes send-text"));
+        assert!(!t.content.contains("ft robot sessions list"));
+        assert!(!t.content.contains("ft robot search \"query\" --explain"));
+        assert!(!t.content.contains("--format json"));
     }
 
     #[test]
@@ -768,6 +784,18 @@ mod tests {
         });
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].action, ConfigAction::Replace);
+    }
+
+    #[test]
+    fn plan_append_when_section_marker_is_unterminated() {
+        let slugs = vec!["claude".to_string()];
+        let malformed = format!("# My Project\n\n{}\nold content\n", SECTION_START_MARKER);
+        let plan = build_generation_plan(&slugs, ConfigScope::Project, |_| {
+            (true, Some(malformed.clone()))
+        });
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, ConfigAction::Append);
+        assert!(!plan[0].section_exists);
     }
 
     #[test]

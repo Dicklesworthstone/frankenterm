@@ -3962,6 +3962,28 @@ mod tests {
         assert_eq!(data.summary.installed_but_idle_count, 1); // codex is installed but not running
     }
 
+    #[test]
+    fn from_agent_inventory_root_only_entry_is_not_counted_as_configured() {
+        let inv = crate::agent_correlator::AgentInventory {
+            installed: vec![crate::agent_correlator::InstalledAgentInventoryEntry {
+                slug: "codex".to_string(),
+                detected: true,
+                evidence: vec!["default root exists: /home/user/.codex".to_string()],
+                root_paths: vec!["/home/user/.codex".to_string()],
+                config_path: None,
+                binary_path: None,
+                version: None,
+            }],
+            running: std::collections::BTreeMap::new(),
+        };
+
+        let data = AgentInventoryData::from(&inv);
+        assert_eq!(data.summary.installed_count, 1);
+        assert_eq!(data.summary.configured_count, 0);
+        assert_eq!(data.summary.installed_but_idle_count, 1);
+        assert_eq!(data.installed[0].config_path, None);
+    }
+
     // -----------------------------------------------------------------------
     // Mission types (ft-1i2ge.5.2)
     // -----------------------------------------------------------------------
