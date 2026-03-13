@@ -565,25 +565,33 @@ impl TermWindow {
         let render_info = ctx.renderer_info();
         self.opengl_info.replace(render_info.clone());
 
-        match RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE) {
-            Ok(render_state) => {
-                log::debug!(
-                    "OpenGL initialized! {} FrankenTerm version: {}",
-                    render_info,
-                    config::wezterm_version(),
-                );
-                self.render_state.replace(render_state);
-            }
-            Err(err) => {
-                log::error!("failed to create RenderState: {}", err);
-            }
-        }
-
-        if self.render_state.is_none() {
-            panic!("No OpenGL");
-        }
+        let render_state = RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE)
+            .with_context(|| format!("failed to create render state for {render_info}"))?;
+        log::debug!(
+            "Renderer initialized: {} FrankenTerm version: {}",
+            render_info,
+            config::wezterm_version(),
+        );
+        self.render_state.replace(render_state);
 
         Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WebGpuSurfaceErrorAction {
+    Retry,
+    SkipFrame,
+    Fail,
+}
+
+fn classify_webgpu_surface_error(err: &wgpu::SurfaceError) -> WebGpuSurfaceErrorAction {
+    match err {
+        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => WebGpuSurfaceErrorAction::Retry,
+        wgpu::SurfaceError::Timeout => WebGpuSurfaceErrorAction::SkipFrame,
+        wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other => {
+            WebGpuSurfaceErrorAction::Fail
+        }
     }
 }
 
@@ -1096,12 +1104,23 @@ impl TermWindow {
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
             Err(err) => {
-                match err.downcast_ref::<wgpu::SurfaceError>() {
-                    Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                match err
+                    .downcast_ref::<wgpu::SurfaceError>()
+                    .map(classify_webgpu_surface_error)
+                {
+                    Some(WebGpuSurfaceErrorAction::Retry) => {
+                        log::warn!("webgpu surface became stale; retrying after resize");
                         self.webgpu.as_mut().unwrap().resize(self.dimensions);
                         return self.do_paint_webgpu_impl();
                     }
-                    _ => {}
+                    Some(WebGpuSurfaceErrorAction::SkipFrame) => {
+                        log::warn!("webgpu surface timed out acquiring the next frame; skipping");
+                        if let Some(window) = self.window.as_ref() {
+                            window.invalidate();
+                        }
+                        return Ok(true);
+                    }
+                    Some(WebGpuSurfaceErrorAction::Fail) | None => {}
                 }
                 Err(err)
             }
@@ -3787,5 +3806,42 @@ impl Drop for TermWindow {
                 fe.forget_known_window(&window);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WebGpuSurfaceErrorAction, classify_webgpu_surface_error};
+
+    #[test]
+    fn webgpu_surface_error_classification_retries_stale_surfaces() {
+        assert_eq!(
+            classify_webgpu_surface_error(&wgpu::SurfaceError::Lost),
+            WebGpuSurfaceErrorAction::Retry
+        );
+        assert_eq!(
+            classify_webgpu_surface_error(&wgpu::SurfaceError::Outdated),
+            WebGpuSurfaceErrorAction::Retry
+        );
+    }
+
+    #[test]
+    fn webgpu_surface_error_classification_skips_timeout_frames() {
+        assert_eq!(
+            classify_webgpu_surface_error(&wgpu::SurfaceError::Timeout),
+            WebGpuSurfaceErrorAction::SkipFrame
+        );
+    }
+
+    #[test]
+    fn webgpu_surface_error_classification_fails_terminal_errors() {
+        assert_eq!(
+            classify_webgpu_surface_error(&wgpu::SurfaceError::OutOfMemory),
+            WebGpuSurfaceErrorAction::Fail
+        );
+        assert_eq!(
+            classify_webgpu_surface_error(&wgpu::SurfaceError::Other),
+            WebGpuSurfaceErrorAction::Fail
+        );
     }
 }

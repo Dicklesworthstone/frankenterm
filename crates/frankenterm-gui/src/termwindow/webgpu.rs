@@ -30,6 +30,8 @@ pub struct WebGpuState {
     pub config: RefCell<wgpu::SurfaceConfiguration>,
     pub dimensions: RefCell<Dimensions>,
     pub render_pipeline: wgpu::RenderPipeline,
+    shader_uniform_buffer: wgpu::Buffer,
+    shader_uniform_bind_group: wgpu::BindGroup,
     shader_uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,
@@ -208,16 +210,17 @@ fn compute_compatibility_list(
         .collect()
 }
 
-fn select_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
-    let first = *formats
+fn select_surface_format(formats: &[wgpu::TextureFormat]) -> anyhow::Result<wgpu::TextureFormat> {
+    let first = formats
         .first()
-        .expect("surface capability format list should not be empty");
+        .copied()
+        .ok_or_else(|| anyhow!("surface capability format list should not be empty"))?;
     let preferred_srgb = first.add_srgb_suffix();
-    if formats.contains(&preferred_srgb) {
+    Ok(if formats.contains(&preferred_srgb) {
         preferred_srgb
     } else {
         first
-    }
+    })
 }
 
 fn select_view_formats_for_format(format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
@@ -386,7 +389,7 @@ impl WebGpuState {
 
         let queue = Arc::new(queue);
 
-        let format = select_surface_format(&caps.formats);
+        let format = select_surface_format(&caps.formats)?;
         // Need to check that this is supported, as trying to set
         // view_formats without it will cause surface.configure
         // to panic
@@ -421,6 +424,19 @@ impl WebGpuState {
                 }],
                 label: Some("ShaderUniform bind group layout"),
             });
+        let shader_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ShaderUniform Buffer"),
+            contents: bytemuck::bytes_of(&ShaderUniform::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let shader_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shader_uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shader_uniform_buffer.as_entire_binding(),
+            }],
+            label: Some("ShaderUniform Bind Group"),
+        });
 
         let texture_nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -523,6 +539,8 @@ impl WebGpuState {
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
             render_pipeline,
+            shader_uniform_buffer,
+            shader_uniform_bind_group,
             handle,
             shader_uniform_bind_group_layout,
             texture_bind_group_layout,
@@ -531,22 +549,13 @@ impl WebGpuState {
         })
     }
 
-    pub fn create_uniform(&self, uniform: ShaderUniform) -> wgpu::BindGroup {
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("ShaderUniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniform]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.shader_uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-            label: Some("ShaderUniform Bind Group"),
-        })
+    pub fn update_uniform(&self, uniform: ShaderUniform) {
+        self.queue
+            .write_buffer(&self.shader_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    pub fn shader_uniform_bind_group(&self) -> &wgpu::BindGroup {
+        &self.shader_uniform_bind_group
     }
 
     #[allow(unused_mut)]
@@ -597,7 +606,7 @@ mod tests {
         ];
 
         assert_eq!(
-            select_surface_format(&formats),
+            select_surface_format(&formats).unwrap(),
             wgpu::TextureFormat::Bgra8UnormSrgb
         );
     }
@@ -610,9 +619,14 @@ mod tests {
         ];
 
         assert_eq!(
-            select_surface_format(&formats),
+            select_surface_format(&formats).unwrap(),
             wgpu::TextureFormat::Rgba16Float
         );
+    }
+
+    #[test]
+    fn surface_format_rejects_empty_capabilities_list() {
+        assert!(select_surface_format(&[]).is_err());
     }
 
     #[test]

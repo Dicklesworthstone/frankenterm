@@ -86,7 +86,7 @@ impl crate::TermWindow {
         )
         .to_arrays_transposed();
 
-        let uniforms = webgpu.create_uniform(ShaderUniform {
+        webgpu.update_uniform(ShaderUniform {
             foreground_text_hsb,
             milliseconds,
             projection,
@@ -111,7 +111,7 @@ impl crate::TermWindow {
             timestamp_writes: None,
         });
         render_pass.set_pipeline(&webgpu.render_pipeline);
-        render_pass.set_bind_group(0, &uniforms, &[]);
+        render_pass.set_bind_group(0, webgpu.shader_uniform_bind_group(), &[]);
         render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
         render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
 
