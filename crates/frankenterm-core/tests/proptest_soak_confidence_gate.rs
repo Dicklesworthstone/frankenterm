@@ -412,3 +412,206 @@ fn confidence_verdict_summary_renders() {
     let summary = verdict.render_summary();
     assert!(!summary.is_empty());
 }
+
+// =============================================================================
+// Additional serde roundtrip tests for uncovered types
+// =============================================================================
+
+fn arb_scg_str() -> impl Strategy<Value = String> {
+    "[a-z]{3,12}".prop_map(String::from)
+}
+
+fn arb_cell_telemetry() -> impl Strategy<Value = CellTelemetry> {
+    (0u64..1000, 0u64..1000, 0u64..100, 0u64..500, 0u64..500, 0u64..100, 0u64..50, 0u64..50)
+        .prop_map(|(attempted, succeeded, failed, spawned, completed, cancelled, faults, recoveries)| {
+            CellTelemetry {
+                ops_attempted: attempted, ops_succeeded: succeeded, ops_failed: failed,
+                tasks_spawned: spawned, tasks_completed: completed, tasks_cancelled: cancelled,
+                faults_injected: faults, recoveries,
+            }
+        })
+}
+
+fn arb_cell_result() -> impl Strategy<Value = CellResult> {
+    (
+        arb_scg_str(), arb_journey_category(), arb_workload_profile(),
+        arb_failure_injection(), proptest::bool::ANY, proptest::bool::ANY,
+        0u64..60_000, arb_cell_telemetry(),
+    )
+        .prop_map(|(cell_id, category, workload, injection, passed, blocking, dur, telemetry)| {
+            CellResult {
+                cell_id, category, workload, injection, passed, blocking,
+                duration_ms: dur, failure_reason: None,
+                error_rate: 0.01, p95_latency_ms: 42.5,
+                seed: Some(42), telemetry,
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn scg_s01_user_journey_scenario_serde(
+        sid in arb_scg_str(), cat in arb_journey_category(), blocking in proptest::bool::ANY,
+    ) {
+        let scenario = UserJourneyScenario {
+            scenario_id: sid.clone(), category: cat,
+            description: "test scenario".to_string(), expected_duration_ms: 60_000,
+            blocking, seed: Some(42), command: "cargo test".to_string(),
+        };
+        let json = serde_json::to_string(&scenario).unwrap();
+        let back: UserJourneyScenario = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.scenario_id, &sid);
+        prop_assert_eq!(back.blocking, blocking);
+    }
+
+    #[test]
+    fn scg_s02_soak_matrix_serde(cat in arb_journey_category()) {
+        let matrix = SoakMatrix::custom(
+            vec![UserJourneyScenario {
+                scenario_id: "s1".to_string(), category: cat,
+                description: "test".to_string(), expected_duration_ms: 1000,
+                blocking: true, seed: None, command: "echo".to_string(),
+            }],
+            vec![WorkloadProfile::Steady],
+            vec![FailureInjectionProfile::None],
+        );
+        let json = serde_json::to_string(&matrix).unwrap();
+        let back: SoakMatrix = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.scenarios.len(), 1);
+        prop_assert_eq!(back.workload_profiles.len(), 1);
+    }
+
+    #[test]
+    fn scg_s03_soak_execution_plan_serde(cat in arb_journey_category(), wp in arb_workload_profile()) {
+        let plan = SoakExecutionPlan {
+            cells: vec![SoakCell {
+                cell_id: "cell-1".to_string(), scenario_id: "s1".to_string(),
+                category: cat, workload: wp, injection: FailureInjectionProfile::None,
+                blocking: true, seed: Some(42),
+            }],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: SoakExecutionPlan = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cells.len(), 1);
+        prop_assert_eq!(&back.cells[0].cell_id, "cell-1");
+    }
+
+    #[test]
+    fn scg_s04_soak_cell_serde(
+        cid in arb_scg_str(), cat in arb_journey_category(),
+        wp in arb_workload_profile(), fi in arb_failure_injection(),
+    ) {
+        let cell = SoakCell {
+            cell_id: cid.clone(), scenario_id: "s1".to_string(),
+            category: cat, workload: wp, injection: fi,
+            blocking: true, seed: Some(99),
+        };
+        let json = serde_json::to_string(&cell).unwrap();
+        let back: SoakCell = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.cell_id, &cid);
+        prop_assert_eq!(back.seed, Some(99));
+    }
+
+    #[test]
+    fn scg_s05_soak_execution_result_serde(dur in 1000u64..60_000) {
+        let result = SoakExecutionResult {
+            cell_results: vec![], invariant_checks: vec![],
+            total_duration_ms: dur, started_at_ms: 1_700_000_000_000,
+            completed_at_ms: 1_700_000_000_000 + dur,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: SoakExecutionResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_duration_ms, dur);
+    }
+
+    #[test]
+    fn scg_s06_cell_result_serde(cr in arb_cell_result()) {
+        let cid = cr.cell_id.clone();
+        let passed = cr.passed;
+        let json = serde_json::to_string(&cr).unwrap();
+        let back: CellResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.cell_id, &cid);
+        prop_assert_eq!(back.passed, passed);
+    }
+
+    #[test]
+    fn scg_s07_cell_telemetry_serde(tel in arb_cell_telemetry()) {
+        let attempted = tel.ops_attempted;
+        let json = serde_json::to_string(&tel).unwrap();
+        let back: CellTelemetry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.ops_attempted, attempted);
+    }
+
+    #[test]
+    fn scg_s08_soak_invariant_check_serde(iid in arb_scg_str(), passed in proptest::bool::ANY) {
+        let check = SoakInvariantCheck {
+            invariant_id: iid.clone(), description: "test invariant".to_string(),
+            passed, evidence: "ok".to_string(), mandatory: true,
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        let back: SoakInvariantCheck = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.invariant_id, &iid);
+        prop_assert_eq!(back.passed, passed);
+    }
+
+    #[test]
+    fn scg_s09_aggregated_soak_telemetry_serde(ops in 0u64..10_000, faults in 0u64..500) {
+        let tel = AggregatedSoakTelemetry {
+            ops_attempted: ops, ops_succeeded: ops, ops_failed: 0,
+            tasks_spawned: 100, tasks_completed: 100, tasks_cancelled: 0,
+            faults_injected: faults, recoveries: faults,
+            deadlock_detected_count: 0, max_p95_latency_ms: 42.5,
+        };
+        let json = serde_json::to_string(&tel).unwrap();
+        let back: AggregatedSoakTelemetry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.ops_attempted, ops);
+        prop_assert_eq!(back.faults_injected, faults);
+    }
+
+    #[test]
+    fn scg_s10_confidence_gate_serde(
+        pass_rate in 0.5f64..1.0, error_rate in 0.0f64..0.1,
+    ) {
+        let gate = ConfidenceGate {
+            min_pass_rate: pass_rate, max_error_rate: error_rate,
+            max_p95_latency_ms: 5000.0,
+            blocking_failures_are_hard_stop: true,
+            mandatory_invariants_are_hard_stop: true,
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        let back: ConfidenceGate = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.min_pass_rate - pass_rate).abs() < 1e-10);
+        prop_assert!((back.max_error_rate - error_rate).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scg_s11_confidence_verdict_serde(
+        decision in arb_confidence_decision(),
+        total in 1usize..100, passed_count in 0usize..100,
+    ) {
+        let verdict = ConfidenceVerdict {
+            decision, checks: vec![],
+            cells_total: total, cells_passed: passed_count.min(total),
+            cells_failed: total.saturating_sub(passed_count.min(total)),
+            soak_duration_ms: 60_000,
+        };
+        let json = serde_json::to_string(&verdict).unwrap();
+        let back: ConfidenceVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.cells_total, total);
+    }
+
+    #[test]
+    fn scg_s12_gate_condition_serde(cid in arb_scg_str(), passed in proptest::bool::ANY, blocking in proptest::bool::ANY) {
+        let cond = GateCondition {
+            condition_id: cid.clone(), description: "test check".to_string(),
+            passed, measured: "42%".to_string(), blocking,
+        };
+        let json = serde_json::to_string(&cond).unwrap();
+        let back: GateCondition = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.condition_id, &cid);
+        prop_assert_eq!(back.passed, passed);
+        prop_assert_eq!(back.blocking, blocking);
+    }
+}

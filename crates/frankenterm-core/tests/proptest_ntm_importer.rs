@@ -450,3 +450,259 @@ proptest! {
         prop_assert_eq!(bundle.report.total_items, 0);
     }
 }
+
+// =============================================================================
+// Additional serde roundtrip tests for uncovered types
+// =============================================================================
+
+use std::collections::BTreeMap;
+
+fn arb_ni_str() -> impl Strategy<Value = String> {
+    "[a-z]{3,12}".prop_map(String::from)
+}
+
+fn arb_import_severity() -> impl Strategy<Value = ImportSeverity> {
+    prop_oneof![
+        Just(ImportSeverity::Info),
+        Just(ImportSeverity::Warning),
+        Just(ImportSeverity::Error),
+    ]
+}
+
+fn arb_translated_step_type() -> impl Strategy<Value = TranslatedStepType> {
+    prop_oneof![
+        arb_ni_str().prop_map(|t| TranslatedStepType::SendText { text: t, pane_filter: None }),
+        arb_ni_str().prop_map(|p| TranslatedStepType::WaitFor { pattern: p, timeout_ms: Some(5000) }),
+        arb_ni_str().prop_map(|c| TranslatedStepType::Assert { condition: c }),
+        (100u64..10_000).prop_map(|d| TranslatedStepType::Sleep { duration_ms: d }),
+        arb_ni_str().prop_map(|a| TranslatedStepType::Unsupported {
+            original_action: a, params: HashMap::new(),
+        }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn ni_s01_ntm_window_serde(name in arb_ni_str()) {
+        let win = NtmWindow {
+            name: name.clone(), layout: Some("horizontal".to_string()),
+            panes: vec![], focus_index: Some(0),
+        };
+        let json = serde_json::to_string(&win).unwrap();
+        let back: NtmWindow = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert_eq!(back.focus_index, Some(0));
+    }
+
+    #[test]
+    fn ni_s02_ntm_pane_serde(role in proptest::option::of(arb_ni_str()), is_focus in proptest::bool::ANY) {
+        let pane = NtmPane {
+            role: role.clone(), command: Some("bash".to_string()), args: vec!["-l".to_string()],
+            environment: HashMap::new(), cwd: None, split_direction: None,
+            split_ratio: Some(0.5), is_focus,
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        let back: NtmPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.role, &role);
+        prop_assert_eq!(back.is_focus, is_focus);
+    }
+
+    #[test]
+    fn ni_s03_ntm_workflow_trigger_serde(kind in arb_ni_str(), value in arb_ni_str()) {
+        let trigger = NtmWorkflowTrigger {
+            kind: kind.clone(), value: value.clone(), pane_filter: None,
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let back: NtmWorkflowTrigger = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.kind, &kind);
+        prop_assert_eq!(&back.value, &value);
+    }
+
+    #[test]
+    fn ni_s04_ntm_workflow_step_serde(name in arb_ni_str(), action in arb_ni_str()) {
+        let step = NtmWorkflowStep {
+            name: name.clone(), action: action.clone(),
+            params: HashMap::new(), conditions: vec![], timeout_secs: Some(30),
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let back: NtmWorkflowStep = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert_eq!(&back.action, &action);
+    }
+
+    #[test]
+    fn ni_s05_ntm_safety_config_serde(gate in proptest::bool::ANY, rate in 0u32..100) {
+        let cfg = NtmSafetyConfig {
+            command_safety_gate: gate, require_approval_destructive: true,
+            rate_limit_per_minute: rate,
+            allowlist: vec!["ls".to_string()], denylist: vec!["rm".to_string()],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: NtmSafetyConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.command_safety_gate, gate);
+        prop_assert_eq!(back.rate_limit_per_minute, rate);
+    }
+
+    #[test]
+    fn ni_s06_ntm_robot_config_serde(auth in proptest::bool::ANY, max_c in proptest::option::of(1u32..100)) {
+        let cfg = NtmRobotConfig {
+            bind_address: Some("127.0.0.1:9090".to_string()),
+            require_auth: auth, max_concurrent: max_c,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: NtmRobotConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.require_auth, auth);
+        prop_assert_eq!(back.max_concurrent, max_c);
+    }
+
+    #[test]
+    fn ni_s07_ntm_hook_config_serde(event in arb_ni_str(), cmd in arb_ni_str()) {
+        let hook = NtmHookConfig {
+            event: event.clone(), command: cmd.clone(), timeout_secs: Some(10),
+        };
+        let json = serde_json::to_string(&hook).unwrap();
+        let back: NtmHookConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.event, &event);
+        prop_assert_eq!(&back.command, &cmd);
+    }
+
+    #[test]
+    fn ni_s08_import_severity_serde(sev in arb_import_severity()) {
+        let json = serde_json::to_string(&sev).unwrap();
+        let back: ImportSeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, sev);
+    }
+
+    #[test]
+    fn ni_s09_import_item_result_serde(sid in arb_ni_str(), success in proptest::bool::ANY) {
+        let result = ImportItemResult {
+            source_id: sid.clone(), target_type: "session_profile".to_string(),
+            success, findings: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ImportItemResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.source_id, &sid);
+        prop_assert_eq!(back.success, success);
+    }
+
+    #[test]
+    fn ni_s10_import_report_serde(total in 0usize..10, success_count in 0usize..10) {
+        let report = ImportReport {
+            schema_version: "1.0".to_string(), source_system: "ntm".to_string(),
+            total_items: total, success_count, failure_count: 0, warning_count: 0,
+            items: vec![], finding_summary: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ImportReport = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_items, total);
+        prop_assert_eq!(back.success_count, success_count);
+    }
+
+    #[test]
+    fn ni_s11_translated_session_profile_serde(name in arb_ni_str(), role in arb_ni_str()) {
+        let profile = TranslatedSessionProfile {
+            name: name.clone(), description: "test".to_string(), role: role.clone(),
+            spawn_command: None, environment: HashMap::new(), working_directory: None,
+            resource_hints: TranslatedResourceHints::default(),
+            layout_template: None, bootstrap_commands: vec![], tags: vec![],
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        let back: TranslatedSessionProfile = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert_eq!(&back.role, &role);
+    }
+
+    #[test]
+    fn ni_s12_translated_spawn_command_serde(cmd in arb_ni_str(), shell in proptest::bool::ANY) {
+        let sc = TranslatedSpawnCommand {
+            command: cmd.clone(), args: vec!["--flag".to_string()], use_shell: shell,
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let back: TranslatedSpawnCommand = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.command, &cmd);
+        prop_assert_eq!(back.use_shell, shell);
+    }
+
+    #[test]
+    fn ni_s13_translated_resource_hints_serde(rows in 10u16..100, cols in 40u16..200) {
+        let hints = TranslatedResourceHints {
+            min_rows: rows, min_cols: cols, max_scrollback: 5000, priority_weight: 100,
+        };
+        let json = serde_json::to_string(&hints).unwrap();
+        let back: TranslatedResourceHints = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.min_rows, rows);
+        prop_assert_eq!(back.min_cols, cols);
+    }
+
+    #[test]
+    fn ni_s14_translated_layout_template_serde(name in arb_ni_str(), panes in 1u32..10) {
+        let tmpl = TranslatedLayoutTemplate {
+            name: name.clone(), description: Some("test layout".to_string()),
+            root: TranslatedLayoutNode::Slot { role: Some("main".to_string()), weight: 1.0 },
+            min_panes: panes,
+        };
+        let json = serde_json::to_string(&tmpl).unwrap();
+        let back: TranslatedLayoutTemplate = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+        prop_assert_eq!(back.min_panes, panes);
+    }
+
+    #[test]
+    fn ni_s15_translated_workflow_step_serde(name in arb_ni_str(), step_type in arb_translated_step_type()) {
+        let step = TranslatedWorkflowStep {
+            name: name.clone(), description: "test step".to_string(), step_type,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let back: TranslatedWorkflowStep = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.name, &name);
+    }
+
+    #[test]
+    fn ni_s16_translated_config_serde(log_level in proptest::option::of(arb_ni_str())) {
+        let cfg = TranslatedConfig {
+            log_level: log_level.clone(), workspace: Some("/tmp/test".to_string()),
+            poll_interval_ms: Some(500), pattern_packs: vec!["default".to_string()],
+            safety: TranslatedSafetyConfig::default(),
+            untranslated: HashMap::new(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: TranslatedConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.log_level, &log_level);
+    }
+
+    #[test]
+    fn ni_s17_translated_safety_config_serde(gate in proptest::bool::ANY, rate in 0u32..200) {
+        let cfg = TranslatedSafetyConfig {
+            command_safety_gate: gate, require_approval_destructive: true,
+            rate_limit_per_minute: rate, allowlist: vec![], denylist: vec![],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: TranslatedSafetyConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.command_safety_gate, gate);
+        prop_assert_eq!(back.rate_limit_per_minute, rate);
+    }
+
+    #[test]
+    fn ni_s18_ntm_import_bundle_serde(name in arb_ni_str()) {
+        let bundle = NtmImportBundle {
+            session_profiles: vec![TranslatedSessionProfile {
+                name: name.clone(), description: "test".to_string(), role: "agent".to_string(),
+                spawn_command: None, environment: HashMap::new(), working_directory: None,
+                resource_hints: TranslatedResourceHints::default(),
+                layout_template: None, bootstrap_commands: vec![], tags: vec![],
+            }],
+            layout_templates: vec![], workflows: vec![],
+            config: None,
+            report: ImportReport {
+                schema_version: "1.0".to_string(), source_system: "ntm".to_string(),
+                total_items: 1, success_count: 1, failure_count: 0, warning_count: 0,
+                items: vec![], finding_summary: BTreeMap::new(),
+            },
+        };
+        let json = serde_json::to_string(&bundle).unwrap();
+        let back: NtmImportBundle = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&back.session_profiles[0].name, &name);
+    }
+}
