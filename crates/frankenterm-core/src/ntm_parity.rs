@@ -900,4 +900,278 @@ mod tests {
         assert_eq!(divergence.blocking_divergence_count, 1);
         assert_eq!(divergence.high_priority_divergence_count, 1);
     }
+
+    // ========================================================================
+    // NtmParityPriority and NtmParityAssertionOp serde
+    // ========================================================================
+
+    #[test]
+    fn priority_serde_roundtrip() {
+        let priorities = [NtmParityPriority::Blocking, NtmParityPriority::High];
+        for p in &priorities {
+            let json = serde_json::to_string(p).unwrap();
+            let back: NtmParityPriority = serde_json::from_str(&json).unwrap();
+            assert_eq!(*p, back);
+        }
+    }
+
+    #[test]
+    fn priority_as_str() {
+        assert_eq!(NtmParityPriority::Blocking.as_str(), "blocking");
+        assert_eq!(NtmParityPriority::High.as_str(), "high");
+    }
+
+    #[test]
+    fn assertion_op_serde_roundtrip() {
+        let ops = [
+            NtmParityAssertionOp::Eq,
+            NtmParityAssertionOp::IsArray,
+            NtmParityAssertionOp::HasAny,
+            NtmParityAssertionOp::In,
+            NtmParityAssertionOp::Contains,
+        ];
+        for op in &ops {
+            let json = serde_json::to_string(op).unwrap();
+            let back: NtmParityAssertionOp = serde_json::from_str(&json).unwrap();
+            assert_eq!(*op, back);
+        }
+    }
+
+    #[test]
+    fn assertion_op_as_str() {
+        assert_eq!(NtmParityAssertionOp::Eq.as_str(), "eq");
+        assert_eq!(NtmParityAssertionOp::IsArray.as_str(), "is_array");
+        assert_eq!(NtmParityAssertionOp::HasAny.as_str(), "has_any");
+        assert_eq!(NtmParityAssertionOp::In.as_str(), "in");
+        assert_eq!(NtmParityAssertionOp::Contains.as_str(), "contains");
+    }
+
+    // ========================================================================
+    // evaluate_assertion individual ops
+    // ========================================================================
+
+    #[test]
+    fn assertion_eq_passes_on_match() {
+        let assertion = NtmParityAssertion {
+            path: "$.ok".to_string(),
+            op: NtmParityAssertionOp::Eq,
+            value: Some(json!(true)),
+        };
+        let stdout = json!({"ok": true});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn assertion_eq_fails_on_mismatch() {
+        let assertion = NtmParityAssertion {
+            path: "$.ok".to_string(),
+            op: NtmParityAssertionOp::Eq,
+            value: Some(json!(true)),
+        };
+        let stdout = json!({"ok": false});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn assertion_is_array_passes_for_array() {
+        let assertion = NtmParityAssertion {
+            path: "$.data.panes".to_string(),
+            op: NtmParityAssertionOp::IsArray,
+            value: None,
+        };
+        let stdout = json!({"data": {"panes": [1, 2, 3]}});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn assertion_is_array_fails_for_non_array() {
+        let assertion = NtmParityAssertion {
+            path: "$.data.panes".to_string(),
+            op: NtmParityAssertionOp::IsArray,
+            value: None,
+        };
+        let stdout = json!({"data": {"panes": "not an array"}});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn assertion_contains_passes_for_substring() {
+        let assertion = NtmParityAssertion {
+            path: "$stdout".to_string(),
+            op: NtmParityAssertionOp::Contains,
+            value: Some(json!("hello")),
+        };
+        let output = NtmParityCommandOutput {
+            scenario_id: "test".to_string(),
+            command: "echo".to_string(),
+            expanded_command: "echo".to_string(),
+            exit_code: Some(0),
+            stdout: "say hello world".to_string(),
+            stderr: String::new(),
+            duration_ms: 1,
+            execution_error: None,
+        };
+        let result = evaluate_assertion("success", &assertion, None, &output);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn assertion_in_passes_when_value_in_array() {
+        let assertion = NtmParityAssertion {
+            path: "$.status".to_string(),
+            op: NtmParityAssertionOp::In,
+            value: Some(json!(["ok", "degraded", "error"])),
+        };
+        let stdout = json!({"status": "degraded"});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn assertion_in_fails_when_value_not_in_array() {
+        let assertion = NtmParityAssertion {
+            path: "$.status".to_string(),
+            op: NtmParityAssertionOp::In,
+            value: Some(json!(["ok", "degraded"])),
+        };
+        let stdout = json!({"status": "unknown"});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn assertion_has_any_passes_when_key_present() {
+        let assertion = NtmParityAssertion {
+            path: "$.data".to_string(),
+            op: NtmParityAssertionOp::HasAny,
+            value: Some(json!(["panes", "sessions"])),
+        };
+        let stdout = json!({"data": {"panes": []}});
+        let output = sample_output(stdout.clone());
+        let result = evaluate_assertion("success", &assertion, Some(&stdout), &output);
+        assert!(result.passed);
+    }
+
+    // ========================================================================
+    // validate_envelope edge cases
+    // ========================================================================
+
+    #[test]
+    fn validate_envelope_toon_accepts_non_empty() {
+        assert!(validate_envelope(
+            "ft robot --format toon state",
+            None,
+            "some toon output"
+        ));
+    }
+
+    #[test]
+    fn validate_envelope_toon_rejects_empty() {
+        assert!(!validate_envelope("ft robot --format toon state", None, ""));
+        assert!(!validate_envelope(
+            "ft robot --format toon state",
+            None,
+            "   "
+        ));
+    }
+
+    #[test]
+    fn validate_envelope_json_ok_true() {
+        let json = json!({"ok": true, "data": {}});
+        assert!(validate_envelope("ft robot state", Some(&json), "{}"));
+    }
+
+    #[test]
+    fn validate_envelope_json_error_with_code() {
+        let json = json!({"ok": false, "error": {"code": "not_found"}});
+        assert!(validate_envelope("ft robot state", Some(&json), "{}"));
+    }
+
+    #[test]
+    fn validate_envelope_json_rejects_invalid() {
+        assert!(!validate_envelope("ft robot state", None, "not json"));
+        let json = json!({"ok": false});
+        assert!(!validate_envelope("ft robot state", Some(&json), "{}"));
+    }
+
+    // ========================================================================
+    // NtmParityScenarioStatus serde
+    // ========================================================================
+
+    #[test]
+    fn scenario_status_serde_roundtrip() {
+        let statuses = [
+            NtmParityScenarioStatus::Pass,
+            NtmParityScenarioStatus::Fail,
+            NtmParityScenarioStatus::IntentionalDelta,
+            NtmParityScenarioStatus::Untested,
+        ];
+        for s in &statuses {
+            let json = serde_json::to_string(s).unwrap();
+            let back: NtmParityScenarioStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*s, back);
+        }
+    }
+
+    // ========================================================================
+    // resolve_assertion_target
+    // ========================================================================
+
+    #[test]
+    fn resolve_target_stdout_returns_raw_stdout() {
+        let output = sample_output(json!({}));
+        let result = resolve_assertion_target("$stdout", Some(&json!({})), &output);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_string());
+    }
+
+    #[test]
+    fn resolve_target_stderr_returns_raw_stderr() {
+        let output = NtmParityCommandOutput {
+            scenario_id: "t".to_string(),
+            command: "t".to_string(),
+            expanded_command: "t".to_string(),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "error output".to_string(),
+            duration_ms: 1,
+            execution_error: None,
+        };
+        let result = resolve_assertion_target("$stderr", None, &output);
+        assert_eq!(result.unwrap().as_str().unwrap(), "error output");
+    }
+
+    #[test]
+    fn resolve_target_root_returns_full_json() {
+        let json = json!({"ok": true});
+        let output = sample_output(json.clone());
+        let result = resolve_assertion_target("$", Some(&json), &output);
+        assert_eq!(result.unwrap(), json);
+    }
+
+    #[test]
+    fn resolve_target_path_navigates_nested() {
+        let json = json!({"a": {"b": {"c": 42}}});
+        let output = sample_output(json.clone());
+        let result = resolve_assertion_target("$.a.b.c", Some(&json), &output);
+        assert_eq!(result.unwrap(), json!(42));
+    }
+
+    #[test]
+    fn resolve_target_missing_path_returns_none() {
+        let json = json!({"a": 1});
+        let output = sample_output(json.clone());
+        let result = resolve_assertion_target("$.b.c", Some(&json), &output);
+        assert!(result.is_none());
+    }
 }
