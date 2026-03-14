@@ -5172,6 +5172,465 @@ mod tests {
     }
 
     // ========================================================================
+    // HandleProcessTriageLifecycle tests
+    // ========================================================================
+
+    #[test]
+    fn handle_process_triage_lifecycle_metadata() {
+        let workflow = HandleProcessTriageLifecycle::new();
+        assert_eq!(workflow.name(), "handle_process_triage_lifecycle");
+        assert_eq!(
+            workflow.description(),
+            "Orchestrate process triage lifecycle phases (snapshot, plan, apply, verify, diff, session)"
+        );
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert_eq!(workflow.steps().len(), 6);
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_step_names() {
+        let workflow = HandleProcessTriageLifecycle::new();
+        let steps = workflow.steps();
+        assert_eq!(steps[0].name, "snapshot");
+        assert_eq!(steps[1].name, "plan");
+        assert_eq!(steps[2].name, "apply");
+        assert_eq!(steps[3].name, "verify");
+        assert_eq!(steps[4].name, "diff");
+        assert_eq!(steps[5].name, "session");
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_handles_event_type() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleProcessTriageLifecycle::new();
+
+        let triage_event = Detection {
+            rule_id: "process_triage.lifecycle".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "process_triage.lifecycle".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "triage".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&triage_event));
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_handles_rule_id() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleProcessTriageLifecycle::new();
+
+        let by_rule = Detection {
+            rule_id: "process_triage.lifecycle".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "other.event_type".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "triage".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&by_rule));
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_rejects_unrelated_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleProcessTriageLifecycle::new();
+
+        let unrelated = Detection {
+            rule_id: "claude_code.session.end".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "end".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&unrelated));
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_trigger_event_types() {
+        let workflow = HandleProcessTriageLifecycle::new();
+        let types = workflow.trigger_event_types();
+        assert_eq!(types, &["process_triage.lifecycle"]);
+    }
+
+    #[test]
+    fn handle_process_triage_lifecycle_trigger_rule_ids() {
+        let workflow = HandleProcessTriageLifecycle::new();
+        let rule_ids = workflow.trigger_rule_ids();
+        assert_eq!(rule_ids, &["process_triage.lifecycle"]);
+    }
+
+    // ========================================================================
+    // HandleAuthRequired tests
+    // ========================================================================
+
+    #[test]
+    fn handle_auth_required_metadata() {
+        let workflow = HandleAuthRequired::new();
+        assert_eq!(workflow.name(), "handle_auth_required");
+        assert_eq!(
+            workflow.description(),
+            "Centralize auth-required events with strategy selection and cooldown"
+        );
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+        assert_eq!(workflow.steps().len(), 3);
+    }
+
+    #[test]
+    fn handle_auth_required_step_names() {
+        let workflow = HandleAuthRequired::new();
+        let steps = workflow.steps();
+        assert_eq!(steps[0].name, "check_cooldown");
+        assert_eq!(steps[1].name, "classify_auth");
+        assert_eq!(steps[2].name, "record_and_plan");
+    }
+
+    #[test]
+    fn handle_auth_required_handles_auth_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleAuthRequired::new();
+
+        let device_code = Detection {
+            rule_id: "claude_code.auth.device_code".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "auth.device_code".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "device code".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&device_code));
+
+        let auth_error = Detection {
+            event_type: "auth.error".to_string(),
+            ..device_code.clone()
+        };
+        assert!(workflow.handles(&auth_error));
+    }
+
+    #[test]
+    fn handle_auth_required_rejects_non_auth_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleAuthRequired::new();
+
+        let session_event = Detection {
+            rule_id: "claude_code.session.start".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.start".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "session start".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&session_event));
+
+        let error_event = Detection {
+            event_type: "error.network".to_string(),
+            ..session_event
+        };
+        assert!(!workflow.handles(&error_event));
+    }
+
+    #[test]
+    fn handle_auth_required_supported_agent_types() {
+        let workflow = HandleAuthRequired::new();
+        let types = workflow.supported_agent_types();
+        assert!(types.contains(&"codex"));
+        assert!(types.contains(&"claude_code"));
+        assert!(types.contains(&"gemini"));
+    }
+
+    #[test]
+    fn handle_auth_required_with_cooldown() {
+        let workflow = HandleAuthRequired::with_cooldown_ms(2000);
+        assert_eq!(workflow.cooldown_ms, 2000);
+        assert_eq!(workflow.name(), "handle_auth_required");
+    }
+
+    #[test]
+    fn handle_auth_required_default_cooldown() {
+        let workflow = HandleAuthRequired::default();
+        assert_eq!(workflow.cooldown_ms, AUTH_COOLDOWN_MS);
+        assert_eq!(workflow.cooldown_ms, 5 * 60 * 1000);
+    }
+
+    // ========================================================================
+    // HandleClaudeCodeLimits tests
+    // ========================================================================
+
+    #[test]
+    fn handle_claude_code_limits_metadata() {
+        let workflow = HandleClaudeCodeLimits::new();
+        assert_eq!(workflow.name(), "handle_claude_code_limits");
+        assert_eq!(
+            workflow.description(),
+            "Safe-pause on Claude Code usage/rate limits with recovery plan"
+        );
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+        assert_eq!(workflow.steps().len(), 3);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_step_names() {
+        let workflow = HandleClaudeCodeLimits::new();
+        let steps = workflow.steps();
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "check_cooldown");
+        assert_eq!(steps[2].name, "classify_and_record");
+    }
+
+    #[test]
+    fn handle_claude_code_limits_handles_claude_code_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleClaudeCodeLimits::new();
+
+        let usage_reached = Detection {
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Usage limit reached".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&usage_reached));
+
+        let usage_warning = Detection {
+            event_type: "usage.warning".to_string(),
+            ..usage_reached.clone()
+        };
+        assert!(workflow.handles(&usage_warning));
+
+        let rate_limit = Detection {
+            event_type: "rate_limit.detected".to_string(),
+            ..usage_reached.clone()
+        };
+        assert!(workflow.handles(&rate_limit));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_rejects_non_claude_code_agent() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleClaudeCodeLimits::new();
+
+        // Same event type but from Codex — should NOT match
+        let codex_usage = Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Usage limit".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&codex_usage));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_rejects_unrelated_event_types() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleClaudeCodeLimits::new();
+
+        let session_end = Detection {
+            rule_id: "claude_code.session.end".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Session ended".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&session_end));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_with_cooldown() {
+        let workflow = HandleClaudeCodeLimits::with_cooldown_ms(3000);
+        assert_eq!(workflow.cooldown_ms, 3000);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_default_cooldown() {
+        let workflow = HandleClaudeCodeLimits::default();
+        assert_eq!(workflow.cooldown_ms, CLAUDE_CODE_LIMITS_COOLDOWN_MS);
+        assert_eq!(workflow.cooldown_ms, 10 * 60 * 1000);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_usage_reached() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"reset_time": "2026-03-14T12:00:00Z"}
+        });
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "usage_reached");
+        assert_eq!(reset_time.as_deref(), Some("2026-03-14T12:00:00Z"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_rate_limit() {
+        let trigger = serde_json::json!({
+            "event_type": "rate_limit.detected",
+            "extracted": {"retry_after": "30s"}
+        });
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "rate_limit_detected");
+        assert_eq!(reset_time.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_unknown() {
+        let trigger = serde_json::json!({"event_type": "some.other"});
+        let (limit_type, _) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "unknown_limit");
+    }
+
+    // ========================================================================
+    // HandleGeminiQuota tests
+    // ========================================================================
+
+    #[test]
+    fn handle_gemini_quota_metadata() {
+        let workflow = HandleGeminiQuota::new();
+        assert_eq!(workflow.name(), "handle_gemini_quota");
+        assert_eq!(
+            workflow.description(),
+            "Safe-pause on Gemini quota/usage limits with recovery plan"
+        );
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+        assert_eq!(workflow.steps().len(), 3);
+    }
+
+    #[test]
+    fn handle_gemini_quota_step_names() {
+        let workflow = HandleGeminiQuota::new();
+        let steps = workflow.steps();
+        assert_eq!(steps[0].name, "check_guards");
+        assert_eq!(steps[1].name, "check_cooldown");
+        assert_eq!(steps[2].name, "classify_and_record");
+    }
+
+    #[test]
+    fn handle_gemini_quota_handles_gemini_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleGeminiQuota::new();
+
+        let quota_reached = Detection {
+            rule_id: "gemini.usage.reached".to_string(),
+            agent_type: AgentType::Gemini,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Quota exhausted".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&quota_reached));
+
+        let quota_warning = Detection {
+            event_type: "usage.warning".to_string(),
+            ..quota_reached.clone()
+        };
+        assert!(workflow.handles(&quota_warning));
+
+        let rate_limit = Detection {
+            event_type: "rate_limit.detected".to_string(),
+            ..quota_reached.clone()
+        };
+        assert!(workflow.handles(&rate_limit));
+    }
+
+    #[test]
+    fn handle_gemini_quota_rejects_non_gemini_agent() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleGeminiQuota::new();
+
+        let claude_usage = Detection {
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Usage limit".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&claude_usage));
+    }
+
+    #[test]
+    fn handle_gemini_quota_with_cooldown() {
+        let workflow = HandleGeminiQuota::with_cooldown_ms(7000);
+        assert_eq!(workflow.cooldown_ms, 7000);
+    }
+
+    #[test]
+    fn handle_gemini_quota_default_cooldown() {
+        let workflow = HandleGeminiQuota::default();
+        assert_eq!(workflow.cooldown_ms, GEMINI_QUOTA_COOLDOWN_MS);
+        assert_eq!(workflow.cooldown_ms, 10 * 60 * 1000);
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_quota_reached() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"remaining": "0%"}
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_reached");
+        assert_eq!(remaining.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_quota_warning() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.warning",
+            "extracted": {"remaining": "15%"}
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_warning");
+        assert_eq!(remaining.as_deref(), Some("15%"));
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_unknown() {
+        let trigger = serde_json::json!({"event_type": "some.other"});
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "unknown_quota");
+        assert!(remaining.is_none());
+    }
+
+    // ========================================================================
     // HandleOnErrorCassSearch tests (ft-2l9kn)
     // ========================================================================
 
