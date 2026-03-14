@@ -82,6 +82,7 @@ fastmcp = { workspace = true, optional = true }
 toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
+httparse = { version = "1", optional = true }
 # Sync (optional, behind feature)
 asupersync = { workspace = true, optional = true, features = ["tls"] }
 # Distributed mode (optional, behind feature)
@@ -498,7 +499,7 @@ vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
 mcp-client = ["dep:fastmcp"]
-web = ["dep:fastapi", "dep:asupersync"]
+web = ["dep:fastapi", "dep:asupersync", "dep:httparse"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
