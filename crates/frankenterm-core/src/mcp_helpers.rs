@@ -1006,4 +1006,45 @@ mod tests {
         assert_eq!(evidence(&context, "result"), Some("success"));
         assert_eq!(evidence(&context, "elapsed_ms"), Some("12"));
     }
+
+    // ========================================================================
+    // builtin_workflows Tests
+    // ========================================================================
+
+    #[test]
+    fn helpers_builtin_workflows_count() {
+        let config = Config::default();
+        let workflows = super::builtin_workflows(&config);
+        assert_eq!(
+            workflows.len(),
+            10,
+            "helpers builtin_workflows must match mcp.rs (expected 10, got {})",
+            workflows.len()
+        );
+    }
+
+    #[test]
+    fn helpers_builtin_workflows_names_match_mcp() {
+        let config = Config::default();
+        let workflows = super::builtin_workflows(&config);
+        let names: Vec<&str> = workflows.iter().map(|w| w.name()).collect();
+        let expected = [
+            "handle_compaction",
+            "handle_usage_limits",
+            "handle_session_end",
+            "handle_auth_required",
+            "handle_claude_code_limits",
+            "handle_gemini_quota",
+            "handle_process_triage_lifecycle",
+            "handle_on_error_cass_search",
+            "handle_swarm_learning_index",
+            "handle_session_start_context",
+        ];
+        for name in &expected {
+            assert!(
+                names.contains(name),
+                "helpers builtin_workflows missing: {name}"
+            );
+        }
+    }
 }

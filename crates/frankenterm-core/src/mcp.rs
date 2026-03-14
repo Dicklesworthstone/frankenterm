@@ -2777,11 +2777,64 @@ mod tests {
     fn builtin_workflows_not_empty() {
         let config = Config::default();
         let workflows = builtin_workflows(&config);
-        assert!(
-            workflows.len() >= 5,
-            "expected at least 5 builtin workflows, got {}",
+        assert_eq!(
+            workflows.len(),
+            10,
+            "expected exactly 10 builtin workflows, got {}",
             workflows.len()
         );
+    }
+
+    #[test]
+    fn builtin_workflows_names_complete() {
+        let config = Config::default();
+        let workflows = builtin_workflows(&config);
+        let names: Vec<&str> = workflows.iter().map(|w| w.name()).collect();
+        let expected = [
+            "handle_compaction",
+            "handle_usage_limits",
+            "handle_session_end",
+            "handle_auth_required",
+            "handle_claude_code_limits",
+            "handle_gemini_quota",
+            "handle_process_triage_lifecycle",
+            "handle_on_error_cass_search",
+            "handle_swarm_learning_index",
+            "handle_session_start_context",
+        ];
+        for name in &expected {
+            assert!(
+                names.contains(name),
+                "missing builtin workflow: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_workflows_all_have_descriptions() {
+        let config = Config::default();
+        let workflows = builtin_workflows(&config);
+        for wf in &workflows {
+            assert!(
+                !wf.description().is_empty(),
+                "workflow '{}' has empty description",
+                wf.name()
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_workflows_unique_names() {
+        let config = Config::default();
+        let workflows = builtin_workflows(&config);
+        let names: Vec<&str> = workflows.iter().map(|w| w.name()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for name in &names {
+            assert!(
+                seen.insert(name),
+                "duplicate builtin workflow name: {name}"
+            );
+        }
     }
 
     // ── SearchParams deserialization ──────────────────────────────────────
