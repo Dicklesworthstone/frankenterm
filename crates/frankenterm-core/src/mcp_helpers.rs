@@ -22,7 +22,9 @@ use crate::runtime_compat::RuntimeBuilder as CompatRuntimeBuilder;
 use crate::storage::{PaneReservation, StorageHandle};
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
-    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, Workflow, WorkflowRunner,
+    HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd,
+    HandleSessionStartContext, HandleSwarmLearningIndex, HandleUsageLimits, Workflow,
+    WorkflowRunner,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -383,6 +385,9 @@ pub(super) fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
         Arc::new(HandleClaudeCodeLimits::new()),
         Arc::new(HandleGeminiQuota::new()),
         Arc::new(HandleProcessTriageLifecycle::new()),
+        Arc::new(HandleOnErrorCassSearch::new()),
+        Arc::new(HandleSwarmLearningIndex::new()),
+        Arc::new(HandleSessionStartContext::new()),
     ]
 }
 

@@ -65,7 +65,8 @@ use crate::wezterm::{
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd,
-    HandleSwarmLearningIndex, HandleUsageLimits, PaneWorkflowLockManager, Workflow,
+    HandleSessionStartContext, HandleSwarmLearningIndex, HandleUsageLimits,
+    PaneWorkflowLockManager, Workflow,
     WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
 };
 
@@ -113,17 +114,21 @@ use mcp_tools::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
-use mcp_types::{CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms};
+use mcp_types::{
+    CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
+    McpMissionAssignmentData, McpMissionFailureCatalogEntry, McpMissionTransitionInfo,
+    McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData,
+    MissionStateParams, now_ms,
+};
 #[cfg(test)]
 use mcp_types::{
     EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData,
-    McpMissionAssignmentCounters, McpMissionAssignmentData, McpMissionControlData,
-    McpMissionStateData, McpMissionTransitionInfo, McpPaneState, McpRuleItem, McpSearchHit,
-    McpWaitForData, McpWorkflowItem, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
-    MissionPauseParams, MissionStateParams, SearchParams, SendParams, StateParams, TruncationInfo,
-    WaitForParams, WorkflowRunParams, apply_tail_truncation, default_cass_context_lines,
-    default_cass_limit, default_cass_offset, default_cass_timeout_secs, default_events_limit,
-    default_tail, default_timeout_secs, default_ttl_ms, default_wait_tail,
+    McpMissionControlData, McpMissionStateData, McpPaneState, McpRuleItem, McpSearchHit,
+    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
+    MissionPauseParams, SearchParams, SendParams, StateParams, TruncationInfo, WaitForParams,
+    WorkflowRunParams, apply_tail_truncation, default_cass_context_lines, default_cass_limit,
+    default_cass_offset, default_cass_timeout_secs, default_events_limit, default_tail,
+    default_timeout_secs, default_ttl_ms, default_wait_tail,
 };
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
@@ -469,6 +474,7 @@ fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
         Arc::new(HandleProcessTriageLifecycle::new()),
         Arc::new(HandleOnErrorCassSearch::new()),
         Arc::new(HandleSwarmLearningIndex::new()),
+        Arc::new(HandleSessionStartContext::new()),
     ]
 }
 

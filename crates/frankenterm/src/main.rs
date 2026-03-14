@@ -45648,9 +45648,35 @@ log_level = "debug"
                 trigger_event_types: Some(vec!["process_triage.lifecycle".to_string()]),
                 requires_pane: Some(true),
             },
+            RobotWorkflowInfo {
+                name: "handle_on_error_cass_search".to_string(),
+                description: Some(
+                    "Search cass for past fixes when an error pattern is detected".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec![
+                    "error.network".to_string(),
+                    "error.timeout".to_string(),
+                    "error.overloaded".to_string(),
+                    "mux.error".to_string(),
+                ]),
+                requires_pane: Some(true),
+            },
+            RobotWorkflowInfo {
+                name: "handle_swarm_learning_index".to_string(),
+                description: Some(
+                    "Index completed agent sessions into cass for swarm learning".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec![
+                    "session.end".to_string(),
+                    "session.summary".to_string(),
+                ]),
+                requires_pane: Some(true),
+            },
         ];
 
-        assert_eq!(workflows.len(), 8, "must list exactly 8 workflows");
+        assert_eq!(workflows.len(), 10, "must list exactly 10 workflows");
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"handle_compaction"));
         assert!(names.contains(&"handle_usage_limits"));
@@ -45660,6 +45686,8 @@ log_level = "debug"
         assert!(names.contains(&"handle_claude_code_limits"));
         assert!(names.contains(&"handle_gemini_quota"));
         assert!(names.contains(&"handle_process_triage_lifecycle"));
+        assert!(names.contains(&"handle_on_error_cass_search"));
+        assert!(names.contains(&"handle_swarm_learning_index"));
         assert!(
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"

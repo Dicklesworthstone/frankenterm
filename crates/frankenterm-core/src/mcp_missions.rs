@@ -306,17 +306,17 @@ pub(super) fn mcp_build_mission_assignments(
 
         // Apply filters
         if let Some(ref f) = filters.run_state {
-            if run_state != f.as_str() {
+            if run_state != *f {
                 continue;
             }
         }
         if let Some(ref f) = filters.agent_state {
-            if agent_state != f.as_str() {
+            if agent_state != *f {
                 continue;
             }
         }
         if let Some(ref f) = filters.action_state {
-            if action_state != f.as_str() {
+            if action_state != *f {
                 continue;
             }
         }
