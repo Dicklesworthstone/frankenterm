@@ -140,3 +140,136 @@ pub(super) fn redact_json_value(value: &mut serde_json::Value, redactor: &Redact
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value};
+    use crate::policy::Redactor;
+    use crate::web_framework::QueryString;
+
+    // ── parse_limit ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_limit_default_when_absent() {
+        let qs = QueryString::parse("");
+        assert_eq!(parse_limit(&qs), super::DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn parse_limit_explicit_value() {
+        let qs = QueryString::parse("limit=25");
+        assert_eq!(parse_limit(&qs), 25);
+    }
+
+    #[test]
+    fn parse_limit_clamped_to_max() {
+        let qs = QueryString::parse("limit=99999");
+        assert_eq!(parse_limit(&qs), super::MAX_LIMIT);
+    }
+
+    #[test]
+    fn parse_limit_invalid_uses_default() {
+        let qs = QueryString::parse("limit=abc");
+        assert_eq!(parse_limit(&qs), super::DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn parse_limit_zero_is_valid() {
+        let qs = QueryString::parse("limit=0");
+        assert_eq!(parse_limit(&qs), 0);
+    }
+
+    // ── parse_u64 ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_u64_present() {
+        let qs = QueryString::parse("pane=42");
+        assert_eq!(parse_u64(&qs, "pane"), Some(42));
+    }
+
+    #[test]
+    fn parse_u64_absent() {
+        let qs = QueryString::parse("other=1");
+        assert_eq!(parse_u64(&qs, "pane"), None);
+    }
+
+    #[test]
+    fn parse_u64_invalid() {
+        let qs = QueryString::parse("pane=-1");
+        assert_eq!(parse_u64(&qs, "pane"), None);
+    }
+
+    // ── parse_i64 ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_i64_positive() {
+        let qs = QueryString::parse("since=1000");
+        assert_eq!(parse_i64(&qs, "since"), Some(1000));
+    }
+
+    #[test]
+    fn parse_i64_negative() {
+        let qs = QueryString::parse("offset=-500");
+        assert_eq!(parse_i64(&qs, "offset"), Some(-500));
+    }
+
+    #[test]
+    fn parse_i64_absent() {
+        let qs = QueryString::parse("");
+        assert_eq!(parse_i64(&qs, "offset"), None);
+    }
+
+    // ── parse_bool ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bool_true_variants() {
+        for val in ["1", "true", "yes", "TRUE", "Yes", "True"] {
+            let qs = QueryString::parse(&format!("verbose={val}"));
+            assert!(parse_bool(&qs, "verbose"), "expected true for '{val}'");
+        }
+    }
+
+    #[test]
+    fn parse_bool_false_variants() {
+        for val in ["0", "false", "no", "FALSE", "No"] {
+            let qs = QueryString::parse(&format!("verbose={val}"));
+            assert!(!parse_bool(&qs, "verbose"), "expected false for '{val}'");
+        }
+    }
+
+    #[test]
+    fn parse_bool_absent_is_false() {
+        let qs = QueryString::parse("");
+        assert!(!parse_bool(&qs, "verbose"));
+    }
+
+    // ── redact_json_value ────────────────────────────────────────────
+
+    #[test]
+    fn redact_json_value_leaves_non_strings_unchanged() {
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!({"count": 42, "active": true, "empty": null});
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(value["count"], 42);
+        assert_eq!(value["active"], true);
+        assert!(value["empty"].is_null());
+    }
+
+    #[test]
+    fn redact_json_value_recurses_into_arrays() {
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!(["hello", ["nested"]]);
+        redact_json_value(&mut value, &redactor);
+        // Strings are passed through the redactor (which by default returns them unchanged)
+        assert_eq!(value[0], "hello");
+        assert_eq!(value[1][0], "nested");
+    }
+
+    #[test]
+    fn redact_json_value_recurses_into_objects() {
+        let redactor = Redactor::new();
+        let mut value = serde_json::json!({"outer": {"inner": "text"}});
+        redact_json_value(&mut value, &redactor);
+        assert_eq!(value["outer"]["inner"], "text");
+    }
+}
