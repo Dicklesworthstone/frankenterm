@@ -2275,4 +2275,92 @@ mod tests {
         assert!(json.get("aborted_at").is_none());
         assert_eq!(json["error_reason"], "already_completed");
     }
+
+    // ========================================================================
+    // Serde roundtrip for PolicyDenied and Error variants
+    // ========================================================================
+
+    #[test]
+    fn exec_result_serde_policy_denied() {
+        let r = WorkflowExecutionResult::PolicyDenied {
+            execution_id: "e-denied".to_string(),
+            step_index: 0,
+            reason: "pane in alt-screen".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_completed());
+        assert!(!back.is_aborted());
+        assert_eq!(back.execution_id(), Some("e-denied"));
+    }
+
+    #[test]
+    fn exec_result_serde_error_with_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: Some("e-err".to_string()),
+            error: "storage unavailable".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_completed());
+        assert_eq!(back.execution_id(), Some("e-err"));
+    }
+
+    #[test]
+    fn exec_result_serde_error_without_id() {
+        let r = WorkflowExecutionResult::Error {
+            execution_id: None,
+            error: "early failure".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: WorkflowExecutionResult = serde_json::from_str(&json).unwrap();
+        assert!(back.execution_id().is_none());
+    }
+
+    // ========================================================================
+    // AbortResult roundtrip
+    // ========================================================================
+
+    #[test]
+    fn abort_result_serializes_all_fields() {
+        let r = AbortResult {
+            aborted: true,
+            execution_id: "e-abort".to_string(),
+            workflow_name: "handle_usage_limits".to_string(),
+            pane_id: 99,
+            previous_status: "running".to_string(),
+            aborted_at_step: 3,
+            reason: Some("operator initiated".to_string()),
+            aborted_at: Some(1710403200000),
+            error_reason: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["aborted"], true);
+        assert_eq!(json["execution_id"], "e-abort");
+        assert_eq!(json["workflow_name"], "handle_usage_limits");
+        assert_eq!(json["pane_id"], 99);
+        assert_eq!(json["previous_status"], "running");
+        assert_eq!(json["aborted_at_step"], 3);
+        assert_eq!(json["reason"], "operator initiated");
+        assert_eq!(json["aborted_at"], 1710403200000_i64);
+        assert!(json.get("error_reason").is_none());
+    }
+
+    // ========================================================================
+    // WorkflowRunnerConfig custom values
+    // ========================================================================
+
+    #[test]
+    fn runner_config_custom_values() {
+        let config = WorkflowRunnerConfig {
+            max_concurrent: 10,
+            step_timeout_ms: 60_000,
+            retry_backoff_multiplier: 1.5,
+            max_retries_per_step: 5,
+        };
+        assert_eq!(config.max_concurrent, 10);
+        assert_eq!(config.step_timeout_ms, 60_000);
+        assert!((config.retry_backoff_multiplier - 1.5).abs() < f64::EPSILON);
+        assert_eq!(config.max_retries_per_step, 5);
+    }
 }
