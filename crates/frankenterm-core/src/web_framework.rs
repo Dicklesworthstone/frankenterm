@@ -98,3 +98,29 @@ impl FrameworkWebRuntime {
         Ok(())
     }
 }
+
+// ── Helper functions ─────────────────────────────────────────────────────
+
+/// Build a JSON response with the given status code.
+pub(crate) fn json_response_with_status<T: serde::Serialize>(
+    status: StatusCode,
+    payload: &T,
+) -> Response {
+    let body = serde_json::to_vec(payload).unwrap_or_default();
+    Response::with_status(status)
+        .header("content-type", b"application/json".to_vec())
+        .body(ResponseBody::Bytes(body))
+}
+
+/// Build an SSE streaming response with standard headers.
+pub(crate) fn sse_stream_response<S>(stream: S) -> Response
+where
+    S: asupersync::stream::Stream<Item = Vec<u8>> + Send + 'static,
+{
+    Response::with_status(StatusCode::OK)
+        .header("content-type", b"text/event-stream".to_vec())
+        .header("cache-control", b"no-cache".to_vec())
+        .header("connection", b"keep-alive".to_vec())
+        .header("x-accel-buffering", b"no".to_vec())
+        .body(ResponseBody::stream(stream))
+}

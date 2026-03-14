@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+#[cfg(test)]
+use serde::Deserialize;
 
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
