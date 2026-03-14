@@ -2292,6 +2292,210 @@ mod tests {
     }
 
     #[test]
+    fn get_lines_rejects_unexpected_response_type() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("unexpected-get-lines.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "unexpected-get-lines-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetLines(_) => Pdu::UnitResponse(UnitResponse {}),
+                            _ => continue,
+                        };
+
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if matches!(decoded.pdu, Pdu::GetLines(_)) {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect(config).await.expect("connect");
+
+            let err = client
+                .get_lines(34, vec![0..3, 5..6])
+                .await
+                .expect_err("get_lines should reject wrong response type");
+            assert!(matches!(
+                &err,
+                DirectMuxError::UnexpectedResponse { expected, got }
+                    if expected == "GetLinesResponse" && got == "UnitResponse"
+            ));
+            assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn request_methods_with_cx_reject_unexpected_response_types() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir
+                .path()
+                .join("unexpected-request-methods-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut unexpected_requests = 0usize;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let payload = GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "unexpected-request-methods-with-cx-test"
+                                        .to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                };
+                                Pdu::GetCodecVersionResponse(payload)
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::GetPaneRenderChanges(_) | Pdu::GetLines(_) => {
+                                unexpected_requests += 1;
+                                Pdu::UnitResponse(UnitResponse {})
+                            }
+                            Pdu::WriteToPane(_) | Pdu::SendPaste(_) => {
+                                unexpected_requests += 1;
+                                Pdu::ListPanesResponse(ListPanesResponse {
+                                    tabs: Vec::new(),
+                                    tab_titles: Vec::new(),
+                                    window_titles: HashMap::new(),
+                                })
+                            }
+                            _ => continue,
+                        };
+
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if unexpected_requests == 4 {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let render_err = client
+                .get_pane_render_changes_with_cx(&cx, 12)
+                .await
+                .expect_err("render changes with cx should reject wrong response type");
+            assert!(matches!(
+                &render_err,
+                DirectMuxError::UnexpectedResponse { expected, got }
+                    if expected == "GetPaneRenderChangesResponse" && got == "UnitResponse"
+            ));
+            assert_eq!(
+                render_err.protocol_error_kind(),
+                ProtocolErrorKind::Recoverable
+            );
+
+            let lines_err = client
+                .get_lines_with_cx(&cx, 34, vec![0..3, 5..6])
+                .await
+                .expect_err("get_lines_with_cx should reject wrong response type");
+            assert!(matches!(
+                &lines_err,
+                DirectMuxError::UnexpectedResponse { expected, got }
+                    if expected == "GetLinesResponse" && got == "UnitResponse"
+            ));
+            assert_eq!(
+                lines_err.protocol_error_kind(),
+                ProtocolErrorKind::Recoverable
+            );
+
+            let write_err = client
+                .write_to_pane_with_cx(&cx, 56, b"hello".to_vec())
+                .await
+                .expect_err("write_to_pane_with_cx should reject wrong response type");
+            assert!(matches!(
+                &write_err,
+                DirectMuxError::UnexpectedResponse { expected, got }
+                    if expected == "UnitResponse" && got == "ListPanesResponse"
+            ));
+            assert_eq!(
+                write_err.protocol_error_kind(),
+                ProtocolErrorKind::Recoverable
+            );
+
+            let paste_err = client
+                .send_paste_with_cx(&cx, 78, "paste me".to_string())
+                .await
+                .expect_err("send_paste_with_cx should reject wrong response type");
+            assert!(matches!(
+                &paste_err,
+                DirectMuxError::UnexpectedResponse { expected, got }
+                    if expected == "UnitResponse" && got == "ListPanesResponse"
+            ));
+            assert_eq!(
+                paste_err.protocol_error_kind(),
+                ProtocolErrorKind::Recoverable
+            );
+
+            drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
     fn list_panes_wire_frame_matches_codec_encoding() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3899,6 +4103,23 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn connect_with_cx_to_missing_socket_returns_error() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let config = DirectMuxClientConfig::default()
+                .with_socket_path("/tmp/wa-test-nonexistent-socket-with-cx-12345.sock");
+            let err = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .unwrap_err();
+            match err {
+                DirectMuxError::SocketNotFound(_) => {}
+                other => panic!("expected SocketNotFound, got: {other}"),
+            }
+        });
+    }
+
     #[test]
     fn connect_times_out_when_server_stalls_during_codec_handshake() {
         run_async_test(async {
@@ -4604,6 +4825,113 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_panes_with_cx_handles_partial_frame_reads() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("partial-frame-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for partial-frame with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "partial-frame-with-cx-test"
+                                                .to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    let response = Pdu::ListPanesResponse(ListPanesResponse {
+                                        tabs: Vec::new(),
+                                        tab_titles: Vec::new(),
+                                        window_titles: HashMap::new(),
+                                    });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    assert!(
+                                        out.len() > 1,
+                                        "encoded frame should be splittable for partial-read test"
+                                    );
+                                    let split = (out.len() / 2).max(1).min(out.len() - 1);
+                                    stream
+                                        .write_all(&out[..split])
+                                        .await
+                                        .expect("write first frame chunk");
+                                    sleep(Duration::from_millis(20)).await;
+                                    stream
+                                        .write_all(&out[split..])
+                                        .await
+                                        .expect("write second frame chunk");
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let panes = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect("list_panes_with_cx should succeed with split response frame");
+            assert!(panes.tabs.is_empty());
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
     #[test]
     fn list_panes_rejects_oversized_response_frame() {
         run_async_test(async {
@@ -4934,6 +5262,50 @@ mod tests {
 
             let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
             let err = DirectMuxClient::connect(config).await.unwrap_err();
+            match err {
+                DirectMuxError::IncompatibleCodec { local, remote, .. } => {
+                    assert_eq!(local, CODEC_VERSION);
+                    assert_eq!(remote, CODEC_VERSION + 999);
+                }
+                other => panic!("expected IncompatibleCodec, got: {other}"),
+            }
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn incompatible_codec_version_rejected_with_cx() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("mux-incompat-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path).await.expect("bind");
+
+            task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut temp = vec![0u8; 4096];
+                let read = unix_stream_read(&mut stream, &mut temp)
+                    .await
+                    .expect("read");
+                read_buf.extend_from_slice(&temp[..read]);
+                if let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                    let response = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                        codec_vers: CODEC_VERSION + 999,
+                        version_string: "incompatible-wezterm-with-cx".to_string(),
+                        executable_path: PathBuf::from("/bin/wezterm"),
+                        config_file_path: None,
+                    });
+                    let mut out = Vec::new();
+                    response.encode(&mut out, decoded.serial).expect("encode");
+                    stream.write_all(&out).await.expect("write");
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let err = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .unwrap_err();
             match err {
                 DirectMuxError::IncompatibleCodec { local, remote, .. } => {
                     assert_eq!(local, CODEC_VERSION);
