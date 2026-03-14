@@ -1,7 +1,7 @@
 //! Structured web error surface for Wave 4B migration.
 
 use crate::VERSION;
-use crate::web_framework::{Response, ResponseBody, StatusCode};
+use crate::web_framework::{Response, StatusCode, json_response_with_status};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -42,13 +42,10 @@ impl ApiResponse<()> {
 
 pub(super) fn json_ok<T: Serialize>(data: T) -> Response {
     let resp = ApiResponse::success(data);
-    Response::json(&resp).unwrap_or_else(|_| Response::internal_error())
+    json_response_with_status(StatusCode::OK, &resp)
 }
 
 pub(super) fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     let resp = ApiResponse::<()>::error(code, message);
-    let body = serde_json::to_vec(&resp).unwrap_or_default();
-    Response::with_status(status)
-        .header("content-type", b"application/json".to_vec())
-        .body(ResponseBody::Bytes(body))
+    json_response_with_status(status, &resp)
 }

@@ -13,7 +13,7 @@ use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
 use crate::runtime_compat::{mpsc, select, sleep, task, timeout};
 use crate::storage::{SegmentScanQuery, StorageHandle};
-use crate::web_framework::{QueryString, Request, Response, ResponseBody, StatusCode};
+use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
 use asupersync::stream::Stream;
 use serde_json::json;
 use std::pin::Pin;
@@ -165,12 +165,7 @@ where
     }
 
     fn into_response(self) -> Response {
-        Response::with_status(StatusCode::OK)
-            .header("content-type", b"text/event-stream".to_vec())
-            .header("cache-control", b"no-cache".to_vec())
-            .header("connection", b"keep-alive".to_vec())
-            .header("x-accel-buffering", b"no".to_vec())
-            .body(ResponseBody::stream(self.stream))
+        sse_stream_response(self.stream)
     }
 }
 
