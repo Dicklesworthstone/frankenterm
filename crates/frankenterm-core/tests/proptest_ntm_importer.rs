@@ -471,12 +471,19 @@ fn arb_import_severity() -> impl Strategy<Value = ImportSeverity> {
 
 fn arb_translated_step_type() -> impl Strategy<Value = TranslatedStepType> {
     prop_oneof![
-        arb_ni_str().prop_map(|t| TranslatedStepType::SendText { text: t, pane_filter: None }),
-        arb_ni_str().prop_map(|p| TranslatedStepType::WaitFor { pattern: p, timeout_ms: Some(5000) }),
+        arb_ni_str().prop_map(|t| TranslatedStepType::SendText {
+            text: t,
+            pane_filter: None
+        }),
+        arb_ni_str().prop_map(|p| TranslatedStepType::WaitFor {
+            pattern: p,
+            timeout_ms: Some(5000)
+        }),
         arb_ni_str().prop_map(|c| TranslatedStepType::Assert { condition: c }),
         (100u64..10_000).prop_map(|d| TranslatedStepType::Sleep { duration_ms: d }),
         arb_ni_str().prop_map(|a| TranslatedStepType::Unsupported {
-            original_action: a, params: HashMap::new(),
+            original_action: a,
+            params: HashMap::new(),
         }),
     ]
 }

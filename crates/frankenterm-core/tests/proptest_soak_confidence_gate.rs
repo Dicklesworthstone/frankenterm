@@ -422,30 +422,61 @@ fn arb_scg_str() -> impl Strategy<Value = String> {
 }
 
 fn arb_cell_telemetry() -> impl Strategy<Value = CellTelemetry> {
-    (0u64..1000, 0u64..1000, 0u64..100, 0u64..500, 0u64..500, 0u64..100, 0u64..50, 0u64..50)
-        .prop_map(|(attempted, succeeded, failed, spawned, completed, cancelled, faults, recoveries)| {
-            CellTelemetry {
-                ops_attempted: attempted, ops_succeeded: succeeded, ops_failed: failed,
-                tasks_spawned: spawned, tasks_completed: completed, tasks_cancelled: cancelled,
-                faults_injected: faults, recoveries,
-            }
-        })
+    (
+        0u64..1000,
+        0u64..1000,
+        0u64..100,
+        0u64..500,
+        0u64..500,
+        0u64..100,
+        0u64..50,
+        0u64..50,
+    )
+        .prop_map(
+            |(attempted, succeeded, failed, spawned, completed, cancelled, faults, recoveries)| {
+                CellTelemetry {
+                    ops_attempted: attempted,
+                    ops_succeeded: succeeded,
+                    ops_failed: failed,
+                    tasks_spawned: spawned,
+                    tasks_completed: completed,
+                    tasks_cancelled: cancelled,
+                    faults_injected: faults,
+                    recoveries,
+                }
+            },
+        )
 }
 
 fn arb_cell_result() -> impl Strategy<Value = CellResult> {
     (
-        arb_scg_str(), arb_journey_category(), arb_workload_profile(),
-        arb_failure_injection(), proptest::bool::ANY, proptest::bool::ANY,
-        0u64..60_000, arb_cell_telemetry(),
+        arb_scg_str(),
+        arb_journey_category(),
+        arb_workload_profile(),
+        arb_failure_injection(),
+        proptest::bool::ANY,
+        proptest::bool::ANY,
+        0u64..60_000,
+        arb_cell_telemetry(),
     )
-        .prop_map(|(cell_id, category, workload, injection, passed, blocking, dur, telemetry)| {
-            CellResult {
-                cell_id, category, workload, injection, passed, blocking,
-                duration_ms: dur, failure_reason: None,
-                error_rate: 0.01, p95_latency_ms: 42.5,
-                seed: Some(42), telemetry,
-            }
-        })
+        .prop_map(
+            |(cell_id, category, workload, injection, passed, blocking, dur, telemetry)| {
+                CellResult {
+                    cell_id,
+                    category,
+                    workload,
+                    injection,
+                    passed,
+                    blocking,
+                    duration_ms: dur,
+                    failure_reason: None,
+                    error_rate: 0.01,
+                    p95_latency_ms: 42.5,
+                    seed: Some(42),
+                    telemetry,
+                }
+            },
+        )
 }
 
 proptest! {

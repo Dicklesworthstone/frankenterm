@@ -880,21 +880,40 @@ fn arb_ml_str() -> impl Strategy<Value = String> {
 fn arb_operator_override_kind() -> impl Strategy<Value = OperatorOverrideKind> {
     prop_oneof![
         (arb_ml_str(), arb_ml_str()).prop_map(|(bead, agent)| {
-            OperatorOverrideKind::Pin { bead_id: bead, target_agent: agent }
+            OperatorOverrideKind::Pin {
+                bead_id: bead,
+                target_agent: agent,
+            }
         }),
         arb_ml_str().prop_map(|b| OperatorOverrideKind::Exclude { bead_id: b }),
         arb_ml_str().prop_map(|a| OperatorOverrideKind::ExcludeAgent { agent_id: a }),
         (arb_ml_str(), -100i32..100).prop_map(|(b, d)| {
-            OperatorOverrideKind::Reprioritize { bead_id: b, score_delta: d }
+            OperatorOverrideKind::Reprioritize {
+                bead_id: b,
+                score_delta: d,
+            }
         }),
     ]
 }
 
 fn arb_operator_override() -> impl Strategy<Value = OperatorOverride> {
-    (arb_ml_str(), arb_operator_override_kind(), arb_ml_str(), arb_ml_str(), arb_ml_str(), 0i64..2_000_000_000_000)
+    (
+        arb_ml_str(),
+        arb_operator_override_kind(),
+        arb_ml_str(),
+        arb_ml_str(),
+        arb_ml_str(),
+        0i64..2_000_000_000_000,
+    )
         .prop_map(|(id, kind, by, rc, rationale, at)| OperatorOverride {
-            override_id: id, kind, activated_by: by, reason_code: rc,
-            rationale, activated_at_ms: at, expires_at_ms: None, correlation_id: None,
+            override_id: id,
+            kind,
+            activated_by: by,
+            reason_code: rc,
+            rationale,
+            activated_at_ms: at,
+            expires_at_ms: None,
+            correlation_id: None,
         })
 }
 
@@ -910,7 +929,9 @@ fn arb_conflict_type() -> impl Strategy<Value = ConflictType> {
 fn arb_conflict_resolution() -> impl Strategy<Value = ConflictResolution> {
     prop_oneof![
         (arb_ml_str(), arb_ml_str()).prop_map(|(w, l)| ConflictResolution::AutoResolved {
-            winner_agent: w, loser_agent: l, strategy: DeconflictionStrategy::PriorityWins,
+            winner_agent: w,
+            loser_agent: l,
+            strategy: DeconflictionStrategy::PriorityWins,
         }),
         (0i64..60_000).prop_map(|ms| ConflictResolution::Deferred { retry_after_ms: ms }),
         Just(ConflictResolution::PendingManualResolution),

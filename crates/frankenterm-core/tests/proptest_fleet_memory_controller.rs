@@ -101,7 +101,13 @@ fn arb_fleet_memory_snapshot() -> impl Strategy<Value = FleetMemorySnapshot> {
         prop::collection::vec(arb_fleet_memory_action(), 0..5),
     )
         .prop_map(
-            |(compound_tier, total_evaluations, total_transitions, consecutive_at_tier, last_actions)| {
+            |(
+                compound_tier,
+                total_evaluations,
+                total_transitions,
+                consecutive_at_tier,
+                last_actions,
+            )| {
                 FleetMemorySnapshot {
                     compound_tier,
                     total_evaluations,
@@ -120,12 +126,14 @@ fn arb_decision_record() -> impl Strategy<Value = DecisionRecord> {
         arb_fleet_pressure_tier(),
         prop::collection::vec(arb_fleet_memory_action(), 1..5),
     )
-        .prop_map(|(sequence, signals, compound_tier, actions)| DecisionRecord {
-            sequence,
-            signals,
-            compound_tier,
-            actions,
-        })
+        .prop_map(
+            |(sequence, signals, compound_tier, actions)| DecisionRecord {
+                sequence,
+                signals,
+                compound_tier,
+                actions,
+            },
+        )
 }
 
 // ── Serde Roundtrip Tests ───────────────────────────────────────────────────

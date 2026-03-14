@@ -572,7 +572,6 @@ fn evidence_summary_serializes() {
 // Serde roundtrip tests for 19 uncovered types (PinkForge session 16)
 // =============================================================================
 
-
 fn arb_ce_str() -> impl Strategy<Value = String> {
     "[a-z0-9_]{1,15}"
 }

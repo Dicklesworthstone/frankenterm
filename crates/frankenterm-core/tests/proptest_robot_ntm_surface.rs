@@ -89,13 +89,16 @@ fn arb_string_map() -> impl Strategy<Value = HashMap<String, String>> {
 // =============================================================================
 
 fn arb_ntm_equivalence() -> impl Strategy<Value = NtmEquivalence> {
-    (arb_string_vec(), arb_string(), arb_convergence_classification()).prop_map(
-        |(cmds, domain, classification)| NtmEquivalence {
+    (
+        arb_string_vec(),
+        arb_string(),
+        arb_convergence_classification(),
+    )
+        .prop_map(|(cmds, domain, classification)| NtmEquivalence {
             ntm_commands: cmds,
             census_domain: domain,
             classification,
-        },
-    )
+        })
 }
 
 proptest! {
@@ -179,15 +182,20 @@ fn arb_checkpoint_save_data() -> impl Strategy<Value = CheckpointSaveData> {
 }
 
 fn arb_checkpoint_summary() -> impl Strategy<Value = CheckpointSummary> {
-    (arb_string(), arb_opt_string(), 0..100usize, 0..100000u64, 0..u64::MAX).prop_map(
-        |(id, label, pane_count, size, ts)| CheckpointSummary {
+    (
+        arb_string(),
+        arb_opt_string(),
+        0..100usize,
+        0..100000u64,
+        0..u64::MAX,
+    )
+        .prop_map(|(id, label, pane_count, size, ts)| CheckpointSummary {
             checkpoint_id: id,
             label,
             pane_count,
             size_bytes: size,
             created_at: ts,
-        },
-    )
+        })
 }
 
 fn arb_checkpoint_list_data() -> impl Strategy<Value = CheckpointListData> {
@@ -206,13 +214,15 @@ fn arb_checkpoint_pane_snapshot() -> impl Strategy<Value = CheckpointPaneSnapsho
         any::<bool>(),
         0..10000usize,
     )
-        .prop_map(|(pane_id, title, wd, has_sb, sb_lines)| CheckpointPaneSnapshot {
-            pane_id,
-            title,
-            working_dir: wd,
-            has_scrollback: has_sb,
-            scrollback_lines: sb_lines,
-        })
+        .prop_map(
+            |(pane_id, title, wd, has_sb, sb_lines)| CheckpointPaneSnapshot {
+                pane_id,
+                title,
+                working_dir: wd,
+                has_scrollback: has_sb,
+                scrollback_lines: sb_lines,
+            },
+        )
 }
 
 fn arb_checkpoint_show_data() -> impl Strategy<Value = CheckpointShowData> {
@@ -318,9 +328,7 @@ proptest! {
 fn arb_context_status_request() -> impl Strategy<Value = ContextStatusRequest> {
     prop_oneof![
         Just(ContextStatusRequest { pane_id: None }),
-        (0..1000u64).prop_map(|id| ContextStatusRequest {
-            pane_id: Some(id)
-        }),
+        (0..1000u64).prop_map(|id| ContextStatusRequest { pane_id: Some(id) }),
     ]
 }
 
@@ -413,13 +421,15 @@ fn arb_compaction_event() -> impl Strategy<Value = CompactionEvent> {
         0..500000u64,
         arb_string(),
     )
-        .prop_map(|(ts, before_tok, after_tok, freed, trigger)| CompactionEvent {
-            timestamp_ms: ts,
-            utilization_before: before_tok as f64 / 1_000_000.0,
-            utilization_after: after_tok as f64 / 1_000_000.0,
-            tokens_freed: freed,
-            trigger,
-        })
+        .prop_map(
+            |(ts, before_tok, after_tok, freed, trigger)| CompactionEvent {
+                timestamp_ms: ts,
+                utilization_before: before_tok as f64 / 1_000_000.0,
+                utilization_after: after_tok as f64 / 1_000_000.0,
+                tokens_freed: freed,
+                trigger,
+            },
+        )
 }
 
 fn arb_context_history_data() -> impl Strategy<Value = ContextHistoryData> {
@@ -507,27 +517,23 @@ proptest! {
 // =============================================================================
 
 fn arb_work_claim_request() -> impl Strategy<Value = WorkClaimRequest> {
-    (arb_string(), arb_string()).prop_map(|(item_id, agent_id)| WorkClaimRequest {
-        item_id,
-        agent_id,
-    })
+    (arb_string(), arb_string())
+        .prop_map(|(item_id, agent_id)| WorkClaimRequest { item_id, agent_id })
 }
 
 fn arb_work_release_request() -> impl Strategy<Value = WorkReleaseRequest> {
-    (arb_string(), arb_opt_string()).prop_map(|(item_id, reason)| WorkReleaseRequest {
-        item_id,
-        reason,
-    })
+    (arb_string(), arb_opt_string())
+        .prop_map(|(item_id, reason)| WorkReleaseRequest { item_id, reason })
 }
 
 fn arb_work_complete_request() -> impl Strategy<Value = WorkCompleteRequest> {
-    (arb_string(), arb_opt_string(), arb_string_vec()).prop_map(
-        |(item_id, summary, evidence)| WorkCompleteRequest {
+    (arb_string(), arb_opt_string(), arb_string_vec()).prop_map(|(item_id, summary, evidence)| {
+        WorkCompleteRequest {
             item_id,
             summary,
             evidence,
-        },
-    )
+        }
+    })
 }
 
 fn arb_work_list_request() -> impl Strategy<Value = WorkListRequest> {
@@ -548,20 +554,18 @@ fn arb_work_list_request() -> impl Strategy<Value = WorkListRequest> {
 }
 
 fn arb_work_ready_request() -> impl Strategy<Value = WorkReadyRequest> {
-    (arb_opt_string(), 1..200usize).prop_map(|(agent_id, limit)| WorkReadyRequest {
-        agent_id,
-        limit,
-    })
+    (arb_opt_string(), 1..200usize)
+        .prop_map(|(agent_id, limit)| WorkReadyRequest { agent_id, limit })
 }
 
 fn arb_work_assign_request() -> impl Strategy<Value = WorkAssignRequest> {
-    (arb_string(), arb_string(), arb_opt_string()).prop_map(
-        |(item_id, agent_id, strategy)| WorkAssignRequest {
+    (arb_string(), arb_string(), arb_opt_string()).prop_map(|(item_id, agent_id, strategy)| {
+        WorkAssignRequest {
             item_id,
             agent_id,
             strategy,
-        },
-    )
+        }
+    })
 }
 
 fn arb_work_command() -> impl Strategy<Value = WorkCommand> {
@@ -576,15 +580,22 @@ fn arb_work_command() -> impl Strategy<Value = WorkCommand> {
 }
 
 fn arb_work_claim_data() -> impl Strategy<Value = WorkClaimData> {
-    (arb_string(), arb_string(), arb_string(), 0..10u32, 0..u64::MAX).prop_map(
-        |(item_id, agent_id, title, priority, claimed_at)| WorkClaimData {
-            item_id,
-            agent_id,
-            title,
-            priority,
-            claimed_at,
-        },
+    (
+        arb_string(),
+        arb_string(),
+        arb_string(),
+        0..10u32,
+        0..u64::MAX,
     )
+        .prop_map(
+            |(item_id, agent_id, title, priority, claimed_at)| WorkClaimData {
+                item_id,
+                agent_id,
+                title,
+                priority,
+                claimed_at,
+            },
+        )
 }
 
 fn arb_work_release_data() -> impl Strategy<Value = WorkReleaseData> {
@@ -595,10 +606,8 @@ fn arb_work_release_data() -> impl Strategy<Value = WorkReleaseData> {
 }
 
 fn arb_work_complete_data() -> impl Strategy<Value = WorkCompleteData> {
-    (arb_string(), arb_string_vec()).prop_map(|(item_id, unblocked)| WorkCompleteData {
-        item_id,
-        unblocked,
-    })
+    (arb_string(), arb_string_vec())
+        .prop_map(|(item_id, unblocked)| WorkCompleteData { item_id, unblocked })
 }
 
 fn arb_work_item_summary() -> impl Strategy<Value = WorkItemSummary> {
@@ -648,13 +657,13 @@ fn arb_work_ready_data() -> impl Strategy<Value = WorkReadyData> {
 }
 
 fn arb_work_assign_data() -> impl Strategy<Value = WorkAssignData> {
-    (arb_string(), arb_string(), arb_string()).prop_map(
-        |(item_id, agent_id, strategy_used)| WorkAssignData {
+    (arb_string(), arb_string(), arb_string()).prop_map(|(item_id, agent_id, strategy_used)| {
+        WorkAssignData {
             item_id,
             agent_id,
             strategy_used,
-        },
-    )
+        }
+    })
 }
 
 proptest! {
@@ -734,9 +743,8 @@ fn arb_fleet_scale_request() -> impl Strategy<Value = FleetScaleRequest> {
 }
 
 fn arb_fleet_rebalance_request() -> impl Strategy<Value = FleetRebalanceRequest> {
-    (arb_rebalance_strategy(), any::<bool>()).prop_map(|(strategy, dry_run)| {
-        FleetRebalanceRequest { strategy, dry_run }
-    })
+    (arb_rebalance_strategy(), any::<bool>())
+        .prop_map(|(strategy, dry_run)| FleetRebalanceRequest { strategy, dry_run })
 }
 
 fn arb_fleet_agents_request() -> impl Strategy<Value = FleetAgentsRequest> {
@@ -878,8 +886,7 @@ fn arb_agent_slot_info() -> impl Strategy<Value = AgentSlotInfo> {
 }
 
 fn arb_fleet_agents_data() -> impl Strategy<Value = FleetAgentsData> {
-    prop::collection::vec(arb_agent_slot_info(), 0..5)
-        .prop_map(|agents| FleetAgentsData { agents })
+    prop::collection::vec(arb_agent_slot_info(), 0..5).prop_map(|agents| FleetAgentsData { agents })
 }
 
 proptest! {
@@ -994,14 +1001,18 @@ fn arb_profile_command() -> impl Strategy<Value = ProfileCommand> {
 }
 
 fn arb_profile_summary() -> impl Strategy<Value = ProfileSummary> {
-    (arb_string(), arb_opt_string(), arb_string(), arb_string_vec()).prop_map(
-        |(name, description, role, tags)| ProfileSummary {
+    (
+        arb_string(),
+        arb_opt_string(),
+        arb_string(),
+        arb_string_vec(),
+    )
+        .prop_map(|(name, description, role, tags)| ProfileSummary {
             name,
             description,
             role,
             tags,
-        },
-    )
+        })
 }
 
 fn arb_profile_list_data() -> impl Strategy<Value = ProfileListData> {

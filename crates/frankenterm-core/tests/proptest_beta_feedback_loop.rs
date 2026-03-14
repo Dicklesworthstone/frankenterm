@@ -4,9 +4,9 @@
 //! properties, config defaults, stage ordering, and snapshot consistency.
 
 use frankenterm_core::beta_feedback_loop::{
-    BetaCohort, BetaLoopConfig, BetaLoopController, BetaLoopSnapshot, BetaStage,
-    CohortEvaluation, DecisionReason, FeedbackCategory, FeedbackSeverity, PromotionDecision,
-    QualitativeFeedback, SmoothnessObservation, StageEvaluation,
+    BetaCohort, BetaLoopConfig, BetaLoopController, BetaLoopSnapshot, BetaStage, CohortEvaluation,
+    DecisionReason, FeedbackCategory, FeedbackSeverity, PromotionDecision, QualitativeFeedback,
+    SmoothnessObservation, StageEvaluation,
 };
 use proptest::prelude::*;
 
@@ -99,7 +99,14 @@ fn arb_smoothness_observation() -> impl Strategy<Value = SmoothnessObservation> 
         any::<u64>(),
     )
         .prop_map(
-            |(member_id, smoothness, input_to_paint_us, frame_jitter_us, keystroke_echo_us, timestamp_ms)| {
+            |(
+                member_id,
+                smoothness,
+                input_to_paint_us,
+                frame_jitter_us,
+                keystroke_echo_us,
+                timestamp_ms,
+            )| {
                 SmoothnessObservation {
                     member_id,
                     smoothness,
@@ -152,10 +159,8 @@ fn arb_beta_loop_config() -> impl Strategy<Value = BetaLoopConfig> {
 }
 
 fn arb_decision_reason() -> impl Strategy<Value = DecisionReason> {
-    ("[a-z_]{3,15}", "[a-z ]{5,30}").prop_map(|(code, explanation)| DecisionReason {
-        code,
-        explanation,
-    })
+    ("[a-z_]{3,15}", "[a-z ]{5,30}")
+        .prop_map(|(code, explanation)| DecisionReason { code, explanation })
 }
 
 fn arb_cohort_evaluation() -> impl Strategy<Value = CohortEvaluation> {

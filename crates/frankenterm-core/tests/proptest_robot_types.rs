@@ -1424,9 +1424,7 @@ proptest! {
 // Extended coverage: remaining 67 uncovered types (PinkForge session 16)
 // ============================================================================
 
-use frankenterm_core::plan::{
-    ApprovalState, MissionActorRole, MissionLifecycleState, Outcome,
-};
+use frankenterm_core::plan::{ApprovalState, MissionActorRole, MissionLifecycleState, Outcome};
 
 fn arb_short_str2() -> impl Strategy<Value = String> {
     "[a-z0-9_]{1,15}"
@@ -1461,16 +1459,32 @@ fn arb_approval_state() -> impl Strategy<Value = ApprovalState> {
     prop_oneof![
         Just(ApprovalState::NotRequired),
         (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(by, at)| {
-            ApprovalState::Pending { requested_by: by, requested_at_ms: at }
+            ApprovalState::Pending {
+                requested_by: by,
+                requested_at_ms: at,
+            }
         }),
         (arb_short_str2(), 0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(by, at, hash)| {
-            ApprovalState::Approved { approved_by: by, approved_at_ms: at, approval_code_hash: hash }
+            ApprovalState::Approved {
+                approved_by: by,
+                approved_at_ms: at,
+                approval_code_hash: hash,
+            }
         }),
-        (arb_short_str2(), 0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(by, at, reason)| {
-            ApprovalState::Denied { denied_by: by, denied_at_ms: at, reason_code: reason }
-        }),
+        (arb_short_str2(), 0i64..2_000_000_000_000, arb_short_str2()).prop_map(
+            |(by, at, reason)| {
+                ApprovalState::Denied {
+                    denied_by: by,
+                    denied_at_ms: at,
+                    reason_code: reason,
+                }
+            }
+        ),
         (0i64..2_000_000_000_000, arb_short_str2()).prop_map(|(at, reason)| {
-            ApprovalState::Expired { expired_at_ms: at, reason_code: reason }
+            ApprovalState::Expired {
+                expired_at_ms: at,
+                reason_code: reason,
+            }
         }),
     ]
 }
@@ -1478,13 +1492,23 @@ fn arb_approval_state() -> impl Strategy<Value = ApprovalState> {
 fn arb_outcome() -> impl Strategy<Value = Outcome> {
     prop_oneof![
         (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, at)| {
-            Outcome::Success { reason_code: r, completed_at_ms: at }
+            Outcome::Success {
+                reason_code: r,
+                completed_at_ms: at,
+            }
         }),
         (arb_short_str2(), arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, e, at)| {
-            Outcome::Failed { reason_code: r, error_code: e, completed_at_ms: at }
+            Outcome::Failed {
+                reason_code: r,
+                error_code: e,
+                completed_at_ms: at,
+            }
         }),
         (arb_short_str2(), 0i64..2_000_000_000_000).prop_map(|(r, at)| {
-            Outcome::Cancelled { reason_code: r, completed_at_ms: at }
+            Outcome::Cancelled {
+                reason_code: r,
+                completed_at_ms: at,
+            }
         }),
     ]
 }
@@ -1494,158 +1518,364 @@ fn arb_mission_transition_info() -> impl Strategy<Value = MissionTransitionInfo>
 }
 
 fn arb_mission_failure_catalog_entry() -> impl Strategy<Value = MissionFailureCatalogEntry> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2())
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+    )
         .prop_map(|(rc, ec, term, retry, hh, mh)| MissionFailureCatalogEntry {
-            reason_code: rc, error_code: ec, terminality: term,
-            retryability: retry, human_hint: hh, machine_hint: mh,
+            reason_code: rc,
+            error_code: ec,
+            terminality: term,
+            retryability: retry,
+            human_hint: hh,
+            machine_hint: mh,
         })
 }
 
 fn arb_mission_assignment_counters() -> impl Strategy<Value = MissionAssignmentCounters> {
-    (0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10, 0usize..10)
-        .prop_map(|(pa, ap, dn, ex, su, fa, ca, un)| MissionAssignmentCounters {
-            pending_approval: pa, approved: ap, denied: dn, expired: ex,
-            succeeded: su, failed: fa, cancelled: ca, unresolved: un,
-        })
+    (
+        0usize..10,
+        0usize..10,
+        0usize..10,
+        0usize..10,
+        0usize..10,
+        0usize..10,
+        0usize..10,
+        0usize..10,
+    )
+        .prop_map(
+            |(pa, ap, dn, ex, su, fa, ca, un)| MissionAssignmentCounters {
+                pending_approval: pa,
+                approved: ap,
+                denied: dn,
+                expired: ex,
+                succeeded: su,
+                failed: fa,
+                cancelled: ca,
+                unresolved: un,
+            },
+        )
 }
 
 fn arb_mission_state_filters() -> impl Strategy<Value = MissionStateFilters> {
     (0usize..100,).prop_map(|(limit,)| MissionStateFilters {
-        mission_state: None, run_state: None, agent_state: None,
-        action_state: None, assignment_id: None, assignee: None, limit,
+        mission_state: None,
+        run_state: None,
+        agent_state: None,
+        action_state: None,
+        assignment_id: None,
+        assignee: None,
+        limit,
     })
 }
 
 fn arb_mission_assignment_data() -> impl Strategy<Value = MissionAssignmentData> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_mission_actor_role(),
-     arb_short_str2(), arb_mission_run_state(), arb_mission_agent_state(),
-     arb_mission_action_state(), arb_approval_state())
-        .prop_map(|(aid, cid, assignee, assigned_by, action_type, run_state, agent_state, action_state, approval_state)| {
-            MissionAssignmentData {
-                assignment_id: aid, candidate_id: cid, assignee, assigned_by,
-                action_type, run_state, agent_state, action_state, approval_state,
-                outcome: None, reason_code: None, error_code: None,
-            }
-        })
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_mission_actor_role(),
+        arb_short_str2(),
+        arb_mission_run_state(),
+        arb_mission_agent_state(),
+        arb_mission_action_state(),
+        arb_approval_state(),
+    )
+        .prop_map(
+            |(
+                aid,
+                cid,
+                assignee,
+                assigned_by,
+                action_type,
+                run_state,
+                agent_state,
+                action_state,
+                approval_state,
+            )| {
+                MissionAssignmentData {
+                    assignment_id: aid,
+                    candidate_id: cid,
+                    assignee,
+                    assigned_by,
+                    action_type,
+                    run_state,
+                    agent_state,
+                    action_state,
+                    approval_state,
+                    outcome: None,
+                    reason_code: None,
+                    error_code: None,
+                }
+            },
+        )
 }
 
 fn arb_mission_state_data() -> impl Strategy<Value = MissionStateData> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(),
-     arb_mission_lifecycle_state(), proptest::bool::ANY, 0usize..10, 0usize..10)
-        .prop_map(|(mf, mid, title, hash, ls, matches, cc, ac)| MissionStateData {
-            mission_file: mf, mission_id: mid, title, mission_hash: hash,
-            lifecycle_state: ls, mission_matches_filter: matches,
-            candidate_count: cc, assignment_count: ac,
-            matched_assignment_count: 0, returned_assignment_count: 0,
-            filters: MissionStateFilters {
-                mission_state: None, run_state: None, agent_state: None,
-                action_state: None, assignment_id: None, assignee: None, limit: 100,
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_mission_lifecycle_state(),
+        proptest::bool::ANY,
+        0usize..10,
+        0usize..10,
+    )
+        .prop_map(
+            |(mf, mid, title, hash, ls, matches, cc, ac)| MissionStateData {
+                mission_file: mf,
+                mission_id: mid,
+                title,
+                mission_hash: hash,
+                lifecycle_state: ls,
+                mission_matches_filter: matches,
+                candidate_count: cc,
+                assignment_count: ac,
+                matched_assignment_count: 0,
+                returned_assignment_count: 0,
+                filters: MissionStateFilters {
+                    mission_state: None,
+                    run_state: None,
+                    agent_state: None,
+                    action_state: None,
+                    assignment_id: None,
+                    assignee: None,
+                    limit: 100,
+                },
+                assignment_counters: MissionAssignmentCounters::default(),
+                available_transitions: vec![],
+                assignments: vec![],
             },
-            assignment_counters: MissionAssignmentCounters::default(),
-            available_transitions: vec![], assignments: vec![],
-        })
+        )
 }
 
 fn arb_tx_precondition_data() -> impl Strategy<Value = TxPreconditionData> {
-    (arb_tx_precondition_kind(), arb_short_str2(), proptest::bool::ANY)
-        .prop_map(|(kind, desc, req)| TxPreconditionData { kind, description: desc, required: req })
+    (
+        arb_tx_precondition_kind(),
+        arb_short_str2(),
+        proptest::bool::ANY,
+    )
+        .prop_map(|(kind, desc, req)| TxPreconditionData {
+            kind,
+            description: desc,
+            required: req,
+        })
 }
 
 fn arb_tx_compensating_action_data() -> impl Strategy<Value = TxCompensatingActionData> {
-    (arb_short_str2(), arb_short_str2(), arb_tx_compensation_kind())
-        .prop_map(|(sid, desc, at)| TxCompensatingActionData { step_id: sid, description: desc, action_type: at })
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_tx_compensation_kind(),
+    )
+        .prop_map(|(sid, desc, at)| TxCompensatingActionData {
+            step_id: sid,
+            description: desc,
+            action_type: at,
+        })
 }
 
 fn arb_tx_risk_summary_data() -> impl Strategy<Value = TxRiskSummaryData> {
-    (0usize..50, 0usize..10, 0usize..5, 0usize..10, arb_tx_step_risk())
+    (
+        0usize..50,
+        0usize..10,
+        0usize..5,
+        0usize..10,
+        arb_tx_step_risk(),
+    )
         .prop_map(|(ts, hr, cr, uc, or)| TxRiskSummaryData {
-            total_steps: ts, high_risk_count: hr, critical_risk_count: cr,
-            uncompensated_steps: uc, overall_risk: or,
+            total_steps: ts,
+            high_risk_count: hr,
+            critical_risk_count: cr,
+            uncompensated_steps: uc,
+            overall_risk: or,
         })
 }
 
 fn arb_tx_rejected_edge_data() -> impl Strategy<Value = TxRejectedEdgeData> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2())
-        .prop_map(|(f, t, r)| TxRejectedEdgeData { from_step: f, to_step: t, reason: r })
+    (arb_short_str2(), arb_short_str2(), arb_short_str2()).prop_map(|(f, t, r)| {
+        TxRejectedEdgeData {
+            from_step: f,
+            to_step: t,
+            reason: r,
+        }
+    })
 }
 
 fn arb_tx_step_data() -> impl Strategy<Value = TxStepData> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_tx_step_risk())
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_tx_step_risk(),
+    )
         .prop_map(|(id, bid, aid, desc, risk)| TxStepData {
-            id, bead_id: bid, agent_id: aid, description: desc,
-            depends_on: vec![], preconditions: vec![], compensations: vec![],
-            risk, score: 0.5,
+            id,
+            bead_id: bid,
+            agent_id: aid,
+            description: desc,
+            depends_on: vec![],
+            preconditions: vec![],
+            compensations: vec![],
+            risk,
+            score: 0.5,
         })
 }
 
 fn arb_tx_step_record_data() -> impl Strategy<Value = TxStepRecordData> {
-    (0u64..1000, arb_short_str2(), arb_short_str2(), arb_short_str2(),
-     0u64..2_000_000_000_000, arb_tx_step_outcome(), arb_tx_step_risk(), arb_short_str2(), arb_short_str2())
-        .prop_map(|(ord, sid, idem, eid, ts, outcome, risk, prev, aid)| TxStepRecordData {
-            ordinal: ord, step_id: sid, idem_key: idem, execution_id: eid,
-            timestamp_ms: ts, outcome, risk, prev_hash: prev, agent_id: aid,
-        })
+    (
+        0u64..1000,
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        0u64..2_000_000_000_000,
+        arb_tx_step_outcome(),
+        arb_tx_step_risk(),
+        arb_short_str2(),
+        arb_short_str2(),
+    )
+        .prop_map(
+            |(ord, sid, idem, eid, ts, outcome, risk, prev, aid)| TxStepRecordData {
+                ordinal: ord,
+                step_id: sid,
+                idem_key: idem,
+                execution_id: eid,
+                timestamp_ms: ts,
+                outcome,
+                risk,
+                prev_hash: prev,
+                agent_id: aid,
+            },
+        )
 }
 
 fn arb_tx_chain_verification_data() -> impl Strategy<Value = TxChainVerificationData> {
-    (proptest::bool::ANY, 0usize..100)
-        .prop_map(|(intact, total)| TxChainVerificationData {
-            chain_intact: intact, first_break_at: None, missing_ordinals: vec![], total_records: total,
-        })
+    (proptest::bool::ANY, 0usize..100).prop_map(|(intact, total)| TxChainVerificationData {
+        chain_intact: intact,
+        first_break_at: None,
+        missing_ordinals: vec![],
+        total_records: total,
+    })
 }
 
 fn arb_tx_timeline_entry_data() -> impl Strategy<Value = TxTimelineEntryData> {
-    (0u64..2_000_000_000_000, arb_short_str2(), arb_short_str2(), arb_short_str2(),
-     arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2())
-        .prop_map(|(ts, phase, sid, kind, rc, summary, aid, hash)| TxTimelineEntryData {
-            timestamp_ms: ts, phase, step_id: sid, kind, reason_code: rc,
-            summary, agent_id: aid, ordinal: None, record_hash: hash,
-        })
+    (
+        0u64..2_000_000_000_000,
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+    )
+        .prop_map(
+            |(ts, phase, sid, kind, rc, summary, aid, hash)| TxTimelineEntryData {
+                timestamp_ms: ts,
+                phase,
+                step_id: sid,
+                kind,
+                reason_code: rc,
+                summary,
+                agent_id: aid,
+                ordinal: None,
+                record_hash: hash,
+            },
+        )
 }
 
 fn arb_pipeline_watermark_info() -> impl Strategy<Value = PipelineWatermarkInfo> {
-    (0u64..1000, 0i64..2_000_000_000_000, 0u64..100_000)
-        .prop_map(|(pid, last, total)| PipelineWatermarkInfo {
-            pane_id: pid, last_indexed_at_ms: last, total_docs_indexed: total, session_id: None,
-        })
+    (0u64..1000, 0i64..2_000_000_000_000, 0u64..100_000).prop_map(|(pid, last, total)| {
+        PipelineWatermarkInfo {
+            pane_id: pid,
+            last_indexed_at_ms: last,
+            total_docs_indexed: total,
+            session_id: None,
+        }
+    })
 }
 
 fn arb_rule_item() -> impl Strategy<Value = RuleItem> {
-    (arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(), arb_short_str2(),
-     0usize..10, proptest::bool::ANY)
+    (
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        arb_short_str2(),
+        0usize..10,
+        proptest::bool::ANY,
+    )
         .prop_map(|(id, at, et, sev, desc, ac, hr)| RuleItem {
-            id, agent_type: at, event_type: et, severity: sev, description: desc,
-            workflow: None, anchor_count: ac, has_regex: hr,
+            id,
+            agent_type: at,
+            event_type: et,
+            severity: sev,
+            description: desc,
+            workflow: None,
+            anchor_count: ac,
+            has_regex: hr,
         })
 }
 
 fn arb_rule_match_item() -> impl Strategy<Value = RuleMatchItem> {
-    (arb_short_str2(), 0usize..1000, 0usize..1000, arb_short_str2())
+    (
+        arb_short_str2(),
+        0usize..1000,
+        0usize..1000,
+        arb_short_str2(),
+    )
         .prop_map(|(rid, s, e, mt)| RuleMatchItem {
-            rule_id: rid, start: s, end: e, matched_text: mt, trace: None,
+            rule_id: rid,
+            start: s,
+            end: e,
+            matched_text: mt,
+            trace: None,
         })
 }
 
 fn arb_rule_trace_info() -> impl Strategy<Value = RuleTraceInfo> {
-    (proptest::bool::ANY, proptest::bool::ANY)
-        .prop_map(|(a, r)| RuleTraceInfo { anchors_checked: a, regex_matched: r })
+    (proptest::bool::ANY, proptest::bool::ANY).prop_map(|(a, r)| RuleTraceInfo {
+        anchors_checked: a,
+        regex_matched: r,
+    })
 }
 
 fn arb_workflow_step_log() -> impl Strategy<Value = WorkflowStepLog> {
-    (0usize..100, arb_short_str2(), arb_short_str2(), 0i64..2_000_000_000_000)
+    (
+        0usize..100,
+        arb_short_str2(),
+        arb_short_str2(),
+        0i64..2_000_000_000_000,
+    )
         .prop_map(|(idx, name, rt, started)| WorkflowStepLog {
-            step_index: idx, step_name: name, result_type: rt,
-            step_id: None, step_kind: None, result_data: None, policy_summary: None,
-            verification_refs: None, error_code: None, started_at: started,
-            completed_at: None, duration_ms: None,
+            step_index: idx,
+            step_name: name,
+            result_type: rt,
+            step_id: None,
+            step_kind: None,
+            result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
+            started_at: started,
+            completed_at: None,
+            duration_ms: None,
         })
 }
 
 fn arb_workflow_action_plan() -> impl Strategy<Value = WorkflowActionPlan> {
-    (arb_short_str2(), arb_short_str2())
-        .prop_map(|(pid, hash)| WorkflowActionPlan {
-            plan_id: pid, plan_hash: hash, plan: None, created_at: None,
-        })
+    (arb_short_str2(), arb_short_str2()).prop_map(|(pid, hash)| WorkflowActionPlan {
+        plan_id: pid,
+        plan_hash: hash,
+        plan: None,
+        created_at: None,
+    })
 }
 
 // ============================================================================
