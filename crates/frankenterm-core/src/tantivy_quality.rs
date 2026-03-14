@@ -211,14 +211,16 @@ impl QualityHarness {
         }
 
         let total_queries = results.len();
-        let passed = results.iter().filter(|r| r.passed && r.latency_ok).count();
+        let passed = results.iter().filter(|r| r.passed).count();
         let failed = results
             .iter()
             .filter(|r| !r.passed && r.error.is_none())
             .count();
         let latency_violations = results.iter().filter(|r| !r.latency_ok).count();
         let errors = results.iter().filter(|r| r.error.is_some()).count();
-        let all_passed = passed == total_queries;
+        let all_passed = results
+            .iter()
+            .all(|r| r.passed && r.latency_ok && r.error.is_none());
 
         QualityReport {
             results,
@@ -1000,6 +1002,8 @@ mod tests {
 
         // Assertions pass but latency fails
         assert!(!report.all_passed);
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 0);
         assert_eq!(report.latency_violations, 1);
         assert!(report.results[0].passed); // assertions still pass
         assert!(!report.results[0].latency_ok);

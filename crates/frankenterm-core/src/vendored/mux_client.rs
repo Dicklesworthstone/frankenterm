@@ -1802,7 +1802,7 @@ fn spawn_subscription_task_with_cx(
 #[cfg(feature = "asupersync-runtime")]
 fn inherited_subscription_runtime_handle() -> RuntimeHandle {
     crate::runtime_compat::current_runtime_handle()
-        .expect("pane output subscription started outside Runtime::block_on context")
+        .expect("pane output subscription started without an installed runtime handle")
 }
 
 impl Drop for PaneOutputSubscription {
@@ -1840,7 +1840,7 @@ pub fn subscribe_pane_output_with_cx(
     }
 }
 
-/// Start a subscription using ambient runtime spawning.
+/// Start a subscription using the installed runtime handle plus an inherited `Cx`.
 ///
 /// Under `asupersync-runtime`, prefer [`subscribe_pane_output_with_cx`] so the
 /// background poller and receiver path share an explicit caller-owned `Cx`.

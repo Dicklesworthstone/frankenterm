@@ -150,7 +150,7 @@ thread_local! {
 }
 
 /// Install an asupersync `RuntimeHandle` into thread-local storage for
-/// ambient `task::spawn` access.
+/// ambient `task::spawn` access and inherited-handle helper paths.
 ///
 /// The `runtime_compat::Runtime::block_on` wrapper calls this automatically.
 /// Test fixtures using the raw asupersync runtime should call this manually.
@@ -175,13 +175,6 @@ pub fn clear_runtime_handle() {
 /// No-op for builds that do not install an asupersync runtime handle.
 #[cfg(not(feature = "asupersync-runtime"))]
 pub fn clear_runtime_handle() {}
-
-/// No runtime handle is installed when the asupersync runtime feature is off.
-#[cfg(not(feature = "asupersync-runtime"))]
-#[must_use]
-pub fn current_runtime_handle() -> Option<()> {
-    None
-}
 
 #[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]

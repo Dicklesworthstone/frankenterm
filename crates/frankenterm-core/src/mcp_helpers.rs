@@ -2,7 +2,9 @@
 //!
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
-use super::{CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms};
+use super::mcp_types::{
+    CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms,
+};
 use crate::Result;
 use crate::agent_provider::AgentProvider;
 use crate::cass::CassAgent;
