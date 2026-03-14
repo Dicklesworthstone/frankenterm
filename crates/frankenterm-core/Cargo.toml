@@ -364,6 +364,10 @@ harness = false
 name = "scan_pipeline"
 harness = false
 
+[[bench]]
+name = "input_latency_bench"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
