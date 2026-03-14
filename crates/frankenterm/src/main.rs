@@ -8326,6 +8326,12 @@ fn resolve_workflow(
         "handle_process_triage_lifecycle" => Some(std::sync::Arc::new(
             frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
         )),
+        "handle_on_error_cass_search" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleOnErrorCassSearch::new(),
+        )),
+        "handle_swarm_learning_index" => Some(std::sync::Arc::new(
+            frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
+        )),
         _ => None,
     }
 }
@@ -45739,6 +45745,8 @@ log_level = "debug"
             "handle_claude_code_limits",
             "handle_gemini_quota",
             "handle_process_triage_lifecycle",
+            "handle_on_error_cass_search",
+            "handle_swarm_learning_index",
         ] {
             assert!(
                 resolve_workflow(name, &config).is_some(),
