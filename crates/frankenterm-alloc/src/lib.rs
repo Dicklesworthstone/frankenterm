@@ -67,6 +67,17 @@ pub struct AllocatorStats {
     pub retained: usize,
 }
 
+/// Logical per-pane arena accounting snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneArenaStats {
+    /// Current logical bytes tracked against the pane arena.
+    pub tracked_bytes: usize,
+    /// Peak logical bytes observed for the pane arena.
+    pub peak_tracked_bytes: usize,
+    /// Number of accounting updates applied to the pane arena.
+    pub updates: u64,
+}
+
 /// Errors returned by allocator stats reads.
 #[derive(Debug, thiserror::Error)]
 pub enum AllocatorStatsError {
@@ -138,6 +149,15 @@ impl PaneArena {
     pub const fn arena_id(&self) -> ArenaId {
         self.arena_id
     }
+}
+
+/// Snapshot of a logical pane arena plus its accounting state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneArenaSnapshot {
+    /// Logical pane arena identity.
+    pub arena: PaneArena,
+    /// Current tracked accounting state.
+    pub stats: PaneArenaStats,
 }
 
 /// Safe typed ownership wrapper for per-pane arena allocations.
@@ -217,7 +237,29 @@ impl ReserveOutcome {
 #[derive(Debug, Default)]
 pub struct PaneArenaRegistry {
     next_arena_id: AtomicU32,
-    arenas_by_pane: Mutex<HashMap<u64, PaneArena>>,
+    arenas_by_pane: Mutex<HashMap<u64, PaneArenaState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneArenaState {
+    arena: PaneArena,
+    stats: PaneArenaStats,
+}
+
+impl PaneArenaState {
+    fn new(arena: PaneArena) -> Self {
+        Self {
+            arena,
+            stats: PaneArenaStats::default(),
+        }
+    }
+
+    fn update_tracked_bytes(&mut self, tracked_bytes: usize) -> PaneArenaStats {
+        self.stats.tracked_bytes = tracked_bytes;
+        self.stats.peak_tracked_bytes = self.stats.peak_tracked_bytes.max(tracked_bytes);
+        self.stats.updates = self.stats.updates.saturating_add(1);
+        self.stats
+    }
 }
 
 impl PaneArenaRegistry {
@@ -238,11 +280,11 @@ impl PaneArenaRegistry {
             .expect("pane arena registry lock poisoned");
 
         if let Some(existing) = guard.get(&pane_id).copied() {
-            return ReserveOutcome::Existing(existing);
+            return ReserveOutcome::Existing(existing.arena);
         }
 
         let arena = PaneArena::new(pane_id, self.allocate_arena_id());
-        guard.insert(pane_id, arena);
+        guard.insert(pane_id, PaneArenaState::new(arena));
         ReserveOutcome::Created(arena)
     }
 
@@ -252,6 +294,25 @@ impl PaneArenaRegistry {
             .lock()
             .expect("pane arena registry lock poisoned")
             .remove(&pane_id)
+            .map(|state| state.arena)
+    }
+
+    /// Update the logical tracked byte count for a pane arena.
+    pub fn set_tracked_bytes(&self, pane_id: u64, tracked_bytes: usize) -> Option<PaneArenaStats> {
+        self.arenas_by_pane
+            .lock()
+            .expect("pane arena registry lock poisoned")
+            .get_mut(&pane_id)
+            .map(|state| state.update_tracked_bytes(tracked_bytes))
+    }
+
+    /// Lookup the accounting state for a pane reservation.
+    pub fn stats(&self, pane_id: u64) -> Option<PaneArenaStats> {
+        self.arenas_by_pane
+            .lock()
+            .expect("pane arena registry lock poisoned")
+            .get(&pane_id)
+            .map(|state| state.stats)
     }
 
     /// Lookup an existing pane reservation.
@@ -260,7 +321,7 @@ impl PaneArenaRegistry {
             .lock()
             .expect("pane arena registry lock poisoned")
             .get(&pane_id)
-            .copied()
+            .map(|state| state.arena)
     }
 
     /// Number of tracked pane reservations.
@@ -286,9 +347,26 @@ impl PaneArenaRegistry {
             .lock()
             .expect("pane arena registry lock poisoned")
             .values()
-            .copied()
+            .map(|state| state.arena)
             .collect();
         values.sort_by_key(PaneArena::pane_id);
+        values
+    }
+
+    /// Sorted snapshot of all pane reservations with accounting state.
+    #[must_use]
+    pub fn stats_snapshot(&self) -> Vec<PaneArenaSnapshot> {
+        let mut values: Vec<_> = self
+            .arenas_by_pane
+            .lock()
+            .expect("pane arena registry lock poisoned")
+            .values()
+            .map(|state| PaneArenaSnapshot {
+                arena: state.arena,
+                stats: state.stats,
+            })
+            .collect();
+        values.sort_by_key(|snapshot| snapshot.arena.pane_id());
         values
     }
 
@@ -355,6 +433,36 @@ mod tests {
             .map(|arena| arena.pane_id())
             .collect();
         assert_eq!(panes, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn registry_tracks_logical_bytes_and_peak_usage() {
+        let registry = PaneArenaRegistry::new();
+        let arena = registry.reserve(17).arena();
+
+        let first = registry
+            .set_tracked_bytes(17, 64)
+            .expect("pane arena stats should exist");
+        assert_eq!(first.tracked_bytes, 64);
+        assert_eq!(first.peak_tracked_bytes, 64);
+        assert_eq!(first.updates, 1);
+
+        let second = registry
+            .set_tracked_bytes(17, 32)
+            .expect("pane arena stats should exist");
+        assert_eq!(second.tracked_bytes, 32);
+        assert_eq!(second.peak_tracked_bytes, 64);
+        assert_eq!(second.updates, 2);
+
+        let snapshot = registry.stats_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].arena, arena);
+        assert_eq!(snapshot[0].stats, second);
+
+        let released = registry.release(17).expect("pane arena should exist");
+        assert_eq!(released, arena);
+        assert!(registry.stats(17).is_none());
+        assert!(registry.stats_snapshot().is_empty());
     }
 
     #[test]

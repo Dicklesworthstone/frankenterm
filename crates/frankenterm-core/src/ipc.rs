@@ -1057,14 +1057,17 @@ async fn handle_request_with_context(
             if let Some(registry_lock) = ctx.registry.as_ref() {
                 let (active_count, panes) = {
                     let registry = registry_lock.read().await;
-                    let snapshot = registry.pane_arenas_snapshot();
+                    let snapshot = registry.pane_arena_stats_snapshot();
                     let active_count = snapshot.len();
                     let panes: Vec<_> = snapshot
                         .into_iter()
-                        .map(|arena| {
+                        .map(|snapshot| {
                             serde_json::json!({
-                                "pane_id": arena.pane_id(),
-                                "arena_id": arena.arena_id().raw(),
+                                "pane_id": snapshot.arena.pane_id(),
+                                "arena_id": snapshot.arena.arena_id().raw(),
+                                "tracked_bytes": snapshot.stats.tracked_bytes,
+                                "peak_tracked_bytes": snapshot.stats.peak_tracked_bytes,
+                                "updates": snapshot.stats.updates,
                             })
                         })
                         .collect();
@@ -2124,6 +2127,25 @@ mod tests {
                 .collect();
             assert_eq!(pane_ids, vec![7, 9]);
             assert!(panes.iter().all(|pane| pane.get("arena_id").is_some()));
+            assert!(panes.iter().all(|pane| {
+                pane.get("tracked_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0)
+            }));
+            assert!(panes.iter().all(|pane| {
+                let tracked = pane
+                    .get("tracked_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                pane.get("peak_tracked_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|peak| peak >= tracked)
+            }));
+            assert!(panes.iter().all(|pane| {
+                pane.get("updates")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value >= 1)
+            }));
 
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;

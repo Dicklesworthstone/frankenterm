@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::hash::Hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use frankenterm_alloc::{PaneArena, PaneArenaRegistry};
+use frankenterm_alloc::{PaneArena, PaneArenaRegistry, PaneArenaSnapshot, PaneArenaStats};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -382,6 +382,19 @@ impl PaneEntry {
         self.last_seen_at = epoch_ms();
     }
 
+    /// Approximate logical bytes owned by this pane entry.
+    ///
+    /// This deliberately tracks the dynamic strings/maps held by pane metadata
+    /// rather than pretending we have true allocator arena isolation today.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + pane_info_dynamic_bytes(&self.info)
+            + pane_fingerprint_dynamic_bytes(&self.fingerprint)
+            + observation_dynamic_bytes(&self.observation)
+            + self.pane_uuid.len()
+    }
+
     // NOTE: update_from_status was removed in v0.2.0 to eliminate Lua performance bottleneck.
     // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
     // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
@@ -416,6 +429,46 @@ impl PaneEntry {
     #[must_use]
     pub fn uuid(&self) -> &str {
         &self.pane_uuid
+    }
+}
+
+fn option_string_len(value: &Option<String>) -> usize {
+    value.as_ref().map_or(0, String::len)
+}
+
+fn json_value_dynamic_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items.iter().map(json_value_dynamic_bytes).sum(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, nested)| key.len() + json_value_dynamic_bytes(nested))
+            .sum(),
+    }
+}
+
+fn pane_info_dynamic_bytes(info: &PaneInfo) -> usize {
+    option_string_len(&info.domain_name)
+        + option_string_len(&info.workspace)
+        + option_string_len(&info.title)
+        + option_string_len(&info.cwd)
+        + option_string_len(&info.tty_name)
+        + info
+            .extra
+            .iter()
+            .map(|(key, value)| key.len() + json_value_dynamic_bytes(value))
+            .sum::<usize>()
+}
+
+fn pane_fingerprint_dynamic_bytes(fingerprint: &PaneFingerprint) -> usize {
+    fingerprint.domain.len() + fingerprint.initial_title.len() + fingerprint.initial_cwd.len()
+}
+
+fn observation_dynamic_bytes(observation: &ObservationDecision) -> usize {
+    match observation {
+        ObservationDecision::Observed => 0,
+        ObservationDecision::Ignored { reason } => reason.len(),
     }
 }
 
@@ -814,6 +867,8 @@ impl PaneRegistry {
             expires_at,
         };
         entry.priority_override = Some(override_state.clone());
+        let tracked_bytes = entry.estimated_bytes();
+        let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
         Ok(override_state)
     }
 
@@ -825,6 +880,8 @@ impl PaneRegistry {
             ));
         };
         entry.priority_override = None;
+        let tracked_bytes = entry.estimated_bytes();
+        let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
         Ok(())
     }
 
@@ -833,14 +890,19 @@ impl PaneRegistry {
     /// Returns the number of overrides cleared.
     pub fn purge_expired_priority_overrides(&mut self, now_ms: i64) -> usize {
         let mut cleared = 0usize;
-        for entry in self.entries.values_mut() {
+        let mut tracked_byte_updates = Vec::new();
+        for (pane_id, entry) in &mut self.entries {
             let Some(ref ov) = entry.priority_override else {
                 continue;
             };
             if ov.expires_at.is_some_and(|exp| exp <= now_ms) {
                 entry.priority_override = None;
                 cleared = cleared.saturating_add(1);
+                tracked_byte_updates.push((*pane_id, entry.estimated_bytes()));
             }
+        }
+        for (pane_id, tracked_bytes) in tracked_byte_updates {
+            let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
         }
         cleared
     }
@@ -900,6 +962,8 @@ impl PaneRegistry {
                 }
 
                 entry.update_info(pane);
+                let tracked_bytes = entry.estimated_bytes();
+                let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
             } else {
                 // New pane
                 diff.new_panes.push(pane_id);
@@ -909,8 +973,10 @@ impl PaneRegistry {
                 let pane_arena = self.pane_arenas.reserve(pane_id).arena();
 
                 let entry = PaneEntry::new(pane, fingerprint, observation, pane_arena);
+                let tracked_bytes = entry.estimated_bytes();
                 self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
                 self.entries.insert(pane_id, entry);
+                let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
                 self.trauma_states.insert(
                     pane_id,
                     TraumaState::with_config(self.trauma_guard_config.to_trauma_config()),
@@ -1002,6 +1068,18 @@ impl PaneRegistry {
     #[must_use]
     pub fn pane_arenas_snapshot(&self) -> Vec<PaneArena> {
         self.pane_arenas.snapshot()
+    }
+
+    /// Current accounting snapshot for a pane arena.
+    #[must_use]
+    pub fn pane_arena_stats(&self, pane_id: u64) -> Option<PaneArenaStats> {
+        self.pane_arenas.stats(pane_id)
+    }
+
+    /// Snapshot of active pane-arena reservations with logical byte accounting.
+    #[must_use]
+    pub fn pane_arena_stats_snapshot(&self) -> Vec<PaneArenaSnapshot> {
+        self.pane_arenas.stats_snapshot()
     }
 
     /// Get only observed pane IDs (for tailing)
@@ -3429,14 +3507,37 @@ mod tests {
         assert_eq!(first.pane_id(), 1);
         assert_eq!(second.pane_id(), 2);
         assert_ne!(first.arena_id(), second.arena_id());
+        let first_stats = registry
+            .pane_arena_stats(1)
+            .expect("pane 1 stats should exist");
+        let second_stats = registry
+            .pane_arena_stats(2)
+            .expect("pane 2 stats should exist");
+        assert!(first_stats.tracked_bytes > 0);
+        assert_eq!(first_stats.tracked_bytes, first_stats.peak_tracked_bytes);
+        assert_eq!(first_stats.updates, 1);
+        assert!(second_stats.tracked_bytes > 0);
+        assert_eq!(second_stats.tracked_bytes, second_stats.peak_tracked_bytes);
+        assert_eq!(second_stats.updates, 1);
 
         registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
 
         assert_eq!(registry.pane_arena_count(), 1);
         assert!(registry.pane_arena(2).is_none());
+        assert!(registry.pane_arena_stats(2).is_none());
         let snapshot = registry.pane_arenas_snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].pane_id(), 1);
+        let stats_snapshot = registry.pane_arena_stats_snapshot();
+        assert_eq!(stats_snapshot.len(), 1);
+        assert_eq!(stats_snapshot[0].arena.pane_id(), 1);
+        let remaining_stats = registry
+            .pane_arena_stats(1)
+            .expect("pane 1 stats should still exist");
+        assert!(remaining_stats.tracked_bytes > 0);
+        assert!(remaining_stats.peak_tracked_bytes >= remaining_stats.tracked_bytes);
+        assert!(remaining_stats.updates >= 1);
+        assert_eq!(stats_snapshot[0].stats, remaining_stats);
     }
 
     // =========================================================================
