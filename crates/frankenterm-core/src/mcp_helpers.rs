@@ -545,8 +545,16 @@ pub(super) fn record_mcp_audit_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ActionKind, ActorKind, CompatRuntimeBuilder, Config, DecisionContext, IpcPaneState,
+        MCP_REFRESH_COOLDOWN_MS, PaneCapabilities, PolicyDecision, PolicySurface,
+        SEND_OSC_SEGMENT_LIMIT, StorageHandle, approval_command, check_refresh_cooldown,
+        effective_search_fusion_weights, effective_search_quality_timeout_ms,
+        effective_search_rrf_k, elapsed_ms, mcp_audit_decision_context, policy_reason,
+        record_mcp_audit, redact_mcp_args, resolve_alt_screen_state,
+    };
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
     use tempfile::TempDir;
 
     // ========================================================================
