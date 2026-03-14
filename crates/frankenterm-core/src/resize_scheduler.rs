@@ -940,11 +940,8 @@ impl ResizeScheduler {
         // Storm detection: track per-tab submission rate.
         if let Some(tab) = tab_id {
             if self.config.storm_window_ms > 0 && self.config.storm_threshold_intents > 0 {
+                self.prune_tab_submit_history(tab, submitted_at_ms);
                 let history = self.tab_submit_history.entry(tab).or_default();
-                let cutoff = submitted_at_ms.saturating_sub(self.config.storm_window_ms);
-                while history.front().is_some_and(|&ts| ts < cutoff) {
-                    history.pop_front();
-                }
                 history.push_back(submitted_at_ms);
                 if history.len() as u32 >= self.config.storm_threshold_intents {
                     self.metrics.storm_events_detected =
@@ -1210,6 +1207,11 @@ impl ResizeScheduler {
         self.drop_overdeferred_pending();
 
         let mut candidates = self.collect_candidates();
+        let frame_observed_at_ms = candidates
+            .iter()
+            .map(|candidate| candidate.submitted_at_ms)
+            .max()
+            .unwrap_or(0);
         candidates.sort_by(|left, right| {
             right
                 .score
@@ -1292,7 +1294,7 @@ impl ResizeScheduler {
         for candidate in candidates {
             // Storm per-tab throttle: limit picks from tabs in storm state.
             if let Some(tab) = candidate.tab_id {
-                if self.is_tab_in_storm(tab) {
+                if self.is_tab_in_storm(tab, frame_observed_at_ms) {
                     let picks = tab_picks.get(&tab).copied().unwrap_or(0);
                     if picks >= self.config.max_storm_picks_per_tab {
                         self.metrics.storm_picks_throttled =
@@ -1360,9 +1362,10 @@ impl ResizeScheduler {
                 forced_over_budget_served = true;
             }
 
+            let activation_observed_at_ms = frame_observed_at_ms.max(intent.submitted_at_ms);
             state.active_seq = Some(intent.intent_seq);
             state.active_phase = Some(ResizeExecutionPhase::Preparing);
-            state.active_phase_started_at_ms = Some(intent.submitted_at_ms);
+            state.active_phase_started_at_ms = Some(activation_observed_at_ms);
             state.deferrals = 0;
             state.aging_credit = 0;
 
@@ -1378,7 +1381,7 @@ impl ResizeScheduler {
             self.push_lifecycle_event(
                 intent.pane_id,
                 intent.intent_seq,
-                Some(intent.submitted_at_ms),
+                Some(activation_observed_at_ms),
                 ResizeLifecycleStage::Scheduled,
                 ResizeLifecycleDetail::IntentScheduled {
                     scheduler_class: intent.scheduler_class,
@@ -1390,7 +1393,7 @@ impl ResizeScheduler {
             self.push_lifecycle_event(
                 intent.pane_id,
                 intent.intent_seq,
-                Some(intent.submitted_at_ms),
+                Some(activation_observed_at_ms),
                 ResizeLifecycleStage::Preparing,
                 ResizeLifecycleDetail::ActivePhaseTransition {
                     phase: ResizeExecutionPhase::Preparing,
@@ -1928,13 +1931,32 @@ impl ResizeScheduler {
         }
     }
 
-    fn is_tab_in_storm(&self, tab_id: u64) -> bool {
-        self.config.storm_window_ms > 0
-            && self.config.storm_threshold_intents > 0
-            && self
-                .tab_submit_history
-                .get(&tab_id)
-                .is_some_and(|h| h.len() as u32 >= self.config.storm_threshold_intents)
+    fn is_tab_in_storm(&mut self, tab_id: u64, observed_at_ms: u64) -> bool {
+        if self.config.storm_window_ms == 0 || self.config.storm_threshold_intents == 0 {
+            return false;
+        }
+
+        self.prune_tab_submit_history(tab_id, observed_at_ms);
+        self.tab_submit_history
+            .get(&tab_id)
+            .is_some_and(|h| h.len() as u32 >= self.config.storm_threshold_intents)
+    }
+
+    fn prune_tab_submit_history(&mut self, tab_id: u64, observed_at_ms: u64) {
+        let cutoff = observed_at_ms.saturating_sub(self.config.storm_window_ms);
+        let remove_entry = self
+            .tab_submit_history
+            .get_mut(&tab_id)
+            .is_some_and(|history| {
+                while history.front().is_some_and(|&ts| ts < cutoff) {
+                    history.pop_front();
+                }
+                history.is_empty()
+            });
+
+        if remove_entry {
+            self.tab_submit_history.remove(&tab_id);
+        }
     }
 
     fn push_lifecycle_event(

@@ -288,6 +288,25 @@ pub struct CassContextLine {
     pub extra: HashMap<String, Value>,
 }
 
+/// Parsed output for `cass index`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CassIndexResult {
+    /// Number of sessions indexed in this run.
+    #[serde(default)]
+    pub sessions_indexed: Option<usize>,
+    /// Number of new sessions discovered.
+    #[serde(default)]
+    pub new_sessions: Option<usize>,
+    /// Whether the index operation completed successfully.
+    #[serde(default)]
+    pub success: Option<bool>,
+    /// Duration of the index operation in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Parsed output for `cass status`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CassStatus {
@@ -568,6 +587,26 @@ impl CassClient {
     /// Check cass health via `cass status`.
     pub async fn status(&self) -> Result<CassStatus, CassError> {
         let args = vec!["status".to_string(), "--json".to_string()];
+        let output = self.run(&args).await?;
+        parse_json(&output, self.max_error_bytes)
+    }
+
+    /// Trigger a cass index refresh via `cass index`.
+    ///
+    /// This updates the cass search index with any new or modified session files.
+    /// Used as part of the swarm learning cycle: after an agent session completes,
+    /// indexing makes the session's content searchable for future agents.
+    ///
+    /// Returns the raw JSON output from `cass index --json` on success.
+    pub async fn trigger_index(
+        &self,
+        workspace: Option<&str>,
+    ) -> Result<CassIndexResult, CassError> {
+        let mut args = vec!["index".to_string(), "--json".to_string()];
+        if let Some(ws) = workspace {
+            args.push("--path".to_string());
+            args.push(ws.to_string());
+        }
         let output = self.run(&args).await?;
         parse_json(&output, self.max_error_bytes)
     }

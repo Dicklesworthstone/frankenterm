@@ -189,6 +189,12 @@ impl EventStreamFilter {
             }
         }
 
+        // Handled state only exists for detection events. On the live bus,
+        // every detection is initially unhandled until a workflow records it.
+        if self.unhandled_only && !matches!(event, Event::PatternDetected { .. }) {
+            return false;
+        }
+
         // Severity filter (only applies to PatternDetected)
         if let Some(min_sev) = self.min_severity {
             if let Event::PatternDetected { detection, .. } = event {
@@ -519,26 +525,49 @@ impl EventWaiter {
     /// Subscribes to the bus and blocks until the condition is met or
     /// timeout expires. Returns the matching event or timeout result.
     pub async fn wait(self, bus: &EventBus) -> WaitResult {
+        let Self {
+            condition,
+            filter,
+            timeout,
+        } = self;
         let start = std::time::Instant::now();
         let mut subscriber = bus.subscribe();
 
-        let recv_loop = async {
-            loop {
-                match subscriber.recv().await {
-                    Ok(event) => {
-                        if self.filter.matches_event(&event) && self.condition.matches(&event) {
-                            return event;
+        let recv_loop = async move {
+            match condition {
+                WaitCondition::AllOf { conditions } => {
+                    let mut tracker = AllOfTracker::new(conditions);
+                    loop {
+                        match subscriber.recv().await {
+                            Ok(event) => {
+                                if filter.matches_event(&event) && tracker.check(&event) {
+                                    return event;
+                                }
+                            }
+                            Err(_) => {
+                                // Channel closed or lagged — continue
+                                continue;
+                            }
                         }
                     }
-                    Err(_) => {
-                        // Channel closed or lagged — continue
-                        continue;
-                    }
                 }
-            }
+                condition => loop {
+                    match subscriber.recv().await {
+                        Ok(event) => {
+                            if filter.matches_event(&event) && condition.matches(&event) {
+                                return event;
+                            }
+                        }
+                        Err(_) => {
+                            // Channel closed or lagged — continue
+                            continue;
+                        }
+                    }
+                },
+            };
         };
 
-        match crate::runtime_compat::timeout(self.timeout, recv_loop).await {
+        match crate::runtime_compat::timeout(timeout, recv_loop).await {
             Ok(event) => WaitResult::Matched {
                 event,
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -883,6 +912,7 @@ impl SubscriptionRegistry {
 mod tests {
     use super::*;
     use crate::patterns::{Detection, Severity};
+    use std::sync::Arc;
 
     fn make_detection(rule_id: &str, severity: Severity) -> Detection {
         Detection {
@@ -903,6 +933,30 @@ mod tests {
             pane_uuid: None,
             detection: make_detection(rule_id, Severity::Warning),
             event_id,
+        }
+    }
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build compat runtime for test");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -1045,6 +1099,18 @@ mod tests {
         assert!(!filter.matches_event(&make_pattern_event(2, "test.rule", None)));
         // Wrong rule
         assert!(!filter.matches_event(&make_pattern_event(1, "other.rule", None)));
+    }
+
+    #[test]
+    fn unhandled_only_filter_only_matches_live_detections() {
+        let filter = EventStreamFilter::builder().unhandled_only().build();
+
+        assert!(filter.matches_event(&make_pattern_event(1, "test.rule", None)));
+        assert!(!filter.matches_event(&Event::PaneDiscovered {
+            pane_id: 1,
+            domain: "local".to_string(),
+            title: "test".to_string(),
+        }));
     }
 
     #[test]
@@ -1325,6 +1391,36 @@ mod tests {
             .with_filter(EventStreamFilter::builder().pane_id(1).build());
         // Just verify it builds without panic
         assert_eq!(waiter.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn event_waiter_all_of_waits_for_each_condition() {
+        run_async_test(async {
+            let bus = Arc::new(EventBus::new(16));
+            let waiter = EventWaiter::new(WaitCondition::AllOf {
+                conditions: vec![WaitCondition::rule_id("a"), WaitCondition::rule_id("b")],
+            })
+            .with_timeout(Duration::from_secs(1));
+            let wait_bus = Arc::clone(&bus);
+
+            let wait_task =
+                crate::runtime_compat::task::spawn(async move { waiter.wait(&wait_bus).await });
+
+            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            bus.publish(make_pattern_event(1, "a", Some(1)));
+            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            bus.publish(make_pattern_event(1, "b", Some(2)));
+
+            match wait_task.await.unwrap() {
+                WaitResult::Matched { event, .. } => {
+                    assert!(matches!(
+                        event,
+                        Event::PatternDetected { detection, .. } if detection.rule_id == "b"
+                    ));
+                }
+                other => panic!("expected matched result, got {other:?}"),
+            }
+        });
     }
 
     // --- FilteredEventStream telemetry test ---
