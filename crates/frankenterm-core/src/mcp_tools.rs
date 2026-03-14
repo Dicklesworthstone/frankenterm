@@ -4307,8 +4307,10 @@ mod tests {
         WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
         WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
         WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
-        mcp_get_text_policy_input, mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, serialize_mcp_audit_decision_context,
     };
     use crate::mcp_error::MCP_ERR_INVALID_ARGS;
     use crate::plan::{
@@ -5194,5 +5196,136 @@ mod tests {
             .expect("wa.reserve should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.reserve should require pane_id");
+    }
+
+    // ========================================================================
+    // Policy input helpers — send, workflow, reserve, release
+    // ========================================================================
+
+    #[test]
+    fn mcp_send_text_policy_input_fields() {
+        let caps = PaneCapabilities::unknown();
+        let input = mcp_send_text_policy_input(5, "local", caps, "send summary", "echo hello");
+        assert_eq!(input.action, ActionKind::SendText);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Mux);
+        assert_eq!(input.pane_id, Some(5));
+        assert_eq!(input.domain.as_deref(), Some("local"));
+        assert_eq!(input.text_summary.as_deref(), Some("send summary"));
+        assert_eq!(input.command_text.as_deref(), Some("echo hello"));
+    }
+
+    #[test]
+    fn mcp_workflow_run_policy_input_fields() {
+        let caps = PaneCapabilities::unknown();
+        let input = mcp_workflow_run_policy_input(9, "SSH:host", caps, "run workflow");
+        assert_eq!(input.action, ActionKind::WorkflowRun);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Workflow);
+        assert_eq!(input.pane_id, Some(9));
+        assert_eq!(input.domain.as_deref(), Some("SSH:host"));
+        assert_eq!(input.text_summary.as_deref(), Some("run workflow"));
+    }
+
+    #[test]
+    fn mcp_reserve_pane_policy_input_fields() {
+        let input = mcp_reserve_pane_policy_input(42, "reserve pane 42");
+        assert_eq!(input.action, ActionKind::ReservePane);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Swarm);
+        assert_eq!(input.pane_id, Some(42));
+        assert_eq!(input.command_text.as_deref(), Some("reserve_pane"));
+    }
+
+    #[test]
+    fn mcp_release_pane_policy_input_with_pane_id() {
+        let input = mcp_release_pane_policy_input("release pane 42", Some(42));
+        assert_eq!(input.action, ActionKind::ReleasePane);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Swarm);
+        assert_eq!(input.pane_id, Some(42));
+        assert_eq!(input.command_text.as_deref(), Some("release_reservation"));
+    }
+
+    #[test]
+    fn mcp_release_pane_policy_input_without_pane_id() {
+        let input = mcp_release_pane_policy_input("release all", None);
+        assert_eq!(input.action, ActionKind::ReleasePane);
+        assert_eq!(input.pane_id, None);
+    }
+
+    // ========================================================================
+    // Event mutation decision context
+    // ========================================================================
+
+    #[test]
+    fn mcp_event_mutation_decision_context_fields() {
+        let context = mcp_event_mutation_decision_context(
+            "wa.events_annotate",
+            "events_annotate",
+            123,
+            "add_note",
+            Some("agent-42"),
+            "Annotate event 123",
+            9999,
+        );
+
+        assert_eq!(context.timestamp_ms, 9999);
+        assert_eq!(context.action, ActionKind::ExecCommand);
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+
+        let evidence: std::collections::HashMap<String, String> = context
+            .evidence
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+
+        assert_eq!(evidence.get("tool").map(String::as_str), Some("wa.events_annotate"));
+        assert_eq!(evidence.get("event_action_kind").map(String::as_str), Some("events_annotate"));
+        assert_eq!(evidence.get("event_id").map(String::as_str), Some("123"));
+        assert_eq!(evidence.get("operation").map(String::as_str), Some("add_note"));
+        assert_eq!(evidence.get("actor_id").map(String::as_str), Some("agent-42"));
+        assert_eq!(evidence.get("event_surface").map(String::as_str), Some("mcp"));
+    }
+
+    #[test]
+    fn mcp_event_mutation_decision_context_without_actor_id() {
+        let context = mcp_event_mutation_decision_context(
+            "wa.events_triage",
+            "events_triage",
+            456,
+            "set_state",
+            None,
+            "Triage event 456",
+            1000,
+        );
+
+        let evidence: std::collections::HashMap<String, String> = context
+            .evidence
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+
+        assert!(evidence.get("actor_id").is_none(), "actor_id should be absent when None");
+        assert_eq!(evidence.get("event_id").map(String::as_str), Some("456"));
+    }
+
+    #[test]
+    fn serialize_mcp_audit_decision_context_produces_valid_json() {
+        let context = mcp_event_mutation_decision_context(
+            "wa.events_label",
+            "events_label",
+            789,
+            "add_label",
+            Some("test-agent"),
+            "Label event 789",
+            5000,
+        );
+        let json = serialize_mcp_audit_decision_context(&context);
+        assert!(json.is_some(), "serialization should succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json.unwrap()).expect("should be valid JSON");
+        assert!(parsed.is_object());
     }
 }
