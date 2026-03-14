@@ -5453,4 +5453,248 @@ mod tests {
         let workflow = HandleOnErrorCassSearch::default();
         assert_eq!(workflow.cooldown_ms, ON_ERROR_CASS_COOLDOWN_MS);
     }
+
+    // ========================================================================
+    // HandleSwarmLearningIndex tests (ft-2l9kn)
+    // ========================================================================
+
+    #[test]
+    fn handle_swarm_learning_index_metadata() {
+        let workflow = HandleSwarmLearningIndex::new();
+        assert_eq!(workflow.name(), "handle_swarm_learning_index");
+        assert_eq!(
+            workflow.description(),
+            "Index completed agent sessions into cass for swarm learning"
+        );
+        assert!(!workflow.is_destructive());
+        assert!(!workflow.requires_approval());
+        assert!(workflow.requires_pane());
+        assert_eq!(workflow.steps().len(), 2);
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_step_names() {
+        let workflow = HandleSwarmLearningIndex::new();
+        let steps = workflow.steps();
+        assert_eq!(steps[0].name, "check_cooldown");
+        assert_eq!(steps[1].name, "trigger_cass_index");
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_handles_session_end_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleSwarmLearningIndex::new();
+
+        let session_end = Detection {
+            rule_id: "claude_code.session.end".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Session ended".to_string(),
+            span: (0, 0),
+        };
+        assert!(workflow.handles(&session_end));
+
+        let session_summary = Detection {
+            rule_id: "codex.session.summary".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.summary".to_string(),
+            ..session_end.clone()
+        };
+        assert!(workflow.handles(&session_summary));
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_rejects_non_session_events() {
+        use crate::patterns::{AgentType, Detection, Severity};
+
+        let workflow = HandleSwarmLearningIndex::new();
+
+        let error_event = Detection {
+            rule_id: "claude_code.error.network".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "error.network".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Connection refused".to_string(),
+            span: (0, 0),
+        };
+        assert!(!workflow.handles(&error_event));
+
+        let session_start = Detection {
+            event_type: "session.start".to_string(),
+            ..error_event.clone()
+        };
+        assert!(!workflow.handles(&session_start));
+
+        let auth_event = Detection {
+            event_type: "auth.required".to_string(),
+            ..error_event
+        };
+        assert!(!workflow.handles(&auth_event));
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_trigger_event_types() {
+        let workflow = HandleSwarmLearningIndex::new();
+        let types = workflow.trigger_event_types();
+        assert_eq!(types.len(), 2);
+        assert!(types.contains(&"session.end"));
+        assert!(types.contains(&"session.summary"));
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_supported_agent_types() {
+        let workflow = HandleSwarmLearningIndex::new();
+        let types = workflow.supported_agent_types();
+        assert!(types.contains(&"claude_code"));
+        assert!(types.contains(&"codex"));
+        assert!(types.contains(&"gemini"));
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_with_cooldown() {
+        let workflow = HandleSwarmLearningIndex::with_cooldown_ms(5000);
+        assert_eq!(workflow.cooldown_ms, 5000);
+        assert_eq!(workflow.name(), "handle_swarm_learning_index");
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_default_cooldown() {
+        let workflow = HandleSwarmLearningIndex::default();
+        assert_eq!(workflow.cooldown_ms, SWARM_LEARNING_INDEX_COOLDOWN_MS);
+        assert_eq!(workflow.cooldown_ms, 15 * 60 * 1000);
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_local_pane() {
+        let pane = crate::storage::PaneRecord {
+            pane_id: 10,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some("Working on ft-2l9kn".to_string()),
+            cwd: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(Some(&pane));
+        assert_eq!(
+            workspace.as_deref(),
+            Some("/Users/jemanuel/projects/frankenterm")
+        );
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_file_uri_pane() {
+        let pane = crate::storage::PaneRecord {
+            pane_id: 11,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: None,
+            cwd: Some("file:///home/user/project".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(Some(&pane));
+        assert_eq!(workspace.as_deref(), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_remote_pane_returns_none() {
+        let pane = crate::storage::PaneRecord {
+            pane_id: 12,
+            pane_uuid: None,
+            domain: "SSH:remote-host".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: None,
+            cwd: Some("file://remote-host/home/user/project".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(Some(&pane));
+        assert!(
+            workspace.is_none(),
+            "remote pane should not produce a workspace, got: {workspace:?}"
+        );
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_empty_cwd_returns_none() {
+        let pane = crate::storage::PaneRecord {
+            pane_id: 13,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: None,
+            cwd: Some(String::new()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(Some(&pane));
+        assert!(
+            workspace.is_none(),
+            "empty cwd should not produce workspace, got: {workspace:?}"
+        );
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_none_pane() {
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(None);
+        assert!(workspace.is_none());
+    }
+
+    #[test]
+    fn handle_swarm_learning_index_workspace_from_no_cwd() {
+        let pane = crate::storage::PaneRecord {
+            pane_id: 14,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let workspace = HandleSwarmLearningIndex::workspace_from_pane(Some(&pane));
+        assert!(
+            workspace.is_none(),
+            "pane with no cwd should not produce workspace"
+        );
+    }
 }
