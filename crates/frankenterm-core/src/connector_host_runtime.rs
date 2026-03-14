@@ -1450,4 +1450,232 @@ mod tests {
             SANDBOX_DECISION_HISTORY_CAPACITY
         );
     }
+
+    // ========================================================================
+    // ConnectorProtocolVersion
+    // ========================================================================
+
+    #[test]
+    fn protocol_version_display() {
+        let v = ConnectorProtocolVersion::new(2, 3, 1);
+        assert_eq!(v.to_string(), "2.3.1");
+    }
+
+    #[test]
+    fn protocol_version_default() {
+        let v = ConnectorProtocolVersion::default();
+        assert_eq!(v.to_string(), "1.0.0");
+    }
+
+    #[test]
+    fn protocol_version_serde_roundtrip() {
+        let v = ConnectorProtocolVersion::new(3, 7, 11);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: ConnectorProtocolVersion = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn protocol_version_ordering() {
+        let v1 = ConnectorProtocolVersion::new(1, 0, 0);
+        let v2 = ConnectorProtocolVersion::new(1, 1, 0);
+        let v3 = ConnectorProtocolVersion::new(2, 0, 0);
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+    }
+
+    // ========================================================================
+    // ConnectorFailureClass
+    // ========================================================================
+
+    #[test]
+    fn failure_class_as_str_and_display() {
+        let classes = [
+            (ConnectorFailureClass::Auth, "auth"),
+            (ConnectorFailureClass::Quota, "quota"),
+            (ConnectorFailureClass::Network, "network"),
+            (ConnectorFailureClass::Policy, "policy"),
+            (ConnectorFailureClass::Validation, "validation"),
+            (ConnectorFailureClass::Timeout, "timeout"),
+            (ConnectorFailureClass::Unknown, "unknown"),
+        ];
+        for (class, expected) in &classes {
+            assert_eq!(class.as_str(), *expected);
+            assert_eq!(class.to_string(), *expected);
+        }
+    }
+
+    #[test]
+    fn failure_class_serde_roundtrip() {
+        let classes = [
+            ConnectorFailureClass::Auth,
+            ConnectorFailureClass::Quota,
+            ConnectorFailureClass::Network,
+            ConnectorFailureClass::Policy,
+            ConnectorFailureClass::Validation,
+            ConnectorFailureClass::Timeout,
+            ConnectorFailureClass::Unknown,
+        ];
+        for class in &classes {
+            let json = serde_json::to_string(class).unwrap();
+            let back: ConnectorFailureClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(*class, back);
+        }
+    }
+
+    // ========================================================================
+    // ConnectorRuntimeBudgets
+    // ========================================================================
+
+    #[test]
+    fn budgets_default_values() {
+        let b = ConnectorRuntimeBudgets::default();
+        assert_eq!(b.cpu_millis_per_second, 750);
+        assert_eq!(b.memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(b.io_bytes_per_second, 16 * 1024 * 1024);
+        assert_eq!(b.max_inflight_ops, 256);
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn budgets_validate_rejects_each_zero_field() {
+        let base = ConnectorRuntimeBudgets::default();
+
+        let zero_cpu = ConnectorRuntimeBudgets {
+            cpu_millis_per_second: 0,
+            ..base
+        };
+        assert!(zero_cpu.validate().is_err());
+
+        let zero_mem = ConnectorRuntimeBudgets {
+            memory_bytes: 0,
+            ..base
+        };
+        assert!(zero_mem.validate().is_err());
+
+        let zero_io = ConnectorRuntimeBudgets {
+            io_bytes_per_second: 0,
+            ..base
+        };
+        assert!(zero_io.validate().is_err());
+
+        let zero_ops = ConnectorRuntimeBudgets {
+            max_inflight_ops: 0,
+            ..base
+        };
+        assert!(zero_ops.validate().is_err());
+    }
+
+    #[test]
+    fn budgets_serde_roundtrip() {
+        let b = ConnectorRuntimeBudgets {
+            cpu_millis_per_second: 500,
+            memory_bytes: 1024,
+            io_bytes_per_second: 2048,
+            max_inflight_ops: 10,
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        let back: ConnectorRuntimeBudgets = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
+    }
+
+    // ========================================================================
+    // ConnectorCapability
+    // ========================================================================
+
+    #[test]
+    fn capability_serde_roundtrip_all_variants() {
+        let caps = [
+            ConnectorCapability::Invoke,
+            ConnectorCapability::ReadState,
+            ConnectorCapability::StreamEvents,
+            ConnectorCapability::FilesystemRead,
+            ConnectorCapability::FilesystemWrite,
+            ConnectorCapability::NetworkEgress,
+            ConnectorCapability::SecretBroker,
+            ConnectorCapability::ProcessExec,
+        ];
+        for cap in &caps {
+            let json = serde_json::to_string(cap).unwrap();
+            let back: ConnectorCapability = serde_json::from_str(&json).unwrap();
+            assert_eq!(*cap, back);
+        }
+    }
+
+    // ========================================================================
+    // ConnectorLifecyclePhase and ConnectorLifecycleState
+    // ========================================================================
+
+    #[test]
+    fn lifecycle_phase_serde_roundtrip() {
+        let phases = [
+            ConnectorLifecyclePhase::Stopped,
+            ConnectorLifecyclePhase::Starting,
+            ConnectorLifecyclePhase::Running,
+            ConnectorLifecyclePhase::Degraded,
+            ConnectorLifecyclePhase::Failed,
+        ];
+        for phase in &phases {
+            let json = serde_json::to_string(phase).unwrap();
+            let back: ConnectorLifecyclePhase = serde_json::from_str(&json).unwrap();
+            assert_eq!(*phase, back);
+        }
+    }
+
+    // ========================================================================
+    // ConnectorHostRuntimeError Display
+    // ========================================================================
+
+    #[test]
+    fn error_display_formats() {
+        let errors: Vec<ConnectorHostRuntimeError> = vec![
+            ConnectorHostRuntimeError::InvalidConfig {
+                reason: "bad config".to_string(),
+            },
+            ConnectorHostRuntimeError::InvalidTransition {
+                from: ConnectorLifecyclePhase::Stopped,
+                to: ConnectorLifecyclePhase::Running,
+                reason: "not ready".to_string(),
+            },
+            ConnectorHostRuntimeError::StartupProbeFailed {
+                class: ConnectorFailureClass::Timeout,
+                reason_code: "probe_timeout".to_string(),
+            },
+            ConnectorHostRuntimeError::BudgetExceeded {
+                dimension: "cpu".to_string(),
+            },
+        ];
+        for err in &errors {
+            let display = err.to_string();
+            assert!(!display.is_empty());
+        }
+    }
+
+    // ========================================================================
+    // ConnectorOperationRequest
+    // ========================================================================
+
+    #[test]
+    fn operation_request_constructor() {
+        let req = ConnectorOperationRequest::new(
+            "connector.invoke.test",
+            "corr-abc",
+            ConnectorCapability::Invoke,
+        );
+        assert_eq!(req.action, "connector.invoke.test");
+        assert_eq!(req.correlation_id, "corr-abc");
+        assert_eq!(req.capability, ConnectorCapability::Invoke);
+        assert!(req.target.is_none());
+    }
+
+    #[test]
+    fn operation_request_with_target() {
+        let req = ConnectorOperationRequest::new(
+            "connector.read_state",
+            "corr-xyz",
+            ConnectorCapability::ReadState,
+        )
+        .with_target("pane-42");
+        assert_eq!(req.target.as_deref(), Some("pane-42"));
+    }
 }
