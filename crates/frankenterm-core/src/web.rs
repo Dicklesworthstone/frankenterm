@@ -8,6 +8,7 @@ use crate::events::EventBus;
 use crate::storage::StorageHandle;
 use crate::Result;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::web_framework::{App, FrameworkWebRuntime, QueryString, Request, Response, StatusCode};
