@@ -4,31 +4,14 @@
 //! data endpoints (/panes, /events, /search, /bookmarks, /ruleset-profile, /saved-searches)
 //! backed by shared query helpers, plus SSE subscriptions for live event/delta streams.
 
-use crate::events::{Event, EventBus, RecvError};
-use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};
-use crate::storage::{
-    EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery, StorageHandle,
-};
-use crate::ui_query;
-use crate::{Error, Result, VERSION};
-// TcpListener used indirectly via server submodule
-use asupersync::stream::Stream;
-#[cfg(test)]
-use serde::Serialize;
-use serde_json::json;
-use std::net::{SocketAddr, TcpStream};
+use crate::events::EventBus;
+use crate::storage::StorageHandle;
+use crate::Result;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
 
-use crate::web_framework::{
-    App, BoxFuture, ControlFlow, FrameworkWebRuntime, Method, Middleware, QueryString, Request,
-    RequestContext, Response, ResponseBody, StatusCode,
-};
+use crate::web_framework::{App, FrameworkWebRuntime, QueryString, Request, Response, StatusCode};
 
 mod error;
 mod extractors;
@@ -40,7 +23,40 @@ mod server;
 mod sse;
 mod websocket;
 
+use server::poke_listener;
+pub use server::{run_web_server, start_web_server};
+
+#[cfg(test)]
+use crate::events::{Event, RecvError};
+#[cfg(test)]
+use crate::policy::Redactor;
+#[cfg(test)]
+use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};
+#[cfg(test)]
+use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery};
+#[cfg(test)]
+use crate::ui_query;
+#[cfg(test)]
+use crate::{Error, VERSION};
+#[cfg(test)]
+use serde::Serialize;
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
+use std::net::TcpStream;
+#[cfg(test)]
+use std::task::{Context, Poll};
+#[cfg(test)]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use tracing::{info, warn};
+#[cfg(test)]
+use crate::web_framework::{
+    BoxFuture, ControlFlow, Method, Middleware, RequestContext, ResponseBody,
+};
+#[cfg(test)]
 use error::{json_err, json_ok};
+#[cfg(test)]
 use extractors::{
     parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, require_event_bus,
     require_storage, require_storage_and_event_bus,
@@ -51,13 +67,13 @@ use handlers::{
     HealthResponse, PaneView, PanesResponse, RulesetProfileResponse, RulesetProfileView,
     SavedSearchView, SavedSearchesResponse, SearchHit, SearchResponse,
 };
+#[cfg(test)]
 use handlers::{
     handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
     handle_search, health_response,
 };
+#[cfg(test)]
 use middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
-use server::poke_listener;
-pub use server::{run_web_server, start_web_server};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;

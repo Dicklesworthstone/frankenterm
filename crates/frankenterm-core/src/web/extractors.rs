@@ -94,26 +94,26 @@ pub(super) fn require_storage_and_event_bus(
 /// Parse `?limit=N` with bounds clamping.
 pub(super) fn parse_limit(qs: &QueryString<'_>) -> usize {
     qs.get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v: &str| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_LIMIT)
         .min(MAX_LIMIT)
 }
 
 /// Parse a `u64` query parameter by key.
 pub(super) fn parse_u64(qs: &QueryString<'_>, key: &str) -> Option<u64> {
-    qs.get(key).and_then(|v| v.parse::<u64>().ok())
+    qs.get(key).and_then(|v: &str| v.parse::<u64>().ok())
 }
 
 /// Parse an `i64` query parameter by key.
 pub(super) fn parse_i64(qs: &QueryString<'_>, key: &str) -> Option<i64> {
-    qs.get(key).and_then(|v| v.parse::<i64>().ok())
+    qs.get(key).and_then(|v: &str| v.parse::<i64>().ok())
 }
 
 /// Parse a boolean query parameter (case-insensitive "1", "true", or "yes").
 pub(super) fn parse_bool(qs: &QueryString<'_>, key: &str) -> bool {
-    qs.get(key).is_some_and(|v| {
+    qs.get(key).is_some_and(|v: &str| {
         let lower = v.to_ascii_lowercase();
-        matches!(lower.as_str(), "1" | "true" | "yes")
+        matches!(&*lower, "1" | "true" | "yes")
     })
 }
 
