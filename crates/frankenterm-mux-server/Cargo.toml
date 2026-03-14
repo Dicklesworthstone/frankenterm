@@ -13,11 +13,16 @@ publish = false
 name = "frankenterm-mux-server"
 path = "src/main.rs"
 
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
+
 [dependencies]
 anyhow.workspace = true
 async_ossl.workspace = true
 clap.workspace = true
 config.workspace = true
+frankenterm-alloc = { workspace = true, optional = true }
 libc.workspace = true
 log.workspace = true
 mux.workspace = true

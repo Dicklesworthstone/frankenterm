@@ -1,6 +1,8 @@
 use anyhow::Context;
 use clap::*;
 use config::configuration;
+#[cfg(feature = "jemalloc")]
+use frankenterm_alloc as _;
 use frankenterm_mux_server_impl::update_mux_domains_for_server;
 use mux::Mux;
 use mux::activity::Activity;
@@ -357,6 +359,20 @@ mod tests {
         unsafe {
             std::env::remove_var("WEZTERM_UNIX_SOCKET");
             std::env::remove_var("FRANKENTERM_UNIX_SOCKET");
+        }
+    }
+
+    #[test]
+    fn jemalloc_feature_matches_allocator_backend() {
+        #[cfg(feature = "jemalloc")]
+        {
+            assert!(frankenterm_alloc::jemalloc_enabled());
+            assert_eq!(frankenterm_alloc::allocator_backend().as_str(), "jemalloc");
+        }
+
+        #[cfg(not(feature = "jemalloc"))]
+        {
+            assert_eq!(env!("CARGO_PKG_NAME"), "frankenterm-mux-server");
         }
     }
 
