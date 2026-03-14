@@ -34,6 +34,9 @@ pub enum RestoreError {
     #[error("database error: {0}")]
     Database(String),
 
+    #[error("invalid persisted value for {field}: {value}")]
+    InvalidPersistedValue { field: &'static str, value: i64 },
+
     #[error("no restorable sessions found")]
     NoSessions,
 
@@ -54,6 +57,25 @@ impl From<rusqlite::Error> for RestoreError {
     fn from(e: rusqlite::Error) -> Self {
         RestoreError::Database(e.to_string())
     }
+}
+
+fn decode_u64(value: i64, field: &'static str) -> Result<u64, RestoreError> {
+    u64::try_from(value).map_err(|_| RestoreError::InvalidPersistedValue { field, value })
+}
+
+fn decode_opt_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, RestoreError> {
+    value.map(|v| decode_u64(v, field)).transpose()
+}
+
+fn decode_usize(value: i64, field: &'static str) -> Result<usize, RestoreError> {
+    usize::try_from(value).map_err(|_| RestoreError::InvalidPersistedValue { field, value })
+}
+
+fn decode_opt_usize(
+    value: Option<i64>,
+    field: &'static str,
+) -> Result<Option<usize>, RestoreError> {
+    value.map(|v| decode_usize(v, field)).transpose()
 }
 
 // =============================================================================
@@ -177,20 +199,37 @@ pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, Res
          ORDER BY COALESCE(last_checkpoint_at, created_at) DESC",
     )?;
 
-    let candidates = stmt
+    let raw_candidates = stmt
         .query_map([], |row| {
-            Ok(SessionCandidate {
-                session_id: row.get(0)?,
-                created_at: row.get::<_, i64>(1)? as u64,
-                last_checkpoint_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                topology_json: row.get(3)?,
-                ft_version: row.get(4)?,
-                host_id: row.get(5)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(candidates)
+    raw_candidates
+        .into_iter()
+        .map(
+            |(session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id)| {
+                Ok(SessionCandidate {
+                    session_id,
+                    created_at: decode_u64(created_at, "mux_sessions.created_at")?,
+                    last_checkpoint_at: decode_opt_u64(
+                        last_checkpoint_at,
+                        "mux_sessions.last_checkpoint_at",
+                    )?,
+                    topology_json,
+                    ft_version,
+                    host_id,
+                })
+            },
+        )
+        .collect()
 }
 
 /// Load the latest checkpoint for a session, including pane states.
@@ -240,18 +279,20 @@ pub fn load_checkpoint_by_id(
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(3)?,
             ))
         },
     );
 
-    let (session_id, checkpoint_at, checkpoint_type, pane_count) = match checkpoint {
+    let (session_id, checkpoint_at_raw, checkpoint_type, pane_count_raw) = match checkpoint {
         Ok(c) => c,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(e) => return Err(RestoreError::Database(e.to_string())),
     };
+    let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
+    let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
 
     // Load pane states for this checkpoint ID.
     let mut stmt = conn.prepare(
@@ -263,7 +304,7 @@ pub fn load_checkpoint_by_id(
     let raw_pane_states = stmt
         .query_map([checkpoint_id], |row| {
             Ok((
-                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
@@ -273,7 +314,8 @@ pub fn load_checkpoint_by_id(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut pane_states = Vec::with_capacity(raw_pane_states.len());
-    for (pane_id, cwd, command, terminal_json, agent_json) in raw_pane_states {
+    for (pane_id_raw, cwd, command, terminal_json, agent_json) in raw_pane_states {
+        let pane_id = decode_u64(pane_id_raw, "mux_pane_state.pane_id")?;
         let terminal_state =
             serde_json::from_str::<TerminalState>(&terminal_json).map_err(|error| {
                 RestoreError::CorruptCheckpoint(format!(
@@ -390,22 +432,50 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
          ORDER BY COALESCE(s.last_checkpoint_at, s.created_at) DESC",
     )?;
 
-    let sessions = stmt
+    let raw_sessions = stmt
         .query_map([], |row| {
-            Ok(SessionInfo {
-                session_id: row.get(0)?,
-                created_at: row.get::<_, i64>(1)? as u64,
-                last_checkpoint_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                shutdown_clean: row.get::<_, i64>(3)? != 0,
-                ft_version: row.get(4)?,
-                host_id: row.get(5)?,
-                checkpoint_count: row.get::<_, i64>(6)? as usize,
-                pane_count: row.get::<_, Option<i64>>(7)?.map(|v| v as usize),
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(sessions)
+    raw_sessions
+        .into_iter()
+        .map(
+            |(
+                session_id,
+                created_at,
+                last_checkpoint_at,
+                shutdown_clean,
+                ft_version,
+                host_id,
+                checkpoint_count,
+                pane_count,
+            )| {
+                Ok(SessionInfo {
+                    session_id,
+                    created_at: decode_u64(created_at, "mux_sessions.created_at")?,
+                    last_checkpoint_at: decode_opt_u64(
+                        last_checkpoint_at,
+                        "mux_sessions.last_checkpoint_at",
+                    )?,
+                    shutdown_clean: shutdown_clean != 0,
+                    ft_version,
+                    host_id,
+                    checkpoint_count: decode_usize(checkpoint_count, "session_checkpoints.count")?,
+                    pane_count: decode_opt_usize(pane_count, "session_checkpoints.pane_count")?,
+                })
+            },
+        )
+        .collect()
 }
 
 /// Checkpoint summary for show command.
@@ -432,20 +502,28 @@ pub fn show_session(
              FROM mux_sessions WHERE session_id = ?1",
             [session_id],
             |row| {
-                Ok(SessionCandidate {
-                    session_id: row.get(0)?,
-                    created_at: row.get::<_, i64>(1)? as u64,
-                    last_checkpoint_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    topology_json: row.get(3)?,
-                    ft_version: row.get(4)?,
-                    host_id: row.get(5)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
             },
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => RestoreError::NoSessions,
             other => RestoreError::Database(other.to_string()),
         })?;
+    let session = SessionCandidate {
+        session_id: session.0,
+        created_at: decode_u64(session.1, "mux_sessions.created_at")?,
+        last_checkpoint_at: decode_opt_u64(session.2, "mux_sessions.last_checkpoint_at")?,
+        topology_json: session.3,
+        ft_version: session.4,
+        host_id: session.5,
+    };
 
     // Get checkpoints
     let mut stmt = conn.prepare(
@@ -455,17 +533,32 @@ pub fn show_session(
          ORDER BY checkpoint_at DESC",
     )?;
 
-    let checkpoints = stmt
+    let raw_checkpoints = stmt
         .query_map([session_id], |row| {
-            Ok(CheckpointInfo {
-                id: row.get(0)?,
-                checkpoint_at: row.get::<_, i64>(1)? as u64,
-                checkpoint_type: row.get(2)?,
-                pane_count: row.get::<_, i64>(3)? as usize,
-                total_bytes: row.get::<_, i64>(4)? as usize,
-            })
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+
+    let checkpoints = raw_checkpoints
+        .into_iter()
+        .map(
+            |(id, checkpoint_at, checkpoint_type, pane_count, total_bytes)| {
+                Ok(CheckpointInfo {
+                    id,
+                    checkpoint_at: decode_u64(checkpoint_at, "session_checkpoints.checkpoint_at")?,
+                    checkpoint_type,
+                    pane_count: decode_usize(pane_count, "session_checkpoints.pane_count")?,
+                    total_bytes: decode_usize(total_bytes, "session_checkpoints.total_bytes")?,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, RestoreError>>()?;
 
     Ok((session, checkpoints))
 }
@@ -512,11 +605,11 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
     )?;
 
     Ok(SessionDoctorReport {
-        total_sessions: total_sessions as usize,
-        unclean_sessions: unclean_sessions as usize,
-        total_checkpoints: total_checkpoints as usize,
-        orphaned_pane_states: orphaned_pane_states as usize,
-        total_data_bytes: total_data_bytes as usize,
+        total_sessions: decode_usize(total_sessions, "mux_sessions.count")?,
+        unclean_sessions: decode_usize(unclean_sessions, "mux_sessions.unclean_count")?,
+        total_checkpoints: decode_usize(total_checkpoints, "session_checkpoints.count")?,
+        orphaned_pane_states: decode_usize(orphaned_pane_states, "mux_pane_state.orphaned_count")?,
+        total_data_bytes: decode_usize(total_data_bytes, "session_checkpoints.total_bytes_sum")?,
     })
 }
 
@@ -1664,6 +1757,33 @@ mod tests {
     }
 
     #[test]
+    fn load_latest_checkpoint_rejects_negative_pane_id() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-neg-pane", false);
+        let cp_id = insert_checkpoint(&conn, "sess-neg-pane", 5000, 1);
+
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (?1, ?2, ?3)",
+            params![
+                cp_id,
+                -1i64,
+                r#"{"rows":24,"cols":80,"cursor_row":0,"cursor_col":0,"is_alt_screen":false,"title":"neg"}"#
+            ],
+        )
+        .unwrap();
+
+        let err = load_latest_checkpoint(&db_path, "sess-neg-pane").expect_err("negative pane id");
+        assert!(matches!(
+            err,
+            RestoreError::InvalidPersistedValue {
+                field: "mux_pane_state.pane_id",
+                value: -1
+            }
+        ));
+    }
+
+    #[test]
     fn restore_summary_counts() {
         let mut layout_result = RestoreResult {
             pane_id_map: HashMap::new(),
@@ -1802,6 +1922,27 @@ mod tests {
         let a = sessions.iter().find(|s| s.session_id == "sess-a").unwrap();
         assert!(a.shutdown_clean);
         assert_eq!(a.checkpoint_count, 0);
+    }
+
+    #[test]
+    fn list_sessions_rejects_negative_created_at() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["sess-neg-created", -1i64, topology, "0.1.0", 0i64],
+        )
+        .unwrap();
+
+        let err = list_sessions(&db_path).expect_err("negative created_at");
+        assert!(matches!(
+            err,
+            RestoreError::InvalidPersistedValue {
+                field: "mux_sessions.created_at",
+                value: -1
+            }
+        ));
     }
 
     #[test]
