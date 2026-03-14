@@ -1,6 +1,6 @@
 use crate::domain::ClientInner;
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
+use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -8,8 +8,8 @@ use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
 use mux::domain::DomainId;
 use mux::pane::{
-    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
-    Pattern, SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
+    SearchResult, WithPaneLines, alloc_pane_id,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -137,17 +137,27 @@ impl ClientPane {
     pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
-                *self.mouse_grabbed.lock() = delta.mouse_grabbed;
+                let mouse_grabbed = delta.mouse_grabbed;
+                {
+                    let renderable = self.renderable.lock();
+                    if renderable.get_current_seqno() > delta.seqno {
+                        return Ok(());
+                    }
+                }
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
                 let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines).await;
 
-                self.renderable
+                let applied = self
+                    .renderable
                     .lock()
                     .inner
                     .borrow_mut()
                     .apply_changes_to_surface(delta, bonus_lines);
+                if applied {
+                    *self.mouse_grabbed.lock() = mouse_grabbed;
+                }
             }
             Pdu::SetClipboard(SetClipboard {
                 clipboard,

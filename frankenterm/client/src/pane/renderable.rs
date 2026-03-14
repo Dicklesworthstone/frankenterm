@@ -2,11 +2,11 @@ use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
 use anyhow::anyhow;
 use codec::*;
-use config::{configuration, ConfigHandle};
+use config::{ConfigHandle, configuration};
 use lru::LruCache;
+use mux::Mux;
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::Mux;
 use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
@@ -20,12 +20,20 @@ use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
-use termwiz::surface::{SequenceNo, SEQ_ZERO};
+use termwiz::surface::{SEQ_ZERO, SequenceNo};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+fn initial_last_poll(now: Instant) -> Instant {
+    now.checked_sub(BASE_POLL_INTERVAL).unwrap_or(now)
+}
+
+fn should_apply_unilateral_delta(current_seqno: SequenceNo, delta_seqno: SequenceNo) -> bool {
+    delta_seqno >= current_seqno
+}
 
 #[derive(Debug)]
 enum LineEntry {
@@ -100,7 +108,7 @@ impl RenderableInner {
             client: Arc::clone(client),
             remote_pane_id,
             local_pane_id,
-            last_poll: now,
+            last_poll: initial_last_poll(now),
             dead: false,
             poll_in_progress: AtomicBool::new(false),
             poll_interval: BASE_POLL_INTERVAL,
@@ -308,7 +316,7 @@ impl RenderableInner {
         &mut self,
         delta: GetPaneRenderChangesResponse,
         bonus_lines: Vec<(StableRowIndex, Line)>,
-    ) {
+    ) -> bool {
         log::trace!(
             "apply_changes_to_surface local={} remote={}",
             self.local_pane_id,
@@ -317,6 +325,17 @@ impl RenderableInner {
         let now = Instant::now();
         self.poll_interval = BASE_POLL_INTERVAL;
         self.last_recv_time = now;
+
+        if !should_apply_unilateral_delta(self.seqno, delta.seqno) {
+            log::trace!(
+                "ignoring stale render delta for local={} remote={} seqno {} < {}",
+                self.local_pane_id,
+                self.remote_pane_id,
+                delta.seqno,
+                self.seqno
+            );
+            return false;
+        }
 
         let mut dirty = RangeSet::new();
         for r in delta.dirty_lines {
@@ -423,6 +442,7 @@ impl RenderableInner {
                 }
             }
         }
+        true
     }
 
     pub fn make_all_stale(&mut self) {
@@ -863,5 +883,29 @@ impl RenderableState {
 
     pub fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
         self.inner.borrow().tiered_scrollback_status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BASE_POLL_INTERVAL, initial_last_poll, should_apply_unilateral_delta};
+    use std::time::Instant;
+    use termwiz::surface::SequenceNo;
+
+    #[test]
+    fn initial_last_poll_allows_immediate_first_poll() {
+        let now = Instant::now();
+        let initial = initial_last_poll(now);
+
+        assert!(now.duration_since(initial) >= BASE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn unilateral_deltas_must_not_rewind_seqno() {
+        let current: SequenceNo = 10;
+
+        assert!(should_apply_unilateral_delta(current, 10));
+        assert!(should_apply_unilateral_delta(current, 11));
+        assert!(!should_apply_unilateral_delta(current, 9));
     }
 }
