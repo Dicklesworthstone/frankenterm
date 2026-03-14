@@ -5271,6 +5271,106 @@ mod tests {
         assert_eq!(rule_ids, &["process_triage.lifecycle"]);
     }
 
+    #[test]
+    fn process_triage_plan_stats_empty_trigger() {
+        let trigger = serde_json::json!({});
+        let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.auto_safe_count, 0);
+        assert_eq!(stats.review_count, 0);
+        assert_eq!(stats.protected_count, 0);
+        assert!(!stats.has_protected_destructive);
+    }
+
+    #[test]
+    fn process_triage_plan_stats_with_entries() {
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "plan": {
+                    "entries": [
+                        {"category": "zombie", "action": {"action": "kill"}},
+                        {"category": "stuck_test", "action": {"action": "kill"}},
+                        {"category": "active_agent", "action": {"action": "protect"}},
+                        {"category": "unknown", "action": {"action": "flag_for_review"}},
+                    ]
+                }
+            }
+        });
+        let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
+        assert_eq!(stats.entry_count, 4);
+        assert_eq!(stats.auto_safe_count, 2); // zombie, stuck_test
+        assert_eq!(stats.protected_count, 1); // active_agent
+        assert_eq!(stats.review_count, 1); // unknown
+        assert!(!stats.has_protected_destructive); // "protect" is safe
+    }
+
+    #[test]
+    fn process_triage_plan_stats_protected_destructive() {
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "plan": {
+                    "entries": [
+                        {"category": "system_process", "action": {"action": "kill"}},
+                    ]
+                }
+            }
+        });
+        let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
+        assert_eq!(stats.protected_count, 1);
+        assert!(stats.has_protected_destructive); // "kill" on a protected category
+    }
+
+    #[test]
+    fn process_triage_plan_stats_fallback_paths() {
+        // Plan can come from process_triage/plan, extracted/triage_plan, or triage_plan
+        let trigger = serde_json::json!({
+            "triage_plan": {
+                "entries": [{"category": "duplicate_build", "action": {"action": "kill"}}]
+            }
+        });
+        let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
+        assert_eq!(stats.entry_count, 1);
+        assert_eq!(stats.auto_safe_count, 1);
+    }
+
+    #[test]
+    fn process_triage_plan_stats_explicit_counts_override_inferred() {
+        let trigger = serde_json::json!({
+            "process_triage": {
+                "plan": {
+                    "entries": [
+                        {"category": "zombie", "action": {"action": "kill"}},
+                    ],
+                    "auto_safe_count": 5,
+                    "review_count": 3,
+                    "protected_count": 2,
+                }
+            }
+        });
+        let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger).unwrap();
+        assert_eq!(stats.entry_count, 1);
+        assert_eq!(stats.auto_safe_count, 5); // explicit overrides inferred (1)
+        assert_eq!(stats.review_count, 3);
+        assert_eq!(stats.protected_count, 2);
+    }
+
+    #[test]
+    fn process_triage_category_classification() {
+        // Auto-safe categories
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("zombie"));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("stuck_test"));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("stuck_cli"));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("duplicate_build"));
+        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe("active_agent"));
+        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe("unknown"));
+
+        // Protected categories
+        assert!(HandleProcessTriageLifecycle::category_is_protected("active_agent"));
+        assert!(HandleProcessTriageLifecycle::category_is_protected("system_process"));
+        assert!(!HandleProcessTriageLifecycle::category_is_protected("zombie"));
+        assert!(!HandleProcessTriageLifecycle::category_is_protected("unknown"));
+    }
+
     // ========================================================================
     // HandleAuthRequired tests
     // ========================================================================
