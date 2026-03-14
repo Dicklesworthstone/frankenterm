@@ -5172,6 +5172,113 @@ mod tests {
     }
 
     // ========================================================================
+    // FallbackReason Display and serde
+    // ========================================================================
+
+    #[test]
+    fn fallback_reason_display_variants() {
+        let needs_auth = FallbackReason::NeedsHumanAuth {
+            account: "openai-team".to_string(),
+            detail: "MFA required".to_string(),
+        };
+        assert!(needs_auth.to_string().contains("openai-team"));
+        assert!(needs_auth.to_string().contains("MFA required"));
+
+        let disabled = FallbackReason::FailoverDisabled;
+        assert!(disabled.to_string().contains("disabled"));
+
+        let missing = FallbackReason::ToolMissing {
+            tool: "caut".to_string(),
+        };
+        assert!(missing.to_string().contains("caut"));
+
+        let denied = FallbackReason::PolicyDenied {
+            rule: "alt_screen".to_string(),
+        };
+        assert!(denied.to_string().contains("alt_screen"));
+
+        let exhausted = FallbackReason::AllAccountsExhausted {
+            accounts_checked: 3,
+        };
+        assert!(exhausted.to_string().contains("3"));
+
+        let other = FallbackReason::Other {
+            detail: "unexpected".to_string(),
+        };
+        assert_eq!(other.to_string(), "unexpected");
+    }
+
+    #[test]
+    fn fallback_reason_all_variants_serde_display_consistency() {
+        let reasons = vec![
+            FallbackReason::NeedsHumanAuth {
+                account: "acct".to_string(),
+                detail: "MFA".to_string(),
+            },
+            FallbackReason::FailoverDisabled,
+            FallbackReason::ToolMissing {
+                tool: "caut".to_string(),
+            },
+            FallbackReason::PolicyDenied {
+                rule: "alt_screen".to_string(),
+            },
+            FallbackReason::AllAccountsExhausted {
+                accounts_checked: 5,
+            },
+            FallbackReason::Other {
+                detail: "misc".to_string(),
+            },
+        ];
+        for reason in &reasons {
+            let json = serde_json::to_string(reason).unwrap();
+            let back: FallbackReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(reason.to_string(), back.to_string());
+        }
+    }
+
+    // ========================================================================
+    // Fallback plan builder tests (extended)
+    // ========================================================================
+
+    #[test]
+    fn build_needs_human_auth_plan_includes_resume_step() {
+        let plan = build_needs_human_auth_plan(
+            42,
+            "openai-team",
+            "MFA required",
+            Some("sess-abc"),
+            Some(1710403200000),
+            9999,
+        );
+        assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
+        assert!(plan.operator_steps.iter().any(|s| s.contains("sess-abc")));
+        assert!(plan
+            .operator_steps
+            .iter()
+            .any(|s| s.contains("reset")));
+    }
+
+    #[test]
+    fn build_needs_human_auth_plan_no_session_omits_resume() {
+        let plan = build_needs_human_auth_plan(1, "acme", "password", None, None, 5000);
+        assert!(plan.resume_session_id.is_none());
+        assert!(!plan.operator_steps.iter().any(|s| s.contains("resume")));
+    }
+
+    #[test]
+    fn build_failover_disabled_plan_includes_config_command() {
+        let plan = build_failover_disabled_plan(10, Some("sess-xyz"), Some(999), 1000);
+        assert!(plan
+            .operator_steps
+            .iter()
+            .any(|s| s.contains("disabled")));
+        assert!(plan
+            .suggested_commands
+            .iter()
+            .any(|c| c.contains("config")));
+    }
+
+    // ========================================================================
     // HandleProcessTriageLifecycle tests
     // ========================================================================
 
