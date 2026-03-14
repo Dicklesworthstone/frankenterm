@@ -3,9 +3,16 @@
 //! These handlers are extracted from `web.rs` in a strangler-fig migration to
 //! keep behavior stable while reducing monolith size.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::error::{json_err, json_ok};
+use super::extractors::{parse_bool, parse_i64, parse_limit, parse_u64, require_storage};
+use super::middleware::AppState;
+use crate::VERSION;
+use crate::policy::Redactor;
+use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult};
+use crate::ui_query;
+use crate::web_framework::{QueryString, Request, Response, StatusCode};
 use serde::Serialize;
+use std::sync::Arc;
 
 // =============================================================================
 // /health

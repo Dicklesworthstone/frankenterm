@@ -1,7 +1,24 @@
 //! Server-Sent Events endpoint surface for Wave 4B migration.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::error::json_err;
+use super::extractors::{
+    parse_u64, redact_json_value, require_event_bus, require_storage_and_event_bus,
+};
+use super::{
+    STREAM_CHANNEL_BUFFER, STREAM_DEFAULT_MAX_HZ, STREAM_KEEPALIVE_SECS,
+    STREAM_MAX_CONSECUTIVE_DROPS, STREAM_MAX_MAX_HZ, STREAM_SCAN_LIMIT, STREAM_SCAN_MAX_PAGES,
+    STREAM_SCHEMA_VERSION,
+};
+use crate::events::{Event, RecvError};
+use crate::policy::Redactor;
+use crate::runtime_compat::{mpsc, select, sleep, task, timeout};
+use crate::storage::{SegmentScanQuery, StorageHandle};
+use crate::web_framework::{QueryString, Request, Response, ResponseBody, StatusCode};
+use asupersync::stream::Stream;
+use serde_json::json;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum EventStreamChannel {
@@ -673,7 +690,8 @@ pub(super) fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{EventStreamChannel, parse_event_stream_channel};
+    use crate::web_framework::QueryString;
 
     #[test]
     fn parse_event_stream_channel_is_case_insensitive() {

@@ -1,7 +1,7 @@
 //! Structured web error surface for Wave 4B migration.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use crate::VERSION;
+use crate::web_framework::{Response, ResponseBody, StatusCode};
 use serde::Serialize;
 
 #[derive(Serialize)]

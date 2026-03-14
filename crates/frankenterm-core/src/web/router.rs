@@ -3,8 +3,17 @@
 //! This is the first strangler-fig extraction from `web.rs`, keeping
 //! behavior identical while moving route wiring into `web/` modules.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::handlers::{
+    handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
+    handle_search, health_response,
+};
+use super::middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
+use super::sse::{handle_stream_deltas, handle_stream_events};
+use crate::events::EventBus;
+use crate::policy::Redactor;
+use crate::storage::StorageHandle;
+use crate::web_framework::{App, Method, Request, RequestContext};
+use std::sync::Arc;
 
 pub(super) fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<EventBus>>) -> App {
     let state = AppState {

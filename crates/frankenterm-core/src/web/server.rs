@@ -2,9 +2,13 @@
 //!
 //! Extracted from `web.rs` as part of Wave 4B migration (ft-1zej2).
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::{WebServerConfig, WebServerHandle, build_app};
+use crate::runtime_compat::{select, signal};
 use crate::web_framework::FrameworkWebRuntime;
+use crate::{Error, Result};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+use tracing::{info, warn};
 
 /// Start the web server and return a handle for shutdown.
 ///
@@ -69,7 +73,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use super::signal::unix::SignalKind;
+        use crate::runtime_compat::signal::unix::SignalKind;
 
         let mut term = signal::unix::signal(SignalKind::terminate())
             .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
