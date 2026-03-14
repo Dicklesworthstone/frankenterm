@@ -6,9 +6,10 @@ set -euo pipefail
 #
 # Validates:
 # 1. Baseline checkpoint remains HOLD while sample sufficiency is unmet.
-# 2. Negative guardrail: synthetic GO with unmet thresholds is rejected.
-# 3. Recovery guardrail: synthetic GO with met thresholds is accepted.
-# 4. Evidence consistency across summary, feedback log, and correlation CSV.
+# 2. Feedback threshold counting only accepts real-user feedback.
+# 3. Negative guardrail: synthetic GO with unmet thresholds is rejected.
+# 4. Recovery guardrail: synthetic GO with met thresholds is accepted.
+# 5. Evidence consistency across summary, feedback log, and correlation CSV.
 # =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -160,6 +161,38 @@ validate_checkpoint_mirror() {
     jq -r '.anomaly_taxonomy[] | [.anomaly_id, .triage_owner, .remediation_owner, .close_loop_status] | @tsv' \
       "${summary_path}"
   )
+}
+
+validate_feedback_threshold_contract() {
+  local feedback_path="$1"
+
+  jq -s -e '
+    length > 0
+    and all(
+      .[];
+      (.feedback_id | type == "string" and length > 0)
+      and (.is_user_feedback | type == "boolean")
+      and (.counts_toward_thresholds | type == "boolean")
+      and (if .is_user_feedback == false then .counts_toward_thresholds == false else true end)
+      and (if .workflow_group == "synthetic-harness" then .counts_toward_thresholds == false else true end)
+    )
+  ' "${feedback_path}" >/dev/null
+}
+
+validate_feedback_threshold_consistency() {
+  local summary_path="$1"
+  local feedback_path="$2"
+  local summary_total countable_total
+
+  summary_total="$(jq -r '.sample_sufficiency.observed.feedback_items_total' "${summary_path}")"
+  countable_total="$(jq -s '[.[] | select(.is_user_feedback == true and .counts_toward_thresholds == true)] | length' "${feedback_path}")"
+
+  if [[ "${summary_total}" != "${countable_total}" ]]; then
+    echo "summary feedback_items_total (${summary_total}) does not match countable real-user feedback (${countable_total})" >&2
+    return 1
+  fi
+
+  return 0
 }
 
 emit_log \
@@ -317,6 +350,48 @@ emit_log \
 
 emit_log \
   "running" \
+  "feedback_threshold_contract" \
+  "real_user_feedback_counting" \
+  "none" \
+  "none" \
+  "$(basename "${FEEDBACK_FILE}")" \
+  "Validate that only real-user feedback can count toward threshold sufficiency"
+
+if ! validate_feedback_threshold_contract "${FEEDBACK_FILE}"; then
+  emit_log \
+    "failed" \
+    "feedback_threshold_contract" \
+    "real_user_feedback_counting" \
+    "invalid_feedback_threshold_contract" \
+    "feedback_threshold_contract_failed" \
+    "$(basename "${FEEDBACK_FILE}")" \
+    "Feedback log allows non-user or synthetic evidence to count toward thresholds"
+  exit 1
+fi
+
+if ! validate_feedback_threshold_consistency "${SUMMARY_FILE}" "${FEEDBACK_FILE}"; then
+  emit_log \
+    "failed" \
+    "feedback_threshold_contract" \
+    "summary_feedback_threshold_consistency" \
+    "summary_feedback_threshold_mismatch" \
+    "feedback_threshold_consistency_failed" \
+    "$(basename "${SUMMARY_FILE}")" \
+    "Summary feedback threshold counts do not match the countable real-user feedback log"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "feedback_threshold_contract" \
+  "real_user_feedback_counting->summary_feedback_threshold_consistency" \
+  "feedback_threshold_contract_valid" \
+  "none" \
+  "$(basename "${SUMMARY_FILE}")" \
+  "Fixture-only evidence is excluded from threshold counts and summary totals are consistent"
+
+emit_log \
+  "running" \
   "anomaly_taxonomy" \
   "owner_remediation_schema" \
   "none" \
@@ -360,10 +435,90 @@ emit_log \
 tmp_negative="$(mktemp)"
 tmp_recovery="$(mktemp)"
 tmp_anomaly_negative="$(mktemp)"
+tmp_feedback_threshold_negative="$(mktemp)"
+tmp_feedback_summary_negative="$(mktemp)"
 cleanup() {
-  rm -f "${tmp_negative}" "${tmp_recovery}" "${tmp_anomaly_negative}"
+  rm -f \
+    "${tmp_negative}" \
+    "${tmp_recovery}" \
+    "${tmp_anomaly_negative}" \
+    "${tmp_feedback_threshold_negative}" \
+    "${tmp_feedback_summary_negative}"
 }
 trap cleanup EXIT
+
+jq \
+  '.counts_toward_thresholds = true' \
+  "${FEEDBACK_FILE}" > "${tmp_feedback_threshold_negative}"
+
+emit_log \
+  "running" \
+  "feedback_threshold_negative_guardrail" \
+  "real_user_feedback_counting_negative" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_feedback_threshold_negative}")" \
+  "Synthetic feedback incorrectly marked countable should be rejected"
+
+if validate_feedback_threshold_contract "${tmp_feedback_threshold_negative}" >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "feedback_threshold_negative_guardrail" \
+    "real_user_feedback_counting_negative" \
+    "synthetic_feedback_miscount_not_rejected" \
+    "unexpected_feedback_threshold_pass" \
+    "$(basename "${tmp_feedback_threshold_negative}")" \
+    "Synthetic feedback miscount unexpectedly passed"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "feedback_threshold_negative_guardrail" \
+  "real_user_feedback_counting_negative" \
+  "synthetic_feedback_miscount_rejected" \
+  "none" \
+  "$(basename "${tmp_feedback_threshold_negative}")" \
+  "Synthetic feedback miscount was correctly rejected"
+
+jq \
+  '.decision = "GO"
+   | .decision_reason = ["synthetic summary-only mismatch: thresholds claim real-user sufficiency without countable real-user feedback"]
+   | .sample_sufficiency.thresholds_met = true
+   | .sample_sufficiency.observed.feedback_items_total = 40
+   | .sample_sufficiency.observed.feedback_items_per_workflow_group =
+      {"editor-heavy": 10, "long-scrollback-monitoring": 10, "high-tab-pane-churn": 10, "mixed-font-size-zoom": 10}' \
+  "${SUMMARY_FILE}" > "${tmp_feedback_summary_negative}"
+
+emit_log \
+  "running" \
+  "feedback_summary_negative_guardrail" \
+  "summary_feedback_threshold_consistency_negative" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_feedback_summary_negative}")" \
+  "Summary cannot claim threshold sufficiency without countable real-user feedback"
+
+if validate_feedback_threshold_consistency "${tmp_feedback_summary_negative}" "${FEEDBACK_FILE}" >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "feedback_summary_negative_guardrail" \
+    "summary_feedback_threshold_consistency_negative" \
+    "summary_feedback_mismatch_not_rejected" \
+    "unexpected_feedback_summary_pass" \
+    "$(basename "${tmp_feedback_summary_negative}")" \
+    "Summary-only threshold inflation unexpectedly passed"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "feedback_summary_negative_guardrail" \
+  "summary_feedback_threshold_consistency_negative" \
+  "summary_feedback_mismatch_rejected" \
+  "none" \
+  "$(basename "${tmp_feedback_summary_negative}")" \
+  "Summary-only threshold inflation was correctly rejected"
 
 jq \
   '.decision = "GO"
@@ -481,7 +636,7 @@ emit_log \
 emit_log \
   "passed" \
   "suite_complete" \
-  "baseline->consistency->anomaly_schema->negative_guardrail->recovery_guardrail->anomaly_negative_guardrail" \
+  "baseline->consistency->feedback_threshold_contract->feedback_threshold_negative_guardrail->feedback_summary_negative_guardrail->anomaly_schema->negative_guardrail->recovery_guardrail->anomaly_negative_guardrail" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
