@@ -11829,7 +11829,7 @@ async fn distributed_agent_send_pane_snapshot(
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
     >,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
 
@@ -11838,10 +11838,12 @@ async fn distributed_agent_send_pane_snapshot(
         storage_handle.get_panes().await?
     };
 
+    let mut pane_snapshot_count = 0usize;
     for pane in panes {
         if !distributed_agent_local_pane(&pane) {
             continue;
         }
+        pane_snapshot_count += 1;
 
         let title = pane
             .title
@@ -11859,7 +11861,7 @@ async fn distributed_agent_send_pane_snapshot(
         }
     }
 
-    Ok(())
+    Ok(pane_snapshot_count)
 }
 
 #[cfg(feature = "distributed")]
@@ -12259,12 +12261,19 @@ async fn distributed_agent_stream_session(
                     protocol_version
                 );
             }
+            tracing::info!(
+                agent_id = %agent_id,
+                session_id = %session_id,
+                protocol_version,
+                "Distributed handshake acknowledged"
+            );
         }
         Ok(Err(err)) => anyhow::bail!("Distributed handshake response read failed: {err}"),
         Err(_) => anyhow::bail!("Distributed handshake acknowledgement timed out"),
     }
 
-    distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+    let snapshot_panes =
+        distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
     let recovered = distributed_agent_flush_all_panes(
         streamer,
         storage,
@@ -12273,16 +12282,35 @@ async fn distributed_agent_stream_session(
         &mut stream,
     )
     .await?;
-    if recovered > 0 {
-        tracing::debug!(recovered, "Flushed pending pane history after connect");
-    }
+    tracing::info!(
+        agent_id = %agent_id,
+        session_id = %session_id,
+        snapshot_panes,
+        recovered,
+        seq = streamer.seq(),
+        messages_sent = streamer.messages_sent(),
+        messages_dropped = streamer.messages_dropped(),
+        "Distributed agent session primed after connect"
+    );
 
     let mut subscriber = event_bus.subscribe();
     let heartbeat_interval = Duration::from_secs(30);
     let mut next_heartbeat = Instant::now() + heartbeat_interval;
+    let mut heartbeat_count = 0_u64;
+    let mut lag_repair_count = 0_u64;
 
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
+            tracing::info!(
+                agent_id = %agent_id,
+                session_id = %session_id,
+                heartbeats = heartbeat_count,
+                lag_repairs = lag_repair_count,
+                seq = streamer.seq(),
+                messages_sent = streamer.messages_sent(),
+                messages_dropped = streamer.messages_dropped(),
+                "Distributed agent stream session stopping after shutdown signal"
+            );
             return Ok(());
         }
 
@@ -12302,8 +12330,15 @@ async fn distributed_agent_stream_session(
                     .await?;
                 }
                 Err(frankenterm_core::events::RecvError::Lagged { missed_count }) => {
+                    lag_repair_count += 1;
                     tracing::warn!(
+                        agent_id = %agent_id,
+                        session_id = %session_id,
                         missed = missed_count,
+                        lag_repairs = lag_repair_count,
+                        seq = streamer.seq(),
+                        messages_sent = streamer.messages_sent(),
+                        messages_dropped = streamer.messages_dropped(),
                         "Distributed agent subscriber lagged; repairing via history scan"
                     );
                     let repaired = distributed_agent_flush_all_panes(
@@ -12314,21 +12349,54 @@ async fn distributed_agent_stream_session(
                         &mut stream,
                     )
                     .await?;
-                    tracing::debug!(repaired, "Distributed lag repair flushed pending history");
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        session_id = %session_id,
+                        repaired,
+                        lag_repairs = lag_repair_count,
+                        seq = streamer.seq(),
+                        messages_sent = streamer.messages_sent(),
+                        messages_dropped = streamer.messages_dropped(),
+                        "Distributed lag repair flushed pending history"
+                    );
                 }
                 Err(frankenterm_core::events::RecvError::Closed) => {
                     anyhow::bail!("Distributed agent event bus closed");
                 }
             },
             Err(_) => {
-                distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+                let pane_snapshot_count =
+                    distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+                heartbeat_count += 1;
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    session_id = %session_id,
+                    heartbeats = heartbeat_count,
+                    pane_snapshot_count,
+                    seq = streamer.seq(),
+                    messages_sent = streamer.messages_sent(),
+                    messages_dropped = streamer.messages_dropped(),
+                    "Distributed agent heartbeat snapshot sent"
+                );
                 next_heartbeat = Instant::now() + heartbeat_interval;
                 continue;
             }
         }
 
         if Instant::now() >= next_heartbeat {
-            distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+            let pane_snapshot_count =
+                distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+            heartbeat_count += 1;
+            tracing::debug!(
+                agent_id = %agent_id,
+                session_id = %session_id,
+                heartbeats = heartbeat_count,
+                pane_snapshot_count,
+                seq = streamer.seq(),
+                messages_sent = streamer.messages_sent(),
+                messages_dropped = streamer.messages_dropped(),
+                "Distributed agent heartbeat snapshot sent"
+            );
             next_heartbeat = Instant::now() + heartbeat_interval;
         }
     }
@@ -12384,10 +12452,31 @@ async fn distributed_agent_stream_forever(
             break;
         }
 
+        tracing::debug!(
+            connect = %connect_addr,
+            agent_id = %agent_id,
+            session_id = %session_id,
+            segment_cursor_count = segment_cursors.len(),
+            gap_cursor_count = gap_cursors.len(),
+            seq = streamer.seq(),
+            messages_sent = streamer.messages_sent(),
+            messages_dropped = streamer.messages_dropped(),
+            "Distributed agent dialing aggregator"
+        );
         match distributed_agent_connect(&connect_addr, &distributed_config).await {
             Ok(io) => {
-                tracing::info!(connect = %connect_addr, agent_id = %agent_id, "Distributed agent connected");
                 streamer.mark_connected();
+                tracing::info!(
+                    connect = %connect_addr,
+                    agent_id = %agent_id,
+                    session_id = %session_id,
+                    segment_cursor_count = segment_cursors.len(),
+                    gap_cursor_count = gap_cursors.len(),
+                    seq = streamer.seq(),
+                    messages_sent = streamer.messages_sent(),
+                    messages_dropped = streamer.messages_dropped(),
+                    "Distributed agent connected"
+                );
                 if let Err(err) = distributed_agent_stream_session(
                     io,
                     &mut streamer,
@@ -12405,14 +12494,32 @@ async fn distributed_agent_stream_forever(
                     if shutdown_flag.load(Ordering::SeqCst) {
                         break;
                     }
-                    tracing::warn!(connect = %connect_addr, error = %err, "Distributed stream session ended");
+                    tracing::warn!(
+                        connect = %connect_addr,
+                        agent_id = %agent_id,
+                        session_id = %session_id,
+                        error = %err,
+                        seq = streamer.seq(),
+                        messages_sent = streamer.messages_sent(),
+                        messages_dropped = streamer.messages_dropped(),
+                        "Distributed stream session ended"
+                    );
                 }
             }
             Err(err) => {
                 if shutdown_flag.load(Ordering::SeqCst) {
                     break;
                 }
-                tracing::warn!(connect = %connect_addr, error = %err, "Distributed agent connect failed");
+                tracing::warn!(
+                    connect = %connect_addr,
+                    agent_id = %agent_id,
+                    session_id = %session_id,
+                    error = %err,
+                    seq = streamer.seq(),
+                    messages_sent = streamer.messages_sent(),
+                    messages_dropped = streamer.messages_dropped(),
+                    "Distributed agent connect failed"
+                );
             }
         }
 
@@ -12420,6 +12527,23 @@ async fn distributed_agent_stream_forever(
             break;
         }
         let backoff_ms = distributed_agent_next_reconnect_backoff_ms(&mut streamer);
+        let reconnect_attempt = match streamer.state() {
+            frankenterm_core::wire_protocol::ConnectionState::Reconnecting { attempt } => {
+                attempt.saturating_add(1)
+            }
+            _ => 0,
+        };
+        tracing::info!(
+            connect = %connect_addr,
+            agent_id = %agent_id,
+            session_id = %session_id,
+            reconnect_attempt,
+            backoff_ms,
+            seq = streamer.seq(),
+            messages_sent = streamer.messages_sent(),
+            messages_dropped = streamer.messages_dropped(),
+            "Distributed agent waiting before reconnect"
+        );
         if distributed_agent_sleep_with_shutdown(&shutdown_flag, Duration::from_millis(backoff_ms))
             .await
         {
