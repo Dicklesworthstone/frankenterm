@@ -1407,9 +1407,9 @@ mod tests {
                 crate::runtime_compat::task::spawn(async move { waiter.wait(&wait_bus).await });
 
             crate::runtime_compat::sleep(Duration::from_millis(10)).await;
-            bus.publish(make_pattern_event(1, "a", Some(1)));
+            let _ = bus.publish(make_pattern_event(1, "a", Some(1)));
             crate::runtime_compat::sleep(Duration::from_millis(10)).await;
-            bus.publish(make_pattern_event(1, "b", Some(2)));
+            let _ = bus.publish(make_pattern_event(1, "b", Some(2)));
 
             match wait_task.await.unwrap() {
                 WaitResult::Matched { event, .. } => {
