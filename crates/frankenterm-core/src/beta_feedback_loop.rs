@@ -439,10 +439,15 @@ impl BetaLoopController {
                 continue;
             }
 
-            let obs = self.observations.get(&idx).map(Vec::as_slice).unwrap_or(&[]);
+            let obs = self
+                .observations
+                .get(&idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let fb = self.feedback.get(&idx).map(Vec::as_slice).unwrap_or(&[]);
 
-            let smoothness_at_percentile = percentile_smoothness(obs, self.config.smoothness_percentile);
+            let smoothness_at_percentile =
+                percentile_smoothness(obs, self.config.smoothness_percentile);
             let mean_nps = if fb.is_empty() {
                 None
             } else {
@@ -616,7 +621,11 @@ impl BetaLoopController {
         let mut cohort_observation_counts = HashMap::new();
         let mut cohort_feedback_counts = HashMap::new();
         for (idx, cohort) in self.cohorts.iter().enumerate() {
-            let obs_count = self.observations.get(&idx).map(|v| v.len() as u64).unwrap_or(0);
+            let obs_count = self
+                .observations
+                .get(&idx)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
             let fb_count = self.feedback.get(&idx).map(|v| v.len() as u64).unwrap_or(0);
             cohort_observation_counts.insert(cohort.name.clone(), obs_count);
             cohort_feedback_counts.insert(cohort.name.clone(), fb_count);
@@ -891,7 +900,11 @@ mod tests {
         }
         let eval = ctrl.evaluate(2000);
         assert_eq!(eval.decision, PromotionDecision::Rollback);
-        assert!(eval.reasons.iter().any(|r| r.code == "smoothness_budget_exceeded"));
+        assert!(
+            eval.reasons
+                .iter()
+                .any(|r| r.code == "smoothness_budget_exceeded")
+        );
     }
 
     #[test]
@@ -924,10 +937,11 @@ mod tests {
         }
         let eval = ctrl.evaluate(2000);
         assert_eq!(eval.decision, PromotionDecision::Rollback);
-        assert!(eval
-            .reasons
-            .iter()
-            .any(|r| r.code == "critical_friction_exceeded"));
+        assert!(
+            eval.reasons
+                .iter()
+                .any(|r| r.code == "critical_friction_exceeded")
+        );
     }
 
     // ── Stage transitions ──────────────────────────────────────────────
@@ -1065,7 +1079,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let rt: BetaLoopConfig = serde_json::from_str(&json).unwrap();
         assert!((rt.smoothness_target - config.smoothness_target).abs() < f64::EPSILON);
-        assert_eq!(rt.min_observations_per_cohort, config.min_observations_per_cohort);
+        assert_eq!(
+            rt.min_observations_per_cohort,
+            config.min_observations_per_cohort
+        );
         assert_eq!(rt.promotion_nps_threshold, config.promotion_nps_threshold);
     }
 

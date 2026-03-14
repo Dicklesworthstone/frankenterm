@@ -175,11 +175,26 @@ impl CheckpointCommand {
 
     fn ntm_equivalence(&self) -> NtmEquivalence {
         let (cmds, classification) = match self {
-            Self::Save(_) => (vec!["ntm checkpoint save"], ConvergenceClassification::Upgrade),
-            Self::List(_) => (vec!["ntm checkpoint list"], ConvergenceClassification::DirectReplacement),
-            Self::Show(_) => (vec!["ntm checkpoint show"], ConvergenceClassification::Upgrade),
-            Self::Delete(_) => (vec!["ntm checkpoint delete"], ConvergenceClassification::DirectReplacement),
-            Self::Rollback(_) => (vec!["ntm rollback", "ntm checkpoint restore"], ConvergenceClassification::Upgrade),
+            Self::Save(_) => (
+                vec!["ntm checkpoint save"],
+                ConvergenceClassification::Upgrade,
+            ),
+            Self::List(_) => (
+                vec!["ntm checkpoint list"],
+                ConvergenceClassification::DirectReplacement,
+            ),
+            Self::Show(_) => (
+                vec!["ntm checkpoint show"],
+                ConvergenceClassification::Upgrade,
+            ),
+            Self::Delete(_) => (
+                vec!["ntm checkpoint delete"],
+                ConvergenceClassification::DirectReplacement,
+            ),
+            Self::Rollback(_) => (
+                vec!["ntm rollback", "ntm checkpoint restore"],
+                ConvergenceClassification::Upgrade,
+            ),
         };
         NtmEquivalence {
             ntm_commands: cmds.into_iter().map(String::from).collect(),
@@ -549,10 +564,7 @@ impl WorkCommand {
 
     fn ntm_equivalence(&self) -> NtmEquivalence {
         let (cmds, classification) = match self {
-            Self::Claim(_) => (
-                vec!["ntm work claim"],
-                ConvergenceClassification::Upgrade,
-            ),
+            Self::Claim(_) => (vec!["ntm work claim"], ConvergenceClassification::Upgrade),
             Self::Release(_) => (
                 vec!["ntm work release"],
                 ConvergenceClassification::DirectReplacement,
@@ -565,14 +577,8 @@ impl WorkCommand {
                 vec!["ntm work list", "ntm marching-orders"],
                 ConvergenceClassification::Upgrade,
             ),
-            Self::Ready(_) => (
-                vec!["ntm work ready"],
-                ConvergenceClassification::Novel,
-            ),
-            Self::Assign(_) => (
-                vec!["ntm work assign"],
-                ConvergenceClassification::Upgrade,
-            ),
+            Self::Ready(_) => (vec!["ntm work ready"], ConvergenceClassification::Novel),
+            Self::Assign(_) => (vec!["ntm work assign"], ConvergenceClassification::Upgrade),
         };
         NtmEquivalence {
             ntm_commands: cmds.into_iter().map(String::from).collect(),
@@ -1011,13 +1017,14 @@ impl ProfileCommand {
                 ConvergenceClassification::Upgrade,
             ),
             Self::Apply(_) => (
-                vec!["ntm spawn", "ntm session-templates apply", "ntm personas apply"],
+                vec![
+                    "ntm spawn",
+                    "ntm session-templates apply",
+                    "ntm personas apply",
+                ],
                 ConvergenceClassification::Upgrade,
             ),
-            Self::Validate(_) => (
-                vec![],
-                ConvergenceClassification::Novel,
-            ),
+            Self::Validate(_) => (vec![], ConvergenceClassification::Novel),
         };
         NtmEquivalence {
             ntm_commands: cmds.into_iter().map(String::from).collect(),
@@ -1293,12 +1300,11 @@ mod tests {
 
     #[test]
     fn checkpoint_rollback_dry_run_roundtrip() {
-        let cmd = RobotNtmCommand::Checkpoint(CheckpointCommand::Rollback(
-            CheckpointRollbackRequest {
+        let cmd =
+            RobotNtmCommand::Checkpoint(CheckpointCommand::Rollback(CheckpointRollbackRequest {
                 checkpoint_id: "ckpt-abc123".into(),
                 dry_run: true,
-            },
-        ));
+            }));
         let json = serde_json::to_string(&cmd).unwrap();
         let rt: RobotNtmCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, rt);
@@ -1372,9 +1378,8 @@ mod tests {
 
     #[test]
     fn fleet_status_command_roundtrip() {
-        let cmd = RobotNtmCommand::Fleet(FleetCommand::Status(FleetStatusRequest {
-            detailed: true,
-        }));
+        let cmd =
+            RobotNtmCommand::Fleet(FleetCommand::Status(FleetStatusRequest { detailed: true }));
         let json = serde_json::to_string(&cmd).unwrap();
         let rt: RobotNtmCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, rt);
@@ -1797,9 +1802,16 @@ mod tests {
 
     #[test]
     fn all_surfaces_have_unique_command_paths() {
-        let paths: Vec<&str> = NtmApiSurface::ALL.iter().map(|s| s.command_path()).collect();
+        let paths: Vec<&str> = NtmApiSurface::ALL
+            .iter()
+            .map(|s| s.command_path())
+            .collect();
         let unique: std::collections::HashSet<&str> = paths.iter().copied().collect();
-        assert_eq!(paths.len(), unique.len(), "duplicate command paths detected");
+        assert_eq!(
+            paths.len(),
+            unique.len(),
+            "duplicate command paths detected"
+        );
     }
 
     #[test]
@@ -1816,7 +1828,11 @@ mod tests {
             .collect();
         // checkpoint save/delete/rollback + context rotate + work claim/release/complete/assign
         // + fleet scale/rebalance + profile apply = 11
-        assert_eq!(mutations.len(), 11, "mutation surface count mismatch: {mutations:?}");
+        assert_eq!(
+            mutations.len(),
+            11,
+            "mutation surface count mismatch: {mutations:?}"
+        );
     }
 
     #[test]
@@ -1828,7 +1844,11 @@ mod tests {
             .collect();
         // checkpoint list/show + context status/history + work list/ready
         // + fleet status/agents + profile list/show/validate = 11
-        assert_eq!(reads.len(), 11, "read-only surface count mismatch: {reads:?}");
+        assert_eq!(
+            reads.len(),
+            11,
+            "read-only surface count mismatch: {reads:?}"
+        );
     }
 
     // ─── Convergence classification ──────────────────────────────────
@@ -1849,7 +1869,10 @@ mod tests {
 
     #[test]
     fn convergence_classification_labels() {
-        assert_eq!(ConvergenceClassification::DirectReplacement.label(), "direct-replacement");
+        assert_eq!(
+            ConvergenceClassification::DirectReplacement.label(),
+            "direct-replacement"
+        );
         assert_eq!(ConvergenceClassification::Upgrade.label(), "upgrade");
         assert_eq!(ConvergenceClassification::Novel.label(), "novel");
         assert_eq!(ConvergenceClassification::Partial.label(), "partial");
@@ -1880,7 +1903,8 @@ mod tests {
 
     #[test]
     fn profile_apply_default_count_is_one() {
-        let json = r#"{"action":"apply","name":"test","count":1,"env_overrides":{},"dry_run":false}"#;
+        let json =
+            r#"{"action":"apply","name":"test","count":1,"env_overrides":{},"dry_run":false}"#;
         let cmd: ProfileCommand = serde_json::from_str(json).unwrap();
         if let ProfileCommand::Apply(req) = cmd {
             assert_eq!(req.count, 1);

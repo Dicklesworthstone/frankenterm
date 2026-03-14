@@ -468,25 +468,58 @@ mod tests {
 
     #[test]
     fn map_backpressure_tiers() {
-        assert_eq!(map_backpressure(BackpressureTier::Green), FleetPressureTier::Normal);
-        assert_eq!(map_backpressure(BackpressureTier::Yellow), FleetPressureTier::Elevated);
-        assert_eq!(map_backpressure(BackpressureTier::Red), FleetPressureTier::Critical);
-        assert_eq!(map_backpressure(BackpressureTier::Black), FleetPressureTier::Emergency);
+        assert_eq!(
+            map_backpressure(BackpressureTier::Green),
+            FleetPressureTier::Normal
+        );
+        assert_eq!(
+            map_backpressure(BackpressureTier::Yellow),
+            FleetPressureTier::Elevated
+        );
+        assert_eq!(
+            map_backpressure(BackpressureTier::Red),
+            FleetPressureTier::Critical
+        );
+        assert_eq!(
+            map_backpressure(BackpressureTier::Black),
+            FleetPressureTier::Emergency
+        );
     }
 
     #[test]
     fn map_memory_pressure_tiers() {
-        assert_eq!(map_memory_pressure(MemoryPressureTier::Green), FleetPressureTier::Normal);
-        assert_eq!(map_memory_pressure(MemoryPressureTier::Yellow), FleetPressureTier::Elevated);
-        assert_eq!(map_memory_pressure(MemoryPressureTier::Orange), FleetPressureTier::Critical);
-        assert_eq!(map_memory_pressure(MemoryPressureTier::Red), FleetPressureTier::Emergency);
+        assert_eq!(
+            map_memory_pressure(MemoryPressureTier::Green),
+            FleetPressureTier::Normal
+        );
+        assert_eq!(
+            map_memory_pressure(MemoryPressureTier::Yellow),
+            FleetPressureTier::Elevated
+        );
+        assert_eq!(
+            map_memory_pressure(MemoryPressureTier::Orange),
+            FleetPressureTier::Critical
+        );
+        assert_eq!(
+            map_memory_pressure(MemoryPressureTier::Red),
+            FleetPressureTier::Emergency
+        );
     }
 
     #[test]
     fn map_budget_levels() {
-        assert_eq!(map_budget_level(BudgetLevel::Normal), FleetPressureTier::Normal);
-        assert_eq!(map_budget_level(BudgetLevel::Throttled), FleetPressureTier::Elevated);
-        assert_eq!(map_budget_level(BudgetLevel::OverBudget), FleetPressureTier::Critical);
+        assert_eq!(
+            map_budget_level(BudgetLevel::Normal),
+            FleetPressureTier::Normal
+        );
+        assert_eq!(
+            map_budget_level(BudgetLevel::Throttled),
+            FleetPressureTier::Elevated
+        );
+        assert_eq!(
+            map_budget_level(BudgetLevel::OverBudget),
+            FleetPressureTier::Critical
+        );
     }
 
     // ── Tier ordering ────────────────────────────────────────────────
@@ -529,10 +562,22 @@ mod tests {
 
     #[test]
     fn fleet_tier_snake_case() {
-        assert_eq!(serde_json::to_string(&FleetPressureTier::Normal).unwrap(), "\"normal\"");
-        assert_eq!(serde_json::to_string(&FleetPressureTier::Elevated).unwrap(), "\"elevated\"");
-        assert_eq!(serde_json::to_string(&FleetPressureTier::Critical).unwrap(), "\"critical\"");
-        assert_eq!(serde_json::to_string(&FleetPressureTier::Emergency).unwrap(), "\"emergency\"");
+        assert_eq!(
+            serde_json::to_string(&FleetPressureTier::Normal).unwrap(),
+            "\"normal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FleetPressureTier::Elevated).unwrap(),
+            "\"elevated\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FleetPressureTier::Critical).unwrap(),
+            "\"critical\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FleetPressureTier::Emergency).unwrap(),
+            "\"emergency\""
+        );
     }
 
     #[test]
@@ -717,10 +762,22 @@ mod tests {
         // Normal has no real actions
         assert!(normal.iter().all(|a| *a == FleetMemoryAction::None));
         // Elevated includes throttling
-        assert!(elevated.iter().any(|a| *a == FleetMemoryAction::ThrottlePolling));
+        assert!(
+            elevated
+                .iter()
+                .any(|a| *a == FleetMemoryAction::ThrottlePolling)
+        );
         // Critical includes everything Elevated has plus more
-        assert!(critical.iter().any(|a| *a == FleetMemoryAction::ThrottlePolling));
-        assert!(critical.iter().any(|a| *a == FleetMemoryAction::PauseIdlePanes));
+        assert!(
+            critical
+                .iter()
+                .any(|a| *a == FleetMemoryAction::ThrottlePolling)
+        );
+        assert!(
+            critical
+                .iter()
+                .any(|a| *a == FleetMemoryAction::PauseIdlePanes)
+        );
     }
 
     // ── Action predicates ────────────────────────────────────────────
