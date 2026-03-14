@@ -17,6 +17,8 @@ REMOTE_SCRATCH_ROOT="${RCH_REMOTE_SCRATCH_ROOT:-target/${REMOTE_SCRATCH_BASENAME
 REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-${REMOTE_SCRATCH_ROOT}/tmp}"
 REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-${REMOTE_SCRATCH_ROOT}/cargo-target}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
 
 emit_log() {
   local outcome="$1"
@@ -87,6 +89,23 @@ fail_now() {
   exit 1
 }
 
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    TIMEOUT_BIN=""
+  fi
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
+}
+
 run_rch_guarded() {
   local scenario="$1"
   local decision_path="$2"
@@ -94,12 +113,13 @@ run_rch_guarded() {
   local failure_reason="$4"
   local failure_code="$5"
   local output_log="$6"
+  local queue_log=""
   shift 6
 
   set +e
   (
     cd "${ROOT_DIR}"
-    "$@"
+    run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@"
   ) 2>&1 | tee "${output_log}"
   local cmd_status=${PIPESTATUS[0]}
   set -e
@@ -112,6 +132,20 @@ run_rch_guarded() {
       "remote_offload_required" \
       "$(basename "${output_log}")" \
       "rch fell back to local execution; refusing local CPU-intensive run"
+  fi
+
+  if [[ ${cmd_status} -eq 124 || ${cmd_status} -eq 137 ]]; then
+    queue_log="${output_log%.log}.rch_queue_timeout.log"
+    if ! rch queue > "${queue_log}" 2>&1; then
+      queue_log="${output_log}"
+    fi
+    fail_now \
+      "${scenario}" \
+      "${decision_path}.stall_guard" \
+      "rch_remote_step_timeout" \
+      "RCH-REMOTE-STALL" \
+      "$(basename "${queue_log}")" \
+      "rch command exceeded ${RCH_STEP_TIMEOUT_SECS}s without producing a final result"
   fi
 
   if [[ ${cmd_status} -ne 0 ]]; then
@@ -179,6 +213,26 @@ if ! command -v rch >/dev/null 2>&1; then
     "$(basename "${LOG_FILE}")" \
     "rch is required; cargo must not run locally for this bead"
 fi
+
+resolve_timeout_bin
+if [[ -z "${TIMEOUT_BIN}" ]]; then
+  fail_now \
+    "suite_init" \
+    "preflight_timeout_tool" \
+    "timeout_tool_missing" \
+    "timeout_not_found" \
+    "$(basename "${LOG_FILE}")" \
+    "timeout or gtimeout is required to fail closed on stalled remote execution"
+fi
+
+emit_log \
+  "started" \
+  "suite_init" \
+  "stall_guard_config" \
+  "timeout_guard_enabled" \
+  "none" \
+  "$(basename "${LOG_FILE}")" \
+  "rch_step_timeout_secs=${RCH_STEP_TIMEOUT_SECS}; timeout_bin=${TIMEOUT_BIN}"
 
 probe_has_reachable_workers() {
   local probe_log="$1"

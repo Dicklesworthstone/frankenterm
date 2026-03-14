@@ -21,12 +21,15 @@ fi
 export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
+LAST_STEP_QUEUE_LOG=""
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_SOCKET_PATH_REGEX='unix_listener: path .*too long for Unix domain socket|too long for Unix domain socket'
 LOCAL_RCH_TMPDIR_OVERRIDE=""
 RCH_WORKERS_TOML="${HOME}/.config/rch/workers.toml"
 RCH_CONFIG_FILE="${ROOT_DIR}/.rch/config.toml"
 RCH_REMOTE_BASE_DEFAULT="/home/ubuntu/rch"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
@@ -73,10 +76,17 @@ run_step() {
   shift
 
   LAST_STEP_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}.log"
+  LAST_STEP_QUEUE_LOG=""
   set +e
-  "$@" 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
+  run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@" 2>&1 | tee "${LAST_STEP_LOG}" | tee -a "${STDOUT_FILE}"
   local rc=${PIPESTATUS[0]}
   set -e
+  if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+    LAST_STEP_QUEUE_LOG="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_${label}_rch_queue_timeout.log"
+    if ! run_rch queue > "${LAST_STEP_QUEUE_LOG}" 2>&1; then
+      LAST_STEP_QUEUE_LOG=""
+    fi
+  fi
   return ${rc}
 }
 
@@ -95,6 +105,36 @@ run_rch() {
     TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
   else
     rch "$@"
+  fi
+}
+
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    TIMEOUT_BIN=""
+  fi
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
+}
+
+step_timed_out() {
+  local step_rc="$1"
+  [[ ${step_rc} -eq 124 || ${step_rc} -eq 137 ]]
+}
+
+step_timeout_artifact() {
+  if [[ -n "${LAST_STEP_QUEUE_LOG}" ]]; then
+    basename "${LAST_STEP_QUEUE_LOG}"
+  else
+    basename "${LAST_STEP_LOG}"
   fi
 }
 
@@ -351,7 +391,15 @@ require_cmd cargo
 require_cmd python3
 require_cmd ssh
 
+resolve_timeout_bin
+if [[ -z "${TIMEOUT_BIN}" ]]; then
+  emit_log "preflight" "preflight_timeout_tool" "missing:timeout_or_gtimeout" "failed" "missing_prerequisite" "E2E-PREREQ" "timeout-or-gtimeout"
+  echo "missing required timeout command: timeout or gtimeout" >&2
+  exit 1
+fi
+
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
+emit_log "preflight" "stall_guard_config" "rch_step_timeout_secs=${RCH_STEP_TIMEOUT_SECS}; timeout_bin=${TIMEOUT_BIN}" "applied" "timeout_guard_enabled" "none" "$(basename "${LOG_FILE}")"
 
 if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
   emit_log "preflight" "rch_local_tmpdir_workaround" "TMPDIR=${LOCAL_RCH_TMPDIR_OVERRIDE}" "applied" "darwin_controlmaster_socket_guard" "none" "$(basename "${STDOUT_FILE}")"
@@ -404,7 +452,12 @@ if run_step rch_remote_smoke run_rch exec -- cargo check --help; then
   fi
   emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "passed" "remote_exec_confirmed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  step_rc=$?
+  if step_timed_out "${step_rc}"; then
+    emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "preflight" "rch_remote_smoke" "cargo_check_help" "failed" "rch_remote_smoke_failed" "RCH-REMOTE-SMOKE-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
   exit 2
 fi
 
@@ -418,7 +471,12 @@ if run_step nominal_labruntime \
   fi
   emit_log "validation" "nominal_path" "tailer_labruntime_tests" "passed" "tests_passed" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "test_failure" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  step_rc=$?
+  if step_timed_out "${step_rc}"; then
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "validation" "nominal_path" "tailer_labruntime_tests" "failed" "test_failure" "CARGO-TEST-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
   exit 1
 fi
 
@@ -433,6 +491,11 @@ if rch_fail_open_detected "${LAST_STEP_LOG}"; then
   emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "rch_fail_open_local_fallback" "RCH-LOCAL-FALLBACK" "$(basename "${LAST_STEP_LOG}")"
   echo "rch fell back to local execution; failing per offload-only policy" >&2
   exit 3
+fi
+
+if step_timed_out "${missing_feature_rc}"; then
+  emit_log "validation" "failure_injection_path" "bench_without_feature" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  exit 1
 fi
 
 if [[ ${missing_feature_rc} -eq 0 ]]; then
@@ -457,7 +520,12 @@ if run_step recovery_with_feature \
   fi
   emit_log "validation" "recovery_path" "bench_with_feature" "passed" "recovery_success" "none" "$(basename "${LAST_STEP_LOG}")"
 else
-  emit_log "validation" "recovery_path" "bench_with_feature" "failed" "recovery_failed" "CARGO-CHECK-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  step_rc=$?
+  if step_timed_out "${step_rc}"; then
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "rch_remote_step_timeout" "RCH-REMOTE-STALL" "$(step_timeout_artifact)"
+  else
+    emit_log "validation" "recovery_path" "bench_with_feature" "failed" "recovery_failed" "CARGO-CHECK-FAIL" "$(basename "${LAST_STEP_LOG}")"
+  fi
   exit 1
 fi
 
