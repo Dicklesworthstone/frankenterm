@@ -1,18 +1,18 @@
-use crate::connui::ConnectionUI;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
-use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::Mux;
-use anyhow::{anyhow, bail, Context};
+use crate::connui::ConnectionUI;
+use crate::domain::{Domain, DomainId, DomainState, WriterWrapper, alloc_domain_id};
+use crate::localpane::LocalPane;
+use crate::pane::{Pane, PaneId, alloc_pane_id};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use config::{Shell, SshBackend, SshDomain};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_ssh::{
+    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
     runtime::{
         self as ssh_runtime,
-        channel::{bounded, Receiver as AsyncReceiver, TryRecvError as AsyncTryRecvError},
+        channel::{Receiver as AsyncReceiver, TryRecvError as AsyncTryRecvError, bounded},
     },
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use frankenterm_term::TerminalSize;
 use portable_pty::cmdbuilder::CommandBuilder;
@@ -20,10 +20,10 @@ use portable_pty::{ChildKiller, ExitStatus, MasterPty, PtySize};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Read, Write};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use termwiz::cell::{unicode_column_width, AttributeChange, Intensity};
+use termwiz::cell::{AttributeChange, Intensity, unicode_column_width};
 use termwiz::input::{InputEvent, InputParser};
 use termwiz::lineedit::*;
 use termwiz::render::terminfo::TerminfoRenderer;
@@ -470,7 +470,7 @@ fn connect_ssh_session(
 
     impl<'a> termwiz::terminal::Terminal for TerminalShim<'a> {
         fn set_raw_mode(&mut self) -> termwiz::Result<()> {
-            use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
+            use termwiz::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
 
             macro_rules! decset {
                 ($variant:ident) => {
@@ -1150,5 +1150,193 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::Config;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    fn test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct TestConfigGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestConfigGuard {
+        fn new() -> Self {
+            let guard = test_lock().lock().expect("lock");
+            config::use_test_configuration();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for TestConfigGuard {
+        fn drop(&mut self) {
+            config::use_test_configuration();
+        }
+    }
+
+    fn test_domain(remote_address: &str) -> SshDomain {
+        SshDomain {
+            name: "ssh-test".to_string(),
+            remote_address: remote_address.to_string(),
+            ..SshDomain::default()
+        }
+    }
+
+    fn env_value<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
+        env.get(key)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("missing env var {}", key))
+    }
+
+    #[test]
+    fn ssh_domain_to_ssh_config_maps_domain_overrides() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let mut domain = test_domain("unit-test.example.invalid:2202");
+        domain.username = Some("deploy".to_string());
+        domain.no_agent_auth = true;
+        domain.ssh_backend = Some(SshBackend::Ssh2);
+        domain
+            .ssh_option
+            .insert("compression".to_string(), "yes".to_string());
+
+        let ssh_config = ssh_domain_to_ssh_config(&domain)?;
+
+        assert_eq!(
+            ssh_config
+                .get("frankenterm_ssh_backend")
+                .map(String::as_str),
+            Some("ssh2")
+        );
+        assert_eq!(ssh_config.get("user").map(String::as_str), Some("deploy"));
+        assert_eq!(ssh_config.get("port").map(String::as_str), Some("2202"));
+        assert_eq!(
+            ssh_config.get("identitiesonly").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            ssh_config.get("compression").map(String::as_str),
+            Some("yes")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_domain_to_ssh_config_uses_global_backend_default() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let mut config = Config::default_config();
+        config.ssh_backend = SshBackend::Ssh2;
+        config::use_this_configuration(config);
+
+        let ssh_config = ssh_domain_to_ssh_config(&test_domain("backend-default.invalid"))?;
+
+        assert_eq!(
+            ssh_config
+                .get("frankenterm_ssh_backend")
+                .map(String::as_str),
+            Some("ssh2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_command_non_posix_keeps_explicit_command_line() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let remote = RemoteSshDomain::with_ssh_domain(&test_domain("builder.invalid"))?;
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("%s");
+        cmd.arg("hello world");
+        cmd.env("CUSTOM", "VALUE");
+        let expected = cmd.as_unix_command_line()?;
+
+        let pane_id: PaneId = 4242;
+        let (command_line, env) =
+            remote.build_command(pane_id, Some(cmd), Some("/tmp/ignored".to_string()))?;
+
+        assert_eq!(command_line.as_deref(), Some(expected.as_str()));
+        assert_eq!(env_value(&env, "CUSTOM"), "VALUE");
+        assert_eq!(env_value(&env, "WEZTERM_REMOTE_PANE"), "4242");
+        Ok(())
+    }
+
+    #[test]
+    fn build_command_posix_prefers_command_dir_and_inlines_env() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let mut domain = test_domain("builder.invalid");
+        domain.assume_shell = Shell::Posix;
+        let remote = RemoteSshDomain::with_ssh_domain(&domain)?;
+
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("%s");
+        cmd.arg("hello world");
+        cmd.env("CUSTOM", "VALUE");
+        cmd.cwd("/tmp/original-dir");
+        let expected_tail = cmd.as_unix_command_line()?;
+
+        let pane_id: PaneId = 77;
+        let (command_line, env) =
+            remote.build_command(pane_id, Some(cmd), Some("/tmp/override dir".to_string()))?;
+
+        let command_line = command_line.expect("posix shell should wrap command");
+        assert!(command_line.starts_with("cd '/tmp/override dir';env "));
+        assert!(command_line.contains("CUSTOM=VALUE"));
+        assert!(command_line.contains("WEZTERM_REMOTE_PANE=77"));
+        assert!(command_line.contains(&expected_tail));
+        assert!(
+            !command_line.contains("/tmp/original-dir"),
+            "command_dir should override builder cwd"
+        );
+        assert_eq!(env_value(&env, "CUSTOM"), "VALUE");
+        assert_eq!(env_value(&env, "WEZTERM_REMOTE_PANE"), "77");
+        Ok(())
+    }
+
+    #[test]
+    fn build_command_uses_domain_default_prog() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let mut domain = test_domain("builder.invalid");
+        domain.default_prog = Some(vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo hi".to_string(),
+        ]);
+        let remote = RemoteSshDomain::with_ssh_domain(&domain)?;
+
+        let mut expected = CommandBuilder::new("bash");
+        expected.arg("-lc");
+        expected.arg("echo hi");
+        let expected = expected.as_unix_command_line()?;
+
+        let (command_line, env) = remote.build_command(9, None, None)?;
+
+        assert_eq!(command_line.as_deref(), Some(expected.as_str()));
+        assert_eq!(env_value(&env, "WEZTERM_REMOTE_PANE"), "9");
+        Ok(())
+    }
+
+    #[test]
+    fn build_command_default_prog_without_shell_wrapper_returns_none() -> anyhow::Result<()> {
+        let _guard = TestConfigGuard::new();
+
+        let remote = RemoteSshDomain::with_ssh_domain(&test_domain("builder.invalid"))?;
+
+        let (command_line, env) = remote.build_command(11, None, None)?;
+
+        assert!(command_line.is_none());
+        assert_eq!(env_value(&env, "WEZTERM_REMOTE_PANE"), "11");
+        assert_eq!(env_value(&env, "TERM_PROGRAM"), "WezTerm");
+        Ok(())
     }
 }
