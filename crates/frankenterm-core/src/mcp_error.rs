@@ -126,7 +126,15 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
+        MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
+        MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+        MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
+    };
+    use crate::cass::CassError;
+    use crate::caut::CautError;
+    use crate::error::{Error, WeztermError};
 
     // ========================================================================
     // Error Code Constants

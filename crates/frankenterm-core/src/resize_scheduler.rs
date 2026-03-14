@@ -2398,6 +2398,29 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_seeds_active_phase_age_from_frame_observation() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+        let _ = scheduler.submit_intent(intent(11, 1, ResizeWorkClass::Interactive, 1, 100));
+        let _ = scheduler.submit_intent(intent(12, 1, ResizeWorkClass::Interactive, 1, 200));
+
+        let frame = scheduler.schedule_frame();
+        assert_eq!(frame.scheduled.len(), 1);
+        assert_eq!(frame.scheduled[0].pane_id, 11);
+
+        let snapshot = scheduler.snapshot();
+        let pane = snapshot.panes.iter().find(|row| row.pane_id == 11).unwrap();
+        assert_eq!(pane.active_phase_started_at_ms, Some(200));
+
+        let debug = scheduler.debug_snapshot(64);
+        let stalled = debug.stalled_transactions(260, 75);
+        assert!(stalled.is_empty(), "age should be based on activation time, not old submit time");
+    }
+
+    #[test]
     fn overload_rejects_background_when_pending_cap_is_reached() {
         let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
             max_pending_panes: 1,
@@ -3367,6 +3390,57 @@ mod tests {
             4,
             "no storm: old submissions pruned from window"
         );
+        assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
+    }
+
+    #[test]
+    fn storm_state_ages_out_before_scheduling_with_newer_frame_observation() {
+        let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig {
+            frame_budget_units: 20,
+            storm_window_ms: 50,
+            storm_threshold_intents: 3,
+            max_storm_picks_per_tab: 1,
+            allow_single_oversubscription: false,
+            ..ResizeSchedulerConfig::default()
+        });
+
+        let _ = scheduler.submit_intent(intent_with_tab(
+            1,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            100,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            2,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            110,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            3,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            120,
+            Some(1),
+        ));
+        let _ = scheduler.submit_intent(intent_with_tab(
+            4,
+            1,
+            ResizeWorkClass::Interactive,
+            1,
+            200,
+            Some(2),
+        ));
+
+        let frame = scheduler.schedule_frame();
+        let tab1_picks = frame.scheduled.iter().filter(|work| work.pane_id <= 3).count();
+
+        assert_eq!(tab1_picks, 3, "stale storm state should age out before scheduling");
         assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
     }
 
