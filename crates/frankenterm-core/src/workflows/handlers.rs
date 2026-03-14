@@ -2059,6 +2059,253 @@ impl Workflow for HandleOnErrorCassSearch {
 }
 
 // ============================================================================
+// HandleSwarmLearningIndex — index completed sessions into cass (ft-2l9kn)
+// ============================================================================
+
+/// Cooldown window in milliseconds (15 minutes).
+/// Prevents re-indexing if a recent session from the same pane already triggered it.
+pub const SWARM_LEARNING_INDEX_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+const SWARM_LEARNING_INDEX_TIMEOUT_SECS: u64 = 30;
+
+/// Trigger cass index refresh when an agent session completes.
+///
+/// This is the "swarm learning" component of the cass integration: when an agent
+/// finishes working on a problem, the session is indexed so future agents can
+/// search for and benefit from the solution.
+///
+/// Fires on `session.end` and `session.summary` events after the cooldown window.
+pub struct HandleSwarmLearningIndex {
+    cooldown_ms: i64,
+}
+
+impl HandleSwarmLearningIndex {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: SWARM_LEARNING_INDEX_COOLDOWN_MS,
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+
+    fn workspace_from_pane(pane: Option<&crate::storage::PaneRecord>) -> Option<String> {
+        let cwd = pane?.cwd.as_deref()?;
+        let parsed = crate::wezterm::CwdInfo::parse(cwd);
+        if parsed.is_remote || parsed.path.is_empty() {
+            return None;
+        }
+        Some(parsed.path)
+    }
+}
+
+impl Default for HandleSwarmLearningIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleSwarmLearningIndex {
+    fn name(&self) -> &'static str {
+        "handle_swarm_learning_index"
+    }
+
+    fn description(&self) -> &'static str {
+        "Index completed agent sessions into cass for swarm learning"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        let et = &detection.event_type;
+        et == "session.end" || et == "session.summary"
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["session.end", "session.summary"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["claude_code", "codex", "gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if cass index was recently triggered for this pane",
+            ),
+            WorkflowStep::new(
+                "trigger_cass_index",
+                "Trigger cass index refresh for the session workspace",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Check cooldown
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("swarm_learning_index".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_index_ts = recent[0].ts,
+                                "handle_swarm_learning_index: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_index_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                "handle_swarm_learning_index: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: Trigger cass index
+                1 => {
+                    let pane = storage.get_pane(pane_id).await.ok().flatten();
+                    let workspace = Self::workspace_from_pane(pane.as_ref());
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    let cass = CassClient::new()
+                        .with_timeout_secs(SWARM_LEARNING_INDEX_TIMEOUT_SECS);
+                    let result_label = match cass
+                        .trigger_index(workspace.as_deref())
+                        .await
+                    {
+                        Ok(index_result) => {
+                            let sessions = index_result
+                                .sessions_indexed
+                                .unwrap_or(0);
+                            let new_sessions = index_result
+                                .new_sessions
+                                .unwrap_or(0);
+                            tracing::info!(
+                                pane_id,
+                                sessions,
+                                new_sessions,
+                                "handle_swarm_learning_index: cass index complete"
+                            );
+                            "index_complete"
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                "handle_swarm_learning_index: cass index failed"
+                            );
+                            "index_error"
+                        }
+                    };
+
+                    let timestamp_ms = now_ms();
+                    let input_summary = format!(
+                        "Swarm learning index for {agent_type} session end"
+                    );
+                    let mut context = new_workflow_handler_audit_context(
+                        "swarm_learning_index",
+                        "handle_swarm_learning_index",
+                        &execution_id,
+                        pane_id,
+                        Some(&input_summary),
+                        result_label,
+                        timestamp_ms,
+                    );
+                    context.add_evidence("agent_type", agent_type);
+                    add_optional_evidence(
+                        &mut context,
+                        "workspace",
+                        workspace.as_deref(),
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "swarm_learning_index".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id: None,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context: serialize_workflow_handler_audit_context(
+                            &context,
+                        ),
+                        result: result_label.to_string(),
+                    };
+
+                    if let Err(error) = storage.record_audit_action(audit).await {
+                        tracing::error!(
+                            pane_id,
+                            error = %error,
+                            "handle_swarm_learning_index: audit recording failed"
+                        );
+                    }
+
+                    StepResult::done(serde_json::json!({
+                        "status": result_label,
+                        "pane_id": pane_id,
+                        "workspace": workspace,
+                    }))
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
 // HandleAuthRequired — centralize auth recovery (wa-nu4.2.2.4)
 // ============================================================================
 

@@ -64,9 +64,9 @@ use crate::wezterm::{
 };
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
-    HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits,
-    PaneWorkflowLockManager, Workflow, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner,
-    WorkflowRunnerConfig,
+    HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd,
+    HandleSwarmLearningIndex, HandleUsageLimits, PaneWorkflowLockManager, Workflow,
+    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
 };
 
 #[path = "mcp_bridge.rs"]
@@ -468,6 +468,7 @@ fn builtin_workflows(config: &Config) -> Vec<Arc<dyn Workflow>> {
         Arc::new(HandleGeminiQuota::new()),
         Arc::new(HandleProcessTriageLifecycle::new()),
         Arc::new(HandleOnErrorCassSearch::new()),
+        Arc::new(HandleSwarmLearningIndex::new()),
     ]
 }
 

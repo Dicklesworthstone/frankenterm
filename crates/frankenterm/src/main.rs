@@ -7831,6 +7831,7 @@ fn build_workflow_by_name(
         Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
         Arc::new(frankenterm_core::workflows::HandleProcessTriageLifecycle::new()),
         Arc::new(frankenterm_core::workflows::HandleOnErrorCassSearch::new()),
+        Arc::new(frankenterm_core::workflows::HandleSwarmLearningIndex::new()),
     ];
 
     workflows.into_iter().find(|wf| wf.name() == name)
@@ -13109,8 +13110,11 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(
             frankenterm_core::workflows::HandleOnErrorCassSearch::new(),
         ));
+        workflow_runner.register_workflow(Arc::new(
+            frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
+        ));
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_session_start_context, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle, handle_on_error_cass_search"
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_session_start_context, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle, handle_on_error_cass_search, handle_swarm_learning_index"
         );
 
         // Spawn workflow runner event loop
@@ -22428,6 +22432,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ));
                         runner.register_workflow(Arc::new(
                             frankenterm_core::workflows::HandleOnErrorCassSearch::new(),
+                        ));
+                        runner.register_workflow(Arc::new(
+                            frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
                         ));
 
                         // Look up workflow
