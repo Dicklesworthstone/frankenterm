@@ -5510,6 +5510,73 @@ mod tests {
         assert_eq!(limit_type, "unknown_limit");
     }
 
+    #[test]
+    fn handle_claude_code_limits_classify_usage_warning() {
+        let trigger = serde_json::json!({"event_type": "usage.warning"});
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "usage_warning");
+        assert!(reset_time.is_none());
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_prefers_reset_time_over_retry_after() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {
+                "reset_time": "2026-03-14T18:00:00Z",
+                "retry_after": "fallback"
+            }
+        });
+        let (_, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(reset_time.as_deref(), Some("2026-03-14T18:00:00Z"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_falls_back_to_retry_after() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": {"retry_after": "60s"}
+        });
+        let (_, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(reset_time.as_deref(), Some("60s"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_usage_warning_is_safe_to_send() {
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_warning", None, 5);
+        assert_eq!(plan["safe_to_send"], true);
+        assert_eq!(plan["limit_type"], "usage_warning");
+        assert_eq!(plan["pane_id"], 5);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_usage_reached_not_safe() {
+        let plan = HandleClaudeCodeLimits::build_recovery_plan(
+            "usage_reached",
+            Some("2026-03-14T18:00:00Z"),
+            10,
+        );
+        assert_eq!(plan["safe_to_send"], false);
+        assert_eq!(plan["reset_time"], "2026-03-14T18:00:00Z");
+        let steps = plan["next_steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("reset")));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_rate_limit_not_safe() {
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("rate_limit_detected", None, 3);
+        assert_eq!(plan["safe_to_send"], false);
+        assert!(plan["reset_time"].is_null());
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_unknown_type() {
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("unknown_limit", None, 1);
+        assert_eq!(plan["safe_to_send"], false);
+        let steps = plan["next_steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("Unknown")));
+    }
+
     // ========================================================================
     // HandleGeminiQuota tests
     // ========================================================================
@@ -5628,6 +5695,41 @@ mod tests {
         let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
         assert_eq!(quota_type, "unknown_quota");
         assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn handle_gemini_quota_classify_rate_limit_maps_to_reached() {
+        let trigger = serde_json::json!({
+            "event_type": "rate_limit.detected",
+            "extracted": {"remaining": "0%"}
+        });
+        let (quota_type, remaining) = HandleGeminiQuota::classify_quota(&trigger);
+        assert_eq!(quota_type, "quota_reached");
+        assert_eq!(remaining.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn handle_gemini_quota_recovery_plan_warning_is_safe() {
+        let plan = HandleGeminiQuota::build_recovery_plan("quota_warning", Some("15%"), 7);
+        assert_eq!(plan["safe_to_send"], true);
+        assert_eq!(plan["remaining_pct"], "15%");
+        assert_eq!(plan["pane_id"], 7);
+    }
+
+    #[test]
+    fn handle_gemini_quota_recovery_plan_reached_not_safe() {
+        let plan = HandleGeminiQuota::build_recovery_plan("quota_reached", Some("0%"), 11);
+        assert_eq!(plan["safe_to_send"], false);
+        let steps = plan["next_steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("exhausted")));
+    }
+
+    #[test]
+    fn handle_gemini_quota_recovery_plan_unknown_type() {
+        let plan = HandleGeminiQuota::build_recovery_plan("unknown_quota", None, 2);
+        assert_eq!(plan["safe_to_send"], false);
+        let steps = plan["next_steps"].as_array().unwrap();
+        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("Unknown")));
     }
 
     // ========================================================================
