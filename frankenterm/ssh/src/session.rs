@@ -2,10 +2,10 @@ use crate::auth::*;
 use crate::config::ConfigMap;
 use crate::host::*;
 use crate::pty::*;
-use crate::runtime::channel::{bounded, Receiver, Sender};
+use crate::runtime::channel::{Receiver, Sender, bounded};
 use crate::sessioninner::*;
 use crate::sftp::{Sftp, SftpRequest};
-use filedescriptor::{socketpair, FileDescriptor};
+use filedescriptor::{FileDescriptor, socketpair};
 use portable_pty::PtySize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -200,6 +200,28 @@ pub struct ExecResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    fn test_session_sender() -> (SessionSender, Receiver<SessionRequest>, FileDescriptor) {
+        let (tx, rx) = bounded(1);
+        let (writer, reader) = socketpair().expect("socketpair failed");
+        (
+            SessionSender {
+                tx,
+                pipe: Arc::new(Mutex::new(writer)),
+            },
+            rx,
+            reader,
+        )
+    }
+
+    fn assert_pipe_wakeup(mut reader: FileDescriptor) {
+        let mut wake = [0u8; 1];
+        reader
+            .read_exact(&mut wake)
+            .expect("failed to read wake byte");
+        assert_eq!(wake, [b'x']);
+    }
 
     #[test]
     fn dead_session_display() {
@@ -316,5 +338,31 @@ mod tests {
         let dbg = format!("{:?}", sig);
         assert!(dbg.contains("SignalChannel"));
         assert!(dbg.contains("TERM"));
+    }
+
+    #[test]
+    fn session_sender_send_enqueues_request_and_wakes_pipe() {
+        let (sender, rx, reader) = test_session_sender();
+
+        crate::runtime::block_on(async {
+            sender
+                .send(SessionRequest::SessionDropped)
+                .await
+                .expect("send failed");
+        });
+
+        assert!(matches!(rx.try_recv(), Ok(SessionRequest::SessionDropped)));
+        assert_pipe_wakeup(reader);
+    }
+
+    #[test]
+    fn dropping_session_enqueues_session_dropped_and_wakes_pipe() {
+        let (sender, rx, reader) = test_session_sender();
+
+        let session = Session { tx: sender };
+        drop(session);
+
+        assert!(matches!(rx.try_recv(), Ok(SessionRequest::SessionDropped)));
+        assert_pipe_wakeup(reader);
     }
 }

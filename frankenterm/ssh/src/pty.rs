@@ -1,8 +1,8 @@
-use crate::runtime::channel::{bounded, Receiver, TryRecvError};
+use crate::runtime::channel::{Receiver, TryRecvError, bounded};
 use crate::session::{SessionRequest, SessionSender, SignalChannel};
 use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
 use crate::sessionwrap::SessionWrap;
-use filedescriptor::{socketpair, FileDescriptor};
+use filedescriptor::{FileDescriptor, socketpair};
 use portable_pty::{ExitStatus, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -324,5 +324,99 @@ impl crate::sessioninner::SessionInner {
             .ok_or_else(|| anyhow::anyhow!("invalid channel id {}", resize.channel))?;
         info.channel.resize_pty(&resize)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use portable_pty::{Child, ChildKiller};
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+
+    fn test_session_sender() -> (SessionSender, Receiver<SessionRequest>, FileDescriptor) {
+        let (tx, rx) = bounded(1);
+        let (writer, reader) = socketpair().expect("socketpair failed");
+        (
+            SessionSender {
+                tx,
+                pipe: Arc::new(Mutex::new(writer)),
+            },
+            rx,
+            reader,
+        )
+    }
+
+    fn assert_pipe_wakeup(mut reader: FileDescriptor) {
+        let mut wake = [0u8; 1];
+        reader
+            .read_exact(&mut wake)
+            .expect("failed to read wake byte");
+        assert_eq!(wake, [b'x']);
+    }
+
+    #[test]
+    fn ssh_child_wait_closed_channel_returns_failure_status_and_caches_it() {
+        let (exit_tx, exit_rx) = bounded(1);
+        drop(exit_tx);
+
+        let mut child = SshChildProcess {
+            channel: 7,
+            tx: None,
+            exit: exit_rx,
+            exited: None,
+        };
+
+        let status = child.wait().expect("wait failed");
+        assert_eq!(status.exit_code(), 1);
+        assert_eq!(child.exited.as_ref().map(ExitStatus::exit_code), Some(1));
+        assert_eq!(
+            child
+                .try_wait()
+                .expect("try_wait failed")
+                .expect("cached exit status missing")
+                .exit_code(),
+            1
+        );
+    }
+
+    #[test]
+    fn ssh_child_async_wait_closed_channel_returns_failure_status_and_caches_it() {
+        let (exit_tx, exit_rx) = bounded(1);
+        drop(exit_tx);
+
+        let mut child = SshChildProcess {
+            channel: 9,
+            tx: None,
+            exit: exit_rx,
+            exited: None,
+        };
+
+        let status = crate::runtime::block_on(child.async_wait()).expect("async_wait failed");
+        assert_eq!(status.exit_code(), 1);
+        assert_eq!(child.exited.as_ref().map(ExitStatus::exit_code), Some(1));
+    }
+
+    #[test]
+    fn ssh_child_kill_posts_hup_signal_and_wakes_pipe() {
+        let (sender, rx, reader) = test_session_sender();
+        let (_exit_tx, exit_rx) = bounded(1);
+        let mut child = SshChildProcess {
+            channel: 11,
+            tx: Some(sender),
+            exit: exit_rx,
+            exited: None,
+        };
+
+        child.kill().expect("kill failed");
+
+        match rx.try_recv().expect("signal request missing") {
+            SessionRequest::SignalChannel(signal) => {
+                assert_eq!(signal.channel, 11);
+                assert_eq!(signal.signame, "HUP");
+            }
+            other => panic!("expected SignalChannel request, got {:?}", other),
+        }
+        assert_pipe_wakeup(reader);
     }
 }
