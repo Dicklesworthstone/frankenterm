@@ -480,4 +480,216 @@ mod tests {
             assert!(matches!(err, AllocatorStatsError::JemallocNotEnabled));
         }
     }
+
+    // ========================================================================
+    // AllocatorBackend
+    // ========================================================================
+
+    #[test]
+    fn allocator_backend_as_str() {
+        assert_eq!(AllocatorBackend::System.as_str(), "system");
+        assert_eq!(AllocatorBackend::Jemalloc.as_str(), "jemalloc");
+    }
+
+    #[test]
+    fn jemalloc_enabled_matches_backend() {
+        assert_eq!(
+            jemalloc_enabled(),
+            allocator_backend() == AllocatorBackend::Jemalloc
+        );
+    }
+
+    // ========================================================================
+    // AllocatorStats default
+    // ========================================================================
+
+    #[test]
+    fn allocator_stats_default_is_zeroed() {
+        let stats = AllocatorStats::default();
+        assert_eq!(stats.allocated, 0);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.resident, 0);
+        assert_eq!(stats.mapped, 0);
+        assert_eq!(stats.retained, 0);
+    }
+
+    // ========================================================================
+    // ArenaId and PaneArena
+    // ========================================================================
+
+    #[test]
+    fn arena_id_raw_returns_inner_value() {
+        let id = ArenaId(42);
+        assert_eq!(id.raw(), 42);
+    }
+
+    #[test]
+    fn pane_arena_accessors() {
+        let arena = PaneArena::new(7, ArenaId(3));
+        assert_eq!(arena.pane_id(), 7);
+        assert_eq!(arena.arena_id(), ArenaId(3));
+    }
+
+    #[test]
+    fn pane_arena_equality() {
+        let a = PaneArena::new(1, ArenaId(10));
+        let b = PaneArena::new(1, ArenaId(10));
+        let c = PaneArena::new(1, ArenaId(11));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ========================================================================
+    // Arena<T> wrapper
+    // ========================================================================
+
+    #[test]
+    fn arena_as_mut_allows_modification() {
+        let owner = PaneArena::new(1, ArenaId(1));
+        let mut arena = Arena::new(owner, vec![1, 2, 3]);
+        arena.as_mut().push(4);
+        assert_eq!(arena.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(arena.owner(), owner);
+    }
+
+    #[test]
+    fn arena_into_inner_returns_value() {
+        let owner = PaneArena::new(5, ArenaId(5));
+        let arena = Arena::new(owner, "hello".to_string());
+        let inner = arena.into_inner();
+        assert_eq!(inner, "hello");
+    }
+
+    // ========================================================================
+    // ReserveOutcome
+    // ========================================================================
+
+    #[test]
+    fn reserve_outcome_created_accessors() {
+        let arena = PaneArena::new(1, ArenaId(1));
+        let outcome = ReserveOutcome::Created(arena);
+        assert!(outcome.is_created());
+        assert_eq!(outcome.arena(), arena);
+    }
+
+    #[test]
+    fn reserve_outcome_existing_accessors() {
+        let arena = PaneArena::new(2, ArenaId(2));
+        let outcome = ReserveOutcome::Existing(arena);
+        assert!(!outcome.is_created());
+        assert_eq!(outcome.arena(), arena);
+    }
+
+    // ========================================================================
+    // PaneArenaRegistry edge cases
+    // ========================================================================
+
+    #[test]
+    fn registry_get_returns_none_for_unknown_pane() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.get(999).is_none());
+    }
+
+    #[test]
+    fn registry_get_returns_some_for_reserved_pane() {
+        let registry = PaneArenaRegistry::new();
+        let outcome = registry.reserve(42);
+        let got = registry.get(42).expect("should find reserved pane");
+        assert_eq!(got, outcome.arena());
+    }
+
+    #[test]
+    fn registry_release_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.release(999).is_none());
+    }
+
+    #[test]
+    fn registry_set_tracked_bytes_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.set_tracked_bytes(999, 100).is_none());
+    }
+
+    #[test]
+    fn registry_stats_nonexistent_returns_none() {
+        let registry = PaneArenaRegistry::new();
+        assert!(registry.stats(999).is_none());
+    }
+
+    #[test]
+    fn registry_multiple_panes_independent_arenas() {
+        let registry = PaneArenaRegistry::new();
+        let a = registry.reserve(1).arena();
+        let b = registry.reserve(2).arena();
+        let c = registry.reserve(3).arena();
+
+        assert_ne!(a.arena_id(), b.arena_id());
+        assert_ne!(b.arena_id(), c.arena_id());
+        assert_eq!(registry.count(), 3);
+
+        // Track bytes independently
+        registry.set_tracked_bytes(1, 100);
+        registry.set_tracked_bytes(2, 200);
+        registry.set_tracked_bytes(3, 300);
+
+        assert_eq!(registry.stats(1).unwrap().tracked_bytes, 100);
+        assert_eq!(registry.stats(2).unwrap().tracked_bytes, 200);
+        assert_eq!(registry.stats(3).unwrap().tracked_bytes, 300);
+    }
+
+    #[test]
+    fn registry_peak_tracked_bytes_is_watermark() {
+        let registry = PaneArenaRegistry::new();
+        registry.reserve(1);
+
+        registry.set_tracked_bytes(1, 100);
+        registry.set_tracked_bytes(1, 500);
+        registry.set_tracked_bytes(1, 200);
+        registry.set_tracked_bytes(1, 400);
+
+        let stats = registry.stats(1).unwrap();
+        assert_eq!(stats.tracked_bytes, 400);
+        assert_eq!(stats.peak_tracked_bytes, 500);
+        assert_eq!(stats.updates, 4);
+    }
+
+    #[test]
+    fn registry_arena_ids_are_monotonically_increasing() {
+        let registry = PaneArenaRegistry::new();
+        let a = registry.reserve(10).arena().arena_id().raw();
+        let b = registry.reserve(20).arena().arena_id().raw();
+        let c = registry.reserve(30).arena().arena_id().raw();
+        assert!(a < b);
+        assert!(b < c);
+    }
+
+    #[test]
+    fn registry_stats_snapshot_includes_all_panes() {
+        let registry = PaneArenaRegistry::new();
+        registry.reserve(5);
+        registry.reserve(3);
+        registry.reserve(7);
+
+        registry.set_tracked_bytes(5, 50);
+        registry.set_tracked_bytes(7, 70);
+
+        let snapshot = registry.stats_snapshot();
+        assert_eq!(snapshot.len(), 3);
+        // Sorted by pane_id
+        assert_eq!(snapshot[0].arena.pane_id(), 3);
+        assert_eq!(snapshot[1].arena.pane_id(), 5);
+        assert_eq!(snapshot[2].arena.pane_id(), 7);
+        // Stats reflect tracked bytes
+        assert_eq!(snapshot[0].stats.tracked_bytes, 0); // no set_tracked_bytes for pane 3
+        assert_eq!(snapshot[1].stats.tracked_bytes, 50);
+        assert_eq!(snapshot[2].stats.tracked_bytes, 70);
+    }
+
+    #[test]
+    fn pane_arena_stats_default_is_zeroed() {
+        let stats = PaneArenaStats::default();
+        assert_eq!(stats.tracked_bytes, 0);
+        assert_eq!(stats.peak_tracked_bytes, 0);
+        assert_eq!(stats.updates, 0);
+    }
 }
