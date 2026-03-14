@@ -159,6 +159,13 @@ pub fn install_runtime_handle(handle: asupersync::runtime::RuntimeHandle) {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
 }
 
+/// Return the currently installed asupersync `RuntimeHandle`, if any.
+#[cfg(feature = "asupersync-runtime")]
+#[must_use]
+pub fn current_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
+    ASUPERSYNC_HANDLE.with(|cell| cell.borrow().as_ref().cloned())
+}
+
 /// Remove the asupersync `RuntimeHandle` from thread-local storage.
 #[cfg(feature = "asupersync-runtime")]
 pub fn clear_runtime_handle() {
@@ -168,6 +175,13 @@ pub fn clear_runtime_handle() {
 /// No-op for builds that do not install an asupersync runtime handle.
 #[cfg(not(feature = "asupersync-runtime"))]
 pub fn clear_runtime_handle() {}
+
+/// No runtime handle is installed when the asupersync runtime feature is off.
+#[cfg(not(feature = "asupersync-runtime"))]
+#[must_use]
+pub fn current_runtime_handle() -> Option<()> {
+    None
+}
 
 #[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
@@ -1516,6 +1530,20 @@ mod tests {
     fn runtime_builder_current_thread_builds() {
         let rt = RuntimeBuilder::current_thread().build();
         assert!(rt.is_ok());
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn current_runtime_handle_tracks_install_and_clear() {
+        clear_runtime_handle();
+        assert!(current_runtime_handle().is_none());
+
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        install_runtime_handle(runtime.inner.handle());
+        assert!(current_runtime_handle().is_some());
+
+        clear_runtime_handle();
+        assert!(current_runtime_handle().is_none());
     }
 
     #[test]

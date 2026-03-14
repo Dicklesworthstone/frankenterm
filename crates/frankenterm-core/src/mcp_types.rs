@@ -2,8 +2,12 @@
 //!
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use crate::config::PaneFilterConfig;
+use crate::policy::{InjectionResult, PaneCapabilities};
+use crate::query_contract::UnifiedSearchMode;
+use crate::wezterm::PaneInfo;
 
 pub(super) const MCP_VERSION: &str = "v1";
 
