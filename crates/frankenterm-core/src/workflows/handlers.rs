@@ -5371,6 +5371,90 @@ mod tests {
         assert_eq!(workflow.cooldown_ms, 5 * 60 * 1000);
     }
 
+    #[test]
+    fn auth_recovery_strategy_device_code_from_event_type() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.device_code",
+            "extracted": {"code": "ABCD-1234", "url": "https://example.test/device"},
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "device_code");
+        match strategy {
+            AuthRecoveryStrategy::DeviceCode { code, url } => {
+                assert_eq!(code.as_deref(), Some("ABCD-1234"));
+                assert_eq!(url.as_deref(), Some("https://example.test/device"));
+            }
+            other => panic!("expected DeviceCode, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_recovery_strategy_device_code_from_rule_id() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.unknown",
+            "rule_id": "codex.auth.device_code",
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "device_code");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_api_key_error_from_event_type() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.error",
+            "extracted": {"key_name": "ANTHROPIC_API_KEY"},
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "api_key_error");
+        match strategy {
+            AuthRecoveryStrategy::ApiKeyError { key_hint } => {
+                assert_eq!(key_hint.as_deref(), Some("ANTHROPIC_API_KEY"));
+            }
+            other => panic!("expected ApiKeyError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_recovery_strategy_api_key_from_rule_id() {
+        let trigger = serde_json::json!({
+            "event_type": "other",
+            "rule_id": "claude_code.auth.api_key.missing",
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "api_key_error");
+    }
+
+    #[test]
+    fn auth_recovery_strategy_manual_intervention_fallback() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.browser_required",
+            "agent_type": "codex",
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "manual_intervention");
+        match strategy {
+            AuthRecoveryStrategy::ManualIntervention { agent_type, hint } => {
+                assert_eq!(agent_type, "codex");
+                assert!(hint.contains("codex"));
+            }
+            other => panic!("expected ManualIntervention, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_recovery_strategy_missing_agent_type_defaults_to_unknown() {
+        let trigger = serde_json::json!({
+            "event_type": "auth.browser_required",
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        match strategy {
+            AuthRecoveryStrategy::ManualIntervention { agent_type, .. } => {
+                assert_eq!(agent_type, "unknown");
+            }
+            other => panic!("expected ManualIntervention, got: {other:?}"),
+        }
+    }
+
     // ========================================================================
     // HandleClaudeCodeLimits tests
     // ========================================================================
