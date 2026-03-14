@@ -1522,4 +1522,142 @@ mod tests {
             Some("1")
         );
     }
+
+    // ========================================================================
+    // canonical_thread_id edge cases
+    // ========================================================================
+
+    #[test]
+    fn canonical_thread_id_uses_explicit_when_provided() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "m-1".to_string(),
+            fleet_id: Some("fleet-1".to_string()),
+            bead_id: Some("bead-1".to_string()),
+            assignment_id: None,
+            thread_id: Some("custom-thread".to_string()),
+            correlation_id: "corr-1".to_string(),
+            scenario_id: None,
+        };
+        assert_eq!(ctx.canonical_thread_id(), "custom-thread");
+    }
+
+    #[test]
+    fn canonical_thread_id_trims_whitespace() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "m-1".to_string(),
+            fleet_id: None,
+            bead_id: None,
+            assignment_id: None,
+            thread_id: Some("  padded-thread  ".to_string()),
+            correlation_id: "corr-1".to_string(),
+            scenario_id: None,
+        };
+        assert_eq!(ctx.canonical_thread_id(), "padded-thread");
+    }
+
+    #[test]
+    fn canonical_thread_id_ignores_empty_explicit() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "m-2".to_string(),
+            fleet_id: None,
+            bead_id: None,
+            assignment_id: None,
+            thread_id: Some("   ".to_string()),
+            correlation_id: "corr-2".to_string(),
+            scenario_id: None,
+        };
+        // Empty/whitespace-only thread_id falls back to derived
+        assert!(ctx.canonical_thread_id().starts_with("mission-"));
+        assert!(ctx.canonical_thread_id().contains("m-2"));
+    }
+
+    #[test]
+    fn canonical_thread_id_includes_fleet_and_bead() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "m-3".to_string(),
+            fleet_id: Some("fleet-A".to_string()),
+            bead_id: Some("ft-123".to_string()),
+            assignment_id: None,
+            thread_id: None,
+            correlation_id: "corr-3".to_string(),
+            scenario_id: None,
+        };
+        let tid = ctx.canonical_thread_id();
+        assert!(tid.starts_with("mission-"));
+        assert!(tid.contains("fleet"));
+        assert!(tid.contains("ft-123") || tid.contains("ft_123"));
+    }
+
+    #[test]
+    fn canonical_thread_id_mission_only() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "solo-mission".to_string(),
+            fleet_id: None,
+            bead_id: None,
+            assignment_id: None,
+            thread_id: None,
+            correlation_id: "corr-4".to_string(),
+            scenario_id: None,
+        };
+        let tid = ctx.canonical_thread_id();
+        assert!(tid.starts_with("mission-"));
+        assert!(tid.contains("solo"));
+    }
+
+    // ========================================================================
+    // Type serde roundtrips
+    // ========================================================================
+
+    #[test]
+    fn coordination_event_kind_serde_roundtrip() {
+        let kinds = [
+            CoordinationEventKind::StartNotice,
+            CoordinationEventKind::ProgressUpdate,
+            CoordinationEventKind::Handoff,
+            CoordinationEventKind::ContentionSignal,
+            CoordinationEventKind::Acknowledgement,
+        ];
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let back: CoordinationEventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*kind, back);
+        }
+    }
+
+    #[test]
+    fn mission_agent_mail_config_serde_roundtrip() {
+        let config = MissionAgentMailConfig {
+            ack_timeout_ms: 30_000,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: MissionAgentMailConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ack_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn mission_agent_mail_config_default() {
+        let config = MissionAgentMailConfig::default();
+        assert!(config.ack_timeout_ms > 0, "default ack_timeout_ms must be positive");
+    }
+
+    #[test]
+    fn coordination_context_serde_roundtrip() {
+        let ctx = MissionCoordinationContext {
+            mission_id: "m-serde".to_string(),
+            fleet_id: Some("fleet-1".to_string()),
+            bead_id: Some("ft-abc".to_string()),
+            assignment_id: None,
+            thread_id: None,
+            correlation_id: "corr-serde".to_string(),
+            scenario_id: Some("test-scenario".to_string()),
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: MissionCoordinationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mission_id, "m-serde");
+        assert_eq!(back.fleet_id.as_deref(), Some("fleet-1"));
+        assert_eq!(back.bead_id.as_deref(), Some("ft-abc"));
+        assert!(back.assignment_id.is_none());
+        assert!(back.thread_id.is_none());
+        assert_eq!(back.scenario_id.as_deref(), Some("test-scenario"));
+    }
 }
