@@ -45,8 +45,6 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-#[cfg(all(feature = "vendored", unix))]
-use crate::runtime_compat::mpsc_send;
 use crate::runtime_compat::{
     RwLock, mpsc, sleep,
     task::{self, JoinHandle},
@@ -106,6 +104,20 @@ async fn recv_event<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         rx.recv().await
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+async fn send_runtime_channel<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_request();
+        tx.send(&cx, value).await.is_ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        tx.send(value).await.is_ok()
     }
 }
 
@@ -2153,7 +2165,7 @@ impl ObservationRuntime {
                                     } else {
                                         exit_reason
                                     };
-                                    let _ = mpsc_send(
+                                    let _ = send_runtime_channel(
                                         &stream_exit_tx,
                                         StreamingTaskExit {
                                             pane_id,
@@ -2953,10 +2965,7 @@ async fn run_vendored_streaming_capture(
 
         let segments = bridge.process_delta(delta);
         for segment in segments {
-            if mpsc_send(&capture_tx, CaptureEvent { segment })
-                .await
-                .is_err()
-            {
+            if !send_runtime_channel(&capture_tx, CaptureEvent { segment }).await {
                 exit_reason = "capture ingress closed".to_string();
                 break;
             }
@@ -3669,17 +3678,44 @@ mod tests {
     }
 
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
-        #[cfg(feature = "asupersync-runtime")]
+        #[cfg(all(feature = "vendored", unix))]
         {
-            let cx = crate::cx::for_testing();
-            let sent = tx.send(&cx, value).await;
-            assert!(sent.is_ok(), "test mpsc send should succeed");
+            let sent = send_runtime_channel(tx, value).await;
+            assert!(sent, "test mpsc send should succeed");
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
+        #[cfg(not(all(feature = "vendored", unix)))]
         {
+            #[cfg(feature = "asupersync-runtime")]
+            let sent = {
+                let cx = crate::cx::for_testing();
+                tx.send(&cx, value).await
+            };
+
+            #[cfg(not(feature = "asupersync-runtime"))]
             let sent = tx.send(value).await;
+
             assert!(sent.is_ok(), "test mpsc send should succeed");
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn send_runtime_channel_reports_open_receiver() {
+        run_async_test(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            assert!(send_runtime_channel(&tx, 11).await);
+            assert_eq!(recv_mpsc(&mut rx).await, 11);
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn send_runtime_channel_reports_closed_receiver() {
+        run_async_test(async {
+            let (tx, rx) = mpsc::channel::<u8>(1);
+            drop(rx);
+            assert!(!send_runtime_channel(&tx, 7).await);
+        });
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_executor::Executor;
-use flume::{bounded, unbounded, Receiver, TryRecvError};
+use flume::{Receiver, TryRecvError, bounded, unbounded};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -191,6 +191,15 @@ where
 /// Sleep for the specified duration.
 ///
 /// This helper centralizes timer usage so call-sites can remain runtime-agnostic.
+#[cfg(feature = "async-asupersync")]
+pub async fn sleep(duration: std::time::Duration) {
+    asupersync::time::sleep(asupersync::time::wall_now(), duration).await;
+}
+
+/// Sleep for the specified duration.
+///
+/// This helper centralizes timer usage so call-sites can remain runtime-agnostic.
+#[cfg(not(feature = "async-asupersync"))]
 pub async fn sleep(duration: std::time::Duration) {
     async_io::Timer::after(duration).await;
 }
