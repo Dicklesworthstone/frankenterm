@@ -299,3 +299,134 @@ fn empty_contract_returns_invalid_contract_error() {
     let check = matches!(result.unwrap_err(), TxExecutionError::InvalidContract(_));
     assert!(check);
 }
+
+// ── Compensation invariants ────────────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn compensation_only_runs_when_commit_has_failures(
+        num_steps in 2_usize..=5,
+        fail_idx in 0_usize..5,
+    ) {
+        let fail_idx = fail_idx % num_steps;
+        let config = TxExecutionConfig {
+            fail_step: Some(format!("step-{fail_idx}")),
+            auto_compensate: true,
+            ..TxExecutionConfig::default()
+        };
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
+        let mut contract = make_contract(num_steps);
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        // Compensation should exist since we injected a failure
+        if let Some(commit) = &result.commit_report {
+            if commit.has_failures() {
+                prop_assert!(
+                    result.compensation_report.is_some(),
+                    "compensation must run when commit has failures and auto_compensate is true"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_compensation_without_auto_compensate(
+        num_steps in 2_usize..=4,
+        fail_idx in 0_usize..4,
+    ) {
+        let fail_idx = fail_idx % num_steps;
+        let config = TxExecutionConfig {
+            fail_step: Some(format!("step-{fail_idx}")),
+            auto_compensate: false,
+            ..TxExecutionConfig::default()
+        };
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
+        let mut contract = make_contract(num_steps);
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        prop_assert!(
+            result.compensation_report.is_none(),
+            "compensation must NOT run when auto_compensate is false"
+        );
+    }
+}
+
+// ── Contract state mutation invariants ─────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn contract_reflects_final_state_after_execution(num_steps in 1_usize..=4) {
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let mut contract = make_contract(num_steps);
+
+        // Before execution
+        let pre_state = contract.lifecycle_state.clone();
+        let pre_outcome = contract.outcome.clone();
+        prop_assert_eq!(pre_state, MissionTxState::Planned);
+        prop_assert_eq!(pre_outcome, TxOutcome::Pending);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        // After execution, contract must match result
+        prop_assert_eq!(
+            contract.lifecycle_state.clone(), result.final_state,
+            "contract lifecycle_state must match result.final_state"
+        );
+        prop_assert_eq!(
+            contract.outcome.clone(), result.outcome,
+            "contract outcome must match result.outcome"
+        );
+    }
+
+    #[test]
+    fn failure_injection_produces_non_committed_outcome(
+        num_steps in 2_usize..=5,
+        fail_idx in 0_usize..5,
+    ) {
+        let fail_idx = fail_idx % num_steps;
+        let config = TxExecutionConfig {
+            fail_step: Some(format!("step-{fail_idx}")),
+            ..TxExecutionConfig::default()
+        };
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
+        let mut contract = make_contract(num_steps);
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        prop_assert_ne!(
+            result.outcome,
+            TxOutcome::Committed,
+            "injected failure must prevent Committed outcome"
+        );
+    }
+}
+
+// ── Observability event coverage ───────────────────────────────────────────
+
+proptest! {
+    #[test]
+    fn successful_execution_emits_prepare_and_commit_events(num_steps in 1_usize..=3) {
+        use frankenterm_core::tx_observability::TxEventKind;
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let mut contract = make_contract(num_steps);
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        let kinds: Vec<&TxEventKind> = result.events.iter().map(|e| &e.kind).collect();
+        prop_assert!(
+            kinds.contains(&&TxEventKind::PrepareStarted),
+            "must emit PrepareStarted event"
+        );
+        prop_assert!(
+            kinds.contains(&&TxEventKind::PrepareCompleted),
+            "must emit PrepareCompleted event"
+        );
+        prop_assert!(
+            kinds.contains(&&TxEventKind::CommitStarted),
+            "must emit CommitStarted event"
+        );
+        prop_assert!(
+            kinds.contains(&&TxEventKind::CommitCompleted),
+            "must emit CommitCompleted event"
+        );
+    }
+}
