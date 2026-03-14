@@ -3243,7 +3243,6 @@ dependencies = [
  "futures",
  "half",
  "hex",
- "httparse",
  "loom",
  "memchr",
  "mux",
