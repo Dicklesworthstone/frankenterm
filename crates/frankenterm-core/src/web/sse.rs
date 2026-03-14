@@ -685,8 +685,12 @@ pub(super) fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventStreamChannel, parse_event_stream_channel};
+    use super::{
+        EventStreamChannel, SseEvent, parse_event_stream_channel, parse_stream_max_hz,
+    };
     use crate::web_framework::QueryString;
+
+    // ── parse_event_stream_channel ───────────────────────────────────
 
     #[test]
     fn parse_event_stream_channel_is_case_insensitive() {
@@ -713,5 +717,125 @@ mod tests {
     fn parse_event_stream_channel_invalid_still_errors() {
         let qs = QueryString::parse("channel=unknown");
         assert!(parse_event_stream_channel(&qs).is_err());
+    }
+
+    #[test]
+    fn parse_event_stream_channel_no_param_defaults_to_all() {
+        let qs = QueryString::parse("");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::All)
+        ));
+    }
+
+    #[test]
+    fn parse_event_stream_channel_explicit_all() {
+        let qs = QueryString::parse("channel=all");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::All)
+        ));
+    }
+
+    #[test]
+    fn parse_event_stream_channel_singular_forms() {
+        let qs = QueryString::parse("channel=delta");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Deltas)
+        ));
+
+        let qs = QueryString::parse("channel=detection");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Detections)
+        ));
+
+        let qs = QueryString::parse("channel=signal");
+        assert!(matches!(
+            parse_event_stream_channel(&qs),
+            Ok(EventStreamChannel::Signals)
+        ));
+    }
+
+    // ── parse_stream_max_hz ──────────────────────────────────────────
+
+    #[test]
+    fn parse_stream_max_hz_default_when_absent() {
+        let qs = QueryString::parse("");
+        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+    }
+
+    #[test]
+    fn parse_stream_max_hz_explicit_value() {
+        let qs = QueryString::parse("max_hz=100");
+        assert_eq!(parse_stream_max_hz(&qs), 100);
+    }
+
+    #[test]
+    fn parse_stream_max_hz_clamped_to_max() {
+        let qs = QueryString::parse("max_hz=99999");
+        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_MAX_MAX_HZ);
+    }
+
+    #[test]
+    fn parse_stream_max_hz_zero_uses_default() {
+        let qs = QueryString::parse("max_hz=0");
+        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+    }
+
+    #[test]
+    fn parse_stream_max_hz_invalid_uses_default() {
+        let qs = QueryString::parse("max_hz=notanumber");
+        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+    }
+
+    // ── SseEvent serialization ───────────────────────────────────────
+
+    #[test]
+    fn sse_event_data_only() {
+        let event = SseEvent::new("hello world");
+        let bytes = event.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "data: hello world\n\n");
+    }
+
+    #[test]
+    fn sse_event_with_event_type_and_id() {
+        let event = SseEvent::new("payload")
+            .event_type("detection")
+            .id("42");
+        let bytes = event.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("event: detection\n"));
+        assert!(text.contains("id: 42\n"));
+        assert!(text.contains("data: payload\n"));
+        assert!(text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn sse_event_multiline_data() {
+        let event = SseEvent::new("line1\nline2\nline3");
+        let bytes = event.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("data: line1\n"));
+        assert!(text.contains("data: line2\n"));
+        assert!(text.contains("data: line3\n"));
+    }
+
+    #[test]
+    fn sse_event_comment() {
+        let event = SseEvent::comment("keepalive");
+        let bytes = event.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, ": keepalive\n\n");
+    }
+
+    #[test]
+    fn sse_event_empty_data() {
+        let event = SseEvent::new("");
+        let bytes = event.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "data: \n\n");
     }
 }
