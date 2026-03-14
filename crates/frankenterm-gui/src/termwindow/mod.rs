@@ -2420,7 +2420,7 @@ impl TermWindow {
                 | LauncherFlags::DOMAINS
                 | LauncherFlags::KEY_ASSIGNMENTS
                 | LauncherFlags::COMMANDS,
-            help_text: Some("Session manager: Enter=run/switch  Esc=cancel  /=filter".to_string()),
+            help_text: Some("Session manager: Enter=switch/open  Esc=cancel  /=filter".to_string()),
             fuzzy_help_text: None,
             alphabet: None,
         };

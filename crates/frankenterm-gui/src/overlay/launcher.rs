@@ -222,6 +222,90 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
+fn domain_connection_label(state: DomainState) -> &'static str {
+    match state {
+        DomainState::Attached => "connected",
+        DomainState::Detached => "detached",
+    }
+}
+
+fn session_entry_label(ws: &LauncherWorkspaceEntry) -> String {
+    let session_shape = format!(
+        "{}, {}",
+        count_label(ws.window_count, "window", "windows"),
+        count_label(ws.pane_count, "pane", "panes")
+    );
+
+    if ws.is_active {
+        format!("Session [current]: `{}` ({session_shape})", ws.name)
+    } else {
+        format!("Session: switch to `{}` ({session_shape})", ws.name)
+    }
+}
+
+fn create_session_entry_label(active_workspace: &str) -> String {
+    format!("Session: create new (current is `{active_workspace}`)")
+}
+
+fn domain_entry_label(domain: &LauncherDomainEntry) -> String {
+    let connection = domain_connection_label(domain.state);
+    match domain.state {
+        DomainState::Attached => {
+            format!("Domain [{connection}]: open new tab in {}", domain.label)
+        }
+        DomainState::Detached => format!("Domain [{connection}]: attach {}", domain.label),
+    }
+}
+
+fn build_session_domain_entries(args: &LauncherArgs) -> (Vec<Entry>, Option<usize>) {
+    let mut entries = vec![];
+    let mut active_idx = None;
+
+    if args.flags.contains(LauncherFlags::WORKSPACES) {
+        for ws in &args.workspaces {
+            if ws.is_active {
+                active_idx = Some(entries.len());
+            }
+            entries.push(Entry {
+                label: session_entry_label(ws),
+                action: KeyAssignment::SwitchToWorkspace {
+                    name: Some(ws.name.clone()),
+                    spawn: None,
+                },
+            });
+        }
+        entries.push(Entry {
+            label: create_session_entry_label(&args.active_workspace),
+            action: KeyAssignment::SwitchToWorkspace {
+                name: None,
+                spawn: None,
+            },
+        });
+    }
+
+    for domain in &args.domains {
+        if active_idx.is_none() && domain.domain_id == args.domain_id_of_current_tab {
+            active_idx = Some(entries.len());
+        }
+
+        let action = if domain.state == DomainState::Attached {
+            KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
+                domain: SpawnTabDomain::DomainName(domain.name.to_string()),
+                ..SpawnCommand::default()
+            })
+        } else {
+            KeyAssignment::AttachDomain(domain.name.to_string())
+        };
+
+        entries.push(Entry {
+            label: domain_entry_label(domain),
+            action,
+        });
+    }
+
+    (entries, active_idx)
+}
+
 struct LauncherState {
     active_idx: usize,
     max_items: usize,
@@ -279,8 +363,14 @@ impl LauncherState {
 
     fn build_entries(&mut self, args: LauncherArgs) {
         let config = configuration();
-        // Pull in the user defined entries from the launch_menu
-        // section of the configuration.
+        let (mut session_domain_entries, session_active_idx) = build_session_domain_entries(&args);
+        if let Some(active_idx) = session_active_idx {
+            self.active_idx = active_idx;
+        }
+        self.entries.append(&mut session_domain_entries);
+
+        // Pull in user-defined launch_menu items after the session/domain rows
+        // so Cmd+S stays focused on session management first.
         if args.flags.contains(LauncherFlags::LAUNCH_MENU_ITEMS) {
             for item in &config.launch_menu {
                 self.entries.push(Entry {
@@ -294,67 +384,6 @@ impl LauncherState {
                     action: KeyAssignment::SpawnCommandInNewTab(item.clone()),
                 });
             }
-        }
-
-        for domain in &args.domains {
-            let entry = if domain.state == DomainState::Attached {
-                Entry {
-                    label: format!("New Tab ({})", domain.label),
-                    action: KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
-                        domain: SpawnTabDomain::DomainName(domain.name.to_string()),
-                        ..SpawnCommand::default()
-                    }),
-                }
-            } else {
-                Entry {
-                    label: format!("Attach {}", domain.label),
-                    action: KeyAssignment::AttachDomain(domain.name.to_string()),
-                }
-            };
-
-            // Preselect the entry that corresponds to the active tab
-            // at the time that the launcher was set up, so that pressing
-            // Enter immediately afterwards spawns a tab in the same domain.
-            if domain.domain_id == args.domain_id_of_current_tab {
-                self.active_idx = self.entries.len();
-            }
-            self.entries.push(entry);
-        }
-
-        if args.flags.contains(LauncherFlags::WORKSPACES) {
-            for ws in &args.workspaces {
-                let session_shape = format!(
-                    "{}, {}",
-                    count_label(ws.window_count, "window", "windows"),
-                    count_label(ws.pane_count, "pane", "panes")
-                );
-                let label = if ws.is_active {
-                    format!("Current session: `{}` ({session_shape})", ws.name)
-                } else {
-                    format!("Switch to session: `{}` ({session_shape})", ws.name)
-                };
-
-                if ws.is_active {
-                    self.active_idx = self.entries.len();
-                }
-                self.entries.push(Entry {
-                    label,
-                    action: KeyAssignment::SwitchToWorkspace {
-                        name: Some(ws.name.clone()),
-                        spawn: None,
-                    },
-                });
-            }
-            self.entries.push(Entry {
-                label: format!(
-                    "Create new session (current is `{}`)",
-                    args.active_workspace
-                ),
-                action: KeyAssignment::SwitchToWorkspace {
-                    name: None,
-                    spawn: None,
-                },
-            });
         }
 
         for tab in &args.tabs {
@@ -738,4 +767,92 @@ pub fn launcher(
     state.update_filter();
     state.render(&mut term)?;
     state.run_loop(&mut term)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_args(flags: LauncherFlags) -> LauncherArgs {
+        LauncherArgs {
+            flags,
+            domains: vec![
+                LauncherDomainEntry {
+                    domain_id: 9,
+                    name: "local".to_string(),
+                    state: DomainState::Attached,
+                    label: "domain `local`".to_string(),
+                },
+                LauncherDomainEntry {
+                    domain_id: 11,
+                    name: "prod".to_string(),
+                    state: DomainState::Detached,
+                    label: "domain `prod` - Remote prod".to_string(),
+                },
+            ],
+            tabs: vec![],
+            pane_id: 0,
+            domain_id_of_current_tab: 9,
+            title: "Session Manager".to_string(),
+            active_workspace: "agent-fleet".to_string(),
+            workspaces: vec![
+                LauncherWorkspaceEntry {
+                    name: "agent-fleet".to_string(),
+                    window_count: 2,
+                    pane_count: 5,
+                    is_active: true,
+                },
+                LauncherWorkspaceEntry {
+                    name: "staging".to_string(),
+                    window_count: 1,
+                    pane_count: 2,
+                    is_active: false,
+                },
+            ],
+            help_text: String::new(),
+            fuzzy_help_text: String::new(),
+            alphabet: String::new(),
+        }
+    }
+
+    #[test]
+    fn session_rows_are_listed_before_domain_rows() {
+        let (entries, active_idx) = build_session_domain_entries(&sample_args(
+            LauncherFlags::WORKSPACES | LauncherFlags::DOMAINS,
+        ));
+
+        assert_eq!(
+            entries[0].label,
+            "Session [current]: `agent-fleet` (2 windows, 5 panes)"
+        );
+        assert_eq!(
+            entries[1].label,
+            "Session: switch to `staging` (1 window, 2 panes)"
+        );
+        assert_eq!(
+            entries[2].label,
+            "Session: create new (current is `agent-fleet`)"
+        );
+        assert_eq!(
+            entries[3].label,
+            "Domain [connected]: open new tab in domain `local`"
+        );
+        assert_eq!(
+            entries[4].label,
+            "Domain [detached]: attach domain `prod` - Remote prod"
+        );
+        assert_eq!(active_idx, Some(0));
+    }
+
+    #[test]
+    fn current_domain_is_preselected_when_only_domains_are_visible() {
+        let (entries, active_idx) =
+            build_session_domain_entries(&sample_args(LauncherFlags::DOMAINS));
+
+        assert_eq!(
+            entries[0].label,
+            "Domain [connected]: open new tab in domain `local`"
+        );
+        assert_eq!(active_idx, Some(0));
+    }
 }

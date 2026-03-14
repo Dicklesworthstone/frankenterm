@@ -108,6 +108,8 @@ Default session-manager entry point:
 
 - `Cmd+S` opens the session manager launcher (workspace/domain/session switch surface).
 - Session rows include active/current marker plus window and pane counts.
+- Session rows are listed before domain and command-palette rows so the overlay opens session-first.
+- Domain rows surface the current mux connection state (`connected` or `detached`).
 
 Global launch options:
 
