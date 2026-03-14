@@ -4,8 +4,15 @@
 //! Contains file I/O, state resolution, and assignment aggregation helpers
 //! used by the mission/tx tool handlers.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::mcp_error::{MCP_ERR_INVALID_ARGS, McpToolError};
+
+use super::{
+    McpMissionAssignmentCounters, McpMissionAssignmentData, McpMissionFailureCatalogEntry,
+    McpMissionTransitionInfo, McpTxTransitionInfo, MissionStateParams,
+};
 
 // ── Tx contract file resolution and loading ─────────────────────────────
 
@@ -354,7 +361,16 @@ pub(super) fn mcp_build_mission_assignments(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        MCP_ERR_INVALID_ARGS, MissionStateParams, mcp_build_mission_assignments,
+        mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
+        mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions,
+        mcp_parse_mission_kill_switch, mcp_resolve_mission_file_path,
+        mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path, mcp_tx_transition_info,
+    };
+    use crate::config::Config;
     use crate::plan::{
         ApprovalState, Assignment, AssignmentId, CandidateActionId, MissionActorRole, MissionId,
         MissionKillSwitchLevel, MissionLifecycleState, MissionOwnership, MissionTxContract,

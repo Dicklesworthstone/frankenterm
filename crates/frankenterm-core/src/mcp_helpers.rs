@@ -2,8 +2,30 @@
 //!
 //! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
+use super::{CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms};
+use crate::Result;
+use crate::agent_provider::AgentProvider;
+use crate::cass::CassAgent;
+use crate::caut::CautService;
+use crate::config::Config;
+use crate::ingest::Osc133State;
+use crate::mcp_framework::{
+    FrameworkContent as Content, FrameworkMcpError as McpError, FrameworkMcpResult as McpResult,
+};
+use crate::policy::{
+    ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
+    PolicyEngine, PolicySurface,
+};
+use crate::runtime_compat::RuntimeBuilder as CompatRuntimeBuilder;
+use crate::storage::{PaneReservation, StorageHandle};
+use crate::workflows::{
+    HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
+    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, Workflow, WorkflowRunner,
+};
+use serde::Serialize;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 // ── Search config helpers ──────────────────────────────────────────
 
