@@ -1,6 +1,8 @@
 use crate::pane::{ForEachPaneLogicalLine, WithPaneLines};
 use frankenterm_dynamic::{FromDynamic, ToDynamic};
-use frankenterm_term::{Line, StableRowIndex, Terminal};
+use frankenterm_term::{
+    Line, StableRowIndex, Terminal, TieredScrollbackStatus as TermTieredScrollbackStatus,
+};
 #[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
 use rangeset::RangeSet;
@@ -20,6 +22,56 @@ pub struct StableCursorPosition {
 }
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(StableCursorPosition);
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, FromDynamic, ToDynamic,
+)]
+pub struct PaneTieredScrollbackStatus {
+    pub tiering_enabled: bool,
+    pub configured_scrollback_rows: usize,
+    pub configured_hot_lines: usize,
+    pub configured_warm_max_bytes: usize,
+    pub visible_rows: usize,
+    pub in_memory_scrollback_rows: usize,
+    pub warm_resident_lines: usize,
+    pub warm_resident_bytes: usize,
+    pub warm_spill_lines_total: u64,
+    pub warm_spill_bytes_total: u64,
+    pub cold_spill_lines_total: u64,
+    pub cold_spill_bytes_total: u64,
+    pub cold_worker_peak_backlog_depth: usize,
+    pub cold_worker_completion_throughput_lines_per_sec: u64,
+    pub cold_worker_completed_lines_total: u64,
+    pub cold_worker_completed_batches_total: u64,
+    pub cold_worker_cancellation_count: u64,
+}
+#[cfg(feature = "lua")]
+impl_lua_conversion_dynamic!(PaneTieredScrollbackStatus);
+
+impl From<TermTieredScrollbackStatus> for PaneTieredScrollbackStatus {
+    fn from(status: TermTieredScrollbackStatus) -> Self {
+        Self {
+            tiering_enabled: status.tiering_enabled,
+            configured_scrollback_rows: status.configured_scrollback_rows,
+            configured_hot_lines: status.configured_hot_lines,
+            configured_warm_max_bytes: status.configured_warm_max_bytes,
+            visible_rows: status.visible_rows,
+            in_memory_scrollback_rows: status.in_memory_scrollback_rows,
+            warm_resident_lines: status.warm_resident_lines,
+            warm_resident_bytes: status.warm_resident_bytes,
+            warm_spill_lines_total: status.warm_spill_lines_total,
+            warm_spill_bytes_total: status.warm_spill_bytes_total,
+            cold_spill_lines_total: status.cold_spill_lines_total,
+            cold_spill_bytes_total: status.cold_spill_bytes_total,
+            cold_worker_peak_backlog_depth: status.cold_worker_peak_backlog_depth,
+            cold_worker_completion_throughput_lines_per_sec: status
+                .cold_worker_completion_throughput_lines_per_sec,
+            cold_worker_completed_lines_total: status.cold_worker_completed_lines_total,
+            cold_worker_completed_batches_total: status.cold_worker_completed_batches_total,
+            cold_worker_cancellation_count: status.cold_worker_cancellation_count,
+        }
+    }
+}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, FromDynamic, ToDynamic,
@@ -281,5 +333,33 @@ mod tests {
         };
         assert!(dims.reverse_video);
         assert_ne!(dims, RenderableDimensions::default());
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_status_converts_from_terminal_status() {
+        let status = PaneTieredScrollbackStatus::from(TermTieredScrollbackStatus {
+            tiering_enabled: true,
+            configured_scrollback_rows: 128,
+            configured_hot_lines: 64,
+            configured_warm_max_bytes: 4096,
+            visible_rows: 32,
+            in_memory_scrollback_rows: 48,
+            warm_resident_lines: 16,
+            warm_resident_bytes: 2048,
+            warm_spill_lines_total: 99,
+            warm_spill_bytes_total: 8192,
+            cold_spill_lines_total: 55,
+            cold_spill_bytes_total: 16384,
+            cold_worker_peak_backlog_depth: 3,
+            cold_worker_completion_throughput_lines_per_sec: 777,
+            cold_worker_completed_lines_total: 44,
+            cold_worker_completed_batches_total: 11,
+            cold_worker_cancellation_count: 2,
+        });
+
+        assert!(status.tiering_enabled);
+        assert_eq!(status.configured_hot_lines, 64);
+        assert_eq!(status.warm_resident_bytes, 2048);
+        assert_eq!(status.cold_worker_completed_batches_total, 11);
     }
 }

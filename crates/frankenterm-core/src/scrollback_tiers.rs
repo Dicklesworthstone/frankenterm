@@ -97,6 +97,52 @@ pub enum ScrollbackTier {
     Cold,
 }
 
+/// Page-level metadata retained after a page is evicted to the cold tier.
+#[derive(Debug, Clone, Copy)]
+struct ColdPageMeta {
+    page_index: u64,
+    line_count: usize,
+}
+
+/// Concrete location hint for resolving a scrollback offset.
+///
+/// This is the bridge between tier selection and future retrieval logic:
+/// callers can use the returned page metadata to fetch/decompress the
+/// appropriate page without re-scanning the entire tier layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "tier", rename_all = "snake_case")]
+pub enum ScrollbackLocationHint {
+    /// The line is still resident in the hot tier.
+    Hot {
+        /// Zero-based line index within the hot deque, ordered oldest→newest.
+        line_index: usize,
+    },
+    /// The line resides in a warm compressed page that can be decompressed on demand.
+    Warm {
+        /// Stable page identifier, ordered from oldest to newest over the lifetime
+        /// of the scrollback instance.
+        page_index: u64,
+        /// Zero-based page offset counting backward from the newest warm page.
+        page_offset_from_newest: usize,
+        /// Zero-based line index within the page, ordered oldest→newest.
+        line_index_in_page: usize,
+        /// Total lines in the page.
+        page_line_count: usize,
+    },
+    /// The line has been evicted from memory and must be re-fetched from cold storage.
+    Cold {
+        /// Stable page identifier, ordered from oldest to newest over the lifetime
+        /// of the scrollback instance.
+        page_index: u64,
+        /// Zero-based page offset counting backward from the newest cold page.
+        page_offset_from_newest: usize,
+        /// Zero-based line index within the page, ordered oldest→newest.
+        line_index_in_page: usize,
+        /// Total lines in the page.
+        page_line_count: usize,
+    },
+}
+
 // =============================================================================
 // Tiered Scrollback
 // =============================================================================
@@ -114,6 +160,8 @@ pub struct TieredScrollback {
     hot: VecDeque<String>,
     /// Warm tier: compressed pages, ordered oldest-first.
     warm: VecDeque<CompressedPage>,
+    /// Cold tier metadata, ordered oldest-first.
+    cold: VecDeque<ColdPageMeta>,
     /// Total compressed bytes in the warm tier.
     warm_bytes: usize,
     /// Total lines ever added (including evicted).
@@ -155,6 +203,7 @@ impl TieredScrollback {
             compressor,
             hot: VecDeque::new(),
             warm: VecDeque::new(),
+            cold: VecDeque::new(),
             warm_bytes: 0,
             total_lines_added: 0,
             cold_line_count: 0,
@@ -263,6 +312,47 @@ impl TieredScrollback {
         ScrollbackTier::Cold
     }
 
+    /// Resolve an offset-from-end into a concrete tier/page/line location hint.
+    ///
+    /// Offset 0 = most recent line. Returns `None` if the offset falls beyond
+    /// the total retained+evicted line count.
+    #[must_use]
+    pub fn locate_offset(&self, offset_from_end: usize) -> Option<ScrollbackLocationHint> {
+        let hot_len = self.hot.len();
+        if offset_from_end < hot_len {
+            return Some(ScrollbackLocationHint::Hot {
+                line_index: hot_len - 1 - offset_from_end,
+            });
+        }
+
+        let mut remaining = offset_from_end - hot_len;
+        for (page_offset_from_newest, page) in self.warm.iter().rev().enumerate() {
+            if remaining < page.line_count {
+                return Some(ScrollbackLocationHint::Warm {
+                    page_index: page.page_index,
+                    page_offset_from_newest,
+                    line_index_in_page: page.line_count - 1 - remaining,
+                    page_line_count: page.line_count,
+                });
+            }
+            remaining -= page.line_count;
+        }
+
+        for (page_offset_from_newest, page) in self.cold.iter().rev().enumerate() {
+            if remaining < page.line_count {
+                return Some(ScrollbackLocationHint::Cold {
+                    page_index: page.page_index,
+                    page_offset_from_newest,
+                    line_index_in_page: page.line_count - 1 - remaining,
+                    page_line_count: page.line_count,
+                });
+            }
+            remaining -= page.line_count;
+        }
+
+        None
+    }
+
     /// Take a snapshot of the scrollback tier statistics.
     #[must_use]
     pub fn snapshot(&self) -> ScrollbackTierSnapshot {
@@ -283,9 +373,7 @@ impl TieredScrollback {
     /// Used during backpressure Red/Black tier events or when pane is idle.
     pub fn evict_all_warm(&mut self) {
         while let Some(page) = self.warm.pop_front() {
-            self.warm_bytes -= page.compressed_size();
-            self.cold_line_count += page.line_count as u64;
-            self.cold_page_count += 1;
+            self.evict_warm_page(page);
         }
     }
 
@@ -293,9 +381,7 @@ impl TieredScrollback {
     pub fn enforce_warm_cap(&mut self) {
         while self.warm_bytes > self.config.warm_max_bytes {
             if let Some(page) = self.warm.pop_front() {
-                self.warm_bytes -= page.compressed_size();
-                self.cold_line_count += page.line_count as u64;
-                self.cold_page_count += 1;
+                self.evict_warm_page(page);
             } else {
                 break;
             }
@@ -306,6 +392,7 @@ impl TieredScrollback {
     pub fn clear(&mut self) {
         self.hot.clear();
         self.warm.clear();
+        self.cold.clear();
         self.warm_bytes = 0;
         self.cold_line_count = 0;
         self.cold_page_count = 0;
@@ -363,6 +450,16 @@ impl TieredScrollback {
         if self.config.cold_eviction_enabled {
             self.enforce_warm_cap();
         }
+    }
+
+    fn evict_warm_page(&mut self, page: CompressedPage) {
+        self.warm_bytes -= page.compressed_size();
+        self.cold_line_count += page.line_count as u64;
+        self.cold_page_count += 1;
+        self.cold.push_back(ColdPageMeta {
+            page_index: page.page_index,
+            line_count: page.line_count,
+        });
     }
 }
 
@@ -617,6 +714,92 @@ mod tests {
         assert_eq!(sb.tier_for_offset(199), ScrollbackTier::Cold);
     }
 
+    #[test]
+    fn locate_offset_hot_returns_direct_line_index() {
+        let mut sb = TieredScrollback::new(small_config());
+        sb.push_lines((0..5).map(line));
+
+        assert_eq!(
+            sb.locate_offset(0),
+            Some(ScrollbackLocationHint::Hot { line_index: 4 })
+        );
+        assert_eq!(
+            sb.locate_offset(4),
+            Some(ScrollbackLocationHint::Hot { line_index: 0 })
+        );
+        assert_eq!(sb.locate_offset(5), None);
+    }
+
+    #[test]
+    fn locate_offset_warm_returns_page_and_line_hint() {
+        let mut sb = TieredScrollback::new(small_config());
+        for i in 0..20 {
+            sb.push_line(line(i));
+        }
+
+        assert_eq!(
+            sb.locate_offset(sb.hot_len()),
+            ScrollbackLocationHint::Warm {
+                page_index: 0,
+                page_offset_from_newest: 0,
+                line_index_in_page: 4,
+                page_line_count: 5,
+            }
+            .into()
+        );
+
+        assert_eq!(
+            sb.warm_page_lines(0)
+                .as_ref()
+                .and_then(|lines| lines.get(4))
+                .map(String::as_str),
+            Some("line-000004")
+        );
+    }
+
+    #[test]
+    fn locate_offset_cold_returns_stable_page_metadata() {
+        let config = ScrollbackConfig {
+            hot_lines: 10,
+            page_size: 5,
+            warm_max_bytes: 50, // Small cap → forces cold eviction
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: true,
+        };
+        let mut sb = TieredScrollback::new(config);
+        for i in 0..200 {
+            sb.push_line(line(i));
+        }
+
+        assert_eq!(
+            sb.locate_offset(199),
+            ScrollbackLocationHint::Cold {
+                page_index: 0,
+                page_offset_from_newest: sb.snapshot().cold_pages as usize - 1,
+                line_index_in_page: 0,
+                page_line_count: 5,
+            }
+            .into()
+        );
+
+        let newest_cold = sb.locate_offset(sb.hot_len() + sb.snapshot().warm_lines);
+        assert!(matches!(
+            newest_cold,
+            Some(ScrollbackLocationHint::Cold { .. })
+        ));
+        if let Some(ScrollbackLocationHint::Cold {
+            page_index,
+            page_offset_from_newest,
+            line_index_in_page,
+            page_line_count,
+        }) = newest_cold
+        {
+            assert!(page_index > 0);
+            assert_eq!(page_offset_from_newest, 0);
+            assert_eq!(line_index_in_page + 1, page_line_count);
+        }
+    }
+
     // ── Hot line access ──────────────────────────────────────────────
 
     #[test]
@@ -753,6 +936,19 @@ mod tests {
         assert_eq!(serde_json::to_value(ScrollbackTier::Hot).unwrap(), "hot");
         assert_eq!(serde_json::to_value(ScrollbackTier::Warm).unwrap(), "warm");
         assert_eq!(serde_json::to_value(ScrollbackTier::Cold).unwrap(), "cold");
+    }
+
+    #[test]
+    fn scrollback_location_hint_serde_roundtrip() {
+        let hint = ScrollbackLocationHint::Warm {
+            page_index: 7,
+            page_offset_from_newest: 1,
+            line_index_in_page: 3,
+            page_line_count: 5,
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        let back: ScrollbackLocationHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(hint, back);
     }
 
     // ── Lines <-> bytes roundtrip ───────────────────────────────────

@@ -637,6 +637,22 @@ impl ScrollbackTieringState {
         outcome
     }
 
+    fn evict_all_warm(&mut self) -> ScrollbackSpillOutcome {
+        let mut outcome = ScrollbackSpillOutcome::default();
+
+        while let Some(evicted) = self.warm_line_bytes.pop_front() {
+            self.warm_bytes = self.warm_bytes.saturating_sub(evicted);
+            self.cold_spill_lines_total = self.cold_spill_lines_total.saturating_add(1);
+            self.cold_spill_bytes_total =
+                self.cold_spill_bytes_total.saturating_add(evicted as u64);
+            outcome.cold_lines_evicted = outcome.cold_lines_evicted.saturating_add(1);
+            outcome.cold_bytes_evicted = outcome.cold_bytes_evicted.saturating_add(evicted);
+        }
+
+        self.warm_bytes = 0;
+        outcome
+    }
+
     fn warm_resident_lines(&self) -> usize {
         self.warm_line_bytes.len()
     }
@@ -750,6 +766,36 @@ impl Screen {
             .max(std::mem::size_of::<Line>())
     }
 
+    fn apply_cold_spill_outcome(
+        &mut self,
+        seqno: SequenceNo,
+        spill_outcome: ScrollbackSpillOutcome,
+        reason: &'static str,
+    ) {
+        if spill_outcome.cold_lines_evicted == 0 {
+            return;
+        }
+
+        self.cold_scrollback_worker
+            .begin_intent(seqno, spill_outcome.cold_lines_evicted);
+        self.cold_scrollback_worker
+            .complete_cold_batch(seqno, spill_outcome.cold_lines_evicted);
+        self.cold_scrollback_worker.finish_intent(
+            seqno,
+            Duration::from_millis(1),
+            spill_outcome.cold_lines_evicted,
+        );
+        debug!(
+            "tiered_scrollback_cold_spill reason={} seqno={} cold_lines_evicted={} cold_bytes_evicted={} warm_resident_lines={} warm_resident_bytes={}",
+            reason,
+            seqno,
+            spill_outcome.cold_lines_evicted,
+            spill_outcome.cold_bytes_evicted,
+            self.scrollback_tiering.warm_resident_lines(),
+            self.scrollback_tiering.warm_bytes
+        );
+    }
+
     fn record_scrollback_spill(&mut self, line: &Line, seqno: SequenceNo) {
         if !self.allow_scrollback {
             return;
@@ -765,27 +811,26 @@ impl Screen {
         let spill_outcome = self
             .scrollback_tiering
             .record_spill(line_bytes, self.tiered_scrollback_warm_max_bytes());
-        if spill_outcome.cold_lines_evicted == 0 {
-            return;
+        self.apply_cold_spill_outcome(seqno, spill_outcome, "budget_overflow");
+    }
+
+    /// Force all warm-tier residency into cold-tier accounting.
+    ///
+    /// This is the low-level primitive needed by fleet-level memory actions
+    /// such as `EvictWarmScrollback` and emergency cleanup paths.
+    pub fn evict_warm_scrollback(&mut self, seqno: SequenceNo) -> usize {
+        if !self.allow_scrollback {
+            return 0;
+        }
+        let tier = self.config.scrollback_tier_config();
+        if !tier.enabled {
+            return 0;
         }
 
-        self.cold_scrollback_worker
-            .begin_intent(seqno, spill_outcome.cold_lines_evicted);
-        self.cold_scrollback_worker
-            .complete_cold_batch(seqno, spill_outcome.cold_lines_evicted);
-        self.cold_scrollback_worker.finish_intent(
-            seqno,
-            Duration::from_millis(1),
-            spill_outcome.cold_lines_evicted,
-        );
-        debug!(
-            "tiered_scrollback_cold_spill seqno={} cold_lines_evicted={} cold_bytes_evicted={} warm_resident_lines={} warm_resident_bytes={}",
-            seqno,
-            spill_outcome.cold_lines_evicted,
-            spill_outcome.cold_bytes_evicted,
-            self.scrollback_tiering.warm_resident_lines(),
-            self.scrollback_tiering.warm_bytes
-        );
+        let spill_outcome = self.scrollback_tiering.evict_all_warm();
+        let evicted = spill_outcome.cold_lines_evicted;
+        self.apply_cold_spill_outcome(seqno, spill_outcome, "manual_evict");
+        evicted
     }
 
     fn visible_frame_snapshot(&self) -> Vec<Line> {
@@ -3762,6 +3807,93 @@ mod tests {
                 > 0,
             "cold spill should produce throughput telemetry"
         );
+    }
+
+    #[test]
+    fn evict_warm_scrollback_flushes_resident_warm_lines() {
+        let warm_max_bytes = std::mem::size_of::<Line>() * 64;
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=16 {
+            screen.scroll_up(&region, 1, seq, CellAttributes::blank(), bidi_mode());
+        }
+
+        let warm_lines_before = screen.scrollback_tiering.warm_resident_lines();
+        let warm_bytes_before = screen.scrollback_tiering.warm_bytes;
+        assert!(
+            warm_lines_before > 0,
+            "test requires resident warm-tier lines"
+        );
+        assert_eq!(
+            screen.scrollback_tiering.cold_spill_lines_total, 0,
+            "warm tier should still be resident before explicit eviction"
+        );
+
+        let evicted = screen.evict_warm_scrollback(999);
+
+        assert_eq!(evicted, warm_lines_before);
+        assert_eq!(screen.scrollback_tiering.warm_resident_lines(), 0);
+        assert_eq!(screen.scrollback_tiering.warm_bytes, 0);
+        assert_eq!(
+            screen.scrollback_tiering.cold_spill_lines_total,
+            warm_lines_before as u64
+        );
+        assert_eq!(
+            screen.scrollback_tiering.cold_spill_bytes_total,
+            warm_bytes_before as u64
+        );
+        assert_eq!(
+            screen.cold_scrollback_worker.completed_lines_total(),
+            warm_lines_before as u64
+        );
+        assert_eq!(screen.cold_scrollback_worker.completed_batches_total(), 1);
+        assert_eq!(screen.cold_scrollback_worker.backlog_depth(), 0);
+        assert!(
+            screen
+                .cold_scrollback_worker
+                .completion_throughput_lines_per_sec()
+                > 0,
+            "explicit warm eviction should update cold worker throughput telemetry"
+        );
+    }
+
+    #[test]
+    fn evict_warm_scrollback_noops_when_no_warm_residency_exists() {
+        let mut screen = test_screen_with_config(
+            2,
+            4,
+            96,
+            TestTermConfig {
+                scrollback: 10,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 2,
+                    warm_max_bytes: std::mem::size_of::<Line>() * 64,
+                },
+                ..TestTermConfig::default()
+            },
+        );
+
+        assert_eq!(screen.scrollback_tiering.warm_resident_lines(), 0);
+        assert_eq!(screen.evict_warm_scrollback(1000), 0);
+        assert_eq!(screen.scrollback_tiering.warm_resident_lines(), 0);
+        assert_eq!(screen.scrollback_tiering.cold_spill_lines_total, 0);
+        assert_eq!(screen.cold_scrollback_worker.completed_lines_total(), 0);
+        assert_eq!(screen.cold_scrollback_worker.completed_batches_total(), 0);
     }
 
     #[test]

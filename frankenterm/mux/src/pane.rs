@@ -270,6 +270,11 @@ pub trait Pane: Downcast + Send + Sync {
     /// Returns render related dimensions
     fn get_dimensions(&self) -> RenderableDimensions;
 
+    /// Returns live tiered scrollback telemetry for panes that maintain it.
+    fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
+        None
+    }
+
     fn pane_constraints(&self) -> PaneConstraints {
         PaneConstraints::default()
     }

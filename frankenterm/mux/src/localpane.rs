@@ -380,6 +380,18 @@ impl Pane for LocalPane {
         terminal_get_dimensions(&mut self.terminal.lock())
     }
 
+    fn get_tiered_scrollback_status(
+        &self,
+    ) -> Option<crate::renderable::PaneTieredScrollbackStatus> {
+        Some(
+            self.terminal
+                .lock()
+                .screen()
+                .tiered_scrollback_status()
+                .into(),
+        )
+    }
+
     fn copy_user_vars(&self) -> HashMap<String, String> {
         self.terminal.lock().user_vars().clone()
     }

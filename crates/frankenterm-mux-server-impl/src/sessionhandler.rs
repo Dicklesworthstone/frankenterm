@@ -5,7 +5,7 @@ use config::TermConfig;
 use mux::client::ClientId;
 use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, Pane, PaneId};
-use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
 use mux::{Mux, MuxNotification};
 use promise::spawn::spawn_into_main_thread;
@@ -41,6 +41,7 @@ pub(crate) struct PerPane {
     title: String,
     working_dir: Option<Url>,
     dimensions: RenderableDimensions,
+    tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
     mouse_grabbed: bool,
     sent_initial_palette: bool,
     seqno: SequenceNo,
@@ -62,6 +63,10 @@ impl PerPane {
 
         let dims = pane.get_dimensions();
         if dims != self.dimensions {
+            changed = true;
+        }
+        let tiered_scrollback_status = pane.get_tiered_scrollback_status();
+        if tiered_scrollback_status != self.tiered_scrollback_status {
             changed = true;
         }
 
@@ -125,6 +130,7 @@ impl PerPane {
         self.title = title.clone();
         self.working_dir = working_dir.clone();
         self.dimensions = dims;
+        self.tiered_scrollback_status = tiered_scrollback_status;
         self.mouse_grabbed = mouse_grabbed;
 
         let bonus_lines = bonus_lines.into();
@@ -133,6 +139,7 @@ impl PerPane {
             mouse_grabbed,
             dirty_lines: all_dirty_lines.iter().cloned().collect(),
             dimensions: dims,
+            tiered_scrollback_status,
             cursor_position,
             title,
             bonus_lines,
@@ -758,6 +765,7 @@ impl SessionHandler {
                                     pane_id,
                                     cursor_position,
                                     dimensions,
+                                    tiered_scrollback_status: pane.get_tiered_scrollback_status(),
                                 },
                             ))
                         },

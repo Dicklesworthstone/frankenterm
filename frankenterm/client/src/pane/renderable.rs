@@ -5,7 +5,7 @@ use codec::*;
 use config::{configuration, ConfigHandle};
 use lru::LruCache;
 use mux::pane::PaneId;
-use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::Mux;
 use promise::BrokenPromise;
 use rangeset::*;
@@ -64,6 +64,7 @@ pub struct RenderableInner {
 
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
+    pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
 
     lines: LruCache<StableRowIndex, LineEntry>,
     pub title: String,
@@ -105,6 +106,7 @@ impl RenderableInner {
             poll_interval: BASE_POLL_INTERVAL,
             cursor_position: StableCursorPosition::default(),
             dimensions,
+            tiered_scrollback_status: None,
             lines: LruCache::new(
                 NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
             ),
@@ -350,6 +352,7 @@ impl RenderableInner {
             self.cursor_position = delta.cursor_position;
         }
         self.dimensions = delta.dimensions;
+        self.tiered_scrollback_status = delta.tiered_scrollback_status;
         self.title = delta.title;
         self.working_dir = delta.working_dir.map(Into::into);
         log::trace!(
@@ -856,5 +859,9 @@ impl RenderableState {
 
     pub fn get_dimensions(&self) -> RenderableDimensions {
         self.inner.borrow().dimensions
+    }
+
+    pub fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
+        self.inner.borrow().tiered_scrollback_status
     }
 }

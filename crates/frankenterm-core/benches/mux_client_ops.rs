@@ -138,6 +138,7 @@ fn build_render_changes_response(pane_id: usize, seqno: usize) -> GetPaneRenderC
             pixel_height: 0,
             reverse_video: false,
         },
+        tiered_scrollback_status: None,
         dirty_lines: Vec::new(),
         title: "bench".to_string(),
         working_dir: None,

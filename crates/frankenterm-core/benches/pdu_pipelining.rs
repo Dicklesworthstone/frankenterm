@@ -65,6 +65,7 @@ fn render_changes_response(pane_id: usize) -> GetPaneRenderChangesResponse {
             pixel_height: 0,
             reverse_video: false,
         },
+        tiered_scrollback_status: None,
         dirty_lines: Vec::new(),
         title: format!("pane-{pane_id}"),
         working_dir: None,

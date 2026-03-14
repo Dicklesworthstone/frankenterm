@@ -174,6 +174,18 @@ impl Pane for TermWizTerminalPane {
         terminal_get_dimensions(&mut self.terminal.lock())
     }
 
+    fn get_tiered_scrollback_status(
+        &self,
+    ) -> Option<crate::renderable::PaneTieredScrollbackStatus> {
+        Some(
+            self.terminal
+                .lock()
+                .screen()
+                .tiered_scrollback_status()
+                .into(),
+        )
+    }
+
     fn get_title(&self) -> String {
         self.terminal.lock().get_title().to_string()
     }

@@ -20,7 +20,7 @@ use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
-use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{FloatingPaneRect, PaneNode, SerdeUrl, SplitRequest, TabId};
 use mux::window::WindowId;
 use portable_pty::CommandBuilder;
@@ -1037,6 +1037,8 @@ pub struct GetPaneRenderableDimensionsResponse {
     pub pane_id: PaneId,
     pub cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1051,6 +1053,8 @@ pub struct GetPaneRenderChangesResponse {
     pub mouse_grabbed: bool,
     pub cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
     pub dirty_lines: Vec<Range<StableRowIndex>>,
     pub title: String,
     pub working_dir: Option<SerdeUrl>,
