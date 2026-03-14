@@ -1,12 +1,12 @@
 {
   "issue_id": "ft-1u90p.8.7",
-  "checkpoint_date": "2026-03-12",
+  "checkpoint_date": "2026-03-13",
   "decision": "HOLD",
   "decision_reason": [
     "sample sufficiency thresholds not met",
     "no real-user survey responses captured yet",
     "current checkpoint uses fixture-only conformance run",
-    "2026-03-12 guardrail harness rerun passed; HOLD still required due insufficient cohort samples"
+    "2026-03-13 guardrail harness rerun passed, including anomaly schema checks; HOLD still required due insufficient cohort samples"
   ],
   "dependencies": {
     "ft-1u90p.7.7": "closed",
@@ -52,10 +52,10 @@
     "artifact_dir": "e2e-artifacts/2026-02-22T17-53-14Z/scenario_01_alt_screen_conformance"
   },
   "validation": {
-    "last_validated_at_utc": "2026-03-12T05:30:13Z",
-    "validation_scope": "evidence consistency + decision guardrails",
+    "last_validated_at_utc": "2026-03-13T02:58:37Z",
+    "validation_scope": "evidence consistency + anomaly taxonomy + decision guardrails",
     "e2e_script": "tests/e2e/test_ft_1u90p_8_7.sh",
-    "latest_log": "tests/e2e/logs/ft_1u90p_8_7_20260312_013012.jsonl",
+    "latest_log": "tests/e2e/logs/ft_1u90p_8_7_20260312_225836.jsonl",
     "checks": [
       "baseline_hold_when_thresholds_unmet",
       "summary_csv_feedback_join_consistency",
@@ -77,7 +77,7 @@
       "triage_owner": "resize-rollout-ops",
       "remediation_owner": "beta-program",
       "opened_at_utc": "2026-02-22T17:53:16Z",
-      "last_updated_at_utc": "2026-03-12T05:30:13Z",
+      "last_updated_at_utc": "2026-03-13T02:58:37Z",
       "summary": "Observed resize volume, alt-screen coverage, hardware-tier coverage, and feedback volume remain below the documented C2 thresholds.",
       "linked_feedback_ids": [
         "checkpoint-2026-02-22-fixture-only"
@@ -85,12 +85,12 @@
       "linked_artifacts": [
         "evidence/wa-1u90p.8.7/cohort_daily_summary.json",
         "evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv",
-        "tests/e2e/logs/ft_1u90p_8_7_20260312_013012.jsonl"
+        "tests/e2e/logs/ft_1u90p_8_7_20260312_225836.jsonl"
       ],
       "close_loop_status": "awaiting_real_user_cohort_ingest",
       "close_loop_evidence": [
-        "docs/resize-controlled-beta-feedback-loop-wa-1u90p.8.7.md#current-checkpoint-2026-03-12",
-        "evidence/wa-1u90p.8.7/decision_checkpoint_20260312.md"
+        "docs/resize-controlled-beta-feedback-loop-wa-1u90p.8.7.md#current-checkpoint-2026-03-13",
+        "evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md"
       ],
       "tracking_issue_ids": [
         "ft-1u90p.8.7",
@@ -107,7 +107,7 @@
       "triage_owner": "telemetry-correlation",
       "remediation_owner": "beta-program",
       "opened_at_utc": "2026-02-22T17:53:16Z",
-      "last_updated_at_utc": "2026-03-12T05:30:13Z",
+      "last_updated_at_utc": "2026-03-13T02:58:37Z",
       "summary": "The current checkpoint still derives from synthetic alt-screen evidence, so telemetry-to-feedback joins do not yet include real-user survey responses.",
       "linked_feedback_ids": [
         "checkpoint-2026-02-22-fixture-only"
@@ -115,12 +115,12 @@
       "linked_artifacts": [
         "evidence/wa-1u90p.8.7/beta_feedback_log.jsonl",
         "evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv",
-        "evidence/wa-1u90p.8.7/decision_checkpoint_20260312.md"
+        "evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md"
       ],
       "close_loop_status": "waiting_for_c2_feedback_collection",
       "close_loop_evidence": [
-        "evidence/wa-1u90p.8.7/decision_checkpoint_20260312.md",
-        "tests/e2e/logs/ft_1u90p_8_7_20260312_013012.jsonl"
+        "evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md",
+        "tests/e2e/logs/ft_1u90p_8_7_20260312_225836.jsonl"
       ],
       "tracking_issue_ids": [
         "ft-1u90p.8.7"
