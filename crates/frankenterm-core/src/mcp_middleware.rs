@@ -206,7 +206,11 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        McpOutputFormat, augment_tool_schema_with_format, encode_mcp_contents,
+        extract_mcp_output_format, parse_mcp_output_format,
+    };
+    use crate::mcp_framework::FrameworkContent as Content;
 
     // ========================================================================
     // McpOutputFormat Tests

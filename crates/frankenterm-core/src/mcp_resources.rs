@@ -575,7 +575,20 @@ impl ResourceHandler for WaReservationsByPaneTemplateResource {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::McpEnvelope;
+    use super::{
+        WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
+        WaEventsTemplateResource, WaEventsUnhandledTemplateResource, WaPanesResource,
+        WaReservationsByPaneTemplateResource, WaReservationsResource,
+        WaRulesByAgentTemplateResource, WaRulesResource, WaWorkflowsResource, envelope_as_resource,
+        tool_output_as_resource,
+    };
+    use crate::config::{Config, PaneFilterConfig};
+    use crate::mcp_framework::{
+        FrameworkContent as Content, FrameworkResourceHandler as ResourceHandler,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn db_path() -> Arc<PathBuf> {
         Arc::new(PathBuf::from("/tmp/test-mcp.db"))
