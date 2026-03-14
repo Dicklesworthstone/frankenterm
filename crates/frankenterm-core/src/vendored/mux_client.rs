@@ -12,8 +12,10 @@ use crate::config as wa_config;
 use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
 use crate::runtime_compat::mpsc_reserve_send;
+#[cfg(any(not(feature = "asupersync-runtime"), test))]
+use crate::runtime_compat::task;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{mpsc, mpsc_try_reserve_send, task, timeout, watch};
+use crate::runtime_compat::{mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
     GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
@@ -1463,7 +1465,6 @@ impl Default for SubscriptionConfig {
 /// Dropping this handle cancels the subscription.
 #[cfg(feature = "asupersync-runtime")]
 enum SubscriptionTask {
-    Ambient(task::JoinHandle<()>),
     Scoped(cx::JoinHandle<()>),
 }
 
@@ -1517,14 +1518,8 @@ fn pane_delta_try_emit_ended(
 
 #[cfg(feature = "asupersync-runtime")]
 async fn join_subscription_task(task: SubscriptionTask) {
-    match task {
-        SubscriptionTask::Ambient(handle) => {
-            let _ = handle.await;
-        }
-        SubscriptionTask::Scoped(handle) => {
-            handle.await;
-        }
-    }
+    let SubscriptionTask::Scoped(handle) = task;
+    handle.await;
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]
@@ -1788,6 +1783,28 @@ fn subscription_poll_delay(config: &SubscriptionConfig, saw_dirty_output: bool) 
     }
 }
 
+#[cfg(feature = "asupersync-runtime")]
+fn spawn_subscription_task_with_cx(
+    handle: &RuntimeHandle,
+    cx: &Cx,
+    client: DirectMuxClient,
+    pane_id: u64,
+    config: SubscriptionConfig,
+    tx: mpsc::Sender<PaneDelta>,
+    cancel_rx: watch::Receiver<bool>,
+) -> SubscriptionTask {
+    let task = cx::spawn_with_cx(handle, cx, move |cx| async move {
+        run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
+    });
+    SubscriptionTask::Scoped(task)
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn inherited_subscription_runtime_handle() -> RuntimeHandle {
+    crate::runtime_compat::current_runtime_handle()
+        .expect("pane output subscription started outside Runtime::block_on context")
+}
+
 impl Drop for PaneOutputSubscription {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
@@ -1814,14 +1831,12 @@ pub fn subscribe_pane_output_with_cx(
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
-    let task = cx::spawn_with_cx(handle, cx, move |cx| async move {
-        run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
-    });
-
     PaneOutputSubscription {
         receiver: rx,
         cancel: cancel_tx,
-        task: Some(SubscriptionTask::Scoped(task)),
+        task: Some(spawn_subscription_task_with_cx(
+            handle, cx, client, pane_id, config, tx, cancel_rx,
+        )),
     }
 }
 
@@ -1838,16 +1853,14 @@ pub fn subscribe_pane_output_with_inherited_cx(
 ) -> PaneOutputSubscription {
     let (tx, rx) = mpsc::channel(config.channel_capacity);
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let poller_cx = cx.clone();
-
-    let task = SubscriptionTask::Ambient(task::spawn(async move {
-        run_subscription_loop(&poller_cx, client, pane_id, config, tx, cancel_rx).await;
-    }));
+    let handle = inherited_subscription_runtime_handle();
 
     PaneOutputSubscription {
         receiver: rx,
         cancel: cancel_tx,
-        task: Some(task),
+        task: Some(spawn_subscription_task_with_cx(
+            &handle, cx, client, pane_id, config, tx, cancel_rx,
+        )),
     }
 }
 
@@ -1860,10 +1873,11 @@ pub fn subscribe_pane_output(
     let (cancel_tx, cancel_rx) = watch::channel(false);
 
     #[cfg(feature = "asupersync-runtime")]
-    let task = SubscriptionTask::Ambient(task::spawn(async move {
+    let task = {
         let cx = crate::cx::for_request();
-        run_subscription_loop(&cx, client, pane_id, config, tx, cancel_rx).await;
-    }));
+        let handle = inherited_subscription_runtime_handle();
+        spawn_subscription_task_with_cx(&handle, &cx, client, pane_id, config, tx, cancel_rx)
+    };
 
     #[cfg(not(feature = "asupersync-runtime"))]
     let task = task::spawn(async move {
@@ -3933,6 +3947,56 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn connect_with_cx_times_out_when_server_stalls_during_codec_handshake() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("connect-read-timeout-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for connect timeout with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    assert!(read > 0, "expected codec handshake request bytes");
+
+                    // Keep the socket open without sending a codec response so
+                    // client-side read timeout handling is exercised.
+                    sleep(Duration::from_millis(150)).await;
+                });
+            });
+
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should become ready");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(40);
+
+            let err = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect_err("connect_with_cx should fail when codec handshake stalls");
+            assert!(
+                matches!(err, DirectMuxError::ReadTimeout),
+                "expected ReadTimeout, got: {err}"
+            );
+
+            server.join().expect("server thread should exit cleanly");
+        });
+    }
+
     #[test]
     fn send_paste_write_timeout_when_server_stops_reading_after_handshake() {
         run_async_test(async {
@@ -4009,6 +4073,94 @@ mod tests {
                 .send_paste(0, payload)
                 .await
                 .expect_err("send_paste should time out when peer stops reading");
+            assert!(matches!(err, DirectMuxError::WriteTimeout));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_paste_with_cx_write_timeout_when_server_stops_reading_after_handshake() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("write-timeout-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for write-timeout with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "write-timeout-with-cx-test"
+                                                .to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+
+                                    // Keep socket open but stop reading so the client
+                                    // write path eventually back-pressures.
+                                    sleep(Duration::from_millis(500)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+            client.config.write_timeout = Duration::from_millis(5);
+
+            let payload = "x".repeat(32 * 1024 * 1024);
+            let err = client
+                .send_paste_with_cx(&cx, 0, payload)
+                .await
+                .expect_err("send_paste_with_cx should time out when peer stops reading");
             assert!(matches!(err, DirectMuxError::WriteTimeout));
 
             drop(client);
@@ -4097,6 +4249,91 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_panes_with_cx_read_timeout_when_server_stalls_after_handshake() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("read-timeout-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for read-timeout with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "read-timeout-with-cx-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    // Keep the socket open but silent past client read_timeout.
+                                    sleep(Duration::from_millis(250)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(40);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let err = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("list_panes_with_cx should time out when server stalls");
+            assert!(matches!(err, DirectMuxError::ReadTimeout));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
     #[test]
     fn list_panes_disconnected_when_server_closes_after_request() {
         run_async_test(async {
@@ -4171,6 +4408,93 @@ mod tests {
                 .list_panes()
                 .await
                 .expect_err("list_panes should fail when server closes without responding");
+            assert!(matches!(err, DirectMuxError::Disconnected));
+
+            drop(client);
+            server.join().expect("server thread");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_panes_with_cx_disconnected_when_server_closes_after_request() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir
+                .path()
+                .join("disconnected-after-request-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for disconnected with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "disconnected-with-cx-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let mut out = Vec::new();
+                                    Pdu::UnitResponse(UnitResponse {})
+                                        .encode(&mut out, decoded.serial)
+                                        .expect("encode response");
+                                    stream.write_all(&out).await.expect("write response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    // Close after consuming the request so the client sees EOF
+                                    // while awaiting the corresponding response.
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let err = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("list_panes_with_cx should fail when server closes without responding");
             assert!(matches!(err, DirectMuxError::Disconnected));
 
             drop(client);
