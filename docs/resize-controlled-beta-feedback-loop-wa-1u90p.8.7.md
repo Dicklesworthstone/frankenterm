@@ -43,6 +43,7 @@ The controlled beta maps to rollout cohort `C2` from `docs/resize-rollout-plan-w
 - Feedback sufficiency target:
   - >= 40 categorized feedback items total
   - >= 10 items from each workflow group
+- Only feedback items with `is_user_feedback = true` and `counts_toward_thresholds = true` count toward those promotion thresholds. Fixture-only or synthetic harness entries may stay in the evidence log for auditability, but they never satisfy beta sample sufficiency on their own.
 
 If sample thresholds are not met, decision status remains `HOLD`.
 
@@ -72,6 +73,8 @@ All beta feedback must be tagged with exactly one primary category and optional 
 - `severity` (`critical`/`high`/`medium`/`low`)
 - `session_id` (or anonymized equivalent)
 - `notes_md` (freeform operator note)
+- `is_user_feedback` (`true` only for real cohort feedback)
+- `counts_toward_thresholds` (`true` only when that item is eligible to satisfy promotion sample sufficiency)
 
 ## Anomaly and Remediation Taxonomy
 
@@ -160,7 +163,7 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - Decision: `HOLD`
 - Basis:
   - instrumentation path verified using deterministic fixture-only alt-screen conformance run
-  - e2e evidence guardrail harness revalidated on 2026-03-14 UTC (baseline/anomaly-schema/negative/recovery/anomaly-negative)
+  - e2e evidence guardrail harness revalidated on 2026-03-14 UTC (baseline/feedback-threshold-contract/anomaly-schema/negative/recovery/anomaly-negative)
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
 - Active anomaly ledger:

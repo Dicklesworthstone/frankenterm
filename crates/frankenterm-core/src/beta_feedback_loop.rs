@@ -261,6 +261,71 @@ pub enum PromotionDecision {
     Rollback,
 }
 
+/// Severity for rollout anomalies tracked alongside beta feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalySeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Lifecycle state for a tracked rollout anomaly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnomalyStatus {
+    Open,
+    Investigating,
+    Mitigated,
+    Closed,
+}
+
+/// Structured anomaly ledger entry for rollout blockers and regressions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BetaAnomaly {
+    /// Stable anomaly identifier.
+    pub anomaly_id: String,
+    /// Short category code (for example `A1`).
+    pub category_code: String,
+    /// Short human-readable title.
+    pub title: String,
+    /// Severity of the anomaly.
+    pub severity: AnomalySeverity,
+    /// Current lifecycle state.
+    pub status: AnomalyStatus,
+    /// Whether this anomaly forces `GO`, `HOLD`, or `ROLLBACK`.
+    pub blocking_decision: PromotionDecision,
+    /// Current triage owner.
+    pub triage_owner: String,
+    /// Current remediation owner.
+    pub remediation_owner: String,
+    /// When the anomaly was opened.
+    pub opened_at_ms: u64,
+    /// When the anomaly was last updated.
+    pub last_updated_at_ms: u64,
+    /// Freeform summary of the issue.
+    pub summary: String,
+    /// Linked qualitative feedback ids.
+    pub linked_feedback_ids: Vec<String>,
+    /// Linked evidence artifacts.
+    pub linked_artifacts: Vec<String>,
+    /// Current close-loop status string.
+    pub close_loop_status: String,
+    /// Evidence supporting the current close-loop status.
+    pub close_loop_evidence: Vec<String>,
+    /// Tracking issue ids for cross-linking into beads/docs.
+    pub tracking_issue_ids: Vec<String>,
+}
+
+impl BetaAnomaly {
+    /// Whether the anomaly is still active for rollout decisions.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.status != AnomalyStatus::Closed
+    }
+}
+
 /// Reason for a promotion decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionReason {
@@ -323,6 +388,12 @@ pub struct BetaLoopSnapshot {
     pub cohort_observation_counts: HashMap<String, u64>,
     /// Per-cohort feedback counts.
     pub cohort_feedback_counts: HashMap<String, u64>,
+    /// Number of currently active anomalies.
+    #[serde(default)]
+    pub active_anomaly_count: u64,
+    /// Full anomaly ledger snapshot.
+    #[serde(default)]
+    pub anomalies: Vec<BetaAnomaly>,
 }
 
 // ── Controller ─────────────────────────────────────────────────────────
@@ -341,6 +412,8 @@ pub struct BetaLoopController {
     feedback: HashMap<usize, Vec<QualitativeFeedback>>,
     /// cohort index → smoothness observations
     observations: HashMap<usize, Vec<SmoothnessObservation>>,
+    /// Structured anomaly ledger for HOLD/ROLLBACK blockers.
+    anomalies: Vec<BetaAnomaly>,
     transition_count: u32,
     evaluation_count: u32,
     last_decision: Option<PromotionDecision>,
@@ -363,6 +436,7 @@ impl BetaLoopController {
             member_cohort,
             feedback: HashMap::new(),
             observations: HashMap::new(),
+            anomalies: Vec::new(),
             transition_count: 0,
             evaluation_count: 0,
             last_decision: None,
@@ -412,6 +486,51 @@ impl BetaLoopController {
         }
     }
 
+    /// Upsert an anomaly in the rollout ledger.
+    pub fn record_anomaly(&mut self, anomaly: BetaAnomaly) {
+        if let Some(existing) = self
+            .anomalies
+            .iter_mut()
+            .find(|existing| existing.anomaly_id == anomaly.anomaly_id)
+        {
+            *existing = anomaly;
+        } else {
+            self.anomalies.push(anomaly);
+            self.anomalies
+                .sort_by(|left, right| left.anomaly_id.cmp(&right.anomaly_id));
+        }
+    }
+
+    /// Mark an anomaly as closed and append any new close-loop evidence.
+    pub fn resolve_anomaly(
+        &mut self,
+        anomaly_id: &str,
+        resolved_at_ms: u64,
+        close_loop_evidence: Vec<String>,
+    ) -> bool {
+        let Some(anomaly) = self
+            .anomalies
+            .iter_mut()
+            .find(|anomaly| anomaly.anomaly_id == anomaly_id)
+        else {
+            return false;
+        };
+
+        anomaly.status = AnomalyStatus::Closed;
+        anomaly.last_updated_at_ms = resolved_at_ms;
+        anomaly.close_loop_status = "closed".into();
+        for evidence in close_loop_evidence {
+            if !anomaly
+                .close_loop_evidence
+                .iter()
+                .any(|entry| entry == &evidence)
+            {
+                anomaly.close_loop_evidence.push(evidence);
+            }
+        }
+        true
+    }
+
     /// Total feedback entries across all cohorts.
     #[must_use]
     pub fn total_feedback(&self) -> u64 {
@@ -424,6 +543,24 @@ impl BetaLoopController {
         self.observations.values().map(|v| v.len() as u64).sum()
     }
 
+    /// Number of active anomalies currently affecting rollout decisions.
+    #[must_use]
+    pub fn active_anomaly_count(&self) -> usize {
+        self.anomalies
+            .iter()
+            .filter(|anomaly| anomaly.is_active())
+            .count()
+    }
+
+    /// Active anomalies currently affecting rollout decisions.
+    #[must_use]
+    pub fn active_anomalies(&self) -> Vec<&BetaAnomaly> {
+        self.anomalies
+            .iter()
+            .filter(|anomaly| anomaly.is_active())
+            .collect()
+    }
+
     /// Evaluate the current stage and produce a promotion decision.
     #[must_use]
     pub fn evaluate(&mut self, now_ms: u64) -> StageEvaluation {
@@ -433,6 +570,24 @@ impl BetaLoopController {
         let mut any_rollback = false;
         let mut all_meet_criteria = true;
         let mut any_data = false;
+        let mut hold_anomalies = Vec::new();
+
+        for anomaly in self.active_anomalies() {
+            match anomaly.blocking_decision {
+                PromotionDecision::Rollback => {
+                    any_rollback = true;
+                    reasons.push(DecisionReason {
+                        code: "anomaly_forces_rollback".into(),
+                        explanation: format!(
+                            "Anomaly '{}' ({}) forces rollback; triage owner '{}'",
+                            anomaly.anomaly_id, anomaly.title, anomaly.triage_owner,
+                        ),
+                    });
+                }
+                PromotionDecision::Hold => hold_anomalies.push(anomaly),
+                PromotionDecision::Promote => {}
+            }
+        }
 
         for (idx, cohort) in self.cohorts.iter().enumerate() {
             if !cohort.is_active_at(self.stage) {
@@ -532,9 +687,18 @@ impl BetaLoopController {
 
         let decision = if any_rollback {
             PromotionDecision::Rollback
-        } else if all_meet_criteria && any_data {
+        } else if all_meet_criteria && any_data && hold_anomalies.is_empty() {
             PromotionDecision::Promote
         } else {
+            for anomaly in &hold_anomalies {
+                reasons.push(DecisionReason {
+                    code: "anomaly_forces_hold".into(),
+                    explanation: format!(
+                        "Anomaly '{}' ({}) forces hold; remediation owner '{}'",
+                        anomaly.anomaly_id, anomaly.title, anomaly.remediation_owner,
+                    ),
+                });
+            }
             if !any_data {
                 reasons.push(DecisionReason {
                     code: "insufficient_data".into(),
@@ -610,6 +774,7 @@ impl BetaLoopController {
         self.stage = BetaStage::Baseline;
         self.feedback.clear();
         self.observations.clear();
+        self.anomalies.clear();
         self.transition_count = 0;
         self.evaluation_count = 0;
         self.last_decision = None;
@@ -639,6 +804,8 @@ impl BetaLoopController {
             last_decision: self.last_decision,
             cohort_observation_counts,
             cohort_feedback_counts,
+            active_anomaly_count: self.active_anomaly_count() as u64,
+            anomalies: self.anomalies.clone(),
         }
     }
 }
@@ -724,6 +891,50 @@ mod tests {
             description: "Terminal freezes during resize".into(),
             timestamp_ms: ts,
             nps_score: -50,
+        }
+    }
+
+    fn hold_anomaly(anomaly_id: &str, ts: u64) -> BetaAnomaly {
+        BetaAnomaly {
+            anomaly_id: anomaly_id.into(),
+            category_code: "A1".into(),
+            title: "Insufficient sample coverage".into(),
+            severity: AnomalySeverity::High,
+            status: AnomalyStatus::Open,
+            blocking_decision: PromotionDecision::Hold,
+            triage_owner: "resize-rollout-ops".into(),
+            remediation_owner: "beta-program".into(),
+            opened_at_ms: ts,
+            last_updated_at_ms: ts,
+            summary: "Awaiting enough real-user samples.".into(),
+            linked_feedback_ids: vec!["checkpoint-fixture-only".into()],
+            linked_artifacts: vec!["evidence/wa-1u90p.8.7/cohort_daily_summary.json".into()],
+            close_loop_status: "awaiting_real_user_cohort_ingest".into(),
+            close_loop_evidence: vec![
+                "evidence/wa-1u90p.8.7/decision_checkpoint_20260314.md".into(),
+            ],
+            tracking_issue_ids: vec!["ft-1u90p.8.7".into()],
+        }
+    }
+
+    fn rollback_anomaly(anomaly_id: &str, ts: u64) -> BetaAnomaly {
+        BetaAnomaly {
+            anomaly_id: anomaly_id.into(),
+            category_code: "A4".into(),
+            title: "Repeated resize regression".into(),
+            severity: AnomalySeverity::Critical,
+            status: AnomalyStatus::Investigating,
+            blocking_decision: PromotionDecision::Rollback,
+            triage_owner: "resize-rollout-ops".into(),
+            remediation_owner: "rendering-team".into(),
+            opened_at_ms: ts,
+            last_updated_at_ms: ts,
+            summary: "Critical resize regression remains unresolved.".into(),
+            linked_feedback_ids: vec!["feedback-critical-1".into()],
+            linked_artifacts: vec!["evidence/wa-1u90p.8.7/decision_checkpoint_20260314.md".into()],
+            close_loop_status: "investigating".into(),
+            close_loop_evidence: vec!["tests/e2e/logs/ft_1u90p_8_7_20260314_002836.jsonl".into()],
+            tracking_issue_ids: vec!["ft-1u90p.8.7".into()],
         }
     }
 
@@ -942,6 +1153,89 @@ mod tests {
                 .iter()
                 .any(|r| r.code == "critical_friction_exceeded")
         );
+    }
+
+    #[test]
+    fn evaluate_hold_when_active_anomaly_blocks_promotion() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        ctrl.stage = BetaStage::InternalBeta;
+        for i in 0..10 {
+            ctrl.record_observation(good_observation("alice", i * 100));
+            ctrl.record_feedback(positive_feedback("bob", i * 100));
+        }
+        ctrl.record_anomaly(hold_anomaly("sample-gap", 1_000));
+
+        let eval = ctrl.evaluate(2_000);
+        assert_eq!(eval.decision, PromotionDecision::Hold);
+        assert!(
+            eval.reasons
+                .iter()
+                .any(|reason| reason.code == "anomaly_forces_hold")
+        );
+    }
+
+    #[test]
+    fn evaluate_rollback_when_active_anomaly_demands_it() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        ctrl.stage = BetaStage::InternalBeta;
+        for i in 0..10 {
+            ctrl.record_observation(good_observation("alice", i * 100));
+            ctrl.record_feedback(positive_feedback("bob", i * 100));
+        }
+        ctrl.record_anomaly(rollback_anomaly("regression-open", 1_000));
+
+        let eval = ctrl.evaluate(2_000);
+        assert_eq!(eval.decision, PromotionDecision::Rollback);
+        assert!(
+            eval.reasons
+                .iter()
+                .any(|reason| reason.code == "anomaly_forces_rollback")
+        );
+    }
+
+    #[test]
+    fn resolved_anomaly_no_longer_blocks_promotion() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        ctrl.stage = BetaStage::InternalBeta;
+        for i in 0..10 {
+            ctrl.record_observation(good_observation("alice", i * 100));
+            ctrl.record_feedback(positive_feedback("bob", i * 100));
+        }
+        ctrl.record_anomaly(hold_anomaly("sample-gap", 1_000));
+        assert_eq!(ctrl.active_anomaly_count(), 1);
+        assert!(ctrl.resolve_anomaly(
+            "sample-gap",
+            2_000,
+            vec!["evidence/wa-1u90p.8.7/decision_checkpoint_20260315.md".into()],
+        ));
+
+        let eval = ctrl.evaluate(3_000);
+        assert_eq!(eval.decision, PromotionDecision::Promote);
+        let snapshot = ctrl.snapshot();
+        assert_eq!(snapshot.active_anomaly_count, 0);
+        assert_eq!(snapshot.anomalies.len(), 1);
+        assert_eq!(snapshot.anomalies[0].status, AnomalyStatus::Closed);
+        assert!(
+            snapshot.anomalies[0]
+                .close_loop_evidence
+                .iter()
+                .any(|entry| entry.ends_with("decision_checkpoint_20260315.md"))
+        );
+    }
+
+    #[test]
+    fn record_anomaly_upserts_existing_entry() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        let mut anomaly = hold_anomaly("sample-gap", 1_000);
+        ctrl.record_anomaly(anomaly.clone());
+        anomaly.status = AnomalyStatus::Mitigated;
+        anomaly.last_updated_at_ms = 2_000;
+        ctrl.record_anomaly(anomaly.clone());
+
+        let snapshot = ctrl.snapshot();
+        assert_eq!(snapshot.anomalies.len(), 1);
+        assert_eq!(snapshot.anomalies[0].status, AnomalyStatus::Mitigated);
+        assert_eq!(snapshot.active_anomaly_count, 1);
     }
 
     // ── Stage transitions ──────────────────────────────────────────────

@@ -4,9 +4,10 @@
 //! properties, config defaults, stage ordering, and snapshot consistency.
 
 use frankenterm_core::beta_feedback_loop::{
-    BetaCohort, BetaLoopConfig, BetaLoopController, BetaLoopSnapshot, BetaStage, CohortEvaluation,
-    DecisionReason, FeedbackCategory, FeedbackSeverity, PromotionDecision, QualitativeFeedback,
-    SmoothnessObservation, StageEvaluation,
+    AnomalySeverity, AnomalyStatus, BetaAnomaly, BetaCohort, BetaLoopConfig, BetaLoopController,
+    BetaLoopSnapshot, BetaStage, CohortEvaluation, DecisionReason, FeedbackCategory,
+    FeedbackSeverity, PromotionDecision, QualitativeFeedback, SmoothnessObservation,
+    StageEvaluation,
 };
 use proptest::prelude::*;
 
@@ -48,6 +49,24 @@ fn arb_promotion_decision() -> impl Strategy<Value = PromotionDecision> {
         Just(PromotionDecision::Promote),
         Just(PromotionDecision::Hold),
         Just(PromotionDecision::Rollback),
+    ]
+}
+
+fn arb_anomaly_severity() -> impl Strategy<Value = AnomalySeverity> {
+    prop_oneof![
+        Just(AnomalySeverity::Low),
+        Just(AnomalySeverity::Medium),
+        Just(AnomalySeverity::High),
+        Just(AnomalySeverity::Critical),
+    ]
+}
+
+fn arb_anomaly_status() -> impl Strategy<Value = AnomalyStatus> {
+    prop_oneof![
+        Just(AnomalyStatus::Open),
+        Just(AnomalyStatus::Investigating),
+        Just(AnomalyStatus::Mitigated),
+        Just(AnomalyStatus::Closed),
     ]
 }
 
@@ -163,6 +182,64 @@ fn arb_decision_reason() -> impl Strategy<Value = DecisionReason> {
         .prop_map(|(code, explanation)| DecisionReason { code, explanation })
 }
 
+fn arb_beta_anomaly() -> impl Strategy<Value = BetaAnomaly> {
+    (
+        "[a-z0-9\\-]{3,20}",
+        "A[1-9]",
+        "[a-z ]{5,30}",
+        arb_anomaly_severity(),
+        arb_anomaly_status(),
+        arb_promotion_decision(),
+        "[a-z\\-]{3,20}",
+        "[a-z\\-]{3,20}",
+        any::<u64>(),
+        any::<u64>(),
+        "[a-z ]{5,60}",
+        prop::collection::vec("[a-z0-9\\-]{3,20}", 0..4),
+        prop::collection::vec("[a-z0-9_./\\-]{3,50}", 0..4),
+        "[a-z_]{3,30}",
+        prop::collection::vec("[a-z0-9_./\\-]{3,50}", 0..4),
+        prop::collection::vec("ft-[a-z0-9.\\-]{3,20}", 0..4),
+    )
+        .prop_map(
+            |(
+                anomaly_id,
+                category_code,
+                title,
+                severity,
+                status,
+                blocking_decision,
+                triage_owner,
+                remediation_owner,
+                opened_at_ms,
+                last_updated_at_ms,
+                summary,
+                linked_feedback_ids,
+                linked_artifacts,
+                close_loop_status,
+                close_loop_evidence,
+                tracking_issue_ids,
+            )| BetaAnomaly {
+                anomaly_id,
+                category_code,
+                title,
+                severity,
+                status,
+                blocking_decision,
+                triage_owner,
+                remediation_owner,
+                opened_at_ms,
+                last_updated_at_ms,
+                summary,
+                linked_feedback_ids,
+                linked_artifacts,
+                close_loop_status,
+                close_loop_evidence,
+                tracking_issue_ids,
+            },
+        )
+}
+
 fn arb_cohort_evaluation() -> impl Strategy<Value = CohortEvaluation> {
     (
         "[a-z]{3,10}",
@@ -225,6 +302,8 @@ fn arb_beta_loop_snapshot() -> impl Strategy<Value = BetaLoopSnapshot> {
         proptest::option::of(arb_promotion_decision()),
         prop::collection::hash_map("[a-z]{3,8}", any::<u64>(), 0..4),
         prop::collection::hash_map("[a-z]{3,8}", any::<u64>(), 0..4),
+        any::<u64>(),
+        prop::collection::vec(arb_beta_anomaly(), 0..4),
     )
         .prop_map(
             |(
@@ -236,6 +315,8 @@ fn arb_beta_loop_snapshot() -> impl Strategy<Value = BetaLoopSnapshot> {
                 last_decision,
                 cohort_observation_counts,
                 cohort_feedback_counts,
+                active_anomaly_count,
+                anomalies,
             )| {
                 BetaLoopSnapshot {
                     stage,
@@ -246,6 +327,8 @@ fn arb_beta_loop_snapshot() -> impl Strategy<Value = BetaLoopSnapshot> {
                     last_decision,
                     cohort_observation_counts,
                     cohort_feedback_counts,
+                    active_anomaly_count,
+                    anomalies,
                 }
             },
         )
@@ -282,6 +365,20 @@ proptest! {
         let json = serde_json::to_string(&dec).unwrap();
         let parsed: PromotionDecision = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(dec, parsed);
+    }
+
+    #[test]
+    fn proptest_anomaly_severity_serde_roundtrip(sev in arb_anomaly_severity()) {
+        let json = serde_json::to_string(&sev).unwrap();
+        let parsed: AnomalySeverity = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(sev, parsed);
+    }
+
+    #[test]
+    fn proptest_anomaly_status_serde_roundtrip(status in arb_anomaly_status()) {
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: AnomalyStatus = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(status, parsed);
     }
 
     #[test]
@@ -339,6 +436,13 @@ proptest! {
         let parsed: DecisionReason = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(r.code, parsed.code);
         prop_assert_eq!(r.explanation, parsed.explanation);
+    }
+
+    #[test]
+    fn proptest_beta_anomaly_serde_roundtrip(anomaly in arb_beta_anomaly()) {
+        let json = serde_json::to_string(&anomaly).unwrap();
+        let parsed: BetaAnomaly = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(anomaly, parsed);
     }
 
     #[test]
