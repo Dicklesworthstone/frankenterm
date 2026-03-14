@@ -113,8 +113,18 @@ use mcp_tools::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
-#[allow(clippy::wildcard_imports)]
-use mcp_types::*;
+use mcp_types::{CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms};
+#[cfg(test)]
+use mcp_types::{
+    EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData,
+    McpMissionAssignmentCounters, McpMissionAssignmentData, McpMissionControlData,
+    McpMissionStateData, McpMissionTransitionInfo, McpPaneState, McpRuleItem, McpSearchHit,
+    McpWaitForData, McpWorkflowItem, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
+    MissionPauseParams, MissionStateParams, SearchParams, SendParams, StateParams, TruncationInfo,
+    WaitForParams, WorkflowRunParams, apply_tail_truncation, default_cass_context_lines,
+    default_cass_limit, default_cass_offset, default_cass_timeout_secs, default_events_limit,
+    default_tail, default_timeout_secs, default_ttl_ms, default_wait_tail,
+};
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
     config.search.rrf_k.max(1)
