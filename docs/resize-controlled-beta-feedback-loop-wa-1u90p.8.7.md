@@ -1,7 +1,7 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
-Date: 2026-03-13
-Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-13 UTC with anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
+Date: 2026-03-14
+Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-14 UTC with anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
 Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
 Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
 
@@ -155,12 +155,12 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - `tests/e2e/test_ft_1u90p_8_7.sh`
 - `tests/e2e/logs/ft_1u90p_8_7_<RUN_ID>.jsonl`
 
-### Current Checkpoint (2026-03-13)
+### Current Checkpoint (2026-03-14)
 
 - Decision: `HOLD`
 - Basis:
   - instrumentation path verified using deterministic fixture-only alt-screen conformance run
-  - e2e evidence guardrail harness revalidated on 2026-03-13 UTC (baseline/anomaly-schema/negative/recovery/anomaly-negative)
+  - e2e evidence guardrail harness revalidated on 2026-03-14 UTC (baseline/anomaly-schema/negative/recovery/anomaly-negative)
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
 - Active anomaly ledger:
@@ -177,8 +177,9 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260303.md`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260312.md`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md`
+  - `evidence/wa-1u90p.8.7/decision_checkpoint_20260314.md`
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_20260312_225836.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260314_002836.jsonl`
 
 ## Decision Rubric (Promotion / Hold / Rollback)
 
