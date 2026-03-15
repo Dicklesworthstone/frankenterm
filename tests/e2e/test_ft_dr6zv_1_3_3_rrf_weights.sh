@@ -25,6 +25,10 @@ SKIP_COUNT=0
 
 mkdir -p "$LOG_DIR"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "dr6zv_1_3_3_rrf_weights"
+ensure_rch_ready
+
 log_event() {
     local scenario="$1" event="$2" outcome="$3" reason_code="${4:-}" detail="${5:-}"
     local ts

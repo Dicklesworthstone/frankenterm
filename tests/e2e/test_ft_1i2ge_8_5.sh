@@ -45,6 +45,10 @@ REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-${REMOTE_SCRATCH_ROOT}/tmp}"
 REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-${REMOTE_SCRATCH_ROOT}/cargo-target}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_8_5"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

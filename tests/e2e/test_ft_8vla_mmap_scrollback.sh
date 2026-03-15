@@ -20,6 +20,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "8vla_mmap_scrollback"
+ensure_rch_ready
+
 emit_log() {
   local component="$1"
   local decision_path="$2"

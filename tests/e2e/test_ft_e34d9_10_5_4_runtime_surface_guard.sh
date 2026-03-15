@@ -44,6 +44,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
 fi
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_5_4_runtime_surface_guard"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

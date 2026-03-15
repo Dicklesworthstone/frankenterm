@@ -12,6 +12,10 @@ PANE_ID=0
 TARGET_DIR="target-rch-ft-l5em3-1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_l5em3_1_${RUN_ID}.jsonl"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_1"
+ensure_rch_ready
+
 emit_log() {
   local status="$1"
   local step="$2"

@@ -12,6 +12,10 @@ LOG_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_summary.json"
 TARGET_DIR="target-rch-ft-nu4-3-9-5-${RUN_ID}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_3_9_5"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

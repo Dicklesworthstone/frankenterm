@@ -20,6 +20,10 @@ else
 fi
 export CARGO_TARGET_DIR
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "124z4"
+ensure_rch_ready
+
 LAST_STEP_LOG=""
 LAST_STEP_QUEUE_LOG=""
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|Failed to connect to ubuntu@|too long for Unix domain socket'

@@ -11,6 +11,10 @@ CORRELATION_ID="ft-3681t.7.3-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_3681t_7_3_capacity_governor_${RUN_ID}.jsonl"
 TARGET_DIR="target-rch-ft-3681t-7-3"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_7_3_capacity_governor"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

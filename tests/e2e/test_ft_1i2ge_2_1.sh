@@ -12,6 +12,10 @@ LOG_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.jsonl"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.probe.log"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_2_1_${RUN_ID}.stdout.log"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_2_1"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

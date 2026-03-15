@@ -13,6 +13,10 @@ STDOUT_FILE="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_3681t_4_4_robot_contracts_${RUN_ID}.probe.log"
 TARGET_DIR="target-rch-ft3681t44-contracts"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_4_4_robot_contracts"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

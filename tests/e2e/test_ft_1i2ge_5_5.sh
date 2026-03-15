@@ -20,6 +20,10 @@ LAST_STDERR_FILE=""
 LAST_RC=0
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_5"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

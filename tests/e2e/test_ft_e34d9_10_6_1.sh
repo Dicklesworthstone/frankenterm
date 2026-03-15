@@ -21,6 +21,10 @@ check_log=""
 probe_log=""
 status_log=""
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_6_1"
+ensure_rch_ready
+
 emit_log() {
   local component="$1"
   local decision_path="$2"

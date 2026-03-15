@@ -13,6 +13,10 @@ TARGET_DIR="target-rch-ft-so7qh-6-${RUN_ID}"
 
 LOG_FILE="${LOG_DIR}/ft_so7qh_6_${RUN_ID}.jsonl"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_6"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

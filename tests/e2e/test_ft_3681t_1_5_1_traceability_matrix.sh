@@ -32,6 +32,10 @@ INCOMPLETE_COUNT=0
 RCH_PREFLIGHT_DONE=0
 RCH_REMOTE_READY=0
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_1_5_1_traceability_matrix"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

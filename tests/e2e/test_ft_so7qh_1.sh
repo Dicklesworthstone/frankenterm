@@ -15,6 +15,10 @@ TARGET_DIR="target-rch-ft-so7qh-1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_so7qh_1_${RUN_ID}.stdout.log"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "so7qh_1"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

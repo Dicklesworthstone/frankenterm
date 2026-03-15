@@ -23,6 +23,10 @@ else
 fi
 export CARGO_TARGET_DIR
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_7_contract_golden"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

@@ -20,6 +20,10 @@ export CARGO_TARGET_DIR
 
 LAST_STEP_LOG=""
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_4_1_unix_ipc"
+ensure_rch_ready
+
 emit_log() {
   local component="$1"
   local decision_path="$2"

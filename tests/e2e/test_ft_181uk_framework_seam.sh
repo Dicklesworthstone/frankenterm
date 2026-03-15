@@ -25,6 +25,10 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "181uk_framework_seam"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

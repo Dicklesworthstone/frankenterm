@@ -13,6 +13,10 @@ RAW_DIR="${LOG_DIR}/${RUN_ID}_raw"
 TARGET_DIR="target-rch-ft-2p9cb-6-1-3"
 mkdir -p "${RAW_DIR}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "2p9cb_6_1_3"
+ensure_rch_ready
+
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }

@@ -11,6 +11,10 @@ CORRELATION_ID="ft-l5em3.2-${RUN_ID}"
 TARGET_DIR="target-rch-ft-l5em3-2-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_l5em3_2_${RUN_ID}.jsonl"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "l5em3_2"
+ensure_rch_ready
+
 emit_log() {
   local status="$1"
   local step="$2"

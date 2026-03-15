@@ -13,6 +13,10 @@ STDOUT_FILE="${LOG_DIR}/ft_1i2ge_6_1_${RUN_ID}.stdout.log"
 PROBE_FILE="${LOG_DIR}/ft_1i2ge_6_1_${RUN_ID}.probe.log"
 LOG_FILE_REL="${LOG_FILE#"${ROOT_DIR}"/}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_6_1"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

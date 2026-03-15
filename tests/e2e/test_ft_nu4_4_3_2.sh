@@ -20,6 +20,10 @@ RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 TIMEOUT_BIN=""
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_4_3_2"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local scenario="$2"

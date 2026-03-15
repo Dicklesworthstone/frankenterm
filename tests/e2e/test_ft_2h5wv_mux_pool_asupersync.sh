@@ -19,6 +19,10 @@ RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
 TIMEOUT_BIN=""
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "2h5wv_mux_pool_asupersync"
+ensure_rch_ready
+
 PASS=0
 FAIL=0
 RCH_RUNTIME_BLOCKED="false"

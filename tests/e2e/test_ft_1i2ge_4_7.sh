@@ -30,6 +30,10 @@ else
 fi
 export CARGO_TARGET_DIR
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${CORRELATION_ID}" "1i2ge_4_7"
+ensure_rch_ready
+
 log_structured() {
     local outcome="$1" reason_code="$2" error_code="${3:-}" extra="${4:-}"
     printf '{"timestamp":"%s","component":"%s","scenario_id":"%s","correlation_id":"%s","outcome":"%s","reason_code":"%s","error_code":"%s"%s}\n' \

@@ -26,6 +26,10 @@ TARGET_DIR="target-rch-ft-1i2ge-4-6-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_4_6_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_4_6_${RUN_ID}.stdout.log"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_4_6"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

@@ -32,6 +32,10 @@ else
 fi
 export CARGO_TARGET_DIR
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${TIMESTAMP}" "2dss0"
+ensure_rch_ready
+
 # ── Structured log helper ──────────────────────────────────────────────────
 log_event() {
     local component="$1"

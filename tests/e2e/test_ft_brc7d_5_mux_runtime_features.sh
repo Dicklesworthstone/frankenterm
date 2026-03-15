@@ -14,6 +14,10 @@ TARGET_DIR="target-rch-ft-brc7d-5-${RUN_ID}"
 
 LAST_STEP_LOG=""
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "brc7d_5_mux_runtime_features"
+ensure_rch_ready
+
 emit_log() {
   local component="$1"
   local decision_path="$2"

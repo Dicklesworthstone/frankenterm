@@ -19,6 +19,10 @@ LAST_STEP_LOG=""
 RCH_LOCAL_FALLBACK_COUNT=0
 BENCH_ENOSPC=0
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "2oph2_scan_pipeline"
+ensure_rch_ready
+
 emit_log() {
   local component="$1"
   local decision_path="$2"

@@ -24,6 +24,10 @@ LOG_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.stdout.log"
 STDERR_FILE="${LOG_DIR}/ft_3681t_3_5_${RUN_ID}.stderr.log"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "3681t_3_5_swarm_pipeline_recovery"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"

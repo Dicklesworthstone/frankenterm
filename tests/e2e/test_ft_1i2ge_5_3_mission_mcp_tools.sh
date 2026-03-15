@@ -18,6 +18,10 @@ STDOUT_BASENAME="mission_mcp_tools_${RUN_ID}"
 WORKSPACE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ft-mission-mcp-tools.XXXXXX")"
 MISSION_PATH="${WORKSPACE_DIR}/.ft/mission/active.json"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
+rch_init "${LOG_DIR}" "${RUN_ID}" "1i2ge_5_3_mission_mcp_tools"
+ensure_rch_ready
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"
