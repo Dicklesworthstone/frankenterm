@@ -1723,4 +1723,176 @@ mod tests {
         assert!(suite.blocking_pass);
         assert_eq!(suite.total, 3);
     }
+
+    // ========================================================================
+    // HttpMethod
+    // ========================================================================
+
+    #[test]
+    fn http_method_labels() {
+        assert_eq!(HttpMethod::Get.label(), "GET");
+        assert_eq!(HttpMethod::Post.label(), "POST");
+        assert_eq!(HttpMethod::Put.label(), "PUT");
+        assert_eq!(HttpMethod::Delete.label(), "DELETE");
+    }
+
+    #[test]
+    fn http_method_serde_roundtrip() {
+        for method in [HttpMethod::Get, HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+            let json = serde_json::to_string(&method).unwrap();
+            let back: HttpMethod = serde_json::from_str(&json).unwrap();
+            assert_eq!(method, back);
+        }
+    }
+
+    // ========================================================================
+    // SdkLanguage
+    // ========================================================================
+
+    #[test]
+    fn sdk_language_extensions() {
+        assert_eq!(SdkLanguage::Python.extension(), ".py");
+        assert_eq!(SdkLanguage::TypeScript.extension(), ".ts");
+        assert_eq!(SdkLanguage::Rust.extension(), ".rs");
+        assert_eq!(SdkLanguage::Go.extension(), ".go");
+    }
+
+    #[test]
+    fn sdk_language_labels() {
+        assert_eq!(SdkLanguage::Python.label(), "Python");
+        assert_eq!(SdkLanguage::TypeScript.label(), "TypeScript");
+        assert_eq!(SdkLanguage::Rust.label(), "Rust");
+        assert_eq!(SdkLanguage::Go.label(), "Go");
+    }
+
+    #[test]
+    fn sdk_language_serde_roundtrip() {
+        for lang in [SdkLanguage::Python, SdkLanguage::TypeScript, SdkLanguage::Rust, SdkLanguage::Go] {
+            let json = serde_json::to_string(&lang).unwrap();
+            let back: SdkLanguage = serde_json::from_str(&json).unwrap();
+            assert_eq!(lang, back);
+        }
+    }
+
+    // ========================================================================
+    // CompatLevel
+    // ========================================================================
+
+    #[test]
+    fn compat_level_serde_roundtrip() {
+        for level in [
+            CompatLevel::Full,
+            CompatLevel::MappedCompat,
+            CompatLevel::Partial,
+            CompatLevel::Incompatible,
+            CompatLevel::NoEquivalent,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: CompatLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(level, back);
+        }
+    }
+
+    // ========================================================================
+    // MappingDirection
+    // ========================================================================
+
+    #[test]
+    fn mapping_direction_serde_roundtrip() {
+        for dir in [MappingDirection::NtmToFt, MappingDirection::FtToNtm] {
+            let json = serde_json::to_string(&dir).unwrap();
+            let back: MappingDirection = serde_json::from_str(&json).unwrap();
+            assert_eq!(dir, back);
+        }
+    }
+
+    // ========================================================================
+    // ReplayTestResult
+    // ========================================================================
+
+    #[test]
+    fn replay_test_result_serde_roundtrip() {
+        let result = ReplayTestResult {
+            test_id: "replay-1".to_string(),
+            passed: false,
+            diff_summary: "field $.data.count: expected 5, got 3".to_string(),
+            diff_count: 1,
+            duration_ms: 42,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ReplayTestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.test_id, "replay-1");
+        assert!(!back.passed);
+        assert_eq!(back.diff_count, 1);
+        assert_eq!(back.duration_ms, 42);
+    }
+
+    // ========================================================================
+    // ReplayTestSuiteResult with failures
+    // ========================================================================
+
+    #[test]
+    fn replay_suite_with_failures_reports_correct_pass_rate() {
+        let tests = vec![
+            ReplayContractTest::new("t1", "cmd1", "test 1"),
+            ReplayContractTest::new("t2", "cmd2", "test 2"),
+            ReplayContractTest::new("t3", "cmd3", "test 3"),
+        ];
+
+        let results = vec![
+            ReplayTestResult {
+                test_id: "t1".to_string(),
+                passed: true,
+                diff_summary: String::new(),
+                diff_count: 0,
+                duration_ms: 10,
+            },
+            ReplayTestResult {
+                test_id: "t2".to_string(),
+                passed: false,
+                diff_summary: "mismatch".to_string(),
+                diff_count: 2,
+                duration_ms: 20,
+            },
+            ReplayTestResult {
+                test_id: "t3".to_string(),
+                passed: true,
+                diff_summary: String::new(),
+                diff_count: 0,
+                duration_ms: 15,
+            },
+        ];
+
+        let suite = ReplayTestSuiteResult::from_results("suite-mixed", results, &tests);
+        assert_eq!(suite.total, 3);
+        assert_eq!(suite.passed, 2);
+        assert_eq!(suite.failed, 1);
+        // 2/3 ≈ 0.6667
+        assert!((suite.pass_rate - 2.0 / 3.0).abs() < 0.01);
+        let failed_ids: Vec<&str> = suite
+            .results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| r.test_id.as_str())
+            .collect();
+        assert_eq!(failed_ids, vec!["t2"]);
+    }
+
+    // ========================================================================
+    // ErrorCodeSpec
+    // ========================================================================
+
+    #[test]
+    fn error_code_spec_serde_roundtrip() {
+        let spec = ErrorCodeSpec {
+            code: "wezterm.1001".to_string(),
+            condition: "mux server unreachable".to_string(),
+            recovery: "restart wezterm".to_string(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ErrorCodeSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.code, "wezterm.1001");
+        assert_eq!(back.condition, "mux server unreachable");
+        assert_eq!(back.recovery, "restart wezterm");
+    }
 }
