@@ -20,18 +20,85 @@ mkdir -p "$raw_dir"
 scenarios_pass=0
 scenarios_fail=0
 
+RUN_ID="$(date +"%Y%m%d_%H%M%S")"
+RCH_TARGET_DIR="target/rch-e2e-replay-side-effect-isolation-${RUN_ID}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/replay_side_effect_isolation_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/replay_side_effect_isolation_${RUN_ID}.smoke.log"
+
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_json() { echo "$1" >>"$json_log"; }
 
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+
+    set +e
+    (
+        cd "${ROOT_DIR}"
+        run_rch_cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+
+    check_rch_fallback "${output_file}"
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+
+    set +e
+    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+    local smoke_rc=$?
+    set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"step\":\"start\",\"status\":\"running\"}"
+
+ensure_rch_ready
 
 # ── Scenario 1: Full unit test suite ──────────────────────────────────
 scenario="scenario1_unit_tests"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core replay_side_effect_barrier -- --nocapture \
-  >"$raw_dir/${scenario}.stdout.log" 2>"$raw_dir/${scenario}.stderr.log"
+run_rch_cargo_logged "$raw_dir/${scenario}.stdout.log" test -p frankenterm-core replay_side_effect_barrier -- --nocapture
 rc=$?
 set -e
 
@@ -49,8 +116,7 @@ scenario="scenario2_proptest"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core --test proptest_replay_side_effect_barrier -- --nocapture \
-  >"$raw_dir/${scenario}.stdout.log" 2>"$raw_dir/${scenario}.stderr.log"
+run_rch_cargo_logged "$raw_dir/${scenario}.stdout.log" test -p frankenterm-core --test proptest_replay_side_effect_barrier -- --nocapture
 rc=$?
 set -e
 
@@ -67,11 +133,9 @@ scenario="scenario3_determinism"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core replay_side_effect_barrier::tests::replay_barrier_blocks_all_effect_types -- --nocapture \
-  >"$raw_dir/${scenario}_run1.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_run1.log" test -p frankenterm-core replay_side_effect_barrier::tests::replay_barrier_blocks_all_effect_types -- --nocapture
 rc1=$?
-cargo test -p frankenterm-core replay_side_effect_barrier::tests::replay_barrier_blocks_all_effect_types -- --nocapture \
-  >"$raw_dir/${scenario}_run2.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_run2.log" test -p frankenterm-core replay_side_effect_barrier::tests::replay_barrier_blocks_all_effect_types -- --nocapture
 rc2=$?
 set -e
 
@@ -88,8 +152,7 @@ scenario="scenario4_isolation_completeness"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_side_effect_isolation\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core --test proptest_replay_side_effect_barrier no_effects_escape_replay -- --nocapture \
-  >"$raw_dir/${scenario}.stdout.log" 2>"$raw_dir/${scenario}.stderr.log"
+run_rch_cargo_logged "$raw_dir/${scenario}.stdout.log" test -p frankenterm-core --test proptest_replay_side_effect_barrier no_effects_escape_replay -- --nocapture
 rc=$?
 set -e
 

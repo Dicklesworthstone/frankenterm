@@ -15,6 +15,67 @@ CORRELATION_ID="ft-1i2ge.5.6-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.jsonl"
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
 
+RCH_TARGET_DIR="target/rch-e2e-operator-overrides-${RUN_ID}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/operator_overrides_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/operator_overrides_${RUN_ID}.smoke.log"
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+    set +e
+    (
+        cd "${ROOT_DIR}"
+        run_rch_cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+    check_rch_fallback "${output_file}"
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+    set +e
+    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+    local smoke_rc=$?
+    set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"
@@ -59,16 +120,16 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+ensure_rch_ready
+
 # ── Test 1: Compile check with subprocess-bridge feature ─────────────
 emit_log "running" "compile_check" "cargo_check" "none" \
   "none" "cargo check with subprocess-bridge feature"
 
+compile_log="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.compile.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-5-6-${RUN_ID}" \
-    cargo check -p frankenterm-core --features subprocess-bridge 2>&1
-) > "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.compile.log" 2>&1
+run_rch_cargo_logged "${compile_log}" \
+  check -p frankenterm-core --features subprocess-bridge
 compile_rc=$?
 set -e
 
@@ -85,13 +146,11 @@ emit_log "passed" "compile_check" "compilation_ok" "none" \
 emit_log "running" "unit_tests" "cargo_test" "none" \
   "none" "run override unit tests"
 
+tests_log="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-5-6-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge --lib \
-    -- "mission_loop::tests" 2>&1
-) > "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log" 2>&1
+run_rch_cargo_logged "${tests_log}" \
+  test -p frankenterm-core --features subprocess-bridge --lib \
+  -- "mission_loop::tests"
 test_rc=$?
 set -e
 
@@ -103,8 +162,8 @@ if [[ ${test_rc} -ne 0 ]]; then
 fi
 
 # Count passing override tests.
-override_count=$(grep -c "override.*ok$" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log" || echo 0)
-evaluate_count=$(grep -c "evaluate_with.*ok$" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log" || echo 0)
+override_count=$(grep -c "override.*ok$" "${tests_log}" || echo 0)
+evaluate_count=$(grep -c "evaluate_with.*ok$" "${tests_log}" || echo 0)
 total_override=$((override_count + evaluate_count))
 
 if [[ ${total_override} -lt 17 ]]; then
@@ -122,16 +181,14 @@ emit_log "passed" "unit_tests" "all_tests_ok" "none" \
 emit_log "running" "clippy_check" "cargo_clippy" "none" \
   "none" "verify zero clippy warnings in mission_loop"
 
+clippy_log="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.clippy.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-5-6-${RUN_ID}" \
-    cargo clippy -p frankenterm-core --features subprocess-bridge --lib --tests 2>&1
-) > "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.clippy.log" 2>&1
+run_rch_cargo_logged "${clippy_log}" \
+  clippy -p frankenterm-core --features subprocess-bridge --lib --tests
 clippy_rc=$?
 set -e
 
-mission_loop_warnings=$(grep -c "mission_loop.rs" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.clippy.log" || echo 0)
+mission_loop_warnings=$(grep -c "mission_loop.rs" "${clippy_log}" || echo 0)
 if [[ ${mission_loop_warnings} -gt 0 ]]; then
   emit_log "failed" "clippy_check" "clippy_warnings" "CLIPPY_WARN" \
     "ft_1i2ge_5_6_${RUN_ID}.clippy.log" \
@@ -147,7 +204,7 @@ emit_log "running" "serde_contract" "type_contract" "none" \
   "none" "validate override types serialize/deserialize correctly"
 
 # Ensure the serde roundtrip test is among passing tests.
-if ! grep -q "override_state_serde_roundtrip.*ok" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log"; then
+if ! grep -q "override_state_serde_roundtrip.*ok" "${tests_log}"; then
   emit_log "failed" "serde_contract" "missing_serde_test" "CONTRACT_MISSING" \
     "ft_1i2ge_5_6_${RUN_ID}.tests.log" "override_state_serde_roundtrip test not found"
   echo "FAIL: serde roundtrip test missing" >&2
@@ -160,13 +217,11 @@ emit_log "passed" "serde_contract" "serde_verified" "none" \
 emit_log "running" "determinism" "repeat_run" "none" \
   "none" "verify test results are deterministic across repeated runs"
 
+repeat_log="${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests_repeat.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-5-6-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge --lib \
-    -- "mission_loop::tests" 2>&1
-) > "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests_repeat.log" 2>&1
+run_rch_cargo_logged "${repeat_log}" \
+  test -p frankenterm-core --features subprocess-bridge --lib \
+  -- "mission_loop::tests"
 repeat_rc=$?
 set -e
 
@@ -178,8 +233,8 @@ if [[ ${repeat_rc} -ne 0 ]]; then
 fi
 
 # Compare test counts between runs.
-pass_count_1=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log" || echo 0)
-pass_count_2=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests_repeat.log" || echo 0)
+pass_count_1=$(grep -c "ok$" "${tests_log}" || echo 0)
+pass_count_2=$(grep -c "ok$" "${repeat_log}" || echo 0)
 if [[ ${pass_count_1} -ne ${pass_count_2} ]]; then
   emit_log "failed" "determinism" "count_mismatch" "DETERMINISM_FAIL" \
     "ft_1i2ge_5_6_${RUN_ID}.tests_repeat.log" \
@@ -196,7 +251,7 @@ emit_log "running" "recovery_path" "override_clear" "none" \
   "none" "validate that clearing overrides restores normal pipeline behavior"
 
 # The clear_override_moves_to_history test validates this path.
-if ! grep -q "clear_override_moves_to_history.*ok" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log"; then
+if ! grep -q "clear_override_moves_to_history.*ok" "${tests_log}"; then
   emit_log "failed" "recovery_path" "missing_clear_test" "RECOVERY_MISSING" \
     "ft_1i2ge_5_6_${RUN_ID}.tests.log" "clear_override recovery test not found"
   echo "FAIL: recovery path test missing" >&2
@@ -209,7 +264,7 @@ emit_log "passed" "recovery_path" "clear_verified" "none" \
 emit_log "running" "failure_injection" "ttl_expiry" "none" \
   "none" "validate that expired overrides are correctly evicted"
 
-if ! grep -q "evaluate_with_expired_override_evicted.*ok" "${LOG_DIR}/ft_1i2ge_5_6_${RUN_ID}.tests.log"; then
+if ! grep -q "evaluate_with_expired_override_evicted.*ok" "${tests_log}"; then
   emit_log "failed" "failure_injection" "missing_expiry_test" "INJECTION_MISSING" \
     "ft_1i2ge_5_6_${RUN_ID}.tests.log" "expired override eviction test not found"
   echo "FAIL: failure injection test missing" >&2
@@ -222,8 +277,5 @@ emit_log "passed" "failure_injection" "expiry_verified" "none" \
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "$(basename "${LOG_FILE}")" \
   "validated override types, pipeline integration, serde contract, determinism, recovery, and failure injection"
-
-# Cleanup ephemeral target dir.
-rm -rf "${ROOT_DIR}/target-e2e-1i2ge-5-6-${RUN_ID}" 2>/dev/null || true
 
 echo "ft-1i2ge.5.6 e2e passed. Logs: ${LOG_FILE_REL}"

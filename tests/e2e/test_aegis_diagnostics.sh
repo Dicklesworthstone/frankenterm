@@ -20,8 +20,74 @@ mkdir -p "$raw_dir"
 scenarios_pass=0
 scenarios_fail=0
 
+# ── rch offload variables ────────────────────────────────────────────
+RCH_TARGET_DIR="target/rch-e2e-aegis-diagnostics-${run_id}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/${run_id}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/${run_id}.smoke.log"
+
+# ── helpers ───────────────────────────────────────────────────────────
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_json() { echo "$1" >>"$json_log"; }
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+    set +e
+    (
+        cd "${ROOT_DIR}"
+        run_rch_cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+    check_rch_fallback "${output_file}"
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+    set +e
+    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+    local smoke_rc=$?
+    set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
+# ── preflight ─────────────────────────────────────────────────────────
+ensure_rch_ready
 
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"aegis_diagnostics\",\"run_id\":\"$run_id\",\"step\":\"start\",\"status\":\"running\"}"
 
@@ -30,8 +96,7 @@ scenario="scenario1_unit_tests"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"aegis_diagnostics\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core aegis_diagnostics -- --nocapture \
-  >"$raw_dir/${scenario}.stdout.log" 2>"$raw_dir/${scenario}.stderr.log"
+run_rch_cargo_logged "$raw_dir/${scenario}.stdout.log" test -p frankenterm-core aegis_diagnostics -- --nocapture
 rc=$?
 set -e
 
@@ -49,11 +114,9 @@ scenario="scenario2_cross_module"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"aegis_diagnostics\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core aegis_backpressure -- --nocapture \
-  >"$raw_dir/${scenario}_backpressure.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_backpressure.log" test -p frankenterm-core aegis_backpressure -- --nocapture
 rc1=$?
-cargo test -p frankenterm-core aegis_entropy_anomaly -- --nocapture \
-  >"$raw_dir/${scenario}_entropy.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_entropy.log" test -p frankenterm-core aegis_entropy_anomaly -- --nocapture
 rc2=$?
 set -e
 
@@ -70,9 +133,9 @@ scenario="scenario3_determinism"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"aegis_diagnostics\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
 set +e
-cargo test -p frankenterm-core aegis_diagnostics::tests::engine_dump_json -- --nocapture >"$raw_dir/${scenario}_run1.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_run1.log" test -p frankenterm-core aegis_diagnostics::tests::engine_dump_json -- --nocapture
 rc1=$?
-cargo test -p frankenterm-core aegis_diagnostics::tests::engine_dump_json -- --nocapture >"$raw_dir/${scenario}_run2.log" 2>&1
+run_rch_cargo_logged "$raw_dir/${scenario}_run2.log" test -p frankenterm-core aegis_diagnostics::tests::engine_dump_json -- --nocapture
 rc2=$?
 set -e
 

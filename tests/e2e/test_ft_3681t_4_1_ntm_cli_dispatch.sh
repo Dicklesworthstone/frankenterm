@@ -18,6 +18,45 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# ── rch infrastructure ──────────────────────────────────────────────────────
+RCH_TARGET_DIR="target/rch-e2e-ntm-cli-dispatch-${RUN_ID}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/ntm_cli_dispatch_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/ntm_cli_dispatch_${RUN_ID}.smoke.log"
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+run_rch() { TMPDIR=/tmp rch "$@"; }
+run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
+probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"; shift
+    set +e; ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
+    check_rch_fallback "${output_file}"; return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"
@@ -58,6 +97,13 @@ if ! command -v jq >/dev/null 2>&1; then
   emit_log "failed" "preflight_jq" "jq_missing" "jq_not_found" "jq is required"
   exit 1
 fi
+
+ensure_rch_ready
+
+# Build the ft binary via rch
+echo "[preflight] Building ft binary via rch..."
+build_log="${LOG_DIR}/ntm_cli_dispatch_${RUN_ID}.build.log"
+run_rch_cargo_logged "${build_log}" build --package frankenterm || true
 
 # Find the ft binary
 FT_BIN=""

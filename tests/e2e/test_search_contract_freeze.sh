@@ -19,23 +19,61 @@ raw_dir="$LOG_DIR/${run_id}_raw"
 mkdir -p "$raw_dir"
 scenarios_pass=0
 scenarios_fail=0
+RUN_ID="${run_id}"
 
 now_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
 log_json() { echo "$1" >>"$json_log"; }
 
+# ── rch infrastructure ──────────────────────────────────────────────────────
+RCH_TARGET_DIR="target/rch-e2e-search-contract-${RUN_ID}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/search_contract_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/search_contract_${RUN_ID}.smoke.log"
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+run_rch() { TMPDIR=/tmp rch "$@"; }
+run_rch_cargo() { run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"; }
+probe_has_reachable_workers() { grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"; }
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"; shift
+    set +e; ( cd "${ROOT_DIR}"; run_rch_cargo "$@" ) >"${output_file}" 2>&1; local rc=$?; set -e
+    check_rch_fallback "${output_file}"; return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+    set +e; run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1; local probe_rc=$?; set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+    set +e; run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1; local smoke_rc=$?; set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"step\":\"start\",\"status\":\"running\"}"
+
+ensure_rch_ready
 
 # ── Scenario 1: Full contract test suite ──────────────────────────────
 scenario="scenario1_contract_tests"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"outcome\":\"running\"}"
 
 cargo_out="$raw_dir/${scenario}.stdout.log"
-cargo_err="$raw_dir/${scenario}.stderr.log"
-
 set +e
-cargo test -p frankenterm-core --test search_api_contract_freeze -- --nocapture \
-  >"$cargo_out" 2>"$cargo_err"
+run_rch_cargo_logged "${cargo_out}" test -p frankenterm-core --test search_api_contract_freeze -- --nocapture
 rc=$?
 set -e
 
@@ -44,7 +82,7 @@ if [ $rc -eq 0 ]; then
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":null,\"error_code\":null,\"tests_passed\":$test_count,\"artifact_path\":\"${cargo_out#$ROOT_DIR/}\"}"
   scenarios_pass=$((scenarios_pass + 1))
 else
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"fail\",\"outcome\":\"fail\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":\"test_failure\",\"error_code\":\"exit_$rc\",\"artifact_path\":\"${cargo_err#$ROOT_DIR/}\"}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"fail\",\"outcome\":\"fail\",\"inputs\":{\"test\":\"search_api_contract_freeze\"},\"reason_code\":\"test_failure\",\"error_code\":\"exit_$rc\",\"artifact_path\":\"${cargo_out#$ROOT_DIR/}\"}"
   scenarios_fail=$((scenarios_fail + 1))
 fi
 
@@ -54,16 +92,14 @@ log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",
 
 run1="$raw_dir/${scenario}_run1.log"
 run2="$raw_dir/${scenario}_run2.log"
-
 set +e
-cargo test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture >"$run1" 2>&1
+run_rch_cargo_logged "${run1}" test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
 rc1=$?
-cargo test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture >"$run2" 2>&1
+run_rch_cargo_logged "${run2}" test -p frankenterm-core --test search_api_contract_freeze regression_ -- --nocapture
 rc2=$?
 set -e
 
 if [ $rc1 -eq 0 ] && [ $rc2 -eq 0 ]; then
-  # Both runs pass: deterministic
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"reason_code\":\"both_runs_pass\"}"
   scenarios_pass=$((scenarios_pass + 1))
 else
@@ -77,7 +113,6 @@ log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",
 
 schema_file="$ROOT_DIR/docs/json-schema/wa-robot-search.json"
 if [ -f "$schema_file" ]; then
-  # Validate it's valid JSON
   if python3 -c "import json; json.load(open('$schema_file'))" 2>/dev/null || \
      jq empty "$schema_file" 2>/dev/null; then
     log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"result\",\"status\":\"pass\",\"outcome\":\"pass\",\"reason_code\":\"schema_valid_json\"}"
@@ -95,10 +130,9 @@ fi
 scenario="scenario4_failure_injection"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"search_contract_freeze\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario\",\"step\":\"run\",\"status\":\"running\"}"
 
+scenario4_log="$raw_dir/${scenario}.log"
 set +e
-# Run only the schema contract tests (would fail if schema were broken)
-cargo test -p frankenterm-core --test search_api_contract_freeze contract_search_schema -- --nocapture \
-  >"$raw_dir/${scenario}.log" 2>&1
+run_rch_cargo_logged "${scenario4_log}" test -p frankenterm-core --test search_api_contract_freeze contract_search_schema -- --nocapture
 rc=$?
 set -e
 

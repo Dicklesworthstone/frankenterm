@@ -15,6 +15,67 @@ CORRELATION_ID="ft-1i2ge.7.1-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.jsonl"
 LOG_FILE_REL="${LOG_FILE#${ROOT_DIR}/}"
 
+RCH_TARGET_DIR="target/rch-e2e-scenario-matrix-${RUN_ID}"
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/scenario_matrix_${RUN_ID}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/scenario_matrix_${RUN_ID}.smoke.log"
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+run_rch_cargo() {
+    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+    set +e
+    (
+        cd "${ROOT_DIR}"
+        run_rch_cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+    check_rch_fallback "${output_file}"
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this e2e harness; refusing local cargo execution."
+    fi
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+    set +e
+    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+    local smoke_rc=$?
+    set -e
+    check_rch_fallback "${RCH_SMOKE_LOG}"
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 emit_log() {
   local outcome="$1"
   local decision_path="$2"
@@ -59,17 +120,17 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+ensure_rch_ready
+
 # ── Test 1: Compile check ──────────────────────────────────────────
 emit_log "running" "compile_check" "cargo_check" "none" \
   "none" "cargo check scenario matrix tests"
 
+compile_log="${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.compile.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-7-1-${RUN_ID}" \
-    cargo check -p frankenterm-core --features subprocess-bridge \
-    --test mission_e2e_scenario_matrix 2>&1
-) > "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.compile.log" 2>&1
+run_rch_cargo_logged "${compile_log}" \
+  check -p frankenterm-core --features subprocess-bridge \
+  --test mission_e2e_scenario_matrix
 compile_rc=$?
 set -e
 
@@ -86,13 +147,11 @@ emit_log "passed" "compile_check" "compilation_ok" "none" \
 emit_log "running" "matrix_tests" "cargo_test" "none" \
   "none" "run scenario matrix tests"
 
+tests_log="${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-7-1-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge \
-    --test mission_e2e_scenario_matrix 2>&1
-) > "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests.log" 2>&1
+run_rch_cargo_logged "${tests_log}" \
+  test -p frankenterm-core --features subprocess-bridge \
+  --test mission_e2e_scenario_matrix
 test_rc=$?
 set -e
 
@@ -103,7 +162,7 @@ if [[ ${test_rc} -ne 0 ]]; then
   exit 1
 fi
 
-matrix_count=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests.log" || echo 0)
+matrix_count=$(grep -c "ok$" "${tests_log}" || echo 0)
 
 if [[ ${matrix_count} -lt 25 ]]; then
   emit_log "failed" "matrix_tests" "insufficient_test_coverage" "COVERAGE_LOW" \
@@ -120,17 +179,15 @@ emit_log "passed" "matrix_tests" "all_tests_ok" "none" \
 emit_log "running" "clippy_check" "cargo_clippy" "none" \
   "none" "verify zero clippy warnings in scenario matrix tests"
 
+clippy_log="${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.clippy.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-7-1-${RUN_ID}" \
-    cargo clippy -p frankenterm-core --features subprocess-bridge \
-    --test mission_e2e_scenario_matrix 2>&1
-) > "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.clippy.log" 2>&1
+run_rch_cargo_logged "${clippy_log}" \
+  clippy -p frankenterm-core --features subprocess-bridge \
+  --test mission_e2e_scenario_matrix
 clippy_rc=$?
 set -e
 
-matrix_warnings=$(grep -c "mission_e2e_scenario_matrix.rs" "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.clippy.log" || echo 0)
+matrix_warnings=$(grep -c "mission_e2e_scenario_matrix.rs" "${clippy_log}" || echo 0)
 if [[ ${matrix_warnings} -gt 0 ]]; then
   emit_log "failed" "clippy_check" "clippy_warnings" "CLIPPY_WARN" \
     "ft_1i2ge_7_1_${RUN_ID}.clippy.log" \
@@ -153,7 +210,7 @@ for pattern in \
   "degraded_" \
   "emergency_" \
   "acceptance_"; do
-  if ! grep -q "${pattern}.*ok" "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests.log"; then
+  if ! grep -q "${pattern}.*ok" "${tests_log}"; then
     echo "MISSING: ${pattern}" >&2
     missing_categories=$((missing_categories + 1))
   fi
@@ -173,13 +230,11 @@ emit_log "passed" "category_coverage" "all_categories_covered" "none" \
 emit_log "running" "determinism" "repeat_run" "none" \
   "none" "verify scenario matrix results are deterministic"
 
+repeat_log="${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests_repeat.log"
 set +e
-(
-  cd "${ROOT_DIR}"
-  CARGO_TARGET_DIR="target-e2e-1i2ge-7-1-${RUN_ID}" \
-    cargo test -p frankenterm-core --features subprocess-bridge \
-    --test mission_e2e_scenario_matrix 2>&1
-) > "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests_repeat.log" 2>&1
+run_rch_cargo_logged "${repeat_log}" \
+  test -p frankenterm-core --features subprocess-bridge \
+  --test mission_e2e_scenario_matrix
 repeat_rc=$?
 set -e
 
@@ -190,8 +245,8 @@ if [[ ${repeat_rc} -ne 0 ]]; then
   exit 1
 fi
 
-pass_count_1=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests.log" || echo 0)
-pass_count_2=$(grep -c "ok$" "${LOG_DIR}/ft_1i2ge_7_1_${RUN_ID}.tests_repeat.log" || echo 0)
+pass_count_1=$(grep -c "ok$" "${tests_log}" || echo 0)
+pass_count_2=$(grep -c "ok$" "${repeat_log}" || echo 0)
 if [[ ${pass_count_1} -ne ${pass_count_2} ]]; then
   emit_log "failed" "determinism" "count_mismatch" "DETERMINISM_FAIL" \
     "ft_1i2ge_7_1_${RUN_ID}.tests_repeat.log" \
@@ -207,8 +262,5 @@ emit_log "passed" "determinism" "repeat_run_stable" "none" \
 emit_log "passed" "suite_complete" "all_scenarios_passed" "none" \
   "$(basename "${LOG_FILE}")" \
   "validated scenario matrix: compilation, ${matrix_count} tests, clippy, category coverage, determinism"
-
-# Cleanup ephemeral target dir.
-rm -rf "${ROOT_DIR}/target-e2e-1i2ge-7-1-${RUN_ID}" 2>/dev/null || true
 
 echo "ft-1i2ge.7.1 e2e passed. Logs: ${LOG_FILE_REL}"
