@@ -677,22 +677,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_client_error_serde_roundtrip() {
-        let err = McpClientError {
-            code: "mcp_client.test",
-            message: "test error".to_string(),
-            hint: Some("try again".to_string()),
-        };
-        let json = serde_json::to_string(&err).unwrap();
-        let back: McpClientError = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.message, "test error");
-        assert_eq!(back.hint.as_deref(), Some("try again"));
+    fn mcp_client_error_serializes_with_hint() {
+        let err = McpClientError::new("mcp_client.test", "test error")
+            .with_hint("try again");
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "mcp_client.test");
+        assert_eq!(json["message"], "test error");
+        assert_eq!(json["hint"], "try again");
     }
 
     #[test]
-    fn mcp_client_error_serde_skips_none_hint() {
+    fn mcp_client_error_serializes_without_hint() {
         let err = McpClientError::new("mcp_client.test", "no hint");
         let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "mcp_client.test");
         assert!(json.get("hint").is_none());
     }
 
