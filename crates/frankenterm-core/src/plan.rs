@@ -2884,8 +2884,10 @@ pub struct TxCompensationReport {
     pub outcome: TxCompensationOutcome,
     pub compensated_count: usize,
     pub failed_count: usize,
+    #[serde(default)]
     pub no_compensation_count: usize,
     pub skipped_count: usize,
+    #[serde(default)]
     pub step_results: Vec<TxCommitStepResult>,
     pub decision_path: String,
     pub reason_code: String,
@@ -4001,9 +4003,10 @@ pub fn reconstruct_tx_resume_state(
         all_step_ids
     };
 
-    // Compensation is needed if commit had failures and compensation hasn't run.
+    // Compensation is needed if commit had failures, some steps were committed,
+    // and compensation hasn't run yet.
     let needs_compensation = if let Some(cr) = commit_report {
-        cr.has_failures() && !compensation_phase_completed
+        cr.has_failures() && !committed_step_ids.is_empty() && !compensation_phase_completed
     } else {
         false
     };
