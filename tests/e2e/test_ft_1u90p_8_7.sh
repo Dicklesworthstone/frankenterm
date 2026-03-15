@@ -10,6 +10,7 @@ set -euo pipefail
 # 3. Negative guardrail: synthetic GO with unmet thresholds is rejected.
 # 4. Recovery guardrail: synthetic GO with met thresholds is accepted.
 # 5. Evidence consistency across summary, feedback log, and correlation CSV.
+# 6. Correlation CSV preserves threshold-eligibility metadata end-to-end.
 # =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -195,6 +196,45 @@ validate_feedback_threshold_consistency() {
   return 0
 }
 
+validate_correlation_threshold_contract() {
+  local feedback_path="$1"
+  local correlation_path="$2"
+  local header row csv_feedback_id csv_is_user_feedback csv_counts_toward_thresholds
+  local log_is_user_feedback log_counts_toward_thresholds
+
+  header="$(head -n1 "${correlation_path}")"
+  row="$(tail -n +2 "${correlation_path}" | tail -n1)"
+
+  if [[ "${header}" != *"counts_toward_thresholds"* ]]; then
+    echo "correlation CSV is missing counts_toward_thresholds column" >&2
+    return 1
+  fi
+
+  csv_feedback_id="$(printf '%s\n' "${row}" | cut -d',' -f3)"
+  csv_is_user_feedback="$(printf '%s\n' "${row}" | cut -d',' -f4)"
+  csv_counts_toward_thresholds="$(printf '%s\n' "${row}" | cut -d',' -f5)"
+
+  log_is_user_feedback="$(jq -sr --arg feedback_id "${csv_feedback_id}" '[.[] | select(.feedback_id == $feedback_id)][0].is_user_feedback' "${feedback_path}")"
+  log_counts_toward_thresholds="$(jq -sr --arg feedback_id "${csv_feedback_id}" '[.[] | select(.feedback_id == $feedback_id)][0].counts_toward_thresholds' "${feedback_path}")"
+
+  if [[ "${log_is_user_feedback}" == "null" || "${log_counts_toward_thresholds}" == "null" ]]; then
+    echo "correlation CSV feedback_id (${csv_feedback_id}) does not map to feedback threshold metadata" >&2
+    return 1
+  fi
+
+  if [[ "${csv_is_user_feedback}" != "${log_is_user_feedback}" ]]; then
+    echo "correlation CSV is_user_feedback (${csv_is_user_feedback}) does not match feedback log (${log_is_user_feedback})" >&2
+    return 1
+  fi
+
+  if [[ "${csv_counts_toward_thresholds}" != "${log_counts_toward_thresholds}" ]]; then
+    echo "correlation CSV counts_toward_thresholds (${csv_counts_toward_thresholds}) does not match feedback log (${log_counts_toward_thresholds})" >&2
+    return 1
+  fi
+
+  return 0
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -350,6 +390,36 @@ emit_log \
 
 emit_log \
   "running" \
+  "correlation_threshold_contract" \
+  "summary_csv_feedback_threshold_join" \
+  "none" \
+  "none" \
+  "$(basename "${CORRELATION_FILE}")" \
+  "Validate correlation CSV threshold-eligibility metadata against feedback log"
+
+if ! validate_correlation_threshold_contract "${FEEDBACK_FILE}" "${CORRELATION_FILE}"; then
+  emit_log \
+    "failed" \
+    "correlation_threshold_contract" \
+    "summary_csv_feedback_threshold_join" \
+    "correlation_threshold_contract_failed" \
+    "correlation_threshold_contract_mismatch" \
+    "$(basename "${CORRELATION_FILE}")" \
+    "Correlation CSV threshold metadata does not match feedback log eligibility metadata"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "correlation_threshold_contract" \
+  "summary_csv_feedback_threshold_join" \
+  "correlation_threshold_contract_valid" \
+  "none" \
+  "$(basename "${CORRELATION_FILE}")" \
+  "Correlation CSV preserves threshold-eligibility metadata end-to-end"
+
+emit_log \
+  "running" \
   "feedback_threshold_contract" \
   "real_user_feedback_counting" \
   "none" \
@@ -437,15 +507,50 @@ tmp_recovery="$(mktemp)"
 tmp_anomaly_negative="$(mktemp)"
 tmp_feedback_threshold_negative="$(mktemp)"
 tmp_feedback_summary_negative="$(mktemp)"
+tmp_correlation_threshold_negative="$(mktemp)"
 cleanup() {
   rm -f \
     "${tmp_negative}" \
     "${tmp_recovery}" \
     "${tmp_anomaly_negative}" \
     "${tmp_feedback_threshold_negative}" \
-    "${tmp_feedback_summary_negative}"
+    "${tmp_feedback_summary_negative}" \
+    "${tmp_correlation_threshold_negative}"
 }
 trap cleanup EXIT
+
+sed '2s/,false,false,/,false,true,/' \
+  "${CORRELATION_FILE}" > "${tmp_correlation_threshold_negative}"
+
+emit_log \
+  "running" \
+  "correlation_threshold_negative_guardrail" \
+  "summary_csv_feedback_threshold_join_negative" \
+  "none" \
+  "none" \
+  "$(basename "${tmp_correlation_threshold_negative}")" \
+  "Correlation CSV cannot claim threshold eligibility that disagrees with the feedback log"
+
+if validate_correlation_threshold_contract "${FEEDBACK_FILE}" "${tmp_correlation_threshold_negative}" >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "correlation_threshold_negative_guardrail" \
+    "summary_csv_feedback_threshold_join_negative" \
+    "correlation_threshold_mismatch_not_rejected" \
+    "unexpected_correlation_threshold_pass" \
+    "$(basename "${tmp_correlation_threshold_negative}")" \
+    "Correlation CSV threshold mismatch unexpectedly passed"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "correlation_threshold_negative_guardrail" \
+  "summary_csv_feedback_threshold_join_negative" \
+  "correlation_threshold_mismatch_rejected" \
+  "none" \
+  "$(basename "${tmp_correlation_threshold_negative}")" \
+  "Correlation CSV threshold mismatch was correctly rejected"
 
 jq \
   '.counts_toward_thresholds = true' \
@@ -636,7 +741,7 @@ emit_log \
 emit_log \
   "passed" \
   "suite_complete" \
-  "baseline->consistency->feedback_threshold_contract->feedback_threshold_negative_guardrail->feedback_summary_negative_guardrail->anomaly_schema->negative_guardrail->recovery_guardrail->anomaly_negative_guardrail" \
+  "baseline->consistency->correlation_threshold_contract->correlation_threshold_negative_guardrail->feedback_threshold_contract->feedback_threshold_negative_guardrail->feedback_summary_negative_guardrail->anomaly_schema->negative_guardrail->recovery_guardrail->anomaly_negative_guardrail" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \

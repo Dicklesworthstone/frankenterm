@@ -1,7 +1,7 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
 Date: 2026-03-14
-Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-14 UTC with real-user-threshold and anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
+Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-15 UTC with correlation-threshold, real-user-threshold, and anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
 Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
 Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
 
@@ -113,6 +113,8 @@ The beta evidence package must also maintain an explicit anomaly ledger for ever
 
 Each feedback item must map to a telemetry window and relevant resize metrics.
 
+The correlation artifact must preserve threshold-eligibility metadata end-to-end. Each CSV row should carry both `is_user_feedback` and `counts_toward_thresholds` so reviewers can distinguish real countable cohort signals from fixture-only or synthetic evidence without consulting a second artifact first.
+
 ### Correlation Keys
 
 - `session_id`
@@ -163,7 +165,7 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
 - Decision: `HOLD`
 - Basis:
   - instrumentation path verified using deterministic fixture-only alt-screen conformance run
-  - e2e evidence guardrail harness revalidated on 2026-03-14 UTC (baseline/feedback-threshold-contract/anomaly-schema/negative/recovery/anomaly-negative)
+  - e2e evidence guardrail harness revalidated on 2026-03-15 UTC (baseline/correlation-threshold-contract/feedback-threshold-contract/anomaly-schema/negative/recovery/anomaly-negative)
   - sample sufficiency thresholds for promotion are not yet met
   - real-user feedback ingestion has not started
 - Active anomaly ledger:
@@ -182,7 +184,7 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260314.md`
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260314_204826.jsonl`
 
 ## Decision Rubric (Promotion / Hold / Rollback)
 

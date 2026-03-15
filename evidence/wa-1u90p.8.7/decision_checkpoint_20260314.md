@@ -13,7 +13,7 @@
   - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
 - Decision guardrail automation:
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260314_204826.jsonl`
 
 ## Gate Evaluation
 - Hard no-go triggers: not observed in the current fixture-only checkpoint.
@@ -21,8 +21,10 @@
   - sample sufficiency thresholds are still not met
   - real-user C2 cohort feedback coverage remains below minimum
 - Guardrail validation run:
-  - executed at `2026-03-14T22:05:38Z` (`2026-03-14T18:05:38-04:00` local)
+  - executed at `2026-03-15T00:48:26Z` (`2026-03-14T20:48:26-04:00` local)
   - baseline case correctly remains `HOLD`
+  - correlation CSV preserves threshold-eligibility metadata end-to-end
+  - correlation CSV threshold mismatches are rejected
   - fixture-only feedback is excluded from threshold counts and summary totals must match countable real-user feedback
   - synthetic feedback miscounting is rejected
   - summary-only threshold inflation without countable real-user feedback is rejected
@@ -32,7 +34,7 @@
   - anomaly-negative case (missing owner/evidence) is rejected
 
 ## Decision Rationale
-The evidence pipeline, real-user threshold contract, anomaly ledger schema, and promotion guardrails remain healthy and reproducible, but promotion is still blocked on real-user C2 sample sufficiency. `HOLD` remains the correct operational decision.
+The evidence pipeline, correlation CSV threshold contract, real-user threshold contract, anomaly ledger schema, and promotion guardrails remain healthy and reproducible, but promotion is still blocked on real-user C2 sample sufficiency. `HOLD` remains the correct operational decision.
 
 ## Active Anomaly / Remediation Tracking
 
@@ -43,7 +45,7 @@ The evidence pipeline, real-user threshold contract, anomaly ledger schema, and 
    - Triage owner: `resize-rollout-ops`
    - Remediation owner: `beta-program`
    - Close-loop status: `awaiting_real_user_cohort_ingest`
-   - Evidence: `evidence/wa-1u90p.8.7/cohort_daily_summary.json`, `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`, `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
+   - Evidence: `evidence/wa-1u90p.8.7/cohort_daily_summary.json`, `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`, `tests/e2e/logs/ft_1u90p_8_7_20260314_204826.jsonl`
 
 2. `fixture-only-feedback-source-2026-03-12`
    - Category: `A2`
