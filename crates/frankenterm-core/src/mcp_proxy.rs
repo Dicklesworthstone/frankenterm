@@ -684,4 +684,161 @@ mod tests {
         let result = compose_proxy_tools(builder, &config, None);
         assert!(result.is_err());
     }
+
+    // ========================================================================
+    // sanitize_prefix_segment edge cases
+    // ========================================================================
+
+    #[test]
+    fn sanitize_prefix_segment_empty_returns_server() {
+        assert_eq!(sanitize_prefix_segment(""), "server");
+    }
+
+    #[test]
+    fn sanitize_prefix_segment_whitespace_only_returns_server() {
+        assert_eq!(sanitize_prefix_segment("   "), "server");
+    }
+
+    #[test]
+    fn sanitize_prefix_segment_special_chars_replaced() {
+        assert_eq!(sanitize_prefix_segment("my.server@v2"), "my-server-v2");
+    }
+
+    #[test]
+    fn sanitize_prefix_segment_preserves_hyphens_and_underscores() {
+        assert_eq!(sanitize_prefix_segment("my-server_v2"), "my-server_v2");
+    }
+
+    #[test]
+    fn sanitize_prefix_segment_lowercases() {
+        assert_eq!(sanitize_prefix_segment("MyServer"), "myserver");
+    }
+
+    #[test]
+    fn sanitize_prefix_segment_trims_leading_trailing_hyphens() {
+        // Special chars at boundaries become hyphens, which are trimmed
+        assert_eq!(sanitize_prefix_segment("..name.."), "name");
+    }
+
+    // ========================================================================
+    // filter_remote_tools edge cases
+    // ========================================================================
+
+    #[test]
+    fn filter_remote_tools_allows_mutating_when_configured() {
+        let mut settings = McpClientConfig::default();
+        settings.proxy_allow_mutating_tools = true;
+
+        let tools = vec![
+            McpClientToolDefinition {
+                name: "safe_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            },
+            McpClientToolDefinition {
+                name: "drop_db".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"destructive": true})),
+            },
+        ];
+
+        let filtered = filter_remote_tools(&settings, tools);
+        assert_eq!(filtered.len(), 2, "all tools should pass when mutating allowed");
+    }
+
+    #[test]
+    fn filter_remote_tools_empty_input() {
+        let settings = McpClientConfig::default();
+        let filtered = filter_remote_tools(&settings, Vec::new());
+        assert!(filtered.is_empty());
+    }
+
+    // ========================================================================
+    // select_proxy_servers edge cases
+    // ========================================================================
+
+    #[test]
+    fn select_proxy_servers_deduplicates_case_insensitive() {
+        let settings = McpClientConfig {
+            proxy_servers: vec!["Morph".to_string(), "morph".to_string()],
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![make_server("Morph", false)];
+        let selected = select_proxy_servers(&settings, &discovered).unwrap();
+        assert_eq!(selected.len(), 1, "duplicate names should be deduped");
+    }
+
+    #[test]
+    fn select_proxy_servers_skips_disabled_in_mount_all() {
+        let settings = McpClientConfig {
+            proxy_mount_all_discovered: true,
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![
+            make_server("enabled-one", false),
+            make_server("disabled-one", true),
+            make_server("enabled-two", false),
+        ];
+        let selected = select_proxy_servers(&settings, &discovered).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|s| !s.disabled));
+    }
+
+    #[test]
+    fn select_proxy_servers_preferred_falls_back_to_discovered() {
+        let settings = McpClientConfig {
+            proxy_mount_all_discovered: false,
+            preferred_servers: vec!["alpha".to_string(), "beta".to_string()],
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![
+            make_server("alpha", false),
+            make_server("beta", false),
+            make_server("gamma", false),
+        ];
+        let selected = select_proxy_servers(&settings, &discovered).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].name, "alpha");
+        assert_eq!(selected[1].name, "beta");
+    }
+
+    #[test]
+    fn select_proxy_servers_no_config_returns_error() {
+        let settings = McpClientConfig {
+            proxy_mount_all_discovered: false,
+            preferred_servers: Vec::new(),
+            proxy_servers: Vec::new(),
+            ..McpClientConfig::default()
+        };
+        let discovered = vec![make_server("server-a", false)];
+        let result = select_proxy_servers(&settings, &discovered);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // insert_route_prefix
+    // ========================================================================
+
+    #[test]
+    fn insert_route_prefix_first_insert_succeeds() {
+        let mut used = HashSet::new();
+        assert!(insert_route_prefix(&mut used, "remote/my-tool"));
+    }
+
+    #[test]
+    fn insert_route_prefix_duplicate_returns_false() {
+        let mut used = HashSet::new();
+        insert_route_prefix(&mut used, "remote/my-tool");
+        assert!(!insert_route_prefix(&mut used, "remote/my-tool"));
+    }
 }
