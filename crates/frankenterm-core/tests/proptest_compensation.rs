@@ -321,7 +321,7 @@ proptest! {
         let state = outcome.target_tx_state();
         let is_valid = matches!(
             state,
-            MissionTxState::Compensated | MissionTxState::Failed
+            MissionTxState::Compensated | MissionTxState::RolledBack | MissionTxState::Failed
         );
         prop_assert!(is_valid);
     }
@@ -330,10 +330,13 @@ proptest! {
     fn rejects_non_compensating_state(
         num_steps in 1usize..4,
         state in prop_oneof![
+            Just(MissionTxState::Draft),
             Just(MissionTxState::Planned),
             Just(MissionTxState::Prepared),
             Just(MissionTxState::Committing),
             Just(MissionTxState::Committed),
+            Just(MissionTxState::RolledBack),
+            Just(MissionTxState::Failed),
         ],
     ) {
         let mut contract = make_contract_with_compensations(num_steps);

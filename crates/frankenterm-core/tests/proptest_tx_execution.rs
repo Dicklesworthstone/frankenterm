@@ -206,6 +206,7 @@ proptest! {
         let terminal_states = [
             MissionTxState::Committed,
             MissionTxState::Compensated,
+            MissionTxState::RolledBack,
             MissionTxState::Failed,
             MissionTxState::Planned,
         ];

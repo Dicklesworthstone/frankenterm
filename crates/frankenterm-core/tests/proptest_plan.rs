@@ -1640,6 +1640,7 @@ fn arb_outcome() -> impl Strategy<Value = Outcome> {
 
 fn arb_mission_tx_state() -> impl Strategy<Value = MissionTxState> {
     prop_oneof![
+        Just(MissionTxState::Draft),
         Just(MissionTxState::Planned),
         Just(MissionTxState::Prepared),
         Just(MissionTxState::Committing),
@@ -1647,6 +1648,7 @@ fn arb_mission_tx_state() -> impl Strategy<Value = MissionTxState> {
         Just(MissionTxState::Failed),
         Just(MissionTxState::Compensating),
         Just(MissionTxState::Compensated),
+        Just(MissionTxState::RolledBack),
     ]
 }
 
@@ -1855,7 +1857,7 @@ proptest! {
         let target = val.target_tx_state();
         match val {
             TxCompensationOutcome::FullyRolledBack => {
-                let check = matches!(target, MissionTxState::Compensated);
+                let check = matches!(target, MissionTxState::RolledBack);
                 prop_assert!(check);
             }
             TxCompensationOutcome::CompensationFailed => {
