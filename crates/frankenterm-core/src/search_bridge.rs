@@ -319,7 +319,7 @@ impl SearchBridge {
         let searcher = Arc::clone(&self.searcher);
         let worker_cancellation = cancellation.clone();
 
-        let mut worker = crate::runtime_compat::task::spawn_blocking(
+        let worker = crate::runtime_compat::spawn_blocking(
             move || -> Result<SearchBridgeResult, SearchError> {
                 let (cancel_done, cancel_thread) =
                     spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());
@@ -362,6 +362,7 @@ impl SearchBridge {
                 search_result
             },
         );
+        tokio::pin!(worker);
 
         let search_result = loop {
             crate::runtime_compat::select! {
@@ -371,7 +372,9 @@ impl SearchBridge {
                     }
                 }
                 () = cancellation.cancelled() => {
-                    worker.abort();
+                    // Tokio documents that abort does not stop a running
+                    // `spawn_blocking` task, so this bridge relies on the
+                    // worker cancellation thread to request cooperative exit.
                     let timeout_ms = timeout.map_or(0, |value| value.as_millis() as u64);
                     if timeout_fired.load(Ordering::Acquire) {
                         break Err(SearchBridgeError::Timeout { timeout_ms });
@@ -384,8 +387,8 @@ impl SearchBridge {
                     while let Ok(phase) = phase_rx.try_recv() {
                         on_phase(phase);
                     }
-                    let worker_result = worker_result.map_err(|err| SearchBridgeError::Runtime {
-                        message: err.to_string(),
+                    let worker_result = worker_result.map_err(|message| SearchBridgeError::Runtime {
+                        message,
                     })?;
 
                     break match worker_result {
