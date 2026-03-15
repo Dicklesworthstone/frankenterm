@@ -20,18 +20,53 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
 mkdir -p "${LOG_DIR}"
 
-RUN_ID="$(date +"%Y%m%d_%H%M%S")"
+RUN_ID="$(date -u +"%Y%m%d_%H%M%S")"
 SCENARIO_ID="mission_tx_track"
 CORRELATION_ID="ft-1i2ge.8-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/mission_tx_track_${RUN_ID}.jsonl"
-CARGO_TARGET_DIR="${MISSION_TX_TRACK_TARGET:-/tmp/ft-e2e-tx-track-target}"
+STDOUT_FILE="${LOG_DIR}/mission_tx_track_${RUN_ID}.stdout.log"
+DEFAULT_CARGO_TARGET_DIR="target/rch-e2e-mission-tx-track-${RUN_ID}"
+INHERITED_CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-}"
+if [[ -n "${INHERITED_CARGO_TARGET_DIR}" && "${INHERITED_CARGO_TARGET_DIR}" != /* ]]; then
+  CARGO_TARGET_DIR="${INHERITED_CARGO_TARGET_DIR}"
+else
+  CARGO_TARGET_DIR="${DEFAULT_CARGO_TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR
 
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 TOTAL_SCENARIOS=7
+LAST_STEP_QUEUE_LOG=""
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+LOCAL_RCH_TMPDIR_OVERRIDE=""
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
+RCH_PROBE_LOG="${LOG_DIR}/mission_tx_track_${RUN_ID}.rch_probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/mission_tx_track_${RUN_ID}.rch_smoke.log"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  LOCAL_RCH_TMPDIR_OVERRIDE="/tmp"
+fi
 
 # ── Structured log emitter ───────────────────────────────────────────────────
+
+artifact_label() {
+  local path="$1"
+
+  if [[ -z "${path}" || "${path}" == "none" ]]; then
+    printf '%s\n' "${path}"
+    return
+  fi
+
+  if [[ "${path}" == "${ROOT_DIR}/"* ]]; then
+    printf '%s\n' "${path#"${ROOT_DIR}"/}"
+    return
+  fi
+
+  basename "${path}"
+}
 
 emit_log() {
   local outcome="$1"
@@ -68,7 +103,103 @@ emit_log() {
     }' >> "${LOG_FILE}"
 }
 
-# ── Build check ──────────────────────────────────────────────────────────────
+resolve_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    TIMEOUT_BIN=""
+  fi
+}
+
+run_rch() {
+  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+    env TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" rch "$@"
+  else
+    rch "$@"
+  fi
+}
+
+run_rch_timed() {
+  local timeout_secs="$1"
+  shift
+
+  local -a cmd=(rch "$@")
+  if [[ -n "${LOCAL_RCH_TMPDIR_OVERRIDE}" ]]; then
+    cmd=(env TMPDIR="${LOCAL_RCH_TMPDIR_OVERRIDE}" "${cmd[@]}")
+  fi
+
+  if [[ -n "${TIMEOUT_BIN}" ]]; then
+    "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "${cmd[@]}"
+  else
+    "${cmd[@]}"
+  fi
+}
+
+probe_has_reachable_workers() {
+  grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+step_timed_out() {
+  local rc="$1"
+  [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]
+}
+
+timeout_artifact_label() {
+  local default_path="$1"
+
+  if [[ -n "${LAST_STEP_QUEUE_LOG}" ]]; then
+    artifact_label "${LAST_STEP_QUEUE_LOG}"
+  else
+    artifact_label "${default_path}"
+  fi
+}
+
+check_rch_fallback_in_logs() {
+  local decision_path="$1"
+  local artifact_path="$2"
+  local input_summary="$3"
+
+  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${artifact_path}" 2>/dev/null; then
+    emit_log \
+      "failed" \
+      "${decision_path}" \
+      "rch_local_fallback_detected" \
+      "RCH-LOCAL-FALLBACK" \
+      "$(artifact_label "${artifact_path}")" \
+      "${input_summary}"
+    echo "rch fell back to local execution during ${decision_path}; refusing offload policy violation." >&2
+    exit 3
+  fi
+}
+
+run_rch_cargo_logged() {
+  local decision_path="$1"
+  local artifact_path="$2"
+  shift 2
+
+  LAST_STEP_QUEUE_LOG=""
+  set +e
+  (
+    cd "${ROOT_DIR}"
+    run_rch_timed "${RCH_STEP_TIMEOUT_SECS}" exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" cargo "$@"
+  ) 2>&1 | tee "${artifact_path}" | tee -a "${STDOUT_FILE}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  if step_timed_out "${rc}"; then
+    LAST_STEP_QUEUE_LOG="${artifact_path%.log}.queue.log"
+    if ! run_rch queue > "${LAST_STEP_QUEUE_LOG}" 2>&1; then
+      LAST_STEP_QUEUE_LOG=""
+    fi
+  fi
+
+  check_rch_fallback_in_logs "${decision_path}" "${artifact_path}" "rch cargo $*"
+  return "${rc}"
+}
+
+# ── Fail-closed rch preflight ────────────────────────────────────────────────
 
 echo "=== Mission TX Track E2E Validation (${SCENARIO_ID}) ==="
 echo "  Run ID: ${RUN_ID}"
@@ -76,47 +207,138 @@ echo "  Log: ${LOG_FILE}"
 echo "  Target: ${CARGO_TARGET_DIR}"
 echo ""
 
-emit_log "started" "preflight" "e2e.started" "" "" "scenarios=${TOTAL_SCENARIOS}"
-
-# Check if cargo test binary can be compiled
-echo "[preflight] Checking test binary compilation..."
-
-# Try rch first, fall back to local
-BUILD_CMD="cargo test -p frankenterm-core --features subprocess-bridge --no-default-features --test proptest_tx_execution --no-run"
-BUILD_EXIT=0
-
-if command -v rch &>/dev/null; then
-  rch exec -- ${BUILD_CMD} 2>/dev/null && BUILD_EXIT=0 || BUILD_EXIT=$?
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for structured logging." >&2
+  exit 1
 fi
 
-if [[ "${BUILD_EXIT}" -ne 0 ]]; then
-  # Try local build via Python fork bypass
-  python3 -c "
-import os, subprocess, sys
-pid = os.fork()
-if pid == 0:
-    os.setsid()
-    env = os.environ.copy()
-    env['CC'] = '/opt/homebrew/opt/llvm/bin/clang'
-    env['CXX'] = '/opt/homebrew/opt/llvm/bin/clang++'
-    env['CARGO_TARGET_DIR'] = '${CARGO_TARGET_DIR}'
-    r = subprocess.run('${BUILD_CMD}'.split(), env=env, capture_output=True, text=True, timeout=300)
-    os._exit(r.returncode)
-else:
-    _, status = os.waitpid(pid, 0)
-    sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
-" 2>/dev/null && BUILD_EXIT=0 || BUILD_EXIT=$?
+emit_log "started" "preflight" "e2e.started" "" "$(artifact_label "${LOG_FILE}")" "scenarios=${TOTAL_SCENARIOS}"
+
+if ! command -v rch >/dev/null 2>&1; then
+  emit_log \
+    "failed" \
+    "preflight->rch_required" \
+    "rch_required_missing" \
+    "RCH-E001" \
+    "$(artifact_label "${LOG_FILE}")" \
+    "rch is required for cargo execution in this scenario"
+  echo "rch is required for this e2e scenario; refusing local cargo execution." >&2
+  exit 1
 fi
 
-if [[ "${BUILD_EXIT}" -ne 0 ]]; then
-  echo "[preflight] SKIP: Cannot compile test binary (exit ${BUILD_EXIT})"
-  emit_log "skipped" "preflight->build_failed" "build.compile_failed" "BUILD-E001" "" "exit=${BUILD_EXIT}"
-  echo ""
-  echo "=== RESULTS: 0 passed, 0 failed, ${TOTAL_SCENARIOS} skipped (build failed) ==="
-  exit 0
+resolve_timeout_bin
+if [[ -z "${TIMEOUT_BIN}" ]]; then
+  emit_log \
+    "running" \
+    "preflight->timeout_resolution" \
+    "timeout_guard_unavailable" \
+    "" \
+    "$(artifact_label "${LOG_FILE}")" \
+    "timeout/gtimeout not installed; continuing without external timeout wrapper"
 fi
 
-emit_log "passed" "preflight->build_ok" "build.compiled" "" "" ""
+echo "[preflight] Probing rch workers..."
+set +e
+run_rch --json workers probe --all > "${RCH_PROBE_LOG}" 2>&1
+probe_rc=$?
+set -e
+check_rch_fallback_in_logs "preflight->rch_probe" "${RCH_PROBE_LOG}" "rch workers probe --all"
+if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+  emit_log \
+    "failed" \
+    "preflight->rch_probe" \
+    "rch_workers_unhealthy" \
+    "RCH-E100" \
+    "$(artifact_label "${RCH_PROBE_LOG}")" \
+    "probe_exit=${probe_rc}"
+  echo "rch workers are unavailable; refusing local cargo execution." >&2
+  exit 1
+fi
+emit_log \
+  "passed" \
+  "preflight->rch_probe" \
+  "rch_workers_healthy" \
+  "" \
+  "$(artifact_label "${RCH_PROBE_LOG}")" \
+  "rch workers probe reported reachable capacity"
+
+echo "[preflight] Verifying remote rch exec path..."
+set +e
+run_rch_timed "${RCH_STEP_TIMEOUT_SECS}" exec -- cargo check --help > "${RCH_SMOKE_LOG}" 2>&1
+smoke_rc=$?
+set -e
+check_rch_fallback_in_logs "preflight->rch_smoke" "${RCH_SMOKE_LOG}" "rch remote smoke check (cargo check --help)"
+if step_timed_out "${smoke_rc}"; then
+  emit_log \
+    "failed" \
+    "preflight->rch_smoke" \
+    "rch_remote_smoke_timed_out" \
+    "RCH-REMOTE-STALL" \
+    "$(artifact_label "${RCH_SMOKE_LOG}")" \
+    "timeout_secs=${RCH_STEP_TIMEOUT_SECS}"
+  echo "rch remote smoke check timed out." >&2
+  exit 1
+fi
+if [[ ${smoke_rc} -ne 0 ]]; then
+  emit_log \
+    "failed" \
+    "preflight->rch_smoke" \
+    "rch_remote_smoke_failed" \
+    "RCH-E101" \
+    "$(artifact_label "${RCH_SMOKE_LOG}")" \
+    "smoke_exit=${smoke_rc}"
+  echo "rch remote smoke preflight failed; refusing local cargo execution." >&2
+  exit 1
+fi
+emit_log \
+  "passed" \
+  "preflight->rch_smoke" \
+  "rch_remote_smoke_passed" \
+  "" \
+  "$(artifact_label "${RCH_SMOKE_LOG}")" \
+  "verified remote rch exec path before running cargo tests"
+
+echo "[preflight] Compiling proptest_tx_execution via rch..."
+compile_log="${LOG_DIR}/mission_tx_track_${RUN_ID}.compile.log"
+if run_rch_cargo_logged "preflight->build_check" "${compile_log}" \
+  test -p frankenterm-core --features subprocess-bridge --no-default-features \
+  --test proptest_tx_execution --no-run; then
+  compile_rc=0
+else
+  compile_rc=$?
+fi
+
+if step_timed_out "${compile_rc}"; then
+  emit_log \
+    "failed" \
+    "preflight->build_check" \
+    "build.compile_timed_out" \
+    "RCH-REMOTE-STALL" \
+    "$(timeout_artifact_label "${compile_log}")" \
+    "timeout_secs=${RCH_STEP_TIMEOUT_SECS}"
+  echo "[preflight] FAIL: compile step timed out"
+  exit 1
+fi
+
+if [[ ${compile_rc} -ne 0 ]]; then
+  emit_log \
+    "failed" \
+    "preflight->build_check" \
+    "build.compile_failed" \
+    "BUILD-E001" \
+    "$(artifact_label "${compile_log}")" \
+    "exit=${compile_rc}"
+  echo "[preflight] FAIL: Cannot compile test binary (exit ${compile_rc})"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "preflight->build_check" \
+  "build.compiled" \
+  "" \
+  "$(artifact_label "${compile_log}")" \
+  "test binary compiled remotely via rch"
 
 # ── Run test scenarios ───────────────────────────────────────────────────────
 
@@ -124,38 +346,59 @@ run_test() {
   local name="$1"
   local filter="$2"
   local scenario_decision="$3"
+  local scenario_log="${LOG_DIR}/mission_tx_track_${RUN_ID}_${name}.log"
 
   echo -n "  [${name}] "
 
-  local test_cmd="cargo test -p frankenterm-core --features subprocess-bridge --no-default-features --test proptest_tx_execution -- ${filter} --exact --nocapture"
-  local test_exit=0
-  local test_stdout=""
+  emit_log \
+    "running" \
+    "${scenario_decision}" \
+    "${name}.running" \
+    "" \
+    "$(artifact_label "${scenario_log}")" \
+    "filter=${filter}"
 
-  test_stdout=$(python3 -c "
-import os, subprocess, sys
-pid = os.fork()
-if pid == 0:
-    os.setsid()
-    env = os.environ.copy()
-    env['CC'] = '/opt/homebrew/opt/llvm/bin/clang'
-    env['CXX'] = '/opt/homebrew/opt/llvm/bin/clang++'
-    env['CARGO_TARGET_DIR'] = '${CARGO_TARGET_DIR}'
-    r = subprocess.run('${test_cmd}'.split(), env=env, capture_output=True, text=True, timeout=120)
-    print(r.stdout[-500:] if r.stdout else '')
-    os._exit(r.returncode)
-else:
-    _, status = os.waitpid(pid, 0)
-    sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
-" 2>/dev/null) && test_exit=0 || test_exit=$?
+  if run_rch_cargo_logged "${scenario_decision}" "${scenario_log}" \
+    test -p frankenterm-core --features subprocess-bridge --no-default-features \
+    --test proptest_tx_execution -- "${filter}" --exact --nocapture; then
+    test_exit=0
+  else
+    test_exit=$?
+  fi
 
-  if [[ "${test_exit}" -eq 0 ]]; then
+  if step_timed_out "${test_exit}"; then
+    echo "FAIL (timeout)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    emit_log \
+      "failed" \
+      "${scenario_decision}" \
+      "${name}.timed_out" \
+      "RCH-REMOTE-STALL" \
+      "$(timeout_artifact_label "${scenario_log}")" \
+      "filter=${filter},timeout_secs=${RCH_STEP_TIMEOUT_SECS}"
+    return 0
+  fi
+
+  if [[ ${test_exit} -eq 0 ]]; then
     echo "PASS"
     PASS_COUNT=$((PASS_COUNT + 1))
-    emit_log "passed" "${scenario_decision}" "${name}.passed" "" "" "filter=${filter}"
+    emit_log \
+      "passed" \
+      "${scenario_decision}" \
+      "${name}.passed" \
+      "" \
+      "$(artifact_label "${scenario_log}")" \
+      "filter=${filter}"
   else
     echo "FAIL (exit ${test_exit})"
     FAIL_COUNT=$((FAIL_COUNT + 1))
-    emit_log "failed" "${scenario_decision}" "${name}.failed" "TEST-E001" "" "filter=${filter},exit=${test_exit}"
+    emit_log \
+      "failed" \
+      "${scenario_decision}" \
+      "${name}.failed" \
+      "TEST-E001" \
+      "$(artifact_label "${scenario_log}")" \
+      "filter=${filter},exit=${test_exit}"
   fi
 }
 
@@ -187,7 +430,13 @@ run_test "empty_contract_error" "empty_contract_returns_invalid_contract_error" 
 echo ""
 echo "=== RESULTS: ${PASS_COUNT} passed, ${FAIL_COUNT} failed, ${SKIP_COUNT} skipped (of ${TOTAL_SCENARIOS}) ==="
 
-emit_log "completed" "summary" "e2e.completed" "" "${LOG_FILE}" "pass=${PASS_COUNT},fail=${FAIL_COUNT},skip=${SKIP_COUNT}"
+emit_log \
+  "completed" \
+  "summary" \
+  "e2e.completed" \
+  "" \
+  "$(artifact_label "${LOG_FILE}")" \
+  "pass=${PASS_COUNT},fail=${FAIL_COUNT},skip=${SKIP_COUNT}"
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   echo "  Log: ${LOG_FILE}"
