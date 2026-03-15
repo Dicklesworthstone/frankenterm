@@ -101,6 +101,8 @@ pub enum ApiSurface {
     TxPlan,
     /// tx-run — execute a transactional plan.
     TxRun,
+    /// tx-rollback — execute compensation for committed steps.
+    TxRollback,
     /// tx-show — inspect execution details.
     TxShow,
 
@@ -150,6 +152,7 @@ impl ApiSurface {
         Self::MissionDecisions,
         Self::TxPlan,
         Self::TxRun,
+        Self::TxRollback,
         Self::TxShow,
         Self::ReplayInspect,
         Self::ReplayDiff,
@@ -189,6 +192,7 @@ impl ApiSurface {
             Self::MissionDecisions => "mission-decisions",
             Self::TxPlan => "tx-plan",
             Self::TxRun => "tx-run",
+            Self::TxRollback => "tx-rollback",
             Self::TxShow => "tx-show",
             Self::ReplayInspect => "replay-inspect",
             Self::ReplayDiff => "replay-diff",
@@ -213,6 +217,7 @@ impl ApiSurface {
                 | Self::Reserve
                 | Self::Release
                 | Self::TxRun
+                | Self::TxRollback
         )
     }
 
@@ -248,7 +253,7 @@ impl ApiSurface {
             Self::AccountsList | Self::AccountsRefresh => "accounts",
             Self::Reserve | Self::Release => "reservations",
             Self::MissionState | Self::MissionDecisions => "mission",
-            Self::TxPlan | Self::TxRun | Self::TxShow => "tx",
+            Self::TxPlan | Self::TxRun | Self::TxRollback | Self::TxShow => "tx",
             Self::ReplayInspect | Self::ReplayDiff | Self::ReplayRegression => "replay",
             Self::QuickStart | Self::Why | Self::Approve => "meta",
         }
@@ -1109,6 +1114,7 @@ mod tests {
     fn mutation_surfaces_identified() {
         assert!(ApiSurface::SendText.is_mutation());
         assert!(ApiSurface::Reserve.is_mutation());
+        assert!(ApiSurface::TxRollback.is_mutation());
         assert!(!ApiSurface::GetText.is_mutation());
         assert!(!ApiSurface::Search.is_mutation());
     }
@@ -1123,7 +1129,7 @@ mod tests {
 
     #[test]
     fn surface_count() {
-        assert_eq!(ApiSurface::ALL.len(), 33);
+        assert_eq!(ApiSurface::ALL.len(), 34);
     }
 
     // ---- ContractCheck ----
@@ -1200,10 +1206,10 @@ mod tests {
 
         let (covered, total) = matrix.surface_coverage();
         assert_eq!(covered, 1);
-        assert_eq!(total, 33);
+        assert_eq!(total, 34);
 
         let uncovered = matrix.uncovered_surfaces();
-        assert_eq!(uncovered.len(), 32);
+        assert_eq!(uncovered.len(), 33);
     }
 
     // ---- Standard matrix ----
