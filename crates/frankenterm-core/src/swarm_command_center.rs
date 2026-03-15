@@ -488,7 +488,7 @@ impl CommandPalette {
             .filter(|r| r.score > 0)
             .collect();
 
-        results.sort_by(|a, b| b.score.cmp(&a.score));
+        results.sort_by_key(|r| std::cmp::Reverse(r.score));
         results
     }
 
@@ -683,7 +683,7 @@ impl LiveView {
         match self.sort_by {
             LiveViewSort::Activity => {
                 self.panes
-                    .sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
+                    .sort_by_key(|p| std::cmp::Reverse(p.last_activity_ms));
             }
             LiveViewSort::Health => {
                 self.panes.sort_by_key(|p| match p.health {
@@ -704,7 +704,7 @@ impl LiveView {
                 });
             }
             LiveViewSort::AlertCount => {
-                self.panes.sort_by(|a, b| b.alert_count.cmp(&a.alert_count));
+                self.panes.sort_by_key(|p| std::cmp::Reverse(p.alert_count));
             }
         }
     }

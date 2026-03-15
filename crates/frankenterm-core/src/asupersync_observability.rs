@@ -698,25 +698,20 @@ pub fn evaluate_asupersync_health(
     snapshot: &AsupersyncTelemetrySnapshot,
     config: &AsupersyncObservabilityConfig,
 ) -> Vec<RuntimeHealthCheck> {
-    let mut checks = Vec::new();
-
-    // ── Scope tree health ────────────────────────────────────────────────
-    checks.push(check_scope_tree(snapshot, config));
-
-    // ── Task lifecycle health ────────────────────────────────────────────
-    checks.push(check_task_lifecycle(snapshot, config));
-
-    // ── Cancellation health ──────────────────────────────────────────────
-    checks.push(check_cancellation(snapshot, config));
-
-    // ── Channel health ───────────────────────────────────────────────────
-    checks.push(check_channel_health(snapshot, config));
-
-    // ── Lock contention health ───────────────────────────────────────────
-    checks.push(check_lock_contention(snapshot, config));
-
-    // ── Recovery health ──────────────────────────────────────────────────
-    checks.push(check_recovery_health(snapshot));
+    let checks = vec![
+        // ── Scope tree health ────────────────────────────────────────────────
+        check_scope_tree(snapshot, config),
+        // ── Task lifecycle health ────────────────────────────────────────────
+        check_task_lifecycle(snapshot, config),
+        // ── Cancellation health ──────────────────────────────────────────────
+        check_cancellation(snapshot, config),
+        // ── Channel health ───────────────────────────────────────────────────
+        check_channel_health(snapshot, config),
+        // ── Lock contention health ───────────────────────────────────────────
+        check_lock_contention(snapshot, config),
+        // ── Recovery health ──────────────────────────────────────────────────
+        check_recovery_health(snapshot),
+    ];
 
     checks
 }
@@ -1161,11 +1156,7 @@ pub fn generate_slo_samples(snapshot: &AsupersyncTelemetrySnapshot) -> Vec<Runti
     samples.push(RuntimeSloSample {
         slo_id: RuntimeSloId::QueueBacklogDepth,
         measured: snapshot.tasks_pending() as f64,
-        good_count: if snapshot.tasks_pending() < 1000 {
-            1
-        } else {
-            0
-        },
+        good_count: u64::from(snapshot.tasks_pending() < 1000),
         total_count: 1,
     });
 

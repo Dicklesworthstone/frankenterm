@@ -826,7 +826,8 @@ impl AlignmentReport {
             0.0_f64
         };
 
-        self.readiness_score = 0.4 * step_ratio + 0.3 * feature_ratio + 0.3 * surface_ratio;
+        self.readiness_score =
+            0.4_f64.mul_add(step_ratio, 0.3_f64.mul_add(feature_ratio, 0.3 * surface_ratio));
         self.overall_aligned = self.readiness_score >= 0.8;
     }
 

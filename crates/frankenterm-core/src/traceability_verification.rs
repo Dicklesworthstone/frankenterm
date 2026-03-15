@@ -221,7 +221,7 @@ impl DomainCoverage {
         let coverage_pct = if total == 0 {
             0.0
         } else {
-            (implemented as f64 + 0.5 * partial as f64) / total as f64 * 100.0
+            0.5_f64.mul_add(partial as f64, implemented as f64) / total as f64 * 100.0
         };
         Self {
             domain: domain.to_string(),
@@ -806,7 +806,6 @@ impl VerificationPack {
     pub fn summary(&self) -> String {
         let total = self.checks.len();
         let passed = self.checks.iter().filter(|c| c.passed).count();
-        let _failed = total - passed;
         let verdict_str = match self.pack_verdict {
             PackVerdict::Complete => "COMPLETE",
             PackVerdict::ConditionalPass => "CONDITIONAL_PASS",

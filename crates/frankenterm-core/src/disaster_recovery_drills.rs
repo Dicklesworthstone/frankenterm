@@ -491,25 +491,25 @@ impl DrillRunner {
         });
 
         // Evaluate RPO
-        let rpo_met = scenario.rpo.as_ref().map(|target| {
+        let recovery_point_met = scenario.rpo.as_ref().map(|target| {
             let actual = Duration::from_millis(metrics.data_loss_window_ms);
-            let met = target.is_met(actual);
+            let rpo_passed = target.is_met(actual);
             if self.config.verbose {
                 notes.push(format!(
                     "RPO: actual={}ms target={}ms {}",
                     metrics.data_loss_window_ms,
                     target.max_data_loss.as_millis(),
-                    if met { "MET" } else { "MISSED" }
+                    if rpo_passed { "MET" } else { "MISSED" }
                 ));
             }
-            if !met {
+            if !rpo_passed {
                 errors.push(format!(
                     "RPO exceeded: data_loss={}ms > target={}ms",
                     metrics.data_loss_window_ms,
                     target.max_data_loss.as_millis()
                 ));
             }
-            met
+            rpo_passed
         });
 
         // Evaluate completeness
@@ -523,8 +523,13 @@ impl DrillRunner {
         }
 
         // Determine verdict
-        let verdict = if !completeness_met || rto_met == Some(false) || rpo_met == Some(false) {
-            if completeness_met && (rto_met != Some(false) || rpo_met != Some(false)) {
+        let verdict = if !completeness_met
+            || rto_met == Some(false)
+            || recovery_point_met == Some(false)
+        {
+            if completeness_met
+                && (rto_met != Some(false) || recovery_point_met != Some(false))
+            {
                 DrillVerdict::Degraded
             } else {
                 DrillVerdict::Fail
@@ -545,7 +550,7 @@ impl DrillRunner {
             verdict,
             metrics,
             rto_met,
-            rpo_met,
+            rpo_met: recovery_point_met,
             completeness_met,
             notes,
             errors,
@@ -582,7 +587,7 @@ impl DrillRunner {
 
         for scenario in &scenarios {
             let metrics = metrics_map.get(&scenario.id).cloned();
-            let result = self.evaluate_scenario(&scenario, metrics);
+            let result = self.evaluate_scenario(scenario, metrics);
             let is_fail = result.verdict.is_fail();
             self.results.push(result);
 
@@ -639,6 +644,7 @@ impl DrillRunner {
     }
 
     /// Simulate metrics for a scenario (used when no real pipeline is available).
+    #[allow(clippy::unused_self)]
     fn simulate_metrics(&self, scenario: &DrillScenario) -> DrillMetrics {
         match &scenario.kind {
             DrillKind::ColdStart => DrillMetrics {
@@ -657,11 +663,9 @@ impl DrillRunner {
                 let total = 20u64;
                 let failed = (total * (*failure_fraction as u64)) / 1000;
                 let restored = total - failed;
-                let completeness = if total > 0 {
-                    ((restored * 1000) / total) as u32
-                } else {
-                    1000
-                };
+                let completeness = (restored * 1000)
+                    .checked_div(total)
+                    .map_or(1000, |v| v as u32);
                 DrillMetrics {
                     recovery_time_ms: 30_000,
                     data_loss_window_ms: 0,

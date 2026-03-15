@@ -315,6 +315,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         // Transition ledger to terminal phase
         let terminal_phase = if final_state == MissionTxState::Committed
             || final_state == MissionTxState::Compensated
+            || final_state == MissionTxState::RolledBack
         {
             TxPhase::Completed
         } else {
@@ -706,7 +707,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         if let Some(comp) = compensation_report {
             if comp.is_fully_rolled_back() {
-                return (MissionTxState::Compensated, TxOutcome::Compensated);
+                return (MissionTxState::RolledBack, TxOutcome::Compensated);
             }
             if comp.has_residual_risk() {
                 return (MissionTxState::Failed, TxOutcome::Failed);
@@ -874,7 +875,7 @@ mod tests {
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
         let result = engine.execute(&mut contract, 5000).unwrap();
 
-        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
         assert_eq!(result.outcome, TxOutcome::Compensated);
         assert!(result.compensation_report.is_some());
         let commit = result.commit_report.unwrap();

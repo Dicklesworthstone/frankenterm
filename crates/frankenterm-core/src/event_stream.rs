@@ -546,7 +546,6 @@ impl EventWaiter {
                             }
                             Err(_) => {
                                 // Channel closed or lagged — continue
-                                continue;
                             }
                         }
                     }
@@ -560,7 +559,6 @@ impl EventWaiter {
                         }
                         Err(_) => {
                             // Channel closed or lagged — continue
-                            continue;
                         }
                     }
                 },
@@ -713,7 +711,6 @@ impl FilteredEventStream {
                 }
                 Err(_) => {
                     // Channel closed or lagged — try to recover
-                    continue;
                 }
             }
         }

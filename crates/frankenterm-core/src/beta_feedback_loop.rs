@@ -374,7 +374,7 @@ pub struct StageEvaluation {
 }
 
 /// Serde-roundtrippable snapshot of the entire beta loop state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BetaLoopSnapshot {
     /// Current stage.
     pub stage: BetaStage,

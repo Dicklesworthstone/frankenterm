@@ -2233,7 +2233,7 @@ impl PatternEngine {
                 .to_string();
 
             let anchor_evidence =
-                Self::trace_anchor_evidence(text, &redactor, &fallback_anchor, fallback_span, opts);
+                Self::trace_anchor_evidence(text, &redactor, fallback_anchor, fallback_span, opts);
 
             if let Some(regex) = compiled.regex.as_ref() {
                 let mut any_capture = false;

@@ -1167,9 +1167,7 @@ fn find_fts5_option_value(sql: &str, option_name: &str) -> Option<String> {
     let option_bytes = option_name.as_bytes();
     let mut search_from = 0;
     while search_from + option_bytes.len() <= bytes.len() {
-        let Some(relative) = sql[search_from..].find(option_name) else {
-            return None;
-        };
+        let relative = sql[search_from..].find(option_name)?;
         let start = search_from + relative;
         let end = start + option_bytes.len();
         search_from = end;

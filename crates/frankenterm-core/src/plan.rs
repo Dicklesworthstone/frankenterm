@@ -2568,6 +2568,7 @@ pub const MISSION_TX_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissionTxState {
+    Draft,
     Planned,
     Prepared,
     Committing,
@@ -2575,11 +2576,24 @@ pub enum MissionTxState {
     Failed,
     Compensating,
     Compensated,
+    RolledBack,
+}
+
+impl MissionTxState {
+    /// Whether this tx state is terminal (no further transitions).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Committed | Self::Compensated | Self::RolledBack | Self::Failed
+        )
+    }
 }
 
 impl fmt::Display for MissionTxState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Draft => f.write_str("draft"),
             Self::Planned => f.write_str("planned"),
             Self::Prepared => f.write_str("prepared"),
             Self::Committing => f.write_str("committing"),
@@ -2587,6 +2601,7 @@ impl fmt::Display for MissionTxState {
             Self::Failed => f.write_str("failed"),
             Self::Compensating => f.write_str("compensating"),
             Self::Compensated => f.write_str("compensated"),
+            Self::RolledBack => f.write_str("rolled_back"),
         }
     }
 }
@@ -2689,7 +2704,8 @@ impl TxCompensationOutcome {
     #[must_use]
     pub fn target_tx_state(&self) -> MissionTxState {
         match self {
-            Self::FullyRolledBack | Self::NothingToCompensate => MissionTxState::Compensated,
+            Self::FullyRolledBack => MissionTxState::RolledBack,
+            Self::NothingToCompensate => MissionTxState::Compensated,
             Self::CompensationFailed => MissionTxState::Failed,
         }
     }
@@ -2851,7 +2867,9 @@ pub struct TxCompensationReport {
     pub outcome: TxCompensationOutcome,
     pub compensated_count: usize,
     pub failed_count: usize,
+    pub no_compensation_count: usize,
     pub skipped_count: usize,
+    pub step_results: Vec<TxCommitStepResult>,
     pub decision_path: String,
     pub reason_code: String,
     pub error_code: Option<String>,
@@ -2878,6 +2896,16 @@ impl TxCommitReport {
                     | TxCommitOutcome::KillSwitchBlocked
             )
     }
+
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "commit:{:?}:c={},f={},s={}:{}",
+            self.outcome, self.committed_count, self.failed_count, self.skipped_count,
+            self.decision_path
+        )
+    }
 }
 
 impl TxCompensationReport {
@@ -2891,6 +2919,16 @@ impl TxCompensationReport {
     #[must_use]
     pub fn has_residual_risk(&self) -> bool {
         matches!(self.outcome, TxCompensationOutcome::CompensationFailed)
+    }
+
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "compensate:{:?}:c={},f={},s={}:{}",
+            self.outcome, self.compensated_count, self.failed_count, self.skipped_count,
+            self.decision_path
+        )
     }
 }
 
@@ -3338,7 +3376,9 @@ pub fn execute_compensation_phase(
             outcome: TxCompensationOutcome::NothingToCompensate,
             compensated_count: 0,
             failed_count: 0,
+            no_compensation_count: 0,
             skipped_count: 0,
+            step_results: Vec::new(),
             decision_path: "compensation_phase->nothing_to_compensate".to_string(),
             reason_code: "nothing_to_compensate".to_string(),
             error_code: None,
@@ -3428,7 +3468,9 @@ pub fn execute_compensation_phase(
         },
         compensated_count,
         failed_count,
+        no_compensation_count: 0,
         skipped_count,
+        step_results: Vec::new(),
         decision_path: "compensation_phase".to_string(),
         reason_code: if all_ok {
             "fully_rolled_back".to_string()
@@ -3653,6 +3695,255 @@ impl MissionAgentCapabilityProfile {
                 self.max_parallel_assignments
             }
         }
+    }
+}
+
+// ── Journal / idempotency / resume types ─────────────────────────────────────
+// These support the disabled tx_correctness_suite and tx_e2e_scenario_matrix
+// test suites (ft-1i2ge.8.10 / ft-1i2ge.8.11).
+
+/// Phase of a transaction lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxPhase {
+    Prepare,
+    Commit,
+    Compensate,
+}
+
+impl fmt::Display for TxPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare => f.write_str("prepare"),
+            Self::Commit => f.write_str("commit"),
+            Self::Compensate => f.write_str("compensate"),
+        }
+    }
+}
+
+/// A receipt recording a state transition in the contract lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxReceipt {
+    pub seq: u64,
+    pub state: MissionTxState,
+    pub emitted_at_ms: i64,
+    pub reason_code: Option<String>,
+    pub error_code: Option<String>,
+}
+
+/// Record of a single step's execution within a transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxStepExecutionRecord {
+    pub step_id: TxStepId,
+    pub ordinal: u32,
+    pub phase: TxPhase,
+    pub succeeded: bool,
+    pub step_idempotency_key: String,
+    pub attempt_count: u32,
+    pub last_attempted_at_ms: i64,
+}
+
+impl TxStepExecutionRecord {
+    /// Whether this step already succeeded in the given phase.
+    #[must_use]
+    pub fn is_already_succeeded(&self, phase: &TxPhase) -> bool {
+        self.succeeded && self.phase == *phase
+    }
+
+    /// Compute a deterministic idempotency key for a step execution.
+    #[must_use]
+    pub fn compute_step_key(tx_id: &TxId, step_id: &TxStepId, phase: &TxPhase) -> String {
+        format!("sk:{}:{}:{}", tx_id.0, step_id.0, phase)
+    }
+}
+
+/// Full execution record for a transaction (idempotency journal entry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxExecutionRecord {
+    pub tx_id: TxId,
+    pub plan_id: TxPlanId,
+    pub lifecycle_state: MissionTxState,
+    pub correlation_id: String,
+    pub tx_idempotency_key: String,
+    pub step_records: Vec<TxStepExecutionRecord>,
+    pub commit_report_hash: Option<String>,
+    pub compensation_report_hash: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+impl TxExecutionRecord {
+    /// Compute a deterministic idempotency key for the entire transaction.
+    #[must_use]
+    pub fn compute_tx_key(contract: &MissionTxContract) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        contract.intent.tx_id.0.hash(&mut hasher);
+        contract.plan.plan_id.0.hash(&mut hasher);
+        contract.intent.correlation_id.hash(&mut hasher);
+        contract.plan.steps.len().hash(&mut hasher);
+        for step in &contract.plan.steps {
+            step.step_id.0.hash(&mut hasher);
+        }
+        format!("txk:{:016x}", hasher.finish())
+    }
+}
+
+/// Verdict from idempotency validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxIdempotencyVerdict {
+    /// No prior execution found; proceed.
+    FirstExecution,
+    /// A prior terminal execution exists; block.
+    DoubleExecutionBlocked {
+        original_state: MissionTxState,
+    },
+    /// A prior non-terminal execution exists; resume from where it left off.
+    Resumable {
+        resume_from_state: MissionTxState,
+        completed_steps: Vec<TxStepId>,
+    },
+}
+
+/// Result of an idempotency check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxIdempotencyCheck {
+    pub verdict: TxIdempotencyVerdict,
+}
+
+impl TxIdempotencyCheck {
+    /// Whether the caller should proceed with execution.
+    #[must_use]
+    pub fn should_proceed(&self) -> bool {
+        !matches!(
+            self.verdict,
+            TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+        )
+    }
+}
+
+/// Validate whether a transaction phase can proceed given prior execution records.
+#[must_use]
+pub fn validate_tx_idempotency(
+    _contract: &MissionTxContract,
+    phase: TxPhase,
+    record: Option<&TxExecutionRecord>,
+) -> TxIdempotencyCheck {
+    match record {
+        None => TxIdempotencyCheck {
+            verdict: TxIdempotencyVerdict::FirstExecution,
+        },
+        Some(rec) => {
+            // If prior execution is in a terminal state, block.
+            if rec.lifecycle_state.is_terminal() {
+                return TxIdempotencyCheck {
+                    verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
+                        original_state: rec.lifecycle_state,
+                    },
+                };
+            }
+            // Non-terminal: check if it's the same phase and can resume.
+            let completed: Vec<TxStepId> = rec
+                .step_records
+                .iter()
+                .filter(|sr| sr.phase == phase && sr.succeeded)
+                .map(|sr| sr.step_id.clone())
+                .collect();
+            TxIdempotencyCheck {
+                verdict: TxIdempotencyVerdict::Resumable {
+                    resume_from_state: rec.lifecycle_state,
+                    completed_steps: completed,
+                },
+            }
+        }
+    }
+}
+
+/// Reconstructed resume state for a transaction after a crash or interruption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxResumeState {
+    pub pending_step_ids: Vec<TxStepId>,
+    pub committed_step_ids: Vec<TxStepId>,
+    pub compensated_step_ids: Vec<TxStepId>,
+    pub commit_phase_completed: bool,
+    pub compensation_phase_completed: bool,
+    pub reconstructed_at_ms: i64,
+}
+
+impl TxResumeState {
+    /// Whether all phases are complete and no work remains.
+    #[must_use]
+    pub fn is_fully_resolved(&self) -> bool {
+        self.commit_phase_completed && self.pending_step_ids.is_empty()
+    }
+}
+
+/// Reconstruct the resume state of a transaction from its contract and reports.
+#[must_use]
+pub fn reconstruct_tx_resume_state(
+    contract: &MissionTxContract,
+    commit_report: Option<&TxCommitReport>,
+    comp_report: Option<&TxCompensationReport>,
+    now_ms: i64,
+) -> TxResumeState {
+    let all_step_ids: Vec<TxStepId> = contract
+        .plan
+        .steps
+        .iter()
+        .map(|s| s.step_id.clone())
+        .collect();
+
+    let mut committed_step_ids = Vec::new();
+    let mut commit_phase_completed = false;
+
+    if let Some(cr) = commit_report {
+        commit_phase_completed = true;
+        for result in &cr.step_results {
+            let is_committed = matches!(result.outcome, TxCommitStepOutcome::Committed { .. });
+            if is_committed {
+                committed_step_ids.push(result.step_id.clone());
+            }
+        }
+    }
+
+    // Also mark commit as completed if a terminal receipt exists.
+    for receipt_val in &contract.receipts {
+        if let Ok(receipt) = serde_json::from_value::<TxReceipt>(receipt_val.clone()) {
+            if receipt.state.is_terminal() {
+                commit_phase_completed = true;
+            }
+        }
+    }
+
+    let mut compensated_step_ids = Vec::new();
+    let mut compensation_phase_completed = false;
+
+    if let Some(comp) = comp_report {
+        compensation_phase_completed = true;
+        // Each step result in compensation corresponds to a compensated step.
+        for _result in &comp.step_results {
+            // Compensation steps reference the for_step_id; collect successfully compensated.
+        }
+        compensated_step_ids.clone_from(&committed_step_ids); // Simplified: if comp ran, all committed were targeted.
+        if comp.has_residual_risk() {
+            compensated_step_ids.clear();
+        }
+    }
+
+    let pending_step_ids: Vec<TxStepId> = if commit_phase_completed {
+        Vec::new()
+    } else {
+        all_step_ids
+    };
+
+    TxResumeState {
+        pending_step_ids,
+        committed_step_ids,
+        compensated_step_ids,
+        commit_phase_completed,
+        compensation_phase_completed,
+        reconstructed_at_ms: now_ms,
     }
 }
 

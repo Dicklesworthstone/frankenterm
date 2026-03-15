@@ -1227,7 +1227,7 @@ impl RiskRegistry {
     #[must_use]
     pub fn by_severity(&self) -> Vec<&RiskRecord> {
         let mut sorted: Vec<&RiskRecord> = self.risks.iter().collect();
-        sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.severity));
         sorted
     }
 

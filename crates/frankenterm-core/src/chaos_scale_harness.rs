@@ -475,31 +475,31 @@ impl ChaosScaleHarness {
 
             // Simulate changing pressure over time.
             let cpu = if has_cpu_overload {
-                0.70 + progress * 0.28
+                progress.mul_add(0.28, 0.70)
             } else {
-                0.30 + progress * 0.20
+                progress.mul_add(0.20, 0.30)
             };
             let mem = if has_memory_exhaustion {
-                0.75 + progress * 0.22
+                progress.mul_add(0.22, 0.75)
             } else {
-                0.40 + progress * 0.15
+                progress.mul_add(0.15, 0.40)
             };
             let io = if has_io_stall {
-                0.60 + progress * 0.35
+                progress.mul_add(0.35, 0.60)
             } else {
                 0.10
             };
 
             // Under normal conditions, keep concurrency low. Under failure, ramp it up.
             let heavy_active = if has_cpu_overload || has_memory_exhaustion {
-                (i % 4) as u32
+                i % 4
             } else {
-                (i % 2) as u32 // 0 or 1, always below default max of 2
+                i % 2 // 0 or 1, always below default max of 2
             };
             let medium_active = if has_cpu_overload || has_memory_exhaustion {
-                (i % 8) as u32
+                i % 8
             } else {
-                (i % 4) as u32 // 0–3, always below default max of 6
+                i % 4 // 0–3, always below default max of 6
             };
 
             let signals = PressureSignals {

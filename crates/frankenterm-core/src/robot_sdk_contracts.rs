@@ -14,7 +14,7 @@
 //!   └── ReplayContractTest        — replay-based contract enforcement
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -391,14 +391,12 @@ impl SdkSurface {
 fn to_camel_case(s: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = false;
-    for (i, c) in s.chars().enumerate() {
+    for c in s.chars() {
         if c == '-' || c == '_' {
             capitalize_next = true;
         } else if capitalize_next {
             result.push(c.to_uppercase().next().unwrap_or(c));
             capitalize_next = false;
-        } else if i == 0 {
-            result.push(c);
         } else {
             result.push(c);
         }
@@ -572,11 +570,11 @@ fn render_go_client(surface: &SdkSurface) -> String {
 }
 
 fn unique_return_types(surface: &SdkSurface) -> Vec<String> {
-    let mut seen = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for method in &surface.methods {
-        seen.insert(method.return_type.clone(), ());
+        seen.insert(method.return_type.clone());
     }
-    seen.into_keys().collect()
+    seen.into_iter().collect()
 }
 
 fn render_python_params(params: &[SdkParam]) -> String {
@@ -609,10 +607,11 @@ fn render_typescript_params(params: &[SdkParam]) -> String {
 }
 
 fn render_rust_params(params: &[SdkParam]) -> String {
-    params
-        .iter()
-        .map(|param| format!(", {}: {}", param.name, param.param_type))
-        .collect::<String>()
+    use std::fmt::Write;
+    params.iter().fold(String::new(), |mut acc, param| {
+        let _ = write!(acc, ", {}: {}", param.name, param.param_type);
+        acc
+    })
 }
 
 fn render_go_params(params: &[SdkParam]) -> String {

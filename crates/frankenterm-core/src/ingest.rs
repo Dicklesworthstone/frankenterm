@@ -432,8 +432,8 @@ impl PaneEntry {
     }
 }
 
-fn option_string_len(value: &Option<String>) -> usize {
-    value.as_ref().map_or(0, String::len)
+fn option_string_len(value: Option<&String>) -> usize {
+    value.map_or(0, String::len)
 }
 
 fn json_value_dynamic_bytes(value: &serde_json::Value) -> usize {
@@ -449,11 +449,11 @@ fn json_value_dynamic_bytes(value: &serde_json::Value) -> usize {
 }
 
 fn pane_info_dynamic_bytes(info: &PaneInfo) -> usize {
-    option_string_len(&info.domain_name)
-        + option_string_len(&info.workspace)
-        + option_string_len(&info.title)
-        + option_string_len(&info.cwd)
-        + option_string_len(&info.tty_name)
+    option_string_len(info.domain_name.as_ref())
+        + option_string_len(info.workspace.as_ref())
+        + option_string_len(info.title.as_ref())
+        + option_string_len(info.cwd.as_ref())
+        + option_string_len(info.tty_name.as_ref())
         + info
             .extra
             .iter()

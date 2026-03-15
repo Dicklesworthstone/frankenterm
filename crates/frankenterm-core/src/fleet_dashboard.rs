@@ -143,7 +143,7 @@ impl AlertCondition {
                 snapshot
                     .layer_health
                     .get(&key)
-                    .map_or(false, |h| health_at_or_below(*h, *threshold))
+                    .is_some_and(|h| health_at_or_below(*h, *threshold))
             }
             Self::RedactionCeilingAbove { threshold } => snapshot.redaction_ceiling >= *threshold,
             Self::UnhealthyEnvelopeCount { max_count } => {
@@ -416,7 +416,7 @@ impl FleetDashboardView {
 
         let mut layer_envelope_counts: HashMap<String, usize> = HashMap::new();
         for env in &snapshot.envelopes {
-            let key = serde_json::to_value(&env.layer)
+            let key = serde_json::to_value(env.layer)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| format!("{:?}", env.layer));

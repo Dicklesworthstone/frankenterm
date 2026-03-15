@@ -280,12 +280,12 @@ impl FleetMemoryController {
         self.total_evaluations += 1;
 
         // Map each subsystem to fleet tier
-        let bp_tier = map_backpressure(signals.backpressure);
-        let mp_tier = map_memory_pressure(signals.memory_pressure);
-        let bl_tier = map_budget_level(signals.worst_budget);
+        let backpressure_tier = map_backpressure(signals.backpressure);
+        let mem_pressure_tier = map_memory_pressure(signals.memory_pressure);
+        let budget_tier = map_budget_level(signals.worst_budget);
 
         // Compound: worst-of all subsystems
-        let raw = bp_tier.max(mp_tier).max(bl_tier);
+        let raw = backpressure_tier.max(mem_pressure_tier).max(budget_tier);
 
         // Hysteresis: require consecutive readings before transitioning
         if raw == self.raw_tier {
@@ -295,14 +295,16 @@ impl FleetMemoryController {
             self.consecutive_raw = 1;
         }
 
-        let should_transition = if raw > self.compound_tier {
-            // Escalation: require fewer consecutive readings
-            self.consecutive_raw >= self.config.escalation_threshold
-        } else if raw < self.compound_tier {
-            // De-escalation: require more consecutive readings
-            self.consecutive_raw >= self.config.deescalation_threshold
-        } else {
-            false
+        let should_transition = match raw.cmp(&self.compound_tier) {
+            std::cmp::Ordering::Greater => {
+                // Escalation: require fewer consecutive readings
+                self.consecutive_raw >= self.config.escalation_threshold
+            }
+            std::cmp::Ordering::Less => {
+                // De-escalation: require more consecutive readings
+                self.consecutive_raw >= self.config.deescalation_threshold
+            }
+            std::cmp::Ordering::Equal => false,
         };
 
         if should_transition {
@@ -315,7 +317,7 @@ impl FleetMemoryController {
 
         // Determine actions for current compound tier
         let actions = recommend_actions(self.compound_tier, signals);
-        self.last_actions = actions.clone();
+        self.last_actions.clone_from(&actions);
 
         // Record decision
         let record = DecisionRecord {

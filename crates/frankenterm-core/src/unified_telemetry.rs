@@ -205,7 +205,7 @@ impl HealthStatus {
     /// Combine two statuses, keeping the worse.
     #[must_use]
     pub fn worst(self, other: Self) -> Self {
-        use HealthStatus::*;
+        use HealthStatus::{Degraded, Healthy, Unhealthy, Unknown};
         match (self, other) {
             (Unhealthy, _) | (_, Unhealthy) => Unhealthy,
             (Unknown, _) | (_, Unknown) => Unknown,
@@ -251,7 +251,7 @@ pub enum SubsystemLayer {
 #[serde(tag = "subsystem", rename_all = "snake_case")]
 pub enum SubsystemPayload {
     /// Aggregated policy engine snapshot (all 21 subsystems).
-    Policy(PolicyPayload),
+    Policy(Box<PolicyPayload>),
     /// Swarm scheduler snapshot.
     SwarmScheduler(SwarmSchedulerPayload),
     /// Swarm work queue snapshot.
@@ -262,7 +262,7 @@ pub enum SubsystemPayload {
     /// Core telemetry (resources, histograms, counters).
     Runtime(RuntimePayload),
     /// Storage telemetry.
-    Storage(StoragePayload),
+    Storage(Box<StoragePayload>),
     /// Ingest/tailer budget snapshot.
     Ingest(IngestPayload),
 }
@@ -425,7 +425,7 @@ impl UnifiedFleetSnapshot {
 
         let mut layer_health: HashMap<String, HealthStatus> = HashMap::new();
         for env in &envelopes {
-            let key = serde_json::to_value(&env.layer)
+            let key = serde_json::to_value(env.layer)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| format!("{:?}", env.layer));
