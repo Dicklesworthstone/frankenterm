@@ -3479,6 +3479,7 @@ dependencies = [
  "libc",
  "log",
  "mux",
+ "parking_lot",
  "portable-pty",
  "promise",
  "rangeset",

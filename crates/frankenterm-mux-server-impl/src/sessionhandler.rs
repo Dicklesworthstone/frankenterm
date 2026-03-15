@@ -1254,6 +1254,206 @@ async fn move_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mux::domain::DomainId;
+    use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
+    use parking_lot::MappedMutexGuard;
+    use rangeset::RangeSet;
+    use std::ops::Range;
+    use termwiz::surface::Line;
+    use wezterm_term::color::ColorPalette;
+    use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
+
+    #[derive(Clone)]
+    struct FakePaneState {
+        cursor_position: StableCursorPosition,
+        dimensions: RenderableDimensions,
+        tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
+        title: String,
+        working_dir: Option<Url>,
+        seqno: SequenceNo,
+        lines: Vec<Line>,
+    }
+
+    struct FakePane {
+        pane_id: PaneId,
+        state: Mutex<FakePaneState>,
+    }
+
+    impl FakePane {
+        fn new(tiered_scrollback_status: Option<PaneTieredScrollbackStatus>) -> Self {
+            Self {
+                pane_id: 77,
+                state: Mutex::new(FakePaneState {
+                    cursor_position: StableCursorPosition {
+                        x: 4,
+                        y: 0,
+                        ..Default::default()
+                    },
+                    dimensions: RenderableDimensions {
+                        cols: 80,
+                        viewport_rows: 2,
+                        scrollback_rows: 12,
+                        physical_top: 0,
+                        scrollback_top: 0,
+                        dpi: 96,
+                        pixel_width: 640,
+                        pixel_height: 480,
+                        reverse_video: false,
+                    },
+                    tiered_scrollback_status,
+                    title: "tiered-pane".to_string(),
+                    working_dir: Url::parse("file:///tmp/tiered-pane").ok(),
+                    seqno: 11,
+                    lines: vec![
+                        Line::from_text("alpha", &Default::default(), 1, None),
+                        Line::from_text("beta", &Default::default(), 1, None),
+                    ],
+                }),
+            }
+        }
+
+        fn set_tiered_scrollback_status(&self, status: Option<PaneTieredScrollbackStatus>) {
+            self.state.lock().unwrap().tiered_scrollback_status = status;
+        }
+    }
+
+    impl Pane for FakePane {
+        fn pane_id(&self) -> PaneId {
+            self.pane_id
+        }
+
+        fn get_cursor_position(&self) -> StableCursorPosition {
+            self.state.lock().unwrap().cursor_position
+        }
+
+        fn get_current_seqno(&self) -> SequenceNo {
+            self.state.lock().unwrap().seqno
+        }
+
+        fn get_changed_since(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _seqno: SequenceNo,
+        ) -> RangeSet<StableRowIndex> {
+            RangeSet::new()
+        }
+
+        fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            let state = self.state.lock().unwrap();
+            (
+                lines.start,
+                state
+                    .lines
+                    .iter()
+                    .skip(lines.start as usize)
+                    .take((lines.end - lines.start) as usize)
+                    .cloned()
+                    .collect(),
+            )
+        }
+
+        fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
+            mux::pane::impl_with_lines_via_get_lines(self, lines, with_lines);
+        }
+
+        fn for_each_logical_line_in_stable_range_mut(
+            &self,
+            lines: Range<StableRowIndex>,
+            for_line: &mut dyn ForEachPaneLogicalLine,
+        ) {
+            mux::pane::impl_for_each_logical_line_via_get_logical_lines(self, lines, for_line);
+        }
+
+        fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
+            mux::pane::impl_get_logical_lines_via_get_lines(self, lines)
+        }
+
+        fn get_dimensions(&self) -> RenderableDimensions {
+            self.state.lock().unwrap().dimensions
+        }
+
+        fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
+            self.state.lock().unwrap().tiered_scrollback_status
+        }
+
+        fn get_title(&self) -> String {
+            self.state.lock().unwrap().title.clone()
+        }
+
+        fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
+            Ok(None)
+        }
+
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+            unimplemented!()
+        }
+
+        fn resize(&self, _size: TerminalSize) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        fn is_dead(&self) -> bool {
+            false
+        }
+
+        fn palette(&self) -> ColorPalette {
+            unimplemented!()
+        }
+
+        fn domain_id(&self) -> DomainId {
+            unimplemented!()
+        }
+
+        fn is_mouse_grabbed(&self) -> bool {
+            false
+        }
+
+        fn is_alt_screen_active(&self) -> bool {
+            false
+        }
+
+        fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
+            self.state.lock().unwrap().working_dir.clone()
+        }
+    }
+
+    fn sample_tiered_scrollback_status(cold_spill_lines_total: u64) -> PaneTieredScrollbackStatus {
+        PaneTieredScrollbackStatus {
+            tiering_enabled: true,
+            configured_scrollback_rows: 10_000,
+            configured_hot_lines: 512,
+            configured_warm_max_bytes: 8 * 1024,
+            visible_rows: 2,
+            in_memory_scrollback_rows: 6,
+            warm_resident_lines: 4,
+            warm_resident_bytes: 512,
+            warm_spill_lines_total: cold_spill_lines_total + 4,
+            warm_spill_bytes_total: 4096,
+            cold_spill_lines_total,
+            cold_spill_bytes_total: cold_spill_lines_total * 64,
+            cold_worker_peak_backlog_depth: 3,
+            cold_worker_completion_throughput_lines_per_sec: 256,
+            cold_worker_completed_lines_total: cold_spill_lines_total,
+            cold_worker_completed_batches_total: 2,
+            cold_worker_cancellation_count: 0,
+        }
+    }
 
     /// Creates a PduSender that captures all sent PDUs into a shared Vec.
     fn capturing_sender() -> (PduSender, Arc<Mutex<Vec<DecodedPdu>>>) {
@@ -1703,5 +1903,52 @@ mod tests {
         // Modify one, verify the other is unaffected
         pp1.lock().unwrap().seqno = 42;
         assert_eq!(pp2.lock().unwrap().seqno, 0);
+    }
+
+    #[test]
+    fn compute_changes_includes_initial_tiered_scrollback_status_snapshot() {
+        let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let mut per_pane = PerPane::default();
+
+        let response = per_pane
+            .compute_changes(&pane_dyn, None)
+            .expect("initial pane snapshot should produce a response");
+
+        assert_eq!(
+            response.tiered_scrollback_status,
+            Some(sample_tiered_scrollback_status(12))
+        );
+        assert_eq!(
+            per_pane.tiered_scrollback_status,
+            Some(sample_tiered_scrollback_status(12))
+        );
+    }
+
+    #[test]
+    fn compute_changes_detects_cleared_tiered_scrollback_status_without_other_deltas() {
+        let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let mut per_pane = PerPane::default();
+
+        let initial = per_pane.compute_changes(&pane_dyn, None);
+        assert!(
+            initial.is_some(),
+            "first snapshot should populate cached pane state"
+        );
+        assert!(
+            per_pane.compute_changes(&pane_dyn, None).is_none(),
+            "unchanged pane state should not emit a redundant render delta"
+        );
+
+        pane.set_tiered_scrollback_status(None);
+
+        let response = per_pane
+            .compute_changes(&pane_dyn, None)
+            .expect("clearing tiered scrollback status should produce a response");
+
+        assert!(response.dirty_lines.is_empty());
+        assert_eq!(response.tiered_scrollback_status, None);
+        assert_eq!(per_pane.tiered_scrollback_status, None);
     }
 }
