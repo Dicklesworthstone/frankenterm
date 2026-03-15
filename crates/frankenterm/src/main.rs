@@ -11806,8 +11806,13 @@ async fn distributed_agent_connect(
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_agent_domain_is_remote(domain: &str) -> bool {
+    domain.starts_with("distributed:")
+}
+
+#[cfg(feature = "distributed")]
 fn distributed_agent_local_pane(record: &frankenterm_core::storage::PaneRecord) -> bool {
-    !record.domain.starts_with("distributed:")
+    !distributed_agent_domain_is_remote(&record.domain)
 }
 
 #[cfg(feature = "distributed")]
@@ -12269,8 +12274,46 @@ async fn distributed_agent_stream_event(
             .await?;
             Ok(())
         }
-        event @ Event::PatternDetected { pane_id, .. }
-        | event @ Event::PaneDiscovered { pane_id, .. } => {
+        Event::PaneDiscovered {
+            pane_id,
+            domain,
+            title,
+        } => {
+            if distributed_agent_domain_is_remote(&domain) {
+                tracing::debug!(
+                    pane_id,
+                    domain = %domain,
+                    "Skipping distributed pane discovered event on distributed agent"
+                );
+                return Ok(());
+            }
+            if distributed_agent_should_skip_remote_pane(storage, pane_id).await? {
+                tracing::debug!(
+                    pane_id,
+                    domain = %domain,
+                    "Skipping pane discovered event after storage classified pane as distributed"
+                );
+                return Ok(());
+            }
+            if let Some(mut envelope) = streamer.event_to_envelope(&Event::PaneDiscovered {
+                pane_id,
+                domain,
+                title,
+            }) {
+                if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
+                    let pane_record = {
+                        let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                        storage_handle.get_pane(meta.pane_id).await?
+                    };
+                    if let Some(record) = pane_record {
+                        *meta = distributed_agent_pane_meta(&record);
+                    }
+                }
+                distributed_agent_send_envelope(stream, &envelope).await?;
+            }
+            Ok(())
+        }
+        event @ Event::PatternDetected { pane_id, .. } => {
             if distributed_agent_should_skip_remote_pane(storage, pane_id).await? {
                 tracing::debug!(
                     pane_id,
@@ -42058,6 +42101,86 @@ recorder_backend = "frankensqlite"
                 assert_eq!(eof_size, 0);
                 assert_eq!(streamer.messages_sent(), 2);
                 assert_eq!(segment_cursors.get(&pane_id), Some(&segment.id));
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_stream_event_skips_discovered_remote_domain_without_storage_record() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::net::{TcpListener, TcpStream};
+                use frankenterm_core::events::Event;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_skip_remote_discovered_domain").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 95_u64;
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind remote-discovered listener");
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect remote-discovered stream");
+                let (server, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept remote-discovered stream");
+
+                let mut stream =
+                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
+                let mut reader = asupersync::io::BufReader::new(server);
+                let mut streamer =
+                    frankenterm_core::wire_protocol::AgentStreamer::new("agent-remote-domain");
+                let mut segment_cursors = std::collections::HashMap::new();
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                distributed_agent_stream_event(
+                    Event::PaneDiscovered {
+                        pane_id,
+                        domain: "distributed:agent-remote:prod".to_string(),
+                        title: "remote-pane".to_string(),
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("remote pane discovered event should be ignored without storage record");
+
+                drop(stream);
+
+                let mut line = String::new();
+                let read_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read remote discovered result");
+                assert_eq!(
+                    read_size, 0,
+                    "distributed pane discovery events should be skipped even before storage reflects the pane"
+                );
+                assert_eq!(streamer.messages_sent(), 0);
+                assert!(segment_cursors.is_empty());
+                assert!(gap_cursors.is_empty());
 
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 cleanup_storage(storage_handle, &db_path).await;
