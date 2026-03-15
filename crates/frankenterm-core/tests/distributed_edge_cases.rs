@@ -69,13 +69,13 @@ fn validate_token_rejects_mismatched_simple_tokens() {
 
 #[test]
 fn validate_token_passes_matching_identity_tokens() {
-    // identity:secret format
+    // identity:secret format — client_identity must match token identity
     assert!(
         validate_token(
             DistributedAuthMode::Token,
             Some("agent-1:secret123"),
             Some("agent-1:secret123"),
-            None,
+            Some("agent-1"),
         )
         .is_ok()
     );
@@ -114,7 +114,7 @@ fn validate_token_identity_matching_is_case_insensitive() {
             DistributedAuthMode::Token,
             Some("Agent-1:secret"),
             Some("agent-1:secret"),
-            None,
+            Some("agent-1"),
         )
         .is_ok()
     );
@@ -879,7 +879,7 @@ fn validate_token_multiple_colons() {
             DistributedAuthMode::Token,
             Some("agent:pass:extra"),
             Some("agent:pass:extra"),
-            None,
+            Some("agent"),
         )
         .is_ok()
     );
