@@ -248,6 +248,27 @@ status_has_remote_capacity() {
 
 RCH_PROBE_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_rch_workers_probe.json"
 RCH_STATUS_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_rch_status.json"
+RCH_CHECK_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_rch_check.log"
+
+if ! rch check > "${RCH_CHECK_LOG}" 2>&1; then
+  fail_now \
+    "suite_init" \
+    "preflight_rch_check" \
+    "rch_not_ready" \
+    "rch_check_failed" \
+    "$(basename "${RCH_CHECK_LOG}")" \
+    "rch check failed before workers probe/status"
+fi
+
+emit_log \
+  "passed" \
+  "suite_init" \
+  "preflight_rch_check" \
+  "rch_ready" \
+  "none" \
+  "$(basename "${RCH_CHECK_LOG}")" \
+  "rch check passed before workers probe/status"
+
 PROBE_REACHABLE="false"
 if rch workers probe --all --json > "${RCH_PROBE_LOG}" 2>"${RCH_PROBE_LOG}.stderr"; then
   if probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
@@ -338,6 +359,7 @@ jq -cn \
   --arg core_log "$(basename "${CORE_E2E_LOG}")" \
   --arg listener_log "$(basename "${LISTENER_E2E_LOG}")" \
   --arg bench_log "$(basename "${BENCH_LOG}")" \
+  --arg rch_check "$(basename "${RCH_CHECK_LOG}")" \
   --arg rch_probe "$(basename "${RCH_PROBE_LOG}")" \
   --arg rch_status "$(basename "${RCH_STATUS_LOG}")" \
   '{
@@ -350,6 +372,7 @@ jq -cn \
       target_dir: $remote_target_dir
     },
     artifacts: {
+      rch_check: $rch_check,
       rch_probe: $rch_probe,
       rch_status: $rch_status,
       core_streaming_e2e_log: $core_log,
