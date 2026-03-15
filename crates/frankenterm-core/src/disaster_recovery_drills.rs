@@ -523,20 +523,17 @@ impl DrillRunner {
         }
 
         // Determine verdict
-        let verdict = if !completeness_met
-            || rto_met == Some(false)
-            || recovery_point_met == Some(false)
-        {
-            if completeness_met
-                && (rto_met != Some(false) || recovery_point_met != Some(false))
-            {
-                DrillVerdict::Degraded
+        let verdict =
+            if !completeness_met || rto_met == Some(false) || recovery_point_met == Some(false) {
+                if completeness_met && (rto_met != Some(false) || recovery_point_met != Some(false))
+                {
+                    DrillVerdict::Degraded
+                } else {
+                    DrillVerdict::Fail
+                }
             } else {
-                DrillVerdict::Fail
-            }
-        } else {
-            DrillVerdict::Pass
-        };
+                DrillVerdict::Pass
+            };
 
         notes.push(format!(
             "completeness={:.1}% (target={:.1}%)",
