@@ -120,6 +120,69 @@ EOF
   chmod +x "${mock_bin}/rch"
 }
 
+write_success_build_rch() {
+  local mock_bin="$1"
+  local marker_file="$2"
+  mkdir -p "${mock_bin}"
+  cat > "${mock_bin}/rch" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
+  cat <<'JSON'
+{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}
+JSON
+  exit 0
+fi
+
+if [[ "\${1:-}" == "exec" ]]; then
+  shift
+  printf '%s\n' "\$*" > "${marker_file}"
+  target_dir=""
+  for arg in "\$@"; do
+    if [[ "\${arg}" == CARGO_TARGET_DIR=* ]]; then
+      target_dir="\${arg#CARGO_TARGET_DIR=}"
+      break
+    fi
+  done
+  if [[ -z "\${target_dir}" ]]; then
+    echo "missing CARGO_TARGET_DIR" >&2
+    exit 64
+  fi
+  mkdir -p "\${PWD}/\${target_dir}/release"
+  cat > "\${PWD}/\${target_dir}/release/frankenterm-gui" <<'BIN'
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  echo "stub 0.0.0"
+  exit 0
+fi
+if [[ "\${1:-}" == "--help" ]]; then
+  echo "stub help"
+  exit 0
+fi
+exit 0
+BIN
+  cat > "\${PWD}/\${target_dir}/release/ft" <<'BIN'
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  echo "stub 0.0.0"
+  exit 0
+fi
+if [[ "\${1:-}" == "--help" ]]; then
+  echo "stub help"
+  exit 0
+fi
+exit 0
+BIN
+  chmod +x "\${PWD}/\${target_dir}/release/frankenterm-gui" "\${PWD}/\${target_dir}/release/ft"
+  exit 0
+fi
+
+printf 'unexpected invocation: %s\n' "\$*" >> "${marker_file}"
+exit 64
+EOF
+  chmod +x "${mock_bin}/rch"
+}
+
 write_codesign_mock() {
   local mock_bin="$1"
   local marker_file="$2"
@@ -172,6 +235,18 @@ scenario_dry_run_skips_rch() {
     fi
     if ! grep -Eq '\[DRY-RUN\].* exec -- env CARGO_TARGET_DIR=' "${stdout_file}"; then
       record_result "dry_run_skips_rch" "false" "missing_dry_run_build_line" "DRY_RUN_OUTPUT_MISSING" "dry-run output missing rch preview"
+      return
+    fi
+    if grep -Fq "${ROOT_DIR}/Cargo.toml" "${stdout_file}"; then
+      record_result "dry_run_skips_rch" "false" "absolute_manifest_path" "ABSOLUTE_MANIFEST_PATH" "dry-run preview leaked local manifest path"
+      return
+    fi
+    if grep -Fq "CARGO_TARGET_DIR=${ROOT_DIR}/" "${stdout_file}"; then
+      record_result "dry_run_skips_rch" "false" "absolute_target_dir" "ABSOLUTE_TARGET_DIR" "dry-run preview leaked local target path"
+      return
+    fi
+    if ! grep -Fq -- '--manifest-path Cargo.toml' "${stdout_file}"; then
+      record_result "dry_run_skips_rch" "false" "missing_relative_manifest_path" "MANIFEST_PATH_NOT_RELATIVE" "dry-run preview missing repo-relative manifest path"
       return
     fi
     if ! grep -q 'Summary: pass=3 fail=0 skip=4 total=7' "${stdout_file}"; then
@@ -357,6 +432,47 @@ scenario_bundle_probe_failure_refuses_exec() {
   record_result "bundle_probe_failure_refuses_exec" "true"
 }
 
+scenario_bundle_build_uses_repo_relative_paths() {
+  local scenario_dir="${ARTIFACT_DIR}/bundle_build_uses_repo_relative_paths"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local marker_file="${scenario_dir}/rch-exec.log"
+  local output_dir="${scenario_dir}/output"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+
+  mkdir -p "${scenario_dir}" "${output_dir}"
+  write_success_build_rch "${mock_bin}" "${marker_file}"
+  write_codesign_mock "${mock_bin}" "${scenario_dir}/codesign.log"
+
+  emit_log "running" "bundle_build_uses_repo_relative_paths" "remote_safe_build" "none" "none" "${stdout_file}" "scripts/create-macos-bundle.sh remote-safe paths"
+  if env \
+    PATH="${mock_bin}:${PATH}" \
+    RCH_BIN="${mock_bin}/rch" \
+    CARGO_TARGET_DIR="${scenario_dir}/target" \
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${output_dir}" >"${stdout_file}" 2>"${stderr_file}"; then
+    if [[ ! -f "${marker_file}" ]]; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
+      return
+    fi
+    if grep -Fq "${ROOT_DIR}/Cargo.toml" "${marker_file}"; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "absolute_manifest_path" "ABSOLUTE_MANIFEST_PATH" "bundle build invoked rch with host manifest path"
+      return
+    fi
+    if grep -Fq "CARGO_TARGET_DIR=${ROOT_DIR}/" "${marker_file}"; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "absolute_target_dir" "ABSOLUTE_TARGET_DIR" "bundle build invoked rch with host target dir"
+      return
+    fi
+    if ! grep -Fq -- '--manifest-path Cargo.toml' "${marker_file}"; then
+      record_result "bundle_build_uses_repo_relative_paths" "false" "missing_relative_manifest_path" "MANIFEST_PATH_NOT_RELATIVE" "bundle build omitted repo-relative manifest path"
+      return
+    fi
+    record_result "bundle_build_uses_repo_relative_paths" "true"
+    return
+  fi
+
+  record_result "bundle_build_uses_repo_relative_paths" "false" "bundle_build_failed" "BUNDLE_BUILD_SCRIPT_FAILED" "bundle build path scenario returned non-zero"
+}
+
 main() {
   echo "=== GUI Bootstrap Contract E2E (ft-1memj.26) ==="
   echo "Artifacts: ${ARTIFACT_DIR}"
@@ -371,6 +487,7 @@ main() {
   scenario_bundle_skip_build_creates_structure
   scenario_bundle_refuses_overwrite
   scenario_bundle_probe_failure_refuses_exec
+  scenario_bundle_build_uses_repo_relative_paths
 
   echo ""
   echo "=== Summary ==="

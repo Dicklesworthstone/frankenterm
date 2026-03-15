@@ -43,6 +43,53 @@ while [[ $# -gt 0 ]]; do
 done
 
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+CARGO_TARGET_DIR_REL=""
+CARGO_TARGET_DIR_IN_REPO=0
+
+resolve_project_path_info() {
+    python3 - "$PROJECT_ROOT" "$1" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+value = sys.argv[2]
+abs_path = os.path.realpath(value if os.path.isabs(value) else os.path.join(root, value))
+rel_path = os.path.relpath(abs_path, root)
+in_repo = rel_path == "." or (rel_path != ".." and not rel_path.startswith(f"..{os.sep}"))
+
+print(abs_path)
+print(rel_path)
+print("1" if in_repo else "0")
+PY
+}
+
+normalize_cargo_target_dir() {
+    local -a info
+    mapfile -t info < <(resolve_project_path_info "$CARGO_TARGET_DIR")
+    CARGO_TARGET_DIR="${info[0]}"
+    CARGO_TARGET_DIR_REL="${info[1]}"
+    CARGO_TARGET_DIR_IN_REPO="${info[2]}"
+}
+
+require_remote_safe_target_dir() {
+    if [[ "$CARGO_TARGET_DIR_IN_REPO" == "1" ]]; then
+        return 0
+    fi
+
+    echo "Error: CARGO_TARGET_DIR '$CARGO_TARGET_DIR' is outside project root '$PROJECT_ROOT'"
+    echo "Use a repo-relative target dir (for example target or target/gui-bundle) when offloading via rch."
+    return 1
+}
+
+run_rch_bundle_build() {
+    (
+        cd "$PROJECT_ROOT"
+        "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" cargo build --release \
+            --bin frankenterm-gui \
+            --bin ft \
+            --manifest-path Cargo.toml
+    )
+}
 
 require_rch() {
     command -v "$RCH_BIN" >/dev/null 2>&1
@@ -70,10 +117,15 @@ sys.exit(1)
 PY
 }
 
+normalize_cargo_target_dir
+
 # --- Build from source ---
 if [ "$SKIP_BUILD" = false ]; then
     if ! require_rch; then
         echo "Error: rch not found at '$RCH_BIN'"
+        exit 1
+    fi
+    if ! require_remote_safe_target_dir; then
         exit 1
     fi
     if ! probe_rch_workers; then
@@ -81,10 +133,7 @@ if [ "$SKIP_BUILD" = false ]; then
         exit 1
     fi
     echo "Building frankenterm-gui and ft via rch (release)..."
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --release \
-        --bin frankenterm-gui \
-        --bin ft \
-        --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    run_rch_bundle_build
 fi
 
 # --- Locate binaries ---

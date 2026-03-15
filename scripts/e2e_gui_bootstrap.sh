@@ -13,7 +13,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RCH_BIN="${RCH_BIN:-rch}"
 GUI_TARGET_DIR="${GUI_TARGET_DIR:-$PROJECT_ROOT/target/e2e-gui-bootstrap}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-GUI_BIN="$GUI_TARGET_DIR/$BUILD_PROFILE/frankenterm-gui"
+GUI_TARGET_DIR_REL=""
+GUI_TARGET_DIR_IN_REPO=0
+GUI_BIN=""
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/target/e2e/gui-bootstrap}"
 BUNDLE_OUTPUT_DIR="${BUNDLE_OUTPUT_DIR:-$LOG_DIR/bundle-${BUILD_PROFILE}-$$}"
 LAUNCH_TIMEOUT_SECS="${LAUNCH_TIMEOUT_SECS:-3}"
@@ -105,6 +107,54 @@ run_cmd() {
   "$@"
 }
 
+resolve_project_path_info() {
+  python3 - "$PROJECT_ROOT" "$1" <<'PY'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+value = sys.argv[2]
+abs_path = os.path.realpath(value if os.path.isabs(value) else os.path.join(root, value))
+rel_path = os.path.relpath(abs_path, root)
+in_repo = rel_path == "." or (rel_path != ".." and not rel_path.startswith(f"..{os.sep}"))
+
+print(abs_path)
+print(rel_path)
+print("1" if in_repo else "0")
+PY
+}
+
+normalize_gui_target_dir() {
+  local -a info
+  mapfile -t info < <(resolve_project_path_info "$GUI_TARGET_DIR")
+  GUI_TARGET_DIR="${info[0]}"
+  GUI_TARGET_DIR_REL="${info[1]}"
+  GUI_TARGET_DIR_IN_REPO="${info[2]}"
+  GUI_BIN="$GUI_TARGET_DIR/$BUILD_PROFILE/frankenterm-gui"
+}
+
+require_remote_safe_gui_target_dir() {
+  if [[ "$GUI_TARGET_DIR_IN_REPO" == "1" ]]; then
+    return 0
+  fi
+
+  BUILD_STEP_STATUS="failed"
+  BUILD_STEP_DETAIL="build step failed (GUI_TARGET_DIR must stay under repo root for rch offload)"
+  log "GUI_TARGET_DIR '$GUI_TARGET_DIR' is outside project root '$PROJECT_ROOT'."
+  log "Use a repo-relative target dir (for example target/e2e-gui-bootstrap) when offloading via rch."
+  return 1
+}
+
+run_rch_gui_build() {
+  (
+    cd "$PROJECT_ROOT"
+    run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR_REL" \
+      cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path Cargo.toml
+  )
+}
+
+normalize_gui_target_dir
+
 run_step() {
   local name="$1"
   shift
@@ -177,11 +227,13 @@ build_gui() {
     mark_skip "--skip-build set"
     return 125
   fi
+  if ! require_remote_safe_gui_target_dir; then
+    return 1
+  fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
     BUILD_STEP_STATUS="dry-run"
     BUILD_STEP_DETAIL="dry-run"
-    run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
-      cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"
+    run_rch_gui_build
     return 0
   fi
   if ! require_rch; then
@@ -197,8 +249,7 @@ build_gui() {
     log "See $RCH_PROBE_LOG for probe details."
     return 1
   fi
-  if run_cmd "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$GUI_TARGET_DIR" \
-    cargo build --profile "$BUILD_PROFILE" --bin frankenterm-gui --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
+  if run_rch_gui_build; then
     BUILD_STEP_STATUS="success"
     BUILD_STEP_DETAIL=""
     return 0
