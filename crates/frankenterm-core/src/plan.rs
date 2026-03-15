@@ -131,10 +131,18 @@ impl ActionPlan {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - Plan version is newer than this build supports
     /// - Step numbers are not sequential starting from 1
     /// - Step IDs are not unique
     /// - Referenced steps in preconditions don't exist
     pub fn validate(&self) -> Result<(), PlanValidationError> {
+        if self.plan_version > PLAN_SCHEMA_VERSION {
+            return Err(PlanValidationError::UnsupportedVersion {
+                version: self.plan_version,
+                max_supported: PLAN_SCHEMA_VERSION,
+            });
+        }
+
         // Check step numbering
         for (i, step) in self.steps.iter().enumerate() {
             let expected = (i + 1) as u32;
@@ -159,6 +167,15 @@ impl ActionPlan {
             if let Precondition::StepCompleted { step_id } = precond {
                 if !seen_ids.contains(step_id) {
                     return Err(PlanValidationError::UnknownStepReference(step_id.clone()));
+                }
+            }
+        }
+        for step in &self.steps {
+            for precond in &step.preconditions {
+                if let Precondition::StepCompleted { step_id } = precond {
+                    if !seen_ids.contains(step_id) {
+                        return Err(PlanValidationError::UnknownStepReference(step_id.clone()));
+                    }
                 }
             }
         }
@@ -3705,8 +3722,8 @@ impl MissionAgentCapabilityProfile {
 }
 
 // ── Journal / idempotency / resume types ─────────────────────────────────────
-// These support the disabled tx_correctness_suite and tx_e2e_scenario_matrix
-// test suites (ft-1i2ge.8.10 / ft-1i2ge.8.11).
+// These support tx_correctness_suite and tx_e2e_scenario_matrix test suites
+// (ft-1i2ge.8.10 / ft-1i2ge.8.11), gated behind `subprocess-bridge` feature.
 
 /// Phase of a transaction lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -3778,7 +3795,8 @@ pub struct TxExecutionRecord {
 }
 
 impl TxExecutionRecord {
-    /// Compute a deterministic idempotency key for the entire transaction.
+    /// Compute an idempotency key for the entire transaction.
+    /// Deterministic within a single process (uses `DefaultHasher`).
     #[must_use]
     pub fn compute_tx_key(contract: &MissionTxContract) -> String {
         use std::collections::hash_map::DefaultHasher;
@@ -3932,13 +3950,12 @@ pub fn reconstruct_tx_resume_state(
 
     if let Some(comp) = comp_report {
         compensation_phase_completed = true;
-        // Each step result in compensation corresponds to a compensated step.
-        for _result in &comp.step_results {
-            // Compensation steps reference the for_step_id; collect successfully compensated.
-        }
-        compensated_step_ids.clone_from(&committed_step_ids); // Simplified: if comp ran, all committed were targeted.
+        // If compensation succeeded, all committed steps were compensated.
+        // If it failed (residual risk), none were fully compensated.
         if comp.has_residual_risk() {
-            compensated_step_ids.clear();
+            // Compensation failed; don't mark anything as compensated.
+        } else {
+            compensated_step_ids.clone_from(&committed_step_ids);
         }
     }
 
@@ -5254,6 +5271,51 @@ mod tests {
         };
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, PlanValidationError::UnknownStepReference(_)));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_step_reference_in_step_precondition() {
+        let plan = ActionPlan {
+            plan_version: PLAN_SCHEMA_VERSION,
+            plan_id: PlanId::placeholder(),
+            title: "bad step ref".into(),
+            workspace_id: "ws".into(),
+            created_at: None,
+            steps: vec![
+                StepPlan::new(1, StepAction::MarkEventHandled { event_id: 1 }, "Step 1")
+                    .with_precondition(Precondition::StepCompleted {
+                        step_id: IdempotencyKey::from_hash("nonexistent"),
+                    }),
+            ],
+            preconditions: vec![],
+            on_failure: None,
+            metadata: None,
+        };
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, PlanValidationError::UnknownStepReference(_)));
+    }
+
+    #[test]
+    fn validation_rejects_unsupported_plan_version() {
+        let plan = ActionPlan {
+            plan_version: PLAN_SCHEMA_VERSION + 1,
+            plan_id: PlanId::placeholder(),
+            title: "future".into(),
+            workspace_id: "ws".into(),
+            created_at: None,
+            steps: vec![],
+            preconditions: vec![],
+            on_failure: None,
+            metadata: None,
+        };
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            PlanValidationError::UnsupportedVersion {
+                version,
+                max_supported
+            } if version == PLAN_SCHEMA_VERSION + 1 && max_supported == PLAN_SCHEMA_VERSION
+        ));
     }
 
     #[test]
