@@ -409,8 +409,8 @@ mod tests {
     use super::{
         Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
         ExternalServerConfig, FrameworkMcpError, FtMcpClient, LOG_TARGET, McpClientConfig,
-        McpClientContentItem, McpClientToolDefinition, discover_servers, map_mcp_error,
-        select_server,
+        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
+        map_mcp_error, select_server,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -656,6 +656,125 @@ mod tests {
 
         assert!(!safe.is_destructive());
         assert!(destructive.is_destructive());
+    }
+
+    // ========================================================================
+    // McpClientError
+    // ========================================================================
+
+    #[test]
+    fn mcp_client_error_display() {
+        let err = McpClientError::new("mcp_client.timeout", "server did not respond");
+        assert_eq!(err.to_string(), "[mcp_client.timeout] server did not respond");
+        assert!(err.hint.is_none());
+    }
+
+    #[test]
+    fn mcp_client_error_with_hint() {
+        let err = McpClientError::new("mcp_client.disabled", "disabled")
+            .with_hint("set enabled=true");
+        assert_eq!(err.hint.as_deref(), Some("set enabled=true"));
+    }
+
+    #[test]
+    fn mcp_client_error_serde_roundtrip() {
+        let err = McpClientError {
+            code: "mcp_client.test",
+            message: "test error".to_string(),
+            hint: Some("try again".to_string()),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let back: McpClientError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message, "test error");
+        assert_eq!(back.hint.as_deref(), Some("try again"));
+    }
+
+    #[test]
+    fn mcp_client_error_serde_skips_none_hint() {
+        let err = McpClientError::new("mcp_client.test", "no hint");
+        let json = serde_json::to_value(&err).unwrap();
+        assert!(json.get("hint").is_none());
+    }
+
+    // ========================================================================
+    // ExternalServerConfig
+    // ========================================================================
+
+    #[test]
+    fn external_server_config_serde_roundtrip() {
+        let config = ExternalServerConfig {
+            name: "morph".to_string(),
+            command: "/usr/local/bin/morph-mcp".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: HashMap::from([("MCP_DEBUG".to_string(), "1".to_string())]),
+            cwd: Some("/tmp".to_string()),
+            disabled: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ExternalServerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "morph");
+        assert_eq!(back.args, vec!["--stdio"]);
+        assert!(!back.disabled);
+        assert_eq!(back.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // ========================================================================
+    // McpClientToolDefinition
+    // ========================================================================
+
+    #[test]
+    fn tool_definition_is_not_destructive_without_annotations() {
+        let tool = McpClientToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("Read a file".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: Some("1.0".to_string()),
+            tags: vec!["fs".to_string()],
+            annotations: None,
+        };
+        assert!(!tool.is_destructive());
+    }
+
+    #[test]
+    fn tool_definition_serde_roundtrip() {
+        let tool = McpClientToolDefinition {
+            name: "search".to_string(),
+            description: Some("Search".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        };
+        let json = serde_json::to_string(&tool).unwrap();
+        let back: McpClientToolDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "search");
+        assert_eq!(back.description.as_deref(), Some("Search"));
+    }
+
+    // ========================================================================
+    // McpClientContentItem
+    // ========================================================================
+
+    #[test]
+    fn content_item_as_text_returns_text_content() {
+        let item = McpClientContentItem(serde_json::json!({"type": "text", "text": "hello world"}));
+        assert_eq!(item.as_text(), Some("hello world"));
+    }
+
+    #[test]
+    fn content_item_as_text_returns_none_for_non_text() {
+        let item = McpClientContentItem(serde_json::json!({"type": "image", "data": "base64..."}));
+        assert!(item.as_text().is_none());
+    }
+
+    #[test]
+    fn content_item_as_text_returns_none_for_missing_type() {
+        let item = McpClientContentItem(serde_json::json!({"text": "no type field"}));
+        assert!(item.as_text().is_none());
     }
 
     fn field_matches(value: &str, expected: &str) -> bool {
