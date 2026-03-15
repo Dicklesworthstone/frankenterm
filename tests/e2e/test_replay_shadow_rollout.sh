@@ -32,10 +32,6 @@ run_rch() {
     TMPDIR=/tmp rch "$@"
 }
 
-run_rch_cargo() {
-    run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
-}
-
 resolve_timeout_bin() {
     if command -v timeout >/dev/null 2>&1; then
         TIMEOUT_BIN="timeout"
@@ -76,7 +72,7 @@ run_rch_cargo_logged() {
         if ! run_rch queue >"${queue_log}" 2>&1; then
             queue_log="${output_file}"
         fi
-        fatal "rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
     fi
     return "${rc}"
 }
@@ -99,10 +95,9 @@ ensure_rch_ready() {
     fi
 
     set +e
-    run_rch_cargo check --help >"${RCH_SMOKE_LOG}" 2>&1
+    run_rch_cargo_logged "${RCH_SMOKE_LOG}" check --help
     local smoke_rc=$?
     set -e
-    check_rch_fallback "${RCH_SMOKE_LOG}"
     if [[ ${smoke_rc} -ne 0 ]]; then
         fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
     fi
