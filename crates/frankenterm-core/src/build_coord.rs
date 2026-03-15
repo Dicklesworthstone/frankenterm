@@ -414,21 +414,17 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn detect_cargo_command(command: &str) -> Option<&str> {
     let tokens = command_tokens(command);
-    let cargo_tokens = cargo_payload_tokens(&tokens)?;
-    match cargo_tokens {
-        [cargo, subcommand, ..] if cargo == "cargo" => match subcommand.as_str() {
-            "build" | "b" => Some("build"),
-            "check" | "c" => Some("check"),
-            "test" | "t" | "nextest" => Some("test"),
-            "bench" => Some("bench"),
-            "clippy" => Some("clippy"),
-            "run" | "r" => Some("run"),
-            "doc" => Some("doc"),
-            _ => None,
-        },
-        [cargo_nextest, ..] if cargo_nextest == "cargo-nextest" => Some("test"),
-        _ => None,
+    let mut segment_start = 0;
+
+    while segment_start < tokens.len() {
+        if let Some((subcommand, _uses_rch)) = cargo_subcommand_for_segment(&tokens, segment_start)
+        {
+            return Some(subcommand);
+        }
+        segment_start = next_command_segment_start(&tokens, segment_start);
     }
+
+    None
 }
 
 /// Returns true when the command is already routed through `rch exec --`.
@@ -463,7 +459,20 @@ pub fn is_heavy_cargo_command(command: &str) -> bool {
 /// Returns true when a heavy cargo command is missing an `rch exec --` wrapper.
 #[must_use]
 pub fn requires_rch_offload(command: &str) -> bool {
-    is_heavy_cargo_command(command) && !command_uses_rch(command)
+    let tokens = command_tokens(command);
+    let mut segment_start = 0;
+
+    while segment_start < tokens.len() {
+        if let Some((subcommand, uses_rch)) = cargo_subcommand_for_segment(&tokens, segment_start)
+            && HEAVY_CARGO_SUBCOMMANDS.contains(&subcommand)
+            && !uses_rch
+        {
+            return true;
+        }
+        segment_start = next_command_segment_start(&tokens, segment_start);
+    }
+
+    false
 }
 
 /// Recommended `rch` prefix for the current platform.
@@ -485,32 +494,34 @@ fn command_tokens(command: &str) -> Vec<String> {
         .unwrap_or_else(|| trimmed.split_whitespace().map(str::to_string).collect())
 }
 
-fn cargo_payload_tokens(tokens: &[String]) -> Option<&[String]> {
-    let mut segment_start = 0;
+fn cargo_subcommand_for_segment(tokens: &[String], segment_start: usize) -> Option<(&str, bool)> {
+    let mut idx = skip_command_prefixes(tokens, segment_start);
+    let mut uses_rch = false;
 
-    while segment_start < tokens.len() {
-        let mut idx = skip_command_prefixes(tokens, segment_start);
-
-        if matches!(
-            (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
-            (Some(cmd), Some(exec), Some(sep))
-                if is_rch_binary(cmd) && exec == "exec" && sep == "--"
-        ) {
-            idx += 3;
-        }
-
-        idx = skip_command_prefixes(tokens, idx);
-        if matches!(
-            tokens.get(idx).map(String::as_str),
-            Some("cargo" | "cargo-nextest")
-        ) {
-            return Some(&tokens[idx..]);
-        }
-
-        segment_start = next_command_segment_start(tokens, segment_start);
+    if matches!(
+        (tokens.get(idx), tokens.get(idx + 1), tokens.get(idx + 2)),
+        (Some(cmd), Some(exec), Some(sep))
+            if is_rch_binary(cmd) && exec == "exec" && sep == "--"
+    ) {
+        uses_rch = true;
+        idx += 3;
     }
 
-    None
+    idx = skip_command_prefixes(tokens, idx);
+    match tokens.get(idx).map(String::as_str) {
+        Some("cargo") => match tokens.get(idx + 1).map(String::as_str) {
+            Some("build" | "b") => Some(("build", uses_rch)),
+            Some("check" | "c") => Some(("check", uses_rch)),
+            Some("test" | "t" | "nextest") => Some(("test", uses_rch)),
+            Some("bench") => Some(("bench", uses_rch)),
+            Some("clippy") => Some(("clippy", uses_rch)),
+            Some("run" | "r") => Some(("run", uses_rch)),
+            Some("doc") => Some(("doc", uses_rch)),
+            _ => None,
+        },
+        Some("cargo-nextest") => Some(("test", uses_rch)),
+        _ => None,
+    }
 }
 
 fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
@@ -526,13 +537,7 @@ fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
         match tokens.get(idx).map(String::as_str) {
             Some("env") => {
                 idx += 1;
-                while let Some(token) = tokens.get(idx) {
-                    if token.starts_with('-') || is_env_assignment(token) {
-                        idx += 1;
-                    } else {
-                        break;
-                    }
-                }
+                idx = skip_env_prefixes(tokens, idx);
             }
             _ => break,
         }
@@ -563,6 +568,46 @@ fn skip_env_assignments(tokens: &[String], mut idx: usize) -> usize {
         }
     }
     idx
+}
+
+fn skip_env_prefixes(tokens: &[String], mut idx: usize) -> usize {
+    while let Some(token) = tokens.get(idx).map(String::as_str) {
+        if is_env_assignment(token) {
+            idx += 1;
+            continue;
+        }
+
+        match token {
+            "-i" | "--ignore-environment" => {
+                idx += 1;
+            }
+            "-u" | "-C" | "-S" | "--unset" | "--chdir" | "--split-string" => {
+                idx += 1;
+                idx = skip_env_flag_argument(tokens, idx);
+            }
+            token
+                if token.starts_with("--unset=")
+                    || token.starts_with("--chdir=")
+                    || token.starts_with("--split-string=") =>
+            {
+                idx += 1;
+            }
+            token if token.starts_with('-') => {
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+
+    idx
+}
+
+fn skip_env_flag_argument(tokens: &[String], idx: usize) -> usize {
+    if matches!(tokens.get(idx), Some(token) if !is_shell_command_separator(token)) {
+        idx + 1
+    } else {
+        idx
+    }
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -808,6 +853,14 @@ mod tests {
             detect_cargo_command("env -i CARGO_TARGET_DIR=target cargo-nextest run"),
             Some("test")
         );
+        assert_eq!(
+            detect_cargo_command("env -u RUSTC_WRAPPER cargo test -p frankenterm-core"),
+            Some("test")
+        );
+        assert_eq!(
+            detect_cargo_command("env -C /tmp cargo check --workspace"),
+            Some("check")
+        );
     }
 
     #[test]
@@ -1037,6 +1090,18 @@ mod tests {
         ));
         assert!(!requires_rch_offload(
             "cd /tmp && TMPDIR=/tmp rch exec -- cargo test -p frankenterm-core -- --nocapture"
+        ));
+        assert!(requires_rch_offload(
+            "cargo test -p frankenterm-core && TMPDIR=/tmp rch exec -- true"
+        ));
+        assert!(requires_rch_offload(
+            "TMPDIR=/tmp rch exec -- true && cargo test -p frankenterm-core"
+        ));
+        assert!(requires_rch_offload(
+            "env -u RUSTC_WRAPPER cargo test -p frankenterm-core"
+        ));
+        assert!(!requires_rch_offload(
+            "env -C /tmp TMPDIR=/tmp rch exec -- cargo check --help"
         ));
     }
 
