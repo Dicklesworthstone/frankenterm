@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use frankenterm_core::runtime_compat_surface_guard::allowed_raw_runtime_files;
+
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -87,12 +89,22 @@ fn production_surface_files(workspace_root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn allowed_core_runtime_files(workspace_root: &Path) -> BTreeSet<PathBuf> {
+    allowed_raw_runtime_files()
+        .into_iter()
+        .map(|file_name| {
+            workspace_root
+                .join("crates/frankenterm-core/src")
+                .join(file_name)
+        })
+        .collect()
+}
+
 #[test]
 fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
     let workspace_root = workspace_root();
     let files = production_surface_files(&workspace_root);
-    let allowed =
-        BTreeSet::from([workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs")]);
+    let allowed = allowed_core_runtime_files(&workspace_root);
     let violations = scan_for_patterns(
         &workspace_root,
         &files,
@@ -111,7 +123,7 @@ fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
 
     assert!(
         violations.is_empty(),
-        "direct tokio async runtime primitives must stay confined to runtime_compat.rs:\n{}",
+        "direct tokio async runtime primitives must stay confined to the allowed runtime surface files:\n{}",
         violations.join("\n")
     );
 }
