@@ -1,7 +1,7 @@
 # Controlled Beta Feedback Loop (`ft-1u90p.8.7`)
 
 Date: 2026-03-14
-Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-14 UTC with anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
+Status: In progress (unblocked; instrumentation + checkpoint artifacts active; e2e validation harness revalidated 2026-03-14 UTC with real-user-threshold and anomaly-schema guardrails; HOLD unchanged pending real-user cohort data)
 Depends on: `ft-1u90p.8.1`, `ft-1u90p.8.2`, `ft-1u90p.8.3`, `ft-1u90p.7.5`, `docs/resize-performance-slos.md`  
 Related closure: `ft-1u90p.7.7` (closed 2026-02-22)
 
@@ -182,7 +182,7 @@ Each feedback item must map to a telemetry window and relevant resize metrics.
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260313.md`
   - `evidence/wa-1u90p.8.7/decision_checkpoint_20260314.md`
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_20260314_002836.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
 
 ## Decision Rubric (Promotion / Hold / Rollback)
 

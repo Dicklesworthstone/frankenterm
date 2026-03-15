@@ -13,7 +13,7 @@
   - `evidence/wa-1u90p.8.7/cohort_daily_summary.json`
 - Decision guardrail automation:
   - `tests/e2e/test_ft_1u90p_8_7.sh`
-  - `tests/e2e/logs/ft_1u90p_8_7_20260314_002836.jsonl`
+  - `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
 
 ## Gate Evaluation
 - Hard no-go triggers: not observed in the current fixture-only checkpoint.
@@ -21,15 +21,18 @@
   - sample sufficiency thresholds are still not met
   - real-user C2 cohort feedback coverage remains below minimum
 - Guardrail validation run:
-  - executed at `2026-03-14T04:28:36Z` (`2026-03-14T00:28:36-04:00` local)
+  - executed at `2026-03-14T22:05:38Z` (`2026-03-14T18:05:38-04:00` local)
   - baseline case correctly remains `HOLD`
+  - fixture-only feedback is excluded from threshold counts and summary totals must match countable real-user feedback
+  - synthetic feedback miscounting is rejected
+  - summary-only threshold inflation without countable real-user feedback is rejected
   - anomaly owner/remediation schema and checkpoint mirroring remain valid
   - negative case (`GO` with unmet thresholds) is rejected
   - recovery case (`GO` with met thresholds) is accepted
   - anomaly-negative case (missing owner/evidence) is rejected
 
 ## Decision Rationale
-The evidence pipeline, anomaly ledger schema, and promotion guardrails remain healthy and reproducible, but promotion is still blocked on real-user C2 sample sufficiency. `HOLD` remains the correct operational decision.
+The evidence pipeline, real-user threshold contract, anomaly ledger schema, and promotion guardrails remain healthy and reproducible, but promotion is still blocked on real-user C2 sample sufficiency. `HOLD` remains the correct operational decision.
 
 ## Active Anomaly / Remediation Tracking
 
@@ -40,7 +43,7 @@ The evidence pipeline, anomaly ledger schema, and promotion guardrails remain he
    - Triage owner: `resize-rollout-ops`
    - Remediation owner: `beta-program`
    - Close-loop status: `awaiting_real_user_cohort_ingest`
-   - Evidence: `evidence/wa-1u90p.8.7/cohort_daily_summary.json`, `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`, `tests/e2e/logs/ft_1u90p_8_7_20260314_002836.jsonl`
+   - Evidence: `evidence/wa-1u90p.8.7/cohort_daily_summary.json`, `evidence/wa-1u90p.8.7/telemetry_feedback_correlation.csv`, `tests/e2e/logs/ft_1u90p_8_7_20260314_180538.jsonl`
 
 2. `fixture-only-feedback-source-2026-03-12`
    - Category: `A2`
@@ -53,6 +56,6 @@ The evidence pipeline, anomaly ledger schema, and promotion guardrails remain he
 
 ## Required Follow-up
 1. Capture real-user C2 telemetry and categorized feedback across low/mid/high tiers.
-2. Reach documented sample sufficiency thresholds (`resize_events`, `alt_screen_transitions`, tier/session counts, feedback volume).
+2. Reach documented sample sufficiency thresholds (`resize_events`, `alt_screen_transitions`, tier/session counts, real-user countable feedback volume).
 3. Re-run `tests/e2e/test_ft_1u90p_8_7.sh` after new cohort ingestion and append the next dated decision checkpoint.
 4. Update the anomaly ledger entries above until both have close-loop evidence and can move to `closed`.
