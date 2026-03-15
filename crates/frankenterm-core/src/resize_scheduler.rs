@@ -2417,7 +2417,10 @@ mod tests {
 
         let debug = scheduler.debug_snapshot(64);
         let stalled = debug.stalled_transactions(260, 75);
-        assert!(stalled.is_empty(), "age should be based on activation time, not old submit time");
+        assert!(
+            stalled.is_empty(),
+            "age should be based on activation time, not old submit time"
+        );
     }
 
     #[test]
@@ -3438,9 +3441,16 @@ mod tests {
         ));
 
         let frame = scheduler.schedule_frame();
-        let tab1_picks = frame.scheduled.iter().filter(|work| work.pane_id <= 3).count();
+        let tab1_picks = frame
+            .scheduled
+            .iter()
+            .filter(|work| work.pane_id <= 3)
+            .count();
 
-        assert_eq!(tab1_picks, 3, "stale storm state should age out before scheduling");
+        assert_eq!(
+            tab1_picks, 3,
+            "stale storm state should age out before scheduling"
+        );
         assert_eq!(scheduler.metrics().storm_picks_throttled, 0);
     }
 

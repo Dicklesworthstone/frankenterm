@@ -4309,8 +4309,8 @@ mod tests {
         WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
         mcp_event_mutation_decision_context, mcp_get_text_policy_input,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, serialize_mcp_audit_decision_context,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        serialize_mcp_audit_decision_context,
     };
     use crate::mcp_error::MCP_ERR_INVALID_ARGS;
     use crate::plan::{
@@ -5281,12 +5281,27 @@ mod tests {
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
 
-        assert_eq!(evidence.get("tool").map(String::as_str), Some("wa.events_annotate"));
-        assert_eq!(evidence.get("event_action_kind").map(String::as_str), Some("events_annotate"));
+        assert_eq!(
+            evidence.get("tool").map(String::as_str),
+            Some("wa.events_annotate")
+        );
+        assert_eq!(
+            evidence.get("event_action_kind").map(String::as_str),
+            Some("events_annotate")
+        );
         assert_eq!(evidence.get("event_id").map(String::as_str), Some("123"));
-        assert_eq!(evidence.get("operation").map(String::as_str), Some("add_note"));
-        assert_eq!(evidence.get("actor_id").map(String::as_str), Some("agent-42"));
-        assert_eq!(evidence.get("event_surface").map(String::as_str), Some("mcp"));
+        assert_eq!(
+            evidence.get("operation").map(String::as_str),
+            Some("add_note")
+        );
+        assert_eq!(
+            evidence.get("actor_id").map(String::as_str),
+            Some("agent-42")
+        );
+        assert_eq!(
+            evidence.get("event_surface").map(String::as_str),
+            Some("mcp")
+        );
     }
 
     #[test]
@@ -5307,7 +5322,10 @@ mod tests {
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
 
-        assert!(evidence.get("actor_id").is_none(), "actor_id should be absent when None");
+        assert!(
+            evidence.get("actor_id").is_none(),
+            "actor_id should be absent when None"
+        );
         assert_eq!(evidence.get("event_id").map(String::as_str), Some("456"));
     }
 

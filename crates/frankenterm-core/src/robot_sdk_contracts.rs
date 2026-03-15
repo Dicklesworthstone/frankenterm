@@ -1738,7 +1738,12 @@ mod tests {
 
     #[test]
     fn http_method_serde_roundtrip() {
-        for method in [HttpMethod::Get, HttpMethod::Post, HttpMethod::Put, HttpMethod::Delete] {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Delete,
+        ] {
             let json = serde_json::to_string(&method).unwrap();
             let back: HttpMethod = serde_json::from_str(&json).unwrap();
             assert_eq!(method, back);
@@ -1767,7 +1772,12 @@ mod tests {
 
     #[test]
     fn sdk_language_serde_roundtrip() {
-        for lang in [SdkLanguage::Python, SdkLanguage::TypeScript, SdkLanguage::Rust, SdkLanguage::Go] {
+        for lang in [
+            SdkLanguage::Python,
+            SdkLanguage::TypeScript,
+            SdkLanguage::Rust,
+            SdkLanguage::Go,
+        ] {
             let json = serde_json::to_string(&lang).unwrap();
             let back: SdkLanguage = serde_json::from_str(&json).unwrap();
             assert_eq!(lang, back);

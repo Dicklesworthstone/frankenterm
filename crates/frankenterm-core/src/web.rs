@@ -4,9 +4,9 @@
 //! data endpoints (/panes, /events, /search, /bookmarks, /ruleset-profile, /saved-searches)
 //! backed by shared query helpers, plus SSE subscriptions for live event/delta streams.
 
+use crate::Result;
 use crate::events::EventBus;
 use crate::storage::StorageHandle;
-use crate::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,23 +36,11 @@ use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, Segmen
 #[cfg(test)]
 use crate::ui_query;
 #[cfg(test)]
-use crate::{Error, VERSION};
-#[cfg(test)]
-use serde::Serialize;
-#[cfg(test)]
-use serde_json::json;
-#[cfg(test)]
-use std::net::TcpStream;
-#[cfg(test)]
-use std::task::{Context, Poll};
-#[cfg(test)]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(test)]
-use tracing::{info, warn};
-#[cfg(test)]
 use crate::web_framework::{
     BoxFuture, ControlFlow, Method, Middleware, RequestContext, ResponseBody,
 };
+#[cfg(test)]
+use crate::{Error, VERSION};
 #[cfg(test)]
 use error::{json_err, json_ok};
 #[cfg(test)]
@@ -73,6 +61,18 @@ use handlers::{
 };
 #[cfg(test)]
 use middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
+#[cfg(test)]
+use serde::Serialize;
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
+use std::net::TcpStream;
+#[cfg(test)]
+use std::task::{Context, Poll};
+#[cfg(test)]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use tracing::{info, warn};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;

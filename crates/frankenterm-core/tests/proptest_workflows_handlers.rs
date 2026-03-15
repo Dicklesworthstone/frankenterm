@@ -10,13 +10,12 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 
-use frankenterm_core::workflows::{
-    AuthCassHintsLookup, AuthRecoveryStrategy, FallbackNextStepPlan, FallbackReason,
-    OnErrorCassHintsLookup, ResumeSessionConfig, ResumeSessionOutcome,
-    SessionStartCassHintsLookup,
-};
 #[cfg(feature = "browser")]
 use frankenterm_core::workflows::DeviceAuthStepOutcome;
+use frankenterm_core::workflows::{
+    AuthCassHintsLookup, AuthRecoveryStrategy, FallbackNextStepPlan, FallbackReason,
+    OnErrorCassHintsLookup, ResumeSessionConfig, ResumeSessionOutcome, SessionStartCassHintsLookup,
+};
 
 // =============================================================================
 // Strategies

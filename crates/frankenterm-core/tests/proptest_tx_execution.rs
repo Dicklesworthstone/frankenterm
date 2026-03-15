@@ -72,7 +72,15 @@ fn arb_execution_config() -> impl Strategy<Value = TxExecutionConfig> {
         proptest::option::of("[a-z0-9-]{1,20}"),
     )
         .prop_map(
-            |(auto_compensate, produce_forensic_bundle, max_steps, kill_switch, paused, fail_step, fail_comp)| {
+            |(
+                auto_compensate,
+                produce_forensic_bundle,
+                max_steps,
+                kill_switch,
+                paused,
+                fail_step,
+                fail_comp,
+            )| {
                 TxExecutionConfig {
                     auto_compensate,
                     produce_forensic_bundle,

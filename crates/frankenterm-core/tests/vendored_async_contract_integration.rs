@@ -14,8 +14,7 @@ use frankenterm_core::vendored_async_contracts::*;
 #[test]
 fn standard_contracts_cover_all_categories() {
     let contracts = standard_contracts();
-    let categories: std::collections::HashSet<_> =
-        contracts.iter().map(|c| c.category).collect();
+    let categories: std::collections::HashSet<_> = contracts.iter().map(|c| c.category).collect();
 
     assert!(categories.contains(&ContractCategory::Ownership));
     assert!(categories.contains(&ContractCategory::Cancellation));
@@ -118,7 +117,10 @@ fn compliance_with_mixed_evidence_computes_coverage() {
     ];
     let compliance = ContractCompliance::from_evidence(contract, evidence);
     assert!(!compliance.compliant, "mixed evidence → non-compliant");
-    assert!((compliance.coverage - 0.5).abs() < f64::EPSILON, "50% coverage");
+    assert!(
+        (compliance.coverage - 0.5).abs() < f64::EPSILON,
+        "50% coverage"
+    );
 }
 
 #[test]
@@ -269,7 +271,10 @@ fn error_mapping_includes_vendored_to_core() {
         .filter(|c| c.category == ContractCategory::ErrorMapping)
         .collect();
     assert_eq!(err.len(), 2);
-    assert!(err.iter().any(|c| c.direction == BoundaryDirection::VendoredToCore));
+    assert!(
+        err.iter()
+            .any(|c| c.direction == BoundaryDirection::VendoredToCore)
+    );
 }
 
 #[test]
@@ -344,7 +349,11 @@ fn contract_category_distribution_is_stable() {
 fn all_invariant_fields_non_empty() {
     for c in &standard_contracts() {
         assert!(!c.invariant.is_empty(), "{} invariant empty", c.contract_id);
-        assert!(!c.violation_impact.is_empty(), "{} impact empty", c.contract_id);
+        assert!(
+            !c.violation_impact.is_empty(),
+            "{} impact empty",
+            c.contract_id
+        );
         assert!(!c.description.is_empty(), "{} desc empty", c.contract_id);
     }
 }

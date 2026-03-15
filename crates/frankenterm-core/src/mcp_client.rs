@@ -665,21 +665,23 @@ mod tests {
     #[test]
     fn mcp_client_error_display() {
         let err = McpClientError::new("mcp_client.timeout", "server did not respond");
-        assert_eq!(err.to_string(), "[mcp_client.timeout] server did not respond");
+        assert_eq!(
+            err.to_string(),
+            "[mcp_client.timeout] server did not respond"
+        );
         assert!(err.hint.is_none());
     }
 
     #[test]
     fn mcp_client_error_with_hint() {
-        let err = McpClientError::new("mcp_client.disabled", "disabled")
-            .with_hint("set enabled=true");
+        let err =
+            McpClientError::new("mcp_client.disabled", "disabled").with_hint("set enabled=true");
         assert_eq!(err.hint.as_deref(), Some("set enabled=true"));
     }
 
     #[test]
     fn mcp_client_error_serializes_with_hint() {
-        let err = McpClientError::new("mcp_client.test", "test error")
-            .with_hint("try again");
+        let err = McpClientError::new("mcp_client.test", "test error").with_hint("try again");
         let json = serde_json::to_value(&err).unwrap();
         assert_eq!(json["code"], "mcp_client.test");
         assert_eq!(json["message"], "test error");

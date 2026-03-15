@@ -685,9 +685,7 @@ pub(super) fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EventStreamChannel, SseEvent, parse_event_stream_channel, parse_stream_max_hz,
-    };
+    use super::{EventStreamChannel, SseEvent, parse_event_stream_channel, parse_stream_max_hz};
     use crate::web_framework::QueryString;
 
     // ── parse_event_stream_channel ───────────────────────────────────
@@ -802,9 +800,7 @@ mod tests {
 
     #[test]
     fn sse_event_with_event_type_and_id() {
-        let event = SseEvent::new("payload")
-            .event_type("detection")
-            .id("42");
+        let event = SseEvent::new("payload").event_type("detection").id("42");
         let bytes = event.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("event: detection\n"));

@@ -311,9 +311,9 @@ impl Default for InputLatencyBudget {
         Self {
             stages: Vec::new(),
             aggregate: [
-                (Percentile::P50, 2000),  // 2ms p50
-                (Percentile::P95, 4000),  // 4ms p95
-                (Percentile::P99, 8000),  // 8ms p99
+                (Percentile::P50, 2000),   // 2ms p50
+                (Percentile::P95, 4000),   // 4ms p95
+                (Percentile::P99, 8000),   // 8ms p99
                 (Percentile::P999, 16000), // 16ms p999
             ]
             .into_iter()

@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use serde::Serialize;
 #[cfg(test)]
 use serde::Deserialize;
+use serde::Serialize;
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -69,8 +69,8 @@ use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleOnErrorCassSearch, HandleProcessTriageLifecycle, HandleSessionEnd,
     HandleSessionStartContext, HandleSwarmLearningIndex, HandleUsageLimits,
-    PaneWorkflowLockManager, Workflow,
-    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+    PaneWorkflowLockManager, Workflow, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner,
+    WorkflowRunnerConfig,
 };
 
 #[path = "mcp_bridge.rs"]
@@ -120,18 +120,18 @@ use mcp_tools::{
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
     McpMissionAssignmentData, McpMissionFailureCatalogEntry, McpMissionTransitionInfo,
-    McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData,
-    MissionStateParams, now_ms,
+    McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
+    now_ms,
 };
 #[cfg(test)]
 use mcp_types::{
-    EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData,
-    McpMissionControlData, McpMissionStateData, McpPaneState, McpRuleItem, McpSearchHit,
-    McpWaitForData, McpWorkflowRunData, MissionAbortParams, MissionExplainParams,
-    MissionPauseParams, SearchParams, SendParams, StateParams, TruncationInfo, WaitForParams,
-    WorkflowRunParams, apply_tail_truncation, default_cass_context_lines, default_cass_limit,
-    default_cass_offset, default_cass_timeout_secs, default_events_limit, default_tail,
-    default_timeout_secs, default_ttl_ms, default_wait_tail,
+    EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData, McpMissionControlData,
+    McpMissionStateData, McpPaneState, McpRuleItem, McpSearchHit, McpWaitForData,
+    McpWorkflowRunData, MissionAbortParams, MissionExplainParams, MissionPauseParams, SearchParams,
+    SendParams, StateParams, TruncationInfo, WaitForParams, WorkflowRunParams,
+    apply_tail_truncation, default_cass_context_lines, default_cass_limit, default_cass_offset,
+    default_cass_timeout_secs, default_events_limit, default_tail, default_timeout_secs,
+    default_ttl_ms, default_wait_tail,
 };
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
@@ -2806,10 +2806,7 @@ mod tests {
             "handle_session_start_context",
         ];
         for name in &expected {
-            assert!(
-                names.contains(name),
-                "missing builtin workflow: {name}"
-            );
+            assert!(names.contains(name), "missing builtin workflow: {name}");
         }
     }
 
@@ -2833,10 +2830,7 @@ mod tests {
         let names: Vec<&str> = workflows.iter().map(|w| w.name()).collect();
         let mut seen = std::collections::HashSet::new();
         for name in &names {
-            assert!(
-                seen.insert(name),
-                "duplicate builtin workflow name: {name}"
-            );
+            assert!(seen.insert(name), "duplicate builtin workflow name: {name}");
         }
     }
 

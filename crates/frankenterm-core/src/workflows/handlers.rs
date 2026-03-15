@@ -2213,19 +2213,12 @@ impl Workflow for HandleSwarmLearningIndex {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
 
-                    let cass = CassClient::new()
-                        .with_timeout_secs(SWARM_LEARNING_INDEX_TIMEOUT_SECS);
-                    let result_label = match cass
-                        .trigger_index(workspace.as_deref())
-                        .await
-                    {
+                    let cass =
+                        CassClient::new().with_timeout_secs(SWARM_LEARNING_INDEX_TIMEOUT_SECS);
+                    let result_label = match cass.trigger_index(workspace.as_deref()).await {
                         Ok(index_result) => {
-                            let sessions = index_result
-                                .sessions_indexed
-                                .unwrap_or(0);
-                            let new_sessions = index_result
-                                .new_sessions
-                                .unwrap_or(0);
+                            let sessions = index_result.sessions_indexed.unwrap_or(0);
+                            let new_sessions = index_result.new_sessions.unwrap_or(0);
                             tracing::info!(
                                 pane_id,
                                 sessions,
@@ -2245,9 +2238,8 @@ impl Workflow for HandleSwarmLearningIndex {
                     };
 
                     let timestamp_ms = now_ms();
-                    let input_summary = format!(
-                        "Swarm learning index for {agent_type} session end"
-                    );
+                    let input_summary =
+                        format!("Swarm learning index for {agent_type} session end");
                     let mut context = new_workflow_handler_audit_context(
                         "swarm_learning_index",
                         "handle_swarm_learning_index",
@@ -2258,11 +2250,7 @@ impl Workflow for HandleSwarmLearningIndex {
                         timestamp_ms,
                     );
                     context.add_evidence("agent_type", agent_type);
-                    add_optional_evidence(
-                        &mut context,
-                        "workspace",
-                        workspace.as_deref(),
-                    );
+                    add_optional_evidence(&mut context, "workspace", workspace.as_deref());
 
                     let audit = crate::storage::AuditActionRecord {
                         id: 0,
@@ -2278,9 +2266,7 @@ impl Workflow for HandleSwarmLearningIndex {
                         rule_id: None,
                         input_summary: Some(input_summary),
                         verification_summary: None,
-                        decision_context: serialize_workflow_handler_audit_context(
-                            &context,
-                        ),
+                        decision_context: serialize_workflow_handler_audit_context(&context),
                         result: result_label.to_string(),
                     };
 
@@ -5252,10 +5238,7 @@ mod tests {
         );
         assert_eq!(plan.account_id.as_deref(), Some("openai-team"));
         assert!(plan.operator_steps.iter().any(|s| s.contains("sess-abc")));
-        assert!(plan
-            .operator_steps
-            .iter()
-            .any(|s| s.contains("reset")));
+        assert!(plan.operator_steps.iter().any(|s| s.contains("reset")));
     }
 
     #[test]
@@ -5268,14 +5251,8 @@ mod tests {
     #[test]
     fn build_failover_disabled_plan_includes_config_command() {
         let plan = build_failover_disabled_plan(10, Some("sess-xyz"), Some(999), 1000);
-        assert!(plan
-            .operator_steps
-            .iter()
-            .any(|s| s.contains("disabled")));
-        assert!(plan
-            .suggested_commands
-            .iter()
-            .any(|c| c.contains("config")));
+        assert!(plan.operator_steps.iter().any(|s| s.contains("disabled")));
+        assert!(plan.suggested_commands.iter().any(|c| c.contains("config")));
     }
 
     // ========================================================================
@@ -5464,18 +5441,38 @@ mod tests {
     #[test]
     fn process_triage_category_classification() {
         // Auto-safe categories
-        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("zombie"));
-        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("stuck_test"));
-        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("stuck_cli"));
-        assert!(HandleProcessTriageLifecycle::category_is_auto_safe("duplicate_build"));
-        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe("active_agent"));
-        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe("unknown"));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe(
+            "zombie"
+        ));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe(
+            "stuck_test"
+        ));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe(
+            "stuck_cli"
+        ));
+        assert!(HandleProcessTriageLifecycle::category_is_auto_safe(
+            "duplicate_build"
+        ));
+        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe(
+            "active_agent"
+        ));
+        assert!(!HandleProcessTriageLifecycle::category_is_auto_safe(
+            "unknown"
+        ));
 
         // Protected categories
-        assert!(HandleProcessTriageLifecycle::category_is_protected("active_agent"));
-        assert!(HandleProcessTriageLifecycle::category_is_protected("system_process"));
-        assert!(!HandleProcessTriageLifecycle::category_is_protected("zombie"));
-        assert!(!HandleProcessTriageLifecycle::category_is_protected("unknown"));
+        assert!(HandleProcessTriageLifecycle::category_is_protected(
+            "active_agent"
+        ));
+        assert!(HandleProcessTriageLifecycle::category_is_protected(
+            "system_process"
+        ));
+        assert!(!HandleProcessTriageLifecycle::category_is_protected(
+            "zombie"
+        ));
+        assert!(!HandleProcessTriageLifecycle::category_is_protected(
+            "unknown"
+        ));
     }
 
     // ========================================================================
@@ -5865,7 +5862,11 @@ mod tests {
         let plan = HandleClaudeCodeLimits::build_recovery_plan("unknown_limit", None, 1);
         assert_eq!(plan["safe_to_send"], false);
         let steps = plan["next_steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("Unknown")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("Unknown"))
+        );
     }
 
     // ========================================================================
@@ -6012,7 +6013,11 @@ mod tests {
         let plan = HandleGeminiQuota::build_recovery_plan("quota_reached", Some("0%"), 11);
         assert_eq!(plan["safe_to_send"], false);
         let steps = plan["next_steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("exhausted")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("exhausted"))
+        );
     }
 
     #[test]
@@ -6020,7 +6025,11 @@ mod tests {
         let plan = HandleGeminiQuota::build_recovery_plan("unknown_quota", None, 2);
         assert_eq!(plan["safe_to_send"], false);
         let steps = plan["next_steps"].as_array().unwrap();
-        assert!(steps.iter().any(|s| s.as_str().unwrap().contains("Unknown")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("Unknown"))
+        );
     }
 
     // ========================================================================
@@ -6119,10 +6128,7 @@ mod tests {
             "agent_type": "codex",
         });
         let text = HandleOnErrorCassSearch::extract_error_text(&trigger);
-        assert_eq!(
-            text.as_deref(),
-            Some("API overloaded, try again later")
-        );
+        assert_eq!(text.as_deref(), Some("API overloaded, try again later"));
     }
 
     #[test]
@@ -6164,9 +6170,7 @@ mod tests {
             "expected error text in {candidates:?}"
         );
         assert!(
-            candidates
-                .iter()
-                .any(|c| c == "claude_code.error.network"),
+            candidates.iter().any(|c| c == "claude_code.error.network"),
             "expected rule_id in {candidates:?}"
         );
         assert!(
@@ -6195,9 +6199,7 @@ mod tests {
     #[test]
     fn handle_on_error_format_cass_hint_basic() {
         let hit = CassSearchHit {
-            content: Some(
-                "Fix: use rch exec -- cargo test instead of direct cargo".to_string(),
-            ),
+            content: Some("Fix: use rch exec -- cargo test instead of direct cargo".to_string()),
             source_path: Some("/tmp/session.jsonl".to_string()),
             line_number: Some(42),
             ..Default::default()

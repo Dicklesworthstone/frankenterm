@@ -1,8 +1,8 @@
-use crate::runtime::channel::{Receiver, TryRecvError, bounded};
+use crate::runtime::channel::{bounded, Receiver, TryRecvError};
 use crate::session::{SessionRequest, SessionSender, SignalChannel};
 use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
 use crate::sessionwrap::SessionWrap;
-use filedescriptor::{FileDescriptor, socketpair};
+use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::{ExitStatus, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};

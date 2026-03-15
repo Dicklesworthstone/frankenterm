@@ -2,11 +2,11 @@ use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
 use anyhow::anyhow;
 use codec::*;
-use config::{ConfigHandle, configuration};
+use config::{configuration, ConfigHandle};
 use lru::LruCache;
-use mux::Mux;
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
+use mux::Mux;
 use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
 use termwiz::image::{ImageCell, ImageData};
-use termwiz::surface::{SEQ_ZERO, SequenceNo};
+use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
 
@@ -888,7 +888,7 @@ impl RenderableState {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE_POLL_INTERVAL, initial_last_poll, should_apply_unilateral_delta};
+    use super::{initial_last_poll, should_apply_unilateral_delta, BASE_POLL_INTERVAL};
     use std::time::Instant;
     use termwiz::surface::SequenceNo;
 

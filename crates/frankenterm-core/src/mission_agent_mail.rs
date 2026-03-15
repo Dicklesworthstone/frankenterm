@@ -1637,7 +1637,10 @@ mod tests {
     #[test]
     fn mission_agent_mail_config_default() {
         let config = MissionAgentMailConfig::default();
-        assert!(config.ack_timeout_ms > 0, "default ack_timeout_ms must be positive");
+        assert!(
+            config.ack_timeout_ms > 0,
+            "default ack_timeout_ms must be positive"
+        );
     }
 
     #[test]

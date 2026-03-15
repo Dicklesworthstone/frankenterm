@@ -39,9 +39,11 @@ fn arb_percentile() -> impl Strategy<Value = Percentile> {
 }
 
 fn arb_measurement() -> impl Strategy<Value = InputLatencyMeasurement> {
-    (0..10_000u64, prop::collection::btree_map(arb_stage(), 0..1_000_000u64, 0..6)).prop_map(
-        |(id, stages)| InputLatencyMeasurement { id, stages },
+    (
+        0..10_000u64,
+        prop::collection::btree_map(arb_stage(), 0..1_000_000u64, 0..6),
     )
+        .prop_map(|(id, stages)| InputLatencyMeasurement { id, stages })
 }
 
 fn arb_stage_budget() -> impl Strategy<Value = StageBudget> {
@@ -58,11 +60,13 @@ fn arb_budget() -> impl Strategy<Value = InputLatencyBudget> {
         prop::collection::btree_map(arb_percentile(), 500..50_000u64, 0..4),
         0.5f64..2.0,
     )
-        .prop_map(|(stages, aggregate, regression_threshold)| InputLatencyBudget {
-            stages,
-            aggregate,
-            regression_threshold,
-        })
+        .prop_map(
+            |(stages, aggregate, regression_threshold)| InputLatencyBudget {
+                stages,
+                aggregate,
+                regression_threshold,
+            },
+        )
 }
 
 fn arb_budget_check_detail() -> impl Strategy<Value = BudgetCheckDetail> {

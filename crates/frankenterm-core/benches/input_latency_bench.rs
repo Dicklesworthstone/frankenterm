@@ -76,7 +76,9 @@ fn bench_record_stage(c: &mut Criterion) {
     group.bench_function("stage_latency", |b| {
         let m = make_full_measurement(0, 1000);
         b.iter(|| {
-            black_box(m.stage_latency_us(InputLatencyStage::KeyEvent, InputLatencyStage::GpuPresent));
+            black_box(
+                m.stage_latency_us(InputLatencyStage::KeyEvent, InputLatencyStage::GpuPresent),
+            );
         });
     });
 
