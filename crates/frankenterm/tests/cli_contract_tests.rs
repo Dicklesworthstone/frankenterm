@@ -2076,7 +2076,7 @@ fn contract_tx_run_partial_failure_json_envelope() {
             .unwrap_or_default()
             > 0
     );
-    assert_eq!(data["final_state"].as_str(), Some("compensated"));
+    assert_eq!(data["final_state"].as_str(), Some("rolled_back"));
 }
 
 #[test]
@@ -2118,6 +2118,31 @@ fn contract_tx_run_invalid_fail_step_json_error_envelope() {
 }
 
 #[test]
+fn contract_robot_tx_plan_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "plan"]);
+
+    assert_eq!(payload["ok"], true);
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
+
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
+    assert_eq!(data["step_count"].as_u64(), Some(3));
+    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["compensation_count"].as_u64(), Some(3));
+    assert_tx_transition_contract_shape(&data["legal_transitions"]);
+}
+
+#[test]
 fn contract_robot_tx_show_include_contract_json_envelope() {
     let (dir, ws) = setup_workspace();
     let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
@@ -2150,6 +2175,243 @@ fn contract_robot_tx_show_include_contract_json_envelope() {
     assert_eq!(data["receipt_count"].as_u64(), Some(0));
     assert_tx_transition_contract_shape(&data["legal_transitions"]);
     assert_tx_contract_payload_shape(&data["contract"], "planned");
+}
+
+#[test]
+fn contract_robot_tx_run_partial_failure_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "run",
+            "--fail-step",
+            "tx-step:2",
+        ],
+    );
+
+    assert_eq!(payload["ok"], true);
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
+
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(
+        data["prepare_report"]["outcome"].as_str(),
+        Some("all_ready")
+    );
+    assert_eq!(
+        data["commit_report"]["outcome"].as_str(),
+        Some("partial_failure")
+    );
+    assert_eq!(
+        data["commit_report"]["failure_boundary"].as_str(),
+        Some("tx-step:2")
+    );
+    assert_eq!(data["commit_report"]["committed_count"].as_u64(), Some(1));
+    assert_eq!(data["commit_report"]["failed_count"].as_u64(), Some(1));
+    assert_eq!(data["commit_report"]["skipped_count"].as_u64(), Some(1));
+    assert_eq!(
+        data["commit_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
+    assert_eq!(
+        data["compensation_report"]["outcome"].as_str(),
+        Some("fully_rolled_back")
+    );
+    assert_eq!(
+        data["compensation_report"]["compensated_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        data["compensation_report"]["failed_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        data["compensation_report"]["skipped_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        data["compensation_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(1)
+    );
+    assert_eq!(data["final_state"].as_str(), Some("rolled_back"));
+}
+
+#[test]
+fn contract_robot_tx_run_paused_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "run", "--paused"]);
+
+    assert_eq!(payload["ok"], true);
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
+
+    let data = &payload["data"];
+    assert_eq!(
+        data["prepare_report"]["outcome"].as_str(),
+        Some("all_ready")
+    );
+    assert_eq!(
+        data["commit_report"]["outcome"].as_str(),
+        Some("pause_suspended")
+    );
+    assert_eq!(data["commit_report"]["committed_count"].as_u64(), Some(0));
+    assert_eq!(data["commit_report"]["failed_count"].as_u64(), Some(0));
+    assert_eq!(data["commit_report"]["skipped_count"].as_u64(), Some(3));
+    assert_eq!(
+        data["commit_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
+    assert!(data["compensation_report"].is_null());
+    assert_eq!(data["final_state"].as_str(), Some("committing"));
+}
+
+#[test]
+fn contract_robot_tx_run_safe_mode_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "run",
+            "--kill-switch",
+            "safe-mode",
+        ],
+    );
+
+    assert_eq!(payload["ok"], true);
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
+
+    let data = &payload["data"];
+    assert_eq!(
+        data["prepare_report"]["outcome"].as_str(),
+        Some("all_ready")
+    );
+    assert_eq!(
+        data["commit_report"]["outcome"].as_str(),
+        Some("kill_switch_blocked")
+    );
+    assert_eq!(data["commit_report"]["committed_count"].as_u64(), Some(0));
+    assert_eq!(data["commit_report"]["failed_count"].as_u64(), Some(0));
+    assert_eq!(data["commit_report"]["skipped_count"].as_u64(), Some(3));
+    assert_eq!(
+        data["commit_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
+    assert!(data["compensation_report"].is_null());
+    assert_eq!(data["final_state"].as_str(), Some("failed"));
+}
+
+#[test]
+fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
+    let (dir, ws) = setup_workspace();
+    write_default_tx_contract(&dir, MissionTxState::Planned);
+
+    let fail_payload = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "rollback",
+            "--fail-compensation-for-step",
+            "tx-step:1",
+        ],
+    );
+
+    assert_eq!(fail_payload["ok"], true);
+    assert!(fail_payload["elapsed_ms"].as_u64().is_some());
+    assert!(fail_payload["now"].as_u64().is_some());
+    assert!(fail_payload["version"].as_str().is_some());
+
+    let fail_data = &fail_payload["data"];
+    assert_eq!(fail_data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(fail_data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(
+        fail_data["compensation_report"]["outcome"].as_str(),
+        Some("compensation_failed")
+    );
+    assert_eq!(
+        fail_data["compensation_report"]["compensated_count"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        fail_data["compensation_report"]["failed_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        fail_data["compensation_report"]["skipped_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        fail_data["compensation_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
+    assert_eq!(fail_data["final_state"].as_str(), Some("failed"));
+
+    let recovery_payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
+
+    assert_eq!(recovery_payload["ok"], true);
+    assert!(recovery_payload["elapsed_ms"].as_u64().is_some());
+    assert!(recovery_payload["now"].as_u64().is_some());
+    assert!(recovery_payload["version"].as_str().is_some());
+
+    let recovery_data = &recovery_payload["data"];
+    assert_eq!(recovery_data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(recovery_data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(
+        recovery_data["compensation_report"]["outcome"].as_str(),
+        Some("fully_rolled_back")
+    );
+    assert_eq!(
+        recovery_data["compensation_report"]["compensated_count"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        recovery_data["compensation_report"]["failed_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        recovery_data["compensation_report"]["skipped_count"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        recovery_data["compensation_report"]["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
+    assert_eq!(recovery_data["final_state"].as_str(), Some("rolled_back"));
 }
 
 #[test]
