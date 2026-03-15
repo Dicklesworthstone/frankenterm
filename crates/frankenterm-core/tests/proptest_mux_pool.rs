@@ -4,6 +4,8 @@
 //! for counter relationships (recovery successes <= attempts, health
 //! check failures <= checks, embedded PoolStats consistency).
 
+#![cfg(feature = "vendored")]
+
 use frankenterm_core::pool::PoolStats;
 use frankenterm_core::vendored::mux_pool::MuxPoolStats;
 use proptest::prelude::*;

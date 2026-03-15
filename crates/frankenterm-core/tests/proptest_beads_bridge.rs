@@ -3,6 +3,8 @@
 //! Validates backpressure tier determination, config threshold invariants,
 //! status counting, and fail-open degradation across arbitrary inputs.
 
+#![cfg(feature = "subprocess-bridge")]
+
 use std::collections::HashMap;
 
 use proptest::prelude::*;
