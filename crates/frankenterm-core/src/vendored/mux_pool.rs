@@ -1438,6 +1438,96 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pool_health_check_recovers_from_unexpected_response() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(2),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            pool.health_check()
+                .await
+                .expect("health_check should recover after reconnect");
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.health_checks, 1);
+            assert_eq!(stats.health_check_failures, 0);
+            assert_eq!(stats.recovery_attempts, 1);
+            assert_eq!(stats.recovery_successes, 1);
+            assert_eq!(
+                stats.connections_created, 2,
+                "health_check should reconnect exactly once after the recoverable failure"
+            );
+        });
+    }
+
+    #[test]
+    fn pool_health_check_without_recovery_does_not_retry() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(5),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let err = pool
+                .health_check()
+                .await
+                .expect_err("health_check should fail without recovery");
+            assert!(matches!(err, MuxPoolError::Mux(_)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.health_checks, 1);
+            assert_eq!(stats.health_check_failures, 1);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(
+                stats.connections_created, 1,
+                "health_check should not reconnect when recovery is disabled"
+            );
+        });
+    }
+
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_failure() {
