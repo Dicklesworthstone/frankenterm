@@ -1,5 +1,4 @@
-// Disabled: references types not yet implemented in plan.rs
-#![cfg(feature = "__journal_types_placeholder")]
+#![cfg(feature = "subprocess-bridge")]
 
 //! Property-based tests for durable idempotency, dedupe, and resume (H7).
 //!
@@ -19,7 +18,7 @@
 
 use frankenterm_core::plan::{
     MissionActorRole, MissionKillSwitchLevel, MissionTxContract, MissionTxState, StepAction,
-    TxCommitStepInput, TxCompensation, TxExecutionRecord, TxId, TxIdempotencyCheckResult,
+    TxCommitStepInput, TxCompensation, TxExecutionRecord, TxId, TxIdempotencyCheck,
     TxIdempotencyVerdict, TxIntent, TxOutcome, TxPhase, TxPlan, TxPlanId, TxReceipt, TxResumeState,
     TxStep, TxStepExecutionRecord, TxStepId, execute_commit_phase, reconstruct_tx_resume_state,
     validate_tx_idempotency,
@@ -32,12 +31,13 @@ fn make_contract(num_steps: usize) -> MissionTxContract {
     let steps: Vec<TxStep> = (1..=num_steps)
         .map(|i| TxStep {
             step_id: TxStepId(format!("s{i}")),
-            ordinal: i as u32,
+            ordinal: i,
             action: StepAction::SendText {
                 pane_id: i as u64,
                 text: format!("step-{i}"),
                 paste_mode: None,
             },
+            description: String::new(),
         })
         .collect();
 
@@ -163,7 +163,7 @@ proptest! {
         let contract = make_contract(num_steps);
         let result = validate_tx_idempotency(&contract, phase, None);
         prop_assert!(result.should_proceed());
-        let is_fresh = matches!(result.verdict, TxIdempotencyVerdict::Fresh);
+        let is_fresh = matches!(result.verdict, TxIdempotencyVerdict::FirstExecution);
         prop_assert!(is_fresh);
     }
 
@@ -262,13 +262,13 @@ proptest! {
         ],
     ) {
         let mut contract = make_contract(num_steps);
-        contract.receipts.push(TxReceipt {
+        contract.receipts.push(serde_json::to_value(TxReceipt {
             seq: 1,
             state: terminal_state,
             emitted_at_ms: 5000,
             reason_code: None,
             error_code: None,
-        });
+        }).unwrap());
         let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
         prop_assert!(resume.is_fully_resolved());
         prop_assert!(resume.pending_step_ids.is_empty());
@@ -292,7 +292,7 @@ proptest! {
         let contract = make_contract(num_steps);
         let result = validate_tx_idempotency(&contract, TxPhase::Commit, None);
         let json = serde_json::to_string(&result).unwrap();
-        let restored: TxIdempotencyCheckResult = serde_json::from_str(&json).unwrap();
+        let restored: TxIdempotencyCheck = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&result, &restored);
     }
 
