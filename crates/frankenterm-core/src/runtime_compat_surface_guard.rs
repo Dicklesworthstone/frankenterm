@@ -421,6 +421,7 @@ pub fn standard_guard_checks() -> Vec<SurfaceGuardCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendored_async_contracts::standard_compatibility_mappings;
 
     // -------------------------------------------------------------------------
     // 1. allowed_raw_runtime_files_includes_runtime_compat
@@ -741,6 +742,42 @@ mod tests {
                 ),
                 other => panic!("unexpected disposition '{}'", other),
             }
+        }
+    }
+
+    #[test]
+    fn transitional_channel_helpers_match_contract_alignment_state() {
+        let entries = standard_surface_entries();
+        let mappings = standard_compatibility_mappings();
+
+        for api in [
+            "mpsc_recv_option",
+            "mpsc_send",
+            "watch_has_changed",
+            "watch_borrow_and_update_clone",
+            "watch_changed",
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.api_name == api)
+                .unwrap_or_else(|| panic!("missing surface entry for {api}"));
+            assert_eq!(
+                entry.disposition, "Replace",
+                "{api} should remain a Replace surface entry"
+            );
+            assert!(
+                entry.replacement.is_some(),
+                "{api} should document an explicit replacement path"
+            );
+
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.compat_api == api)
+                .unwrap_or_else(|| panic!("missing compatibility mapping for {api}"));
+            assert!(
+                !mapping.disposition_aligned,
+                "{api} should stay non-aligned while replacement is pending"
+            );
         }
     }
 

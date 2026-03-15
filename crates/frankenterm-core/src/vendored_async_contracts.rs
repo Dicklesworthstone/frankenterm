@@ -140,8 +140,10 @@ pub fn standard_contracts() -> Vec<AsyncBoundaryContract> {
             contract_id: "ABC-CHN-001".into(),
             category: ContractCategory::Channeling,
             direction: BoundaryDirection::Bidirectional,
-            description: "Channels use runtime_compat wrappers, not raw tokio channels".into(),
-            invariant: "All channels crossing the Core↔Vendored boundary must be created via runtime_compat channel wrappers (mpsc_send, mpsc_recv_option, etc.), never via raw tokio::sync::mpsc.".into(),
+            description:
+                "Channels use runtime_compat primitives with explicit backend-aware semantics"
+                    .into(),
+            invariant: "All channels crossing the Core↔Vendored boundary must use runtime_compat channel primitives/types rather than raw tokio::sync::{mpsc, watch}. Production send/recv/watch paths must use explicit backend-aware semantics; transitional helpers such as mpsc_send, mpsc_recv_option, watch_has_changed, watch_borrow_and_update_clone, and watch_changed are migration-only seams, not the canonical contract surface.".into(),
             violation_impact: "Runtime mismatch panics and data races when running under asupersync.".into(),
             verifiable: true,
         },
@@ -751,6 +753,67 @@ mod tests {
                 seen.insert(m.compat_api.clone()),
                 "duplicate compat_api: {}",
                 m.compat_api
+            );
+        }
+    }
+
+    #[test]
+    fn channel_contract_marks_transitional_helpers_non_canonical() {
+        let contract = find_contract("ABC-CHN-001");
+        assert!(
+            contract
+                .description
+                .contains("explicit backend-aware semantics"),
+            "channel contract should require explicit backend-aware semantics"
+        );
+        assert!(
+            contract
+                .invariant
+                .contains("runtime_compat channel primitives/types"),
+            "channel contract should point to runtime_compat primitives/types"
+        );
+        for helper in [
+            "mpsc_send",
+            "mpsc_recv_option",
+            "watch_has_changed",
+            "watch_borrow_and_update_clone",
+            "watch_changed",
+        ] {
+            assert!(
+                contract.invariant.contains(helper),
+                "channel contract should name transitional helper {helper} as non-canonical"
+            );
+            assert!(
+                contract.invariant.contains("migration-only seams"),
+                "channel contract should explicitly classify helper APIs as migration-only seams"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_helper_mappings_remain_transitional() {
+        let mappings = standard_compatibility_mappings();
+        for api in [
+            "mpsc_recv_option",
+            "mpsc_send",
+            "watch_has_changed",
+            "watch_borrow_and_update_clone",
+            "watch_changed",
+        ] {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.compat_api == api)
+                .unwrap_or_else(|| panic!("missing mapping for {api}"));
+            assert!(
+                mapping
+                    .satisfies_contracts
+                    .iter()
+                    .any(|id| id == "ABC-CHN-001"),
+                "{api} should remain traceable to ABC-CHN-001 while migration is in progress"
+            );
+            assert!(
+                !mapping.disposition_aligned,
+                "{api} should remain marked non-aligned until fully replaced"
             );
         }
     }
