@@ -412,7 +412,7 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 ///
 /// Returns the cargo subcommand if detected (e.g., "build", "check", "test").
 #[must_use]
-pub fn detect_cargo_command(command: &str) -> Option<&str> {
+pub fn detect_cargo_command(command: &str) -> Option<&'static str> {
     let tokens = command_tokens(command);
     let mut segment_start = 0;
 
@@ -494,7 +494,7 @@ fn command_tokens(command: &str) -> Vec<String> {
         .unwrap_or_else(|| trimmed.split_whitespace().map(str::to_string).collect())
 }
 
-fn cargo_subcommand_for_segment(tokens: &[String], segment_start: usize) -> Option<(&str, bool)> {
+fn cargo_subcommand_for_segment(tokens: &[String], segment_start: usize) -> Option<(&'static str, bool)> {
     let mut idx = skip_command_prefixes(tokens, segment_start);
     let mut uses_rch = false;
 
