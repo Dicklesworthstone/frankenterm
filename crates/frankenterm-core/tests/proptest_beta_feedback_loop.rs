@@ -143,6 +143,7 @@ fn arb_beta_loop_config() -> impl Strategy<Value = BetaLoopConfig> {
         0.5f64..=1.0,
         0.1f64..=1.0,
         1usize..100,
+        1usize..100,
         -50i32..=50,
         -100i32..=-10,
         1usize..10,
@@ -155,6 +156,7 @@ fn arb_beta_loop_config() -> impl Strategy<Value = BetaLoopConfig> {
                 smoothness_target,
                 smoothness_percentile,
                 min_observations_per_cohort,
+                min_feedback_per_cohort,
                 promotion_nps_threshold,
                 rollback_nps_threshold,
                 max_critical_friction,
@@ -166,6 +168,7 @@ fn arb_beta_loop_config() -> impl Strategy<Value = BetaLoopConfig> {
                     smoothness_target,
                     smoothness_percentile,
                     min_observations_per_cohort,
+                    min_feedback_per_cohort,
                     promotion_nps_threshold,
                     rollback_nps_threshold,
                     max_critical_friction,
@@ -421,6 +424,7 @@ proptest! {
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: BetaLoopConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(cfg.min_observations_per_cohort, parsed.min_observations_per_cohort);
+        prop_assert_eq!(cfg.min_feedback_per_cohort, parsed.min_feedback_per_cohort);
         prop_assert_eq!(cfg.promotion_nps_threshold, parsed.promotion_nps_threshold);
         prop_assert_eq!(cfg.rollback_nps_threshold, parsed.rollback_nps_threshold);
         prop_assert_eq!(cfg.max_critical_friction, parsed.max_critical_friction);

@@ -31,6 +31,7 @@
 //! - Feedback NPS ≥ threshold (default: 0 — net neutral or better)
 //! - No critical friction points unresolved
 //! - Minimum observation count per cohort
+//! - Minimum qualitative feedback count per cohort
 //!
 //! Rollback triggers on ANY of:
 //! - Smoothness SLO breached by > 2× error budget
@@ -219,6 +220,8 @@ pub struct BetaLoopConfig {
     pub smoothness_percentile: f64,
     /// Minimum observations per cohort before evaluation.
     pub min_observations_per_cohort: usize,
+    /// Minimum qualitative feedback items per cohort before promotion.
+    pub min_feedback_per_cohort: usize,
     /// NPS threshold for promotion (default: 0).
     pub promotion_nps_threshold: i32,
     /// NPS threshold triggering rollback (default: −30).
@@ -239,6 +242,7 @@ impl Default for BetaLoopConfig {
             smoothness_target: 0.90,
             smoothness_percentile: 0.50,
             min_observations_per_cohort: 30,
+            min_feedback_per_cohort: 10,
             promotion_nps_threshold: 0,
             rollback_nps_threshold: -30,
             max_critical_friction: 3,
@@ -615,6 +619,7 @@ impl BetaLoopController {
                 .count();
 
             let has_enough_obs = obs.len() >= self.config.min_observations_per_cohort;
+            let has_enough_feedback = fb.len() >= self.config.min_feedback_per_cohort;
             any_data = any_data || !obs.is_empty() || !fb.is_empty();
 
             // Check promotion criteria
@@ -625,7 +630,8 @@ impl BetaLoopController {
                 .map(|n| n >= self.config.promotion_nps_threshold as f64)
                 .unwrap_or(true); // No feedback = neutral
             let friction_ok = critical_friction_count <= self.config.max_critical_friction;
-            let meets = has_enough_obs && smoothness_ok && nps_ok && friction_ok;
+            let meets =
+                has_enough_obs && has_enough_feedback && smoothness_ok && nps_ok && friction_ok;
 
             if !meets {
                 all_meet_criteria = false;
@@ -715,6 +721,17 @@ impl BetaLoopController {
                                     eval.cohort_name,
                                     eval.observation_count,
                                     self.config.min_observations_per_cohort,
+                                ),
+                            });
+                        }
+                        if eval.feedback_count < self.config.min_feedback_per_cohort {
+                            reasons.push(DecisionReason {
+                                code: "insufficient_feedback".into(),
+                                explanation: format!(
+                                    "Cohort '{}': {}/{} feedback items",
+                                    eval.cohort_name,
+                                    eval.feedback_count,
+                                    self.config.min_feedback_per_cohort,
                                 ),
                             });
                         }
@@ -832,6 +849,7 @@ mod tests {
     fn test_config() -> BetaLoopConfig {
         BetaLoopConfig {
             min_observations_per_cohort: 5,
+            min_feedback_per_cohort: 3,
             max_feedback_per_cohort: 100,
             max_observations_per_cohort: 1000,
             ..Default::default()
@@ -1085,6 +1103,25 @@ mod tests {
         ctrl.record_observation(good_observation("alice", 200));
         let eval = ctrl.evaluate(1000);
         assert_eq!(eval.decision, PromotionDecision::Hold);
+    }
+
+    #[test]
+    fn evaluate_hold_when_insufficient_feedback() {
+        let mut ctrl = BetaLoopController::new(test_config(), make_cohorts());
+        ctrl.stage = BetaStage::InternalBeta;
+        for i in 0..10 {
+            ctrl.record_observation(good_observation("alice", i * 100));
+        }
+        ctrl.record_feedback(positive_feedback("bob", 100));
+        ctrl.record_feedback(positive_feedback("bob", 200));
+
+        let eval = ctrl.evaluate(1_000);
+        assert_eq!(eval.decision, PromotionDecision::Hold);
+        assert!(
+            eval.reasons
+                .iter()
+                .any(|reason| reason.code == "insufficient_feedback")
+        );
     }
 
     #[test]
@@ -1377,6 +1414,7 @@ mod tests {
             rt.min_observations_per_cohort,
             config.min_observations_per_cohort
         );
+        assert_eq!(rt.min_feedback_per_cohort, config.min_feedback_per_cohort);
         assert_eq!(rt.promotion_nps_threshold, config.promotion_nps_threshold);
     }
 
