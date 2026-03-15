@@ -8840,7 +8840,7 @@ fn next_robot_events_cursor<I>(cursor: Option<i64>, event_ids: I) -> Option<i64>
 where
     I: IntoIterator<Item = i64>,
 {
-    cursor.and(event_ids.into_iter().last().or(cursor))
+    cursor.and_then(|_| event_ids.into_iter().last().or(cursor))
 }
 
 #[allow(dead_code)]
@@ -12302,7 +12302,7 @@ async fn distributed_agent_stream_session(
     )
     .await
     {
-        Ok(Ok(size)) if size == 0 => {
+        Ok(Ok(0)) => {
             anyhow::bail!("Distributed aggregator closed connection during handshake")
         }
         Ok(Ok(_)) => {
@@ -12729,7 +12729,7 @@ async fn run_distributed_agent(
         };
 
     let runtime_config = RuntimeConfig {
-        discovery_interval: Duration::from_millis(5_000),
+        discovery_interval: Duration::from_secs(5),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
         min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
         overlap_size: 4096,
@@ -18814,8 +18814,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 prepared_contract.clone();
                                             compensating_contract.lifecycle_state =
                                                 frankenterm_core::plan::MissionTxState::Compensating;
-                                            compensating_contract.receipts =
-                                                commit.receipts.clone();
+                                            compensating_contract
+                                                .receipts
+                                                .clone_from(&commit.receipts);
                                             let comp_inputs = build_robot_tx_compensation_inputs(
                                                 &commit, None, now_ms,
                                             );
@@ -18920,7 +18921,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let mut compensating_contract = contract.clone();
                                     compensating_contract.lifecycle_state =
                                         frankenterm_core::plan::MissionTxState::Compensating;
-                                    compensating_contract.receipts = contract.receipts.clone();
+                                    compensating_contract
+                                        .receipts
+                                        .clone_from(&contract.receipts);
                                     let compensation_report =
                                         match frankenterm_core::plan::execute_compensation_phase(
                                             &compensating_contract,
@@ -34626,7 +34629,9 @@ fn handle_tx_command(
                     let mut compensating_contract = prepared_contract.clone();
                     compensating_contract.lifecycle_state =
                         frankenterm_core::plan::MissionTxState::Compensating;
-                    compensating_contract.receipts = commit.receipts.clone();
+                    compensating_contract
+                        .receipts
+                        .clone_from(&commit.receipts);
                     let compensation_inputs =
                         build_robot_tx_compensation_inputs(&commit, None, now_ms);
                     let compensation = match frankenterm_core::plan::execute_compensation_phase(
@@ -34746,7 +34751,9 @@ fn handle_tx_command(
             let mut compensating_contract = contract.clone();
             compensating_contract.lifecycle_state =
                 frankenterm_core::plan::MissionTxState::Compensating;
-            compensating_contract.receipts = contract.receipts.clone();
+            compensating_contract
+                .receipts
+                .clone_from(&contract.receipts);
             let compensation_report = match frankenterm_core::plan::execute_compensation_phase(
                 &compensating_contract,
                 &commit_report,
