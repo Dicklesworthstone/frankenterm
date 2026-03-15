@@ -3745,7 +3745,7 @@ impl fmt::Display for TxPhase {
 }
 
 /// A receipt recording a state transition in the contract lifecycle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxReceipt {
     pub seq: u64,
     pub state: MissionTxState,
@@ -3755,7 +3755,7 @@ pub struct TxReceipt {
 }
 
 /// Record of a single step's execution within a transaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxStepExecutionRecord {
     pub step_id: TxStepId,
     pub ordinal: u32,
@@ -3781,7 +3781,7 @@ impl TxStepExecutionRecord {
 }
 
 /// Full execution record for a transaction (idempotency journal entry).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxExecutionRecord {
     pub tx_id: TxId,
     pub plan_id: TxPlanId,
@@ -3795,6 +3795,15 @@ pub struct TxExecutionRecord {
 }
 
 impl TxExecutionRecord {
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "txrec:{}:{}:{}:steps={}",
+            self.tx_id.0, self.plan_id.0, self.lifecycle_state, self.step_records.len()
+        )
+    }
+
     /// Compute an idempotency key for the entire transaction.
     /// Deterministic within a single process (uses `DefaultHasher`).
     #[must_use]
@@ -3842,6 +3851,21 @@ impl TxIdempotencyCheck {
             self.verdict,
             TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
         )
+    }
+
+    /// Whether the prior execution is an exact terminal duplicate.
+    #[must_use]
+    pub fn is_exact_duplicate(&self) -> bool {
+        matches!(
+            self.verdict,
+            TxIdempotencyVerdict::DoubleExecutionBlocked { .. }
+        )
+    }
+
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!("idem:{:?}:proceed={}", self.verdict, self.should_proceed())
     }
 }
 
@@ -3905,6 +3929,18 @@ impl TxResumeState {
     #[must_use]
     pub fn has_pending_work(&self) -> bool {
         !self.is_fully_resolved()
+    }
+
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "resume:pending={},committed={},compensated={},done={}",
+            self.pending_step_ids.len(),
+            self.committed_step_ids.len(),
+            self.compensated_step_ids.len(),
+            self.is_fully_resolved()
+        )
     }
 }
 
