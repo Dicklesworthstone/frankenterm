@@ -131,6 +131,25 @@ fn compliance_with_no_evidence_is_non_compliant() {
     assert!((compliance.coverage - 0.0).abs() < f64::EPSILON);
 }
 
+#[test]
+fn compliance_with_mismatched_contract_id_is_non_compliant() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let evidence = vec![
+        make_evidence(&contract, true),
+        ContractEvidence {
+            contract_id: "ABC-CAN-001".into(),
+            test_name: "wrong_contract".into(),
+            passed: true,
+            evidence_type: EvidenceType::StaticAnalysis,
+            detail: "mismatch".into(),
+        },
+    ];
+
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(!compliance.compliant);
+    assert!((compliance.coverage - 0.5).abs() < f64::EPSILON);
+}
+
 // =============================================================================
 // Audit Report Assembly
 // =============================================================================

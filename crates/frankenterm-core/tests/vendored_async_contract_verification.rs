@@ -227,13 +227,17 @@ fn v09_channeling_no_raw_tokio_channels_in_vendored() {
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
             let raw_mpsc = contents.matches("tokio::sync::mpsc").count();
-            // Allow in cfg(not(feature = "asupersync-runtime")) blocks, but count total
-            // In the asupersync world, these should be zero or cfg-gated
+            let raw_watch = contents.matches("tokio::sync::watch").count();
+            assert_eq!(
+                raw_mpsc + raw_watch,
+                0,
+                "vendored file {file_name} must not bypass runtime_compat channels (mpsc={raw_mpsc}, watch={raw_watch})"
+            );
             emit_contract_log(
                 "v09",
                 "ABC-CHN-001",
-                &format!("{file_name}:raw_tokio_mpsc"),
-                &format!("info:count={raw_mpsc}"),
+                &format!("{file_name}:raw_tokio_channels"),
+                &format!("pass:mpsc={raw_mpsc},watch={raw_watch}"),
             );
         }
     }
@@ -536,6 +540,42 @@ fn v22_compliance_empty_evidence_non_compliant() {
     emit_contract_log("v22", "infra", "empty_evidence", "pass");
 }
 
+/// V22b: Mismatched evidence must not count toward compliance.
+#[test]
+fn v22b_compliance_rejects_mismatched_contract_ids() {
+    let contracts = collect_contracts();
+    let contract = contracts[0].clone();
+
+    let evidence = vec![
+        ContractEvidence {
+            contract_id: contract.contract_id.clone(),
+            test_name: "test_match".into(),
+            passed: true,
+            evidence_type: EvidenceType::UnitTest,
+            detail: "ok".into(),
+        },
+        ContractEvidence {
+            contract_id: "ABC-CAN-001".into(),
+            test_name: "test_mismatch".into(),
+            passed: true,
+            evidence_type: EvidenceType::IntegrationTest,
+            detail: "wrong contract".into(),
+        },
+    ];
+
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(
+        !compliance.compliant,
+        "mismatched contract IDs must invalidate compliance"
+    );
+    assert!(
+        (compliance.coverage - 0.5).abs() < 0.001,
+        "coverage should only count matching passed evidence"
+    );
+
+    emit_contract_log("v22b", "infra", "mismatched_contract_id", "pass");
+}
+
 // =============================================================================
 // V23–V25: Compatibility mapping verification
 // =============================================================================
@@ -623,20 +663,16 @@ fn v26_drift_no_direct_tokio_imports_in_vendored() {
         let path = format!("{}/src/vendored/{file_name}", env!("CARGO_MANIFEST_DIR"));
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            // Count direct `use tokio::` that are NOT inside cfg(not(...)) blocks
-            // Simple heuristic: count all `use tokio::` and check they're cfg-gated
             let tokio_uses = contents.matches("use tokio::").count();
-            let cfg_not_asupersync = contents
-                .matches("cfg(not(feature = \"asupersync-runtime\"))")
-                .count();
-
-            // In fully migrated code, tokio uses should be <= cfg_not gates
-            // (every tokio use should be behind a not(asupersync) gate)
+            assert_eq!(
+                tokio_uses, 0,
+                "vendored file {file_name} must not import tokio directly (found {tokio_uses})"
+            );
             emit_contract_log(
                 "v26",
                 "drift",
                 &format!("{file_name}:tokio_imports"),
-                &format!("info:tokio_uses={tokio_uses},cfg_not_gates={cfg_not_asupersync}"),
+                &format!("pass:tokio_uses={tokio_uses}"),
             );
         }
     }

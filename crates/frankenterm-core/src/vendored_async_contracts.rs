@@ -267,15 +267,24 @@ pub struct ContractCompliance {
 impl ContractCompliance {
     /// Build a [`ContractCompliance`] from a contract and its evidence.
     ///
-    /// `compliant` is `true` iff every piece of evidence passed.
-    /// `coverage` is `passed_count / total_count`, or `0.0` when there is no
-    /// evidence.
+    /// `compliant` is `true` iff every piece of evidence targets this contract
+    /// and passed.
+    /// `coverage` is `matching_passed_count / total_count`, or `0.0` when
+    /// there is no evidence.
     #[must_use]
     pub fn from_evidence(contract: AsyncBoundaryContract, evidence: Vec<ContractEvidence>) -> Self {
+        let contract_id = contract.contract_id.as_str();
         let total = evidence.len();
-        let passed = evidence.iter().filter(|e| e.passed).count();
+        let matching = evidence
+            .iter()
+            .filter(|e| e.contract_id == contract_id)
+            .count();
+        let passed = evidence
+            .iter()
+            .filter(|e| e.contract_id == contract_id && e.passed)
+            .count();
 
-        let compliant = !evidence.is_empty() && passed == total;
+        let compliant = total > 0 && matching == total && passed == total;
         let coverage = if total == 0 {
             0.0
         } else {
@@ -729,6 +738,18 @@ mod tests {
         let c = ContractCompliance::from_evidence(contract, vec![]);
         assert!(!c.compliant);
         assert!((c.coverage - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn contract_compliance_mismatched_contract_ids_are_non_compliant() {
+        let contract = find_contract("ABC-OWN-001");
+        let evidence = vec![
+            make_evidence("ABC-OWN-001", "test_a", true),
+            make_evidence("ABC-CAN-001", "wrong_contract", true),
+        ];
+        let c = ContractCompliance::from_evidence(contract, evidence);
+        assert!(!c.compliant);
+        assert!((c.coverage - 0.5).abs() < f64::EPSILON);
     }
 
     // -------------------------------------------------------------------------

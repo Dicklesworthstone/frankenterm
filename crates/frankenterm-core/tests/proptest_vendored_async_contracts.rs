@@ -157,6 +157,19 @@ fn standard_contracts_all_categories_represented() {
     }
 }
 
+#[test]
+fn compliance_mismatched_contract_id_reduces_coverage_and_fails() {
+    let contract = standard_contracts().into_iter().next().unwrap();
+    let id = contract.contract_id.clone();
+    let evidence = vec![
+        make_evidence(&id, "match", true),
+        make_evidence("ABC-CAN-001", "mismatch", true),
+    ];
+    let compliance = ContractCompliance::from_evidence(contract, evidence);
+    assert!(!compliance.compliant);
+    assert!((compliance.coverage - 0.5).abs() < f64::EPSILON);
+}
+
 proptest! {
     #[test]
     fn standard_contracts_invariants_non_empty(_dummy in Just(())) {
