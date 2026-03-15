@@ -2902,7 +2902,10 @@ impl TxCommitReport {
     pub fn canonical_string(&self) -> String {
         format!(
             "commit:{:?}:c={},f={},s={}:{}",
-            self.outcome, self.committed_count, self.failed_count, self.skipped_count,
+            self.outcome,
+            self.committed_count,
+            self.failed_count,
+            self.skipped_count,
             self.decision_path
         )
     }
@@ -2926,7 +2929,10 @@ impl TxCompensationReport {
     pub fn canonical_string(&self) -> String {
         format!(
             "compensate:{:?}:c={},f={},s={}:{}",
-            self.outcome, self.compensated_count, self.failed_count, self.skipped_count,
+            self.outcome,
+            self.compensated_count,
+            self.failed_count,
+            self.skipped_count,
             self.decision_path
         )
     }
@@ -3796,9 +3802,7 @@ pub enum TxIdempotencyVerdict {
     /// No prior execution found; proceed.
     FirstExecution,
     /// A prior terminal execution exists; block.
-    DoubleExecutionBlocked {
-        original_state: MissionTxState,
-    },
+    DoubleExecutionBlocked { original_state: MissionTxState },
     /// A prior non-terminal execution exists; resume from where it left off.
     Resumable {
         resume_from_state: MissionTxState,
@@ -3807,7 +3811,7 @@ pub enum TxIdempotencyVerdict {
 }
 
 /// Result of an idempotency check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxIdempotencyCheck {
     pub verdict: TxIdempotencyVerdict,
 }
@@ -3868,6 +3872,7 @@ pub struct TxResumeState {
     pub compensated_step_ids: Vec<TxStepId>,
     pub commit_phase_completed: bool,
     pub compensation_phase_completed: bool,
+    pub needs_compensation: bool,
     pub reconstructed_at_ms: i64,
 }
 
@@ -3875,7 +3880,13 @@ impl TxResumeState {
     /// Whether all phases are complete and no work remains.
     #[must_use]
     pub fn is_fully_resolved(&self) -> bool {
-        self.commit_phase_completed && self.pending_step_ids.is_empty()
+        self.commit_phase_completed && self.pending_step_ids.is_empty() && !self.needs_compensation
+    }
+
+    /// Whether compensation is still required.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        !self.is_fully_resolved()
     }
 }
 
@@ -3937,12 +3948,20 @@ pub fn reconstruct_tx_resume_state(
         all_step_ids
     };
 
+    // Compensation is needed if commit had failures and compensation hasn't run.
+    let needs_compensation = if let Some(cr) = commit_report {
+        cr.has_failures() && !compensation_phase_completed
+    } else {
+        false
+    };
+
     TxResumeState {
         pending_step_ids,
         committed_step_ids,
         compensated_step_ids,
         commit_phase_completed,
         compensation_phase_completed,
+        needs_compensation,
         reconstructed_at_ms: now_ms,
     }
 }
