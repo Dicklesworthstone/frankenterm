@@ -15,10 +15,96 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 cargo_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target-replay-performance}-${run_id}"
 mkdir -p "$cargo_home" "$cargo_target_dir"
 
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/replay_performance_${run_id}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/replay_performance_${run_id}.smoke.log"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
+
 pass_count=0
 fail_count=0
 suite_status=0
 suite_started_ms="$(date +%s)"
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+resolve_timeout_bin() {
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    else
+        TIMEOUT_BIN=""
+    fi
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+
+    set +e
+    (
+        cd "$ROOT_DIR"
+        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
+            rch exec -- env \
+            CARGO_HOME="$cargo_home" \
+            CARGO_TARGET_DIR="$cargo_target_dir" \
+            cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+
+    check_rch_fallback "${output_file}"
+    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+        local queue_log="${output_file%.log}.rch_queue_timeout.log"
+        if ! run_rch queue >"${queue_log}" 2>&1; then
+            queue_log="${output_file}"
+        fi
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
+    fi
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this replay e2e harness; refusing local cargo execution."
+    fi
+    resolve_timeout_bin
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
+    fi
+
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+
+    set +e
+    run_rch_cargo_logged "${RCH_SMOKE_LOG}" check --help
+    local smoke_rc=$?
+    set -e
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -102,28 +188,16 @@ to_eps() {
 run_bench() {
   local scenario="$1"
   local bench_name="$2"
-  local stdout_file="$raw_dir/scenario${scenario}.${bench_name}.stdout.log"
-  local stderr_file="$raw_dir/scenario${scenario}.${bench_name}.stderr.log"
+  local combined_file="$raw_dir/scenario${scenario}.${bench_name}.combined.log"
 
   set +e
-  rch exec -- env \
-    CARGO_HOME="$cargo_home" \
-    CARGO_TARGET_DIR="$cargo_target_dir" \
-    cargo bench -p frankenterm-core --bench "$bench_name" \
-    >"$stdout_file" 2>"$stderr_file"
+  run_rch_cargo_logged "${combined_file}" bench -p frankenterm-core --bench "$bench_name"
   local rc=$?
   set -e
 
-  if grep -Fq "[RCH] local" "$stderr_file"; then
-    emit_metric_log "$scenario" "${bench_name}_offload" "0" "1" "false" "fail" "rch_local_fallback" "${stderr_file#$ROOT_DIR/}"
-    suite_status=1
-    fail_count=$((fail_count + 1))
-    return 1
-  fi
-
   if [[ $rc -ne 0 ]]; then
-    emit_metric_log "$scenario" "${bench_name}_execution" "0" "1" "false" "fail" "cargo_bench_failed" "${stderr_file#$ROOT_DIR/}"
-    tail -n 120 "$stderr_file" >&2 || true
+    emit_metric_log "$scenario" "${bench_name}_execution" "0" "1" "false" "fail" "cargo_bench_failed" "${combined_file#$ROOT_DIR/}"
+    tail -n 120 "$combined_file" >&2 || true
     suite_status=1
     fail_count=$((fail_count + 1))
     return 1
@@ -132,20 +206,10 @@ run_bench() {
   return 0
 }
 
-log_json "$(jq -nc --arg timestamp "$(now_ts)" --arg run_id "$run_id" --arg scenario_id "$scenario_id" '{timestamp:$timestamp,test:"performance",scenario_id:$scenario_id,correlation_id:$run_id,status:"running",step:"start"}')"
-
-require_cmd rch
 require_cmd jq
+ensure_rch_ready
 
-probe_log="$raw_dir/rch_workers_probe.log"
-set +e
-rch workers probe --all >"$probe_log" 2>&1
-probe_rc=$?
-set -e
-if [[ $probe_rc -ne 0 ]] || ! grep -q "✓" "$probe_log"; then
-  emit_metric_log "0" "rch_workers_probe" "0" "1" "false" "fail" "rch_workers_unreachable" "${probe_log#$ROOT_DIR/}"
-  exit 1
-fi
+log_json "$(jq -nc --arg timestamp "$(now_ts)" --arg run_id "$run_id" --arg scenario_id "$scenario_id" '{timestamp:$timestamp,test:"performance",scenario_id:$scenario_id,correlation_id:$run_id,status:"running",step:"start"}')"
 
 # Scenario 1: capture benchmark budget (<1ms/event)
 if run_bench 1 "replay_capture"; then

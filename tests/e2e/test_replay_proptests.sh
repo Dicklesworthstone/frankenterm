@@ -14,6 +14,12 @@ mkdir -p "$raw_dir"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 cargo_target_base="${CARGO_TARGET_DIR:-$ROOT_DIR/target-replay-proptests}"
 
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/replay_proptests_${run_id}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/replay_proptests_${run_id}.smoke.log"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
+
 with_run_id_suffix() {
   local path_base="$1"
   if [[ "$path_base" == *"${run_id}"* ]]; then
@@ -45,6 +51,88 @@ pass_properties=0
 fail_properties=0
 total_cases=$((prop_cases * total_properties))
 suite_status=0
+
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+resolve_timeout_bin() {
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    else
+        TIMEOUT_BIN=""
+    fi
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+
+    set +e
+    (
+        cd "$ROOT_DIR"
+        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
+            rch exec -- env \
+            PROPTEST_CASES="${prop_cases}" \
+            PROPTEST_VERBOSE=1 \
+            CARGO_HOME="${cargo_home}" \
+            CARGO_TARGET_DIR="${cargo_target_dir}" \
+            cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+
+    check_rch_fallback "${output_file}"
+    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+        local queue_log="${output_file%.log}.rch_queue_timeout.log"
+        if ! run_rch queue >"${queue_log}" 2>&1; then
+            queue_log="${output_file}"
+        fi
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
+    fi
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this replay e2e harness; refusing local cargo execution."
+    fi
+    resolve_timeout_bin
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
+    fi
+
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+
+    set +e
+    run_rch_cargo_logged "${RCH_SMOKE_LOG}" check --help
+    local smoke_rc=$?
+    set -e
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
 
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -78,54 +166,42 @@ run_prop_suite() {
   local property_count="$3"
   local decision_path="$4"
 
-  local stdout_file="$raw_dir/${suite_label}.stdout.log"
-  local stderr_file="$raw_dir/${suite_label}.stderr.log"
+  local combined_file="$raw_dir/${suite_label}.combined.log"
   local seed_file="$raw_dir/${suite_label}.seeds.log"
   local started_ms
   local ended_ms
   local duration_ms
   local reason_code
-  local rch_mode
 
   started_ms="$(now_ms)"
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases},\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\"},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${stdout_file#$ROOT_DIR/}\"}"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases},\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\"},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
 
   set +e
-  rch exec -- env \
-    PROPTEST_CASES="${prop_cases}" \
-    PROPTEST_VERBOSE=1 \
-    CARGO_HOME="${cargo_home}" \
-    CARGO_TARGET_DIR="${cargo_target_dir}" \
-    cargo test -p frankenterm-core --test "${test_target}" -- --nocapture \
-    >"${stdout_file}" 2>"${stderr_file}"
+  run_rch_cargo_logged "${combined_file}" test -p frankenterm-core --test "${test_target}" -- --nocapture
   local rc=$?
   set -e
 
   ended_ms="$(now_ms)"
   duration_ms=$((ended_ms - started_ms))
 
-  if grep -Fq "[RCH] local" "${stderr_file}"; then
-    rch_mode="local_fallback"
-  else
-    rch_mode="remote_offload"
-  fi
-
   if [[ $rc -eq 0 ]]; then
     pass_properties=$((pass_properties + property_count))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"error_code\":null,\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifact_path\":\"${stdout_file#$ROOT_DIR/}\"}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"error_code\":null,\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\"}"
     return 0
   fi
 
   fail_properties=$((fail_properties + property_count))
-  reason_code="$(classify_reason_code "${stderr_file}")"
-  cat "${stdout_file}" "${stderr_file}" | grep -Ei 'seed|proptest-regressions|minimal failing input' >"${seed_file}" || true
+  reason_code="$(classify_reason_code "${combined_file}")"
+  grep -Ei 'seed|proptest-regressions|minimal failing input' "${combined_file}" >"${seed_file}" || true
   if [[ ! -s "${seed_file}" ]]; then
     echo "no_proptest_seed_detected" >"${seed_file}"
   fi
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"cargo_test_failed\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifact_path\":\"${stderr_file#$ROOT_DIR/}\",\"seed_artifact_path\":\"${seed_file#$ROOT_DIR/}\"}"
-  tail -n 120 "${stderr_file}" >&2 || true
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${suite_label}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_target\":\"${test_target}\",\"properties\":${property_count},\"prop_cases\":${prop_cases}},\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"cargo_test_failed\",\"duration_ms\":${duration_ms},\"rch_mode\":\"remote_offload\",\"artifact_path\":\"${combined_file#$ROOT_DIR/}\",\"seed_artifact_path\":\"${seed_file#$ROOT_DIR/}\"}"
+  tail -n 120 "${combined_file}" >&2 || true
   return "$rc"
 }
+
+ensure_rch_ready
 
 suite_started_ms="$(now_ms)"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_proptests\",\"scenario_id\":\"${scenario_id}\",\"correlation_id\":\"${run_id}\",\"decision_path\":\"suite.start\",\"inputs\":{\"total_properties\":${total_properties},\"prop_cases\":${prop_cases}},\"outcome\":\"running\",\"reason_code\":null,\"error_code\":null,\"artifact_path\":\"${json_log#$ROOT_DIR/}\"}"

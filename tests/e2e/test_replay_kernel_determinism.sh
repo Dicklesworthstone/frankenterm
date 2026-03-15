@@ -29,6 +29,12 @@ fi
 rch_tmpdir="${RCH_TMPDIR:-/tmp}"
 cargo_git_fetch_with_cli="${CARGO_NET_GIT_FETCH_WITH_CLI:-true}"
 
+RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
+RCH_PROBE_LOG="${LOG_DIR}/replay_kernel_determinism_${run_id}.probe.log"
+RCH_SMOKE_LOG="${LOG_DIR}/replay_kernel_determinism_${run_id}.smoke.log"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
+
 with_run_id_suffix() {
   local path_base="$1"
   if [[ "$path_base" == *"${run_id}"* ]]; then
@@ -47,6 +53,87 @@ pass_scenarios=0
 fail_scenarios=0
 suite_status=0
 
+fatal() { echo "FATAL: $1" >&2; exit 1; }
+
+run_rch() {
+    TMPDIR=/tmp rch "$@"
+}
+
+resolve_timeout_bin() {
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    else
+        TIMEOUT_BIN=""
+    fi
+}
+
+probe_has_reachable_workers() {
+    grep -Eiq '"status"[[:space:]]*:[[:space:]]*"(ok|healthy|reachable)"' "$1"
+}
+
+check_rch_fallback() {
+    local output_file="$1"
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_file}" 2>/dev/null; then
+        fatal "rch fell back to local execution; refusing offload policy violation. See ${output_file}"
+    fi
+}
+
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+
+    set +e
+    (
+        cd "$ROOT_DIR"
+        env TMPDIR="$rch_tmpdir" "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
+            rch exec -- env \
+            CARGO_HOME="$cargo_home" \
+            CARGO_TARGET_DIR="$cargo_target_dir" \
+            CARGO_NET_GIT_FETCH_WITH_CLI="$cargo_git_fetch_with_cli" \
+            cargo "$@"
+    ) >"${output_file}" 2>&1
+    local rc=$?
+    set -e
+
+    check_rch_fallback "${output_file}"
+    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+        local queue_log="${output_file%.log}.rch_queue_timeout.log"
+        if ! run_rch queue >"${queue_log}" 2>&1; then
+            queue_log="${output_file}"
+        fi
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
+    fi
+    return "${rc}"
+}
+
+ensure_rch_ready() {
+    if ! command -v rch >/dev/null 2>&1; then
+        fatal "rch is required for this replay e2e harness; refusing local cargo execution."
+    fi
+    resolve_timeout_bin
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
+    fi
+
+    set +e
+    run_rch --json workers probe --all >"${RCH_PROBE_LOG}" 2>&1
+    local probe_rc=$?
+    set -e
+    if [[ ${probe_rc} -ne 0 ]] || ! probe_has_reachable_workers "${RCH_PROBE_LOG}"; then
+        fatal "rch workers are unavailable; refusing local cargo execution. See ${RCH_PROBE_LOG}"
+    fi
+
+    set +e
+    run_rch_cargo_logged "${RCH_SMOKE_LOG}" check --help
+    local smoke_rc=$?
+    set -e
+    if [[ ${smoke_rc} -ne 0 ]]; then
+        fatal "rch remote smoke preflight failed; refusing local cargo execution. See ${RCH_SMOKE_LOG}"
+    fi
+}
+
 now_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -64,57 +151,37 @@ run_kernel_test() {
   local scenario="$1"
   local test_filter="$2"
   local decision_path="$3"
-  local stdout_file="$raw_dir/scenario${scenario}.stdout.log"
-  local stderr_file="$raw_dir/scenario${scenario}.stderr.log"
+  local combined_log="$raw_dir/scenario${scenario}.combined.log"
   local started_ms
   local ended_ms
   local duration_ms
   local rch_mode
   local reason_code
   local error_code
-  local local_fallback
 
   started_ms="$(now_ms)"
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"running\",\"decision_path\":\"${decision_path}\",\"inputs\":{\"test_filter\":\"${test_filter}\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"rch_tmpdir\":\"${rch_tmpdir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
 
-  local_fallback=0
-  if env TMPDIR="$rch_tmpdir" rch exec -- env \
-    CARGO_HOME="$cargo_home" \
-    CARGO_TARGET_DIR="$cargo_target_dir" \
-    CARGO_NET_GIT_FETCH_WITH_CLI="$cargo_git_fetch_with_cli" \
-    cargo test -p frankenterm-core --lib "$test_filter" -- --nocapture >"$stdout_file" 2>"$stderr_file"; then
-    ended_ms="$(now_ms)"
-    duration_ms=$((ended_ms - started_ms))
+  set +e
+  run_rch_cargo_logged "${combined_log}" test -p frankenterm-core --lib "$test_filter" -- --nocapture
+  local rc=$?
+  set -e
 
-    if grep -Fq "[RCH] local" "$stderr_file"; then
-      local_fallback=1
-    fi
+  ended_ms="$(now_ms)"
+  duration_ms=$((ended_ms - started_ms))
 
-    if [[ $local_fallback -eq 1 ]]; then
-      fail_scenarios=$((fail_scenarios + 1))
-      log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"fail\",\"decision_path\":\"${decision_path}\",\"outcome\":\"fail\",\"reason_code\":\"offload_policy_violation\",\"error_code\":\"rch_local_fallback_detected\",\"duration_ms\":${duration_ms},\"rch_mode\":\"local_fallback\",\"artifacts\":{\"stdout\":\"${stdout_file#$ROOT_DIR/}\",\"stderr\":\"${stderr_file#$ROOT_DIR/}\"}}"
-      tail -n 120 "$stderr_file" >&2 || true
-      return 1
-    fi
-
+  if [[ $rc -eq 0 ]]; then
     rch_mode="remote_offload"
     pass_scenarios=$((pass_scenarios + 1))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"pass\",\"decision_path\":\"${decision_path}\",\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"stdout\":\"${stdout_file#$ROOT_DIR/}\",\"stderr\":\"${stderr_file#$ROOT_DIR/}\"}}"
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"pass\",\"decision_path\":\"${decision_path}\",\"outcome\":\"pass\",\"reason_code\":\"assertions_satisfied\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#$ROOT_DIR/}\"}}"
   else
-    ended_ms="$(now_ms)"
-    duration_ms=$((ended_ms - started_ms))
-
-    if grep -Fq "No space left on device" "$stderr_file"; then
+    if grep -Fq "No space left on device" "$combined_log"; then
       reason_code="disk_exhausted"
       error_code="disk_no_space_left"
-    elif grep -Fq "[RCH] local" "$stderr_file"; then
-      reason_code="offload_policy_violation"
-      error_code="rch_local_fallback_detected"
-      local_fallback=1
-    elif grep -Fq "failed to load source for dependency" "$stderr_file" || grep -Eq "revision [[:alnum:]]+ not found" "$stderr_file"; then
+    elif grep -Fq "failed to load source for dependency" "$combined_log" || grep -Eq "revision [[:alnum:]]+ not found" "$combined_log"; then
       reason_code="dependency_fetch_failed"
       error_code="cargo_git_dependency_revision_not_found"
-    elif grep -Fq "[RCH] remote" "$stderr_file"; then
+    elif grep -Fq "[RCH] remote" "$combined_log"; then
       reason_code="remote_execution_failure"
       error_code="rch_remote_command_failed"
     else
@@ -122,17 +189,15 @@ run_kernel_test() {
       error_code="test_failure"
     fi
 
-    if [[ $local_fallback -eq 1 ]]; then
-      rch_mode="local_fallback"
-    else
-      rch_mode="remote_offload"
-    fi
+    rch_mode="remote_offload"
     fail_scenarios=$((fail_scenarios + 1))
-    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"fail\",\"decision_path\":\"${decision_path}\",\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"${error_code}\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"stdout\":\"${stdout_file#$ROOT_DIR/}\",\"stderr\":\"${stderr_file#$ROOT_DIR/}\"}}"
-    tail -n 120 "$stderr_file" >&2 || true
+    log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"${scenario}\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"run_test\",\"status\":\"fail\",\"decision_path\":\"${decision_path}\",\"outcome\":\"fail\",\"reason_code\":\"${reason_code}\",\"error_code\":\"${error_code}\",\"duration_ms\":${duration_ms},\"rch_mode\":\"${rch_mode}\",\"artifacts\":{\"combined\":\"${combined_log#$ROOT_DIR/}\"}}"
+    tail -n 120 "$combined_log" >&2 || true
     return 1
   fi
 }
+
+ensure_rch_ready
 
 suite_started_ms="$(now_ms)"
 log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"replay_kernel\",\"scenario_id\":\"$scenario_id\",\"correlation_id\":\"${run_id}\",\"run_id\":\"${run_id}\",\"step\":\"start\",\"status\":\"running\",\"decision_path\":\"kernel_boot\",\"inputs\":{\"suite\":\"ft-og6q6.3.1\",\"cargo_home\":\"${cargo_home}\",\"cargo_target_dir\":\"${cargo_target_dir}\",\"rch_tmpdir\":\"${rch_tmpdir}\",\"cargo_net_git_fetch_with_cli\":\"${cargo_git_fetch_with_cli}\"}}"
