@@ -66,6 +66,23 @@ ft workflow run <name> --pane <id> [--dry-run]
 ft workflow status <execution_id> [-v|-vv]
 ```
 
+### Mission and tx control
+
+```bash
+ft mission plan [--mission-file <path>] [--include-dispatch-contracts] [-f <plain|json>]
+ft mission run [--mission-file <path>] [-f <plain|json>]
+ft mission status [--mission-file <path>] [-f <plain|json>]
+ft mission explain [--mission-file <path>] [--assignment-id <id>] [-f <plain|json>]
+ft mission pause [--mission-file <path>] [--reason <text>] [-f <plain|json>]
+ft mission resume [--mission-file <path>] [-f <plain|json>]
+ft mission abort [--mission-file <path>] [--reason <text>] [-f <plain|json>]
+
+ft tx plan [--contract-file <path>] [-f <plain|json>]
+ft tx run [--contract-file <path>] [--fail-step <step_id>] [--paused] [--kill-switch <off|safe-mode|hard-stop>] [-f <plain|json>]
+ft tx rollback [--contract-file <path>] [--fail-compensation-for-step <step_id>] [-f <plain|json>]
+ft tx show [--contract-file <path>] [--include-contract] [-f <plain|json>]
+```
+
 ### Rules
 
 ```bash

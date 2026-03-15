@@ -325,6 +325,18 @@ ft workflow run handle_usage_limits --pane 0 --dry-run
 ft workflow status <execution_id> -v
 ```
 
+### Mission & Tx Control
+
+```bash
+ft mission plan                         # Validate mission contract and compute hash
+ft mission status                       # Show lifecycle and assignment summary
+ft tx plan                              # Validate tx contract and summarize lifecycle
+ft tx run                               # Execute prepare+commit deterministically
+ft tx run --fail-step tx-step:2         # Inject a deterministic commit failure
+ft tx rollback                          # Execute compensation for committed steps
+ft tx show --include-contract           # Inspect receipts and full tx payload
+```
+
 ### Rules
 
 ```bash
