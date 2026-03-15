@@ -11811,6 +11811,21 @@ fn distributed_agent_local_pane(record: &frankenterm_core::storage::PaneRecord) 
 }
 
 #[cfg(feature = "distributed")]
+async fn distributed_agent_should_skip_remote_pane(
+    storage: &Arc<
+        frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
+    >,
+    pane_id: u64,
+) -> anyhow::Result<bool> {
+    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+    let pane = storage_handle.get_pane(pane_id).await?;
+    Ok(matches!(
+        pane.as_ref(),
+        Some(record) if !distributed_agent_local_pane(record)
+    ))
+}
+
+#[cfg(feature = "distributed")]
 fn distributed_agent_pane_meta(
     record: &frankenterm_core::storage::PaneRecord,
 ) -> frankenterm_core::wire_protocol::PaneMeta {
@@ -12218,6 +12233,13 @@ async fn distributed_agent_stream_event(
 
     match event {
         Event::SegmentCaptured { pane_id, .. } => {
+            if distributed_agent_should_skip_remote_pane(storage, pane_id).await? {
+                tracing::debug!(
+                    pane_id,
+                    "Skipping distributed pane segment replay on distributed agent"
+                );
+                return Ok(());
+            }
             let _ = distributed_agent_flush_pane_deltas(
                 pane_id,
                 streamer,
@@ -12229,6 +12251,13 @@ async fn distributed_agent_stream_event(
             Ok(())
         }
         Event::GapDetected { pane_id, .. } => {
+            if distributed_agent_should_skip_remote_pane(storage, pane_id).await? {
+                tracing::debug!(
+                    pane_id,
+                    "Skipping distributed pane gap replay on distributed agent"
+                );
+                return Ok(());
+            }
             let _ = distributed_agent_flush_pane_history(
                 pane_id,
                 streamer,
@@ -12240,8 +12269,16 @@ async fn distributed_agent_stream_event(
             .await?;
             Ok(())
         }
-        other => {
-            if let Some(mut envelope) = streamer.event_to_envelope(&other) {
+        event @ Event::PatternDetected { pane_id, .. }
+        | event @ Event::PaneDiscovered { pane_id, .. } => {
+            if distributed_agent_should_skip_remote_pane(storage, pane_id).await? {
+                tracing::debug!(
+                    pane_id,
+                    "Skipping distributed pane metadata/detection replay on distributed agent"
+                );
+                return Ok(());
+            }
+            if let Some(mut envelope) = streamer.event_to_envelope(&event) {
                 if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                     let pane_record = {
                         let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -12255,6 +12292,11 @@ async fn distributed_agent_stream_event(
             }
             Ok(())
         }
+        Event::PaneDisappeared { .. }
+        | Event::WorkflowStarted { .. }
+        | Event::WorkflowStep { .. }
+        | Event::WorkflowCompleted { .. }
+        | Event::UserVarReceived { .. } => Ok(()),
     }
 }
 
@@ -12344,6 +12386,7 @@ async fn distributed_agent_stream_session(
                     protocol_version
                 );
             }
+            distributed_agent_mark_session_established(streamer);
             tracing::info!(
                 agent_id = %agent_id,
                 session_id = %session_id,
@@ -12486,6 +12529,13 @@ async fn distributed_agent_stream_session(
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_agent_mark_session_established(
+    streamer: &mut frankenterm_core::wire_protocol::AgentStreamer,
+) {
+    streamer.mark_connected();
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_agent_sleep_with_shutdown(
     shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
     duration: Duration,
@@ -12548,7 +12598,6 @@ async fn distributed_agent_stream_forever(
         );
         match distributed_agent_connect(&connect_addr, &distributed_config).await {
             Ok(io) => {
-                streamer.mark_connected();
                 tracing::info!(
                     connect = %connect_addr,
                     agent_id = %agent_id,
@@ -12558,7 +12607,7 @@ async fn distributed_agent_stream_forever(
                     seq = streamer.seq(),
                     messages_sent = streamer.messages_sent(),
                     messages_dropped = streamer.messages_dropped(),
-                    "Distributed agent connected"
+                    "Distributed agent transport connected"
                 );
                 if let Err(err) = distributed_agent_stream_session(
                     io,
@@ -34629,9 +34678,7 @@ fn handle_tx_command(
                     let mut compensating_contract = prepared_contract.clone();
                     compensating_contract.lifecycle_state =
                         frankenterm_core::plan::MissionTxState::Compensating;
-                    compensating_contract
-                        .receipts
-                        .clone_from(&commit.receipts);
+                    compensating_contract.receipts.clone_from(&commit.receipts);
                     let compensation_inputs =
                         build_robot_tx_compensation_inputs(&commit, None, now_ms);
                     let compensation = match frankenterm_core::plan::execute_compensation_phase(
@@ -41715,6 +41762,310 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_agent_stream_event_skips_already_distributed_panes() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::net::{TcpListener, TcpStream};
+                use frankenterm_core::events::Event;
+                use frankenterm_core::storage::PaneRecord;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_skip_remote_panes").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 93_u64;
+                let now = now_ms_i64();
+
+                let (segment, gap) = {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("remote-pane-93".to_string()),
+                            domain: "distributed:agent-remote:prod".to_string(),
+                            window_id: None,
+                            tab_id: None,
+                            title: Some("remote-pane".to_string()),
+                            cwd: Some("/remote".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+
+                    let segment = storage_handle
+                        .append_segment(pane_id, "REMOTE_SHOULD_NOT_RESTREAM", None)
+                        .await
+                        .unwrap();
+                    let gap = storage_handle
+                        .record_gap(pane_id, "remote-gap")
+                        .await
+                        .unwrap()
+                        .expect("gap should be recorded");
+                    (segment, gap)
+                };
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind remote-skip listener");
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect remote-skip stream");
+                let (server, _) = listener.accept().await.expect("accept remote-skip stream");
+
+                let mut stream =
+                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
+                let mut reader = asupersync::io::BufReader::new(server);
+                let mut streamer =
+                    frankenterm_core::wire_protocol::AgentStreamer::new("agent-skip-remote");
+                let mut segment_cursors = std::collections::HashMap::new();
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                distributed_agent_stream_event(
+                    Event::PaneDiscovered {
+                        pane_id,
+                        domain: "distributed:agent-remote:prod".to_string(),
+                        title: "remote-pane".to_string(),
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("remote pane discovered event should be ignored");
+
+                distributed_agent_stream_event(
+                    Event::SegmentCaptured {
+                        pane_id,
+                        seq: segment.seq,
+                        content_len: segment.content_len,
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("remote segment event should be ignored");
+
+                distributed_agent_stream_event(
+                    Event::GapDetected {
+                        pane_id,
+                        seq_before: gap.seq_before,
+                        seq_after: gap.seq_after,
+                        reason: gap.reason.clone(),
+                        detected_at_ms: gap.detected_at,
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("remote gap event should be ignored");
+
+                drop(stream);
+
+                let mut line = String::new();
+                let read_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read remote-skip result");
+                assert_eq!(
+                    read_size, 0,
+                    "distributed panes should not be reflected back into the upstream stream"
+                );
+                assert_eq!(streamer.messages_sent(), 0);
+                assert!(segment_cursors.is_empty());
+                assert!(gap_cursors.is_empty());
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_stream_event_still_streams_local_panes() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::net::{TcpListener, TcpStream};
+                use frankenterm_core::events::Event;
+                use frankenterm_core::storage::PaneRecord;
+                use frankenterm_core::wire_protocol::{WireEnvelope, WirePayload};
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_local_panes_stream").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let pane_id = 94_u64;
+                let now = now_ms_i64();
+
+                let segment = {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle
+                        .upsert_pane(PaneRecord {
+                            pane_id,
+                            pane_uuid: Some("local-pane-94".to_string()),
+                            domain: "local".to_string(),
+                            window_id: None,
+                            tab_id: None,
+                            title: Some("local-pane".to_string()),
+                            cwd: Some("/local".to_string()),
+                            tty_name: None,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            observed: true,
+                            ignore_reason: None,
+                            last_decision_at: Some(now),
+                        })
+                        .await
+                        .unwrap();
+
+                    storage_handle
+                        .append_segment(pane_id, "LOCAL_SHOULD_STREAM", None)
+                        .await
+                        .unwrap()
+                };
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind local-stream listener");
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect local-stream stream");
+                let (server, _) = listener.accept().await.expect("accept local-stream");
+
+                let mut stream =
+                    asupersync::io::BufReader::new(Box::new(client) as DistributedIoStream);
+                let mut reader = asupersync::io::BufReader::new(server);
+                let mut streamer =
+                    frankenterm_core::wire_protocol::AgentStreamer::new("agent-local-stream");
+                let mut segment_cursors = std::collections::HashMap::new();
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                distributed_agent_stream_event(
+                    Event::PaneDiscovered {
+                        pane_id,
+                        domain: "local".to_string(),
+                        title: "local-pane".to_string(),
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("local pane discovered event should stream");
+
+                distributed_agent_stream_event(
+                    Event::SegmentCaptured {
+                        pane_id,
+                        seq: segment.seq,
+                        content_len: segment.content_len,
+                    },
+                    &mut streamer,
+                    &storage,
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &mut stream,
+                )
+                .await
+                .expect("local segment event should stream");
+
+                drop(stream);
+
+                let mut line = String::new();
+                let first_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read pane meta");
+                assert!(first_size > 0);
+                let first_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse pane meta");
+
+                line.clear();
+                let second_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read pane delta");
+                assert!(second_size > 0);
+                let second_envelope =
+                    WireEnvelope::from_json(line.trim().as_bytes()).expect("parse pane delta");
+
+                match first_envelope.payload {
+                    WirePayload::PaneMeta(meta) => {
+                        assert_eq!(meta.pane_id, pane_id);
+                        assert_eq!(meta.domain, "local");
+                        assert_eq!(meta.title.as_deref(), Some("local-pane"));
+                    }
+                    other => panic!("expected pane meta envelope, got {other:?}"),
+                }
+
+                match second_envelope.payload {
+                    WirePayload::PaneDelta(delta) => {
+                        assert_eq!(delta.pane_id, pane_id);
+                        assert_eq!(delta.seq, segment.seq);
+                        assert_eq!(delta.content, "LOCAL_SHOULD_STREAM");
+                    }
+                    other => panic!("expected pane delta envelope, got {other:?}"),
+                }
+
+                line.clear();
+                let eof_size = distributed_read_line(
+                    &mut reader,
+                    &mut line,
+                    frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                )
+                .await
+                .expect("read eof");
+                assert_eq!(eof_size, 0);
+                assert_eq!(streamer.messages_sent(), 2);
+                assert_eq!(segment_cursors.get(&pane_id), Some(&segment.id));
+
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query() {
         frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
@@ -47382,7 +47733,7 @@ log_level = "debug"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_agent_reconnect_backoff_escalates_until_connect() {
+    fn distributed_agent_reconnect_backoff_escalates_until_session_established() {
         let mut streamer = frankenterm_core::wire_protocol::AgentStreamer::new("agent-test");
 
         assert_eq!(
@@ -47398,11 +47749,127 @@ log_level = "debug"
             2000
         );
 
-        streamer.mark_connected();
+        distributed_agent_mark_session_established(&mut streamer);
         assert_eq!(
             distributed_agent_next_reconnect_backoff_ms(&mut streamer),
             500
         );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_handshake_rejection_preserves_reconnect_backoff_state() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::{TcpListener, TcpStream};
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let listener = TcpListener::bind(bind_addr.to_string())
+                    .await
+                    .expect("bind rejection listener");
+                let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+                    let (server, _) = listener.accept().await.expect("accept rejection client");
+                    let mut reader = asupersync::io::BufReader::new(server);
+                    let mut line = String::new();
+                    let read_size = distributed_read_line(
+                        &mut reader,
+                        &mut line,
+                        frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    )
+                    .await
+                    .expect("read distributed handshake");
+                    assert!(
+                        read_size > 0,
+                        "client should send handshake before rejection"
+                    );
+
+                    let rejection = serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "dist.auth_failed",
+                            "message": "rejected for test"
+                        }
+                    });
+                    let encoded =
+                        serde_json::to_string(&rejection).expect("serialize rejection payload");
+                    reader
+                        .get_mut()
+                        .write_all(encoded.as_bytes())
+                        .await
+                        .expect("write rejection payload");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .await
+                        .expect("write rejection newline");
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush rejection payload");
+                });
+
+                let client = TcpStream::connect(bind_addr.to_string())
+                    .await
+                    .expect("connect rejection listener");
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_agent_handshake_rejection_backoff").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(16));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut streamer =
+                    frankenterm_core::wire_protocol::AgentStreamer::new("agent-handshake-reject");
+                let mut segment_cursors = std::collections::HashMap::new();
+                let mut gap_cursors = std::collections::HashMap::new();
+
+                let err = distributed_agent_stream_session(
+                    Box::new(client) as DistributedIoStream,
+                    &mut streamer,
+                    &storage,
+                    &event_bus,
+                    Some("expected-token"),
+                    "agent-handshake-reject",
+                    "session-handshake-reject",
+                    &mut segment_cursors,
+                    &mut gap_cursors,
+                    &shutdown_flag,
+                )
+                .await
+                .expect_err("rejected handshake should fail");
+                assert!(
+                    err.to_string().contains("dist.auth_failed"),
+                    "expected structured distributed auth failure, got {err}"
+                );
+                assert!(
+                    !matches!(
+                        streamer.state(),
+                        frankenterm_core::wire_protocol::ConnectionState::Connected
+                    ),
+                    "streamer must not be marked connected when handshake is rejected"
+                );
+                assert_eq!(
+                    distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+                    500
+                );
+                assert_eq!(
+                    distributed_agent_next_reconnect_backoff_ms(&mut streamer),
+                    1000
+                );
+
+                server_task.await.expect("join rejection listener");
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                cleanup_storage(storage_handle, &db_path).await;
+            });
     }
 
     // ========================================================================
