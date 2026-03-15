@@ -998,6 +998,85 @@ pub fn standard_contract_matrix() -> ContractMatrix {
         )
         .with_required_fields(&["events", "total_count", "limit"]),
     );
+    matrix.register(
+        ContractCheck::new(
+            "schema-tx-plan",
+            ApiSurface::TxPlan,
+            CheckCategory::SchemaStability,
+            "tx-plan response has compiled plan structure and risk metadata",
+        )
+        .with_required_fields(&[
+            "plan_id",
+            "plan_hash",
+            "steps",
+            "execution_order",
+            "parallel_levels",
+            "risk_summary",
+            "rejected_edges",
+        ]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "schema-tx-run",
+            ApiSurface::TxRun,
+            CheckCategory::SchemaStability,
+            "tx-run response has execution ledger summary and chain verification",
+        )
+        .with_required_fields(&[
+            "execution_id",
+            "plan_id",
+            "plan_hash",
+            "phase",
+            "step_count",
+            "completed_count",
+            "failed_count",
+            "skipped_count",
+            "records",
+            "chain_verification",
+        ]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "schema-tx-rollback",
+            ApiSurface::TxRollback,
+            CheckCategory::SchemaStability,
+            "tx-rollback response has compensation outcomes and integrity summary",
+        )
+        .with_required_fields(&[
+            "execution_id",
+            "plan_id",
+            "phase",
+            "compensated_steps",
+            "failed_compensations",
+            "total_compensated",
+            "total_failed",
+            "chain_verification",
+        ]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "schema-tx-show",
+            ApiSurface::TxShow,
+            CheckCategory::SchemaStability,
+            "tx-show response has forensic timeline, risk summary, and receipt view",
+        )
+        .with_required_fields(&[
+            "execution_id",
+            "plan_id",
+            "plan_hash",
+            "phase",
+            "classification",
+            "step_count",
+            "record_count",
+            "high_risk_count",
+            "critical_risk_count",
+            "overall_risk",
+            "chain_intact",
+            "timeline",
+            "records",
+            "redacted_field_count",
+        ]),
+    );
 
     // Determinism checks
     matrix.register(
@@ -1026,6 +1105,38 @@ pub fn standard_contract_matrix() -> ContractMatrix {
             "events list is stable for same filter and event state",
         )
         .with_deterministic_fields(&["events", "total_count"]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "det-tx-plan",
+            ApiSurface::TxPlan,
+            CheckCategory::Determinism,
+            "tx-plan returns a stable compiled contract for the same mission state",
+        )
+        .with_deterministic_fields(&[
+            "plan_hash",
+            "steps",
+            "execution_order",
+            "parallel_levels",
+            "risk_summary",
+            "rejected_edges",
+        ]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "det-tx-show",
+            ApiSurface::TxShow,
+            CheckCategory::Determinism,
+            "tx-show returns a stable receipt/timeline view for the same execution snapshot",
+        )
+        .with_deterministic_fields(&[
+            "plan_hash",
+            "classification",
+            "chain_intact",
+            "timeline",
+            "records",
+            "redacted_field_count",
+        ]),
     );
 
     // Idempotency checks for mutations
@@ -1074,6 +1185,24 @@ pub fn standard_contract_matrix() -> ContractMatrix {
         CheckCategory::ErrorContract,
         "Unknown commands produce structured error, not crash",
     ));
+    matrix.register(
+        ContractCheck::new(
+            "err-tx-run-invalid-fail-step",
+            ApiSurface::TxRun,
+            CheckCategory::ErrorContract,
+            "tx-run invalid fail-step returns structured error with corrective guidance",
+        )
+        .with_required_fields(&["code", "message", "hint"]),
+    );
+    matrix.register(
+        ContractCheck::new(
+            "err-tx-rollback-invalid-compensation-step",
+            ApiSurface::TxRollback,
+            CheckCategory::ErrorContract,
+            "tx-rollback invalid compensation step returns structured error with rollback-specific guidance",
+        )
+        .with_required_fields(&["code", "message", "hint"]),
+    );
 
     // Replay correctness
     matrix.register(ContractCheck::new(
@@ -1291,6 +1420,119 @@ mod tests {
                     surface.command_name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn standard_matrix_has_tx_schema_coverage() {
+        let matrix = standard_contract_matrix();
+
+        let expected: &[(ApiSurface, &[&str])] = &[
+            (
+                ApiSurface::TxPlan,
+                &[
+                    "plan_id",
+                    "plan_hash",
+                    "steps",
+                    "execution_order",
+                    "parallel_levels",
+                    "risk_summary",
+                    "rejected_edges",
+                ],
+            ),
+            (
+                ApiSurface::TxRun,
+                &[
+                    "execution_id",
+                    "plan_id",
+                    "plan_hash",
+                    "phase",
+                    "step_count",
+                    "completed_count",
+                    "failed_count",
+                    "skipped_count",
+                    "records",
+                    "chain_verification",
+                ],
+            ),
+            (
+                ApiSurface::TxRollback,
+                &[
+                    "execution_id",
+                    "plan_id",
+                    "phase",
+                    "compensated_steps",
+                    "failed_compensations",
+                    "total_compensated",
+                    "total_failed",
+                    "chain_verification",
+                ],
+            ),
+            (
+                ApiSurface::TxShow,
+                &[
+                    "execution_id",
+                    "plan_id",
+                    "plan_hash",
+                    "phase",
+                    "classification",
+                    "step_count",
+                    "record_count",
+                    "high_risk_count",
+                    "critical_risk_count",
+                    "overall_risk",
+                    "chain_intact",
+                    "timeline",
+                    "records",
+                    "redacted_field_count",
+                ],
+            ),
+        ];
+
+        for (surface, fields) in expected {
+            let check = matrix
+                .checks
+                .iter()
+                .find(|check| {
+                    check.surface == *surface && check.category == CheckCategory::SchemaStability
+                })
+                .unwrap_or_else(|| {
+                    panic!("missing tx schema check for {}", surface.command_name())
+                });
+
+            for field in *fields {
+                assert!(
+                    check.required_fields.iter().any(|value| value == field),
+                    "missing required tx schema field `{field}` for {}",
+                    surface.command_name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standard_matrix_has_tx_error_contract_guidance_checks() {
+        let matrix = standard_contract_matrix();
+
+        for surface in [ApiSurface::TxRun, ApiSurface::TxRollback] {
+            let check = matrix
+                .checks
+                .iter()
+                .find(|check| {
+                    check.surface == surface && check.category == CheckCategory::ErrorContract
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing tx error contract check for {}",
+                        surface.command_name()
+                    )
+                });
+
+            assert!(
+                check.required_fields.iter().any(|value| value == "hint"),
+                "{} error contract should require a hint field",
+                surface.command_name()
+            );
         }
     }
 
