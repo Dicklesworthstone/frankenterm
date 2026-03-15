@@ -19,6 +19,8 @@ RCH_TARGET_DIR="target/rch-e2e-replay-shadow-rollout-${RUN_ID}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_PROBE_LOG="${LOG_DIR}/replay_shadow_rollout_${RUN_ID}.probe.log"
 RCH_SMOKE_LOG="${LOG_DIR}/replay_shadow_rollout_${RUN_ID}.smoke.log"
+RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+TIMEOUT_BIN=""
 PASS_COUNT=0
 FAIL_COUNT=0
 
@@ -32,6 +34,16 @@ run_rch() {
 
 run_rch_cargo() {
     run_rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
+}
+
+resolve_timeout_bin() {
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_BIN="gtimeout"
+    else
+        TIMEOUT_BIN=""
+    fi
 }
 
 probe_has_reachable_workers() {
@@ -52,18 +64,30 @@ run_rch_cargo_logged() {
     set +e
     (
         cd "${REPO_ROOT}"
-        run_rch_cargo "$@"
+        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
+            rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo "$@"
     ) >"${output_file}" 2>&1
     local rc=$?
     set -e
 
     check_rch_fallback "${output_file}"
+    if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
+        local queue_log="${output_file%.log}.rch_queue_timeout.log"
+        if ! run_rch queue >"${queue_log}" 2>&1; then
+            queue_log="${output_file}"
+        fi
+        fatal "rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s; refusing stalled remote execution. See ${queue_log}"
+    fi
     return "${rc}"
 }
 
 ensure_rch_ready() {
     if ! command -v rch >/dev/null 2>&1; then
         fatal "rch is required for this replay e2e harness; refusing local cargo execution."
+    fi
+    resolve_timeout_bin
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
     fi
 
     set +e
