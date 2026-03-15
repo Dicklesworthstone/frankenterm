@@ -12,6 +12,10 @@
 //! - Secret-like strings never leak unredacted
 
 use assert_cmd::Command;
+use frankenterm_core::plan::{
+    MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
+    TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
+};
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +40,153 @@ fn setup_workspace() -> (TempDir, String) {
 
     let ws = dir.path().to_string_lossy().to_string();
     (dir, ws)
+}
+
+fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
+    let tx_id = TxId("tx:test".to_string());
+    MissionTxContract {
+        tx_version: MISSION_TX_SCHEMA_VERSION,
+        intent: TxIntent {
+            tx_id: tx_id.clone(),
+            requested_by: MissionActorRole::Dispatcher,
+            summary: "tx test".to_string(),
+            correlation_id: "corr:test".to_string(),
+            created_at_ms: 1_700_000_000_000,
+        },
+        plan: TxPlan {
+            plan_id: TxPlanId("plan:test".to_string()),
+            tx_id,
+            steps: vec![
+                TxStep {
+                    step_id: TxStepId("tx-step:1".to_string()),
+                    ordinal: 1,
+                    action: StepAction::SendText {
+                        pane_id: 1,
+                        text: "step-1".to_string(),
+                        paste_mode: Some(false),
+                    },
+                    description: "step 1".to_string(),
+                },
+                TxStep {
+                    step_id: TxStepId("tx-step:2".to_string()),
+                    ordinal: 2,
+                    action: StepAction::SendText {
+                        pane_id: 2,
+                        text: "step-2".to_string(),
+                        paste_mode: Some(false),
+                    },
+                    description: "step 2".to_string(),
+                },
+                TxStep {
+                    step_id: TxStepId("tx-step:3".to_string()),
+                    ordinal: 3,
+                    action: StepAction::SendText {
+                        pane_id: 3,
+                        text: "step-3".to_string(),
+                        paste_mode: Some(true),
+                    },
+                    description: "step 3".to_string(),
+                },
+            ],
+            preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+            compensations: vec![
+                TxCompensation {
+                    for_step_id: TxStepId("tx-step:1".to_string()),
+                    action: StepAction::SendText {
+                        pane_id: 1,
+                        text: "undo-1".to_string(),
+                        paste_mode: Some(false),
+                    },
+                },
+                TxCompensation {
+                    for_step_id: TxStepId("tx-step:2".to_string()),
+                    action: StepAction::SendText {
+                        pane_id: 2,
+                        text: "undo-2".to_string(),
+                        paste_mode: Some(false),
+                    },
+                },
+                TxCompensation {
+                    for_step_id: TxStepId("tx-step:3".to_string()),
+                    action: StepAction::SendText {
+                        pane_id: 3,
+                        text: "undo-3".to_string(),
+                        paste_mode: Some(true),
+                    },
+                },
+            ],
+        },
+        lifecycle_state: state,
+        outcome: TxOutcome::Pending,
+        receipts: Vec::new(),
+    }
+}
+
+fn write_default_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path::PathBuf {
+    let path = dir
+        .path()
+        .join(".ft")
+        .join("mission")
+        .join("tx-active.json");
+    std::fs::create_dir_all(path.parent().expect("tx contract parent"))
+        .expect("create mission dir");
+    let contract = sample_tx_contract(state);
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&contract).expect("serialize tx contract"),
+    )
+    .expect("write tx contract");
+    path
+}
+
+fn assert_tx_transition_contract_shape(transitions: &serde_json::Value) {
+    let transitions = transitions
+        .as_array()
+        .expect("legal_transitions should be an array");
+    assert!(
+        !transitions.is_empty(),
+        "expected at least one legal tx transition"
+    );
+    for transition in transitions {
+        assert!(transition["kind"].as_str().is_some());
+        assert!(transition["to"].as_str().is_some());
+    }
+}
+
+fn assert_tx_contract_payload_shape(contract: &serde_json::Value, expected_state: &str) {
+    assert_eq!(
+        contract["tx_version"].as_u64(),
+        Some(u64::from(MISSION_TX_SCHEMA_VERSION))
+    );
+    assert_eq!(contract["lifecycle_state"].as_str(), Some(expected_state));
+    assert_eq!(contract["outcome"].as_str(), Some("pending"));
+    assert_eq!(
+        contract["intent"]["tx_id"].as_str(),
+        Some("tx:test"),
+        "expected stable tx id in fixture"
+    );
+    assert_eq!(contract["plan"]["plan_id"].as_str(), Some("plan:test"));
+
+    let steps = contract["plan"]["steps"]
+        .as_array()
+        .expect("contract.plan.steps should be an array");
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0]["step_id"].as_str(), Some("tx-step:1"));
+    assert_eq!(steps[1]["step_id"].as_str(), Some("tx-step:2"));
+    assert_eq!(steps[2]["step_id"].as_str(), Some("tx-step:3"));
+
+    assert_eq!(
+        contract["plan"]["preconditions"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        contract["plan"]["compensations"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3)
+    );
 }
 
 /// Write a small deterministic simulation scenario used by CLI contract tests.
@@ -1825,6 +1976,214 @@ fn contract_help_lists_core_commands() {
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("stop"))
         .stdout(predicate::str::contains("approve"));
+}
+
+// =============================================================================
+// ft tx contract tests
+// =============================================================================
+
+#[test]
+fn contract_tx_plan_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(&ws, &["tx", "plan", "--format", "json"]);
+
+    assert_eq!(payload["ok"], true);
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
+    assert_eq!(data["step_count"].as_u64(), Some(3));
+    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["compensation_count"].as_u64(), Some(3));
+    assert_tx_transition_contract_shape(&data["legal_transitions"]);
+}
+
+#[test]
+fn contract_tx_show_include_contract_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &["tx", "show", "--include-contract", "--format", "json"],
+    );
+
+    assert_eq!(payload["ok"], true);
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
+    assert_eq!(data["outcome"].as_str(), Some("pending"));
+    assert_eq!(data["step_count"].as_u64(), Some(3));
+    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["compensation_count"].as_u64(), Some(3));
+    assert_eq!(data["receipt_count"].as_u64(), Some(0));
+    assert_tx_transition_contract_shape(&data["legal_transitions"]);
+    assert_tx_contract_payload_shape(&data["contract"], "planned");
+}
+
+#[test]
+fn contract_tx_run_partial_failure_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &["tx", "run", "--format", "json", "--fail-step", "tx-step:2"],
+    );
+
+    assert_eq!(payload["ok"], true);
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(
+        data["prepare_report"]["outcome"].as_str(),
+        Some("all_ready")
+    );
+    assert_eq!(
+        data["commit_report"]["outcome"].as_str(),
+        Some("partial_failure")
+    );
+    assert_eq!(data["commit_report"]["failed_count"].as_u64(), Some(1));
+    assert!(
+        data["commit_report"]["committed_count"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    assert_eq!(
+        data["commit_report"]["failure_boundary"].as_str(),
+        Some("tx-step:2")
+    );
+    assert_eq!(
+        data["compensation_report"]["outcome"].as_str(),
+        Some("fully_rolled_back")
+    );
+    assert!(
+        data["compensation_report"]["compensated_count"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    assert_eq!(data["final_state"].as_str(), Some("compensated"));
+}
+
+#[test]
+fn contract_tx_run_invalid_fail_step_json_error_envelope() {
+    let (dir, ws) = setup_workspace();
+    write_default_tx_contract(&dir, MissionTxState::Planned);
+
+    let output = wa_cmd_for(&ws)
+        .args([
+            "tx",
+            "run",
+            "--format",
+            "json",
+            "--fail-step",
+            "tx-step:missing",
+        ])
+        .output()
+        .expect("ft tx run invalid --fail-step should execute");
+
+    assert_eq!(output.status.code(), Some(7));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(
+        payload["error_code"].as_str(),
+        Some("mission.tx.unknown_fail_step")
+    );
+    assert_eq!(payload["exit_code"].as_i64(), Some(7));
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown --fail-step: tx-step:missing")
+    );
+    assert_eq!(
+        payload["hint"].as_str(),
+        Some("Use `ft tx show --include-contract` to inspect valid step IDs.")
+    );
+}
+
+#[test]
+fn contract_robot_tx_show_include_contract_json_envelope() {
+    let (dir, ws) = setup_workspace();
+    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "show",
+            "--include-contract",
+        ],
+    );
+
+    assert_eq!(payload["ok"], true);
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
+
+    let data = &payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
+    assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
+    assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
+    assert_eq!(data["outcome"].as_str(), Some("pending"));
+    assert_eq!(data["receipt_count"].as_u64(), Some(0));
+    assert_tx_transition_contract_shape(&data["legal_transitions"]);
+    assert_tx_contract_payload_shape(&data["contract"], "planned");
+}
+
+#[test]
+fn contract_robot_tx_run_invalid_fail_step_json_error_envelope() {
+    let (dir, ws) = setup_workspace();
+    write_default_tx_contract(&dir, MissionTxState::Planned);
+    let payload = run_wa_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "run",
+            "--fail-step",
+            "tx-step:missing",
+        ],
+    );
+
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error_code"].as_str(), Some("robot.invalid_args"));
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown --fail-step: tx-step:missing")
+    );
+    assert_eq!(
+        payload["hint"].as_str(),
+        Some("Use a step ID from `ft robot tx show --include-contract`.")
+    );
+    assert!(payload["elapsed_ms"].as_u64().is_some());
+    assert!(payload["now"].as_u64().is_some());
+    assert!(payload["version"].as_str().is_some());
 }
 
 // =============================================================================
