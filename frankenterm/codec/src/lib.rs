@@ -14,7 +14,7 @@
 // Both async-smol and async-asupersync may be enabled simultaneously due to Cargo
 // workspace feature unification. When both are active, asupersync takes priority.
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
@@ -1625,22 +1625,28 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(Pdu::WriteToPane(WriteToPane {
-            pane_id: 0,
-            data: vec![]
-        })
-        .is_user_input());
-        assert!(Pdu::SendPaste(SendPaste {
-            pane_id: 0,
-            data: String::new()
-        })
-        .is_user_input());
-        assert!(Pdu::Resize(Resize {
-            containing_tab_id: 0,
-            pane_id: 0,
-            size: TerminalSize::default(),
-        })
-        .is_user_input());
+        assert!(
+            Pdu::WriteToPane(WriteToPane {
+                pane_id: 0,
+                data: vec![]
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::SendPaste(SendPaste {
+                pane_id: 0,
+                data: String::new()
+            })
+            .is_user_input()
+        );
+        assert!(
+            Pdu::Resize(Resize {
+                containing_tab_id: 0,
+                pane_id: 0,
+                size: TerminalSize::default(),
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -2367,12 +2373,14 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
-            containing_tab_id: 0,
-            pane_id: 0,
-            zoomed: true,
-        })
-        .is_user_input());
+        assert!(
+            Pdu::SetPaneZoomed(SetPaneZoomed {
+                containing_tab_id: 0,
+                pane_id: 0,
+                zoomed: true,
+            })
+            .is_user_input()
+        );
     }
 
     #[test]
@@ -2407,6 +2415,28 @@ mod test {
         let (data, is_compressed) = serialize(&val).unwrap();
         let result: String = deserialize(data.as_slice(), is_compressed).unwrap();
         assert_eq!(result, val);
+    }
+
+    fn sample_tiered_scrollback_status() -> PaneTieredScrollbackStatus {
+        PaneTieredScrollbackStatus {
+            tiering_enabled: true,
+            configured_scrollback_rows: 200_000,
+            configured_hot_lines: 4_096,
+            configured_warm_max_bytes: 8 * 1024 * 1024,
+            visible_rows: 72,
+            in_memory_scrollback_rows: 8_192,
+            warm_resident_lines: 2_048,
+            warm_resident_bytes: 262_144,
+            warm_spill_lines_total: 32_768,
+            warm_spill_bytes_total: 4_194_304,
+            cold_spill_lines_total: 65_536,
+            cold_spill_bytes_total: 8_388_608,
+            cold_worker_peak_backlog_depth: 48,
+            cold_worker_completion_throughput_lines_per_sec: 1_024,
+            cold_worker_completed_lines_total: 98_765,
+            cold_worker_completed_batches_total: 321,
+            cold_worker_cancellation_count: 7,
+        }
     }
 
     #[test]
@@ -2453,6 +2483,73 @@ mod test {
         let mut encoded = Vec::new();
         pdu.encode(&mut encoded, 101).unwrap();
         let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn get_pane_render_changes_response_roundtrip_preserves_tiered_scrollback_status() {
+        let pdu = Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
+            pane_id: 7,
+            mouse_grabbed: false,
+            cursor_position: StableCursorPosition {
+                x: 3,
+                y: 9,
+                ..Default::default()
+            },
+            dimensions: RenderableDimensions {
+                cols: 120,
+                viewport_rows: 72,
+                scrollback_rows: 200_000,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 1_920,
+                pixel_height: 1_080,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: Some(sample_tiered_scrollback_status()),
+            dirty_lines: vec![0..2, 9..10],
+            title: "scrollback-pane".to_string(),
+            working_dir: None,
+            bonus_lines: SerializedLines::default(),
+            input_serial: None,
+            seqno: 17,
+        });
+
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 0x53).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 0x53);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn get_pane_renderable_dimensions_response_roundtrip_preserves_tiered_scrollback_status() {
+        let pdu = Pdu::GetPaneRenderableDimensionsResponse(GetPaneRenderableDimensionsResponse {
+            pane_id: 7,
+            cursor_position: StableCursorPosition {
+                x: 3,
+                y: 9,
+                ..Default::default()
+            },
+            dimensions: RenderableDimensions {
+                cols: 120,
+                viewport_rows: 72,
+                scrollback_rows: 200_000,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 1_920,
+                pixel_height: 1_080,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: Some(sample_tiered_scrollback_status()),
+        });
+
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, 0x54).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 0x54);
         assert_eq!(decoded.pdu, pdu);
     }
 
