@@ -753,7 +753,11 @@ mod tests {
         ];
 
         let filtered = filter_remote_tools(&settings, tools);
-        assert_eq!(filtered.len(), 2, "all tools should pass when mutating allowed");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "all tools should pass when mutating allowed"
+        );
     }
 
     #[test]
