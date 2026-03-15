@@ -695,6 +695,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    #[allow(clippy::unused_self)]
     fn determine_final_outcome(
         &self,
         current_state: MissionTxState,

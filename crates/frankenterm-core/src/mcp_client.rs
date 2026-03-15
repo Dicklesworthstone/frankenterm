@@ -77,7 +77,7 @@ impl McpClientError {
 pub type McpClientResult<T> = std::result::Result<T, McpClientError>;
 
 /// Framework-neutral outbound MCP tool definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpClientToolDefinition {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +107,7 @@ impl McpClientToolDefinition {
 }
 
 /// Framework-neutral outbound MCP content item.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct McpClientContentItem(pub serde_json::Value);
 

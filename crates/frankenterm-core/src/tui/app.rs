@@ -580,7 +580,7 @@ impl<Q: QueryClient> App<Q> {
                         .unwrap_or(timeline_len - 1);
                 }
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            KeyCode::Char('+' | '=') => {
                 if self.view_state.timeline_zoom < 5 {
                     self.view_state.timeline_zoom += 1;
                     self.refresh_timeline_data();

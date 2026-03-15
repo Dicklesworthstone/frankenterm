@@ -261,12 +261,14 @@ fn event_matches_pane(event: &Event, pane_filter: Option<u64>) -> bool {
     sse::event_matches_pane(event, pane_filter)
 }
 
+#[allow(dead_code)]
 fn handle_stream_events(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
     sse::handle_stream_events(req)
 }
 
+#[allow(dead_code)]
 fn handle_stream_deltas(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {

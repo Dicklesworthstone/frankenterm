@@ -447,7 +447,7 @@ pub enum WaitResult {
     /// Condition was satisfied by a matching event.
     Matched {
         /// The event that satisfied the condition.
-        event: Event,
+        event: Box<Event>,
         /// How long the wait took (ms).
         elapsed_ms: u64,
     },
@@ -567,7 +567,7 @@ impl EventWaiter {
 
         match crate::runtime_compat::timeout(timeout, recv_loop).await {
             Ok(event) => WaitResult::Matched {
-                event,
+                event: Box::new(event),
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
             Err(_) => WaitResult::Timeout {
@@ -1260,11 +1260,11 @@ mod tests {
     #[test]
     fn wait_result_matched() {
         let result = WaitResult::Matched {
-            event: Event::PaneDiscovered {
+            event: Box::new(Event::PaneDiscovered {
                 pane_id: 1,
                 domain: "local".to_string(),
                 title: "test".to_string(),
-            },
+            }),
             elapsed_ms: 100,
         };
         assert!(result.is_matched());
@@ -1411,7 +1411,7 @@ mod tests {
             match wait_task.await.unwrap() {
                 WaitResult::Matched { event, .. } => {
                     assert!(matches!(
-                        event,
+                        *event,
                         Event::PatternDetected { detection, .. } if detection.rule_id == "b"
                     ));
                 }

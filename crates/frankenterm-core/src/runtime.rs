@@ -82,6 +82,7 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     }
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)] // tokio requires &mut for borrow_and_update
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
     #[cfg(feature = "asupersync-runtime")]
     {
