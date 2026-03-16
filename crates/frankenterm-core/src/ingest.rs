@@ -1222,33 +1222,28 @@ impl PaneRegistry {
     /// This updates the pane entry and the reverse lookup index.
     /// Returns `true` if successful, `false` if pane not found.
     pub fn adopt_uuid(&mut self, pane_id: u64, new_uuid: String) -> bool {
-        if let Some(entry) = self.entries.get_mut(&pane_id) {
-            // Remove old mapping
-            self.uuid_index.remove(&entry.pane_uuid);
-
-            // Check for collision (sanity check)
-            if let Some(existing_owner) = self.uuid_index.get(&new_uuid) {
-                if *existing_owner != pane_id {
-                    warn!(
-                        "UUID collision during adoption: {} is already owned by pane {}",
-                        new_uuid, existing_owner
-                    );
-                    // Fall through and overwrite? Or fail?
-                    // Overwriting fixes the index for the *current* adoption but leaves
-                    // the other pane with a broken index entry.
-                    // Since this should be rare (hash collision or DB corruption),
-                    // we'll proceed but warn.
-                }
+        if let Some(existing_owner) = self.uuid_index.get(&new_uuid) {
+            if *existing_owner != pane_id {
+                warn!(
+                    "UUID collision during adoption: {} is already owned by pane {}",
+                    new_uuid, existing_owner
+                );
+                return false;
             }
-
-            // Update entry
-            entry.pane_uuid.clone_from(&new_uuid);
-            // Add new mapping
-            self.uuid_index.insert(new_uuid, pane_id);
-            true
-        } else {
-            false
         }
+
+        let Some(entry) = self.entries.get_mut(&pane_id) else {
+            return false;
+        };
+
+        if entry.pane_uuid == new_uuid {
+            return true;
+        }
+
+        let old_uuid = std::mem::replace(&mut entry.pane_uuid, new_uuid.clone());
+        self.uuid_index.remove(&old_uuid);
+        self.uuid_index.insert(new_uuid, pane_id);
+        true
     }
 
     /// Get all entries as an iterator
@@ -1392,8 +1387,24 @@ fn trim_utf8_tail_to_max_bytes(text: &str, max_bytes: usize) -> String {
     }
 
     let mut start = text.len().saturating_sub(max_bytes);
+    // Snap forward to the next valid UTF-8 char boundary so we don't
+    // slice in the middle of a multi-byte code point.
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;
+    }
+    // If snapping consumed all remaining bytes (max_bytes smaller than
+    // smallest character at the boundary), fall back to the last full
+    // character rather than returning an empty string.
+    if start >= text.len() && max_bytes > 0 {
+        // Find the start of the last character.
+        let mut last_char_start = text.len();
+        while last_char_start > 0 && !text.is_char_boundary(last_char_start - 1) {
+            last_char_start -= 1;
+        }
+        if last_char_start > 0 {
+            last_char_start -= 1;
+        }
+        return text[last_char_start..].to_string();
     }
     text[start..].to_string()
 }
@@ -5707,5 +5718,22 @@ mod tests {
         // Check index updates
         assert_eq!(reg.get_pane_id_by_uuid(&new_uuid), Some(1));
         assert!(reg.get_pane_id_by_uuid(&old_uuid).is_none());
+    }
+
+    #[test]
+    fn registry_adopt_uuid_rejects_collision_without_corrupting_index() {
+        let mut reg = PaneRegistry::new();
+        reg.discovery_tick(vec![make_pane_info(1, 100, 10), make_pane_info(2, 100, 11)]);
+
+        let uuid_one = reg.get_entry(1).unwrap().pane_uuid.clone();
+        let uuid_two = reg.get_entry(2).unwrap().pane_uuid.clone();
+
+        let success = reg.adopt_uuid(1, uuid_two.clone());
+        assert!(!success);
+
+        assert_eq!(reg.get_entry(1).unwrap().pane_uuid, uuid_one);
+        assert_eq!(reg.get_entry(2).unwrap().pane_uuid, uuid_two);
+        assert_eq!(reg.get_pane_id_by_uuid(&uuid_one), Some(1));
+        assert_eq!(reg.get_pane_id_by_uuid(&uuid_two), Some(2));
     }
 }

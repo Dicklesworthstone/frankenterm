@@ -691,6 +691,7 @@ impl FilteredEventStream {
     /// Receive the next event that matches the filter.
     ///
     /// Blocks until a matching event arrives or the channel closes.
+    /// Returns `None` when the channel is closed.
     /// Updates the cursor on each delivered event (if it has a storage ID).
     pub async fn next(&mut self) -> Option<Event> {
         loop {
@@ -709,8 +710,13 @@ impl FilteredEventStream {
                     }
                     self.filtered_out.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => {
-                    // Channel closed or lagged — try to recover
+                Err(crate::events::RecvError::Lagged { .. }) => {
+                    // Subscriber fell behind; events were lost but channel is
+                    // still open. Continue receiving from the new position.
+                }
+                Err(crate::events::RecvError::Closed) => {
+                    // Channel closed — no more events will arrive.
+                    return None;
                 }
             }
         }
