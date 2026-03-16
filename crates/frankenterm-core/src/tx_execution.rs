@@ -17,9 +17,10 @@
 //! every transition emits observability events with reason codes.
 
 use crate::plan::{
-    MissionKillSwitchLevel, MissionTxContract, MissionTxState, TxCommitReport, TxCommitStepInput,
-    TxCompensationReport, TxCompensationStepInput, TxOutcome, TxPrepareGateInput, TxPrepareOutcome,
-    TxPrepareReport, evaluate_prepare_phase, execute_commit_phase, execute_compensation_phase,
+    MissionKillSwitchLevel, MissionTxContract, MissionTxState, TxCommitOutcome, TxCommitReport,
+    TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
+    TxPrepareGateInput, TxPrepareOutcome, TxPrepareReport, evaluate_prepare_phase,
+    execute_commit_phase, execute_compensation_phase,
 };
 use crate::tx_idempotency::{
     IdempotencyKey, IdempotencyStore, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,

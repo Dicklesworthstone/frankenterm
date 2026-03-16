@@ -29,7 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 /// Current schema version for action plans.
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
@@ -3082,6 +3082,154 @@ pub fn mission_tx_synthetic_commit_report(
     }
 }
 
+/// Build the commit report a rollback surface should compensate against.
+///
+/// Rollback must compensate only the steps that are proven to have committed.
+/// When a contract carries commit receipts, those receipts are the source of
+/// truth. A synthetic all-committed fallback is only allowed for already
+/// committed tx contracts that have no commit receipts recorded yet.
+pub fn mission_tx_rollback_commit_report(
+    contract: &MissionTxContract,
+    completed_at_ms: i64,
+) -> Result<TxCommitReport, String> {
+    let mut latest_commit_receipts = HashMap::<String, TxReceipt>::new();
+    let mut commit_receipts = Vec::new();
+
+    for receipt_value in &contract.receipts {
+        let phase = receipt_value
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if phase != "commit" {
+            continue;
+        }
+
+        let receipt = serde_json::from_value::<TxReceipt>(receipt_value.clone())
+            .map_err(|err| format!("invalid commit receipt schema: {err}"))?;
+        if receipt.tx_id != contract.intent.tx_id.0 || receipt.plan_id != contract.plan.plan_id.0 {
+            return Err(format!(
+                "commit receipt does not belong to tx {} / plan {}",
+                contract.intent.tx_id.0, contract.plan.plan_id.0
+            ));
+        }
+        let step_id = receipt
+            .step_id
+            .clone()
+            .ok_or_else(|| "commit receipt missing step_id".to_string())?;
+
+        match latest_commit_receipts.get(&step_id) {
+            Some(existing) if existing.seq >= receipt.seq => {}
+            _ => {
+                latest_commit_receipts.insert(step_id, receipt.clone());
+            }
+        }
+        commit_receipts.push(receipt_value.clone());
+    }
+
+    if latest_commit_receipts.is_empty() {
+        return if contract.lifecycle_state == MissionTxState::Committed {
+            Ok(mission_tx_synthetic_commit_report(
+                contract,
+                completed_at_ms,
+            ))
+        } else {
+            Err(format!(
+                "rollback requires commit receipts or a committed tx state, got {}",
+                contract.lifecycle_state
+            ))
+        };
+    }
+
+    commit_receipts.sort_by_key(|receipt| {
+        receipt
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    });
+
+    let mut step_results = Vec::with_capacity(contract.plan.steps.len());
+    let mut committed_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failure_boundary = None;
+    let mut report_error_code = None;
+    let mut report_completed_at_ms = completed_at_ms;
+
+    for step in &contract.plan.steps {
+        let receipt = latest_commit_receipts.get(&step.step_id.0).ok_or_else(|| {
+            format!(
+                "rollback requires a commit receipt for step {}",
+                step.step_id.0
+            )
+        })?;
+
+        report_completed_at_ms = report_completed_at_ms.max(receipt.emitted_at_ms);
+
+        let outcome = match receipt.outcome.as_str() {
+            "committed" => {
+                committed_count += 1;
+                TxCommitStepOutcome::Committed {
+                    reason_code: receipt.reason_code.clone(),
+                }
+            }
+            "failed" => {
+                failed_count += 1;
+                failure_boundary.get_or_insert_with(|| step.step_id.0.clone());
+                if report_error_code.is_none() {
+                    report_error_code.clone_from(&receipt.error_code);
+                }
+                TxCommitStepOutcome::Failed {
+                    reason_code: receipt.reason_code.clone(),
+                }
+            }
+            "skipped" => {
+                skipped_count += 1;
+                TxCommitStepOutcome::Skipped {
+                    reason_code: receipt.reason_code.clone(),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown commit receipt outcome '{other}' for step {}",
+                    step.step_id.0
+                ));
+            }
+        };
+
+        step_results.push(TxCommitStepResult {
+            step_id: step.step_id.clone(),
+            ordinal: step.ordinal,
+            outcome,
+            decision_path: receipt.decision_path.clone(),
+            completed_at_ms: receipt.emitted_at_ms,
+        });
+    }
+
+    let (outcome, reason_code) = if failed_count == 0 {
+        (TxCommitOutcome::FullyCommitted, "fully_committed")
+    } else if committed_count == 0 {
+        (TxCommitOutcome::ImmediateFailure, "immediate_failure")
+    } else {
+        (TxCommitOutcome::PartialFailure, "partial_failure")
+    };
+
+    Ok(TxCommitReport {
+        tx_id: contract.intent.tx_id.clone(),
+        plan_id: contract.plan.plan_id.clone(),
+        outcome,
+        step_results,
+        failure_boundary,
+        committed_count,
+        failed_count,
+        skipped_count,
+        decision_path: "rollback_commit_receipts".to_string(),
+        reason_code: reason_code.to_string(),
+        error_code: report_error_code,
+        completed_at_ms: report_completed_at_ms,
+        receipts: commit_receipts,
+    })
+}
+
 fn tx_last_receipt_seq(receipts: &[serde_json::Value]) -> u64 {
     receipts
         .iter()
@@ -3760,10 +3908,17 @@ impl fmt::Display for TxPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxReceipt {
     pub seq: u64,
+    pub phase: String,
+    pub tx_id: String,
+    pub plan_id: String,
     pub state: MissionTxState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    pub outcome: String,
     pub emitted_at_ms: i64,
-    pub reason_code: Option<String>,
+    pub reason_code: String,
     pub error_code: Option<String>,
+    pub decision_path: String,
 }
 
 /// Record of a single step's execution within a transaction.
@@ -4020,15 +4175,15 @@ pub fn reconstruct_tx_resume_state(
                 committed_step_ids.push(result.step_id.clone());
             }
         }
-    }
-
-    // Also mark commit as completed if a settled receipt exists (terminal or failed).
-    for receipt_val in &contract.receipts {
-        if let Ok(receipt) = serde_json::from_value::<TxReceipt>(receipt_val.clone()) {
-            if receipt.state.is_settled() {
-                commit_phase_completed = true;
-            }
-        }
+    } else if let Ok(receipt_report) = mission_tx_rollback_commit_report(contract, now_ms) {
+        commit_phase_completed = true;
+        committed_step_ids.extend(
+            receipt_report
+                .step_results
+                .into_iter()
+                .filter(|result| result.outcome.is_committed())
+                .map(|result| result.step_id),
+        );
     }
 
     let mut compensated_step_ids = Vec::new();
@@ -6478,6 +6633,103 @@ mod tests {
         assert_eq!(inputs[1].reason_code, "compensation_failed_injected");
         assert_eq!(inputs[1].error_code.as_deref(), Some("FTX4999"));
         assert!(inputs[2].success);
+    }
+
+    #[test]
+    fn tx_receipts_round_trip_through_typed_schema() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(Some("tx-step:2")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let receipt =
+            serde_json::from_value::<TxReceipt>(report.receipts[0].clone()).expect("typed receipt");
+        assert_eq!(receipt.phase, "commit");
+        assert_eq!(receipt.tx_id, "tx:test");
+        assert_eq!(receipt.plan_id, "plan:test");
+        assert_eq!(receipt.step_id.as_deref(), Some("tx-step:1"));
+        assert_eq!(receipt.outcome, "committed");
+        assert_eq!(receipt.reason_code, "commit_succeeded");
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_uses_receipts_instead_of_marking_every_step_committed() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:2")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut rollback_contract = sample_tx_contract(MissionTxState::Failed);
+        rollback_contract.receipts = commit_report.receipts.clone();
+
+        let rollback_report =
+            mission_tx_rollback_commit_report(&rollback_contract, 11_000).expect("rollback report");
+
+        assert_eq!(rollback_report.outcome, TxCommitOutcome::PartialFailure);
+        assert_eq!(rollback_report.committed_count, 1);
+        assert_eq!(rollback_report.failed_count, 1);
+        assert_eq!(rollback_report.skipped_count, 1);
+        assert_eq!(
+            rollback_report.failure_boundary.as_deref(),
+            Some("tx-step:2")
+        );
+        assert!(rollback_report.step_results[0].outcome.is_committed());
+        assert!(!rollback_report.step_results[1].outcome.is_committed());
+        assert!(rollback_report.step_results[2].outcome.is_skipped());
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_non_committed_tx_without_commit_receipts() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let err = mission_tx_rollback_commit_report(&contract, 55).expect_err("rollback error");
+        assert!(err.contains("rollback requires commit receipts or a committed tx state"));
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_receipts_for_another_contract() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut rollback_contract = sample_tx_contract(MissionTxState::Failed);
+        rollback_contract.intent.tx_id = TxId("tx:other".to_string());
+        rollback_contract.receipts = commit_report.receipts;
+
+        let err =
+            mission_tx_rollback_commit_report(&rollback_contract, 11_000).expect_err("mismatch");
+        assert!(err.contains("commit receipt does not belong to tx tx:other / plan plan:test"));
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_falls_back_to_synthetic_for_committed_tx_without_receipts() {
+        let contract = sample_tx_contract(MissionTxState::Committed);
+        let report =
+            mission_tx_rollback_commit_report(&contract, 5_151).expect("synthetic fallback");
+
+        assert_eq!(report.outcome, TxCommitOutcome::FullyCommitted);
+        assert_eq!(report.committed_count, 3);
+        assert!(
+            report
+                .step_results
+                .iter()
+                .all(|result| result.outcome.is_committed())
+        );
     }
 
     #[test]

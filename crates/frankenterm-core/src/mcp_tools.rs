@@ -2458,24 +2458,37 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
 
+        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let commit_report = match crate::plan::mission_tx_rollback_commit_report(&contract, now_ms)
+        {
+            Ok(report) => report,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    err,
+                    Some(
+                        "Use wa.tx_show(include_contract=true) and ensure the contract includes commit receipts for the steps that actually committed."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
         if let Some(step_id) = params.fail_compensation_for_step.as_deref()
-            && !contract
-                .plan
-                .steps
+            && !commit_report
+                .step_results
                 .iter()
-                .any(|step| step.step_id.0 == step_id)
+                .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
         {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
                 format!("Unknown fail_compensation_for_step: {step_id}"),
-                Some("Use step IDs from wa.tx_show(include_contract=true).".to_string()),
+                Some("Use a committed step ID from wa.tx_show(include_contract=true).".to_string()),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
         }
-
-        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
-        let commit_report = mcp_build_tx_synthetic_commit_report(&contract, now_ms);
         let comp_inputs = mcp_build_tx_compensation_inputs(
             &commit_report,
             params.fail_compensation_for_step.as_deref(),
@@ -4314,9 +4327,9 @@ mod tests {
     };
     use crate::mcp_error::MCP_ERR_INVALID_ARGS;
     use crate::plan::{
-        MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
-        TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep,
-        TxStepId,
+        MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
+        MissionTxState, StepAction, TxCommitStepInput, TxCompensation, TxId, TxIntent, TxOutcome,
+        TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId, execute_commit_phase,
     };
     use tempfile::TempDir;
 
@@ -4505,6 +4518,44 @@ mod tests {
     fn write_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path::PathBuf {
         let path = dir.path().join("tx-contract.json");
         let contract = sample_tx_contract(state);
+        std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
+    fn write_tx_contract_with_partial_commit_receipts(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("tx-contract-with-receipts.json");
+        let mut contract = sample_tx_contract(MissionTxState::Failed);
+        let commit_report = execute_commit_phase(
+            &sample_tx_contract(MissionTxState::Prepared),
+            &[
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:1".to_string()),
+                    success: true,
+                    reason_code: "commit_step_succeeded".to_string(),
+                    error_code: None,
+                    completed_at_ms: 10_001,
+                },
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:2".to_string()),
+                    success: false,
+                    reason_code: "commit_step_failed_injected".to_string(),
+                    error_code: Some("FTX3999".to_string()),
+                    completed_at_ms: 10_002,
+                },
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:3".to_string()),
+                    success: true,
+                    reason_code: "commit_step_succeeded".to_string(),
+                    error_code: None,
+                    completed_at_ms: 10_003,
+                },
+            ],
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        contract.receipts = commit_report.receipts;
         std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
         path
     }
@@ -5101,8 +5152,34 @@ mod tests {
         );
         assert_eq!(
             envelope["hint"],
-            "Use step IDs from wa.tx_show(include_contract=true)."
+            "Use a committed step ID from wa.tx_show(include_contract=true)."
         );
+    }
+
+    #[test]
+    fn tx_rollback_tool_uses_receipts_to_compensate_only_committed_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract_with_partial_commit_receipts(&dir);
+        let tool = WaTxRollbackTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(
+            envelope["data"]["compensation_report"]["compensated_count"],
+            1
+        );
+        assert_eq!(envelope["data"]["compensation_report"]["failed_count"], 0);
+        assert_eq!(envelope["data"]["compensation_report"]["skipped_count"], 0);
+        assert_eq!(envelope["data"]["final_state"], "rolled_back");
     }
 
     #[test]

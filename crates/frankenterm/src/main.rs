@@ -15,11 +15,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
+#[cfg(test)]
+use frankenterm_core::plan::mission_tx_synthetic_commit_report as build_robot_tx_synthetic_commit_report;
 use frankenterm_core::plan::{
     mission_tx_commit_step_inputs as build_robot_tx_commit_step_inputs,
     mission_tx_compensation_inputs as build_robot_tx_compensation_inputs,
     mission_tx_prepare_gate_inputs as build_robot_tx_prepare_gate_inputs,
-    mission_tx_synthetic_commit_report as build_robot_tx_synthetic_commit_report,
+    mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
@@ -18889,12 +18891,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                         };
 
+                                    let now_ms = mission_now_ms();
+                                    let commit_report = match build_robot_tx_rollback_commit_report(
+                                        &contract, now_ms,
+                                    ) {
+                                        Ok(report) => report,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
+                                                    RobotTxRollbackData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_INVALID_ARGS,
+                                                    err,
+                                                    Some(
+                                                        "Run `ft robot tx show --include-contract` and ensure the contract includes commit receipts for the steps that actually committed."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
                                     if let Some(step_id) = fail_compensation_for_step.as_deref()
-                                        && !contract
-                                            .plan
-                                            .steps
-                                            .iter()
-                                            .any(|step| step.step_id.0 == step_id)
+                                        && !commit_report.step_results.iter().any(|result| {
+                                            result.step_id.0 == step_id
+                                                && result.outcome.is_committed()
+                                        })
                                     {
                                         let response =
                                             RobotResponse::<RobotTxRollbackData>::error_with_code(
@@ -18911,10 +18933,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
-
-                                    let now_ms = mission_now_ms();
-                                    let commit_report =
-                                        build_robot_tx_synthetic_commit_report(&contract, now_ms);
                                     let comp_inputs = build_robot_tx_compensation_inputs(
                                         &commit_report,
                                         fail_compensation_for_step.as_deref(),
@@ -34650,12 +34668,27 @@ fn handle_tx_command(
                 Err(err) => emit_mission_error(output_format, err),
             };
 
+            let now_ms = mission_now_ms();
+            let commit_report = match build_robot_tx_rollback_commit_report(&contract, now_ms) {
+                Ok(report) => report,
+                Err(err) => emit_mission_error(
+                    output_format,
+                    MissionCommandError {
+                        exit_code: MISSION_EXIT_INVALID_INPUT,
+                        error_code: "mission.tx.rollback_receipts_required",
+                        message: err,
+                        hint: Some(
+                            "Run `ft tx show --include-contract` and ensure the contract includes commit receipts for the steps that actually committed."
+                                .to_string(),
+                        ),
+                    },
+                ),
+            };
             if let Some(step_id) = fail_compensation_for_step.as_deref()
-                && !contract
-                    .plan
-                    .steps
+                && !commit_report
+                    .step_results
                     .iter()
-                    .any(|step| step.step_id.0 == step_id)
+                    .any(|result| result.step_id.0 == step_id && result.outcome.is_committed())
             {
                 emit_mission_error(
                     output_format,
@@ -34664,15 +34697,12 @@ fn handle_tx_command(
                         error_code: "mission.tx.unknown_compensation_step",
                         message: format!("Unknown --fail-compensation-for-step: {step_id}"),
                         hint: Some(
-                            "Use `ft tx show --include-contract` to inspect valid step IDs."
+                            "Use a committed step ID from `ft tx show --include-contract`."
                                 .to_string(),
                         ),
                     },
                 );
             }
-
-            let now_ms = mission_now_ms();
-            let commit_report = build_robot_tx_synthetic_commit_report(&contract, now_ms);
             let compensation_inputs = build_robot_tx_compensation_inputs(
                 &commit_report,
                 fail_compensation_for_step.as_deref(),
