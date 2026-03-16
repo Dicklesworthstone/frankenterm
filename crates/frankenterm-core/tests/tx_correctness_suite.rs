@@ -228,7 +228,15 @@ fn sm_compensation_requires_compensating() {
 fn sm_terminal_states_are_terminal() {
     assert!(MissionTxState::Committed.is_terminal());
     assert!(MissionTxState::RolledBack.is_terminal());
-    assert!(MissionTxState::Failed.is_terminal());
+    assert!(MissionTxState::Compensated.is_terminal());
+}
+
+#[test]
+fn sm_failed_is_not_terminal_but_is_settled() {
+    // Failed can still transition to Compensating, so it's not terminal.
+    assert!(!MissionTxState::Failed.is_terminal());
+    // But it IS settled (no automatic forward progress without intervention).
+    assert!(MissionTxState::Failed.is_settled());
 }
 
 #[test]

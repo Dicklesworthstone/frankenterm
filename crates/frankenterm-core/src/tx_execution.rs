@@ -312,16 +312,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         contract.outcome = outcome.clone();
         decision_path.push_str(&format!("->final:{final_state}"));
 
-        // Transition ledger to terminal phase
-        let terminal_phase = if final_state == MissionTxState::Committed
-            || final_state == MissionTxState::Compensated
-            || final_state == MissionTxState::RolledBack
-        {
-            TxPhase::Completed
-        } else {
-            TxPhase::Aborted
-        };
-        let _ = ledger.transition_phase(terminal_phase);
+        // Transition ledger to terminal phase (skip if outcome is Pending —
+        // the tx is suspended, not finished)
+        if outcome != TxOutcome::Pending {
+            let terminal_phase = if final_state.is_terminal() {
+                TxPhase::Completed
+            } else {
+                TxPhase::Aborted
+            };
+            let _ = ledger.transition_phase(terminal_phase);
+        }
 
         // Emit completion event
         events.push(self.make_event(
@@ -695,7 +695,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    #[allow(clippy::unused_self)]
     fn determine_final_outcome(
         &self,
         current_state: MissionTxState,
@@ -704,6 +703,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     ) -> (MissionTxState, TxOutcome) {
         if commit_report.is_fully_committed() {
             return (MissionTxState::Committed, TxOutcome::Committed);
+        }
+
+        // Paused: remain in a resumable state, not Failed. The commit was
+        // suspended before completion — no steps failed, so this is not a
+        // failure. The operator can resume later.
+        if commit_report.outcome == TxCommitOutcome::PauseSuspended {
+            return (current_state, TxOutcome::Pending);
         }
 
         if let Some(comp) = compensation_report {

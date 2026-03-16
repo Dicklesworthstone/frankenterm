@@ -2597,13 +2597,23 @@ pub enum MissionTxState {
 }
 
 impl MissionTxState {
-    /// Whether this tx state is terminal (no further transitions).
+    /// Whether this tx state is terminal (no further transitions possible).
+    ///
+    /// Note: `Failed` is NOT terminal — it can transition to `Compensating`.
+    /// Use `is_settled()` to check for states that are either terminal or
+    /// require explicit operator intervention to proceed.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Committed | Self::Compensated | Self::RolledBack | Self::Failed
-        )
+        matches!(self, Self::Committed | Self::Compensated | Self::RolledBack)
+    }
+
+    /// Whether this tx state is settled (terminal or failed-awaiting-compensation).
+    ///
+    /// `Failed` is settled but not terminal: it can still transition to
+    /// `Compensating` via explicit operator action or automatic retry.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        self.is_terminal() || matches!(self, Self::Failed)
     }
 }
 
@@ -3919,7 +3929,9 @@ pub fn validate_tx_idempotency(
             verdict: TxIdempotencyVerdict::FirstExecution,
         },
         Some(rec) => {
-            // If prior execution is in a terminal state, block.
+            // If prior execution reached a true terminal state (committed,
+            // compensated, or rolled back), block re-execution.
+            // Note: `Failed` is NOT terminal — it can still be compensated.
             if rec.lifecycle_state.is_terminal() {
                 return TxIdempotencyCheck {
                     verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {
@@ -4010,10 +4022,10 @@ pub fn reconstruct_tx_resume_state(
         }
     }
 
-    // Also mark commit as completed if a terminal receipt exists.
+    // Also mark commit as completed if a settled receipt exists (terminal or failed).
     for receipt_val in &contract.receipts {
         if let Ok(receipt) = serde_json::from_value::<TxReceipt>(receipt_val.clone()) {
-            if receipt.state.is_terminal() {
+            if receipt.state.is_settled() {
                 commit_phase_completed = true;
             }
         }
