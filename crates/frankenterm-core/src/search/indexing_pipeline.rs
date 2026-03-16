@@ -375,17 +375,19 @@ impl ContentIndexingPipeline {
             return report;
         }
 
-        let ingest_report =
-            match self
-                .index
-                .ingest_documents(&all_docs, now_ms, resize_storm_active, cass_hashes)
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    // On ingest error, return partial report with what we have so far.
-                    return report;
-                }
-            };
+        let ingest_outcome = match self.index.ingest_documents_detailed(
+            &all_docs,
+            now_ms,
+            resize_storm_active,
+            cass_hashes,
+        ) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // On ingest error, return partial report with what we have so far.
+                return report;
+            }
+        };
+        let ingest_report = ingest_outcome.report;
 
         let handled_watermark_updates = if ingest_report.deferred_rate_limited_docs == 0 {
             watermark_updates.clone()
@@ -417,25 +419,13 @@ impl ContentIndexingPipeline {
         };
         self.apply_watermark_updates(&handled_watermark_updates);
 
-        // Update per-pane doc counts (approximate: distribute accepted docs
-        // proportionally to pane content contribution).
         let accepted = ingest_report.accepted_docs as u64;
         self.total_docs_indexed += accepted;
         self.total_lines_consumed += report.total_lines_consumed as u64;
 
-        // Distribute accepted docs to watermarks by counting per-pane contributions.
-        let mut pane_doc_counts: HashMap<u64, u64> = HashMap::new();
-        for doc in &all_docs {
-            if let Some(pid) = doc.pane_id {
-                *pane_doc_counts.entry(pid).or_insert(0) += 1;
-            }
-        }
-        let total_submitted = all_docs.len().max(1) as f64;
-        for (pid, count) in &pane_doc_counts {
-            if let Some(wm) = self.watermarks.get_mut(pid) {
-                // Scale accepted docs by this pane's share of submitted docs.
-                let share = (*count as f64 / total_submitted * accepted as f64).round() as u64;
-                wm.total_docs_indexed += share;
+        for (pid, count) in ingest_outcome.accepted_docs_by_pane {
+            if let Some(wm) = self.watermarks.get_mut(&pid) {
+                wm.total_docs_indexed += count;
             }
         }
 
@@ -1025,6 +1015,88 @@ mod tests {
         assert_eq!(pane1.last_indexed_at_ms, 1000);
         assert_eq!(pane1.session_id.as_deref(), Some("sess-1"));
         assert_eq!(pipeline.watermark(2), None);
+    }
+
+    #[test]
+    fn tick_tracks_exact_per_pane_doc_counts_after_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index_with_config(
+            dir.path(),
+            IndexingConfig {
+                index_dir: dir.path().to_path_buf(),
+                max_index_size_bytes: 10 * 1024 * 1024,
+                ttl_days: 30,
+                flush_interval_secs: 60,
+                flush_docs_threshold: 100,
+                max_docs_per_second: 1000,
+            },
+        );
+        let mut pipeline = ContentIndexingPipeline::new(
+            PipelineConfig {
+                extract_artifacts: false,
+                ..test_config()
+            },
+            index,
+        );
+
+        let seed = vec![(1u64, None, make_lines(&["duplicate"], 1000, 100))];
+        let seed_report = pipeline.tick(&seed, 1500, false, None);
+        assert_eq!(seed_report.ingest_report.accepted_docs, 1);
+        assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 1);
+
+        let panes = vec![
+            (1u64, None, make_lines(&["duplicate"], 2000, 100)),
+            (
+                2u64,
+                None,
+                make_lines(&["fresh-a", "", "fresh-b"], 3000, 100),
+            ),
+        ];
+        let report = pipeline.tick(&panes, 3500, false, None);
+
+        assert_eq!(report.ingest_report.accepted_docs, 2);
+        assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 1);
+        assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 2);
+        assert_eq!(pipeline.status(4000).total_docs_indexed, 3);
+    }
+
+    #[test]
+    fn tick_counts_exact_accepted_docs_per_pane_when_other_docs_are_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index_with_config(
+            dir.path(),
+            IndexingConfig {
+                index_dir: dir.path().to_path_buf(),
+                max_index_size_bytes: 10 * 1024 * 1024,
+                ttl_days: 30,
+                flush_interval_secs: 60,
+                flush_docs_threshold: 100,
+                max_docs_per_second: 1000,
+            },
+        );
+        let mut pipeline = ContentIndexingPipeline::new(
+            PipelineConfig {
+                extract_artifacts: false,
+                ..test_config()
+            },
+            index,
+        );
+
+        let seed = vec![(2u64, None, make_lines(&["dup"], 1000, 100))];
+        let seed_report = pipeline.tick(&seed, 2000, false, None);
+        assert_eq!(seed_report.ingest_report.accepted_docs, 1);
+        assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 1);
+
+        let panes = vec![
+            (1u64, None, make_lines(&["alpha", "beta"], 4000, 6000)),
+            (2u64, None, make_lines(&["dup"], 3000, 100)),
+        ];
+        let report = pipeline.tick(&panes, 5000, false, None);
+
+        assert_eq!(report.ingest_report.accepted_docs, 2);
+        assert_eq!(report.ingest_report.skipped_duplicate_docs, 1);
+        assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 2);
+        assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 1);
     }
 
     #[test]

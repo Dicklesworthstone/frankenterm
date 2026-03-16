@@ -281,6 +281,13 @@ struct FlushOutcome {
     reason: IndexFlushReason,
 }
 
+/// Detailed ingest outcome used by higher-level pipeline accounting.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IngestOutcome {
+    pub(crate) report: IndexingIngestReport,
+    pub(crate) accepted_docs_by_pane: HashMap<u64, u64>,
+}
+
 /// Persistent incremental index with dedup + lifecycle policies.
 pub struct SearchIndex {
     config: IndexingConfig,
@@ -363,14 +370,31 @@ impl SearchIndex {
         resize_storm_active: bool,
         cass_hashes: Option<&dyn CassContentHashProvider>,
     ) -> Result<IndexingIngestReport> {
+        Ok(self
+            .ingest_documents_detailed(docs, now_ms, resize_storm_active, cass_hashes)?
+            .report)
+    }
+
+    /// Ingest documents and return aggregate plus exact per-pane accepted counts.
+    pub(crate) fn ingest_documents_detailed(
+        &mut self,
+        docs: &[IndexableDocument],
+        now_ms: i64,
+        resize_storm_active: bool,
+        cass_hashes: Option<&dyn CassContentHashProvider>,
+    ) -> Result<IngestOutcome> {
         let mut report = IndexingIngestReport {
             submitted_docs: docs.len(),
             ..IndexingIngestReport::default()
         };
+        let mut accepted_docs_by_pane = HashMap::new();
 
         if resize_storm_active {
             report.skipped_resize_pause_docs = docs.len();
-            return Ok(report);
+            return Ok(IngestOutcome {
+                report,
+                accepted_docs_by_pane,
+            });
         }
 
         for doc in docs {
@@ -402,6 +426,9 @@ impl SearchIndex {
             self.pending.push(indexed_doc);
             self.rate_window_docs = self.rate_window_docs.saturating_add(1);
             report.accepted_docs += 1;
+            if let Some(pane_id) = doc.pane_id {
+                *accepted_docs_by_pane.entry(pane_id).or_insert(0) += 1;
+            }
         }
 
         if let Some(outcome) = self.flush_if_due(now_ms)? {
@@ -411,7 +438,10 @@ impl SearchIndex {
             report.flush_reason = Some(outcome.reason);
         }
 
-        Ok(report)
+        Ok(IngestOutcome {
+            report,
+            accepted_docs_by_pane,
+        })
     }
 
     /// Trigger interval-based flush checks and maintenance.
