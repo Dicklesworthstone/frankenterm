@@ -459,6 +459,12 @@ impl SearchIndex {
         now_ms: i64,
         cass_hashes: Option<&dyn CassContentHashProvider>,
     ) -> Result<IndexingIngestReport> {
+        let original_state = self.state.clone();
+        let original_pending = self.pending.clone();
+        let original_known_hashes = self.known_hashes.clone();
+        let original_rate_window_started_ms = self.rate_window_started_ms;
+        let original_rate_window_docs = self.rate_window_docs;
+
         self.state.documents.clear();
         self.pending.clear();
         self.known_hashes.clear();
@@ -468,17 +474,29 @@ impl SearchIndex {
         self.rate_window_docs = 0;
 
         // Reindex should not be constrained by per-second throttle.
-        let original_limit = self.config.max_docs_per_second;
-        self.config.max_docs_per_second = u32::MAX;
-        let mut report = self.ingest_documents(docs, now_ms, false, cass_hashes)?;
+        let original_limit = std::mem::replace(&mut self.config.max_docs_per_second, u32::MAX);
+        let reindex_result = (|| {
+            let mut report = self.ingest_documents(docs, now_ms, false, cass_hashes)?;
+            let flush = self.flush_now(now_ms, IndexFlushReason::Reindex)?;
+            report.flushed_docs = report.flushed_docs.saturating_add(flush.flushed_docs);
+            report.expired_docs = report.expired_docs.saturating_add(flush.expired_docs);
+            report.evicted_docs = report.evicted_docs.saturating_add(flush.evicted_docs);
+            report.flush_reason = flush.flush_reason;
+            Ok(report)
+        })();
         self.config.max_docs_per_second = original_limit;
 
-        let flush = self.flush_now(now_ms, IndexFlushReason::Reindex)?;
-        report.flushed_docs = report.flushed_docs.saturating_add(flush.flushed_docs);
-        report.expired_docs = report.expired_docs.saturating_add(flush.expired_docs);
-        report.evicted_docs = report.evicted_docs.saturating_add(flush.evicted_docs);
-        report.flush_reason = flush.flush_reason;
-        Ok(report)
+        match reindex_result {
+            Ok(report) => Ok(report),
+            Err(err) => {
+                self.state = original_state;
+                self.pending = original_pending;
+                self.known_hashes = original_known_hashes;
+                self.rate_window_started_ms = original_rate_window_started_ms;
+                self.rate_window_docs = original_rate_window_docs;
+                Err(err)
+            }
+        }
     }
 
     /// Search indexed documents with simple normalized substring matching.
@@ -1980,6 +1998,42 @@ mod tests {
         // Old content should be gone
         let hits = index.search("old content", 10, 2300);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_reindex_restores_state_and_rate_limit_after_ingest_error() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = make_config(dir.path());
+        cfg.flush_docs_threshold = 1;
+        cfg.max_docs_per_second = 2;
+        let index_dir = cfg.index_dir.clone();
+        let mut index = SearchIndex::open(cfg).expect("open");
+
+        let original = make_doc("old content", 1000, SearchDocumentSource::Scrollback);
+        index
+            .ingest_documents(&[original], 1010, false, None)
+            .expect("ingest original doc");
+
+        std::fs::remove_dir_all(&index_dir).expect("remove index dir");
+        std::fs::write(&index_dir, b"not-a-directory").expect("replace index dir with file");
+
+        let err = index
+            .reindex_documents(
+                &[make_doc(
+                    "new content",
+                    2000,
+                    SearchDocumentSource::Scrollback,
+                )],
+                2200,
+                None,
+            )
+            .expect_err("reindex should fail when state path parent is not a directory");
+        assert!(matches!(err, SearchIndexError::Io(_)));
+        assert_eq!(index.config().max_docs_per_second, 2);
+        assert_eq!(index.documents().len(), 1);
+        let hits = index.search("old content", 10, 2300);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "old content");
     }
 
     // -----------------------------------------------------------------------

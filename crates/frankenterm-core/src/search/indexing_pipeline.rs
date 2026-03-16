@@ -225,6 +225,24 @@ impl ContentIndexingPipeline {
         &mut self.index
     }
 
+    fn apply_watermark_updates(&mut self, updates: &[(u64, Option<String>, i64)]) {
+        for (pane_id, session_id, max_processed_ts) in updates {
+            let entry = self
+                .watermarks
+                .entry(*pane_id)
+                .or_insert_with(|| PaneWatermark {
+                    pane_id: *pane_id,
+                    last_indexed_at_ms: i64::MIN,
+                    total_docs_indexed: 0,
+                    session_id: session_id.clone(),
+                });
+            if *max_processed_ts > entry.last_indexed_at_ms {
+                entry.last_indexed_at_ms = *max_processed_ts;
+            }
+            entry.session_id.clone_from(session_id);
+        }
+    }
+
     /// Run one indexing tick across the given pane content.
     ///
     /// Each entry in `pane_content` is `(pane_id, session_id, scrollback_lines)`.
@@ -268,6 +286,7 @@ impl ContentIndexingPipeline {
 
         let mut report = PipelineTickReport::default();
         let mut all_docs: Vec<IndexableDocument> = Vec::new();
+        let mut watermark_updates: Vec<(u64, Option<String>, i64)> = Vec::new();
 
         // Process each pane up to the per-tick pane limit.
         for (pane_id, session_id, lines) in pane_content.iter().take(self.config.max_panes_per_tick)
@@ -347,29 +366,20 @@ impl ContentIndexingPipeline {
                 .map(|l| l.captured_at_ms)
                 .max()
                 .unwrap_or(watermark_ms);
-            let entry = self
-                .watermarks
-                .entry(*pane_id)
-                .or_insert_with(|| PaneWatermark {
-                    pane_id: *pane_id,
-                    last_indexed_at_ms: i64::MIN,
-                    total_docs_indexed: 0,
-                    session_id: session_id.clone(),
-                });
-            if max_processed_ts > entry.last_indexed_at_ms {
-                entry.last_indexed_at_ms = max_processed_ts;
-            }
-            entry.session_id.clone_from(session_id);
+            watermark_updates.push((*pane_id, session_id.clone(), max_processed_ts));
         }
 
         // Ingest all extracted documents into the search index.
-        if !all_docs.is_empty() {
-            let ingest_report = match self.index.ingest_documents(
-                &all_docs,
-                now_ms,
-                resize_storm_active,
-                cass_hashes,
-            ) {
+        if all_docs.is_empty() {
+            self.apply_watermark_updates(&watermark_updates);
+            return report;
+        }
+
+        let ingest_report =
+            match self
+                .index
+                .ingest_documents(&all_docs, now_ms, resize_storm_active, cass_hashes)
+            {
                 Ok(r) => r,
                 Err(_) => {
                     // On ingest error, return partial report with what we have so far.
@@ -377,30 +387,59 @@ impl ContentIndexingPipeline {
                 }
             };
 
-            // Update per-pane doc counts (approximate: distribute accepted docs
-            // proportionally to pane content contribution).
-            let accepted = ingest_report.accepted_docs as u64;
-            self.total_docs_indexed += accepted;
-            self.total_lines_consumed += report.total_lines_consumed as u64;
-
-            // Distribute accepted docs to watermarks by counting per-pane contributions.
-            let mut pane_doc_counts: HashMap<u64, u64> = HashMap::new();
-            for doc in &all_docs {
-                if let Some(pid) = doc.pane_id {
-                    *pane_doc_counts.entry(pid).or_insert(0) += 1;
+        let handled_watermark_updates = if ingest_report.deferred_rate_limited_docs == 0 {
+            watermark_updates.clone()
+        } else {
+            let handled_docs = all_docs
+                .len()
+                .saturating_sub(ingest_report.deferred_rate_limited_docs);
+            let mut handled_by_pane: HashMap<u64, (Option<String>, i64)> = HashMap::new();
+            for doc in all_docs.iter().take(handled_docs) {
+                let Some(pane_id) = doc.pane_id else {
+                    continue;
+                };
+                let entry = handled_by_pane
+                    .entry(pane_id)
+                    .or_insert_with(|| (doc.session_id.clone(), doc.captured_at_ms));
+                if doc.captured_at_ms > entry.1 {
+                    entry.1 = doc.captured_at_ms;
+                }
+                if entry.0.is_none() {
+                    entry.0 = doc.session_id.clone();
                 }
             }
-            let total_submitted = all_docs.len().max(1) as f64;
-            for (pid, count) in &pane_doc_counts {
-                if let Some(wm) = self.watermarks.get_mut(pid) {
-                    // Scale accepted docs by this pane's share of submitted docs.
-                    let share = (*count as f64 / total_submitted * accepted as f64).round() as u64;
-                    wm.total_docs_indexed += share;
-                }
-            }
+            handled_by_pane
+                .into_iter()
+                .map(|(pane_id, (session_id, max_processed_ts))| {
+                    (pane_id, session_id, max_processed_ts)
+                })
+                .collect()
+        };
+        self.apply_watermark_updates(&handled_watermark_updates);
 
-            report.ingest_report = ingest_report;
+        // Update per-pane doc counts (approximate: distribute accepted docs
+        // proportionally to pane content contribution).
+        let accepted = ingest_report.accepted_docs as u64;
+        self.total_docs_indexed += accepted;
+        self.total_lines_consumed += report.total_lines_consumed as u64;
+
+        // Distribute accepted docs to watermarks by counting per-pane contributions.
+        let mut pane_doc_counts: HashMap<u64, u64> = HashMap::new();
+        for doc in &all_docs {
+            if let Some(pid) = doc.pane_id {
+                *pane_doc_counts.entry(pid).or_insert(0) += 1;
+            }
         }
+        let total_submitted = all_docs.len().max(1) as f64;
+        for (pid, count) in &pane_doc_counts {
+            if let Some(wm) = self.watermarks.get_mut(pid) {
+                // Scale accepted docs by this pane's share of submitted docs.
+                let share = (*count as f64 / total_submitted * accepted as f64).round() as u64;
+                wm.total_docs_indexed += share;
+            }
+        }
+
+        report.ingest_report = ingest_report;
 
         report
     }
@@ -509,6 +548,14 @@ mod tests {
             flush_interval_secs: 1,
             flush_docs_threshold: 5,
             max_docs_per_second: 1000,
+        })
+        .unwrap()
+    }
+
+    fn test_index_with_config(dir: &std::path::Path, config: IndexingConfig) -> SearchIndex {
+        SearchIndex::open(IndexingConfig {
+            index_dir: dir.to_path_buf(),
+            ..config
         })
         .unwrap()
     }
@@ -637,6 +684,7 @@ mod tests {
         let wm = pipeline.watermark(1).unwrap();
         assert!(wm.last_indexed_at_ms > 0);
         assert_eq!(wm.session_id, Some("session-a".to_string()));
+        assert!(wm.total_docs_indexed > 0);
     }
 
     #[test]
@@ -865,6 +913,118 @@ mod tests {
         assert_eq!(report.panes_processed, 1);
         let wm = pipeline.watermark(5).unwrap();
         assert_eq!(wm.session_id, Some("my-session".to_string()));
+    }
+
+    #[test]
+    fn tick_does_not_advance_watermark_when_ingest_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("index");
+        let index = test_index_with_config(
+            &index_dir,
+            IndexingConfig {
+                index_dir: index_dir.clone(),
+                max_index_size_bytes: 10 * 1024 * 1024,
+                ttl_days: 30,
+                flush_interval_secs: 1,
+                flush_docs_threshold: 1,
+                max_docs_per_second: 1000,
+            },
+        );
+        let mut pipeline = ContentIndexingPipeline::new(
+            PipelineConfig {
+                extract_artifacts: false,
+                ..test_config()
+            },
+            index,
+        );
+
+        std::fs::remove_dir_all(&index_dir).unwrap();
+        std::fs::write(&index_dir, b"not-a-directory").unwrap();
+
+        let panes = vec![(1u64, None, make_lines(&["alpha"], 1000, 100))];
+        let report = pipeline.tick(&panes, 2000, false, None);
+
+        assert_eq!(report.panes_processed, 1);
+        assert_eq!(pipeline.watermark(1), None);
+    }
+
+    #[test]
+    fn tick_advances_watermark_only_to_handled_prefix_when_docs_are_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index_with_config(
+            dir.path(),
+            IndexingConfig {
+                index_dir: dir.path().to_path_buf(),
+                max_index_size_bytes: 10 * 1024 * 1024,
+                ttl_days: 30,
+                flush_interval_secs: 60,
+                flush_docs_threshold: 100,
+                max_docs_per_second: 1,
+            },
+        );
+        let mut pipeline = ContentIndexingPipeline::new(
+            PipelineConfig {
+                extract_artifacts: false,
+                ..test_config()
+            },
+            index,
+        );
+
+        let panes = vec![(1u64, None, make_lines(&["alpha", "beta"], 1000, 6000))];
+        let report = pipeline.tick(&panes, 2000, false, None);
+
+        assert!(report.ingest_report.deferred_rate_limited_docs > 0);
+        let wm = pipeline
+            .watermark(1)
+            .expect("accepted prefix should advance watermark");
+        assert_eq!(wm.last_indexed_at_ms, 1000);
+        assert!(wm.total_docs_indexed > 0);
+    }
+
+    #[test]
+    fn tick_advances_fully_handled_panes_when_later_panes_are_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index_with_config(
+            dir.path(),
+            IndexingConfig {
+                index_dir: dir.path().to_path_buf(),
+                max_index_size_bytes: 10 * 1024 * 1024,
+                ttl_days: 30,
+                flush_interval_secs: 60,
+                flush_docs_threshold: 100,
+                max_docs_per_second: 1,
+            },
+        );
+        let mut pipeline = ContentIndexingPipeline::new(
+            PipelineConfig {
+                extract_artifacts: false,
+                ..test_config()
+            },
+            index,
+        );
+
+        let panes = vec![
+            (
+                1u64,
+                Some("sess-1".to_string()),
+                make_lines(&["alpha"], 1000, 100),
+            ),
+            (
+                2u64,
+                Some("sess-2".to_string()),
+                make_lines(&["beta"], 2000, 100),
+            ),
+        ];
+        let report = pipeline.tick(&panes, 3000, false, None);
+
+        assert_eq!(report.ingest_report.accepted_docs, 1);
+        assert_eq!(report.ingest_report.deferred_rate_limited_docs, 1);
+        let pane1 = pipeline
+            .watermark(1)
+            .expect("first pane doc was handled before rate limiting");
+        assert_eq!(pane1.last_indexed_at_ms, 1000);
+        assert_eq!(pane1.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(pipeline.watermark(2), None);
     }
 
     #[test]
