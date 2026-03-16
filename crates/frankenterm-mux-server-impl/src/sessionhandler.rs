@@ -121,10 +121,12 @@ impl PerPane {
 
         // Always send the cursor's row, as that tends to the busiest and we don't
         // have a sequencing concept for our idea of the remote state.
-        let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
-        let mut cursor_line = lines.remove(0);
-        cursor_line.compress_for_scrollback();
-        bonus_lines.push((cursor_line_idx, cursor_line));
+        let (cursor_line_idx, lines) =
+            pane.get_lines(cursor_position.y..cursor_position.y.saturating_add(1));
+        if let Some(mut cursor_line) = lines.into_iter().next() {
+            cursor_line.compress_for_scrollback();
+            bonus_lines.push((cursor_line_idx, cursor_line));
+        }
 
         self.cursor_position = cursor_position;
         self.title = title.clone();
@@ -207,7 +209,7 @@ fn maybe_push_pane_changes(
 
 pub struct SessionHandler {
     to_write_tx: PduSender,
-    per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
+    per_pane: HashMap<PaneId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
     proxy_client_id: Option<ClientId>,
 }
@@ -1950,5 +1952,23 @@ mod tests {
         assert!(response.dirty_lines.is_empty());
         assert_eq!(response.tiered_scrollback_status, None);
         assert_eq!(per_pane.tiered_scrollback_status, None);
+    }
+
+    #[test]
+    fn compute_changes_skips_missing_cursor_row_in_bonus_lines() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().cursor_position.y = 99;
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let mut per_pane = PerPane::default();
+
+        let response = per_pane
+            .compute_changes(&pane_dyn, None)
+            .expect("initial pane snapshot should still produce a response");
+
+        let cursor_y = response.cursor_position.y;
+        let (bonus_lines, _images) = response.bonus_lines.extract_data();
+
+        assert!(bonus_lines.is_empty());
+        assert_eq!(cursor_y, 99);
     }
 }
