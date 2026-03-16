@@ -153,6 +153,59 @@ run_rch_gui_build() {
   )
 }
 
+run_rch_gui_prereq_check() {
+  (
+    cd "$PROJECT_ROOT"
+    "$RCH_BIN" exec -- sh -lc '
+      case "$(uname -s)" in
+        Linux)
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            echo "FT_GUI_REMOTE_PREREQ_MISSING:pkg-config" >&2
+            exit 41
+          fi
+          if ! pkg-config --exists x11; then
+            echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
+            pkg-config --print-errors --exists x11 || true
+            exit 42
+          fi
+          ;;
+      esac
+    '
+  )
+}
+
+ensure_remote_gui_prereqs() {
+  local preflight_log="$LOG_DIR/gui-build-preflight.log"
+  : > "$preflight_log"
+
+  if run_rch_gui_prereq_check > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
+    return 0
+  fi
+
+  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:x11' "$preflight_log"; then
+    BUILD_STEP_STATUS="failed"
+    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config x11 / x11.pc)"
+    log "Remote worker is missing X11 development metadata required for frankenterm-gui."
+    log "frankenterm/window has a hard x11 dependency on Linux; provision x11 dev packages on the RCH workers."
+    log "See $preflight_log for the remote preflight output."
+    return 1
+  fi
+
+  if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:pkg-config' "$preflight_log"; then
+    BUILD_STEP_STATUS="failed"
+    BUILD_STEP_DETAIL="build step failed (remote worker missing pkg-config)"
+    log "Remote worker is missing pkg-config, so frankenterm-gui Linux prerequisites cannot be checked."
+    log "See $preflight_log for the remote preflight output."
+    return 1
+  fi
+
+  BUILD_STEP_STATUS="failed"
+  BUILD_STEP_DETAIL="build step failed (remote GUI prerequisite check failed)"
+  log "Remote GUI prerequisite check failed before cargo build."
+  log "See $preflight_log for the remote preflight output."
+  return 1
+}
+
 normalize_gui_target_dir
 
 run_step() {
@@ -247,6 +300,9 @@ build_gui() {
     BUILD_STEP_DETAIL="build step failed (no reachable RCH workers)"
     log "No reachable RCH workers detected; refusing local cargo fallback."
     log "See $RCH_PROBE_LOG for probe details."
+    return 1
+  fi
+  if ! ensure_remote_gui_prereqs; then
     return 1
   fi
   if run_rch_gui_build; then

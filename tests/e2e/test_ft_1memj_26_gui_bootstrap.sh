@@ -183,6 +183,42 @@ EOF
   chmod +x "${mock_bin}/rch"
 }
 
+write_missing_x11_rch() {
+  local mock_bin="$1"
+  local marker_file="$2"
+  mkdir -p "${mock_bin}"
+  cat > "${mock_bin}/rch" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
+  cat <<'JSON'
+{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}
+JSON
+  exit 0
+fi
+
+if [[ "\${1:-}" == "exec" ]]; then
+  shift
+  printf '%s\n' "\$*" >> "${marker_file}"
+  if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
+    echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
+    echo "Package x11 was not found in the pkg-config search path." >&2
+    exit 42
+  fi
+  if [[ "\$*" == *"cargo build"* ]]; then
+    echo "cargo build should not run after failed x11 preflight" >&2
+    exit 99
+  fi
+  printf 'unexpected exec: %s\n' "\$*" >&2
+  exit 64
+fi
+
+printf 'unexpected invocation: %s\n' "\$*" >&2
+exit 64
+EOF
+  chmod +x "${mock_bin}/rch"
+}
+
 write_codesign_mock() {
   local mock_bin="$1"
   local marker_file="$2"
@@ -314,6 +350,58 @@ scenario_e2e_probe_failure_refuses_exec() {
   record_result "e2e_probe_failure_refuses_exec" "true"
 }
 
+scenario_e2e_missing_x11_refuses_cargo() {
+  local scenario_dir="${ARTIFACT_DIR}/e2e_missing_x11_refuses_cargo"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local marker_file="${scenario_dir}/rch-exec.log"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+  local rc
+
+  mkdir -p "${scenario_dir}"
+  write_missing_x11_rch "${mock_bin}" "${marker_file}"
+
+  emit_log "running" "e2e_missing_x11_refuses_cargo" "remote_prereq_guard" "none" "none" "${stdout_file}" "scripts/e2e_gui_bootstrap.sh missing x11"
+  set +e
+  env \
+    RCH_BIN="${mock_bin}/rch" \
+    LOG_DIR="${scenario_dir}/logs" \
+    GUI_TARGET_DIR="${scenario_dir}/target" \
+    "${ROOT_DIR}/scripts/e2e_gui_bootstrap.sh" --skip-bundle >"${stdout_file}" 2>"${stderr_file}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "unexpected_success" "X11_GUARD_MISSING" "script unexpectedly succeeded"
+    return
+  fi
+  if [[ ! -f "${marker_file}" ]]; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
+    return
+  fi
+  if ! grep -q 'pkg-config --exists x11' "${marker_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_preflight_exec" "X11_PREFLIGHT_MISSING" "script never ran the remote x11 preflight"
+    return
+  fi
+  if grep -q 'cargo build' "${marker_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_X11_FAILURE" "cargo build still ran after failed x11 preflight"
+    return
+  fi
+  if ! grep -q 'Remote worker is missing X11 development metadata required for frankenterm-gui.' "${stdout_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_x11_message" "X11_MESSAGE_MISSING" "missing explicit x11 prerequisite message"
+    return
+  fi
+  if ! grep -q '\[SKIP\] 2. verify GUI binary exists (build step failed (remote worker missing pkg-config x11 / x11.pc); GUI binary unavailable)' "${stdout_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "missing_dependency_skip" "DEPENDENCY_SKIP_MISSING" "dependent GUI binary check did not skip after x11 preflight failure"
+    return
+  fi
+  if ! grep -q 'Summary: pass=0 fail=1 skip=6 total=7' "${stdout_file}"; then
+    record_result "e2e_missing_x11_refuses_cargo" "false" "unexpected_summary" "SUMMARY_MISMATCH" "x11 preflight summary did not collapse to a single root-cause failure"
+    return
+  fi
+  record_result "e2e_missing_x11_refuses_cargo" "true"
+}
+
 scenario_bundle_skip_build_creates_structure() {
   local scenario_dir="${ARTIFACT_DIR}/bundle_skip_build_creates_structure"
   local mock_bin="${scenario_dir}/mock-bin"
@@ -432,6 +520,49 @@ scenario_bundle_probe_failure_refuses_exec() {
   record_result "bundle_probe_failure_refuses_exec" "true"
 }
 
+scenario_bundle_missing_x11_refuses_exec() {
+  local scenario_dir="${ARTIFACT_DIR}/bundle_missing_x11_refuses_exec"
+  local mock_bin="${scenario_dir}/mock-bin"
+  local marker_file="${scenario_dir}/rch-exec.log"
+  local stdout_file="${scenario_dir}/stdout.log"
+  local stderr_file="${scenario_dir}/stderr.log"
+  local rc
+
+  mkdir -p "${scenario_dir}"
+  write_missing_x11_rch "${mock_bin}" "${marker_file}"
+
+  emit_log "running" "bundle_missing_x11_refuses_exec" "remote_prereq_guard" "none" "none" "${stdout_file}" "scripts/create-macos-bundle.sh missing x11"
+  set +e
+  env \
+    RCH_BIN="${mock_bin}/rch" \
+    CARGO_TARGET_DIR="${scenario_dir}/target" \
+    "${ROOT_DIR}/scripts/create-macos-bundle.sh" --output "${scenario_dir}/output" >"${stdout_file}" 2>"${stderr_file}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" -eq 0 ]]; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "unexpected_success" "X11_GUARD_MISSING" "bundle script unexpectedly succeeded"
+    return
+  fi
+  if [[ ! -f "${marker_file}" ]]; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "missing_exec_log" "RCH_EXEC_LOG_MISSING" "mock rch exec log missing"
+    return
+  fi
+  if ! grep -q 'pkg-config --exists x11' "${marker_file}"; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "missing_preflight_exec" "X11_PREFLIGHT_MISSING" "bundle script never ran the remote x11 preflight"
+    return
+  fi
+  if grep -q 'cargo build' "${marker_file}"; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "cargo_ran_after_failed_preflight" "CARGO_RAN_AFTER_X11_FAILURE" "bundle cargo build still ran after failed x11 preflight"
+    return
+  fi
+  if ! grep -q 'Error: remote worker is missing X11 development metadata required for frankenterm-gui' "${stdout_file}"; then
+    record_result "bundle_missing_x11_refuses_exec" "false" "missing_x11_message" "X11_MESSAGE_MISSING" "bundle script missing explicit x11 prerequisite message"
+    return
+  fi
+  record_result "bundle_missing_x11_refuses_exec" "true"
+}
+
 scenario_bundle_build_uses_repo_relative_paths() {
   local scenario_dir="${ARTIFACT_DIR}/bundle_build_uses_repo_relative_paths"
   local mock_bin="${scenario_dir}/mock-bin"
@@ -484,9 +615,11 @@ main() {
 
   scenario_dry_run_skips_rch
   scenario_e2e_probe_failure_refuses_exec
+  scenario_e2e_missing_x11_refuses_cargo
   scenario_bundle_skip_build_creates_structure
   scenario_bundle_refuses_overwrite
   scenario_bundle_probe_failure_refuses_exec
+  scenario_bundle_missing_x11_refuses_exec
   scenario_bundle_build_uses_repo_relative_paths
 
   echo ""

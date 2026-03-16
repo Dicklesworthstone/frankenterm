@@ -91,6 +91,54 @@ run_rch_bundle_build() {
     )
 }
 
+run_rch_gui_prereq_check() {
+    (
+        cd "$PROJECT_ROOT"
+        "$RCH_BIN" exec -- sh -lc '
+            case "$(uname -s)" in
+                Linux)
+                    if ! command -v pkg-config >/dev/null 2>&1; then
+                        echo "FT_GUI_REMOTE_PREREQ_MISSING:pkg-config" >&2
+                        exit 41
+                    fi
+                    if ! pkg-config --exists x11; then
+                        echo "FT_GUI_REMOTE_PREREQ_MISSING:x11" >&2
+                        pkg-config --print-errors --exists x11 || true
+                        exit 42
+                    fi
+                    ;;
+            esac
+        '
+    )
+}
+
+ensure_remote_gui_prereqs() {
+    local preflight_log="$PROJECT_ROOT/target/e2e/gui-bootstrap/bundle-build-preflight.log"
+    mkdir -p "$(dirname "$preflight_log")"
+    : > "$preflight_log"
+
+    if run_rch_gui_prereq_check > >(tee "$preflight_log") 2> >(tee -a "$preflight_log" >&2); then
+        return 0
+    fi
+
+    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:x11' "$preflight_log"; then
+        echo "Error: remote worker is missing X11 development metadata required for frankenterm-gui"
+        echo "frankenterm/window has a hard x11 dependency on Linux; provision x11 dev packages on the RCH workers."
+        echo "See $preflight_log for the remote preflight output."
+        return 1
+    fi
+
+    if grep -q 'FT_GUI_REMOTE_PREREQ_MISSING:pkg-config' "$preflight_log"; then
+        echo "Error: remote worker is missing pkg-config"
+        echo "See $preflight_log for the remote preflight output."
+        return 1
+    fi
+
+    echo "Error: remote GUI prerequisite check failed before cargo build"
+    echo "See $preflight_log for the remote preflight output."
+    return 1
+}
+
 require_rch() {
     command -v "$RCH_BIN" >/dev/null 2>&1
 }
@@ -130,6 +178,9 @@ if [ "$SKIP_BUILD" = false ]; then
     fi
     if ! probe_rch_workers; then
         echo "Error: no reachable RCH workers detected; refusing local cargo fallback"
+        exit 1
+    fi
+    if ! ensure_remote_gui_prereqs; then
         exit 1
     fi
     echo "Building frankenterm-gui and ft via rch (release)..."
