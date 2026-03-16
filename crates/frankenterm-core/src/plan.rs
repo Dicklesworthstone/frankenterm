@@ -3802,26 +3802,62 @@ impl TxExecutionRecord {
     pub fn canonical_string(&self) -> String {
         format!(
             "txrec:{}:{}:{}:steps={}",
-            self.tx_id.0, self.plan_id.0, self.lifecycle_state, self.step_records.len()
+            self.tx_id.0,
+            self.plan_id.0,
+            self.lifecycle_state,
+            self.step_records.len()
         )
     }
 
     /// Compute an idempotency key for the entire transaction.
-    /// Deterministic within a single process (uses `DefaultHasher`).
+    /// Deterministic across processes and machines.
     #[must_use]
     pub fn compute_tx_key(contract: &MissionTxContract) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        contract.intent.tx_id.0.hash(&mut hasher);
-        contract.plan.plan_id.0.hash(&mut hasher);
-        contract.intent.correlation_id.hash(&mut hasher);
-        contract.plan.steps.len().hash(&mut hasher);
-        for step in &contract.plan.steps {
-            step.step_id.0.hash(&mut hasher);
+        #[derive(Serialize)]
+        struct ImmutableTxStep<'a> {
+            step_id: &'a TxStepId,
+            ordinal: usize,
+            action: &'a StepAction,
+            description: &'a str,
         }
-        format!("txk:{:016x}", hasher.finish())
+
+        #[derive(Serialize)]
+        struct ImmutableTxContract<'a> {
+            tx_version: u32,
+            tx_id: &'a TxId,
+            requested_by: &'a MissionActorRole,
+            summary: &'a str,
+            correlation_id: &'a str,
+            plan_id: &'a TxPlanId,
+            steps: Vec<ImmutableTxStep<'a>>,
+            preconditions: &'a [TxPrecondition],
+            compensations: &'a [TxCompensation],
+        }
+
+        let canonical = serde_json::to_string(&ImmutableTxContract {
+            tx_version: contract.tx_version,
+            tx_id: &contract.intent.tx_id,
+            requested_by: &contract.intent.requested_by,
+            summary: &contract.intent.summary,
+            correlation_id: &contract.intent.correlation_id,
+            plan_id: &contract.plan.plan_id,
+            steps: contract
+                .plan
+                .steps
+                .iter()
+                .map(|step| ImmutableTxStep {
+                    step_id: &step.step_id,
+                    ordinal: step.ordinal,
+                    action: &step.action,
+                    description: &step.description,
+                })
+                .collect(),
+            preconditions: &contract.plan.preconditions,
+            compensations: &contract.plan.compensations,
+        })
+        .expect("serializing immutable tx contract should not fail");
+        let hash = sha256_hex(&canonical);
+        format!("txk:{}", &hash[..16])
     }
 }
 
@@ -6265,6 +6301,72 @@ mod tests {
             outcome: TxOutcome::Pending,
             receipts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn compute_tx_key_is_stable_for_same_contract() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+
+        let key1 = TxExecutionRecord::compute_tx_key(&contract);
+        let key2 = TxExecutionRecord::compute_tx_key(&contract);
+
+        assert_eq!(key1, key2);
+        assert!(key1.starts_with("txk:"));
+        assert_eq!(key1.len(), 20);
+    }
+
+    #[test]
+    fn compute_tx_key_changes_when_correlation_id_changes() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut different = contract.clone();
+        different.intent.correlation_id = "corr:other".to_string();
+
+        assert_ne!(
+            TxExecutionRecord::compute_tx_key(&contract),
+            TxExecutionRecord::compute_tx_key(&different)
+        );
+    }
+
+    #[test]
+    fn compute_tx_key_changes_when_step_order_changes() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut reordered = contract.clone();
+        reordered.plan.steps.swap(0, 1);
+
+        assert_ne!(
+            TxExecutionRecord::compute_tx_key(&contract),
+            TxExecutionRecord::compute_tx_key(&reordered)
+        );
+    }
+
+    #[test]
+    fn compute_tx_key_changes_when_step_action_changes() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut different = contract.clone();
+        different.plan.steps[0].action = StepAction::SendText {
+            pane_id: 9,
+            text: "changed".to_string(),
+            paste_mode: Some(true),
+        };
+
+        assert_ne!(
+            TxExecutionRecord::compute_tx_key(&contract),
+            TxExecutionRecord::compute_tx_key(&different)
+        );
+    }
+
+    #[test]
+    fn compute_tx_key_changes_when_preconditions_change() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut different = contract.clone();
+        different.plan.preconditions = vec![TxPrecondition::Custom {
+            check: "pane-ready".to_string(),
+        }];
+
+        assert_ne!(
+            TxExecutionRecord::compute_tx_key(&contract),
+            TxExecutionRecord::compute_tx_key(&different)
+        );
     }
 
     fn sample_commit_inputs(fail_step: Option<&str>) -> Vec<TxCommitStepInput> {
