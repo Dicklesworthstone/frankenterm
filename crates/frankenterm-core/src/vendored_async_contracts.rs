@@ -269,8 +269,9 @@ impl ContractCompliance {
     ///
     /// `compliant` is `true` iff every piece of evidence targets this contract
     /// and passed.
-    /// `coverage` is `matching_passed_count / total_count`, or `0.0` when
-    /// there is no evidence.
+    /// `coverage` is `passed_count / matching_count` (evidence for this
+    /// contract that passed vs total evidence for this contract), or `0.0`
+    /// when there is no matching evidence.
     #[must_use]
     pub fn from_evidence(contract: AsyncBoundaryContract, evidence: Vec<ContractEvidence>) -> Self {
         let contract_id = contract.contract_id.as_str();
@@ -285,10 +286,10 @@ impl ContractCompliance {
             .count();
 
         let compliant = total > 0 && matching == total && passed == total;
-        let coverage = if total == 0 {
+        let coverage = if matching == 0 {
             0.0
         } else {
-            passed as f64 / total as f64
+            passed as f64 / matching as f64
         };
 
         Self {

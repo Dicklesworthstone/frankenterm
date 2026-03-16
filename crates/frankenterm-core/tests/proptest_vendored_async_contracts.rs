@@ -158,7 +158,7 @@ fn standard_contracts_all_categories_represented() {
 }
 
 #[test]
-fn compliance_mismatched_contract_id_reduces_coverage_and_fails() {
+fn compliance_mismatched_contract_id_not_compliant_but_matching_coverage_full() {
     let contract = standard_contracts().into_iter().next().unwrap();
     let id = contract.contract_id.clone();
     let evidence = vec![
@@ -166,8 +166,10 @@ fn compliance_mismatched_contract_id_reduces_coverage_and_fails() {
         make_evidence("ABC-CAN-001", "mismatch", true),
     ];
     let compliance = ContractCompliance::from_evidence(contract, evidence);
+    // Not compliant because not all evidence targets this contract.
     assert!(!compliance.compliant);
-    assert!((compliance.coverage - 0.5).abs() < f64::EPSILON);
+    // But coverage is 1.0 because all MATCHING evidence (1/1) passed.
+    assert!((compliance.coverage - 1.0).abs() < f64::EPSILON);
 }
 
 proptest! {
