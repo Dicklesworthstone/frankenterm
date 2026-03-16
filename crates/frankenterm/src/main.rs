@@ -507,7 +507,7 @@ SEE ALSO:
         #[arg(long, short = 'r')]
         rule_id: Option<String>,
 
-        /// Filter by event type (e.g., "compaction_warning")
+        /// Filter by event type (e.g., "session.compaction")
         #[arg(long, short = 't')]
         event_type: Option<String>,
 
@@ -2501,7 +2501,7 @@ enum RobotCommands {
         #[arg(long)]
         rule_id: Option<String>,
 
-        /// Filter by event type (e.g., "compaction_warning")
+        /// Filter by event type (e.g., "session.compaction")
         #[arg(long)]
         event_type: Option<String>,
 
@@ -7900,6 +7900,7 @@ fn build_workflow_by_name(
     config: &frankenterm_core::config::Config,
 ) -> Option<std::sync::Arc<dyn frankenterm_core::workflows::Workflow>> {
     resolve_workflow(name, &config.workflows)
+        .filter(|workflow| workflow_enabled(workflow.name(), &config.workflows))
 }
 
 fn now_ms_i64() -> i64 {
@@ -8414,34 +8415,21 @@ const BUILTIN_WORKFLOW_NAMES: &[&str] = &[
     "handle_swarm_learning_index",
 ];
 
-fn workflow_trigger_event_types(name: &str) -> &'static [&'static str] {
-    match name {
-        "handle_compaction" => &["compaction_warning"],
-        "handle_usage_limits" => &["usage_limit"],
-        "handle_session_end" => &["session.summary", "session.end"],
-        "handle_session_start_context" => &["session.start"],
-        "handle_auth_required" => &["auth.device_code", "auth.error"],
-        "handle_claude_code_limits" | "handle_gemini_quota" => {
-            &["usage.warning", "usage.reached", "rate_limit.detected"]
-        }
-        "handle_process_triage_lifecycle" => &["process_triage.lifecycle"],
-        "handle_on_error_cass_search" => &[
-            "error.network",
-            "error.timeout",
-            "error.overloaded",
-            "mux.error",
-        ],
-        "handle_swarm_learning_index" => &["session.end", "session.summary"],
-        _ => &[],
-    }
-}
-
 fn builtin_workflows(
     workflows_config: &frankenterm_core::config::WorkflowsConfig,
 ) -> Vec<std::sync::Arc<dyn frankenterm_core::workflows::Workflow>> {
     BUILTIN_WORKFLOW_NAMES
         .iter()
         .filter_map(|name| resolve_workflow(name, workflows_config))
+        .collect()
+}
+
+fn enabled_builtin_workflows(
+    workflows_config: &frankenterm_core::config::WorkflowsConfig,
+) -> Vec<std::sync::Arc<dyn frankenterm_core::workflows::Workflow>> {
+    builtin_workflows(workflows_config)
+        .into_iter()
+        .filter(|workflow| workflow_enabled(workflow.name(), workflows_config))
         .collect()
 }
 
@@ -8453,14 +8441,15 @@ fn builtin_workflow_infos(
         .map(|workflow| RobotWorkflowInfo {
             name: workflow.name().to_string(),
             description: Some(workflow.description().to_string()),
-            enabled: true,
+            enabled: workflow_enabled(workflow.name(), workflows_config),
             trigger_event_types: Some(
-                workflow_trigger_event_types(workflow.name())
+                workflow
+                    .trigger_event_types()
                     .iter()
                     .map(|event_type| (*event_type).to_string())
                     .collect(),
             ),
-            requires_pane: Some(true),
+            requires_pane: Some(workflow.requires_pane()),
         })
         .collect()
 }
@@ -8469,7 +8458,7 @@ fn register_builtin_workflows(
     runner: &frankenterm_core::workflows::WorkflowRunner,
     workflows_config: &frankenterm_core::config::WorkflowsConfig,
 ) {
-    for workflow in builtin_workflows(workflows_config) {
+    for workflow in enabled_builtin_workflows(workflows_config) {
         runner.register_workflow(workflow);
     }
 }
@@ -8679,7 +8668,7 @@ fn build_workflow_dry_run_report(
                 "workflow",
                 format!("Workflow '{name}' loaded"),
             ));
-            if wf.is_enabled() {
+            if workflow_enabled(wf.name(), &config.workflows) {
                 eval.add_check(PolicyCheck::passed(
                     "workflow_enabled",
                     "Workflow is enabled",
@@ -13442,8 +13431,13 @@ async fn run_watcher(
         );
 
         register_builtin_workflows(&workflow_runner, &config.workflows);
+        let enabled_names = enabled_builtin_workflows(&config.workflows)
+            .into_iter()
+            .map(|workflow| workflow.name().to_string())
+            .collect::<Vec<_>>();
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_session_start_context, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle, handle_on_error_cass_search, handle_swarm_learning_index"
+            workflows = ?enabled_names,
+            "Registered enabled workflows"
         );
 
         // Spawn workflow runner event loop
@@ -17460,10 +17454,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotWorkflowCommands::List => {
                                     let workflows = builtin_workflow_infos(&config.workflows);
                                     let total = workflows.len();
+                                    let enabled_count = workflows
+                                        .iter()
+                                        .filter(|workflow| workflow.enabled)
+                                        .count();
                                     let data = RobotWorkflowListData {
                                         workflows,
                                         total,
-                                        enabled_count: Some(total),
+                                        enabled_count: Some(enabled_count),
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
@@ -22488,7 +22486,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Workflow { command }) => {
             match command {
                 WorkflowCommands::List => {
-                    let workflows = builtin_workflows(&config.workflows);
+                    let workflows = enabled_builtin_workflows(&config.workflows);
 
                     println!(
                         "{:<30} {:<8} {:<7} {}",
@@ -37189,8 +37187,8 @@ retention_max_mb = 1000
 enabled_packs = ["builtin:core"]
 
 [workflows]
-# Enabled workflows (by name)
-enabled = ["handle_compaction", "handle_usage_limits"]
+# Enabled workflows (empty = all built-in workflows)
+enabled = []
 # Maximum concurrent workflows
 max_concurrent = 3
 
@@ -46642,10 +46640,23 @@ log_level = "debug"
                 "workflow list should contain '{name}'"
             );
         }
-        assert!(
-            workflows.iter().all(|w| w.enabled),
-            "all workflows must be enabled"
-        );
+        let enabled_for = |name: &str| {
+            workflows
+                .iter()
+                .find(|wf| wf.name == name)
+                .map(|wf| wf.enabled)
+                .unwrap_or(false)
+        };
+        assert!(enabled_for("handle_compaction"));
+        assert!(enabled_for("handle_usage_limits"));
+        assert!(!enabled_for("handle_session_end"));
+        assert!(!enabled_for("handle_session_start_context"));
+        assert!(!enabled_for("handle_auth_required"));
+        assert!(!enabled_for("handle_claude_code_limits"));
+        assert!(!enabled_for("handle_gemini_quota"));
+        assert!(!enabled_for("handle_process_triage_lifecycle"));
+        assert!(!enabled_for("handle_on_error_cass_search"));
+        assert!(!enabled_for("handle_swarm_learning_index"));
 
         let triggers_for = |name: &str| {
             workflows
@@ -46655,6 +46666,18 @@ log_level = "debug"
                 .cloned()
                 .unwrap_or_default()
         };
+        assert_eq!(
+            triggers_for("handle_compaction"),
+            vec!["session.compaction".to_string()]
+        );
+        assert_eq!(
+            triggers_for("handle_usage_limits"),
+            vec![
+                "usage.reached".to_string(),
+                "rate_limit.detected".to_string(),
+                "usage_limit".to_string(),
+            ]
+        );
         assert_eq!(
             triggers_for("handle_session_end"),
             vec!["session.summary".to_string(), "session.end".to_string()]
@@ -46693,12 +46716,26 @@ log_level = "debug"
     }
 
     #[test]
+    fn enabled_builtin_workflows_respect_config_enabled_allowlist() {
+        let config = frankenterm_core::config::WorkflowsConfig {
+            enabled: vec![
+                "handle_compaction".to_string(),
+                "handle_usage_limits".to_string(),
+            ],
+            ..frankenterm_core::config::WorkflowsConfig::default()
+        };
+        let workflows = enabled_builtin_workflows(&config);
+        let names: Vec<&str> = workflows.iter().map(|workflow| workflow.name()).collect();
+        assert_eq!(names, vec!["handle_compaction", "handle_usage_limits"]);
+    }
+
+    #[test]
     fn robot_workflow_list_data_serialization_matches_schema() {
         let workflows = vec![RobotWorkflowInfo {
             name: "handle_compaction".to_string(),
             description: Some("Test workflow".to_string()),
             enabled: true,
-            trigger_event_types: Some(vec!["compaction_warning".to_string()]),
+            trigger_event_types: Some(vec!["session.compaction".to_string()]),
             requires_pane: Some(true),
         }];
         let data = RobotWorkflowListData {
@@ -46718,8 +46755,17 @@ log_level = "debug"
         assert_eq!(wf["name"], "handle_compaction");
         assert_eq!(wf["description"], "Test workflow");
         assert_eq!(wf["enabled"], true);
-        assert_eq!(wf["trigger_event_types"][0], "compaction_warning");
+        assert_eq!(wf["trigger_event_types"][0], "session.compaction");
         assert_eq!(wf["requires_pane"], true);
+    }
+
+    #[test]
+    fn build_workflow_by_name_respects_enabled_config() {
+        let mut config = frankenterm_core::config::Config::default();
+        config.workflows.enabled = vec!["handle_compaction".to_string()];
+
+        assert!(build_workflow_by_name("handle_compaction", &config).is_some());
+        assert!(build_workflow_by_name("handle_session_end", &config).is_none());
     }
 
     #[test]
@@ -46875,14 +46921,18 @@ log_level = "debug"
                 name: "handle_compaction".to_string(),
                 description: Some("Test".to_string()),
                 enabled: true,
-                trigger_event_types: Some(vec!["compaction_warning".to_string()]),
+                trigger_event_types: Some(vec!["session.compaction".to_string()]),
                 requires_pane: Some(true),
             },
             RobotWorkflowInfo {
                 name: "handle_usage_limits".to_string(),
                 description: Some("Test 2".to_string()),
                 enabled: true,
-                trigger_event_types: Some(vec!["usage_limit".to_string()]),
+                trigger_event_types: Some(vec![
+                    "usage.reached".to_string(),
+                    "rate_limit.detected".to_string(),
+                    "usage_limit".to_string(),
+                ]),
                 requires_pane: Some(true),
             },
         ];

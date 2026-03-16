@@ -330,6 +330,10 @@ impl Workflow for HandleCompaction {
         "Re-inject critical context (AGENTS.md) after conversation compaction"
     }
 
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["session.compaction"]
+    }
+
     fn handles(&self, detection: &crate::patterns::Detection) -> bool {
         // Handle any compaction-related detection
         detection.event_type == "session.compaction" || detection.rule_id.contains("compaction")
@@ -645,10 +649,21 @@ impl Workflow for HandleUsageLimits {
     }
 
     fn handles(&self, detection: &crate::patterns::Detection) -> bool {
-        detection.agent_type == crate::patterns::AgentType::Codex
-            && (detection.rule_id.contains("usage")
-                || detection.event_type == "rate_limit.detected"
-                || detection.rule_id.contains("rate_limit"))
+        if detection.agent_type != crate::patterns::AgentType::Codex {
+            return false;
+        }
+
+        matches!(
+            detection.event_type.as_str(),
+            "usage.reached" | "rate_limit.detected" | "usage_limit"
+        ) || matches!(
+            detection.rule_id.as_str(),
+            "codex.usage_limit" | "codex.usage.reached" | "codex.rate_limit.detected"
+        )
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["usage.reached", "rate_limit.detected", "usage_limit"]
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -1044,6 +1059,12 @@ mod tests {
     }
 
     #[test]
+    fn handle_compaction_reports_session_compaction_trigger_event() {
+        let wf = HandleCompaction::new();
+        assert_eq!(wf.trigger_event_types(), ["session.compaction"]);
+    }
+
+    #[test]
     fn handle_compaction_does_not_handle_unrelated() {
         let wf = HandleCompaction::new();
         let detection = crate::patterns::Detection {
@@ -1083,6 +1104,15 @@ mod tests {
         assert_eq!(steps[0].name, "check_guards");
         assert_eq!(steps[1].name, "exit_and_persist");
         assert_eq!(steps[2].name, "select_account");
+    }
+
+    #[test]
+    fn handle_usage_limits_reports_expected_trigger_event_types() {
+        let wf = HandleUsageLimits::new();
+        assert_eq!(
+            wf.trigger_event_types(),
+            ["usage.reached", "rate_limit.detected", "usage_limit"]
+        );
     }
 
     #[test]
@@ -1126,6 +1156,22 @@ mod tests {
             severity: crate::patterns::Severity::Info,
             agent_type: crate::patterns::AgentType::Codex,
             matched_text: "compaction".to_string(),
+            confidence: 1.0,
+            extracted: serde_json::Value::Object(Default::default()),
+            span: (0, 0),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_usage_limits_rejects_session_token_usage_summary() {
+        let wf = HandleUsageLimits::new();
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.session.token_usage".to_string(),
+            event_type: "session.summary".to_string(),
+            severity: crate::patterns::Severity::Info,
+            agent_type: crate::patterns::AgentType::Codex,
+            matched_text: "Token usage: total=1234".to_string(),
             confidence: 1.0,
             extracted: serde_json::Value::Object(Default::default()),
             span: (0, 0),

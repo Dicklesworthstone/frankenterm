@@ -1477,7 +1477,7 @@ fn extract_prompt_placeholders(template: &str) -> Result<Vec<String>, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkflowsConfig {
-    /// Enabled workflows (by name)
+    /// Enabled workflows (by name). Empty means all built-in workflows.
     pub enabled: Vec<String>,
 
     /// Workflows that can auto-run on event detection
@@ -1502,10 +1502,7 @@ pub struct WorkflowsConfig {
 impl Default for WorkflowsConfig {
     fn default() -> Self {
         Self {
-            enabled: vec![
-                "handle_compaction".to_string(),
-                "handle_usage_limits".to_string(),
-            ],
+            enabled: Vec::new(),
             auto_run_allowlist: vec!["handle_compaction".to_string()],
             auto_run_denylist: Vec::new(),
             max_concurrent: 3,
