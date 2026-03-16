@@ -81,10 +81,32 @@ require_remote_safe_target_dir() {
     return 1
 }
 
+resolve_rch_cmd() {
+    if [[ "$RCH_BIN" == */* && -r "$RCH_BIN" ]]; then
+        local shebang=""
+        IFS= read -r shebang < "$RCH_BIN" || true
+        case "$shebang" in
+            '#!'*bash*|'#!'*sh)
+                printf '%s\n' "/bin/bash"
+                printf '%s\n' "$RCH_BIN"
+                return 0
+                ;;
+        esac
+    fi
+
+    printf '%s\n' "$RCH_BIN"
+}
+
+run_rch() {
+    local -a cmd
+    mapfile -t cmd < <(resolve_rch_cmd)
+    "${cmd[@]}" "$@"
+}
+
 run_rch_bundle_build() {
     (
         cd "$PROJECT_ROOT"
-        "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" cargo build --release \
+        run_rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR_REL" cargo build --release \
             --bin frankenterm-gui \
             --bin ft \
             --manifest-path Cargo.toml
@@ -94,7 +116,7 @@ run_rch_bundle_build() {
 run_rch_gui_prereq_check() {
     (
         cd "$PROJECT_ROOT"
-        "$RCH_BIN" exec -- sh -lc '
+        run_rch exec -- sh -lc '
             case "$(uname -s)" in
                 Linux)
                     if ! command -v pkg-config >/dev/null 2>&1; then
@@ -140,12 +162,16 @@ ensure_remote_gui_prereqs() {
 }
 
 require_rch() {
+    if [[ "$RCH_BIN" == */* ]]; then
+        [[ -x "$RCH_BIN" ]]
+        return
+    fi
     command -v "$RCH_BIN" >/dev/null 2>&1
 }
 
 probe_rch_workers() {
     local probe_json
-    probe_json="$("$RCH_BIN" workers probe --json --all)"
+    probe_json="$(run_rch workers probe --json --all)"
     python3 - "$probe_json" <<'PY'
 import json
 import sys

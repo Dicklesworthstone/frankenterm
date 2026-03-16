@@ -87,7 +87,7 @@ write_never_called_rch() {
   local marker_file="$2"
   mkdir -p "${mock_bin}"
   cat > "${mock_bin}/rch" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 printf 'unexpected invocation: %s\n' "\$*" >> "${marker_file}"
 exit 97
@@ -100,12 +100,10 @@ write_probe_failure_rch() {
   local marker_file="$2"
   mkdir -p "${mock_bin}"
   cat > "${mock_bin}/rch" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  cat <<'JSON'
-{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"connection_failed","error":"RCH-E100"}]}
-JSON
+  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"connection_failed","error":"RCH-E100"}]}'
   exit 0
 fi
 
@@ -125,12 +123,10 @@ write_success_build_rch() {
   local marker_file="$2"
   mkdir -p "${mock_bin}"
   cat > "${mock_bin}/rch" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  cat <<'JSON'
-{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}
-JSON
+  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
   exit 0
 fi
 
@@ -149,30 +145,28 @@ if [[ "\${1:-}" == "exec" ]]; then
     exit 64
   fi
   mkdir -p "\${PWD}/\${target_dir}/release"
-  cat > "\${PWD}/\${target_dir}/release/frankenterm-gui" <<'BIN'
-#!/usr/bin/env bash
-if [[ "\${1:-}" == "--version" ]]; then
-  echo "stub 0.0.0"
-  exit 0
-fi
-if [[ "\${1:-}" == "--help" ]]; then
-  echo "stub help"
-  exit 0
-fi
-exit 0
-BIN
-  cat > "\${PWD}/\${target_dir}/release/ft" <<'BIN'
-#!/usr/bin/env bash
-if [[ "\${1:-}" == "--version" ]]; then
-  echo "stub 0.0.0"
-  exit 0
-fi
-if [[ "\${1:-}" == "--help" ]]; then
-  echo "stub help"
-  exit 0
-fi
-exit 0
-BIN
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  echo "stub 0.0.0"' \
+    '  exit 0' \
+    'fi' \
+    'if [[ "${1:-}" == "--help" ]]; then' \
+    '  echo "stub help"' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' > "\${PWD}/\${target_dir}/release/frankenterm-gui"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'if [[ "${1:-}" == "--version" ]]; then' \
+    '  echo "stub 0.0.0"' \
+    '  exit 0' \
+    'fi' \
+    'if [[ "${1:-}" == "--help" ]]; then' \
+    '  echo "stub help"' \
+    '  exit 0' \
+    'fi' \
+    'exit 0' > "\${PWD}/\${target_dir}/release/ft"
   chmod +x "\${PWD}/\${target_dir}/release/frankenterm-gui" "\${PWD}/\${target_dir}/release/ft"
   exit 0
 fi
@@ -188,12 +182,10 @@ write_missing_x11_rch() {
   local marker_file="$2"
   mkdir -p "${mock_bin}"
   cat > "${mock_bin}/rch" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 if [[ "\${1:-}" == "workers" && "\${2:-}" == "probe" ]]; then
-  cat <<'JSON'
-{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}
-JSON
+  printf '%s\n' '{"api_version":"1.0","data":[{"id":"mock-worker","host":"127.0.0.1","status":"ok"}]}'
   exit 0
 fi
 
@@ -223,19 +215,14 @@ write_codesign_mock() {
   local mock_bin="$1"
   local marker_file="$2"
   mkdir -p "${mock_bin}"
-  cat > "${mock_bin}/codesign" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'codesign %s\n' "\$*" >> "${marker_file}"
-exit 0
-EOF
-  chmod +x "${mock_bin}/codesign"
+  : > "${marker_file}"
+  ln -sf /usr/bin/true "${mock_bin}/codesign"
 }
 
 write_stub_binary() {
   local path="$1"
   cat > "${path}" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 if [[ "${1:-}" == "--version" ]]; then
   echo "stub 0.0.0"
   exit 0
