@@ -224,7 +224,8 @@ mod tests {
     #[test]
     fn parse_bool_true_variants() {
         for val in ["1", "true", "yes", "TRUE", "Yes", "True"] {
-            let qs = QueryString::parse(&format!("verbose={val}"));
+            let query = format!("verbose={val}");
+            let qs = QueryString::parse(&query);
             assert!(parse_bool(&qs, "verbose"), "expected true for '{val}'");
         }
     }
@@ -232,7 +233,8 @@ mod tests {
     #[test]
     fn parse_bool_false_variants() {
         for val in ["0", "false", "no", "FALSE", "No"] {
-            let qs = QueryString::parse(&format!("verbose={val}"));
+            let query = format!("verbose={val}");
+            let qs = QueryString::parse(&query);
             assert!(!parse_bool(&qs, "verbose"), "expected false for '{val}'");
         }
     }

@@ -7899,25 +7899,7 @@ fn build_workflow_by_name(
     name: &str,
     config: &frankenterm_core::config::Config,
 ) -> Option<std::sync::Arc<dyn frankenterm_core::workflows::Workflow>> {
-    use frankenterm_core::workflows::{HandleCompaction, Workflow};
-    use std::sync::Arc;
-
-    let workflows: Vec<Arc<dyn Workflow>> = vec![
-        Arc::new(
-            HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
-        ),
-        Arc::new(frankenterm_core::workflows::HandleUsageLimits::new()),
-        Arc::new(frankenterm_core::workflows::HandleSessionEnd::new()),
-        Arc::new(frankenterm_core::workflows::HandleSessionStartContext::new()),
-        Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
-        Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
-        Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
-        Arc::new(frankenterm_core::workflows::HandleProcessTriageLifecycle::new()),
-        Arc::new(frankenterm_core::workflows::HandleOnErrorCassSearch::new()),
-        Arc::new(frankenterm_core::workflows::HandleSwarmLearningIndex::new()),
-    ];
-
-    workflows.into_iter().find(|wf| wf.name() == name)
+    resolve_workflow(name, &config.workflows)
 }
 
 fn now_ms_i64() -> i64 {
@@ -8416,6 +8398,79 @@ fn resolve_workflow(
             frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
         )),
         _ => None,
+    }
+}
+
+const BUILTIN_WORKFLOW_NAMES: &[&str] = &[
+    "handle_compaction",
+    "handle_usage_limits",
+    "handle_session_end",
+    "handle_session_start_context",
+    "handle_auth_required",
+    "handle_claude_code_limits",
+    "handle_gemini_quota",
+    "handle_process_triage_lifecycle",
+    "handle_on_error_cass_search",
+    "handle_swarm_learning_index",
+];
+
+fn workflow_trigger_event_types(name: &str) -> &'static [&'static str] {
+    match name {
+        "handle_compaction" => &["compaction_warning"],
+        "handle_usage_limits" => &["usage_limit"],
+        "handle_session_end" => &["session.summary", "session.end"],
+        "handle_session_start_context" => &["session.start"],
+        "handle_auth_required" => &["auth.device_code", "auth.error"],
+        "handle_claude_code_limits" | "handle_gemini_quota" => {
+            &["usage.warning", "usage.reached", "rate_limit.detected"]
+        }
+        "handle_process_triage_lifecycle" => &["process_triage.lifecycle"],
+        "handle_on_error_cass_search" => &[
+            "error.network",
+            "error.timeout",
+            "error.overloaded",
+            "mux.error",
+        ],
+        "handle_swarm_learning_index" => &["session.end", "session.summary"],
+        _ => &[],
+    }
+}
+
+fn builtin_workflows(
+    workflows_config: &frankenterm_core::config::WorkflowsConfig,
+) -> Vec<std::sync::Arc<dyn frankenterm_core::workflows::Workflow>> {
+    BUILTIN_WORKFLOW_NAMES
+        .iter()
+        .filter_map(|name| resolve_workflow(name, workflows_config))
+        .collect()
+}
+
+fn builtin_workflow_infos(
+    workflows_config: &frankenterm_core::config::WorkflowsConfig,
+) -> Vec<RobotWorkflowInfo> {
+    builtin_workflows(workflows_config)
+        .into_iter()
+        .map(|workflow| RobotWorkflowInfo {
+            name: workflow.name().to_string(),
+            description: Some(workflow.description().to_string()),
+            enabled: true,
+            trigger_event_types: Some(
+                workflow_trigger_event_types(workflow.name())
+                    .iter()
+                    .map(|event_type| (*event_type).to_string())
+                    .collect(),
+            ),
+            requires_pane: Some(true),
+        })
+        .collect()
+}
+
+fn register_builtin_workflows(
+    runner: &frankenterm_core::workflows::WorkflowRunner,
+    workflows_config: &frankenterm_core::config::WorkflowsConfig,
+) {
+    for workflow in builtin_workflows(workflows_config) {
+        runner.register_workflow(workflow);
     }
 }
 
@@ -13019,8 +13074,7 @@ async fn run_watcher(
     use frankenterm_core::storage::StorageHandle;
     use frankenterm_core::webhook::WebhookDispatcher;
     use frankenterm_core::workflows::{
-        HandleCompaction, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
-        WorkflowRunnerConfig,
+        PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner, WorkflowRunnerConfig,
     };
     use std::time::Duration;
 
@@ -13387,37 +13441,7 @@ async fn run_watcher(
             runner_config,
         );
 
-        // Register built-in workflows
-        workflow_runner.register_workflow(Arc::new(
-            HandleCompaction::new().with_prompt_config(config.workflows.compaction_prompts.clone()),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleUsageLimits::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleSessionEnd::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleSessionStartContext::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleAuthRequired::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleClaudeCodeLimits::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleGeminiQuota::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleOnErrorCassSearch::new(),
-        ));
-        workflow_runner.register_workflow(Arc::new(
-            frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
-        ));
+        register_builtin_workflows(&workflow_runner, &config.workflows);
         tracing::info!(
             "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_session_start_context, handle_auth_required, handle_claude_code_limits, handle_gemini_quota, handle_process_triage_lifecycle, handle_on_error_cass_search, handle_swarm_learning_index"
         );
@@ -17303,6 +17327,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         injector,
                                         runner_config,
                                     );
+                                    register_builtin_workflows(&runner, &config.workflows);
 
                                     // Look up workflow by name
                                     let workflow = runner.find_workflow_by_name(&name);
@@ -17433,120 +17458,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                                 RobotWorkflowCommands::List => {
-                                    // List available workflows
-                                    // In standalone robot mode, workflows are defined but not
-                                    // registered. List the built-in workflow definitions.
-                                    let workflows: Vec<RobotWorkflowInfo> = vec![
-                                        RobotWorkflowInfo {
-                                            name: "handle_compaction".to_string(),
-                                            description: Some(
-                                                "Re-inject critical context after conversation \
-                                                 compaction"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "compaction_warning".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_usage_limits".to_string(),
-                                            description: Some(
-                                                "Handle API usage limit reached events".to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "usage_limit".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_session_end".to_string(),
-                                            description: Some(
-                                                "Capture and store structured session summary on \
-                                                 agent session end"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "session.summary".to_string(),
-                                                "session.end".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_session_start_context".to_string(),
-                                            description: Some(
-                                                "Inject startup context hints from cass when a \
-                                                 session starts"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "session.start".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_auth_required".to_string(),
-                                            description: Some(
-                                                "Handle authentication prompts requiring user \
-                                                 intervention or automated login"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "auth.device_code".to_string(),
-                                                "auth.error".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_claude_code_limits".to_string(),
-                                            description: Some(
-                                                "Safe-pause on Claude Code usage/rate limits \
-                                                 with recovery plan"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "usage.warning".to_string(),
-                                                "usage.reached".to_string(),
-                                                "rate_limit.detected".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_gemini_quota".to_string(),
-                                            description: Some(
-                                                "Safe-pause on Gemini quota/usage limits \
-                                                 with recovery plan"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "usage.warning".to_string(),
-                                                "usage.reached".to_string(),
-                                                "rate_limit.detected".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                        RobotWorkflowInfo {
-                                            name: "handle_process_triage_lifecycle".to_string(),
-                                            description: Some(
-                                                "Orchestrate process triage lifecycle phases \
-                                                 (snapshot, plan, apply, verify, diff, session)"
-                                                    .to_string(),
-                                            ),
-                                            enabled: true,
-                                            trigger_event_types: Some(vec![
-                                                "process_triage.lifecycle".to_string(),
-                                            ]),
-                                            requires_pane: Some(true),
-                                        },
-                                    ];
-
+                                    let workflows = builtin_workflow_infos(&config.workflows);
                                     let total = workflows.len();
                                     let data = RobotWorkflowListData {
                                         workflows,
@@ -22576,22 +22488,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Workflow { command }) => {
             match command {
                 WorkflowCommands::List => {
-                    use frankenterm_core::workflows::{HandleCompaction, Workflow};
-                    use std::sync::Arc;
-
-                    let workflows: Vec<Arc<dyn Workflow>> = vec![
-                        Arc::new(
-                            HandleCompaction::new()
-                                .with_prompt_config(config.workflows.compaction_prompts.clone()),
-                        ),
-                        Arc::new(frankenterm_core::workflows::HandleUsageLimits::new()),
-                        Arc::new(frankenterm_core::workflows::HandleSessionEnd::new()),
-                        Arc::new(frankenterm_core::workflows::HandleSessionStartContext::new()),
-                        Arc::new(frankenterm_core::workflows::HandleAuthRequired::new()),
-                        Arc::new(frankenterm_core::workflows::HandleClaudeCodeLimits::new()),
-                        Arc::new(frankenterm_core::workflows::HandleGeminiQuota::new()),
-                        Arc::new(frankenterm_core::workflows::HandleProcessTriageLifecycle::new()),
-                    ];
+                    let workflows = builtin_workflows(&config.workflows);
 
                     println!(
                         "{:<30} {:<8} {:<7} {}",
@@ -22712,38 +22609,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             runner_config,
                         );
 
-                        // Register built-in workflows
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleCompaction::new()
-                                .with_prompt_config(config.workflows.compaction_prompts.clone()),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleUsageLimits::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleSessionEnd::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleSessionStartContext::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleAuthRequired::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleClaudeCodeLimits::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleGeminiQuota::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleOnErrorCassSearch::new(),
-                        ));
-                        runner.register_workflow(Arc::new(
-                            frankenterm_core::workflows::HandleSwarmLearningIndex::new(),
-                        ));
+                        register_builtin_workflows(&runner, &config.workflows);
 
                         // Look up workflow
                         let workflow = runner.find_workflow_by_name(&name);
@@ -25516,31 +25382,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         runner_config,
                     );
 
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleCompaction::new()
-                            .with_prompt_config(config.workflows.compaction_prompts.clone()),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleUsageLimits::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleSessionEnd::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleSessionStartContext::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleAuthRequired::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleClaudeCodeLimits::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleGeminiQuota::new(),
-                    ));
-                    runner.register_workflow(std::sync::Arc::new(
-                        frankenterm_core::workflows::HandleProcessTriageLifecycle::new(),
-                    ));
+                    register_builtin_workflows(&runner, &config.workflows);
 
                     println!("Workflow: {} ({})", workflow.name(), workflow.description());
                     println!("Target pane: {pane_id}");
@@ -46784,132 +46626,22 @@ log_level = "debug"
     }
 
     #[test]
-    fn robot_workflow_list_returns_all_builtin_workflows() {
-        // Replicate the hardcoded list from the List handler to verify completeness.
-        let workflows: Vec<RobotWorkflowInfo> = vec![
-            RobotWorkflowInfo {
-                name: "handle_compaction".to_string(),
-                description: Some(
-                    "Re-inject critical context after conversation compaction".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec!["compaction_warning".to_string()]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_usage_limits".to_string(),
-                description: Some("Handle API usage limit reached events".to_string()),
-                enabled: true,
-                trigger_event_types: Some(vec!["usage_limit".to_string()]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_session_end".to_string(),
-                description: Some(
-                    "Capture and store structured session summary on agent session end".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "session.summary".to_string(),
-                    "session.end".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_session_start_context".to_string(),
-                description: Some("Inject startup context hints from cass when a session starts".to_string()),
-                enabled: true,
-                trigger_event_types: Some(vec!["session.start".to_string()]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_auth_required".to_string(),
-                description: Some(
-                    "Handle authentication prompts requiring user intervention or automated login"
-                        .to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "auth.device_code".to_string(),
-                    "auth.error".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_claude_code_limits".to_string(),
-                description: Some(
-                    "Safe-pause on Claude Code usage/rate limits with recovery plan".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "usage.warning".to_string(),
-                    "usage.reached".to_string(),
-                    "rate_limit.detected".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_gemini_quota".to_string(),
-                description: Some(
-                    "Safe-pause on Gemini quota/usage limits with recovery plan".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "usage.warning".to_string(),
-                    "usage.reached".to_string(),
-                    "rate_limit.detected".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_process_triage_lifecycle".to_string(),
-                description: Some(
-                    "Orchestrate process triage lifecycle phases (snapshot, plan, apply, verify, diff, session)".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec!["process_triage.lifecycle".to_string()]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_on_error_cass_search".to_string(),
-                description: Some(
-                    "Search cass for past fixes when an error pattern is detected".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "error.network".to_string(),
-                    "error.timeout".to_string(),
-                    "error.overloaded".to_string(),
-                    "mux.error".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-            RobotWorkflowInfo {
-                name: "handle_swarm_learning_index".to_string(),
-                description: Some(
-                    "Index completed agent sessions into cass for swarm learning".to_string(),
-                ),
-                enabled: true,
-                trigger_event_types: Some(vec![
-                    "session.end".to_string(),
-                    "session.summary".to_string(),
-                ]),
-                requires_pane: Some(true),
-            },
-        ];
+    fn builtin_workflow_infos_return_all_builtin_workflows() {
+        let workflows =
+            builtin_workflow_infos(&frankenterm_core::config::WorkflowsConfig::default());
 
-        assert_eq!(workflows.len(), 10, "must list exactly 10 workflows");
+        assert_eq!(
+            workflows.len(),
+            BUILTIN_WORKFLOW_NAMES.len(),
+            "must list every built-in workflow"
+        );
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
-        assert!(names.contains(&"handle_compaction"));
-        assert!(names.contains(&"handle_usage_limits"));
-        assert!(names.contains(&"handle_session_end"));
-        assert!(names.contains(&"handle_session_start_context"));
-        assert!(names.contains(&"handle_auth_required"));
-        assert!(names.contains(&"handle_claude_code_limits"));
-        assert!(names.contains(&"handle_gemini_quota"));
-        assert!(names.contains(&"handle_process_triage_lifecycle"));
-        assert!(names.contains(&"handle_on_error_cass_search"));
-        assert!(names.contains(&"handle_swarm_learning_index"));
+        for name in BUILTIN_WORKFLOW_NAMES {
+            assert!(
+                names.contains(name),
+                "workflow list should contain '{name}'"
+            );
+        }
         assert!(
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"
@@ -46952,18 +46684,7 @@ log_level = "debug"
     #[test]
     fn resolve_workflow_supports_all_builtin_workflow_names() {
         let config = frankenterm_core::config::WorkflowsConfig::default();
-        for name in [
-            "handle_compaction",
-            "handle_usage_limits",
-            "handle_session_end",
-            "handle_session_start_context",
-            "handle_auth_required",
-            "handle_claude_code_limits",
-            "handle_gemini_quota",
-            "handle_process_triage_lifecycle",
-            "handle_on_error_cass_search",
-            "handle_swarm_learning_index",
-        ] {
+        for name in BUILTIN_WORKFLOW_NAMES {
             assert!(
                 resolve_workflow(name, &config).is_some(),
                 "resolve_workflow should resolve '{name}'"
