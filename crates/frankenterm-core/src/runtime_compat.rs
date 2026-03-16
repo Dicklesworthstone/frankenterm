@@ -1584,6 +1584,18 @@ mod tests {
         runtime.block_on(future);
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    fn run_paused_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .start_paused(true)
+            .build()
+            .expect("failed to build paused runtime for async test");
+        runtime.block_on(future);
+    }
+
     #[test]
     fn sleep_completes() {
         run_async_test(async {
@@ -3796,13 +3808,15 @@ mod tests {
     // ========================================================================
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test(start_paused = true)]
-    async fn time_advance_moves_clock() {
-        let start = std::time::Instant::now();
-        time::advance(Duration::from_secs(60)).await;
-        // In paused mode, wall-clock barely moves but tokio's clock advances.
-        // We just verify no panic.
-        let _ = start.elapsed();
+    #[test]
+    fn time_advance_moves_clock() {
+        run_paused_async_test(async {
+            let start = std::time::Instant::now();
+            time::advance(Duration::from_secs(60)).await;
+            // In paused mode, wall-clock barely moves but tokio's clock advances.
+            // We just verify no panic.
+            let _ = start.elapsed();
+        });
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
@@ -3822,17 +3836,19 @@ mod tests {
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    #[tokio::test(start_paused = true)]
-    async fn time_advance_then_sleep_resolves() {
-        let (tx, mut rx) = mpsc::channel(1);
-        task::spawn(async move {
-            sleep(Duration::from_millis(100)).await;
-            let _ = tx.send(42).await;
+    #[test]
+    fn time_advance_then_sleep_resolves() {
+        run_paused_async_test(async {
+            let (tx, mut rx) = mpsc::channel(1);
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                let _ = tx.send(42).await;
+            });
+            time::advance(Duration::from_millis(200)).await;
+            task::yield_now().await;
+            let val = rx.recv().await;
+            assert_eq!(val, Some(42));
         });
-        time::advance(Duration::from_millis(200)).await;
-        task::yield_now().await;
-        let val = rx.recv().await;
-        assert_eq!(val, Some(42));
     }
 
     // ── Signal module tests ──────────────────────────────────────────────
