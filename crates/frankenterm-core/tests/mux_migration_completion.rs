@@ -47,17 +47,26 @@ fn pool_cx_threading_concurrent_acquire_respects_capacity() {
         let cx = healthy_cx();
         let pool = Arc::new(MockPool::new(2));
         let acquired = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let max_in_flight = Arc::new(AtomicU64::new(0));
 
-        // Acquire 2 connections concurrently — both should succeed
+        // Acquire 4 connections across a pool of capacity 2. This should
+        // complete, but the number of simultaneously checked-out connections
+        // must stay bounded by the held semaphore permits.
         let mut handles = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..4 {
             let pool = pool.clone();
             let cx = cx.clone();
             let acquired = acquired.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
             handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
                 let conn = pool.acquire(&cx).await.expect("acquire");
                 acquired.fetch_add(1, Ordering::SeqCst);
-                // Hold briefly
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = max_in_flight.fetch_max(current, Ordering::SeqCst);
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
                 pool.release(&cx, conn).await.expect("release");
             }));
         }
@@ -66,8 +75,12 @@ fn pool_cx_threading_concurrent_acquire_respects_capacity() {
             h.await.expect("task");
         }
 
-        assert_eq!(acquired.load(Ordering::SeqCst), 2);
+        assert_eq!(acquired.load(Ordering::SeqCst), 4);
         assert_eq!(pool.available_permits(), 2);
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 2,
+            "checked-out connections must never exceed pool capacity"
+        );
     });
 }
 

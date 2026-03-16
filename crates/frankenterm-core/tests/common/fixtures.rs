@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use asupersync::{Budget, CancelKind, Cx};
 
 use std::collections::HashMap;
@@ -19,10 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A mock connection pool for testing pool patterns with asupersync primitives.
 pub struct MockPool {
-    gate: asupersync::sync::Semaphore,
+    gate: Arc<Semaphore>,
     state: Mutex<MockPoolState>,
     total_acquired: AtomicU64,
-    checked_out: AtomicU64,
     capacity: usize,
 }
 
@@ -37,22 +36,19 @@ impl MockPool {
     pub fn new(capacity: usize) -> Self {
         let available: Vec<u64> = (0..capacity as u64).collect();
         Self {
-            gate: asupersync::sync::Semaphore::new(capacity),
+            gate: Arc::new(Semaphore::new(capacity)),
             state: Mutex::new(MockPoolState {
                 available,
                 next_id: capacity as u64,
             }),
             total_acquired: AtomicU64::new(0),
-            checked_out: AtomicU64::new(0),
             capacity,
         }
     }
 
     /// Acquire a connection from the pool.
     pub async fn acquire(&self, cx: &Cx) -> Result<MockConnection, String> {
-        let _permit = self
-            .gate
-            .acquire(cx, 1)
+        let permit = OwnedSemaphorePermit::acquire(Arc::clone(&self.gate), cx, 1)
             .await
             .map_err(|e| format!("semaphore acquire failed: {e}"))?;
 
@@ -69,19 +65,23 @@ impl MockPool {
         });
 
         self.total_acquired.fetch_add(1, Ordering::Relaxed);
-        self.checked_out.fetch_add(1, Ordering::Relaxed);
-        Ok(MockConnection { id: conn_id })
+        Ok(MockConnection {
+            id: conn_id,
+            permit,
+        })
     }
 
     /// Return a connection to the pool.
     pub async fn release(&self, cx: &Cx, conn: MockConnection) -> Result<(), String> {
+        let MockConnection { id, permit } = conn;
         let mut state = self
             .state
             .lock(cx)
             .await
             .map_err(|e| format!("mutex lock failed: {e}"))?;
-        state.available.push(conn.id);
-        self.checked_out.fetch_sub(1, Ordering::Relaxed);
+        state.available.push(id);
+        drop(state);
+        drop(permit);
         Ok(())
     }
 
@@ -100,15 +100,22 @@ impl MockPool {
     /// Get the number of connections currently available (not checked out).
     #[must_use]
     pub fn available_permits(&self) -> usize {
-        let out = self.checked_out.load(Ordering::Relaxed) as usize;
-        self.capacity.saturating_sub(out)
+        self.gate.available_permits()
     }
 }
 
 /// A mock connection from `MockPool`.
-#[derive(Debug)]
 pub struct MockConnection {
     pub id: u64,
+    permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for MockConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockConnection")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

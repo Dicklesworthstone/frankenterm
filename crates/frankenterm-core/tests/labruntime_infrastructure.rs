@@ -168,13 +168,16 @@ fn mock_pool_acquire_release() {
 
         let conn1 = pool.acquire(&cx).await.expect("acquire 1");
         assert_eq!(pool.total_acquired(), 1);
+        assert_eq!(pool.available_permits(), 1);
 
         let conn2 = pool.acquire(&cx).await.expect("acquire 2");
         assert_eq!(pool.total_acquired(), 2);
         assert_eq!(pool.available_permits(), 0);
 
         pool.release(&cx, conn1).await.expect("release 1");
+        assert_eq!(pool.available_permits(), 1);
         pool.release(&cx, conn2).await.expect("release 2");
+        assert_eq!(pool.available_permits(), 2);
     });
 }
 

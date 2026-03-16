@@ -182,22 +182,24 @@ fn smoke_mock_pool_acquire_release() {
         let pool = MockPool::new(2);
         assert_eq!(pool.capacity(), 2);
 
-        // MockPool's semaphore permit is scoped to the acquire() call,
-        // so available_permits recovers after each acquire completes.
         let conn1 = pool.acquire(&cx).await.expect("acquire 1");
         assert_eq!(pool.total_acquired(), 1);
+        assert_eq!(pool.available_permits(), 1);
 
         let conn2 = pool.acquire(&cx).await.expect("acquire 2");
         assert_eq!(pool.total_acquired(), 2);
+        assert_eq!(pool.available_permits(), 0);
 
-        // Release returns connections to the available pool.
         pool.release(&cx, conn1).await.expect("release 1");
+        assert_eq!(pool.available_permits(), 1);
         pool.release(&cx, conn2).await.expect("release 2");
+        assert_eq!(pool.available_permits(), 2);
 
-        // After release, we can re-acquire.
         let conn3 = pool.acquire(&cx).await.expect("acquire 3");
         assert_eq!(pool.total_acquired(), 3);
+        assert_eq!(pool.available_permits(), 1);
         pool.release(&cx, conn3).await.expect("release 3");
+        assert_eq!(pool.available_permits(), 2);
     });
 }
 

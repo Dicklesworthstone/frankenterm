@@ -373,19 +373,26 @@ fn lab_mock_pool_concurrent_acquire_release() {
             let region = runtime.state.create_root_region(Budget::INFINITE);
             let pool = Arc::new(MockPool::new(2));
             let total_ops = Arc::new(AtomicU64::new(0));
+            let in_flight = Arc::new(AtomicU64::new(0));
+            let max_in_flight = Arc::new(AtomicU64::new(0));
 
             // Spawn 4 tasks that each acquire+release
             for _i in 0..4_u32 {
                 let pool_c = Arc::clone(&pool);
                 let ops = Arc::clone(&total_ops);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
                 let (task_id, _handle) = runtime
                     .state
                     .create_task(region, Budget::INFINITE, async move {
                         let cx = healthy_cx();
                         let conn = pool_c.acquire(&cx).await.expect("acquire");
+                        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = max_in_flight.fetch_max(current, Ordering::SeqCst);
                         // Simulate some work
                         asupersync::runtime::yield_now().await;
                         ops.fetch_add(1, Ordering::SeqCst);
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
                         pool_c.release(&cx, conn).await.expect("release");
                     })
                     .expect("create task");
@@ -399,15 +406,14 @@ fn lab_mock_pool_concurrent_acquire_release() {
             assert_eq!(pool.total_acquired(), 4);
             // All connections returned
             assert_eq!(pool.available_permits(), 2);
+            assert!(
+                max_in_flight.load(Ordering::SeqCst) <= 2,
+                "checked-out connections must never exceed pool capacity"
+            );
         },
     );
     assert!(report.passed());
 }
-
-// Note: `lab_mock_pool_capacity_respects_limit` removed — MockPool's semaphore
-// permit drops when `acquire()` returns, so concurrent capacity enforcement
-// doesn't span the full acquire-to-release cycle. The DPOR scheduler
-// legitimately exposes this design limitation.
 
 #[test]
 fn lab_mock_pool_cancelled_acquire() {
@@ -453,18 +459,25 @@ fn exploration_mock_pool_acquire_release_ordering() {
         let region = runtime.state.create_root_region(Budget::INFINITE);
         let pool = Arc::new(MockPool::new(2));
         let completed = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let max_in_flight = Arc::new(AtomicU64::new(0));
 
         // Spawn tasks that acquire, yield, release — explore interleavings
         for _ in 0..4_u32 {
             let pool_c = Arc::clone(&pool);
             let done = Arc::clone(&completed);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
             let (task_id, _handle) = runtime
                 .state
                 .create_task(region, Budget::INFINITE, async move {
                     let cx = healthy_cx();
                     let conn = pool_c.acquire(&cx).await.expect("acquire");
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = max_in_flight.fetch_max(current, Ordering::SeqCst);
                     asupersync::runtime::yield_now().await;
                     done.fetch_add(1, Ordering::SeqCst);
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
                     pool_c.release(&cx, conn).await.expect("release");
                 })
                 .expect("create task");
@@ -481,6 +494,10 @@ fn exploration_mock_pool_acquire_release_ordering() {
         );
         // Invariant: all permits returned
         assert_eq!(pool.available_permits(), 2, "all permits must be returned");
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 2,
+            "schedule exploration must never exceed pool capacity"
+        );
     });
     assert!(report.passed());
     assert!(report.total_runs >= 5, "should explore multiple schedules");
