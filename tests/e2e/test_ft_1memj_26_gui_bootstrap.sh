@@ -17,6 +17,7 @@ TOTAL=0
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "1memj_26_gui_bootstrap"
+RCH_SKIP_SMOKE_PREFLIGHT=1
 ensure_rch_ready
 
 emit_log() {
@@ -133,6 +134,13 @@ fi
 if [[ "\${1:-}" == "exec" ]]; then
   shift
   printf '%s\n' "\$*" > "${marker_file}"
+  if [[ "\$*" == *"pkg-config --exists x11"* ]]; then
+    exit 0
+  fi
+  if [[ "\$*" != *"cargo build"* ]]; then
+    printf 'unexpected exec: %s\n' "\$*" >&2
+    exit 64
+  fi
   target_dir=""
   for arg in "\$@"; do
     if [[ "\${arg}" == CARGO_TARGET_DIR=* ]]; then
