@@ -46647,16 +46647,9 @@ log_level = "debug"
                 .map(|wf| wf.enabled)
                 .unwrap_or(false)
         };
-        assert!(enabled_for("handle_compaction"));
-        assert!(enabled_for("handle_usage_limits"));
-        assert!(!enabled_for("handle_session_end"));
-        assert!(!enabled_for("handle_session_start_context"));
-        assert!(!enabled_for("handle_auth_required"));
-        assert!(!enabled_for("handle_claude_code_limits"));
-        assert!(!enabled_for("handle_gemini_quota"));
-        assert!(!enabled_for("handle_process_triage_lifecycle"));
-        assert!(!enabled_for("handle_on_error_cass_search"));
-        assert!(!enabled_for("handle_swarm_learning_index"));
+        for name in BUILTIN_WORKFLOW_NAMES {
+            assert!(enabled_for(name), "default config should enable '{name}'");
+        }
 
         let triggers_for = |name: &str| {
             workflows
