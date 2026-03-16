@@ -24,10 +24,12 @@ _LIB_RCH_GUARDS_LOADED=1
 
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
 
 # Populated by rch_init().
 _RCH_PROBE_LOG=""
 _RCH_SMOKE_LOG=""
+_RCH_SMOKE_TARGET_DIR=""
 _RCH_REPO_ROOT=""
 TIMEOUT_BIN=""
 
@@ -98,6 +100,7 @@ rch_init() {
 
     _RCH_PROBE_LOG="${log_dir}/${harness_name}_${run_id}.rch_probe.log"
     _RCH_SMOKE_LOG="${log_dir}/${harness_name}_${run_id}.rch_smoke.log"
+    _RCH_SMOKE_TARGET_DIR="target/rch-smoke/${harness_name}/${run_id}"
 }
 
 # Preflight check: ensure rch is available, workers reachable, and remote
@@ -119,8 +122,12 @@ ensure_rch_ready() {
         rch_fatal "rch workers are unavailable; refusing local cargo execution. See ${_RCH_PROBE_LOG}"
     fi
 
+    if [[ "${RCH_SKIP_SMOKE_PREFLIGHT}" == "1" ]]; then
+        return 0
+    fi
+
     set +e
-    run_rch_cargo_logged "${_RCH_SMOKE_LOG}" env CARGO_TARGET_DIR=target cargo check --help
+    run_rch_cargo_logged "${_RCH_SMOKE_LOG}" env CARGO_TARGET_DIR="${_RCH_SMOKE_TARGET_DIR}" cargo check --help
     local smoke_rc=$?
     set -e
     if [[ ${smoke_rc} -ne 0 ]]; then
