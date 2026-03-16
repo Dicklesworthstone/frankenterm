@@ -241,8 +241,12 @@ pub fn validate_token(
 
     if let Some(expected_identity) = expected_parts.identity {
         let expected_norm = normalize_identity(expected_identity);
-        let presented_norm = presented_parts.identity.map(normalize_identity);
-        if presented_norm.as_deref() != Some(expected_norm.as_str()) {
+        // Use constant-time comparison for identity to avoid timing side-channels.
+        let presented_norm = presented_parts
+            .identity
+            .map(normalize_identity)
+            .unwrap_or_default();
+        if !constant_time_eq(&presented_norm, &expected_norm) {
             return Err(DistributedSecurityError::AuthFailed);
         }
         let Some(client_identity) = client_identity
@@ -251,7 +255,7 @@ pub fn validate_token(
         else {
             return Err(DistributedSecurityError::AuthFailed);
         };
-        if normalize_identity(client_identity) != expected_norm {
+        if !constant_time_eq(&normalize_identity(client_identity), &expected_norm) {
             return Err(DistributedSecurityError::AuthFailed);
         }
     }
