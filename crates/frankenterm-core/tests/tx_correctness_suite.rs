@@ -137,6 +137,32 @@ fn build_execution_record(
     }
 }
 
+fn lifecycle_checkpoint_receipt(
+    contract: &MissionTxContract,
+    seq: u64,
+    state: MissionTxState,
+    reason_code: &str,
+    emitted_at_ms: i64,
+) -> serde_json::Value {
+    serde_json::to_value(TxReceipt {
+        seq,
+        // These fixtures are contract-level checkpoints, not per-step commit receipts.
+        // Keeping them out of the "commit" phase prevents rollback reconstruction from
+        // treating them as malformed step receipts.
+        phase: "lifecycle".into(),
+        tx_id: contract.intent.tx_id.0.clone(),
+        plan_id: contract.plan.plan_id.0.clone(),
+        state,
+        step_id: None,
+        outcome: "state_checkpoint".into(),
+        emitted_at_ms,
+        reason_code: reason_code.into(),
+        error_code: None,
+        decision_path: "test_fixture->lifecycle_checkpoint".into(),
+    })
+    .unwrap()
+}
+
 // ── State Machine Transition Tests ──────────────────────────────────────────
 
 #[test]
@@ -442,16 +468,13 @@ fn receipts_monotonic_through_compensation() {
 #[test]
 fn receipts_continue_sequence_from_prior() {
     let mut contract = build_contract(3, MissionTxState::Prepared);
-    contract.receipts.push(
-        serde_json::to_value(TxReceipt {
-            seq: 42,
-            state: MissionTxState::Prepared,
-            emitted_at_ms: 500,
-            reason_code: Some("prior".into()),
-            error_code: None,
-        })
-        .unwrap(),
-    );
+    contract.receipts.push(lifecycle_checkpoint_receipt(
+        &contract,
+        42,
+        MissionTxState::Prepared,
+        "prior",
+        500,
+    ));
 
     let inputs = success_commit_inputs(3);
     let report = execute_commit_phase(
@@ -611,16 +634,15 @@ fn resume_after_full_commit_no_pending() {
 
     // Put terminal receipt in contract
     let mut terminal_contract = build_contract(3, MissionTxState::Prepared);
-    terminal_contract.receipts.push(
-        serde_json::to_value(TxReceipt {
-            seq: 1,
-            state: MissionTxState::Committed,
-            emitted_at_ms: 11_000,
-            reason_code: None,
-            error_code: None,
-        })
-        .unwrap(),
-    );
+    terminal_contract
+        .receipts
+        .push(lifecycle_checkpoint_receipt(
+            &terminal_contract,
+            1,
+            MissionTxState::Committed,
+            "fully_committed",
+            11_000,
+        ));
 
     let resume =
         reconstruct_tx_resume_state(&terminal_contract, Some(&commit_report), None, 15_000);
@@ -670,16 +692,13 @@ fn resume_after_full_pipeline_is_resolved() {
 
     // Resume with terminal receipt
     let mut final_contract = build_contract(3, MissionTxState::Prepared);
-    final_contract.receipts.push(
-        serde_json::to_value(TxReceipt {
-            seq: 1,
-            state: MissionTxState::RolledBack,
-            emitted_at_ms: 21_000,
-            reason_code: None,
-            error_code: None,
-        })
-        .unwrap(),
-    );
+    final_contract.receipts.push(lifecycle_checkpoint_receipt(
+        &final_contract,
+        1,
+        MissionTxState::RolledBack,
+        "fully_rolled_back",
+        21_000,
+    ));
 
     let resume = reconstruct_tx_resume_state(
         &final_contract,

@@ -101,7 +101,7 @@ use mcp_missions::{
     mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
     mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
-    mcp_tx_transition_info,
+    mcp_save_mission_tx_contract_to_path, mcp_tx_transition_info,
 };
 use mcp_resources::{
     WaAccountsByServiceTemplateResource, WaAccountsResource, WaEventsResource,
