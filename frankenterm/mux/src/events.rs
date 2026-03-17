@@ -9,8 +9,8 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Event types
@@ -247,15 +247,10 @@ impl EventBus {
     /// Handlers are invoked in priority order (Native first, then Wasm,
     /// then Lua).  Within the same priority, registration order is preserved.
     pub fn fire(&self, event: &Event) -> Vec<EventAction> {
-        let handlers = self.handlers.read();
+        let handlers = self.matching_handlers(&event.event_type);
         let mut actions = Vec::new();
-        for record in handlers.iter() {
-            if let Some(ref filter) = record.filter {
-                if filter != &event.event_type {
-                    continue;
-                }
-            }
-            let mut handler_actions = (record.handler)(event);
+        for handler in handlers {
+            let mut handler_actions = handler(event);
             actions.append(&mut handler_actions);
         }
         actions
@@ -271,7 +266,7 @@ impl EventBus {
         self.handlers
             .read()
             .iter()
-            .filter(|r| r.filter.as_ref().is_none_or(|f| f == event_type))
+            .filter(|r| handler_matches_event_type(r, event_type))
             .count()
     }
 
@@ -282,19 +277,12 @@ impl EventBus {
 
     /// Fire an event and return a summary: (action_count, handler_count_matched).
     pub fn fire_counted(&self, event: &Event) -> (usize, usize) {
-        let handlers = self.handlers.read();
+        let handlers = self.matching_handlers(&event.event_type);
         let mut action_count = 0;
-        let mut matched = 0;
-        for record in handlers.iter() {
-            if let Some(ref filter) = record.filter {
-                if filter != &event.event_type {
-                    continue;
-                }
-            }
-            matched += 1;
-            action_count += (record.handler)(event).len();
+        for handler in &handlers {
+            action_count += handler(event).len();
         }
-        (action_count, matched)
+        (action_count, handlers.len())
     }
 
     /// Remove all handlers, returning the count removed.
@@ -304,12 +292,28 @@ impl EventBus {
         handlers.clear();
         count
     }
+
+    fn matching_handlers(&self, event_type: &EventType) -> Vec<Arc<HandlerFn>> {
+        self.handlers
+            .read()
+            .iter()
+            .filter(|record| handler_matches_event_type(record, event_type))
+            .map(|record| Arc::clone(&record.handler))
+            .collect()
+    }
 }
 
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn handler_matches_event_type(record: &HandlerRecord, event_type: &EventType) -> bool {
+    record
+        .filter
+        .as_ref()
+        .is_none_or(|filter| filter == event_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +563,75 @@ mod tests {
         let (action_count, matched) = bus.fire_counted(&make_event(EventType::PaneOutput));
         assert_eq!(action_count, 2);
         assert_eq!(matched, 1);
+    }
+
+    #[test]
+    fn handler_can_deregister_itself_during_fire() {
+        let bus = Arc::new(EventBus::new());
+        let handler_id = Arc::new(std::sync::Mutex::new(None));
+
+        let bus_for_handler = Arc::clone(&bus);
+        let handler_id_for_handler = Arc::clone(&handler_id);
+        let handler: Arc<HandlerFn> = Arc::new(move |_| {
+            if let Some(id) = *handler_id_for_handler.lock().unwrap() {
+                assert!(bus_for_handler.deregister(id));
+            }
+            vec![EventAction::Log {
+                message: "removed".into(),
+            }]
+        });
+
+        let id = bus.register(HandlerPriority::Native, None, handler);
+        *handler_id.lock().unwrap() = Some(id);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bus_for_thread = Arc::clone(&bus);
+        let handle = std::thread::spawn(move || {
+            let actions = bus_for_thread.fire(&make_event(EventType::PaneOutput));
+            tx.send(actions.len()).unwrap();
+        });
+
+        let action_count = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("dispatch should complete without deadlock");
+        handle.join().expect("dispatch thread should not panic");
+        assert_eq!(action_count, 1);
+        assert_eq!(bus.handler_count(), 0);
+    }
+
+    #[test]
+    fn handler_can_deregister_itself_during_fire_counted() {
+        let bus = Arc::new(EventBus::new());
+        let handler_id = Arc::new(std::sync::Mutex::new(None));
+
+        let bus_for_handler = Arc::clone(&bus);
+        let handler_id_for_handler = Arc::clone(&handler_id);
+        let handler: Arc<HandlerFn> = Arc::new(move |_| {
+            if let Some(id) = *handler_id_for_handler.lock().unwrap() {
+                assert!(bus_for_handler.deregister(id));
+            }
+            vec![EventAction::Log {
+                message: "removed".into(),
+            }]
+        });
+
+        let id = bus.register(HandlerPriority::Native, None, handler);
+        *handler_id.lock().unwrap() = Some(id);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bus_for_thread = Arc::clone(&bus);
+        let handle = std::thread::spawn(move || {
+            let stats = bus_for_thread.fire_counted(&make_event(EventType::PaneOutput));
+            tx.send(stats).unwrap();
+        });
+
+        let (action_count, matched) = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("dispatch should complete without deadlock");
+        handle.join().expect("dispatch thread should not panic");
+        assert_eq!(action_count, 1);
+        assert_eq!(matched, 1);
+        assert_eq!(bus.handler_count(), 0);
     }
 
     #[test]
@@ -973,8 +1046,8 @@ mod tests {
     // Concurrent stress tests
     // ===================================================================
 
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
 
     /// Multiple threads fire events concurrently on a shared bus.
     /// Verifies no panics, no lost actions, and handler count is consistent.
