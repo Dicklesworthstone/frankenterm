@@ -4414,9 +4414,9 @@ All MCP errors use stable codes prefixed with `WA-MCP-`:
 | `WA-MCP-0005` | Storage error | `robot.storage_error` |
 | `WA-MCP-0006` | Policy denied | `robot.policy_denied` |
 | `WA-MCP-0007` | Pane not found | `robot.pane_not_found` |
-| `WA-MCP-0008` | Workflow error | `robot.workflow_error` |
+| `WA-MCP-0008` | Workflow error | Workflow-related robot errors, for example `robot.workflow_not_found`, `robot.mission_error`, `robot.tx_error` |
 | `WA-MCP-0009` | Timeout | `robot.timeout` |
-| `WA-MCP-0010` | Not implemented | `robot.not_implemented` |
+| `WA-MCP-0010` | Not implemented | Unsupported/unavailable robot errors, for example `robot.unsupported`, `robot.feature_not_available` |
 
 ##### A.3.3 Tool specs (v1)
 

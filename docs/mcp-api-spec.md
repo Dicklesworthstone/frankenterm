@@ -222,9 +222,9 @@ All MCP errors use stable codes prefixed with `FT-MCP-`:
 | `FT-MCP-0005` | Storage error | `robot.storage_error` |
 | `FT-MCP-0006` | Policy denied or approval required | `robot.policy_denied`, `robot.require_approval` |
 | `FT-MCP-0007` | Pane not found | `robot.pane_not_found` |
-| `FT-MCP-0008` | Workflow error | `robot.workflow_error` |
+| `FT-MCP-0008` | Workflow error | Workflow-related robot errors, for example `robot.workflow_not_found`, `robot.mission_error`, `robot.tx_error` |
 | `FT-MCP-0009` | Timeout | `robot.timeout` |
-| `FT-MCP-0010` | Not implemented | `robot.not_implemented` |
+| `FT-MCP-0010` | Not implemented | Unsupported/unavailable robot errors, for example `robot.unsupported`, `robot.feature_not_available` |
 | `FT-MCP-0011` | Search query lint/FTS syntax error | `robot.fts_query_error` |
 | `FT-MCP-0012` | Reservation conflict | `robot.reservation_conflict` |
 | `FT-MCP-0013` | CAAM/CAUT account backend error | `robot.caut_error` |
