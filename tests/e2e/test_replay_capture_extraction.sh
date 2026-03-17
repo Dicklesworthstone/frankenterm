@@ -73,6 +73,15 @@ run_rch() {
     TMPDIR=/tmp rch "$@"
 }
 
+capture_rch_queue_timeout_log() {
+    local output_file="$1"
+    local queue_log="${output_file%.log}.rch_queue_timeout.log"
+    if ! run_rch queue >"${queue_log}" 2>&1; then
+        queue_log="${output_file}"
+    fi
+    printf '%s\n' "${queue_log}"
+}
+
 resolve_timeout_bin() {
     if command -v timeout >/dev/null 2>&1; then
         TIMEOUT_BIN="timeout"
@@ -103,7 +112,9 @@ run_rch_cargo_logged() {
     set -e
     check_rch_fallback "${output_file}"
     if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${output_file}"
+        local queue_log
+        queue_log="$(capture_rch_queue_timeout_log "${output_file}")"
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
     fi
     return "${rc}"
 }
@@ -151,9 +162,10 @@ set -e
 check_rch_fallback "$raw_log"
 
 if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"$component\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario_id\",\"pane_id\":null,\"step\":\"cargo_test\",\"status\":\"failed\",\"correlation_id\":\"$run_id\",\"decision_path\":\"cargo_test\",\"inputs\":{\"test\":\"runtime_emits_replay_capture_events_when_adapter_is_enabled\",\"error_context\":\"rch remote stall timeout\"},\"outcome\":\"failed\",\"reason_code\":\"rch_remote_stall\",\"error_code\":\"RCH-REMOTE-STALL\",\"artifact_path\":\"${raw_log#$ROOT_DIR/}\"}"
+  queue_log="$(capture_rch_queue_timeout_log "$raw_log")"
+  log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"$component\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario_id\",\"pane_id\":null,\"step\":\"cargo_test\",\"status\":\"failed\",\"correlation_id\":\"$run_id\",\"decision_path\":\"cargo_test\",\"inputs\":{\"test\":\"runtime_emits_replay_capture_events_when_adapter_is_enabled\",\"error_context\":\"rch remote stall timeout\"},\"outcome\":\"failed\",\"reason_code\":\"rch_remote_stall\",\"error_code\":\"RCH-REMOTE-STALL\",\"artifact_path\":\"${queue_log#$ROOT_DIR/}\"}"
   log_json "{\"timestamp\":\"$(now_ts)\",\"component\":\"$component\",\"run_id\":\"$run_id\",\"scenario_id\":\"$scenario_id\",\"pane_id\":null,\"step\":\"complete\",\"status\":\"failed\",\"correlation_id\":\"$run_id\",\"decision_path\":\"suite\",\"inputs\":{\"error_context\":\"rch remote stall timeout\"},\"outcome\":\"failed\",\"reason_code\":\"rch_remote_stall\",\"error_code\":\"RCH-REMOTE-STALL\",\"artifact_path\":\"${json_log#$ROOT_DIR/}\"}"
-  fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${raw_log}"
+  fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
 fi
 
 if [[ $rc -eq 0 ]]; then

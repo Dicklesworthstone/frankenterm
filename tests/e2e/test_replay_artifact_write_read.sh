@@ -100,6 +100,15 @@ run_rch() {
     TMPDIR=/tmp rch "$@"
 }
 
+capture_rch_queue_timeout_log() {
+    local output_file="$1"
+    local queue_log="${output_file%.log}.rch_queue_timeout.log"
+    if ! run_rch queue >"${queue_log}" 2>&1; then
+        queue_log="${output_file}"
+    fi
+    printf '%s\n' "${queue_log}"
+}
+
 resolve_timeout_bin() {
     if command -v timeout >/dev/null 2>&1; then
         TIMEOUT_BIN="timeout"
@@ -130,7 +139,9 @@ run_rch_cargo_logged() {
     set -e
     check_rch_fallback "${output_file}"
     if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${output_file}"
+        local queue_log
+        queue_log="$(capture_rch_queue_timeout_log "${output_file}")"
+        fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
     fi
     return "${rc}"
 }
@@ -197,7 +208,9 @@ run_harvest_command() {
   check_rch_fallback "$combined_file"
 
   if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-    fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${combined_file}"
+    local queue_log
+    queue_log="$(capture_rch_queue_timeout_log "${combined_file}")"
+    fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
   fi
 
   if grep -Eq '\[RCH\][[:space:]]+local|fail-open' "$combined_file"; then
