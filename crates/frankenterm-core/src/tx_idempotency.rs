@@ -636,17 +636,31 @@ impl ResumeContext {
     #[must_use]
     pub fn from_ledger(ledger: &TxExecutionLedger, plan: &TxPlan) -> Self {
         let verification = ledger.verify_chain();
-        let completed = ledger.completed_steps();
+        let completed: HashSet<String> = ledger
+            .records()
+            .iter()
+            .filter(|record| matches!(record.outcome, StepOutcome::Success { .. }))
+            .map(|record| record.idem_key.step_id().to_string())
+            .collect();
         let failed = ledger.failed_steps();
-        let remaining = ledger.pending_step_ids(plan);
 
         // Identify compensated steps.
-        let compensated: Vec<String> = ledger
+        let compensated: HashSet<String> = ledger
             .records()
             .iter()
             .filter(|r| matches!(r.outcome, StepOutcome::Compensated { .. }))
             .map(|r| r.idem_key.step_id().to_string())
             .collect();
+        let remaining = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                !completed.contains(&step.id)
+                    && !failed.contains(&step.id)
+                    && !compensated.contains(&step.id)
+            })
+            .map(|step| step.id.clone())
+            .collect::<Vec<_>>();
 
         let recommendation = if ledger.phase().is_terminal() {
             ResumeRecommendation::AlreadyComplete
@@ -660,14 +674,21 @@ impl ResumeContext {
             ResumeRecommendation::ContinueFromCheckpoint
         };
 
+        let mut completed_steps = completed.into_iter().collect::<Vec<_>>();
+        completed_steps.sort();
+        let mut failed_steps = failed.into_iter().collect::<Vec<_>>();
+        failed_steps.sort();
+        let mut compensated_steps = compensated.into_iter().collect::<Vec<_>>();
+        compensated_steps.sort();
+
         Self {
             execution_id: ledger.execution_id().to_string(),
             plan_id: ledger.plan_id().to_string(),
             interrupted_phase: ledger.phase(),
-            completed_steps: completed.into_iter().collect(),
-            failed_steps: failed.into_iter().collect(),
+            completed_steps,
+            failed_steps,
             remaining_steps: remaining,
-            compensated_steps: compensated,
+            compensated_steps,
             chain_intact: verification.chain_intact,
             last_hash: ledger.last_hash.clone(),
             recommendation,
@@ -1455,6 +1476,37 @@ mod tests {
         );
         assert_eq!(ctx.remaining_steps.len(), 2);
         assert_eq!(ctx.completed_steps.len(), 1);
+    }
+
+    #[test]
+    fn resume_skipped_steps_remain_pending() {
+        let plan = make_plan(2);
+        let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+
+        for step in &plan.steps {
+            let key = make_key("test-plan", &step.id);
+            ledger
+                .append(
+                    key,
+                    StepOutcome::Skipped {
+                        reason: "pause_suspended".to_string(),
+                    },
+                    StepRisk::Low,
+                    "a",
+                    1000,
+                )
+                .unwrap();
+        }
+
+        let ctx = ResumeContext::from_ledger(&ledger, &plan);
+        assert_eq!(
+            ctx.recommendation,
+            ResumeRecommendation::ContinueFromCheckpoint
+        );
+        assert!(ctx.completed_steps.is_empty());
+        assert_eq!(ctx.remaining_steps.len(), 2);
     }
 
     #[test]

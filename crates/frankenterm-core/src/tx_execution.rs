@@ -848,11 +848,11 @@ fn resume_terminal_outcome(
     if contract.lifecycle_state == MissionTxState::Compensated {
         return (MissionTxState::Compensated, TxOutcome::Compensated);
     }
-    if !resume_ctx.compensated_steps.is_empty() {
-        return (MissionTxState::RolledBack, TxOutcome::Compensated);
-    }
     if contract.lifecycle_state == MissionTxState::Failed || !resume_ctx.failed_steps.is_empty() {
         return (MissionTxState::Failed, TxOutcome::Failed);
+    }
+    if !resume_ctx.compensated_steps.is_empty() {
+        return (MissionTxState::RolledBack, TxOutcome::Compensated);
     }
     (MissionTxState::Committed, TxOutcome::Committed)
 }
@@ -1358,6 +1358,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn resume_paused_execution_remains_pending_instead_of_committed() {
+        let mut contract = make_test_contract(2);
+        contract.lifecycle_state = MissionTxState::Committing;
+        contract.outcome = TxOutcome::Pending;
+
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store.create_ledger("exec-1", &compiled_plan).unwrap();
+        {
+            let ledger = store.get_ledger_mut("exec-1").unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+                .unwrap();
+            for step in &contract.plan.steps {
+                ledger
+                    .append(
+                        IdempotencyKey::new(&contract.plan.plan_id.0, &step.step_id.0, "commit"),
+                        StepOutcome::Skipped {
+                            reason: "pause_suspended".into(),
+                        },
+                        StepRisk::Low,
+                        &format!("agent-{}", step.step_id.0),
+                        1000,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let engine = TxExecutionEngine::new(
+            SyntheticStepExecutor,
+            TxExecutionConfig {
+                paused: true,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let result = engine
+            .resume(&mut contract, &store, "exec-1", 5000)
+            .unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::Committing);
+        assert_eq!(result.outcome, TxOutcome::Pending);
+    }
+
+    #[test]
+    fn resume_prefers_failed_state_over_compensated_steps() {
+        let mut contract = make_test_contract(2);
+        contract.lifecycle_state = MissionTxState::Failed;
+        contract.outcome = TxOutcome::Failed;
+
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store.create_ledger("exec-1", &compiled_plan).unwrap();
+        {
+            let ledger = store.get_ledger_mut("exec-1").unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+                .unwrap();
+            ledger
+                .append(
+                    IdempotencyKey::new(&contract.plan.plan_id.0, "step-0", "commit"),
+                    StepOutcome::Success { result: None },
+                    StepRisk::Low,
+                    "agent-step-0",
+                    1000,
+                )
+                .unwrap();
+            ledger
+                .append(
+                    IdempotencyKey::new(&contract.plan.plan_id.0, "step-1", "commit"),
+                    StepOutcome::Failed {
+                        error_code: "FTX3999".into(),
+                        error_message: "commit failed".into(),
+                        compensated: false,
+                    },
+                    StepRisk::Low,
+                    "agent-step-1",
+                    1001,
+                )
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Compensating)
+                .unwrap();
+            ledger
+                .append(
+                    IdempotencyKey::for_compensation(
+                        &contract.plan.plan_id.0,
+                        "step-0",
+                        "rollback",
+                    ),
+                    StepOutcome::Compensated {
+                        original_outcome: Box::new(StepOutcome::Success { result: None }),
+                        compensation_result: "rollback_complete".into(),
+                    },
+                    StepRisk::Low,
+                    "agent-step-0",
+                    1002,
+                )
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Completed)
+                .unwrap();
+        }
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine
+            .resume(&mut contract, &store, "exec-1", 5000)
+            .unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::Failed);
+        assert_eq!(result.outcome, TxOutcome::Failed);
     }
 
     #[test]
