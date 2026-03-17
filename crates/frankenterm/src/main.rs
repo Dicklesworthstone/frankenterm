@@ -8095,6 +8095,12 @@ enum SessionShowPaneLookup {
     },
     NoCheckpointData {
         requested_pane_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_at: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_type: Option<String>,
     },
 }
 
@@ -8106,12 +8112,23 @@ fn load_session_show_pane_lookup(
     let Some(checkpoint) = session_restore::load_latest_checkpoint(db_path, session_id)? else {
         return Ok(SessionShowPaneLookup::NoCheckpointData {
             requested_pane_id: pane_id,
+            checkpoint_id: None,
+            checkpoint_at: None,
+            checkpoint_type: None,
         });
     };
 
     let checkpoint_id = checkpoint.checkpoint_id;
     let checkpoint_at = checkpoint.checkpoint_at;
     let checkpoint_type = checkpoint.checkpoint_type;
+    if checkpoint.pane_states.is_empty() {
+        return Ok(SessionShowPaneLookup::NoCheckpointData {
+            requested_pane_id: pane_id,
+            checkpoint_id: Some(checkpoint_id),
+            checkpoint_at: Some(checkpoint_at),
+            checkpoint_type,
+        });
+    }
     let pane = checkpoint
         .pane_states
         .into_iter()
@@ -8138,7 +8155,7 @@ fn build_session_show_json_payload(
     session: &frankenterm_core::session_restore::SessionCandidate,
     checkpoints: &[frankenterm_core::session_restore::CheckpointInfo],
     pane_lookup: Option<&SessionShowPaneLookup>,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let mut data = serde_json::json!({
         "session": {
             "session_id": session.session_id,
@@ -8151,16 +8168,13 @@ fn build_session_show_json_payload(
     });
 
     if let Some(pane_lookup) = pane_lookup {
-        data.as_object_mut()
-            .expect("session show payload should be a JSON object")
-            .insert(
-                "pane".to_string(),
-                serde_json::to_value(pane_lookup)
-                    .expect("session show pane lookup should serialize"),
-            );
+        let pane_value = serde_json::to_value(pane_lookup)?;
+        if let Some(object) = data.as_object_mut() {
+            object.insert("pane".to_string(), pane_value);
+        }
     }
 
-    data
+    Ok(data)
 }
 
 async fn restore_snapshot_checkpoint(
@@ -36896,7 +36910,7 @@ async fn handle_session_command(
 
             if format == "json" {
                 let data =
-                    build_session_show_json_payload(&session, &checkpoints, pane_lookup.as_ref());
+                    build_session_show_json_payload(&session, &checkpoints, pane_lookup.as_ref())?;
                 println!("{}", serde_json::to_string_pretty(&data)?);
                 return Ok(());
             }
@@ -36963,11 +36977,22 @@ async fn handle_session_command(
                             "Pane {requested_pane_id} not found in selected checkpoint #{checkpoint_id}."
                         );
                     }
-                    SessionShowPaneLookup::NoCheckpointData { requested_pane_id } => {
-                        eprintln!(
-                            "No checkpoint data available for session {session_id}; cannot show pane {requested_pane_id}."
-                        );
-                    }
+                    SessionShowPaneLookup::NoCheckpointData {
+                        requested_pane_id,
+                        checkpoint_id,
+                        ..
+                    } => match checkpoint_id {
+                        Some(checkpoint_id) => {
+                            eprintln!(
+                                "No pane state data available in selected checkpoint #{checkpoint_id} for session {session_id}; cannot show pane {requested_pane_id}."
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "No checkpoint data available for session {session_id}; cannot show pane {requested_pane_id}."
+                            );
+                        }
+                    },
                 }
             }
         }
@@ -39804,6 +39829,30 @@ mod tests {
             lookup,
             SessionShowPaneLookup::NoCheckpointData {
                 requested_pane_id: 7,
+                checkpoint_id: None,
+                checkpoint_at: None,
+                checkpoint_type: None,
+            }
+        );
+    }
+
+    #[test]
+    fn session_show_pane_lookup_reports_empty_selected_checkpoint_as_no_data() {
+        let (db_path, conn, _dir) = setup_session_show_test_db();
+        insert_session_for_session_show_test(&conn, "sess-empty-checkpoint", false);
+        let checkpoint_id =
+            insert_checkpoint_for_session_show_test(&conn, "sess-empty-checkpoint", 2000, 2);
+
+        let lookup = load_session_show_pane_lookup(&db_path, "sess-empty-checkpoint", 7)
+            .expect("load pane lookup");
+
+        assert_eq!(
+            lookup,
+            SessionShowPaneLookup::NoCheckpointData {
+                requested_pane_id: 7,
+                checkpoint_id: Some(checkpoint_id),
+                checkpoint_at: Some(2000),
+                checkpoint_type: Some("periodic".to_string()),
             }
         );
     }
@@ -39832,7 +39881,8 @@ mod tests {
             checkpoint_type: Some("periodic".to_string()),
         };
 
-        let payload = build_session_show_json_payload(&session, &checkpoints, Some(&pane_lookup));
+        let payload = build_session_show_json_payload(&session, &checkpoints, Some(&pane_lookup))
+            .expect("session show payload should serialize");
 
         assert_eq!(payload["session"]["session_id"].as_str(), Some("sess-json"));
         assert_eq!(payload["checkpoints"][0]["id"].as_i64(), Some(17));
