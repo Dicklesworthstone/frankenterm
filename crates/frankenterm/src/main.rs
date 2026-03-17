@@ -4500,11 +4500,32 @@ const ROBOT_ERR_INVALID_ARGS: &str = "robot.invalid_args";
 const ROBOT_ERR_UNKNOWN_SUBCOMMAND: &str = "robot.unknown_subcommand";
 const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
+const ROBOT_ERR_APPROVAL: &str = "robot.approval_error";
+const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
+const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
+const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
+
+fn robot_reservation_error_details(
+    err: &frankenterm_core::Error,
+) -> (&'static str, Option<String>) {
+    match err {
+        frankenterm_core::Error::Storage(
+            frankenterm_core::StorageError::ReservationConflict { .. },
+        ) => (
+            ROBOT_ERR_RESERVATION_CONFLICT,
+            Some(
+                "Pane is already reserved. Use 'ft robot reservations list' to inspect or release the conflicting reservation."
+                    .to_string(),
+            ),
+        ),
+        _ => (ROBOT_ERR_STORAGE, None),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RobotOutputFormat {
@@ -6768,13 +6789,25 @@ fn robot_policy_error_from_decision(
         frankenterm_core::policy::PolicyDecision::RequireApproval { .. } => (
             "robot.require_approval".to_string(),
             decision.reason().unwrap_or(default_reason).to_string(),
-            Some("Human approval is required before reading this output.".to_string()),
+            policy_approval_command(decision).or_else(|| {
+                Some("Human approval is required before reading this output.".to_string())
+            }),
         ),
         frankenterm_core::policy::PolicyDecision::Allow { .. } => (
             "robot.policy_denied".to_string(),
             default_reason.to_string(),
             None,
         ),
+    }
+}
+
+fn policy_approval_command(decision: &frankenterm_core::policy::PolicyDecision) -> Option<String> {
+    match decision {
+        frankenterm_core::policy::PolicyDecision::RequireApproval {
+            approval: Some(approval),
+            ..
+        } => Some(approval.command.clone()),
+        _ => None,
     }
 }
 
@@ -6825,11 +6858,12 @@ async fn authorize_read_or_search_policy(
     config: &frankenterm_core::config::Config,
     storage: Option<&frankenterm_core::storage::StorageHandle>,
     ipc_socket_path: Option<&Path>,
+    workspace_root: Option<&Path>,
     action: frankenterm_core::policy::ActionKind,
     actor: frankenterm_core::policy::ActorKind,
     pane_id: Option<u64>,
     summary: &str,
-) -> (frankenterm_core::policy::PolicyDecision, Option<String>) {
+) -> Result<(frankenterm_core::policy::PolicyDecision, Option<String>), String> {
     let mut engine = frankenterm_core::policy::PolicyEngine::new(
         config.safety.rate_limit_per_pane,
         config.safety.rate_limit_global,
@@ -6838,9 +6872,10 @@ async fn authorize_read_or_search_policy(
     .with_command_gate_config(config.safety.command_gate.clone())
     .with_policy_rules(config.safety.rules.clone());
 
+    let redacted_summary = redact_for_output(summary);
     let mut input = frankenterm_core::policy::PolicyInput::new(action, actor)
         .with_surface(frankenterm_core::policy::PolicySurface::Mux)
-        .with_text_summary(redact_for_output(summary));
+        .with_text_summary(&redacted_summary);
     let mut domain = None;
 
     if let Some(pane_id) = pane_id {
@@ -6864,7 +6899,30 @@ async fn authorize_read_or_search_policy(
         input = input.with_capabilities(frankenterm_core::policy::PaneCapabilities::unknown());
     }
 
-    (engine.authorize(&input), domain)
+    let mut decision = engine.authorize(&input);
+    if decision.requires_approval() {
+        let storage = storage.ok_or_else(|| {
+            "Approval storage unavailable. Run 'ft watch' first so FrankenTerm can issue an approval token."
+                .to_string()
+        })?;
+        let workspace_id = config
+            .workspace_layout(workspace_root)
+            .map_err(|e| format!("Failed to resolve workspace for approval token: {e}"))?
+            .root
+            .to_string_lossy()
+            .to_string();
+        let store = frankenterm_core::approval::ApprovalStore::new(
+            storage,
+            config.safety.approval.clone(),
+            workspace_id,
+        );
+        decision = store
+            .attach_to_decision(decision, &input, Some(redacted_summary))
+            .await
+            .map_err(|e| format!("Failed to issue approval token: {e}"))?;
+    }
+
+    Ok((decision, domain))
 }
 
 fn workflow_run_policy_input(
@@ -7990,6 +8048,119 @@ fn resolve_checkpoint_id(db_path: &str, snapshot_id: &str) -> anyhow::Result<i64
     snapshot_id
         .parse::<i64>()
         .map_err(|_| anyhow::anyhow!("Invalid snapshot ID: {snapshot_id}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct SessionShowPaneState {
+    pane_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_state: Option<frankenterm_core::session_pane_state::TerminalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_metadata: Option<frankenterm_core::session_pane_state::AgentMetadata>,
+}
+
+impl From<frankenterm_core::session_restore::RestoredPaneState> for SessionShowPaneState {
+    fn from(value: frankenterm_core::session_restore::RestoredPaneState) -> Self {
+        Self {
+            pane_id: value.pane_id,
+            cwd: value.cwd,
+            command: value.command,
+            terminal_state: value.terminal_state,
+            agent_metadata: value.agent_metadata,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SessionShowPaneLookup {
+    Found {
+        requested_pane_id: u64,
+        checkpoint_id: i64,
+        checkpoint_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_type: Option<String>,
+        pane: SessionShowPaneState,
+    },
+    PaneNotFound {
+        requested_pane_id: u64,
+        checkpoint_id: i64,
+        checkpoint_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_type: Option<String>,
+    },
+    NoCheckpointData {
+        requested_pane_id: u64,
+    },
+}
+
+fn load_session_show_pane_lookup(
+    db_path: &str,
+    session_id: &str,
+    pane_id: u64,
+) -> anyhow::Result<SessionShowPaneLookup> {
+    let Some(checkpoint) = session_restore::load_latest_checkpoint(db_path, session_id)? else {
+        return Ok(SessionShowPaneLookup::NoCheckpointData {
+            requested_pane_id: pane_id,
+        });
+    };
+
+    let checkpoint_id = checkpoint.checkpoint_id;
+    let checkpoint_at = checkpoint.checkpoint_at;
+    let checkpoint_type = checkpoint.checkpoint_type;
+    let pane = checkpoint
+        .pane_states
+        .into_iter()
+        .find(|state| state.pane_id == pane_id);
+
+    Ok(match pane {
+        Some(pane) => SessionShowPaneLookup::Found {
+            requested_pane_id: pane_id,
+            checkpoint_id,
+            checkpoint_at,
+            checkpoint_type,
+            pane: pane.into(),
+        },
+        None => SessionShowPaneLookup::PaneNotFound {
+            requested_pane_id: pane_id,
+            checkpoint_id,
+            checkpoint_at,
+            checkpoint_type,
+        },
+    })
+}
+
+fn build_session_show_json_payload(
+    session: &frankenterm_core::session_restore::SessionCandidate,
+    checkpoints: &[frankenterm_core::session_restore::CheckpointInfo],
+    pane_lookup: Option<&SessionShowPaneLookup>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "session": {
+            "session_id": session.session_id,
+            "created_at": session.created_at,
+            "last_checkpoint_at": session.last_checkpoint_at,
+            "ft_version": session.ft_version,
+            "host_id": session.host_id,
+        },
+        "checkpoints": checkpoints,
+    });
+
+    if let Some(pane_lookup) = pane_lookup {
+        data.as_object_mut()
+            .expect("session show payload should be a JSON object")
+            .insert(
+                "pane".to_string(),
+                serde_json::to_value(pane_lookup)
+                    .expect("session show pane lookup should serialize"),
+            );
+    }
+
+    data
 }
 
 async fn restore_snapshot_checkpoint(
@@ -9799,7 +9970,7 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                 ),
             ),
             WeztermError::Timeout(_) => (
-                "robot.wezterm_timeout",
+                ROBOT_ERR_TIMEOUT,
                 Some("WezTerm command timed out. The terminal may be unresponsive.".to_string()),
             ),
             WeztermError::CircuitOpen { retry_after_ms } => (
@@ -15017,16 +15188,31 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let pane_id = pane_ids[0];
                                 let summary =
                                     format!("robot.get_text pane_id={pane_id} tail={tail}");
-                                let (decision, domain) = authorize_read_or_search_policy(
+                                let (decision, domain) = match authorize_read_or_search_policy(
                                     &config,
                                     storage.as_ref(),
                                     Some(ipc_socket),
+                                    Some(Path::new(&ctx.effective.paths.workspace_root)),
                                     frankenterm_core::policy::ActionKind::ReadOutput,
                                     frankenterm_core::policy::ActorKind::Robot,
                                     Some(pane_id),
                                     &summary,
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(authorized) => authorized,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<RobotGetTextData>::error_with_code(
+                                                ROBOT_ERR_APPROVAL,
+                                                e,
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
                                 if !decision.is_allowed() {
                                     let status = if decision.requires_approval() {
                                         "require_approval"
@@ -15120,16 +15306,31 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let summary = format!(
                                         "robot.get_text pane_id={target_pane_id} tail={tail}"
                                     );
-                                    let (decision, domain) = authorize_read_or_search_policy(
+                                    let (decision, domain) = match authorize_read_or_search_policy(
                                         &config,
                                         storage.as_ref(),
                                         Some(ipc_socket),
+                                        Some(Path::new(&ctx.effective.paths.workspace_root)),
                                         frankenterm_core::policy::ActionKind::ReadOutput,
                                         frankenterm_core::policy::ActorKind::Robot,
                                         Some(*target_pane_id),
                                         &summary,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        Ok(authorized) => authorized,
+                                        Err(e) => {
+                                            results.insert(
+                                                *target_pane_id,
+                                                RobotPaneTextResult::Error {
+                                                    code: ROBOT_ERR_APPROVAL.to_string(),
+                                                    message: e,
+                                                    hint: None,
+                                                },
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     decisions.insert(*target_pane_id, decision.clone());
                                     domains.insert(*target_pane_id, domain.clone());
 
@@ -15542,7 +15743,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     Err(e) => {
                                         let response =
                                             RobotResponse::<RobotWaitForData>::error_with_code(
-                                                "FT-ROBOT-INVALID-REGEX",
+                                                ROBOT_ERR_INVALID_ARGS,
                                                 format!("Invalid regex pattern: {e}"),
                                                 Some("Check the regex syntax".to_string()),
                                                 elapsed_ms(start),
@@ -15564,7 +15765,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     if !panes.iter().any(|p| p.pane_id == pane_id) {
                                         let response =
                                             RobotResponse::<RobotWaitForData>::error_with_code(
-                                                "FT-ROBOT-PANE-NOT-FOUND",
+                                                ROBOT_ERR_PANE_NOT_FOUND,
                                                 format!("Pane {pane_id} not found"),
                                                 Some(
                                                     "Use 'ft robot state' to list available panes"
@@ -15577,11 +15778,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                                 Err(e) => {
+                                    let (code, hint) = map_wezterm_error_to_robot(&e);
                                     let response =
                                         RobotResponse::<RobotWaitForData>::error_with_code(
-                                            "FT-ROBOT-WEZTERM-ERROR",
+                                            code,
                                             format!("Failed to list panes: {e}"),
-                                            None,
+                                            hint,
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -15631,7 +15833,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     ..
                                 }) => {
                                     let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                        "FT-ROBOT-TIMEOUT",
+                                        ROBOT_ERR_TIMEOUT,
                                         format!(
                                             "Timeout waiting for pattern '{pattern}' after {elapsed}ms ({polls} polls)"
                                         ),
@@ -15641,11 +15843,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
+                                    let (code, hint) = map_wezterm_error_to_robot(&e);
                                     let response =
                                         RobotResponse::<RobotWaitForData>::error_with_code(
-                                            "FT-ROBOT-GET-TEXT-FAILED",
+                                            code,
                                             format!("Failed to get pane text: {e}"),
-                                            None,
+                                            hint,
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -15746,16 +15949,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 canonical.pane
                             );
                             let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
-                            let (policy_decision, policy_domain) = authorize_read_or_search_policy(
-                                &config,
-                                Some(&storage),
-                                Some(ipc_socket),
-                                frankenterm_core::policy::ActionKind::SearchOutput,
-                                frankenterm_core::policy::ActorKind::Robot,
-                                canonical.pane,
-                                &policy_summary,
-                            )
-                            .await;
+                            let (policy_decision, policy_domain) =
+                                match authorize_read_or_search_policy(
+                                    &config,
+                                    Some(&storage),
+                                    Some(ipc_socket),
+                                    Some(Path::new(&ctx.effective.paths.workspace_root)),
+                                    frankenterm_core::policy::ActionKind::SearchOutput,
+                                    frankenterm_core::policy::ActorKind::Robot,
+                                    canonical.pane,
+                                    &policy_summary,
+                                )
+                                .await
+                                {
+                                    Ok(authorized) => authorized,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<RobotSearchData>::error_with_code(
+                                                ROBOT_ERR_APPROVAL,
+                                                e,
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
                             if !policy_decision.is_allowed() {
                                 let status = if policy_decision.requires_approval() {
                                     "require_approval"
@@ -19880,16 +20099,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             print_robot_response(&response, format, stats)?;
                                         }
                                         Err(e) => {
+                                            let (code, hint) = robot_reservation_error_details(&e);
                                             let response =
                                                 RobotResponse::<RobotReserveData>::error_with_code(
-                                                    "robot.reservation_conflict",
-                                                    format!(
-                                                        "Failed to create reservation: {e}"
-                                                    ),
-                                                    Some(
-                                                        "Pane may already be reserved. Use 'ft robot reservations list' to check."
-                                                            .to_string(),
-                                                    ),
+                                                    code,
+                                                    format!("Failed to create reservation: {e}"),
+                                                    hint,
                                                     elapsed_ms(start),
                                                 );
                                             print_robot_response(&response, format, stats)?;
@@ -21429,16 +21644,37 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         canonical.mode.as_str(),
                         pane
                     );
-                    let (policy_decision, policy_domain) = authorize_read_or_search_policy(
+                    let (policy_decision, policy_domain) = match authorize_read_or_search_policy(
                         &config,
                         Some(&storage),
                         Some(layout.ipc_socket_path.as_path()),
+                        Some(workspace_root.as_path()),
                         frankenterm_core::policy::ActionKind::SearchOutput,
                         frankenterm_core::policy::ActorKind::Human,
                         pane,
                         &policy_summary,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(authorized) => authorized,
+                        Err(e) => {
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": false,
+                                    "error": e,
+                                    "error_code": "approval_error",
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                eprintln!("Error: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    };
                     if !policy_decision.is_allowed() {
                         let status = if policy_decision.requires_approval() {
                             "require_approval"
@@ -21460,8 +21696,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             .reason()
                             .unwrap_or("Search denied by policy")
                             .to_string();
+                        let approval_hint = if policy_decision.requires_approval() {
+                            policy_approval_command(&policy_decision).or_else(|| {
+                                Some(
+                                    "Human approval is required before searching captured output."
+                                        .to_string(),
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         if output_format.is_json() {
-                            let payload = serde_json::json!({
+                            let mut payload = serde_json::json!({
                                 "ok": false,
                                 "error": reason,
                                 "error_code": if policy_decision.requires_approval() {
@@ -21471,16 +21717,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 },
                                 "version": frankenterm_core::VERSION,
                             });
+                            if let Some(hint) = approval_hint.as_ref() {
+                                payload["hint"] = serde_json::Value::String(hint.clone());
+                            }
                             println!(
                                 "{}",
                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                             );
                         } else {
                             eprintln!("Error: {reason}");
-                            if policy_decision.requires_approval() {
-                                eprintln!(
-                                    "Hint: Human approval is required before reading this output."
-                                );
+                            if let Some(hint) = approval_hint.as_ref() {
+                                eprintln!("Hint: {hint}");
                             }
                         }
                         std::process::exit(1);
@@ -22425,16 +22672,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .await
                     .ok();
             let policy_summary = format!("get-text pane_id={pane_id} tail={tail}");
-            let (policy_decision, policy_domain) = authorize_read_or_search_policy(
+            let (policy_decision, policy_domain) = match authorize_read_or_search_policy(
                 &config,
                 storage.as_ref(),
                 Some(layout.ipc_socket_path.as_path()),
+                Some(workspace_root.as_path()),
                 frankenterm_core::policy::ActionKind::ReadOutput,
                 frankenterm_core::policy::ActorKind::Human,
                 Some(pane_id),
                 &policy_summary,
             )
-            .await;
+            .await
+            {
+                Ok(authorized) => authorized,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
             if !policy_decision.is_allowed() {
                 let status = if policy_decision.requires_approval() {
                     "require_approval"
@@ -22457,8 +22712,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .unwrap_or("Read denied by policy")
                     .to_string();
                 eprintln!("Error: {reason}");
-                if policy_decision.requires_approval() {
-                    eprintln!("Hint: Human approval is required before reading this output.");
+                if let Some(hint) = policy_approval_command(&policy_decision).or_else(|| {
+                    policy_decision.requires_approval().then(|| {
+                        "Human approval is required before reading this output.".to_string()
+                    })
+                }) {
+                    eprintln!("Hint: {hint}");
                 }
                 std::process::exit(1);
             }
@@ -28347,7 +28606,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("Failed to reserve pane {pane_id}: {e}");
-                    eprintln!("Hint: Use 'ft reservations' to see active reservations.");
+                    match e {
+                        frankenterm_core::Error::Storage(
+                            frankenterm_core::StorageError::ReservationConflict { .. },
+                        ) => {
+                            eprintln!(
+                                "Hint: Use 'ft reservations' to inspect or release the conflicting reservation."
+                            );
+                        }
+                        _ => {
+                            eprintln!("Hint: Check storage health with 'ft doctor' and retry.");
+                        }
+                    }
                     std::process::exit(1);
                 }
             }
@@ -36620,18 +36890,13 @@ async fn handle_session_command(
             format,
         } => {
             let (session, checkpoints) = session_restore::show_session(&db_path, &session_id)?;
+            let pane_lookup = pane
+                .map(|pane_id| load_session_show_pane_lookup(&db_path, &session_id, pane_id))
+                .transpose()?;
 
             if format == "json" {
-                let data = serde_json::json!({
-                    "session": {
-                        "session_id": session.session_id,
-                        "created_at": session.created_at,
-                        "last_checkpoint_at": session.last_checkpoint_at,
-                        "ft_version": session.ft_version,
-                        "host_id": session.host_id,
-                    },
-                    "checkpoints": checkpoints,
-                });
+                let data =
+                    build_session_show_json_payload(&session, &checkpoints, pane_lookup.as_ref());
                 println!("{}", serde_json::to_string_pretty(&data)?);
                 return Ok(());
             }
@@ -36660,39 +36925,48 @@ async fn handle_session_command(
             }
 
             // Show specific pane if requested
-            if let Some(pane_id) = pane {
-                if let Some(latest_cp) = checkpoints.first() {
-                    match session_restore::load_latest_checkpoint(&db_path, &session_id)? {
-                        Some(data) => {
-                            if let Some(ps) = data.pane_states.iter().find(|p| p.pane_id == pane_id)
-                            {
-                                println!("\nPane {pane_id} (checkpoint #{}):", latest_cp.id);
-                                if let Some(ref cwd) = ps.cwd {
-                                    println!("  CWD:     {cwd}");
-                                }
-                                if let Some(ref cmd) = ps.command {
-                                    println!("  Process: {cmd}");
-                                }
-                                if let Some(ref ts) = ps.terminal_state {
-                                    println!(
-                                        "  Size:    {}x{} alt_screen={}",
-                                        ts.cols, ts.rows, ts.is_alt_screen
-                                    );
-                                }
-                                if let Some(ref agent) = ps.agent_metadata {
-                                    println!(
-                                        "  Agent:   {} (state: {})",
-                                        agent.agent_type,
-                                        agent.state.as_deref().unwrap_or("unknown")
-                                    );
-                                }
-                            } else {
-                                eprintln!("Pane {pane_id} not found in latest checkpoint.");
-                            }
+            if let Some(pane_lookup) = pane_lookup {
+                match pane_lookup {
+                    SessionShowPaneLookup::Found {
+                        requested_pane_id,
+                        checkpoint_id,
+                        pane,
+                        ..
+                    } => {
+                        println!("\nPane {requested_pane_id} (checkpoint #{checkpoint_id}):");
+                        if let Some(ref cwd) = pane.cwd {
+                            println!("  CWD:     {cwd}");
                         }
-                        None => {
-                            eprintln!("No checkpoint data available.");
+                        if let Some(ref cmd) = pane.command {
+                            println!("  Process: {cmd}");
                         }
+                        if let Some(ref ts) = pane.terminal_state {
+                            println!(
+                                "  Size:    {}x{} alt_screen={}",
+                                ts.cols, ts.rows, ts.is_alt_screen
+                            );
+                        }
+                        if let Some(ref agent) = pane.agent_metadata {
+                            println!(
+                                "  Agent:   {} (state: {})",
+                                agent.agent_type,
+                                agent.state.as_deref().unwrap_or("unknown")
+                            );
+                        }
+                    }
+                    SessionShowPaneLookup::PaneNotFound {
+                        requested_pane_id,
+                        checkpoint_id,
+                        ..
+                    } => {
+                        eprintln!(
+                            "Pane {requested_pane_id} not found in selected checkpoint #{checkpoint_id}."
+                        );
+                    }
+                    SessionShowPaneLookup::NoCheckpointData { requested_pane_id } => {
+                        eprintln!(
+                            "No checkpoint data available for session {session_id}; cannot show pane {requested_pane_id}."
+                        );
                     }
                 }
             }
@@ -39377,6 +39651,194 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    fn setup_session_show_test_db() -> (String, rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create session show tempdir");
+        let db_path = dir.path().join("session-show.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open session show sqlite db");
+        conn.execute_batch(
+            "
+            CREATE TABLE mux_sessions (
+                session_id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                last_checkpoint_at INTEGER,
+                shutdown_clean INTEGER NOT NULL DEFAULT 0,
+                topology_json TEXT NOT NULL,
+                window_metadata_json TEXT,
+                ft_version TEXT NOT NULL,
+                host_id TEXT
+            );
+
+            CREATE TABLE session_checkpoints (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                checkpoint_at INTEGER NOT NULL,
+                checkpoint_type TEXT,
+                state_hash TEXT NOT NULL,
+                pane_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                metadata_json TEXT
+            );
+
+            CREATE TABLE mux_pane_state (
+                id INTEGER PRIMARY KEY,
+                checkpoint_id INTEGER NOT NULL,
+                pane_id INTEGER NOT NULL,
+                cwd TEXT,
+                command TEXT,
+                env_json TEXT,
+                terminal_state_json TEXT NOT NULL,
+                agent_metadata_json TEXT,
+                scrollback_checkpoint_seq INTEGER,
+                last_output_at INTEGER
+            );
+            ",
+        )
+        .expect("create session show test tables");
+
+        (db_path.to_string_lossy().to_string(), conn, dir)
+    }
+
+    fn insert_session_for_session_show_test(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        shutdown_clean: bool,
+    ) {
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![session_id, 1000i64, topology, "0.1.0", shutdown_clean as i64],
+        )
+        .expect("insert session show test session");
+    }
+
+    fn insert_checkpoint_for_session_show_test(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        checkpoint_at: i64,
+        pane_count: usize,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO session_checkpoints (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+             VALUES (?1, ?2, 'periodic', 'hash123', ?3, 1024)",
+            rusqlite::params![session_id, checkpoint_at, pane_count as i64],
+        )
+        .expect("insert session show test checkpoint");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_pane_state_for_session_show_test(
+        conn: &rusqlite::Connection,
+        checkpoint_id: i64,
+        pane_id: u64,
+        cwd: Option<&str>,
+        command: Option<&str>,
+    ) {
+        let terminal_json = r#"{"rows":24,"cols":80,"cursor_row":0,"cursor_col":0,"is_alt_screen":false,"title":"test"}"#;
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, cwd, command, terminal_state_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![checkpoint_id, pane_id as i64, cwd, command, terminal_json],
+        )
+        .expect("insert session show test pane state");
+    }
+
+    #[test]
+    fn session_show_pane_lookup_uses_selected_checkpoint_metadata() {
+        let (db_path, conn, _dir) = setup_session_show_test_db();
+        insert_session_for_session_show_test(&conn, "sess-shadowed", false);
+        let capture_cp = insert_checkpoint_for_session_show_test(&conn, "sess-shadowed", 1000, 1);
+        insert_pane_state_for_session_show_test(
+            &conn,
+            capture_cp,
+            42,
+            Some("/workspace"),
+            Some("bash"),
+        );
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+            rusqlite::params![
+                "sess-shadowed",
+                2000i64,
+                1i64,
+                r#"{"old_to_new":{"42":99}}"#,
+            ],
+        )
+        .expect("insert newer startup checkpoint");
+
+        let lookup =
+            load_session_show_pane_lookup(&db_path, "sess-shadowed", 42).expect("load pane data");
+
+        match lookup {
+            SessionShowPaneLookup::Found {
+                requested_pane_id,
+                checkpoint_id,
+                checkpoint_at,
+                pane,
+                ..
+            } => {
+                assert_eq!(requested_pane_id, 42);
+                assert_eq!(checkpoint_id, capture_cp);
+                assert_eq!(checkpoint_at, 1000);
+                assert_eq!(pane.cwd.as_deref(), Some("/workspace"));
+                assert_eq!(pane.command.as_deref(), Some("bash"));
+            }
+            other => panic!("expected found pane lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_show_pane_lookup_reports_missing_checkpoint_data() {
+        let (db_path, conn, _dir) = setup_session_show_test_db();
+        insert_session_for_session_show_test(&conn, "sess-no-checkpoints", false);
+
+        let lookup = load_session_show_pane_lookup(&db_path, "sess-no-checkpoints", 7)
+            .expect("load pane lookup");
+
+        assert_eq!(
+            lookup,
+            SessionShowPaneLookup::NoCheckpointData {
+                requested_pane_id: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn build_session_show_json_payload_includes_requested_pane_lookup() {
+        let session = frankenterm_core::session_restore::SessionCandidate {
+            session_id: "sess-json".to_string(),
+            created_at: 1000,
+            last_checkpoint_at: Some(2000),
+            topology_json: "{}".to_string(),
+            ft_version: "0.1.0".to_string(),
+            host_id: Some("host-a".to_string()),
+        };
+        let checkpoints = vec![frankenterm_core::session_restore::CheckpointInfo {
+            id: 17,
+            checkpoint_at: 2000,
+            checkpoint_type: Some("periodic".to_string()),
+            pane_count: 1,
+            total_bytes: 1024,
+        }];
+        let pane_lookup = SessionShowPaneLookup::PaneNotFound {
+            requested_pane_id: 42,
+            checkpoint_id: 17,
+            checkpoint_at: 2000,
+            checkpoint_type: Some("periodic".to_string()),
+        };
+
+        let payload = build_session_show_json_payload(&session, &checkpoints, Some(&pane_lookup));
+
+        assert_eq!(payload["session"]["session_id"].as_str(), Some("sess-json"));
+        assert_eq!(payload["checkpoints"][0]["id"].as_i64(), Some(17));
+        assert_eq!(payload["pane"]["status"].as_str(), Some("pane_not_found"));
+        assert_eq!(payload["pane"]["requested_pane_id"].as_u64(), Some(42));
+        assert_eq!(payload["pane"]["checkpoint_id"].as_i64(), Some(17));
     }
 
     #[test]
@@ -46907,7 +47369,39 @@ log_level = "debug"
         assert_eq!(ROBOT_ERR_UNKNOWN_SUBCOMMAND, "robot.unknown_subcommand");
         assert_eq!(ROBOT_ERR_CONFIG, "robot.config_error");
         assert_eq!(ROBOT_ERR_FTS_QUERY, "robot.fts_query_error");
+        assert_eq!(ROBOT_ERR_APPROVAL, "robot.approval_error");
+        assert_eq!(ROBOT_ERR_PANE_NOT_FOUND, "robot.pane_not_found");
+        assert_eq!(ROBOT_ERR_RESERVATION_CONFLICT, "robot.reservation_conflict");
         assert_eq!(ROBOT_ERR_STORAGE, "robot.storage_error");
+        assert_eq!(ROBOT_ERR_TIMEOUT, "robot.timeout");
+    }
+
+    #[test]
+    fn map_wezterm_error_to_robot_covers_wait_for_paths() {
+        let pane_not_found = frankenterm_core::Error::Wezterm(
+            frankenterm_core::error::WeztermError::PaneNotFound(7),
+        );
+        let (code, hint) = map_wezterm_error_to_robot(&pane_not_found);
+        assert_eq!(code, ROBOT_ERR_PANE_NOT_FOUND);
+        assert!(hint.unwrap().contains("ft robot state"));
+
+        let timeout =
+            frankenterm_core::Error::Wezterm(frankenterm_core::error::WeztermError::Timeout(30));
+        let (code, hint) = map_wezterm_error_to_robot(&timeout);
+        assert_eq!(code, ROBOT_ERR_TIMEOUT);
+        assert!(hint.unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn robot_reservation_error_details_maps_conflict() {
+        let err =
+            frankenterm_core::Error::Storage(frankenterm_core::StorageError::ReservationConflict {
+                pane_id: 3,
+                existing_id: 14,
+            });
+        let (code, hint) = robot_reservation_error_details(&err);
+        assert_eq!(code, ROBOT_ERR_RESERVATION_CONFLICT);
+        assert!(hint.unwrap().contains("reservations list"));
     }
 
     #[test]
@@ -48907,12 +49401,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::SearchOutput,
                 frankenterm_core::policy::ActorKind::Robot,
                 None,
                 "robot search test",
             )
-            .await;
+            .await
+            .expect("default search policy authorization should succeed");
             assert!(
                 decision.is_allowed(),
                 "default robot search should be allowed"
@@ -48953,12 +49449,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::SearchOutput,
                 frankenterm_core::policy::ActorKind::Robot,
                 None,
                 "robot search test",
             )
-            .await;
+            .await
+            .expect("deny rule evaluation should succeed");
             assert!(decision.is_denied(), "rule should deny robot search");
             assert_eq!(decision.reason(), Some("robot search blocked for test"));
             let context = decision
@@ -48968,6 +49466,99 @@ log_level = "debug"
                 context.surface,
                 frankenterm_core::policy::PolicySurface::Mux
             );
+        });
+    }
+
+    #[test]
+    fn read_search_policy_require_approval_attaches_allow_once_command() {
+        run_async_test(async {
+            let workspace = tempfile::tempdir().expect("temp workspace");
+            let db_path = workspace.path().join("ft.db");
+            let storage = frankenterm_core::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should open");
+
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.require_approval.robot.search".to_string(),
+                    description: Some("require approval for robot search".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["search_output".to_string()],
+                        actors: vec!["robot".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::RequireApproval,
+                    message: Some("robot search needs approval".to_string()),
+                });
+
+            let (decision, _domain) = authorize_read_or_search_policy(
+                &config,
+                Some(&storage),
+                None,
+                Some(workspace.path()),
+                frankenterm_core::policy::ActionKind::SearchOutput,
+                frankenterm_core::policy::ActorKind::Robot,
+                None,
+                "robot search test",
+            )
+            .await
+            .expect("approval-backed search authorization should succeed");
+
+            assert!(decision.requires_approval());
+            assert_eq!(decision.reason(), Some("robot search needs approval"));
+            let approval_command =
+                policy_approval_command(&decision).expect("approval command should be attached");
+            assert!(approval_command.contains("ft approve "));
+
+            let (code, _message, hint) =
+                robot_policy_error_from_decision(&decision, "Search denied");
+            assert_eq!(code, "robot.require_approval");
+            assert_eq!(hint.as_deref(), Some(approval_command.as_str()));
+        });
+    }
+
+    #[test]
+    fn read_search_policy_require_approval_without_storage_errors() {
+        run_async_test(async {
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.require_approval.no.storage".to_string(),
+                    description: Some("require approval without storage".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["human".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::RequireApproval,
+                    message: Some("human read needs approval".to_string()),
+                });
+
+            let err = authorize_read_or_search_policy(
+                &config,
+                None,
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActorKind::Human,
+                None,
+                "human read test",
+            )
+            .await
+            .expect_err("approval without storage should fail");
+
+            assert!(err.contains("Approval storage unavailable"));
         });
     }
 
@@ -48998,12 +49589,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::ReadOutput,
                 frankenterm_core::policy::ActorKind::Mcp,
                 None,
                 "mcp read test",
             )
-            .await;
+            .await
+            .expect("mcp read authorization should succeed");
 
             assert!(
                 decision.is_allowed(),
@@ -49046,12 +49639,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::ReadOutput,
                 frankenterm_core::policy::ActorKind::Mcp,
                 None,
                 "mcp read test",
             )
-            .await;
+            .await
+            .expect("mcp mux-surface deny evaluation should succeed");
 
             assert!(
                 decision.is_denied(),
@@ -49095,12 +49690,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::SearchOutput,
                 frankenterm_core::policy::ActorKind::Mcp,
                 None,
                 "mcp search test",
             )
-            .await;
+            .await
+            .expect("mcp search authorization should succeed");
 
             assert!(
                 decision.is_allowed(),
@@ -49143,12 +49740,14 @@ log_level = "debug"
                 &config,
                 None,
                 None,
+                None,
                 frankenterm_core::policy::ActionKind::SearchOutput,
                 frankenterm_core::policy::ActorKind::Mcp,
                 None,
                 "mcp search test",
             )
-            .await;
+            .await
+            .expect("mcp mux-surface search evaluation should succeed");
 
             assert!(
                 decision.is_denied(),
@@ -49188,9 +49787,10 @@ log_level = "debug"
                         actor.as_str()
                     );
                     let (decision, _domain) = authorize_read_or_search_policy(
-                        &config, None, None, action, actor, None, &summary,
+                        &config, None, None, None, action, actor, None, &summary,
                     )
-                    .await;
+                    .await
+                    .expect("surface contract authorization should succeed");
                     let context = decision.context().unwrap_or_else(|| {
                         panic!(
                             "decision context missing for action {} actor {}",
