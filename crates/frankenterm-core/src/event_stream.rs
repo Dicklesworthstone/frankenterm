@@ -541,12 +541,13 @@ impl EventWaiter {
                         match subscriber.recv().await {
                             Ok(event) => {
                                 if filter.matches_event(&event) && tracker.check(&event) {
-                                    return event;
+                                    return Some(event);
                                 }
                             }
-                            Err(_) => {
-                                // Channel closed or lagged — continue
+                            Err(crate::events::RecvError::Lagged { .. }) => {
+                                // Subscriber fell behind — continue from new position.
                             }
+                            Err(crate::events::RecvError::Closed) => return None,
                         }
                     }
                 }
@@ -554,21 +555,25 @@ impl EventWaiter {
                     match subscriber.recv().await {
                         Ok(event) => {
                             if filter.matches_event(&event) && condition.matches(&event) {
-                                return event;
+                                return Some(event);
                             }
                         }
-                        Err(_) => {
-                            // Channel closed or lagged — continue
+                        Err(crate::events::RecvError::Lagged { .. }) => {
+                            // Subscriber fell behind — continue from new position.
                         }
+                        Err(crate::events::RecvError::Closed) => return None,
                     }
                 },
-            };
+            }
         };
 
         match crate::runtime_compat::timeout(timeout, recv_loop).await {
-            Ok(event) => WaitResult::Matched {
+            Ok(Some(event)) => WaitResult::Matched {
                 event: Box::new(event),
                 elapsed_ms: start.elapsed().as_millis() as u64,
+            },
+            Ok(None) => WaitResult::Cancelled {
+                reason: "event bus closed".to_string(),
             },
             Err(_) => WaitResult::Timeout {
                 elapsed_ms: start.elapsed().as_millis() as u64,

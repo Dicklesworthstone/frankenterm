@@ -1200,7 +1200,8 @@ impl WeztermClient {
 
             // Categorize common error patterns
             if stderr_str.contains("Connection refused")
-                || stderr_str.contains("No such file or directory") && stderr_str.contains("socket")
+                || (stderr_str.contains("No such file or directory")
+                    && stderr_str.contains("socket"))
             {
                 return Err(WeztermError::NotRunning.into());
             }

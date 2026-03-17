@@ -321,7 +321,7 @@ impl BackpressureManager {
                 .tier_entered_at
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let elapsed_ms = entered.elapsed().as_millis() as u64;
+            let elapsed_ms = u64::try_from(entered.elapsed().as_millis()).unwrap_or(u64::MAX);
             if elapsed_ms < self.config.hysteresis_ms {
                 return None; // too soon to downgrade
             }
@@ -461,7 +461,7 @@ impl BackpressureManager {
             capture_capacity: depths.capture_capacity,
             write_depth: depths.write_depth,
             write_capacity: depths.write_capacity,
-            duration_in_tier_ms: entered.elapsed().as_millis() as u64,
+            duration_in_tier_ms: u64::try_from(entered.elapsed().as_millis()).unwrap_or(u64::MAX),
             transitions: self.transition_count.load(Ordering::Relaxed),
             paused_panes: self.paused_pane_ids(),
         }
