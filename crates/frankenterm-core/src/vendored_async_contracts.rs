@@ -321,7 +321,7 @@ pub struct CompatibilityMapping {
 /// Standard compatibility mappings between `runtime_compat` APIs and async
 /// boundary contracts.
 ///
-/// Covers all 18 entries in `SURFACE_CONTRACT_V1`.
+/// Covers every entry in `SURFACE_CONTRACT_V1`.
 #[must_use]
 pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
     vec![
@@ -775,12 +775,26 @@ mod tests {
     #[test]
     fn compatibility_mapping_covers_apis() {
         let mappings = standard_compatibility_mappings();
-        // All 18 entries from SURFACE_CONTRACT_V1 should be present.
+        let mapping_apis: std::collections::BTreeSet<_> = mappings
+            .iter()
+            .map(|mapping| mapping.compat_api.as_str())
+            .collect();
+        let contract_apis: std::collections::BTreeSet<_> =
+            crate::runtime_compat::SURFACE_CONTRACT_V1
+                .iter()
+                .map(|entry| entry.api)
+                .collect();
+        let missing: Vec<_> = contract_apis.difference(&mapping_apis).copied().collect();
+        let extra: Vec<_> = mapping_apis.difference(&contract_apis).copied().collect();
         assert_eq!(
             mappings.len(),
-            18,
-            "expected 18 mappings (one per SURFACE_CONTRACT_V1 entry), got {}",
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
+            "expected one mapping per SURFACE_CONTRACT_V1 entry, got {}",
             mappings.len()
+        );
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "compatibility mappings drifted from SURFACE_CONTRACT_V1; missing={missing:?} extra={extra:?}"
         );
 
         // No duplicate api names.

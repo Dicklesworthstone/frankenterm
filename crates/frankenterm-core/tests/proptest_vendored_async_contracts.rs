@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::vendored_async_contracts::*;
+use frankenterm_core::{runtime_compat::SURFACE_CONTRACT_V1, vendored_async_contracts::*};
 
 // =============================================================================
 // Strategies
@@ -376,7 +376,24 @@ fn compatibility_mappings_unique_apis() {
 #[test]
 fn compatibility_mappings_count() {
     let mappings = standard_compatibility_mappings();
-    assert_eq!(mappings.len(), 18, "expected 18 mappings");
+    let mapping_apis: std::collections::BTreeSet<_> = mappings
+        .iter()
+        .map(|mapping| mapping.compat_api.as_str())
+        .collect();
+    let contract_apis: std::collections::BTreeSet<_> =
+        SURFACE_CONTRACT_V1.iter().map(|entry| entry.api).collect();
+    let missing: Vec<_> = contract_apis.difference(&mapping_apis).copied().collect();
+    let extra: Vec<_> = mapping_apis.difference(&contract_apis).copied().collect();
+
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "compatibility mappings drifted from SURFACE_CONTRACT_V1; missing={missing:?} extra={extra:?}"
+    );
+    assert_eq!(
+        mappings.len(),
+        SURFACE_CONTRACT_V1.len(),
+        "expected one mapping per SURFACE_CONTRACT_V1 entry"
+    );
 }
 
 #[test]
