@@ -1007,8 +1007,12 @@ mod tests {
         ];
         let report = pipeline.tick(&panes, 3000, false, None);
 
+        // Each pane produces 1 scrollback doc + 1 command-block fallback doc.
+        // With max_docs_per_second=1: first doc (pane 1 scrollback) accepted,
+        // the command-block duplicate is also rate-limited (checked before dedup),
+        // and both pane 2 docs are rate-limited.
         assert_eq!(report.ingest_report.accepted_docs, 1);
-        assert_eq!(report.ingest_report.deferred_rate_limited_docs, 1);
+        assert_eq!(report.ingest_report.deferred_rate_limited_docs, 3);
         let pane1 = pipeline
             .watermark(1)
             .expect("first pane doc was handled before rate limiting");
@@ -1054,10 +1058,14 @@ mod tests {
         ];
         let report = pipeline.tick(&panes, 3500, false, None);
 
-        assert_eq!(report.ingest_report.accepted_docs, 2);
+        // Pane 1 "duplicate" → 1 scrollback doc + 1 command fallback (deduped).
+        // Pane 2 "fresh-a","","fresh-b" → 2 scrollback docs (split on blank) +
+        //   1 command fallback "fresh-a\nfresh-b" (distinct normalized text).
+        // "dup" and "duplicate" scroll/cmd docs → duplicates from seed or pending.
+        assert_eq!(report.ingest_report.accepted_docs, 3);
         assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 1);
-        assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 2);
-        assert_eq!(pipeline.status(4000).total_docs_indexed, 3);
+        assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 3);
+        assert_eq!(pipeline.status(4000).total_docs_indexed, 4);
     }
 
     #[test]
@@ -1093,9 +1101,12 @@ mod tests {
         ];
         let report = pipeline.tick(&panes, 5000, false, None);
 
-        assert_eq!(report.ingest_report.accepted_docs, 2);
-        assert_eq!(report.ingest_report.skipped_duplicate_docs, 1);
-        assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 2);
+        // Pane 1: "alpha" at 4000, "beta" at 10000 (gap 6000 > 5000) → 2 scrollback
+        //   docs + 1 command fallback "alpha\nbeta" (distinct normalized text) = 3 unique.
+        // Pane 2: "dup" → 1 scrollback + 1 command, both duplicate from seed.
+        assert_eq!(report.ingest_report.accepted_docs, 3);
+        assert_eq!(report.ingest_report.skipped_duplicate_docs, 2);
+        assert_eq!(pipeline.watermark(1).unwrap().total_docs_indexed, 3);
         assert_eq!(pipeline.watermark(2).unwrap().total_docs_indexed, 1);
     }
 
