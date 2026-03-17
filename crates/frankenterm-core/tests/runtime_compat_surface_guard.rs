@@ -114,6 +114,9 @@ fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
             "tokio::process::",
             "tokio::runtime::Builder",
             "tokio::signal::",
+            "tokio::sync::broadcast",
+            "tokio::sync::oneshot",
+            "tokio::sync::Notify",
             "tokio::time::sleep",
             "tokio::time::timeout",
             "tokio::sync::mpsc",
@@ -170,6 +173,18 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
         "runtime_compat.rs must continue to expose a select bridge while this migration contract is active"
     );
     assert!(
+        runtime_compat.contains("pub mod broadcast"),
+        "runtime_compat.rs must continue to expose a broadcast bridge while this migration contract is active"
+    );
+    assert!(
+        runtime_compat.contains("pub mod oneshot"),
+        "runtime_compat.rs must continue to expose a oneshot bridge while this migration contract is active"
+    );
+    assert!(
+        runtime_compat.contains("pub mod notify"),
+        "runtime_compat.rs must continue to expose a notify bridge while this migration contract is active"
+    );
+    assert!(
         runtime_compat.contains("pub mod signal"),
         "runtime_compat.rs must continue to expose a signal bridge while this migration contract is active"
     );
@@ -201,4 +216,57 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
         !main.contains("tokio::select!") && !main.contains("tokio::signal::"),
         "main.rs must not bypass runtime_compat for select/signal operations"
     );
+}
+
+#[test]
+fn production_channel_surfaces_route_through_runtime_compat() {
+    let workspace_root = workspace_root();
+    let events = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/events.rs"))
+        .expect("failed to read events.rs");
+    let storage = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/storage.rs"))
+        .expect("failed to read storage.rs");
+    let search_bridge =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/search_bridge.rs"))
+            .expect("failed to read search_bridge.rs");
+    let cancellation_safe_channel = fs::read_to_string(
+        workspace_root.join("crates/frankenterm-core/src/cancellation_safe_channel.rs"),
+    )
+    .expect("failed to read cancellation_safe_channel.rs");
+    let spsc_ring_buffer =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/spsc_ring_buffer.rs"))
+            .expect("failed to read spsc_ring_buffer.rs");
+
+    assert!(
+        events.contains("use crate::runtime_compat::broadcast;"),
+        "events.rs must route broadcast fan-out through runtime_compat"
+    );
+    assert!(
+        storage.contains("use crate::runtime_compat::oneshot;"),
+        "storage.rs must route request/response oneshot channels through runtime_compat"
+    );
+    for (path, contents) in [
+        ("search_bridge.rs", &search_bridge),
+        ("cancellation_safe_channel.rs", &cancellation_safe_channel),
+        ("spsc_ring_buffer.rs", &spsc_ring_buffer),
+    ] {
+        assert!(
+            contents.contains("use crate::runtime_compat::notify::Notify;"),
+            "{path} must route async notifications through runtime_compat::notify"
+        );
+    }
+
+    for (path, contents) in [
+        ("events.rs", &events),
+        ("storage.rs", &storage),
+        ("search_bridge.rs", &search_bridge),
+        ("cancellation_safe_channel.rs", &cancellation_safe_channel),
+        ("spsc_ring_buffer.rs", &spsc_ring_buffer),
+    ] {
+        assert!(
+            !contents.contains("tokio::sync::broadcast")
+                && !contents.contains("tokio::sync::oneshot")
+                && !contents.contains("tokio::sync::Notify"),
+            "{path} must not bypass runtime_compat for channel/notify primitives"
+        );
+    }
 }

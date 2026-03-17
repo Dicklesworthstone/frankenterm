@@ -242,9 +242,9 @@ proptest! {
 // =========================================================================
 
 #[test]
-fn standard_surface_entries_has_15() {
+fn standard_surface_entries_has_18() {
     let entries = standard_surface_entries();
-    assert_eq!(entries.len(), 15);
+    assert_eq!(entries.len(), 18);
 }
 
 #[test]
@@ -259,9 +259,18 @@ fn standard_surface_entries_all_have_known_dispositions() {
 }
 
 #[test]
-fn standard_guard_checks_has_15() {
+fn standard_guard_checks_has_18() {
     let checks = standard_guard_checks();
-    assert_eq!(checks.len(), 15);
+    assert_eq!(checks.len(), 18);
+}
+
+#[test]
+fn standard_guard_checks_start_fully_compliant() {
+    let checks = standard_guard_checks();
+    assert!(
+        checks.iter().all(|check| check.compliant),
+        "standard guard checks should represent a clean migration surface"
+    );
 }
 
 // =========================================================================

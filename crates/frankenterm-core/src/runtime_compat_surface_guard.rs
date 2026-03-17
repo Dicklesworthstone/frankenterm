@@ -97,9 +97,9 @@ pub struct SurfaceGuardCheck {
     pub call_sites_unwrapped: usize,
     /// Whether this check is currently compliant.
     ///
-    /// - `Keep` APIs: `true` (always allowed)
-    /// - `Replace` APIs: `false` until fully migrated (all call sites wrapped)
-    /// - `Retire` APIs: `false` (must be removed entirely)
+    /// This reflects live guard state, not the migration disposition. A
+    /// `Replace` or `Retire` surface can still be compliant when callers stay
+    /// behind the sanctioned wrapper and no regressions are present.
     pub compliant: bool,
 }
 
@@ -176,7 +176,7 @@ impl SurfaceGuardReport {
         }
     }
 
-    /// Populate `surface_entries` with the 15 entries from `SURFACE_CONTRACT_V1`.
+    /// Populate `surface_entries` with the 18 entries from `SURFACE_CONTRACT_V1`.
     ///
     /// The upstream contract lives in `runtime_compat.rs` and is not
     /// serialisable, so we mirror it here as hardcoded strings.
@@ -254,7 +254,7 @@ impl SurfaceGuardReport {
 // Standard surface entries (hardcoded mirror of SURFACE_CONTRACT_V1)
 // =============================================================================
 
-/// Returns a serialisable mirror of the 15 entries in `SURFACE_CONTRACT_V1`.
+/// Returns a serialisable mirror of the 18 entries in `SURFACE_CONTRACT_V1`.
 #[must_use]
 pub fn standard_surface_entries() -> Vec<SurfaceApiEntry> {
     vec![
@@ -365,6 +365,30 @@ pub fn standard_surface_entries() -> Vec<SurfaceApiEntry> {
             ),
         },
         SurfaceApiEntry {
+            api_name: "broadcast".into(),
+            disposition: "Keep".into(),
+            rationale:
+                "Canonical fan-out channel seam that confines direct tokio broadcast usage to runtime_compat while backend migration continues."
+                    .into(),
+            replacement: None,
+        },
+        SurfaceApiEntry {
+            api_name: "oneshot".into(),
+            disposition: "Keep".into(),
+            rationale:
+                "Canonical request-response channel seam that centralizes the active backend behind runtime_compat."
+                    .into(),
+            replacement: None,
+        },
+        SurfaceApiEntry {
+            api_name: "notify".into(),
+            disposition: "Keep".into(),
+            rationale:
+                "Canonical async notification primitive seam used by production coordination paths during runtime migration."
+                    .into(),
+            replacement: None,
+        },
+        SurfaceApiEntry {
             api_name: "process::Command".into(),
             disposition: "Retire".into(),
             rationale:
@@ -387,29 +411,27 @@ pub fn standard_surface_entries() -> Vec<SurfaceApiEntry> {
 // Standard guard checks
 // =============================================================================
 
-/// Build the standard set of 15 guard checks — one per `SURFACE_CONTRACT_V1`
+/// Build the standard set of 18 guard checks — one per `SURFACE_CONTRACT_V1`
 /// entry.
 ///
-/// Compliance rules:
-/// - `Keep`: compliant = `true` (these APIs are always permitted).
-/// - `Replace`: compliant = `false` (migration still in progress).
-/// - `Retire`: compliant = `false` (must be fully removed).
+/// Standard checks model the current expected clean state of the migration
+/// surface. Disposition (`Keep` / `Replace` / `Retire`) is tracked separately
+/// from live compliance, so a transitional surface still starts compliant so
+/// long as the sanctioned wrapper exists and no raw-runtime regressions have
+/// been detected.
 #[must_use]
 pub fn standard_guard_checks() -> Vec<SurfaceGuardCheck> {
     standard_surface_entries()
         .into_iter()
         .enumerate()
-        .map(|(i, entry)| {
-            let compliant = entry.disposition == "Keep";
-            SurfaceGuardCheck {
-                check_id: format!("SGC-{:02}-{}", i + 1, entry.api_name.replace("::", "-")),
-                api_name: entry.api_name.clone(),
-                disposition: entry.disposition.clone(),
-                wrapper_exists: true,
-                call_sites_wrapped: 0,
-                call_sites_unwrapped: 0,
-                compliant,
-            }
+        .map(|(i, entry)| SurfaceGuardCheck {
+            check_id: format!("SGC-{:02}-{}", i + 1, entry.api_name.replace("::", "-")),
+            api_name: entry.api_name.clone(),
+            disposition: entry.disposition.clone(),
+            wrapper_exists: true,
+            call_sites_wrapped: 0,
+            call_sites_unwrapped: 0,
+            compliant: true,
         })
         .collect()
 }
@@ -608,8 +630,8 @@ mod tests {
         report.with_standard_surface();
         assert_eq!(
             report.surface_entries.len(),
-            15,
-            "expected 15 SURFACE_CONTRACT_V1 entries"
+            18,
+            "expected 18 SURFACE_CONTRACT_V1 entries"
         );
     }
 
@@ -702,8 +724,8 @@ mod tests {
         let checks = standard_guard_checks();
         assert_eq!(
             checks.len(),
-            15,
-            "expected exactly 15 standard guard checks"
+            18,
+            "expected exactly 18 standard guard checks"
         );
     }
 
@@ -723,26 +745,37 @@ mod tests {
         assert!(retire_count > 0, "must have at least one Retire entry");
         assert_eq!(
             keep_count + replace_count + retire_count,
-            15,
-            "all 15 checks must have a known disposition"
+            18,
+            "all 18 checks must have a known disposition"
         );
 
-        // Keep checks must be compliant; Replace and Retire must not.
+        // Disposition tracks migration state, not live compliance. A clean
+        // standard report should start compliant even for transitional surfaces.
         for check in &checks {
-            match check.disposition.as_str() {
-                "Keep" => assert!(
-                    check.compliant,
-                    "Keep check {} should be compliant",
-                    check.check_id
-                ),
-                "Replace" | "Retire" => assert!(
-                    !check.compliant,
-                    "{} check {} should not be compliant",
-                    check.disposition, check.check_id
-                ),
-                other => panic!("unexpected disposition '{}'", other),
-            }
+            assert!(
+                check.compliant,
+                "{} check {} should start compliant in the absence of regressions",
+                check.disposition, check.check_id
+            );
         }
+    }
+
+    #[test]
+    fn standard_guard_checks_seed_a_clean_report() {
+        let mut report = SurfaceGuardReport::new("r-standard-clean", 0);
+        for check in standard_guard_checks() {
+            report.add_guard_check(check);
+        }
+
+        report.finalize();
+        assert!(
+            report.overall_compliant,
+            "standard guard checks should represent a clean migration surface"
+        );
+        assert!(
+            (report.compliance_rate - 1.0).abs() < f64::EPSILON,
+            "standard guard checks should yield full compliance"
+        );
     }
 
     #[test]
@@ -777,6 +810,26 @@ mod tests {
             assert!(
                 !mapping.disposition_aligned,
                 "{api} should stay non-aligned while replacement is pending"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_bridge_modules_are_cataloged_as_keep_surfaces() {
+        let entries = standard_surface_entries();
+
+        for api in ["broadcast", "oneshot", "notify"] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.api_name == api)
+                .unwrap_or_else(|| panic!("missing surface entry for {api}"));
+            assert_eq!(
+                entry.disposition, "Keep",
+                "{api} should remain a canonical runtime_compat surface entry"
+            );
+            assert!(
+                entry.replacement.is_none(),
+                "{api} should not advertise a replacement while it remains a stable wrapper surface"
             );
         }
     }

@@ -122,6 +122,24 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
         replacement: Some("watch::Receiver::changed with explicit cx/lifecycle context"),
     },
     SurfaceContractEntry {
+        api: "broadcast",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Canonical fan-out channel seam that confines direct tokio broadcast usage to runtime_compat while backend migration continues.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "oneshot",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Canonical request-response channel seam that centralizes the active backend behind runtime_compat.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
+        api: "notify",
+        disposition: SurfaceDisposition::Keep,
+        rationale: "Canonical async notification primitive seam used by production coordination paths during runtime migration.",
+        replacement: None,
+    },
+    SurfaceContractEntry {
         api: "process::Command",
         disposition: SurfaceDisposition::Retire,
         rationale: "Tokio process shim remains temporary and should be replaced by asupersync-native process layer.",
@@ -1517,6 +1535,25 @@ mod tests {
             .find(|entry| entry.api == "task::spawn_blocking")
             .expect("task::spawn_blocking entry must exist");
         assert_eq!(entry.disposition, SurfaceDisposition::Replace);
+    }
+
+    #[test]
+    fn surface_contract_catalogs_channel_bridge_modules() {
+        for api in ["broadcast", "oneshot", "notify"] {
+            let entry = SURFACE_CONTRACT_V1
+                .iter()
+                .find(|entry| entry.api == api)
+                .unwrap_or_else(|| panic!("{api} entry must exist"));
+            assert_eq!(
+                entry.disposition,
+                SurfaceDisposition::Keep,
+                "{api} should remain a canonical runtime_compat surface"
+            );
+            assert!(
+                entry.replacement.is_none(),
+                "{api} should not advertise a replacement while it remains the stable wrapper surface"
+            );
+        }
     }
 
     #[test]

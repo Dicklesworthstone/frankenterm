@@ -546,11 +546,11 @@ fn e2e_surface_guard_and_migration_gate_both_pass() {
     let migration_report = VerificationReport::verify(&manifest, &artifacts);
 
     // Both should pass
-    let _guard_ok =
-        guard_report.overall_compliant || guard_report.guard_checks.iter().all(|c| c.compliant);
+    assert!(
+        guard_report.overall_compliant,
+        "surface guard should pass for the standard clean migration surface"
+    );
     assert_eq!(migration_report.verdict, VerificationVerdict::Complete);
-    // _guard_ok may or may not be true depending on standard check state
-    // but we verify both pipelines execute without panicking
 
     // Cross-reference: the dependency-scan artifact would normally verify
     // the same things as the surface guard

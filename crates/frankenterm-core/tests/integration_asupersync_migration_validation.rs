@@ -408,9 +408,15 @@ fn guard_report_all_compliant_checks() {
         report.add_guard_check(check);
     }
     report.finalize();
-    // Standard checks should all be compliant (wrappers exist)
-    let all_compliant = report.guard_checks.iter().all(|c| c.compliant);
-    assert_eq!(report.overall_compliant, all_compliant);
+    assert!(
+        report.guard_checks.iter().all(|c| c.compliant),
+        "standard checks should all be compliant when no regressions are present"
+    );
+    assert!(
+        report.overall_compliant,
+        "a seeded standard guard report should finalize as compliant"
+    );
+    assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
 }
 
 // =========================================================================
