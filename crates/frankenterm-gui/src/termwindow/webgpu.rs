@@ -247,6 +247,17 @@ fn select_surface_view_formats(
     }
 }
 
+fn clamp_surface_dimension_for_configuration(value: usize) -> u32 {
+    value.max(1).min(u32::MAX as usize) as u32
+}
+
+fn initial_surface_extent(dimensions: Dimensions) -> (u32, u32) {
+    (
+        clamp_surface_dimension_for_configuration(dimensions.pixel_width),
+        clamp_surface_dimension_for_configuration(dimensions.pixel_height),
+    )
+}
+
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
 ) -> wgpu::CompositeAlphaMode {
@@ -395,12 +406,13 @@ impl WebGpuState {
         // to panic
         // <https://github.com/wezterm/wezterm/issues/3565>
         let view_formats = select_surface_view_formats(format, &downlevel_caps);
+        let (surface_width, surface_height) = initial_surface_extent(dimensions);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: dimensions.pixel_width as u32,
-            height: dimensions.pixel_height as u32,
+            width: surface_width,
+            height: surface_height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: select_composite_alpha_mode(&caps.alpha_modes),
             view_formats,
@@ -594,9 +606,10 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        select_composite_alpha_mode, select_surface_format, select_surface_view_formats,
-        select_view_formats_for_format,
+        initial_surface_extent, select_composite_alpha_mode, select_surface_format,
+        select_surface_view_formats, select_view_formats_for_format,
     };
+    use window::Dimensions;
 
     #[test]
     fn surface_format_prefers_srgb_variant() {
@@ -679,6 +692,30 @@ mod tests {
                 wgpu::CompositeAlphaMode::Inherit,
             ]),
             wgpu::CompositeAlphaMode::Auto
+        );
+    }
+
+    #[test]
+    fn initial_surface_extent_clamps_zero_dimensions_to_one() {
+        assert_eq!(
+            initial_surface_extent(Dimensions {
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            }),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn initial_surface_extent_preserves_non_zero_dimensions() {
+        assert_eq!(
+            initial_surface_extent(Dimensions {
+                pixel_width: 1280,
+                pixel_height: 720,
+                dpi: 96,
+            }),
+            (1280, 720)
         );
     }
 }
