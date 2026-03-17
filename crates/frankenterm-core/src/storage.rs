@@ -18197,7 +18197,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
 
+        // Temporarily disable foreign keys to insert a row with an invalid
+        // negative pane_id — the test validates that the *query* function
+        // detects and rejects this corruption.
         let now = now_ms();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute(
             "INSERT INTO approval_tokens (
                 code_hash, created_at, expires_at, used_at, workspace_id, action_kind, pane_id,
@@ -18218,6 +18222,7 @@ mod tests {
             ],
         )
         .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
         let err = query_approval_token_by_hash(&conn, "sha256:bad-token")
             .expect_err("negative approval pane id");

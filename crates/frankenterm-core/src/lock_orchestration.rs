@@ -255,8 +255,9 @@ impl WaitGraph {
     /// Check for a cycle involving `start`. Returns the cycle path if found.
     fn find_cycle_from(&self, start: &str) -> Option<Vec<String>> {
         let mut visited = HashSet::new();
+        let mut rec_stack = HashSet::new();
         let mut path = Vec::new();
-        if self.dfs_cycle(start, &mut visited, &mut path) {
+        if self.dfs_cycle(start, &mut visited, &mut rec_stack, &mut path) {
             // Trim path to just the cycle portion
             if let Some(pos) = path.iter().position(|n| n == start) {
                 return Some(path[pos..].to_vec());
@@ -266,21 +267,37 @@ impl WaitGraph {
         None
     }
 
-    fn dfs_cycle(&self, node: &str, visited: &mut HashSet<String>, path: &mut Vec<String>) -> bool {
-        if !visited.insert(node.to_string()) {
-            // Already visited — cycle found
+    fn dfs_cycle(
+        &self,
+        node: &str,
+        visited: &mut HashSet<String>,
+        rec_stack: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> bool {
+        // A cycle exists only if we revisit a node that is currently on
+        // the DFS recursion stack (a back-edge). Nodes that were fully
+        // explored in a prior subtree are not part of a cycle — they
+        // represent shared DAG descendants (e.g., diamond graphs).
+        if rec_stack.contains(node) {
             path.push(node.to_string());
             return true;
         }
+        if visited.contains(node) {
+            return false; // Already fully explored in another subtree
+        }
+
+        visited.insert(node.to_string());
+        rec_stack.insert(node.to_string());
         path.push(node.to_string());
 
         if let Some(neighbors) = self.edges.get(node) {
             for neighbor in neighbors {
-                if self.dfs_cycle(neighbor, visited, path) {
+                if self.dfs_cycle(neighbor, visited, rec_stack, path) {
                     return true;
                 }
             }
         }
+        rec_stack.remove(node);
         path.pop();
         false
     }
@@ -444,7 +461,7 @@ impl LockOrchestrator {
         let expires_at_ms = if ttl_dur.is_zero() {
             0
         } else {
-            now_ms + ttl_dur.as_millis() as u64
+            now_ms.saturating_add(u64::try_from(ttl_dur.as_millis()).unwrap_or(u64::MAX))
         };
 
         inner.locks.insert(
@@ -522,7 +539,7 @@ impl LockOrchestrator {
         let expires_at_ms = if ttl_dur.is_zero() {
             0
         } else {
-            now_ms + ttl_dur.as_millis() as u64
+            now_ms.saturating_add(u64::try_from(ttl_dur.as_millis()).unwrap_or(u64::MAX))
         };
 
         // Reap expired locks on requested resources

@@ -602,12 +602,28 @@ mod tests {
     #[test]
     fn tx_transition_committed_includes_compensating() {
         let transitions = mcp_tx_transition_info(MissionTxState::Committed);
-        // A committed tx can transition to compensating for rollback
-        let has_compensating = transitions.iter().any(|t| t.to.contains("ompensating"));
-        // This depends on the transition table, just ensure we get results
         assert!(
-            !transitions.is_empty() || !has_compensating,
-            "Committed state should have defined behavior"
+            transitions
+                .iter()
+                .any(|t| t.kind == "compensate" && t.to == "compensating"),
+            "Committed txs should advertise the rollback path"
+        );
+    }
+
+    #[test]
+    fn tx_transition_compensating_includes_both_success_terminal_states() {
+        let transitions = mcp_tx_transition_info(MissionTxState::Compensating);
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.kind == "complete" && t.to == "compensated"),
+            "Compensating txs should advertise the compensated terminal state"
+        );
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t.kind == "complete" && t.to == "rolled_back"),
+            "Compensating txs should advertise the rolled_back terminal state"
         );
     }
 

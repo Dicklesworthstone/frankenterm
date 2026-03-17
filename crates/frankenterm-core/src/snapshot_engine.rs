@@ -1070,10 +1070,13 @@ fn save_checkpoint_sync(
     let mut total_bytes: usize = 0;
 
     for ps in pane_states {
-        let terminal_json = serde_json::to_string(&ps.terminal).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed");
-            "{}".to_string()
-        });
+        let terminal_json = match serde_json::to_string(&ps.terminal) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!(error = %e, pane_id = ps.pane_id, "terminal state serialization failed; skipping pane");
+                continue; // Skip this pane rather than silently storing empty state
+            }
+        };
         let env_json = ps.env.as_ref().and_then(|e| {
             serde_json::to_string(e)
                 .inspect_err(|e| tracing::warn!(error = %e, "snapshot env serialization failed"))
@@ -1167,14 +1170,18 @@ fn cleanup_sync(
     let conn = open_conn(db_path)?;
     let cutoff_ms = epoch_ms().saturating_sub(retention_days * 86_400_000);
 
+    // Wrap both DELETEs in a transaction so a concurrent checkpoint insert
+    // between them cannot be incorrectly deleted by the second statement.
+    let tx = conn.unchecked_transaction()?;
+
     // Delete checkpoints older than retention_days
-    let deleted_by_age: usize = conn.execute(
+    let deleted_by_age: usize = tx.execute(
         "DELETE FROM session_checkpoints WHERE checkpoint_at < ?1",
         [cutoff_ms as i64],
     )?;
 
     // Keep only the latest retention_count checkpoints per session
-    let deleted_by_count: usize = conn.execute(
+    let deleted_by_count: usize = tx.execute(
         "DELETE FROM session_checkpoints WHERE id NOT IN (
             SELECT id FROM session_checkpoints
             ORDER BY checkpoint_at DESC
@@ -1183,6 +1190,7 @@ fn cleanup_sync(
         [retention_count as i64],
     )?;
 
+    tx.commit()?;
     Ok(deleted_by_age + deleted_by_count)
 }
 

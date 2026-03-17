@@ -3779,6 +3779,11 @@ const MISSION_TX_TRANSITIONS: &[MissionTxTransitionRule] = &[
         to: MissionTxState::Failed,
     },
     MissionTxTransitionRule {
+        from: MissionTxState::Committed,
+        via: MissionTxTransitionKind::Compensate,
+        to: MissionTxState::Compensating,
+    },
+    MissionTxTransitionRule {
         from: MissionTxState::Failed,
         via: MissionTxTransitionKind::Compensate,
         to: MissionTxState::Compensating,
@@ -3787,6 +3792,11 @@ const MISSION_TX_TRANSITIONS: &[MissionTxTransitionRule] = &[
         from: MissionTxState::Compensating,
         via: MissionTxTransitionKind::Complete,
         to: MissionTxState::Compensated,
+    },
+    MissionTxTransitionRule {
+        from: MissionTxState::Compensating,
+        via: MissionTxTransitionKind::Complete,
+        to: MissionTxState::RolledBack,
     },
     MissionTxTransitionRule {
         from: MissionTxState::Compensating,
@@ -7259,6 +7269,42 @@ mod tests {
         )
         .expect_err("compensation should reject invalid state");
         assert!(comp_err.contains("compensating"));
+    }
+
+    #[test]
+    fn tx_transition_table_includes_committed_rollback_path() {
+        assert!(MISSION_TX_TRANSITIONS.iter().any(|rule| {
+            rule.from == MissionTxState::Committed
+                && rule.via == MissionTxTransitionKind::Compensate
+                && rule.to == MissionTxState::Compensating
+        }));
+    }
+
+    #[test]
+    fn tx_transition_table_includes_both_compensation_success_terminal_states() {
+        let compensating_targets = MISSION_TX_TRANSITIONS
+            .iter()
+            .filter(|rule| {
+                rule.from == MissionTxState::Compensating
+                    && rule.via == MissionTxTransitionKind::Complete
+            })
+            .map(|rule| rule.to)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(compensating_targets.contains(&MissionTxState::Compensated));
+        assert!(compensating_targets.contains(&MissionTxState::RolledBack));
+    }
+
+    #[test]
+    fn tx_transition_table_has_no_duplicate_entries() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, rule) in MISSION_TX_TRANSITIONS.iter().enumerate() {
+            let key = format!("{:?}_{:?}_{:?}", rule.from, rule.via, rule.to);
+            assert!(
+                seen.insert(key.clone()),
+                "Duplicate tx transition at index {i}: {key}",
+            );
+        }
     }
 
     // =========================================================================
