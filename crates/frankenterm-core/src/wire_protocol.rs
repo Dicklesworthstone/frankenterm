@@ -4,6 +4,7 @@
 //! and an aggregator. All messages are JSON-serializable, timestamped in epoch
 //! milliseconds, and include a protocol version for forward/backward compat.
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::patterns::{AgentType, Severity};
@@ -142,6 +143,20 @@ impl WireEnvelope {
             });
         }
         validate_sender_identity(&envelope.sender)?;
+        // Validate content_len matches actual content for PaneDelta payloads.
+        // The sender may set content_len != content.len() (accidentally or
+        // maliciously), which could mislead downstream buffer allocation.
+        if let WirePayload::PaneDelta(ref delta) = envelope.payload {
+            if !delta.content.is_empty() && delta.content_len != delta.content.len() {
+                return Err(WireProtocolError::InvalidJson(
+                    serde_json::Error::custom(format!(
+                        "PaneDelta content_len ({}) does not match content length ({})",
+                        delta.content_len,
+                        delta.content.len()
+                    )),
+                ));
+            }
+        }
         Ok(envelope)
     }
 }
