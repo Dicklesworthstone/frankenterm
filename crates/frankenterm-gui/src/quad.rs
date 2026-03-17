@@ -396,8 +396,211 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
 }
 
 #[cfg(test)]
-#[test]
-fn size() {
-    assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
-    assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+
+    fn assert_vertices_match(
+        actual: &[Vertex; VERTICES_PER_CELL],
+        expected: &[Vertex; VERTICES_PER_CELL],
+    ) {
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(actual.tex, expected.tex);
+            assert_eq!(actual.fg_color, expected.fg_color);
+            assert_eq!(actual.alt_color, expected.alt_color);
+            assert_eq!(actual.hsv, expected.hsv);
+            assert_eq!(actual.has_color, expected.has_color);
+            assert_eq!(actual.mix_value, expected.mix_value);
+        }
+    }
+
+    fn configured_quad() -> [Vertex; VERTICES_PER_CELL] {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+
+        quad.set_position(10.0, 20.0, 30.0, 40.0);
+        quad.set_texture_discrete(0.1, 0.9, 0.2, 0.8);
+        quad.set_fg_color(LinearRgba::with_components(0.25, 0.5, 0.75, 1.0));
+        quad.set_alt_color_and_mix_value(LinearRgba::with_components(0.8, 0.4, 0.2, 0.6), 0.375);
+        quad.set_hsv(Some(HsbTransform {
+            hue: 0.6,
+            saturation: 0.7,
+            brightness: 0.8,
+        }));
+        quad.set_grayscale();
+
+        vertices
+    }
+
+    #[test]
+    fn size() {
+        assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
+        assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+    }
+
+    #[test]
+    fn vertex_desc_matches_vertex_memory_layout() {
+        let desc = Vertex::desc();
+
+        assert_eq!(
+            desc.array_stride,
+            std::mem::size_of::<Vertex>() as wgpu::BufferAddress
+        );
+        assert_eq!(desc.step_mode, wgpu::VertexStepMode::Vertex);
+        assert_eq!(desc.attributes.len(), 7);
+
+        let expected = [
+            (
+                0,
+                wgpu::VertexFormat::Float32x2,
+                offset_of!(Vertex, position),
+            ),
+            (1, wgpu::VertexFormat::Float32x2, offset_of!(Vertex, tex)),
+            (
+                2,
+                wgpu::VertexFormat::Float32x4,
+                offset_of!(Vertex, fg_color),
+            ),
+            (
+                3,
+                wgpu::VertexFormat::Float32x4,
+                offset_of!(Vertex, alt_color),
+            ),
+            (4, wgpu::VertexFormat::Float32x3, offset_of!(Vertex, hsv)),
+            (
+                5,
+                wgpu::VertexFormat::Float32,
+                offset_of!(Vertex, has_color),
+            ),
+            (
+                6,
+                wgpu::VertexFormat::Float32,
+                offset_of!(Vertex, mix_value),
+            ),
+        ];
+
+        for (attribute, (shader_location, format, offset)) in
+            desc.attributes.iter().zip(expected.iter())
+        {
+            assert_eq!(attribute.shader_location, *shader_location);
+            assert_eq!(attribute.format, *format);
+            assert_eq!(attribute.offset, *offset as wgpu::BufferAddress);
+        }
+    }
+
+    #[test]
+    fn quad_sets_positions_and_texture_coordinates_for_all_corners() {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+
+        quad.set_position(1.0, 2.0, 3.0, 4.0);
+        quad.set_texture_discrete(0.1, 0.9, 0.2, 0.8);
+
+        assert_eq!(vertices[V_TOP_LEFT].position, [1.0, 2.0]);
+        assert_eq!(vertices[V_TOP_RIGHT].position, [3.0, 2.0]);
+        assert_eq!(vertices[V_BOT_LEFT].position, [1.0, 4.0]);
+        assert_eq!(vertices[V_BOT_RIGHT].position, [3.0, 4.0]);
+
+        assert_eq!(vertices[V_TOP_LEFT].tex, [0.1, 0.2]);
+        assert_eq!(vertices[V_TOP_RIGHT].tex, [0.9, 0.2]);
+        assert_eq!(vertices[V_BOT_LEFT].tex, [0.1, 0.8]);
+        assert_eq!(vertices[V_BOT_RIGHT].tex, [0.9, 0.8]);
+    }
+
+    #[test]
+    fn quad_propagates_colors_mix_hsv_and_flags_to_every_vertex() {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+        let fg = LinearRgba::with_components(0.2, 0.4, 0.6, 0.8);
+        let alt = LinearRgba::with_components(0.9, 0.3, 0.1, 0.7);
+        let hsv = HsbTransform {
+            hue: 0.3,
+            saturation: 0.5,
+            brightness: 0.7,
+        };
+
+        quad.set_fg_color(fg);
+        quad.set_alt_color_and_mix_value(alt, 0.625);
+        quad.set_hsv(Some(hsv));
+        quad.set_is_background_image();
+
+        for vertex in vertices {
+            assert_eq!(vertex.fg_color, fg.into());
+            assert_eq!(vertex.alt_color, alt.into());
+            assert_eq!(vertex.mix_value, 0.625);
+            assert_eq!(vertex.hsv, [hsv.hue, hsv.saturation, hsv.brightness]);
+            assert_eq!(vertex.has_color, IS_BG_IMAGE);
+        }
+    }
+
+    #[test]
+    fn boxed_quad_round_trip_preserves_geometry_and_style() {
+        let vertices = configured_quad();
+        let boxed = BoxedQuad::from_vertices(&vertices);
+        let round_tripped = boxed.to_vertices();
+
+        assert_vertices_match(&round_tripped, &vertices);
+    }
+
+    #[test]
+    fn heap_quad_allocator_extend_with_preserves_quad_order_and_layers() {
+        let first = configured_quad();
+        let mut second = configured_quad();
+        for vertex in &mut second {
+            vertex.position[0] += 50.0;
+            vertex.position[1] += 10.0;
+            vertex.mix_value = 0.875;
+        }
+
+        let mut allocator = HeapQuadAllocator::default();
+        allocator.extend_with(2, &first);
+        allocator.extend_with(2, &second);
+
+        assert!(allocator.layer0.is_empty());
+        assert!(allocator.layer1.is_empty());
+        assert_eq!(allocator.layer2.len(), 2);
+        assert_vertices_match(&allocator.layer2[0].to_vertices(), &first);
+        assert_vertices_match(&allocator.layer2[1].to_vertices(), &second);
+    }
+
+    #[test]
+    fn heap_quad_allocator_apply_to_preserves_each_layer() {
+        let mut source = HeapQuadAllocator::default();
+        let layer0 = configured_quad();
+        let mut layer1 = configured_quad();
+        let mut layer2 = configured_quad();
+        for vertex in &mut layer1 {
+            vertex.position[0] += 100.0;
+            vertex.has_color = IS_SOLID_COLOR;
+        }
+        for vertex in &mut layer2 {
+            vertex.position[1] += 200.0;
+            vertex.has_color = IS_COLOR_EMOJI;
+        }
+
+        source.extend_with(0, &layer0);
+        source.extend_with(1, &layer1);
+        source.extend_with(2, &layer2);
+
+        let mut destination = HeapQuadAllocator::default();
+        let apply_result = source.apply_to(&mut TripleLayerQuadAllocator::Heap(&mut destination));
+        assert!(
+            apply_result.is_ok(),
+            "heap apply_to should copy quads into the destination allocator: {apply_result:?}"
+        );
+
+        assert_eq!(destination.layer0.len(), 1);
+        assert_eq!(destination.layer1.len(), 1);
+        assert_eq!(destination.layer2.len(), 1);
+        assert_vertices_match(&destination.layer0[0].to_vertices(), &layer0);
+        assert_vertices_match(&destination.layer1[0].to_vertices(), &layer1);
+        assert_vertices_match(&destination.layer2[0].to_vertices(), &layer2);
+    }
 }
