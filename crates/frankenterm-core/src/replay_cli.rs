@@ -430,6 +430,9 @@ mod tests {
             pane_id: pane,
             triggered_by: None,
             overrides: None,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: 0,
             replay_run_id: String::new(),
         }

@@ -131,12 +131,21 @@ pub struct DecisionEvent {
     pub definition_hash: String,
     /// Input event hash.
     pub input_hash: String,
+    /// Truncated input summary (≤256 bytes).
+    #[serde(default)]
+    pub input_summary: String,
     /// Output hash.
     pub output_hash: String,
     /// Virtual timestamp in ms.
     pub timestamp_ms: u64,
     /// Pane ID.
     pub pane_id: u64,
+    /// Parent event ID for causal chaining.
+    #[serde(default)]
+    pub parent_event_id: Option<String>,
+    /// Confidence score (0.0–1.0).
+    #[serde(default)]
+    pub confidence: Option<f64>,
     /// Optional: node that triggered this decision.
     #[serde(default)]
     pub triggered_by: Option<u64>,
@@ -161,8 +170,8 @@ impl DecisionEvent {
         definition_text: &str,
         input_text: &str,
         output: serde_json::Value,
-        _correlation_id: Option<String>,
-        override_node: Option<u64>,
+        parent_event_id: Option<String>,
+        confidence: Option<f64>,
         timestamp_ms: u64,
     ) -> Self {
         use std::collections::hash_map::DefaultHasher;
@@ -175,17 +184,21 @@ impl DecisionEvent {
         }
 
         let output_str = serde_json::to_string(&output).unwrap_or_default();
+        let input_summary = crate::replay_capture::summarize_decision_input(input_text).to_string();
 
         Self {
             decision_type,
             rule_id: rule_id.into(),
             definition_hash: hash_str(definition_text),
             input_hash: hash_str(input_text),
+            input_summary,
             output_hash: hash_str(&output_str),
             timestamp_ms,
             pane_id,
+            parent_event_id,
+            confidence,
             triggered_by: None,
-            overrides: override_node,
+            overrides: None,
             wall_clock_ms: timestamp_ms,
             replay_run_id: String::new(),
         }
@@ -563,6 +576,9 @@ mod tests {
             pane_id,
             triggered_by,
             overrides,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: timestamp_ms * 2, // Transient.
             replay_run_id: "run_001".into(),
         }
@@ -1002,6 +1018,9 @@ mod tests {
             pane_id: 1,
             triggered_by: Some(0),
             overrides: None,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: 200,
             replay_run_id: "run".into(),
         };

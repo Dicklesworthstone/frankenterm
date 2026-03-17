@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 // Re-export decision types from replay_decision_graph for callers that
 // reference `crate::replay_capture::DecisionEvent` / `DecisionType`.
 pub use crate::replay_decision_graph::{DecisionEvent, DecisionType};
@@ -634,6 +636,126 @@ impl IngressTap for CaptureAdapter {
 
 /// Convenience alias for a thread-safe capture adapter handle.
 pub type SharedCaptureAdapter = Arc<CaptureAdapter>;
+
+// ---------------------------------------------------------------------------
+// Sensitivity / Redaction types for capture policy
+// ---------------------------------------------------------------------------
+
+/// Sensitivity tier for captured content.
+///
+/// T1 (lowest) is routine terminal output; T3 (highest) is sensitive
+/// data like credentials or tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSensitivityTier {
+    /// Routine output: commands, build logs, test results.
+    T1,
+    /// Moderate: internal paths, configuration values, agent reasoning.
+    T2,
+    /// Sensitive: credentials, tokens, secrets, PII.
+    T3,
+}
+
+impl CaptureSensitivityTier {
+    /// Stable string tag matching the serde representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::T1 => "t1",
+            Self::T2 => "t2",
+            Self::T3 => "t3",
+        }
+    }
+}
+
+/// How captured sensitive content is redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureRedactionMode {
+    /// Replace sensitive spans with `***` mask.
+    Mask,
+    /// Replace sensitive spans with a one-way hash.
+    Hash,
+    /// Remove the entire field/record.
+    Drop,
+}
+
+/// Policy governing what gets captured and how long it is retained.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureRedactionPolicy {
+    /// Whether redaction is active.
+    pub enabled: bool,
+    /// Default redaction mode for sensitive spans.
+    pub mode: CaptureRedactionMode,
+    /// T1 content retention in days.
+    pub t1_retention_days: u64,
+    /// T2 content retention in days.
+    pub t2_retention_days: u64,
+    /// T3 content retention in days.
+    pub t3_retention_days: u64,
+    /// Custom regex patterns that trigger T3 redaction.
+    #[serde(default)]
+    pub custom_patterns: Vec<String>,
+}
+
+impl Default for CaptureRedactionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: CaptureRedactionMode::Mask,
+            t1_retention_days: 90,
+            t2_retention_days: 30,
+            t3_retention_days: 7,
+            custom_patterns: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hashing / summarization utilities
+// ---------------------------------------------------------------------------
+
+/// FNV-1a hash of a text string, returning the raw u64 digest.
+///
+/// Deterministic and fast; not cryptographic.
+#[must_use]
+pub fn fnv1a_hash_text(text: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// SHA-256 hex digest of a text string (lowercase, 64 chars).
+#[must_use]
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Truncate a decision input to at most 256 bytes on a valid UTF-8 boundary.
+///
+/// Returns a slice of the original string.
+#[must_use]
+pub fn summarize_decision_input(input: &str) -> &str {
+    const MAX_BYTES: usize = 256;
+    if input.len() <= MAX_BYTES {
+        return input;
+    }
+    // Walk backward from MAX_BYTES to find a char boundary.
+    let mut end = MAX_BYTES;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
 
 // ---------------------------------------------------------------------------
 // Tests

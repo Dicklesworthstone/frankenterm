@@ -1,5 +1,4 @@
-// Disabled: references types not yet implemented in replay_capture.rs
-#![cfg(feature = "__journal_types_placeholder")]
+#![cfg(feature = "subprocess-bridge")]
 //! Property-based tests for replay_capture.rs.
 //!
 //! Covers serde roundtrips for CaptureSensitivityTier, CaptureRedactionMode,
