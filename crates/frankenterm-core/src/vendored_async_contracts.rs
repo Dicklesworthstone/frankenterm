@@ -16,8 +16,8 @@
 //! ContractCompliance
 //!   ├── contract: AsyncBoundaryContract
 //!   ├── evidence: Vec<ContractEvidence>
-//!   ├── compliant: bool   (all evidence passed)
-//!   └── coverage: f64     (passed / total)
+//!   ├── compliant: bool   (all evidence targeted this contract and passed)
+//!   └── coverage: f64     (matching passed / matching total)
 //!
 //! CompatibilityMapping
 //!   ├── compat_api: String         (from SURFACE_CONTRACT_V1)
@@ -750,7 +750,7 @@ mod tests {
         ];
         let c = ContractCompliance::from_evidence(contract, evidence);
         assert!(!c.compliant);
-        assert!((c.coverage - 0.5).abs() < f64::EPSILON);
+        assert!((c.coverage - 1.0).abs() < f64::EPSILON);
     }
 
     // -------------------------------------------------------------------------

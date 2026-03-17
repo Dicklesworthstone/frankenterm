@@ -1820,10 +1820,20 @@ impl ObservationRuntime {
                                         new_uuid = %uuid,
                                         "Adopting stable UUID from storage"
                                     );
-                                    entry.pane_uuid = uuid.clone();
+                                    let adopted = {
+                                        let mut reg = registry.write().await;
+                                        reg.adopt_uuid(pane_id, uuid.clone())
+                                    };
 
-                                    let mut reg = registry.write().await;
-                                    let _ = reg.adopt_uuid(pane_id, uuid);
+                                    if adopted {
+                                        entry.pane_uuid = uuid;
+                                    } else {
+                                        warn!(
+                                            pane_id,
+                                            rejected_uuid = %uuid,
+                                            "Rejected stable UUID adoption due to registry collision"
+                                        );
+                                    }
                                 }
                             }
 

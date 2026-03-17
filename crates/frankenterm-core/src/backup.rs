@@ -345,8 +345,9 @@ pub struct ScheduledBackupStatus {
 /// - `manifest.json` — metadata, stats, and checksums
 /// - `checksums.sha256` — per-file SHA-256 checksums
 ///
-/// The backup is created atomically: files are written to a temp directory
-/// first, then renamed to the final location.
+/// Note: files are written directly to the output directory (not atomic).
+/// A crash mid-export may leave a partial backup. The `verify` option
+/// detects this by checking the database checksum after writing.
 pub fn export_backup(
     db_path: &Path,
     workspace_root: &Path,

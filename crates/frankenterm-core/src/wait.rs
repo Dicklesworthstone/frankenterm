@@ -338,11 +338,23 @@ impl QueueDepthGauge {
 
     /// Decrement pending count (call on dequeue). Saturates at zero.
     pub fn decrement(&self) {
-        // fetch_sub with SeqCst; saturate to prevent underflow
-        let prev = self.count.fetch_sub(1, Ordering::SeqCst);
-        if prev == 0 {
-            // Underflow occurred; restore to 0
-            self.count.store(0, Ordering::SeqCst);
+        // CAS loop for saturating atomic decrement — avoids the TOCTOU race
+        // where fetch_sub wraps to usize::MAX and a concurrent increment is
+        // lost when we unconditionally store 0 to repair.
+        let mut current = self.count.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return; // Already zero; nothing to decrement.
+            }
+            match self.count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -387,7 +399,8 @@ impl ActivityTracker {
         let offset = Instant::now()
             .saturating_duration_since(self.epoch)
             .as_nanos() as u64;
-        let encoded = offset.max(1);
+        // Encode as offset + 1 so that 0 remains the "no activity" sentinel.
+        let encoded = offset.saturating_add(1);
         // Monotonic: never go backwards.
         self.last_offset_nanos.fetch_max(encoded, Ordering::SeqCst);
     }
@@ -396,11 +409,11 @@ impl ActivityTracker {
     /// no activity has been recorded.
     #[must_use]
     pub fn last_activity(&self) -> Option<Instant> {
-        let offset = self.last_offset_nanos.load(Ordering::SeqCst);
-        if offset == 0 {
+        let encoded = self.last_offset_nanos.load(Ordering::SeqCst);
+        if encoded == 0 {
             None
         } else {
-            Some(self.epoch + Duration::from_nanos(offset - 1))
+            Some(self.epoch + Duration::from_nanos(encoded - 1))
         }
     }
 

@@ -169,11 +169,9 @@ impl PaneActivityTimestamps {
             return AgentPaneState::Thinking;
         }
 
-        // Fallback: no recent output, no recent input → Idle
-        if since_output >= config.idle_silence_ms {
-            return AgentPaneState::Idle;
-        }
-
+        // Fallback: activity is outside the immediate "active output" window,
+        // but it also has not been quiet long enough to be idle and any
+        // post-input silence has not yet crossed the thinking/stuck thresholds.
         AgentPaneState::Active
     }
 }
@@ -244,6 +242,20 @@ mod tests {
         // 20s since output, input was at 92s (more recent than output)
         // since_output=20000 > thinking_silence_ms=5000 but < stuck_silence_ms=30000
         assert_eq!(ts.classify(100_000, &config), AgentPaneState::Thinking);
+    }
+
+    #[test]
+    fn recent_input_before_thinking_threshold_stays_active() {
+        let ts = PaneActivityTimestamps {
+            last_output_ms: 96_000,
+            last_input_ms: 99_000,
+            is_agent: true,
+            flagged_stuck: false,
+        };
+        let config = AgentDetectionConfig::default();
+        // since_output=4000 < thinking_silence_ms=5000, so the pane is still
+        // within the grace window before it should be considered thinking.
+        assert_eq!(ts.classify(100_000, &config), AgentPaneState::Active);
     }
 
     #[test]

@@ -453,7 +453,7 @@ impl TieredScrollback {
     }
 
     fn evict_warm_page(&mut self, page: CompressedPage) {
-        self.warm_bytes -= page.compressed_size();
+        self.warm_bytes = self.warm_bytes.saturating_sub(page.compressed_size());
         self.cold_line_count += page.line_count as u64;
         self.cold_page_count += 1;
         self.cold.push_back(ColdPageMeta {

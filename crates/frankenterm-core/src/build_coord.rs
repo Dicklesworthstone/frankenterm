@@ -532,19 +532,83 @@ fn segment_command_start(
 
 fn cargo_subcommand_at(tokens: &[String], idx: usize) -> Option<&'static str> {
     match tokens.get(idx).map(String::as_str) {
-        Some("cargo") => match tokens.get(idx + 1).map(String::as_str) {
-            Some("build" | "b") => Some("build"),
-            Some("check" | "c") => Some("check"),
-            Some("test" | "t" | "nextest") => Some("test"),
-            Some("bench") => Some("bench"),
-            Some("clippy") => Some("clippy"),
-            Some("run" | "r") => Some("run"),
-            Some("doc") => Some("doc"),
-            _ => None,
-        },
+        Some("cargo") => cargo_subcommand_after_global_prefixes(tokens, idx + 1),
         Some("cargo-nextest") => Some("test"),
         _ => None,
     }
+}
+
+fn cargo_subcommand_after_global_prefixes(
+    tokens: &[String],
+    mut idx: usize,
+) -> Option<&'static str> {
+    if matches!(
+        tokens.get(idx).map(String::as_str),
+        Some(token) if is_cargo_toolchain_override(token)
+    ) {
+        idx += 1;
+    }
+
+    loop {
+        let token = tokens.get(idx).map(String::as_str)?;
+        if let Some(subcommand) = normalize_cargo_subcommand(token) {
+            return Some(subcommand);
+        }
+
+        let Some(arg_count) = cargo_global_prefix_arg_count(token) else {
+            return None;
+        };
+
+        idx += 1;
+        for _ in 0..arg_count {
+            tokens.get(idx)?;
+            idx += 1;
+        }
+    }
+}
+
+fn normalize_cargo_subcommand(token: &str) -> Option<&'static str> {
+    match token {
+        "build" | "b" => Some("build"),
+        "check" | "c" => Some("check"),
+        "test" | "t" | "nextest" => Some("test"),
+        "bench" => Some("bench"),
+        "clippy" => Some("clippy"),
+        "run" | "r" => Some("run"),
+        "doc" | "d" => Some("doc"),
+        _ => None,
+    }
+}
+
+fn is_cargo_toolchain_override(token: &str) -> bool {
+    token.starts_with('+') && token.len() > 1
+}
+
+fn cargo_global_prefix_arg_count(token: &str) -> Option<usize> {
+    match token {
+        "-q" | "-v" | "--quiet" | "--locked" | "--offline" | "--frozen" | "--verbose" => Some(0),
+        "-C" | "--color" | "--config" | "-Z" => Some(1),
+        token if is_cargo_short_verbosity_flags(token) => Some(0),
+        token
+            if token.starts_with("--color=")
+                || token.starts_with("--config=")
+                || is_cargo_attached_prefix_arg(token, "-C")
+                || is_cargo_attached_prefix_arg(token, "-Z") =>
+        {
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn is_cargo_short_verbosity_flags(token: &str) -> bool {
+    token
+        .strip_prefix('-')
+        .is_some_and(|rest| rest.len() > 1 && rest.chars().all(|ch| matches!(ch, 'v' | 'q')))
+}
+
+fn is_cargo_attached_prefix_arg(token: &str, prefix: &str) -> bool {
+    token.starts_with(prefix) && token.len() > prefix.len()
 }
 
 fn skip_command_prefixes(tokens: &[String], start: usize) -> usize {
@@ -1120,6 +1184,38 @@ mod tests {
     }
 
     #[test]
+    fn detect_cargo_command_with_toolchain_or_global_prefixes() {
+        assert_eq!(
+            detect_cargo_command("cargo +nightly check --workspace"),
+            Some("check")
+        );
+        assert_eq!(detect_cargo_command("cargo -vv check"), Some("check"));
+        assert_eq!(
+            detect_cargo_command(
+                "cargo --config net.git-fetch-with-cli=true test -p frankenterm-core"
+            ),
+            Some("test")
+        );
+        assert_eq!(
+            detect_cargo_command(
+                "cargo +nightly -Z unstable-options clippy --workspace -- -D warnings"
+            ),
+            Some("clippy")
+        );
+        assert_eq!(
+            detect_cargo_command("rch exec -- cargo +nightly --color always build"),
+            Some("build")
+        );
+    }
+
+    #[test]
+    fn detect_cargo_command_does_not_treat_terminal_global_flags_as_builds() {
+        assert_eq!(detect_cargo_command("cargo --help build"), None);
+        assert_eq!(detect_cargo_command("cargo --version check"), None);
+        assert_eq!(detect_cargo_command("cargo --list test"), None);
+    }
+
+    #[test]
     fn detect_cargo_command_in_chained_shell_segment() {
         assert_eq!(
             detect_cargo_command("cd /tmp && cargo test -p frankenterm-core -- --nocapture"),
@@ -1222,9 +1318,13 @@ mod tests {
     fn requires_rch_offload_only_for_unwrapped_heavy_commands() {
         assert!(requires_rch_offload("cargo test -p frankenterm-core"));
         assert!(requires_rch_offload("cargo check --help"));
+        assert!(requires_rch_offload("cargo +nightly check --workspace"));
         assert!(!requires_rch_offload("cargo fmt --check"));
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- cargo test --workspace"
+        ));
+        assert!(!requires_rch_offload(
+            "TMPDIR=/tmp rch exec -- cargo +nightly -Z unstable-options check --workspace"
         ));
         assert!(!requires_rch_offload(
             "TMPDIR=/tmp rch exec -- env CARGO_TARGET_DIR=target cargo check --help"
