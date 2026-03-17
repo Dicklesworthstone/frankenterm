@@ -44,6 +44,7 @@ impl ErrorRenderer {
             },
             Error::Storage(e) => match e {
                 StorageError::Database(_) => "FT-2001",
+                StorageError::ReservationConflict { .. } => "FT-2050",
                 StorageError::SequenceDiscontinuity { .. } => "FT-2010",
                 StorageError::MigrationFailed(_) => "FT-2002",
                 StorageError::SchemaTooNew { .. } => "FT-2003",
@@ -452,6 +453,13 @@ mod tests {
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::Database("x".into()))),
             "FT-2001"
+        );
+        assert_eq!(
+            ErrorRenderer::error_code(&Error::Storage(StorageError::ReservationConflict {
+                pane_id: 9,
+                existing_id: 17,
+            })),
+            "FT-2050"
         );
         assert_eq!(
             ErrorRenderer::error_code(&Error::Storage(StorageError::SequenceDiscontinuity {

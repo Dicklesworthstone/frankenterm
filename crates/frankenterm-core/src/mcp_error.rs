@@ -2,7 +2,7 @@
 
 use crate::cass::CassError;
 use crate::caut::CautError;
-use crate::error::{Error, WeztermError};
+use crate::error::{Error, StorageError, WeztermError};
 
 pub(crate) const MCP_ERR_INVALID_ARGS: &str = "FT-MCP-0001";
 pub(crate) const MCP_ERR_CONFIG: &str = "FT-MCP-0003";
@@ -117,6 +117,10 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
         ),
         Error::Wezterm(_) => (MCP_ERR_WEZTERM, None),
         Error::Config(_) => (MCP_ERR_CONFIG, None),
+        Error::Storage(StorageError::ReservationConflict { .. }) => (
+            MCP_ERR_RESERVATION_CONFLICT,
+            Some("Use wa.reservations to inspect or release the conflicting reservation.".to_string()),
+        ),
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
         Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
         Error::Policy(_) => (MCP_ERR_POLICY, None),
@@ -277,6 +281,17 @@ mod tests {
         let err = Error::Storage(crate::error::StorageError::Database("db error".to_string()));
         let (code, _) = map_mcp_error(&err);
         assert_eq!(code, MCP_ERR_STORAGE);
+    }
+
+    #[test]
+    fn map_error_reservation_conflict() {
+        let err = Error::Storage(crate::error::StorageError::ReservationConflict {
+            pane_id: 12,
+            existing_id: 44,
+        });
+        let (code, hint) = map_mcp_error(&err);
+        assert_eq!(code, MCP_ERR_RESERVATION_CONFLICT);
+        assert!(hint.unwrap().contains("wa.reservations"));
     }
 
     #[test]

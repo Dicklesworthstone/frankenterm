@@ -233,6 +233,7 @@ impl Error {
                 NetworkErrorKind::Permanent
             }
             Self::Policy(_) => NetworkErrorKind::Degraded,
+            Self::Storage(StorageError::ReservationConflict { .. }) => NetworkErrorKind::Degraded,
             Self::Storage(_) | Self::Workflow(_) => NetworkErrorKind::Transient,
         }
     }
@@ -374,6 +375,9 @@ pub enum StorageError {
     #[error("Database error: {0}")]
     Database(String),
 
+    #[error("Pane {pane_id} already has active reservation (id={existing_id})")]
+    ReservationConflict { pane_id: u64, existing_id: i64 },
+
     #[error("Sequence discontinuity: expected {expected}, got {actual}")]
     SequenceDiscontinuity { expected: u64, actual: u64 },
 
@@ -408,6 +412,16 @@ impl StorageError {
             )
             .command("Diagnostics", "ft doctor")
             .alternative("Ensure the workspace directory is writable."),
+            Self::ReservationConflict {
+                pane_id,
+                existing_id,
+            } => Remediation::new(format!(
+                "Pane {pane_id} is already reserved by reservation {existing_id}."
+            ))
+            .command("List reservations", "ft reservations")
+            .alternative(
+                "Wait for the existing reservation to expire or release it before retrying.",
+            ),
             Self::SequenceDiscontinuity { expected, actual } => Remediation::new(format!(
                 "Output sequence gap detected (expected {expected}, got {actual})."
             ))
@@ -621,6 +635,10 @@ mod tests {
                 retry_after_ms: 500,
             }),
             Error::Storage(StorageError::Database("db error".to_string())),
+            Error::Storage(StorageError::ReservationConflict {
+                pane_id: 7,
+                existing_id: 11,
+            }),
             Error::Storage(StorageError::SequenceDiscontinuity {
                 expected: 1,
                 actual: 2,
@@ -1282,6 +1300,16 @@ mod tests {
     fn top_level_policy_is_degraded() {
         use crate::network_reliability::NetworkErrorKind;
         let err = Error::Policy("rate limited".to_string());
+        assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+    }
+
+    #[test]
+    fn top_level_reservation_conflict_is_degraded() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::Storage(StorageError::ReservationConflict {
+            pane_id: 42,
+            existing_id: 9,
+        });
         assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
     }
 }

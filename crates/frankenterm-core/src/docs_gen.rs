@@ -508,13 +508,40 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.unknown_subcommand" => "Unrecognized robot subcommand",
         "robot.not_implemented" => "Command is not yet implemented",
         "robot.config_error" => "Configuration error (missing or invalid config)",
+        "robot.feature_not_available" => {
+            "Feature is unavailable in the current build or runtime configuration"
+        }
         "robot.wezterm_error" => {
             "Error communicating with terminal backend bridge (current: WezTerm)"
         }
+        "robot.wezterm_not_found" => {
+            "Active terminal backend CLI is not installed or not available in PATH"
+        }
+        "robot.wezterm_not_running" => {
+            "Active terminal backend bridge is not running or not reachable"
+        }
+        "robot.wezterm_socket_not_found" => "Terminal backend socket is missing or was not created",
+        "robot.wezterm_command_failed" => {
+            "Terminal backend command failed before returning usable output"
+        }
+        "robot.wezterm_parse_error" => {
+            "Terminal backend response could not be parsed into the expected format"
+        }
+        "robot.circuit_open" => {
+            "Terminal backend circuit breaker is open after repeated recent failures"
+        }
         "robot.storage_error" => "Database or storage layer error",
+        "robot.fts_query_error" => "Full-text search query was invalid or could not be executed",
         "robot.policy_denied" => "Action denied by safety policy",
+        "robot.require_approval" => {
+            "Action requires an allow-once approval token before it can proceed"
+        }
+        "robot.approval_error" => "Approval token issuance or approval workflow persistence failed",
+        "robot.rate_limited" => "External service or policy rate limit was reached",
         "robot.pane_not_found" => "Specified pane does not exist",
+        "robot.reservation_conflict" => "Pane is already reserved by another owner",
         "robot.workflow_error" => "Workflow execution failed",
+        "robot.internal_error" => "Unexpected internal error while handling the robot command",
         "robot.timeout" => "Operation timed out",
         _ => "Unknown error code",
     }
@@ -749,8 +776,28 @@ mod tests {
                 "error_codes": {
                     "enum": [
                         "robot.invalid_args",
+                        "robot.unknown_subcommand",
+                        "robot.not_implemented",
+                        "robot.config_error",
+                        "robot.feature_not_available",
                         "robot.wezterm_error",
-                        "robot.policy_denied"
+                        "robot.wezterm_not_found",
+                        "robot.wezterm_not_running",
+                        "robot.wezterm_socket_not_found",
+                        "robot.wezterm_command_failed",
+                        "robot.wezterm_parse_error",
+                        "robot.circuit_open",
+                        "robot.storage_error",
+                        "robot.fts_query_error",
+                        "robot.policy_denied",
+                        "robot.require_approval",
+                        "robot.approval_error",
+                        "robot.rate_limited",
+                        "robot.pane_not_found",
+                        "robot.reservation_conflict",
+                        "robot.workflow_error",
+                        "robot.internal_error",
+                        "robot.timeout"
                     ]
                 }
             }
@@ -1105,11 +1152,24 @@ mod tests {
             "robot.unknown_subcommand",
             "robot.not_implemented",
             "robot.config_error",
+            "robot.feature_not_available",
             "robot.wezterm_error",
+            "robot.wezterm_not_found",
+            "robot.wezterm_not_running",
+            "robot.wezterm_socket_not_found",
+            "robot.wezterm_command_failed",
+            "robot.wezterm_parse_error",
+            "robot.circuit_open",
             "robot.storage_error",
+            "robot.fts_query_error",
             "robot.policy_denied",
+            "robot.require_approval",
+            "robot.approval_error",
+            "robot.rate_limited",
             "robot.pane_not_found",
+            "robot.reservation_conflict",
             "robot.workflow_error",
+            "robot.internal_error",
             "robot.timeout",
         ];
         for code in &known_codes {
@@ -2111,11 +2171,24 @@ mod tests {
             "robot.unknown_subcommand",
             "robot.not_implemented",
             "robot.config_error",
+            "robot.feature_not_available",
             "robot.wezterm_error",
+            "robot.wezterm_not_found",
+            "robot.wezterm_not_running",
+            "robot.wezterm_socket_not_found",
+            "robot.wezterm_command_failed",
+            "robot.wezterm_parse_error",
+            "robot.circuit_open",
             "robot.storage_error",
+            "robot.fts_query_error",
             "robot.policy_denied",
+            "robot.require_approval",
+            "robot.approval_error",
+            "robot.rate_limited",
             "robot.pane_not_found",
+            "robot.reservation_conflict",
             "robot.workflow_error",
+            "robot.internal_error",
             "robot.timeout",
         ];
         let mut descs: Vec<&str> = codes.iter().map(|c| error_code_description(c)).collect();

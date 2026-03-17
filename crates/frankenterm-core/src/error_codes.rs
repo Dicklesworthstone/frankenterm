@@ -492,6 +492,25 @@ pub static FT_2040: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-2050: Pane reservation conflict
+pub static FT_2050: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-2050",
+    category: ErrorCategory::Storage,
+    title: "Pane reservation conflict",
+    description: "The requested pane already has an active reservation owned by another workflow, agent, or operator.",
+    causes: &[
+        "Another workflow already reserved the pane",
+        "A previous reservation has not been released yet",
+        "The pane is intentionally locked for exclusive automation",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("List active reservations", "ft reservations"),
+        RecoveryStep::text("Wait for the active reservation to expire or be released"),
+        RecoveryStep::text("Choose a different pane if the current reservation is expected"),
+    ],
+    doc_link: None,
+};
+
 // --- Pattern Errors (WA-3xxx) ---
 
 /// WA-3001: Invalid regex
@@ -1031,6 +1050,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-2020", &FT_2020);
         m.insert("FT-2030", &FT_2030);
         m.insert("FT-2040", &FT_2040);
+        m.insert("FT-2050", &FT_2050);
         // Pattern errors
         m.insert("FT-3001", &FT_3001);
         m.insert("FT-3002", &FT_3002);
@@ -1805,6 +1825,18 @@ mod tests {
             def.causes
                 .iter()
                 .any(|c| c.contains("permission") || c.contains("disk"))
+        );
+    }
+
+    #[test]
+    fn ft_2050_definition() {
+        let def = get_error_code("FT-2050").unwrap();
+        assert_eq!(def.category, ErrorCategory::Storage);
+        assert!(def.title.contains("reservation"));
+        assert!(
+            def.recovery_steps
+                .iter()
+                .any(|step| format!("{step:?}").contains("ft reservations"))
         );
     }
 

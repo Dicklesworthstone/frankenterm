@@ -35,14 +35,14 @@ use super::{
     HandleGeminiQuota, HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits,
     InjectionResult, MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
     MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
-    MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig, PaneInfo,
-    PaneReservation, PaneWaiter, PaneWorkflowLockManager, PatternEngine, PolicyDecision,
-    PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
-    StorageHandle, UnifiedSearchMode, WaitMatcher, WaitOptions, WaitResult, WeztermError,
-    WeztermHandleSource, Workflow, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner,
-    WorkflowRunnerConfig, approval_command, build_policy_engine, builtin_workflows,
-    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
+    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
+    PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter,
+    PaneWorkflowLockManager, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
+    PolicyInput, SearchQueryDefaults, SearchQueryInput, StorageHandle, UnifiedSearchMode,
+    WaitMatcher, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
+    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+    approval_command, build_policy_engine, builtin_workflows, default_wezterm_handle,
+    effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
     mcp_build_tx_commit_step_inputs, mcp_build_tx_compensation_inputs,
@@ -2745,15 +2745,8 @@ impl ToolHandler for WaReserveTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = if err.message.contains("already has active reservation") {
-                    (
-                        MCP_ERR_RESERVATION_CONFLICT,
-                        Some("Use wa.reservations to check existing reservations".to_string()),
-                    )
-                } else {
-                    (err.code, err.hint)
-                };
-                let envelope = McpEnvelope::<()>::error(code, err.message, hint, elapsed_ms(start));
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }

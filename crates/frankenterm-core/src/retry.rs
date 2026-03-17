@@ -311,6 +311,7 @@ pub fn is_retryable(error: &Error) -> bool {
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {
             StorageError::Database(_) => true, // Might be transient lock conflict
+            StorageError::ReservationConflict { .. } => false, // Another owner must release first
             StorageError::SequenceDiscontinuity { .. } => false, // Logic error
             StorageError::MigrationFailed(_) => false, // Persistent issue
             StorageError::SchemaTooNew { .. } => false, // Version mismatch
@@ -1003,6 +1004,17 @@ mod tests {
             StorageError::SequenceDiscontinuity {
                 expected: 5,
                 actual: 7,
+            }
+        )));
+    }
+
+    #[test]
+    fn not_retryable_storage_reservation_conflict() {
+        use crate::error::StorageError;
+        assert!(!is_retryable(&Error::Storage(
+            StorageError::ReservationConflict {
+                pane_id: 5,
+                existing_id: 12,
             }
         )));
     }

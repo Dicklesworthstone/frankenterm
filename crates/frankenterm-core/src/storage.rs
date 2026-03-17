@@ -12095,9 +12095,10 @@ fn create_reservation_sync(
         .map_err(|e| StorageError::Database(format!("Failed to check reservation: {e}")))?;
 
     if let Some(existing_id) = existing {
-        return Err(StorageError::Database(format!(
-            "Pane {pane_id} already has active reservation (id={existing_id})"
-        ))
+        return Err(StorageError::ReservationConflict {
+            pane_id,
+            existing_id,
+        }
         .into());
     }
 
@@ -23578,8 +23579,16 @@ mod reservation_tests {
         // Second reservation on same pane should fail
         let r2 = create_reservation_sync(&conn, 1, "workflow", "wf-2", None, 60_000);
         assert!(r2.is_err());
-        let err_msg = format!("{}", r2.unwrap_err());
+        let err = r2.unwrap_err();
+        let err_msg = err.to_string();
         assert!(err_msg.contains("already has active reservation"));
+        assert!(matches!(
+            err,
+            crate::Error::Storage(StorageError::ReservationConflict {
+                pane_id: 1,
+                existing_id: _
+            })
+        ));
     }
 
     #[test]
