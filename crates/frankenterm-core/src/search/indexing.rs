@@ -519,11 +519,16 @@ impl SearchIndex {
         match reindex_result {
             Ok(report) => Ok(report),
             Err(err) => {
+                // Restore in-memory state so the index is consistent.
                 self.state = original_state;
                 self.pending = original_pending;
                 self.known_hashes = original_known_hashes;
                 self.rate_window_started_ms = original_rate_window_started_ms;
                 self.rate_window_docs = original_rate_window_docs;
+                // Also persist the restored state to disk so a process restart
+                // does not reload the partially-reindexed on-disk state that
+                // may have been written by a mid-ingest flush_if_due.
+                let _ = self.persist_state();
                 Err(err)
             }
         }

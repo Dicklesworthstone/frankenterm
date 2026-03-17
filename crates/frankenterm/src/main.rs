@@ -8149,7 +8149,9 @@ fn load_session_show_pane_lookup(
     session_id: &str,
     pane_id: u64,
 ) -> anyhow::Result<SessionShowPaneLookup> {
-    let Some(checkpoint) = session_restore::load_latest_checkpoint(db_path, session_id)? else {
+    let Some(checkpoint) =
+        frankenterm_core::session_restore::load_latest_checkpoint(db_path, session_id)?
+    else {
         return Ok(SessionShowPaneLookup::NoCheckpointData {
             requested_pane_id: pane_id,
             checkpoint_id: None,
@@ -11164,21 +11166,24 @@ fn distributed_sender_hash(sender: &str) -> u64 {
 fn distributed_remote_pane_id(sender: &str, pane_id: u64) -> u64 {
     // Reserve bit 62 for distributed panes while staying within signed i64 range.
     const DISTRIBUTED_PANE_FLAG: u64 = 1 << 62;
-    let sender_bits = distributed_sender_hash(sender) & 0x3fff_ffff;
+    let canonical_sender = distributed_normalize_identity(sender);
+    let sender_bits = distributed_sender_hash(&canonical_sender) & 0x3fff_ffff;
     DISTRIBUTED_PANE_FLAG | (sender_bits << 32) | (pane_id & 0xffff_ffff)
 }
 
 #[cfg(feature = "distributed")]
 fn distributed_remote_domain(sender: &str, domain: &str) -> String {
-    format!("distributed:{sender}:{domain}")
+    let canonical_sender = distributed_normalize_identity(sender);
+    format!("distributed:{canonical_sender}:{domain}")
 }
 
 #[cfg(feature = "distributed")]
 fn distributed_replay_session_key(session_id: &str, sender: &str) -> String {
+    let canonical_sender = distributed_normalize_identity(sender);
     format!(
-        "{}:{session_id}:{}:{sender}",
+        "{}:{session_id}:{}:{canonical_sender}",
         session_id.len(),
-        sender.len()
+        canonical_sender.len()
     )
 }
 
@@ -11189,7 +11194,8 @@ fn distributed_remote_pane_uuid(
     pane_uuid: Option<&str>,
 ) -> Option<String> {
     let raw = pane_uuid.unwrap_or("unknown");
-    Some(format!("distributed:{sender}:{pane_id}:{raw}"))
+    let canonical_sender = distributed_normalize_identity(sender);
+    Some(format!("distributed:{canonical_sender}:{pane_id}:{raw}"))
 }
 
 #[cfg(feature = "distributed")]
@@ -11392,13 +11398,15 @@ async fn distributed_persist_payload(
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
 
+    let canonical_sender = distributed_normalize_identity(sender);
+
     match payload {
         WirePayload::PaneMeta(meta) => {
-            distributed_persist_pane_meta(sender, meta, storage, event_bus).await?;
+            distributed_persist_pane_meta(&canonical_sender, meta, storage, event_bus).await?;
         }
         WirePayload::PaneDelta(delta) => {
-            let remote_pane_id = distributed_remote_pane_id(sender, delta.pane_id);
-            let seq_key = (sender.to_string(), delta.pane_id);
+            let remote_pane_id = distributed_remote_pane_id(&canonical_sender, delta.pane_id);
+            let seq_key = (canonical_sender.clone(), delta.pane_id);
             let mut drop_due_to_reorder = false;
             let mut gap_reason: Option<String> = None;
 
@@ -11413,13 +11421,13 @@ async fn distributed_persist_payload(
                 if delta.seq < expected {
                     drop_due_to_reorder = true;
                     gap_reason = Some(format!(
-                        "distributed_out_of_order:sender={sender}:expected={expected}:actual={}",
+                        "distributed_out_of_order:sender={canonical_sender}:expected={expected}:actual={}",
                         delta.seq
                     ));
                 } else {
                     if delta.seq > expected {
                         gap_reason = Some(format!(
-                            "distributed_seq_gap:sender={sender}:expected={expected}:actual={}",
+                            "distributed_seq_gap:sender={canonical_sender}:expected={expected}:actual={}",
                             delta.seq
                         ));
                     }
@@ -11433,9 +11441,9 @@ async fn distributed_persist_payload(
                 distributed_upsert_pane(
                     &storage_handle,
                     remote_pane_id,
-                    distributed_remote_pane_uuid(sender, delta.pane_id, None),
-                    distributed_remote_domain(sender, "unknown"),
-                    Some(format!("remote:{sender}:{}", delta.pane_id)),
+                    distributed_remote_pane_uuid(&canonical_sender, delta.pane_id, None),
+                    distributed_remote_domain(&canonical_sender, "unknown"),
+                    Some(format!("remote:{canonical_sender}:{}", delta.pane_id)),
                     Some("/remote".to_string()),
                     true,
                     ts,
@@ -11463,7 +11471,10 @@ async fn distributed_persist_payload(
                 .append_segment(
                     remote_pane_id,
                     &delta.content,
-                    Some(format!("remote_sender={sender};remote_seq={}", delta.seq)),
+                    Some(format!(
+                        "remote_sender={canonical_sender};remote_seq={}",
+                        delta.seq
+                    )),
                 )
                 .await?;
             drop(storage_handle);
@@ -11475,17 +11486,17 @@ async fn distributed_persist_payload(
             });
         }
         WirePayload::Gap(gap) => {
-            let remote_pane_id = distributed_remote_pane_id(sender, gap.pane_id);
-            let seq_key = (sender.to_string(), gap.pane_id);
+            let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
+            let seq_key = (canonical_sender.clone(), gap.pane_id);
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
             if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
                 distributed_upsert_pane(
                     &storage_handle,
                     remote_pane_id,
-                    distributed_remote_pane_uuid(sender, gap.pane_id, None),
-                    distributed_remote_domain(sender, "unknown"),
-                    Some(format!("remote:{sender}:{}", gap.pane_id)),
+                    distributed_remote_pane_uuid(&canonical_sender, gap.pane_id, None),
+                    distributed_remote_domain(&canonical_sender, "unknown"),
+                    Some(format!("remote:{canonical_sender}:{}", gap.pane_id)),
                     Some("/remote".to_string()),
                     true,
                     ts,
@@ -11517,9 +11528,10 @@ async fn distributed_persist_payload(
             }
         }
         WirePayload::Detection(detection_notice) => {
-            let remote_pane_id = distributed_remote_pane_id(sender, detection_notice.pane_id);
+            let remote_pane_id =
+                distributed_remote_pane_id(&canonical_sender, detection_notice.pane_id);
             let pane_uuid = distributed_remote_pane_uuid(
-                sender,
+                &canonical_sender,
                 detection_notice.pane_id,
                 detection_notice.pane_uuid.as_deref(),
             );
@@ -11545,8 +11557,11 @@ async fn distributed_persist_payload(
                     &storage_handle,
                     remote_pane_id,
                     pane_uuid.clone(),
-                    distributed_remote_domain(sender, "unknown"),
-                    Some(format!("remote:{sender}:{}", detection_notice.pane_id)),
+                    distributed_remote_domain(&canonical_sender, "unknown"),
+                    Some(format!(
+                        "remote:{canonical_sender}:{}",
+                        detection_notice.pane_id
+                    )),
                     Some("/remote".to_string()),
                     true,
                     detected_at,
@@ -11572,7 +11587,7 @@ async fn distributed_persist_payload(
         }
         WirePayload::PanesMeta(panes_meta) => {
             for pane in panes_meta.panes {
-                distributed_persist_pane_meta(sender, pane, storage, event_bus).await?;
+                distributed_persist_pane_meta(&canonical_sender, pane, storage, event_bus).await?;
             }
         }
     }
@@ -11591,13 +11606,15 @@ async fn distributed_persist_pane_meta(
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
 
-    let remote_pane_id = distributed_remote_pane_id(sender, meta.pane_id);
-    let pane_uuid = distributed_remote_pane_uuid(sender, meta.pane_id, meta.pane_uuid.as_deref());
-    let domain = distributed_remote_domain(sender, &meta.domain);
+    let canonical_sender = distributed_normalize_identity(sender);
+    let remote_pane_id = distributed_remote_pane_id(&canonical_sender, meta.pane_id);
+    let pane_uuid =
+        distributed_remote_pane_uuid(&canonical_sender, meta.pane_id, meta.pane_uuid.as_deref());
+    let domain = distributed_remote_domain(&canonical_sender, &meta.domain);
     let title = meta
         .title
         .clone()
-        .or_else(|| Some(format!("remote:{sender}:{}", meta.pane_id)));
+        .or_else(|| Some(format!("remote:{canonical_sender}:{}", meta.pane_id)));
 
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
     let is_new = storage_handle.get_pane(remote_pane_id).await?.is_none();
@@ -11618,7 +11635,7 @@ async fn distributed_persist_pane_meta(
         let _ = event_bus.publish(Event::PaneDiscovered {
             pane_id: remote_pane_id,
             domain,
-            title: title.unwrap_or_else(|| format!("remote:{sender}:{}", meta.pane_id)),
+            title: title.unwrap_or_else(|| format!("remote:{canonical_sender}:{}", meta.pane_id)),
         });
     }
 
@@ -11819,7 +11836,7 @@ async fn distributed_handle_connection<S>(
             continue;
         }
 
-        let envelope = match frankenterm_core::wire_protocol::WireEnvelope::from_json(
+        let mut envelope = match frankenterm_core::wire_protocol::WireEnvelope::from_json(
             trimmed.as_bytes(),
         ) {
             Ok(envelope) => envelope,
@@ -11829,8 +11846,9 @@ async fn distributed_handle_connection<S>(
             }
         };
 
+        let canonical_sender = distributed_normalize_identity(&envelope.sender);
         if let Some(agent_id) = normalized_handshake_agent.as_deref() {
-            if distributed_normalize_identity(&envelope.sender) != *agent_id {
+            if canonical_sender != *agent_id {
                 distributed_publish_security_error(
                     &mut reader,
                     frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
@@ -11841,7 +11859,7 @@ async fn distributed_handle_connection<S>(
         }
 
         let validation_err = {
-            let replay_id = distributed_replay_session_key(&session_id, &envelope.sender);
+            let replay_id = distributed_replay_session_key(&session_id, &canonical_sender);
             let mut replay_guard = ingest_state.replay_guard.lock().await;
             replay_guard.validate(&replay_id, envelope.seq).err()
         };
@@ -11851,7 +11869,8 @@ async fn distributed_handle_connection<S>(
             continue;
         }
 
-        let sender = envelope.sender.clone();
+        envelope.sender = canonical_sender.clone();
+        let sender = canonical_sender;
         let ingest_result = {
             let mut aggregator = ingest_state.aggregator.lock().await;
             aggregator.ingest_envelope(envelope)
@@ -21725,8 +21744,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 let payload = serde_json::json!({
                                     "ok": false,
                                     "error": e,
-                                    "error_code": "approval_error",
+                                    "error_code": "robot.approval_error",
                                     "version": frankenterm_core::VERSION,
+                                    "elapsed_ms": 0,
+                                    "now": now_epoch_ms(),
                                 });
                                 println!(
                                     "{}",
@@ -21774,11 +21795,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "ok": false,
                                 "error": reason,
                                 "error_code": if policy_decision.requires_approval() {
-                                    "require_approval"
+                                    "robot.require_approval"
                                 } else {
-                                    "policy_denied"
+                                    "robot.policy_denied"
                                 },
                                 "version": frankenterm_core::VERSION,
+                                "elapsed_ms": 0,
+                                "now": now_epoch_ms(),
                             });
                             if let Some(hint) = approval_hint.as_ref() {
                                 payload["hint"] = serde_json::Value::String(hint.clone());
@@ -41507,6 +41530,105 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_persist_payload_normalizes_sender_case_for_remote_pane_mapping() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_persist_payload_sender_case").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let canonical_sender = "agent-mapped";
+            let meta_sender = "Agent-Mapped";
+            let delta_sender = "agent-mapped";
+            let source_pane_id = 27_u64;
+            let remote_pane_id = distributed_remote_pane_id(canonical_sender, source_pane_id);
+            let marker = "DIST_PERSIST_PAYLOAD_CASE_MARKER";
+
+            distributed_persist_payload(
+                meta_sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneMeta(
+                    frankenterm_core::wire_protocol::PaneMeta {
+                        pane_id: source_pane_id,
+                        pane_uuid: Some("pane-uuid-27".to_string()),
+                        domain: "prod".to_string(),
+                        title: Some("remote-pane".to_string()),
+                        cwd: Some("/remote/project".to_string()),
+                        rows: Some(24),
+                        cols: Some(120),
+                        observed: true,
+                        timestamp_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            distributed_persist_payload(
+                delta_sender,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 1,
+                        content: marker.to_string(),
+                        content_len: marker.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let remote = storage_handle
+                    .get_pane(remote_pane_id)
+                    .await
+                    .unwrap()
+                    .expect("canonical remote pane should exist");
+                assert_eq!(remote.domain, "distributed:agent-mapped:prod");
+
+                let distributed_panes: Vec<_> = storage_handle
+                    .get_panes()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|pane| pane.domain.starts_with("distributed:"))
+                    .collect();
+                assert_eq!(
+                    distributed_panes.len(),
+                    1,
+                    "case-only sender variants should not fork remote panes"
+                );
+
+                let search_hits = storage_handle.search(marker).await.unwrap();
+                assert!(search_hits.iter().any(|seg| seg.pane_id == remote_pane_id));
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment() {
         run_async_test(async {
             let (storage_handle, db_path) =
@@ -42799,6 +42921,180 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_listener_normalizes_sender_case_before_ordering_and_persistence() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::TcpStream;
+                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
+                use std::sync::atomic::Ordering;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_sender_case_normalized").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+                distributed_config.enabled = true;
+                distributed_config.bind_addr = bind_addr.to_string();
+                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+                distributed_config.token = Some("dist-case-token".to_string());
+
+                let listener_handle = spawn_distributed_listener(
+                    distributed_config.clone(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
+                )
+                .await
+                .expect("spawn distributed listener");
+
+                let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+                    .await
+                    .expect("connect distributed listener");
+
+                let canonical_sender = "agent-case";
+                let source_pane_id = 92_u64;
+                let remote_pane_id = distributed_remote_pane_id(canonical_sender, source_pane_id);
+                let handshake = DistributedHandshake {
+                    protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                    token: distributed_config.token.clone(),
+                    agent_id: Some("Agent-Case".to_string()),
+                    session_id: Some("session-case".to_string()),
+                };
+                let handshake_json =
+                    serde_json::to_string(&handshake).expect("serialize handshake");
+                stream
+                    .write_all(handshake_json.as_bytes())
+                    .await
+                    .expect("write handshake");
+                stream
+                    .write_all(b"\n")
+                    .await
+                    .expect("write handshake newline");
+                stream.flush().await.expect("flush handshake");
+
+                let mut reader = asupersync::io::BufReader::new(stream);
+                let mut line = String::new();
+                let read_size = frankenterm_core::runtime_compat::timeout(
+                    std::time::Duration::from_secs(1),
+                    distributed_read_line(
+                        &mut reader,
+                        &mut line,
+                        frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                    ),
+                )
+                .await
+                .expect("read handshake acknowledgement within timeout")
+                .expect("read handshake acknowledgement");
+                assert!(
+                    read_size > 0,
+                    "listener should emit handshake acknowledgement"
+                );
+
+                let newer_meta = PaneMeta {
+                    pane_id: source_pane_id,
+                    pane_uuid: Some("pane-case-uuid".to_string()),
+                    domain: "prod".to_string(),
+                    title: Some("newer-title".to_string()),
+                    cwd: Some("/remote/newer".to_string()),
+                    rows: Some(40),
+                    cols: Some(120),
+                    observed: true,
+                    timestamp_ms: now_ms(),
+                };
+                let stale_meta = PaneMeta {
+                    pane_id: source_pane_id,
+                    pane_uuid: Some("pane-case-uuid".to_string()),
+                    domain: "prod".to_string(),
+                    title: Some("stale-title".to_string()),
+                    cwd: Some("/remote/stale".to_string()),
+                    rows: Some(40),
+                    cols: Some(120),
+                    observed: true,
+                    timestamp_ms: now_ms(),
+                };
+
+                let first = WireEnvelope::new(2, "AGENT-CASE", WirePayload::PaneMeta(newer_meta));
+                let second = WireEnvelope::new(1, "agent-case", WirePayload::PaneMeta(stale_meta));
+
+                for envelope in [first, second] {
+                    let bytes = envelope.to_json().expect("serialize envelope");
+                    reader
+                        .get_mut()
+                        .write_all(&bytes)
+                        .await
+                        .expect("write envelope");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .await
+                        .expect("write envelope newline");
+                }
+                reader
+                    .get_mut()
+                    .flush()
+                    .await
+                    .expect("flush envelope writes");
+                drop(reader);
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(150))
+                    .await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    let remote = storage_handle
+                        .get_pane(remote_pane_id)
+                        .await
+                        .unwrap()
+                        .expect("canonical remote pane should exist");
+                    assert_eq!(
+                        remote.title.as_deref(),
+                        Some("newer-title"),
+                        "stale lower-seq mixed-case sender metadata must be ignored"
+                    );
+
+                    let distributed_panes: Vec<_> = storage_handle
+                        .get_panes()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .filter(|pane| pane.domain.starts_with("distributed:"))
+                        .collect();
+                    assert_eq!(
+                        distributed_panes.len(),
+                        1,
+                        "listener should not fork sender state on case-only identity changes"
+                    );
+                }
+
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = listener_handle.await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle.shutdown().await.expect("shutdown storage");
+                }
+                drop(storage);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_listener_rejects_invalid_token_and_does_not_persist_remote_panes() {
         frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
@@ -43161,9 +43457,11 @@ recorder_backend = "frankensqlite"
     fn distributed_remote_pane_id_is_namespaced_and_stable() {
         let a1 = distributed_remote_pane_id("agent-a", 7);
         let a2 = distributed_remote_pane_id("agent-a", 7);
+        let a3 = distributed_remote_pane_id("AGENT-A", 7);
         let b1 = distributed_remote_pane_id("agent-b", 7);
 
         assert_eq!(a1, a2);
+        assert_eq!(a1, a3);
         assert_ne!(a1, b1);
         assert!(a1 >= (1_u64 << 62));
     }

@@ -175,12 +175,16 @@ impl ErrorCode {
             "robot.config_error"
             | "robot.feature_not_available"
             | "robot.invalid_service"
+            | "robot.unsupported"
             | "robot.cass_not_installed" => ErrorCategory::Config,
             "robot.policy_denied"
             | "robot.require_approval"
             | "robot.rate_limited"
             | "robot.approval_error" => ErrorCategory::Policy,
-            "robot.timeout" | "robot.cass_timeout" => ErrorCategory::Network,
+            "robot.timeout"
+            | "robot.cass_timeout"
+            | "robot.cass_error"
+            | "robot.caut_error" => ErrorCategory::Network,
             "robot.assignment_not_found" => ErrorCategory::Workflow,
             code if code.starts_with("robot.workflow_")
                 || code.starts_with("robot.mission_")
@@ -208,6 +212,7 @@ impl ErrorCode {
                 | "robot.wezterm_socket_not_found"
                 | "robot.wezterm_command_failed"
                 | "robot.timeout"
+                | "robot.cass_timeout"
                 | "robot.rate_limited"
                 | "robot.circuit_open"
         )
