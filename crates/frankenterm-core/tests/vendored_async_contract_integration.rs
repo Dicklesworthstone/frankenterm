@@ -227,8 +227,8 @@ fn audit_report_summary_is_non_empty() {
 // =============================================================================
 
 #[test]
-fn compatibility_mappings_have_15_entries() {
-    assert_eq!(standard_compatibility_mappings().len(), 15);
+fn compatibility_mappings_have_18_entries() {
+    assert_eq!(standard_compatibility_mappings().len(), 18);
 }
 
 #[test]
@@ -265,6 +265,28 @@ fn misaligned_mappings_have_reasons() {
         misaligned.len() >= 3,
         "at least 3 misaligned mappings expected"
     );
+}
+
+#[test]
+fn canonical_channel_bridge_mappings_are_present_and_aligned() {
+    let mappings = standard_compatibility_mappings();
+    for api in ["broadcast", "oneshot", "notify"] {
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.compat_api == api)
+            .unwrap_or_else(|| panic!("missing mapping for {api}"));
+        assert!(
+            mapping
+                .satisfies_contracts
+                .iter()
+                .any(|id| id == "ABC-CHN-001"),
+            "{api} should satisfy the canonical channel contract"
+        );
+        assert!(
+            mapping.disposition_aligned,
+            "{api} should remain aligned because it is a Keep surface"
+        );
+    }
 }
 
 // =============================================================================

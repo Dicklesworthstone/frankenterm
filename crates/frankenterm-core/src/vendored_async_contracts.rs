@@ -321,7 +321,7 @@ pub struct CompatibilityMapping {
 /// Standard compatibility mappings between `runtime_compat` APIs and async
 /// boundary contracts.
 ///
-/// Covers all 15 entries in `SURFACE_CONTRACT_V1`.
+/// Covers all 18 entries in `SURFACE_CONTRACT_V1`.
 #[must_use]
 pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
     vec![
@@ -390,6 +390,21 @@ pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
             compat_api: "watch_changed".into(),
             satisfies_contracts: vec!["ABC-CHN-001".into(), "ABC-CAN-001".into()],
             disposition_aligned: false, // Replace — hides cancellation/wake semantics
+        },
+        CompatibilityMapping {
+            compat_api: "broadcast".into(),
+            satisfies_contracts: vec!["ABC-CHN-001".into()],
+            disposition_aligned: true, // Keep — canonical fan-out channel seam
+        },
+        CompatibilityMapping {
+            compat_api: "oneshot".into(),
+            satisfies_contracts: vec!["ABC-CHN-001".into()],
+            disposition_aligned: true, // Keep — canonical request-response seam
+        },
+        CompatibilityMapping {
+            compat_api: "notify".into(),
+            satisfies_contracts: vec!["ABC-CHN-001".into()],
+            disposition_aligned: true, // Keep — canonical async notification seam
         },
         CompatibilityMapping {
             compat_api: "process::Command".into(),
@@ -760,11 +775,11 @@ mod tests {
     #[test]
     fn compatibility_mapping_covers_apis() {
         let mappings = standard_compatibility_mappings();
-        // All 15 entries from SURFACE_CONTRACT_V1 should be present.
+        // All 18 entries from SURFACE_CONTRACT_V1 should be present.
         assert_eq!(
             mappings.len(),
-            15,
-            "expected 15 mappings (one per SURFACE_CONTRACT_V1 entry), got {}",
+            18,
+            "expected 18 mappings (one per SURFACE_CONTRACT_V1 entry), got {}",
             mappings.len()
         );
 
@@ -840,6 +855,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn channel_bridge_mappings_remain_canonical() {
+        let mappings = standard_compatibility_mappings();
+        for api in ["broadcast", "oneshot", "notify"] {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.compat_api == api)
+                .unwrap_or_else(|| panic!("missing mapping for {api}"));
+            assert!(
+                mapping
+                    .satisfies_contracts
+                    .iter()
+                    .any(|id| id == "ABC-CHN-001"),
+                "{api} should remain traceable to ABC-CHN-001 as a canonical runtime_compat channel surface"
+            );
+            assert!(
+                mapping.disposition_aligned,
+                "{api} should remain aligned because it is a stable Keep surface"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // ContractAuditReport
     // -------------------------------------------------------------------------
@@ -852,7 +889,7 @@ mod tests {
             report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
         }
         report.set_surface_status(SurfaceContractStatus {
-            keep_count: 5,
+            keep_count: 8,
             replace_count: 7,
             retire_count: 3,
             replaced_count: 7,
@@ -869,6 +906,8 @@ mod tests {
         assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
         assert!(report.uncovered_contracts.is_empty());
         assert!(report.failing_contracts().is_empty());
+        assert_eq!(report.surface_status.keep_count, 8);
+        assert_eq!(report.surface_status.total_count(), 18);
     }
 
     #[test]

@@ -376,7 +376,29 @@ fn compatibility_mappings_unique_apis() {
 #[test]
 fn compatibility_mappings_count() {
     let mappings = standard_compatibility_mappings();
-    assert_eq!(mappings.len(), 15, "expected 15 mappings");
+    assert_eq!(mappings.len(), 18, "expected 18 mappings");
+}
+
+#[test]
+fn compatibility_mappings_include_canonical_channel_bridges() {
+    let mappings = standard_compatibility_mappings();
+    for api in ["broadcast", "oneshot", "notify"] {
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.compat_api == api)
+            .unwrap_or_else(|| panic!("missing mapping for {api}"));
+        assert!(
+            mapping
+                .satisfies_contracts
+                .iter()
+                .any(|id| id == "ABC-CHN-001"),
+            "{api} should satisfy ABC-CHN-001"
+        );
+        assert!(
+            mapping.disposition_aligned,
+            "{api} should remain aligned because it is a Keep surface"
+        );
+    }
 }
 
 proptest! {
