@@ -11101,11 +11101,22 @@ fn distributed_validate_handshake_protocol_version(
 }
 
 #[cfg(feature = "distributed")]
+#[derive(Debug, Clone)]
+struct DistributedSequenceScopeState {
+    active_connections: usize,
+    replay_id: String,
+    inactive_since_ms: Option<i64>,
+}
+
+#[cfg(feature = "distributed")]
 struct DistributedIngestState {
     aggregator:
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::wire_protocol::Aggregator>,
     replay_guard:
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::distributed::SessionReplayGuard>,
+    active_sequence_scopes: frankenterm_core::runtime_compat::Mutex<
+        std::collections::HashMap<String, DistributedSequenceScopeState>,
+    >,
     pane_seq_by_sender:
         frankenterm_core::runtime_compat::Mutex<std::collections::HashMap<(String, u64), u64>>,
 }
@@ -11115,10 +11126,15 @@ impl DistributedIngestState {
     fn new() -> Self {
         Self {
             aggregator: frankenterm_core::runtime_compat::Mutex::new(
-                frankenterm_core::wire_protocol::Aggregator::new(4096),
+                // Distributed listener cleanup owns session lifetime so reconnect
+                // grace and stale pruning stay aligned across all state holders.
+                frankenterm_core::wire_protocol::Aggregator::with_stale_after(4096, 0),
             ),
             replay_guard: frankenterm_core::runtime_compat::Mutex::new(
                 frankenterm_core::distributed::SessionReplayGuard::new(8192),
+            ),
+            active_sequence_scopes: frankenterm_core::runtime_compat::Mutex::new(
+                std::collections::HashMap::new(),
             ),
             pane_seq_by_sender: frankenterm_core::runtime_compat::Mutex::new(
                 std::collections::HashMap::new(),
@@ -11185,6 +11201,143 @@ fn distributed_replay_session_key(session_id: &str, sender: &str) -> String {
         session_id.len(),
         canonical_sender.len()
     )
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_resolve_session_id(
+    session_id: Option<&str>,
+    handshake_agent_id: Option<&str>,
+    peer_addr: std::net::SocketAddr,
+) -> String {
+    session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| handshake_agent_id.map(distributed_normalize_identity))
+        .unwrap_or_else(|| format!("peer-{peer_addr}"))
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_sender_session_scope(session_id: &str, sender: &str) -> String {
+    let canonical_sender = distributed_normalize_identity(sender);
+    let replay_id = distributed_replay_session_key(session_id, &canonical_sender);
+    let suffix = format!(".{:016x}", distributed_sender_hash(&replay_id));
+    let max_len = frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN;
+
+    if canonical_sender.len() + suffix.len() <= max_len {
+        return format!("{canonical_sender}{suffix}");
+    }
+
+    let prefix_len = max_len.saturating_sub(suffix.len());
+    let mut truncated_sender = canonical_sender;
+    truncated_sender.truncate(prefix_len);
+    format!("{truncated_sender}{suffix}")
+}
+
+#[cfg(feature = "distributed")]
+const DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS: i64 =
+    frankenterm_core::wire_protocol::DEFAULT_AGENT_STALE_AFTER_MS;
+
+#[cfg(feature = "distributed")]
+async fn distributed_register_sequence_scope(
+    ingest_state: &DistributedIngestState,
+    sequence_scope: &str,
+    replay_id: &str,
+) {
+    let _ = distributed_prune_stale_sequence_scopes(
+        ingest_state,
+        now_ms_i64(),
+        DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
+    )
+    .await;
+
+    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
+    let state = active_scopes
+        .entry(sequence_scope.to_string())
+        .or_insert_with(|| DistributedSequenceScopeState {
+            active_connections: 0,
+            replay_id: replay_id.to_string(),
+            inactive_since_ms: None,
+        });
+    state.active_connections = state.active_connections.saturating_add(1);
+    state.replay_id = replay_id.to_string();
+    state.inactive_since_ms = None;
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_prune_stale_sequence_scopes(
+    ingest_state: &DistributedIngestState,
+    now_ms: i64,
+    stale_after_ms: i64,
+) -> usize {
+    if stale_after_ms <= 0 {
+        return 0;
+    }
+
+    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
+    let mut replay_guard = ingest_state.replay_guard.lock().await;
+    let mut aggregator = ingest_state.aggregator.lock().await;
+    let mut pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+
+    let mut stale_scopes = std::collections::HashSet::new();
+    let mut stale_replay_ids = Vec::new();
+
+    active_scopes.retain(|sequence_scope, state| {
+        let is_stale = state.active_connections == 0
+            && state.inactive_since_ms.is_some_and(|inactive_since_ms| {
+                now_ms.saturating_sub(inactive_since_ms) >= stale_after_ms
+            });
+        if is_stale {
+            stale_scopes.insert(sequence_scope.clone());
+            stale_replay_ids.push(state.replay_id.clone());
+        }
+        !is_stale
+    });
+
+    if stale_scopes.is_empty() {
+        return 0;
+    }
+
+    for replay_id in &stale_replay_ids {
+        replay_guard.remove(replay_id);
+    }
+    for sequence_scope in &stale_scopes {
+        aggregator.remove_agent(sequence_scope);
+    }
+    pane_seq_by_sender.retain(|(sequence_scope, _), _| !stale_scopes.contains(sequence_scope));
+
+    stale_scopes.len()
+}
+
+#[cfg(feature = "distributed")]
+async fn distributed_release_sequence_scopes(
+    ingest_state: &DistributedIngestState,
+    sequence_scopes: &std::collections::HashSet<String>,
+) {
+    if sequence_scopes.is_empty() {
+        return;
+    }
+
+    let now_ms = now_ms_i64();
+    let mut active_scopes = ingest_state.active_sequence_scopes.lock().await;
+    for sequence_scope in sequence_scopes {
+        if let Some(state) = active_scopes.get_mut(sequence_scope) {
+            if state.active_connections > 1 {
+                state.active_connections -= 1;
+            } else {
+                state.active_connections = 0;
+                state.inactive_since_ms = Some(now_ms);
+            }
+        }
+    }
+    drop(active_scopes);
+
+    let _ = distributed_prune_stale_sequence_scopes(
+        ingest_state,
+        now_ms,
+        DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
+    )
+    .await;
 }
 
 #[cfg(feature = "distributed")]
@@ -11386,6 +11539,7 @@ where
 #[cfg(feature = "distributed")]
 async fn distributed_persist_payload(
     sender: &str,
+    sequence_scope: Option<&str>,
     payload: frankenterm_core::wire_protocol::WirePayload,
     storage: &Arc<
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
@@ -11399,6 +11553,9 @@ async fn distributed_persist_payload(
     use frankenterm_core::wire_protocol::WirePayload;
 
     let canonical_sender = distributed_normalize_identity(sender);
+    let sequence_scope = sequence_scope
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| canonical_sender.clone());
 
     match payload {
         WirePayload::PaneMeta(meta) => {
@@ -11406,7 +11563,7 @@ async fn distributed_persist_payload(
         }
         WirePayload::PaneDelta(delta) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, delta.pane_id);
-            let seq_key = (canonical_sender.clone(), delta.pane_id);
+            let seq_key = (sequence_scope.clone(), delta.pane_id);
             let mut drop_due_to_reorder = false;
             let mut gap_reason: Option<String> = None;
 
@@ -11414,9 +11571,8 @@ async fn distributed_persist_payload(
                 let mut seq_guard = pane_seq_by_sender.lock().await;
                 let expected = seq_guard
                     .get(&seq_key)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
+                    .map(|last_seen| last_seen.saturating_add(1))
+                    .unwrap_or(0);
 
                 if delta.seq < expected {
                     drop_due_to_reorder = true;
@@ -11487,7 +11643,7 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
-            let seq_key = (canonical_sender.clone(), gap.pane_id);
+            let seq_key = (sequence_scope.clone(), gap.pane_id);
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
             if storage_handle.get_pane(remote_pane_id).await?.is_none() {
                 let ts = now_ms_i64();
@@ -11759,23 +11915,17 @@ async fn distributed_handle_connection<S>(
         .agent_id
         .as_deref()
         .map(distributed_normalize_identity);
-    let session_id = handshake
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            handshake
-                .agent_id
-                .clone()
-                .unwrap_or_else(|| format!("peer-{peer_addr}"))
-        });
+    let session_id = distributed_resolve_session_id(
+        handshake.session_id.as_deref(),
+        handshake.agent_id.as_deref(),
+        peer_addr,
+    );
 
     let mut rate_limiter = frankenterm_core::distributed::FixedWindowRateLimiter::new(8_000, 1000);
     let message_size_limit = frankenterm_core::distributed::MessageSizeLimit {
         max_bytes: frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
     };
+    let mut connection_sequence_scopes = std::collections::HashSet::new();
 
     loop {
         use std::sync::atomic::Ordering;
@@ -11858,8 +12008,15 @@ async fn distributed_handle_connection<S>(
             }
         }
 
+        let _ = distributed_prune_stale_sequence_scopes(
+            &ingest_state,
+            now_ms_i64(),
+            DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
+        )
+        .await;
+
+        let replay_id = distributed_replay_session_key(&session_id, &canonical_sender);
         let validation_err = {
-            let replay_id = distributed_replay_session_key(&session_id, &canonical_sender);
             let mut replay_guard = ingest_state.replay_guard.lock().await;
             replay_guard.validate(&replay_id, envelope.seq).err()
         };
@@ -11869,8 +12026,12 @@ async fn distributed_handle_connection<S>(
             continue;
         }
 
-        envelope.sender = canonical_sender.clone();
         let sender = canonical_sender;
+        let session_scope = distributed_sender_session_scope(&session_id, &sender);
+        if connection_sequence_scopes.insert(session_scope.clone()) {
+            distributed_register_sequence_scope(&ingest_state, &session_scope, &replay_id).await;
+        }
+        envelope.sender = session_scope.clone();
         let ingest_result = {
             let mut aggregator = ingest_state.aggregator.lock().await;
             aggregator.ingest_envelope(envelope)
@@ -11883,6 +12044,7 @@ async fn distributed_handle_connection<S>(
             Ok(frankenterm_core::wire_protocol::IngestResult::Accepted(payload)) => {
                 if let Err(err) = distributed_persist_payload(
                     &sender,
+                    Some(&session_scope),
                     payload,
                     &storage,
                     &event_bus,
@@ -11903,6 +12065,8 @@ async fn distributed_handle_connection<S>(
             }
         }
     }
+
+    distributed_release_sequence_scopes(&ingest_state, &connection_sequence_scopes).await;
 }
 
 #[cfg(feature = "distributed")]
@@ -41460,6 +41624,7 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneMeta(
                     frankenterm_core::wire_protocol::PaneMeta {
                         pane_id: source_pane_id,
@@ -41482,10 +41647,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 0,
                         content: marker.to_string(),
                         content_len: marker.len(),
                         captured_at_ms: now_ms(),
@@ -41552,6 +41718,7 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 meta_sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneMeta(
                     frankenterm_core::wire_protocol::PaneMeta {
                         pane_id: source_pane_id,
@@ -41574,10 +41741,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 delta_sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 0,
                         content: marker.to_string(),
                         content_len: marker.len(),
                         captured_at_ms: now_ms(),
@@ -41629,6 +41797,170 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_persist_payload_accepts_initial_seq_zero_without_gap() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_persist_payload_initial_seq_zero").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-zero";
+            let source_pane_id = 28_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let marker = "DIST_PERSIST_PAYLOAD_SEQ_ZERO";
+
+            distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 0,
+                        content: marker.to_string(),
+                        content_len: marker.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let segments = storage_handle
+                    .get_segments(remote_pane_id, 8)
+                    .await
+                    .unwrap();
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].content, marker);
+
+                let gaps = storage_handle.get_gaps().await.unwrap();
+                assert!(
+                    gaps.into_iter().all(|gap| gap.pane_id != remote_pane_id),
+                    "initial seq=0 must not synthesize a distributed gap"
+                );
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_release_sequence_scopes_preserves_pane_ordering_across_same_session_reconnect() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState::new();
+            let (storage_handle, db_path) =
+                setup_storage("distributed_same_session_reconnect").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+
+            let sender = "agent-reconnect";
+            let session_id = "session-stable";
+            let sequence_scope = distributed_sender_session_scope(session_id, sender);
+            let replay_id = distributed_replay_session_key(session_id, sender);
+            let mut released_scopes = std::collections::HashSet::new();
+            released_scopes.insert(sequence_scope.clone());
+
+            let source_pane_id = 29_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+
+            distributed_register_sequence_scope(&ingest_state, &sequence_scope, &replay_id).await;
+            distributed_persist_payload(
+                sender,
+                Some(&sequence_scope),
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 0,
+                        content: "before-reconnect".to_string(),
+                        content_len: "before-reconnect".len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &ingest_state.pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            distributed_release_sequence_scopes(&ingest_state, &released_scopes).await;
+            distributed_register_sequence_scope(&ingest_state, &sequence_scope, &replay_id).await;
+            distributed_persist_payload(
+                sender,
+                Some(&sequence_scope),
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 1,
+                        content: "after-reconnect".to_string(),
+                        content_len: "after-reconnect".len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &ingest_state.pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let segments = storage_handle
+                    .get_segments(remote_pane_id, 8)
+                    .await
+                    .unwrap();
+                assert_eq!(segments.len(), 2);
+                assert!(
+                    segments
+                        .iter()
+                        .any(|segment| segment.content == "before-reconnect")
+                );
+                assert!(
+                    segments
+                        .iter()
+                        .any(|segment| segment.content == "after-reconnect")
+                );
+
+                let gaps = storage_handle.get_gaps().await.unwrap();
+                assert!(
+                    gaps.into_iter().all(|gap| gap.pane_id != remote_pane_id),
+                    "same-session reconnect must not synthesize a pane gap"
+                );
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_persist_payload_out_of_order_records_sender_scoped_gap_and_drops_segment() {
         run_async_test(async {
             let (storage_handle, db_path) =
@@ -41649,9 +41981,10 @@ recorder_backend = "frankensqlite"
             let gap_jump = "DIST_ORDER_MARKER_GAP_JUMP";
             let dropped = "DIST_ORDER_MARKER_DROPPED";
 
-            for (seq, content) in [(1_u64, first), (3_u64, gap_jump), (2_u64, dropped)] {
+            for (seq, content) in [(0_u64, first), (2_u64, gap_jump), (1_u64, dropped)] {
                 distributed_persist_payload(
                     sender,
+                    None,
                     frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                         frankenterm_core::wire_protocol::PaneDelta {
                             pane_id: source_pane_id,
@@ -41686,11 +42019,11 @@ recorder_backend = "frankensqlite"
                 let gaps = storage_handle.get_gaps().await.unwrap();
                 assert!(gaps.iter().any(|gap| {
                     gap.reason
-                        .contains("distributed_seq_gap:sender=agent-order:expected=2:actual=3")
+                        .contains("distributed_seq_gap:sender=agent-order:expected=1:actual=2")
                 }));
                 assert!(gaps.iter().any(|gap| {
                     gap.reason
-                        .contains("distributed_out_of_order:sender=agent-order:expected=4:actual=2")
+                        .contains("distributed_out_of_order:sender=agent-order:expected=3:actual=1")
                 }));
             }
 
@@ -41725,10 +42058,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 0,
                         content: "before-gap".to_string(),
                         content_len: "before-gap".len(),
                         captured_at_ms: now_ms(),
@@ -41749,10 +42083,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::Gap(
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
-                        seq_before: 1,
+                        seq_before: 0,
                         seq_after: 4,
                         reason: "timeout".to_string(),
                         detected_at_ms: now_ms_i64(),
@@ -41775,9 +42110,9 @@ recorder_backend = "frankensqlite"
                     detected_at_ms,
                 } => {
                     assert_eq!(pane_id, remote_pane_id);
-                    assert_eq!(seq_before, 1);
+                    assert_eq!(seq_before, 0);
                     assert_eq!(seq_after, 4);
-                    assert_eq!(reason, "distributed_gap:timeout:1:4");
+                    assert_eq!(reason, "distributed_gap:timeout:0:4");
                     assert!(detected_at_ms > 0);
                 }
                 other => panic!("expected gap event, got {other:?}"),
@@ -41814,10 +42149,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 0,
                         content: "pre-gap".to_string(),
                         content_len: "pre-gap".len(),
                         captured_at_ms: now_ms(),
@@ -41832,10 +42168,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::Gap(
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
-                        seq_before: 1,
+                        seq_before: 0,
                         seq_after: 4,
                         reason: "timeout".to_string(),
                         detected_at_ms: now_ms_i64(),
@@ -41855,9 +42192,9 @@ recorder_backend = "frankensqlite"
                     .iter()
                     .find(|gap| gap.pane_id == remote_pane_id)
                     .expect("explicit remote gap should be stored");
-                assert_eq!(gap.seq_before, 1);
+                assert_eq!(gap.seq_before, 0);
                 assert_eq!(gap.seq_after, 4);
-                assert_eq!(gap.reason, "distributed_gap:timeout:1:4");
+                assert_eq!(gap.reason, "distributed_gap:timeout:0:4");
             }
 
             {
@@ -41892,10 +42229,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 1,
+                        seq: 0,
                         content: "before-gap".to_string(),
                         content_len: "before-gap".len(),
                         captured_at_ms: now_ms(),
@@ -41910,10 +42248,11 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::Gap(
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
-                        seq_before: 1,
+                        seq_before: 0,
                         seq_after: 4,
                         reason: "timeout".to_string(),
                         detected_at_ms: now_ms_i64(),
@@ -41928,6 +42267,7 @@ recorder_backend = "frankensqlite"
 
             distributed_persist_payload(
                 sender,
+                None,
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
@@ -41952,7 +42292,7 @@ recorder_backend = "frankensqlite"
                     .filter(|gap| gap.pane_id == remote_pane_id)
                     .collect();
                 assert_eq!(pane_gaps.len(), 1);
-                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:1:4");
+                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:0:4");
 
                 let segments = storage_handle
                     .get_segments(remote_pane_id, 10)
@@ -42840,7 +43180,7 @@ recorder_backend = "frankensqlite"
         };
         let pane_delta = PaneDelta {
             pane_id: source_pane_id,
-            seq: 1,
+            seq: 0,
             content: marker.to_string(),
             content_len: marker.len(),
             captured_at_ms: now + 1,
@@ -43076,6 +43416,519 @@ recorder_backend = "frankensqlite"
                         distributed_panes.len(),
                         1,
                         "listener should not fork sender state on case-only identity changes"
+                    );
+                }
+
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = listener_handle.await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle.shutdown().await.expect("shutdown storage");
+                }
+                drop(storage);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_listener_normalizes_fallback_session_identity_across_connections() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::TcpStream;
+                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
+                use std::sync::atomic::Ordering;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_session_fallback_normalized").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+                distributed_config.enabled = true;
+                distributed_config.bind_addr = bind_addr.to_string();
+                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+                distributed_config.token = Some("dist-case-session-token".to_string());
+
+                let listener_handle = spawn_distributed_listener(
+                    distributed_config.clone(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
+                )
+                .await
+                .expect("spawn distributed listener");
+
+                let canonical_sender = "agent-case";
+                let source_pane_id = 93_u64;
+                let remote_pane_id = distributed_remote_pane_id(canonical_sender, source_pane_id);
+                let newer_meta = PaneMeta {
+                    pane_id: source_pane_id,
+                    pane_uuid: Some("pane-case-uuid".to_string()),
+                    domain: "prod".to_string(),
+                    title: Some("newer-title".to_string()),
+                    cwd: Some("/remote/newer".to_string()),
+                    rows: Some(40),
+                    cols: Some(120),
+                    observed: true,
+                    timestamp_ms: now_ms(),
+                };
+                let stale_meta = PaneMeta {
+                    pane_id: source_pane_id,
+                    pane_uuid: Some("pane-case-uuid".to_string()),
+                    domain: "prod".to_string(),
+                    title: Some("stale-title".to_string()),
+                    cwd: Some("/remote/stale".to_string()),
+                    rows: Some(40),
+                    cols: Some(120),
+                    observed: true,
+                    timestamp_ms: now_ms(),
+                };
+
+                {
+                    let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+                        .await
+                        .expect("connect first distributed listener");
+                    let handshake = DistributedHandshake {
+                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                        token: distributed_config.token.clone(),
+                        agent_id: Some("Agent-Case".to_string()),
+                        session_id: None,
+                    };
+                    let handshake_json =
+                        serde_json::to_string(&handshake).expect("serialize first handshake");
+                    stream
+                        .write_all(handshake_json.as_bytes())
+                        .await
+                        .expect("write first handshake");
+                    stream
+                        .write_all(b"\n")
+                        .await
+                        .expect("write first handshake newline");
+                    stream.flush().await.expect("flush first handshake");
+
+                    let mut reader = asupersync::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    let read_size = frankenterm_core::runtime_compat::timeout(
+                        std::time::Duration::from_secs(1),
+                        distributed_read_line(
+                            &mut reader,
+                            &mut line,
+                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                        ),
+                    )
+                    .await
+                    .expect("read first handshake acknowledgement within timeout")
+                    .expect("read first handshake acknowledgement");
+                    assert!(
+                        read_size > 0,
+                        "listener should emit first handshake acknowledgement"
+                    );
+
+                    let envelope =
+                        WireEnvelope::new(2, "AGENT-CASE", WirePayload::PaneMeta(newer_meta));
+                    let bytes = envelope.to_json().expect("serialize first envelope");
+                    reader
+                        .get_mut()
+                        .write_all(&bytes)
+                        .await
+                        .expect("write first envelope");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .await
+                        .expect("write first envelope newline");
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush first envelope");
+                }
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100))
+                    .await;
+
+                {
+                    let mut stream = TcpStream::connect(distributed_config.bind_addr.clone())
+                        .await
+                        .expect("connect second distributed listener");
+                    let handshake = DistributedHandshake {
+                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                        token: distributed_config.token.clone(),
+                        agent_id: Some("agent-case".to_string()),
+                        session_id: None,
+                    };
+                    let handshake_json =
+                        serde_json::to_string(&handshake).expect("serialize second handshake");
+                    stream
+                        .write_all(handshake_json.as_bytes())
+                        .await
+                        .expect("write second handshake");
+                    stream
+                        .write_all(b"\n")
+                        .await
+                        .expect("write second handshake newline");
+                    stream.flush().await.expect("flush second handshake");
+
+                    let mut reader = asupersync::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    let read_size = frankenterm_core::runtime_compat::timeout(
+                        std::time::Duration::from_secs(1),
+                        distributed_read_line(
+                            &mut reader,
+                            &mut line,
+                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                        ),
+                    )
+                    .await
+                    .expect("read second handshake acknowledgement within timeout")
+                    .expect("read second handshake acknowledgement");
+                    assert!(
+                        read_size > 0,
+                        "listener should emit second handshake acknowledgement"
+                    );
+
+                    let envelope =
+                        WireEnvelope::new(1, "agent-case", WirePayload::PaneMeta(stale_meta));
+                    let bytes = envelope.to_json().expect("serialize second envelope");
+                    reader
+                        .get_mut()
+                        .write_all(&bytes)
+                        .await
+                        .expect("write second envelope");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .await
+                        .expect("write second envelope newline");
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush second envelope");
+
+                    line.clear();
+                    let read_size = frankenterm_core::runtime_compat::timeout(
+                        std::time::Duration::from_secs(1),
+                        distributed_read_line(
+                            &mut reader,
+                            &mut line,
+                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                        ),
+                    )
+                    .await
+                    .expect("read replay-detected response within timeout")
+                    .expect("read replay-detected response");
+                    assert!(
+                        read_size > 0,
+                        "listener should emit replay-detected response"
+                    );
+
+                    let payload: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse replay-detected payload");
+                    assert_eq!(payload["ok"], serde_json::Value::Bool(false));
+                    assert_eq!(payload["error"]["code"], "dist.replay_detected");
+                }
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(150))
+                    .await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    let remote = storage_handle
+                        .get_pane(remote_pane_id)
+                        .await
+                        .unwrap()
+                        .expect("canonical remote pane should exist");
+                    assert_eq!(
+                        remote.title.as_deref(),
+                        Some("newer-title"),
+                        "mixed-case reconnect without explicit session_id must not bypass replay protection"
+                    );
+
+                    let distributed_panes: Vec<_> = storage_handle
+                        .get_panes()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .filter(|pane| pane.domain.starts_with("distributed:"))
+                        .collect();
+                    assert_eq!(
+                        distributed_panes.len(),
+                        1,
+                        "case-only reconnects should not fork remote pane state"
+                    );
+                }
+
+                shutdown_flag.store(true, Ordering::SeqCst);
+                let _ = listener_handle.await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    storage_handle.shutdown().await.expect("shutdown storage");
+                }
+                drop(storage);
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_listener_accepts_seq_reset_for_new_session_scope() {
+        frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use asupersync::io::AsyncWriteExt;
+                use asupersync::net::TcpStream;
+                use frankenterm_core::wire_protocol::{
+                    PaneDelta, PaneMeta, WireEnvelope, WirePayload,
+                };
+                use std::sync::atomic::Ordering;
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_session_scope_reset").await;
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let bind_probe =
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+                let bind_addr = bind_probe.local_addr().expect("probe listener addr");
+                drop(bind_probe);
+
+                let mut distributed_config = frankenterm_core::config::DistributedConfig::default();
+                distributed_config.enabled = true;
+                distributed_config.bind_addr = bind_addr.to_string();
+                distributed_config.auth_mode = frankenterm_core::config::DistributedAuthMode::Token;
+                distributed_config.token = Some("dist-session-reset-token".to_string());
+
+                let listener_handle = spawn_distributed_listener(
+                    distributed_config.clone(),
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    std::sync::Arc::clone(&shutdown_flag),
+                )
+                .await
+                .expect("spawn distributed listener");
+
+                let sender = "agent-session-reset";
+                let source_pane_id = 94_u64;
+                let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+                let first_marker = "DIST_SESSION_RESET_FIRST";
+                let second_marker = "DIST_SESSION_RESET_SECOND";
+
+                async fn send_handshake_and_ack(
+                    bind_addr: &str,
+                    token: Option<String>,
+                    sender: &str,
+                    session_id: &str,
+                ) -> asupersync::io::BufReader<TcpStream> {
+                    let mut stream = TcpStream::connect(bind_addr.to_string())
+                        .await
+                        .expect("connect distributed listener");
+                    let handshake = DistributedHandshake {
+                        protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                        token,
+                        agent_id: Some(sender.to_string()),
+                        session_id: Some(session_id.to_string()),
+                    };
+                    let handshake_json =
+                        serde_json::to_string(&handshake).expect("serialize handshake");
+                    stream
+                        .write_all(handshake_json.as_bytes())
+                        .await
+                        .expect("write handshake");
+                    stream
+                        .write_all(b"\n")
+                        .await
+                        .expect("write handshake newline");
+                    stream.flush().await.expect("flush handshake");
+
+                    let mut reader = asupersync::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    let read_size = frankenterm_core::runtime_compat::timeout(
+                        std::time::Duration::from_secs(1),
+                        distributed_read_line(
+                            &mut reader,
+                            &mut line,
+                            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                        ),
+                    )
+                    .await
+                    .expect("read handshake acknowledgement within timeout")
+                    .expect("read handshake acknowledgement");
+                    assert!(
+                        read_size > 0,
+                        "listener should emit handshake acknowledgement"
+                    );
+                    reader
+                }
+
+                {
+                    let mut reader = send_handshake_and_ack(
+                        &distributed_config.bind_addr,
+                        distributed_config.token.clone(),
+                        sender,
+                        "session-old",
+                    )
+                    .await;
+
+                    for envelope in [
+                        WireEnvelope::new(
+                            1,
+                            sender,
+                            WirePayload::PaneMeta(PaneMeta {
+                                pane_id: source_pane_id,
+                                pane_uuid: Some("pane-session-reset".to_string()),
+                                domain: "prod".to_string(),
+                                title: Some("first-session".to_string()),
+                                cwd: Some("/remote/first".to_string()),
+                                rows: Some(40),
+                                cols: Some(120),
+                                observed: true,
+                                timestamp_ms: now_ms(),
+                            }),
+                        ),
+                        WireEnvelope::new(
+                            2,
+                            sender,
+                            WirePayload::PaneDelta(PaneDelta {
+                                pane_id: source_pane_id,
+                                seq: 5,
+                                content: first_marker.to_string(),
+                                content_len: first_marker.len(),
+                                captured_at_ms: now_ms(),
+                            }),
+                        ),
+                    ] {
+                        let bytes = envelope
+                            .to_json()
+                            .expect("serialize first-session envelope");
+                        reader
+                            .get_mut()
+                            .write_all(&bytes)
+                            .await
+                            .expect("write first-session envelope");
+                        reader
+                            .get_mut()
+                            .write_all(b"\n")
+                            .await
+                            .expect("write first-session envelope newline");
+                    }
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush first-session envelopes");
+                }
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(100))
+                    .await;
+
+                {
+                    let mut reader = send_handshake_and_ack(
+                        &distributed_config.bind_addr,
+                        distributed_config.token.clone(),
+                        sender,
+                        "session-new",
+                    )
+                    .await;
+
+                    for envelope in [
+                        WireEnvelope::new(
+                            1,
+                            sender,
+                            WirePayload::PaneMeta(PaneMeta {
+                                pane_id: source_pane_id,
+                                pane_uuid: Some("pane-session-reset".to_string()),
+                                domain: "prod".to_string(),
+                                title: Some("second-session".to_string()),
+                                cwd: Some("/remote/second".to_string()),
+                                rows: Some(40),
+                                cols: Some(120),
+                                observed: true,
+                                timestamp_ms: now_ms(),
+                            }),
+                        ),
+                        WireEnvelope::new(
+                            2,
+                            sender,
+                            WirePayload::PaneDelta(PaneDelta {
+                                pane_id: source_pane_id,
+                                seq: 0,
+                                content: second_marker.to_string(),
+                                content_len: second_marker.len(),
+                                captured_at_ms: now_ms(),
+                            }),
+                        ),
+                    ] {
+                        let bytes = envelope
+                            .to_json()
+                            .expect("serialize second-session envelope");
+                        reader
+                            .get_mut()
+                            .write_all(&bytes)
+                            .await
+                            .expect("write second-session envelope");
+                        reader
+                            .get_mut()
+                            .write_all(b"\n")
+                            .await
+                            .expect("write second-session envelope newline");
+                    }
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush second-session envelopes");
+                }
+
+                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(150))
+                    .await;
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    let remote = storage_handle
+                        .get_pane(remote_pane_id)
+                        .await
+                        .unwrap()
+                        .expect("canonical remote pane should exist");
+                    assert_eq!(remote.title.as_deref(), Some("second-session"));
+
+                    let segments = storage_handle
+                        .get_segments(remote_pane_id, 10)
+                        .await
+                        .unwrap();
+                    assert!(
+                        segments
+                            .iter()
+                            .any(|seg| seg.content.contains(first_marker))
+                    );
+                    assert!(
+                        segments
+                            .iter()
+                            .any(|seg| seg.content.contains(second_marker))
                     );
                 }
 
@@ -43472,6 +44325,151 @@ recorder_backend = "frankensqlite"
         let a = distributed_replay_session_key("session:a", "sender-b");
         let b = distributed_replay_session_key("session", "a:sender-b");
         assert_ne!(a, b);
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_resolve_session_id_uses_normalized_agent_fallback() {
+        let peer_addr = "127.0.0.1:31337"
+            .parse()
+            .expect("parse fallback peer address");
+
+        assert_eq!(
+            distributed_resolve_session_id(None, Some("Agent-Case"), peer_addr),
+            "agent-case"
+        );
+        assert_eq!(
+            distributed_resolve_session_id(
+                Some(" explicit-session "),
+                Some("Agent-Case"),
+                peer_addr
+            ),
+            "explicit-session"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_sender_session_scope_normalizes_sender_and_changes_with_session() {
+        let first = distributed_sender_session_scope("session-a", "Agent-Case");
+        let second = distributed_sender_session_scope("session-a", "agent-case");
+        let third = distributed_sender_session_scope("session-b", "agent-case");
+        let long_sender = "A".repeat(frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN);
+        let long_scope = distributed_sender_session_scope("session-a", &long_sender);
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+        assert!(first.starts_with("agent-case."));
+        assert!(long_scope.len() <= frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN);
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_release_sequence_scopes_preserves_state_until_stale_prune() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState::new();
+            let sequence_scope = distributed_sender_session_scope("session-a", "agent-cleanup");
+            let replay_id = distributed_replay_session_key("session-a", "agent-cleanup");
+            let mut released_scopes = std::collections::HashSet::new();
+            released_scopes.insert(sequence_scope.clone());
+
+            distributed_register_sequence_scope(&ingest_state, &sequence_scope, &replay_id).await;
+            distributed_register_sequence_scope(&ingest_state, &sequence_scope, &replay_id).await;
+
+            {
+                let mut aggregator = ingest_state.aggregator.lock().await;
+                aggregator
+                    .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
+                        1,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 7,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "cleanup-test".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ))
+                    .expect("seed aggregator state for cleanup test");
+            }
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                replay_guard
+                    .validate(&replay_id, 1)
+                    .expect("seed replay guard for cleanup test");
+            }
+
+            {
+                let mut pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                pane_seq_by_sender.insert((sequence_scope.clone(), 7), 3);
+            }
+
+            distributed_release_sequence_scopes(&ingest_state, &released_scopes).await;
+
+            {
+                let aggregator = ingest_state.aggregator.lock().await;
+                assert_eq!(aggregator.agent_last_seq(&sequence_scope), Some(1));
+            }
+            {
+                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
+                    Some(&3)
+                );
+            }
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                assert_eq!(
+                    replay_guard.validate(&replay_id, 1).expect_err(
+                        "released-but-dormant session should still reject stale replay"
+                    ),
+                    frankenterm_core::distributed::DistributedSecurityError::ReplayDetected
+                );
+                replay_guard
+                    .validate(&replay_id, 2)
+                    .expect("dormant session should still advance replay state");
+            }
+
+            distributed_release_sequence_scopes(&ingest_state, &released_scopes).await;
+
+            {
+                let aggregator = ingest_state.aggregator.lock().await;
+                assert_eq!(aggregator.agent_last_seq(&sequence_scope), Some(1));
+            }
+            {
+                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    pane_seq_by_sender.get(&(sequence_scope.clone(), 7)),
+                    Some(&3)
+                );
+            }
+
+            let pruned = distributed_prune_stale_sequence_scopes(
+                &ingest_state,
+                now_ms_i64() + DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS + 1,
+                DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS,
+            )
+            .await;
+            assert_eq!(pruned, 1);
+
+            {
+                let aggregator = ingest_state.aggregator.lock().await;
+                assert_eq!(aggregator.agent_last_seq(&sequence_scope), None);
+                assert_eq!(aggregator.agent_count(), 0);
+            }
+            {
+                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                assert!(pane_seq_by_sender.is_empty());
+            }
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                replay_guard
+                    .validate(&replay_id, 1)
+                    .expect("stale-pruned replay state should accept a fresh session");
+            }
+        });
     }
 
     async fn setup_storage(label: &str) -> (StorageHandle, String) {
