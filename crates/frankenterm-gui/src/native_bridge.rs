@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Channel capacity for the bounded event queue.
 /// Events are dropped when the channel is full (backpressure).
@@ -26,6 +26,7 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 /// Reconnect backoff parameters.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -99,8 +100,9 @@ impl BridgeEvent {
 /// The native event bridge. Owns the sender thread and mux subscription.
 pub struct NativeEventBridge {
     shutdown: Arc<AtomicBool>,
-    _sender_thread: std::thread::JoinHandle<()>,
-    _subscription_id: usize,
+    sender_thread: Option<std::thread::JoinHandle<()>>,
+    mux: Option<Arc<Mux>>,
+    subscription_id: Option<usize>,
 }
 
 impl NativeEventBridge {
@@ -143,14 +145,28 @@ impl NativeEventBridge {
             .name("native-event-bridge".into())
             .spawn(move || {
                 sender_loop(&socket_path, rx, &shutdown_clone);
-            })
-            .expect("failed to spawn native-event-bridge thread");
+            });
+        let sender_thread = match sender_thread {
+            Ok(thread) => thread,
+            Err(err) => {
+                log::warn!(
+                    "Native event bridge: failed to spawn sender thread ({}), \
+                     running without native events",
+                    err
+                );
+                return None;
+            }
+        };
 
         // Subscribe to mux notifications
+        let mux = Mux::get();
         let subscription_id = {
-            let mux = Mux::get();
             let tx_clone = tx.clone();
+            let shutdown_for_subscription = shutdown.clone();
             mux.subscribe(move |notification| {
+                if shutdown_for_subscription.load(Ordering::Acquire) {
+                    return false;
+                }
                 handle_mux_notification(&notification, &tx_clone);
                 true // keep listening
             })
@@ -158,8 +174,9 @@ impl NativeEventBridge {
 
         Some(Self {
             shutdown,
-            _sender_thread: sender_thread,
-            _subscription_id: subscription_id,
+            sender_thread: Some(sender_thread),
+            mux: Some(mux),
+            subscription_id: Some(subscription_id),
         })
     }
 }
@@ -167,8 +184,35 @@ impl NativeEventBridge {
 impl Drop for NativeEventBridge {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        // The sender thread will exit on next recv timeout
-        // The mux subscription will be cleaned up when Mux shuts down
+
+        if let (Some(mux), Some(subscription_id)) = (self.mux.take(), self.subscription_id.take()) {
+            let _ = mux.unsubscribe(subscription_id);
+        }
+
+        if let Some(sender_thread) = self.sender_thread.take() {
+            if sender_thread.join().is_err() {
+                log::warn!("Native event bridge: sender thread panicked during shutdown");
+            }
+        }
+    }
+}
+
+fn wait_for_retry_or_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return true;
+        };
+
+        if remaining.is_zero() {
+            return true;
+        }
+
+        std::thread::sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
     }
 }
 
@@ -199,7 +243,9 @@ fn sender_loop(socket_path: &Path, rx: std_mpsc::Receiver<BridgeEvent>, shutdown
                         e,
                         backoff
                     );
-                    std::thread::sleep(backoff);
+                    if !wait_for_retry_or_shutdown(backoff, shutdown) {
+                        break;
+                    }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
@@ -351,5 +397,125 @@ fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
 fn emit_state_change(pane_id: PaneId, tx: &std_mpsc::SyncSender<BridgeEvent>) {
     if let Some(event) = build_state_change_event(pane_id) {
         let _ = tx.try_send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+    fn test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct TestMuxGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prior: Option<Arc<Mux>>,
+    }
+
+    impl TestMuxGuard {
+        fn install(mux: Arc<Mux>) -> Self {
+            let guard = test_lock().lock().expect("lock");
+            let prior = Mux::try_get();
+            Mux::set_mux(&mux);
+            Self {
+                _guard: guard,
+                prior,
+            }
+        }
+    }
+
+    impl Drop for TestMuxGuard {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn retry_wait_returns_false_after_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = shutdown.clone();
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            shutdown_trigger.store(true, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        let completed_delay = wait_for_retry_or_shutdown(Duration::from_secs(1), shutdown.as_ref());
+        let elapsed = start.elapsed();
+        trigger.join().expect("trigger thread should finish");
+
+        assert!(!completed_delay);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "shutdown-aware wait should stop quickly, elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn drop_unsubscribes_mux_subscription_and_joins_sender_thread() {
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = TestMuxGuard::install(mux.clone());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_exited = Arc::new(AtomicBool::new(false));
+        let exited_flag = thread_exited.clone();
+        let sender_thread = std::thread::spawn(move || {
+            let completed_delay =
+                wait_for_retry_or_shutdown(Duration::from_secs(30), thread_shutdown.as_ref());
+            assert!(!completed_delay);
+            std::thread::sleep(Duration::from_millis(25));
+            exited_flag.store(true, Ordering::Release);
+        });
+
+        let subscription_id = mux.subscribe(|_| true);
+        let bridge = NativeEventBridge {
+            shutdown,
+            sender_thread: Some(sender_thread),
+            mux: Some(mux.clone()),
+            subscription_id: Some(subscription_id),
+        };
+
+        drop(bridge);
+
+        assert!(
+            thread_exited.load(Ordering::Acquire),
+            "drop should wait for the sender thread to exit"
+        );
+        assert!(
+            !mux.unsubscribe(subscription_id),
+            "drop should already have removed the mux subscription"
+        );
+    }
+
+    #[test]
+    fn drop_unsubscribes_original_mux_after_global_mux_swap() {
+        let original_mux = Arc::new(Mux::new(None));
+        let _mux_guard = TestMuxGuard::install(original_mux.clone());
+        let replacement_mux = Arc::new(Mux::new(None));
+
+        let subscription_id = original_mux.subscribe(|_| true);
+        let bridge = NativeEventBridge {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            sender_thread: None,
+            mux: Some(original_mux.clone()),
+            subscription_id: Some(subscription_id),
+        };
+
+        Mux::set_mux(&replacement_mux);
+        drop(bridge);
+
+        assert!(
+            !original_mux.unsubscribe(subscription_id),
+            "drop should unsubscribe from the original mux instance, not the current global mux"
+        );
     }
 }
