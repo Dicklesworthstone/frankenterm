@@ -4505,10 +4505,50 @@ const ROBOT_ERR_PANE_NOT_FOUND: &str = "robot.pane_not_found";
 const ROBOT_ERR_RESERVATION_CONFLICT: &str = "robot.reservation_conflict";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 const ROBOT_ERR_FEATURE_NOT_AVAILABLE: &str = "robot.feature_not_available";
+const ROBOT_ERR_POLICY_DENIED: &str = "robot.policy_denied";
 const ROBOT_ERR_TIMEOUT: &str = "robot.timeout";
+const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
+const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
+const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
+
+fn robot_workflow_status_error_code(status: &str) -> Option<&'static str> {
+    match status {
+        "completed" => None,
+        "policy_denied" => Some(ROBOT_ERR_POLICY_DENIED),
+        "aborted" => Some(ROBOT_ERR_WORKFLOW_ABORTED),
+        "error" => Some(ROBOT_ERR_WORKFLOW_ERROR),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod robot_workflow_status_error_code_tests {
+    use super::{
+        ROBOT_ERR_POLICY_DENIED, ROBOT_ERR_WORKFLOW_ABORTED, ROBOT_ERR_WORKFLOW_ERROR,
+        robot_workflow_status_error_code,
+    };
+
+    #[test]
+    fn workflow_statuses_map_to_stable_robot_error_codes() {
+        assert_eq!(robot_workflow_status_error_code("completed"), None);
+        assert_eq!(
+            robot_workflow_status_error_code("policy_denied"),
+            Some(ROBOT_ERR_POLICY_DENIED)
+        );
+        assert_eq!(
+            robot_workflow_status_error_code("aborted"),
+            Some(ROBOT_ERR_WORKFLOW_ABORTED)
+        );
+        assert_eq!(
+            robot_workflow_status_error_code("error"),
+            Some(ROBOT_ERR_WORKFLOW_ERROR)
+        );
+        assert_eq!(robot_workflow_status_error_code("unexpected"), None);
+    }
+}
 
 fn robot_reservation_error_details(
     err: &frankenterm_core::Error,
@@ -17639,23 +17679,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                         let response = if status == "completed" {
                                             RobotResponse::success(data, workflow_elapsed)
-                                        } else if status == "policy_denied" {
-                                            RobotResponse::<RobotWorkflowData>::error_with_code(
-                                                "robot.policy_denied",
-                                                format!("Workflow '{name}' denied by policy"),
-                                                Some(
-                                                    "Check safety configuration or use --dry-run."
-                                                        .to_string(),
-                                                ),
-                                                workflow_elapsed,
-                                            )
                                         } else {
+                                            let code = robot_workflow_status_error_code(status)
+                                                .expect(
+                                                    "non-completed workflow status must map to a stable robot error code",
+                                                );
                                             let status_message =
                                                 data.message.as_deref().unwrap_or("failed");
+                                            let (message, hint) = if code == ROBOT_ERR_POLICY_DENIED
+                                            {
+                                                (
+                                                    format!("Workflow '{name}' denied by policy"),
+                                                    Some(
+                                                        "Check safety configuration or use --dry-run."
+                                                            .to_string(),
+                                                    ),
+                                                )
+                                            } else {
+                                                (
+                                                    format!("Workflow '{name}' {status_message}"),
+                                                    None,
+                                                )
+                                            };
                                             RobotResponse::<RobotWorkflowData>::error_with_code(
-                                                &format!("robot.workflow_{status}"),
-                                                format!("Workflow '{name}' {status_message}"),
-                                                None,
+                                                code,
+                                                message,
+                                                hint,
                                                 workflow_elapsed,
                                             )
                                         };
@@ -17664,7 +17713,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // No workflow registered with this name
                                         let response =
                                             RobotResponse::<RobotWorkflowData>::error_with_code(
-                                                "robot.workflow_not_found",
+                                                ROBOT_ERR_WORKFLOW_NOT_FOUND,
                                                 format!("Workflow '{name}' not found"),
                                                 Some(
                                                     "No workflows registered in standalone mode. \
