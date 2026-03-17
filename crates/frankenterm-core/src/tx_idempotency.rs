@@ -654,7 +654,7 @@ impl ResumeContext {
             ResumeRecommendation::RestartFresh
         } else if !failed.is_empty() && ledger.phase() == TxPhase::Compensating {
             ResumeRecommendation::CompensateAndAbort
-        } else if remaining.is_empty() {
+        } else if remaining.is_empty() && failed.is_empty() {
             ResumeRecommendation::AlreadyComplete
         } else {
             ResumeRecommendation::ContinueFromCheckpoint
@@ -1478,6 +1478,37 @@ mod tests {
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
         assert!(ctx.remaining_steps.is_empty());
+    }
+
+    #[test]
+    fn resume_failed_last_step_is_not_already_complete() {
+        let plan = make_plan(1);
+        let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+
+        let key = make_key("test-plan", &plan.steps[0].id);
+        ledger
+            .append(
+                key,
+                StepOutcome::Failed {
+                    error_code: "E1".into(),
+                    error_message: "bad".into(),
+                    compensated: false,
+                },
+                StepRisk::High,
+                "a",
+                1000,
+            )
+            .unwrap();
+
+        let ctx = ResumeContext::from_ledger(&ledger, &plan);
+        assert_eq!(
+            ctx.recommendation,
+            ResumeRecommendation::ContinueFromCheckpoint
+        );
+        assert!(ctx.remaining_steps.is_empty());
+        assert_eq!(ctx.failed_steps, vec![plan.steps[0].id.clone()]);
     }
 
     #[test]

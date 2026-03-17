@@ -73,6 +73,27 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
     Ok(contract)
 }
 
+pub(super) fn mcp_save_mission_tx_contract_to_path(
+    path: &Path,
+    contract: &crate::plan::MissionTxContract,
+) -> std::result::Result<(), McpToolError> {
+    let json = serde_json::to_string_pretty(contract).map_err(|err| {
+        McpToolError::new(
+            "robot.tx_serialize_failed",
+            format!("Failed to serialize tx contract: {err}"),
+            None,
+        )
+    })?;
+
+    std::fs::write(path, json).map_err(|err| {
+        McpToolError::new(
+            "robot.tx_write_failed",
+            format!("Failed to write tx contract file {}: {err}", path.display()),
+            None,
+        )
+    })
+}
+
 pub(super) fn mcp_parse_mission_kill_switch(
     raw: Option<&str>,
 ) -> std::result::Result<crate::plan::MissionKillSwitchLevel, McpToolError> {

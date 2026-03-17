@@ -360,24 +360,10 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let ledger = store
             .get_ledger(execution_id)
             .ok_or_else(|| TxExecutionError::LedgerNotFound(execution_id.to_string()))?;
-
-        let compiled_plan = crate::tx_plan_compiler::TxPlan {
-            plan_id: contract.plan.plan_id.0.clone(),
-            plan_hash: 0,
-            steps: Vec::new(),
-            execution_order: Vec::new(),
-            parallel_levels: Vec::new(),
-            risk_summary: crate::tx_plan_compiler::TxRiskSummary {
-                total_steps: contract.plan.steps.len(),
-                high_risk_count: 0,
-                critical_risk_count: 0,
-                uncompensated_steps: 0,
-                overall_risk: crate::tx_plan_compiler::StepRisk::Low,
-            },
-            rejected_edges: Vec::new(),
-        };
-
-        let resume_ctx = crate::tx_idempotency::ResumeContext::from_ledger(ledger, &compiled_plan);
+        let compiled_plan = compiled_plan_from_contract(contract);
+        let resume_ctx = store
+            .resume_context(execution_id, &compiled_plan)
+            .ok_or_else(|| TxExecutionError::LedgerNotFound(execution_id.to_string()))?;
         let mut events = Vec::new();
 
         events.push(self.make_event(
@@ -390,21 +376,26 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
-        match resume_ctx.recommendation {
-            ResumeRecommendation::AlreadyComplete => Ok(TxExecutionResult {
-                final_state: contract.lifecycle_state,
-                outcome: contract.outcome.clone(),
-                prepare_report: TxPrepareReport {
-                    outcome: TxPrepareOutcome::AllReady,
-                },
-                commit_report: None,
-                compensation_report: None,
-                events,
-                ledger: ledger.clone(),
-                forensic_bundle: None,
-                decision_path: "resume->already_complete".to_string(),
-                reason_code: "already_complete".to_string(),
-            }),
+        match resume_ctx.recommendation.clone() {
+            ResumeRecommendation::AlreadyComplete => {
+                let (final_state, outcome) = resume_terminal_outcome(contract, &resume_ctx);
+                contract.lifecycle_state = final_state;
+                contract.outcome = outcome.clone();
+                Ok(TxExecutionResult {
+                    final_state,
+                    outcome,
+                    prepare_report: TxPrepareReport {
+                        outcome: TxPrepareOutcome::AllReady,
+                    },
+                    commit_report: None,
+                    compensation_report: None,
+                    events,
+                    ledger: ledger.clone(),
+                    forensic_bundle: None,
+                    decision_path: "resume->already_complete".to_string(),
+                    reason_code: "already_complete".to_string(),
+                })
+            }
             ResumeRecommendation::RestartFresh => {
                 contract.lifecycle_state = MissionTxState::Planned;
                 contract.outcome = TxOutcome::Pending;
@@ -419,12 +410,29 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 ));
                 self.execute(contract, now_ms)
             }
-            ResumeRecommendation::CompensateAndAbort => {
-                contract.lifecycle_state = MissionTxState::Compensating;
-                contract.outcome = TxOutcome::Pending;
-                self.execute(contract, now_ms)
+            recommendation @ (ResumeRecommendation::CompensateAndAbort
+            | ResumeRecommendation::ContinueFromCheckpoint) => {
+                if resume_ctx.completed_steps.is_empty()
+                    && resume_ctx.failed_steps.is_empty()
+                    && resume_ctx.compensated_steps.is_empty()
+                {
+                    events.push(self.make_event(
+                        TxEventKind::ResumeExecuted,
+                        TxObservabilityPhase::Resume,
+                        "tx.resume.replay_from_start",
+                        execution_id,
+                        &contract.plan.plan_id.0,
+                        ledger.phase(),
+                        now_ms,
+                    ));
+                    return self.execute(contract, now_ms);
+                }
+
+                Err(TxExecutionError::UnsafeResume {
+                    execution_id: execution_id.to_string(),
+                    recommendation,
+                })
             }
-            ResumeRecommendation::ContinueFromCheckpoint => self.execute(contract, now_ms),
         }
     }
 
@@ -720,6 +728,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             if comp.has_residual_risk() {
                 return (MissionTxState::Failed, TxOutcome::Failed);
             }
+            if current_state == MissionTxState::Compensated {
+                return (MissionTxState::Compensated, TxOutcome::Compensated);
+            }
         }
 
         (current_state, TxOutcome::Failed)
@@ -765,6 +776,87 @@ fn reason_code_for_outcome(outcome: &TxOutcome) -> &'static str {
     }
 }
 
+fn compiled_plan_from_contract(contract: &MissionTxContract) -> crate::tx_plan_compiler::TxPlan {
+    let mut ordered_steps = contract.plan.steps.iter().collect::<Vec<_>>();
+    ordered_steps.sort_by_key(|step| step.ordinal);
+
+    let execution_order = ordered_steps
+        .iter()
+        .map(|step| step.step_id.0.clone())
+        .collect::<Vec<_>>();
+
+    let steps = ordered_steps
+        .into_iter()
+        .map(|step| {
+            let step_id = step.step_id.0.clone();
+            let compensations = contract
+                .plan
+                .compensations
+                .iter()
+                .filter(|comp| comp.for_step_id.0 == step_id)
+                .map(|_| crate::tx_plan_compiler::CompensatingAction {
+                    step_id: step_id.clone(),
+                    description: format!("Resume compensation for {step_id}"),
+                    action_type: crate::tx_plan_compiler::CompensationKind::Rollback,
+                })
+                .collect();
+
+            crate::tx_plan_compiler::TxStep {
+                id: step.step_id.0.clone(),
+                bead_id: step.step_id.0.clone(),
+                agent_id: String::new(),
+                description: step.description.clone(),
+                depends_on: Vec::new(),
+                preconditions: Vec::new(),
+                compensations,
+                risk: crate::tx_plan_compiler::StepRisk::Low,
+                score: 1.0,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let parallel_levels = if execution_order.is_empty() {
+        Vec::new()
+    } else {
+        vec![execution_order.clone()]
+    };
+
+    crate::tx_plan_compiler::TxPlan {
+        plan_id: contract.plan.plan_id.0.clone(),
+        plan_hash: 0,
+        steps,
+        execution_order,
+        parallel_levels,
+        risk_summary: crate::tx_plan_compiler::TxRiskSummary {
+            total_steps: contract.plan.steps.len(),
+            high_risk_count: 0,
+            critical_risk_count: 0,
+            uncompensated_steps: 0,
+            overall_risk: crate::tx_plan_compiler::StepRisk::Low,
+        },
+        rejected_edges: Vec::new(),
+    }
+}
+
+fn resume_terminal_outcome(
+    contract: &MissionTxContract,
+    resume_ctx: &crate::tx_idempotency::ResumeContext,
+) -> (MissionTxState, TxOutcome) {
+    if contract.lifecycle_state == MissionTxState::RolledBack {
+        return (MissionTxState::RolledBack, TxOutcome::Compensated);
+    }
+    if contract.lifecycle_state == MissionTxState::Compensated {
+        return (MissionTxState::Compensated, TxOutcome::Compensated);
+    }
+    if !resume_ctx.compensated_steps.is_empty() {
+        return (MissionTxState::RolledBack, TxOutcome::Compensated);
+    }
+    if contract.lifecycle_state == MissionTxState::Failed || !resume_ctx.failed_steps.is_empty() {
+        return (MissionTxState::Failed, TxOutcome::Failed);
+    }
+    (MissionTxState::Committed, TxOutcome::Committed)
+}
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Errors from the tx execution engine.
@@ -782,6 +874,11 @@ pub enum TxExecutionError {
     CompensationPhase(String),
     /// Ledger not found for resume.
     LedgerNotFound(String),
+    /// Resume would replay already executed work without a checkpoint-aware executor.
+    UnsafeResume {
+        execution_id: String,
+        recommendation: ResumeRecommendation,
+    },
 }
 
 impl std::fmt::Display for TxExecutionError {
@@ -793,6 +890,14 @@ impl std::fmt::Display for TxExecutionError {
             Self::CommitPhase(msg) => write!(f, "Commit phase error: {msg}"),
             Self::CompensationPhase(msg) => write!(f, "Compensation phase error: {msg}"),
             Self::LedgerNotFound(id) => write!(f, "Ledger not found: {id}"),
+            Self::UnsafeResume {
+                execution_id,
+                recommendation,
+            } => write!(
+                f,
+                "Unsafe resume for {execution_id}: recommendation {:?} requires checkpoint-aware replay",
+                recommendation
+            ),
         }
     }
 }
@@ -808,6 +913,8 @@ mod tests {
         MissionActorRole, MissionTxContract, MissionTxState, StepAction, TxId, TxIntent, TxOutcome,
         TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
     };
+    use crate::tx_idempotency::{IdempotencyPolicy, IdempotencyStore, StepOutcome};
+    use crate::tx_plan_compiler::StepRisk;
 
     fn make_test_contract(num_steps: usize) -> MissionTxContract {
         let steps: Vec<TxStep> = (0..num_steps)
@@ -903,6 +1010,8 @@ mod tests {
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, config);
         let result = engine.execute(&mut contract, 5000).unwrap();
 
+        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
         let comp = result.compensation_report.unwrap();
         assert_eq!(
             comp.outcome,
@@ -1185,5 +1294,113 @@ mod tests {
 
         assert_eq!(contract.lifecycle_state, MissionTxState::Committed);
         assert_eq!(contract.outcome, TxOutcome::Committed);
+    }
+
+    #[test]
+    fn resume_with_no_step_activity_restarts_execution_safely() {
+        let mut contract = make_test_contract(2);
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store.create_ledger("exec-1", &compiled_plan).unwrap();
+        store
+            .get_ledger_mut("exec-1")
+            .unwrap()
+            .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+            .unwrap();
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine
+            .resume(&mut contract, &store, "exec-1", 5000)
+            .unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::Committed);
+        assert_eq!(result.outcome, TxOutcome::Committed);
+    }
+
+    #[test]
+    fn resume_blocks_partial_progress_without_checkpoint_replay_support() {
+        let mut contract = make_test_contract(3);
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store.create_ledger("exec-1", &compiled_plan).unwrap();
+        {
+            let ledger = store.get_ledger_mut("exec-1").unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+                .unwrap();
+        }
+
+        store
+            .record_execution(
+                "exec-1",
+                IdempotencyKey::new(&contract.plan.plan_id.0, "step-0", "commit"),
+                StepOutcome::Success {
+                    result: Some("ok".into()),
+                },
+                StepRisk::Low,
+                "agent-step-0",
+                1000,
+            )
+            .unwrap();
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let err = engine
+            .resume(&mut contract, &store, "exec-1", 5000)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            TxExecutionError::UnsafeResume {
+                recommendation: ResumeRecommendation::ContinueFromCheckpoint,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resume_preserves_compensated_terminal_state() {
+        let mut contract = make_test_contract(1);
+        contract.lifecycle_state = MissionTxState::Compensated;
+        contract.outcome = TxOutcome::Compensated;
+
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store.create_ledger("exec-1", &compiled_plan).unwrap();
+        {
+            let ledger = store.get_ledger_mut("exec-1").unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Preparing)
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Committing)
+                .unwrap();
+            ledger
+                .append(
+                    IdempotencyKey::new(&contract.plan.plan_id.0, "step-0", "commit"),
+                    StepOutcome::Failed {
+                        error_code: "FTX3999".into(),
+                        error_message: "commit failed before any side effects".into(),
+                        compensated: false,
+                    },
+                    StepRisk::Low,
+                    "agent-step-0",
+                    1000,
+                )
+                .unwrap();
+            ledger
+                .transition_phase(crate::tx_idempotency::TxPhase::Completed)
+                .unwrap();
+        }
+
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine
+            .resume(&mut contract, &store, "exec-1", 5000)
+            .unwrap();
+
+        assert_eq!(result.final_state, MissionTxState::Compensated);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
     }
 }

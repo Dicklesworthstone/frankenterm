@@ -50,9 +50,10 @@ use super::{
     mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
     mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
-    mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
-    policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
-    resolve_alt_screen_state, resolve_workspace_id, to_storage_search_options,
+    mcp_save_mission_tx_contract_to_path, mcp_tx_transition_info, parse_cass_agent,
+    parse_caut_service, parse_unified_search_query, policy_reason, record_mcp_audit_sync,
+    redact_mcp_args, reservation_to_mcp_info, resolve_alt_screen_state, resolve_workspace_id,
+    to_storage_search_options,
 };
 use super::{
     MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
@@ -77,6 +78,17 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
     PolicyInput::new(ActionKind::SearchOutput, ActorKind::Mcp)
         .with_surface(PolicySurface::Mux)
         .with_text_summary(summary.to_string())
+}
+
+fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
+    match state {
+        crate::plan::MissionTxState::Committed => crate::plan::TxOutcome::Committed,
+        crate::plan::MissionTxState::RolledBack | crate::plan::MissionTxState::Compensated => {
+            crate::plan::TxOutcome::Compensated
+        }
+        crate::plan::MissionTxState::Failed => crate::plan::TxOutcome::Failed,
+        _ => crate::plan::TxOutcome::Pending,
+    }
 }
 
 fn mcp_send_text_policy_input(
@@ -2340,7 +2352,7 @@ impl ToolHandler for WaTxRunTool {
             };
 
             final_state = commit.outcome.target_tx_state();
-            if commit.failed_count > 0 && commit.committed_count > 0 {
+            if commit.has_failures() {
                 let mut compensating_contract = prepared_contract.clone();
                 compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
                 compensating_contract.receipts.clone_from(&commit.receipts);
@@ -2367,6 +2379,24 @@ impl ToolHandler for WaTxRunTool {
             }
 
             commit_report = Some(commit);
+        }
+
+        let mut persisted_contract = contract.clone();
+        persisted_contract.lifecycle_state = final_state;
+        persisted_contract.outcome = mcp_tx_outcome_for_state(final_state);
+        if let Some(commit) = &commit_report {
+            persisted_contract.receipts.extend(commit.receipts.clone());
+        }
+        if let Some(compensation) = &compensation_report {
+            persisted_contract
+                .receipts
+                .extend(compensation.receipts.clone());
+        }
+        if let Err(err) = mcp_save_mission_tx_contract_to_path(&contract_path, &persisted_contract)
+        {
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+            return envelope_to_content(envelope);
         }
 
         let data = McpTxRunData {
@@ -2517,11 +2547,25 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
 
+        let final_state = compensation_report.outcome.target_tx_state();
+        let mut persisted_contract = contract.clone();
+        persisted_contract.lifecycle_state = final_state;
+        persisted_contract.outcome = mcp_tx_outcome_for_state(final_state);
+        persisted_contract
+            .receipts
+            .extend(compensation_report.receipts.clone());
+        if let Err(err) = mcp_save_mission_tx_contract_to_path(&contract_path, &persisted_contract)
+        {
+            let envelope =
+                McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+            return envelope_to_content(envelope);
+        }
+
         let data = McpTxRollbackData {
             contract_file: contract_path.display().to_string(),
             tx_id: contract.intent.tx_id.0.clone(),
             plan_id: contract.plan.plan_id.0.clone(),
-            final_state: compensation_report.outcome.target_tx_state(),
+            final_state,
             compensation_report,
         };
         let envelope = McpEnvelope::success(data, elapsed_ms(start));
@@ -4314,9 +4358,9 @@ mod tests {
         WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
         WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
         mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        serialize_mcp_audit_decision_context,
+        mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, serialize_mcp_audit_decision_context,
     };
     use crate::mcp_error::MCP_ERR_INVALID_ARGS;
     use crate::plan::{
@@ -5088,7 +5132,42 @@ mod tests {
             envelope["data"]["compensation_report"]["outcome"],
             "fully_rolled_back"
         );
+        assert_eq!(envelope["data"]["final_state"], "rolled_back");
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(persisted.outcome, TxOutcome::Compensated);
+        assert!(!persisted.receipts.is_empty());
+    }
+
+    #[test]
+    fn tx_run_tool_first_step_failure_persists_compensated_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let tool = WaTxRunTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "fail_step": "tx-step:1"
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(
+            envelope["data"]["compensation_report"]["outcome"],
+            "nothing_to_compensate"
+        );
         assert_eq!(envelope["data"]["final_state"], "compensated");
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::Compensated);
+        assert_eq!(persisted.outcome, TxOutcome::Compensated);
+        assert!(!persisted.receipts.is_empty());
     }
 
     #[test]
@@ -5109,7 +5188,7 @@ mod tests {
 
         assert_eq!(envelope["ok"], true);
         assert_eq!(envelope["data"]["tx_id"], "tx:test");
-        assert_eq!(envelope["data"]["final_state"], "compensated");
+        assert_eq!(envelope["data"]["final_state"], "rolled_back");
         assert_eq!(
             envelope["data"]["compensation_report"]["outcome"],
             "fully_rolled_back"
@@ -5118,6 +5197,11 @@ mod tests {
             envelope["data"]["compensation_report"]["compensated_count"],
             3
         );
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(persisted.outcome, TxOutcome::Compensated);
+        assert!(!persisted.receipts.is_empty());
     }
 
     #[test]

@@ -3603,6 +3603,7 @@ pub fn execute_compensation_phase(
 
     let mut next_seq = tx_last_receipt_seq(&contract.receipts);
     let mut receipts = Vec::new();
+    let mut step_results = Vec::with_capacity(committed_steps.len());
     let mut compensated_count = 0usize;
     let mut failed_count = 0usize;
     let mut skipped_count = 0usize;
@@ -3613,49 +3614,74 @@ pub fn execute_compensation_phase(
         let matched_input = comp_inputs
             .iter()
             .find(|input| input.for_step_id == committed_step.step_id);
-        let (outcome, reason_code, error_code, decision_path, completed_at_ms) = if failure_seen {
-            skipped_count += 1;
-            (
-                "skipped",
-                "compensation_skipped_after_failure".to_string(),
-                None,
-                "compensation_phase->skipped_after_failure".to_string(),
-                now_ms,
-            )
-        } else if let Some(input) = matched_input {
-            if input.success {
-                compensated_count += 1;
+        let (outcome, step_outcome, reason_code, error_code, decision_path, completed_at_ms) =
+            if failure_seen {
+                skipped_count += 1;
+                let reason_code = "compensation_skipped_after_failure".to_string();
                 (
-                    "compensated",
-                    input.reason_code.clone(),
+                    "skipped",
+                    TxCommitStepOutcome::Skipped {
+                        reason_code: reason_code.clone(),
+                    },
+                    reason_code,
                     None,
-                    "compensation_phase->compensated".to_string(),
-                    input.completed_at_ms,
+                    "compensation_phase->skipped_after_failure".to_string(),
+                    now_ms,
                 )
+            } else if let Some(input) = matched_input {
+                if input.success {
+                    compensated_count += 1;
+                    let reason_code = input.reason_code.clone();
+                    (
+                        "compensated",
+                        TxCommitStepOutcome::Committed {
+                            reason_code: reason_code.clone(),
+                        },
+                        reason_code,
+                        None,
+                        "compensation_phase->compensated".to_string(),
+                        input.completed_at_ms,
+                    )
+                } else {
+                    failed_count += 1;
+                    failure_seen = true;
+                    report_error_code.clone_from(&input.error_code);
+                    let reason_code = input.reason_code.clone();
+                    (
+                        "failed",
+                        TxCommitStepOutcome::Failed {
+                            reason_code: reason_code.clone(),
+                        },
+                        reason_code,
+                        input.error_code.clone(),
+                        "compensation_phase->failed".to_string(),
+                        input.completed_at_ms,
+                    )
+                }
             } else {
                 failed_count += 1;
                 failure_seen = true;
-                report_error_code.clone_from(&input.error_code);
+                report_error_code = Some("tx.compensation.input_missing".to_string());
+                let reason_code = "compensation_input_missing".to_string();
                 (
                     "failed",
-                    input.reason_code.clone(),
-                    input.error_code.clone(),
-                    "compensation_phase->failed".to_string(),
-                    input.completed_at_ms,
+                    TxCommitStepOutcome::Failed {
+                        reason_code: reason_code.clone(),
+                    },
+                    reason_code,
+                    Some("tx.compensation.input_missing".to_string()),
+                    "compensation_phase->missing_input".to_string(),
+                    now_ms,
                 )
-            }
-        } else {
-            failed_count += 1;
-            failure_seen = true;
-            report_error_code = Some("tx.compensation.input_missing".to_string());
-            (
-                "failed",
-                "compensation_input_missing".to_string(),
-                Some("tx.compensation.input_missing".to_string()),
-                "compensation_phase->missing_input".to_string(),
-                now_ms,
-            )
-        };
+            };
+
+        step_results.push(TxCommitStepResult {
+            step_id: committed_step.step_id.clone(),
+            ordinal: committed_step.ordinal,
+            outcome: step_outcome,
+            decision_path: decision_path.clone(),
+            completed_at_ms,
+        });
 
         next_seq += 1;
         receipts.push(tx_build_receipt(
@@ -3684,7 +3710,7 @@ pub fn execute_compensation_phase(
         failed_count,
         no_compensation_count: 0,
         skipped_count,
-        step_results: Vec::new(),
+        step_results,
         decision_path: "compensation_phase".to_string(),
         reason_code: if all_ok {
             "fully_rolled_back".to_string()
@@ -7140,12 +7166,67 @@ mod tests {
         assert_eq!(comp_report.compensated_count, 2);
         assert_eq!(comp_report.failed_count, 0);
         assert_eq!(comp_report.skipped_count, 0);
+        assert_eq!(comp_report.step_results.len(), 2);
+        assert_eq!(comp_report.step_results[0].step_id.0, "tx-step:2");
+        assert!(matches!(
+            comp_report.step_results[0].outcome,
+            TxCommitStepOutcome::Committed { .. }
+        ));
+        assert_eq!(comp_report.step_results[1].step_id.0, "tx-step:1");
+        assert!(matches!(
+            comp_report.step_results[1].outcome,
+            TxCommitStepOutcome::Committed { .. }
+        ));
         assert_eq!(comp_report.receipts.len(), 2);
         assert_eq!(comp_report.receipts[0]["step_id"], "tx-step:2");
         assert_eq!(comp_report.receipts[1]["step_id"], "tx-step:1");
         let last_commit_seq = receipt_seq(commit_report.receipts.last().expect("commit receipt"));
         assert!(receipt_seq(&comp_report.receipts[0]) > last_commit_seq);
         assert!(receipt_seq(&comp_report.receipts[1]) > receipt_seq(&comp_report.receipts[0]));
+    }
+
+    #[test]
+    fn tx_compensation_phase_preserves_failure_and_skip_step_results() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let comp_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_comp_inputs(Some("tx-step:2")),
+            20_500,
+        )
+        .expect("compensation report");
+
+        assert_eq!(
+            comp_report.outcome,
+            TxCompensationOutcome::CompensationFailed
+        );
+        assert_eq!(comp_report.compensated_count, 0);
+        assert_eq!(comp_report.failed_count, 1);
+        assert_eq!(comp_report.skipped_count, 1);
+        assert_eq!(comp_report.step_results.len(), 2);
+        assert_eq!(comp_report.step_results[0].step_id.0, "tx-step:2");
+        assert!(matches!(
+            comp_report.step_results[0].outcome,
+            TxCommitStepOutcome::Failed { .. }
+        ));
+        assert_eq!(comp_report.step_results[1].step_id.0, "tx-step:1");
+        assert!(matches!(
+            comp_report.step_results[1].outcome,
+            TxCommitStepOutcome::Skipped { .. }
+        ));
+        assert_eq!(comp_report.receipts[0]["step_id"], "tx-step:2");
+        assert_eq!(comp_report.receipts[1]["step_id"], "tx-step:1");
     }
 
     #[test]
