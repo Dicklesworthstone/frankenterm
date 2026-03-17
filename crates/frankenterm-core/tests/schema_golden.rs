@@ -549,19 +549,61 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
         .filter_map(Value::as_str)
         .collect();
 
-    for expected in [
+    let expected: HashSet<&str> = [
+        "robot.invalid_args",
+        "robot.unknown_subcommand",
+        "robot.config_error",
+        "robot.feature_not_available",
+        "robot.unsupported",
+        "robot.wezterm_error",
+        "robot.wezterm_not_found",
         "robot.wezterm_not_running",
+        "robot.wezterm_socket_not_found",
+        "robot.wezterm_command_failed",
+        "robot.wezterm_parse_error",
+        "robot.circuit_open",
+        "robot.storage_error",
         "robot.fts_query_error",
+        "robot.policy_denied",
         "robot.require_approval",
         "robot.approval_error",
         "robot.rate_limited",
+        "robot.pane_not_found",
+        "robot.reservation_conflict",
+        "robot.event_not_found",
+        "robot.rule_not_found",
+        "robot.workflow_not_found",
+        "robot.code_not_found",
+        "robot.invalid_service",
+        "robot.cass_not_installed",
+        "robot.cass_timeout",
+        "robot.cass_output_too_large",
+        "robot.cass_invalid_json",
+        "robot.cass_error",
+        "robot.agent_detection_error",
+        "robot.caut_error",
+        "robot.mission_not_found",
+        "robot.mission_read_failed",
+        "robot.mission_invalid_json",
+        "robot.mission_validation_failed",
+        "robot.assignment_not_found",
+        "robot.mission_error",
+        "robot.tx_not_found",
+        "robot.tx_read_failed",
+        "robot.tx_invalid_json",
+        "robot.tx_validation_failed",
+        "robot.tx_execution_failed",
+        "robot.tx_error",
         "robot.internal_error",
-    ] {
-        assert!(
-            codes.contains(expected),
-            "wa-robot-envelope.json missing documented error code {expected}"
-        );
-    }
+        "robot.timeout",
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        codes, expected,
+        "wa-robot-envelope.json drifted from the current robot error-code contract"
+    );
 }
 
 #[test]

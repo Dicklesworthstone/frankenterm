@@ -502,14 +502,66 @@ fn write_error_codes_section(out: &mut String, envelope: &Value) {
     }
 }
 
+#[cfg(test)]
+const STANDARD_ROBOT_ERROR_CODES: &[&str] = &[
+    "robot.invalid_args",
+    "robot.unknown_subcommand",
+    "robot.config_error",
+    "robot.feature_not_available",
+    "robot.unsupported",
+    "robot.wezterm_error",
+    "robot.wezterm_not_found",
+    "robot.wezterm_not_running",
+    "robot.wezterm_socket_not_found",
+    "robot.wezterm_command_failed",
+    "robot.wezterm_parse_error",
+    "robot.circuit_open",
+    "robot.storage_error",
+    "robot.fts_query_error",
+    "robot.policy_denied",
+    "robot.require_approval",
+    "robot.approval_error",
+    "robot.rate_limited",
+    "robot.pane_not_found",
+    "robot.reservation_conflict",
+    "robot.event_not_found",
+    "robot.rule_not_found",
+    "robot.workflow_not_found",
+    "robot.code_not_found",
+    "robot.invalid_service",
+    "robot.cass_not_installed",
+    "robot.cass_timeout",
+    "robot.cass_output_too_large",
+    "robot.cass_invalid_json",
+    "robot.cass_error",
+    "robot.agent_detection_error",
+    "robot.caut_error",
+    "robot.mission_not_found",
+    "robot.mission_read_failed",
+    "robot.mission_invalid_json",
+    "robot.mission_validation_failed",
+    "robot.assignment_not_found",
+    "robot.mission_error",
+    "robot.tx_not_found",
+    "robot.tx_read_failed",
+    "robot.tx_invalid_json",
+    "robot.tx_validation_failed",
+    "robot.tx_execution_failed",
+    "robot.tx_error",
+    "robot.internal_error",
+    "robot.timeout",
+];
+
 fn error_code_description(code: &str) -> &'static str {
     match code {
         "robot.invalid_args" => "Invalid or missing command arguments",
         "robot.unknown_subcommand" => "Unrecognized robot subcommand",
-        "robot.not_implemented" => "Command is not yet implemented",
         "robot.config_error" => "Configuration error (missing or invalid config)",
         "robot.feature_not_available" => {
             "Feature is unavailable in the current build or runtime configuration"
+        }
+        "robot.unsupported" => {
+            "Requested robot command or mode is unsupported in this configuration"
         }
         "robot.wezterm_error" => {
             "Error communicating with terminal backend bridge (current: WezTerm)"
@@ -540,7 +592,36 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.rate_limited" => "External service or policy rate limit was reached",
         "robot.pane_not_found" => "Specified pane does not exist",
         "robot.reservation_conflict" => "Pane is already reserved by another owner",
-        "robot.workflow_error" => "Workflow execution failed",
+        "robot.event_not_found" => "Requested event ID does not exist",
+        "robot.rule_not_found" => "Requested rule ID does not exist",
+        "robot.workflow_not_found" => "Requested workflow name is not registered or available",
+        "robot.code_not_found" => "Requested explanation code has no matching template entry",
+        "robot.invalid_service" => "Requested external service identifier is not supported",
+        "robot.cass_not_installed" => "CASS helper is not installed or unavailable",
+        "robot.cass_timeout" => "CASS helper timed out before completing the request",
+        "robot.cass_output_too_large" => {
+            "CASS helper returned more output than the robot surface allows"
+        }
+        "robot.cass_invalid_json" => "CASS helper returned malformed JSON output",
+        "robot.cass_error" => "CASS helper failed for an unspecified reason",
+        "robot.agent_detection_error" => {
+            "Agent detection subsystem failed while collecting results"
+        }
+        "robot.caut_error" => "Account refresh helper failed while talking to the selected service",
+        "robot.mission_not_found" => "Requested mission file or mission identifier was not found",
+        "robot.mission_read_failed" => "Mission file could not be read from disk",
+        "robot.mission_invalid_json" => "Mission file contained invalid JSON",
+        "robot.mission_validation_failed" => "Mission definition failed validation",
+        "robot.assignment_not_found" => "Requested mission assignment ID does not exist",
+        "robot.mission_error" => "Mission command failed for an unspecified reason",
+        "robot.tx_not_found" => {
+            "Requested transaction contract file or transaction ID was not found"
+        }
+        "robot.tx_read_failed" => "Transaction contract file could not be read from disk",
+        "robot.tx_invalid_json" => "Transaction contract file contained invalid JSON",
+        "robot.tx_validation_failed" => "Transaction contract failed validation",
+        "robot.tx_execution_failed" => "Transaction prepare, commit, or compensation phase failed",
+        "robot.tx_error" => "Transaction command failed for an unspecified reason",
         "robot.internal_error" => "Unexpected internal error while handling the robot command",
         "robot.timeout" => "Operation timed out",
         _ => "Unknown error code",
@@ -774,31 +855,7 @@ mod tests {
             },
             "$defs": {
                 "error_codes": {
-                    "enum": [
-                        "robot.invalid_args",
-                        "robot.unknown_subcommand",
-                        "robot.not_implemented",
-                        "robot.config_error",
-                        "robot.feature_not_available",
-                        "robot.wezterm_error",
-                        "robot.wezterm_not_found",
-                        "robot.wezterm_not_running",
-                        "robot.wezterm_socket_not_found",
-                        "robot.wezterm_command_failed",
-                        "robot.wezterm_parse_error",
-                        "robot.circuit_open",
-                        "robot.storage_error",
-                        "robot.fts_query_error",
-                        "robot.policy_denied",
-                        "robot.require_approval",
-                        "robot.approval_error",
-                        "robot.rate_limited",
-                        "robot.pane_not_found",
-                        "robot.reservation_conflict",
-                        "robot.workflow_error",
-                        "robot.internal_error",
-                        "robot.timeout"
-                    ]
+                    "enum": STANDARD_ROBOT_ERROR_CODES
                 }
             }
         })
@@ -1147,32 +1204,7 @@ mod tests {
 
     #[test]
     fn error_code_descriptions_complete() {
-        let known_codes = [
-            "robot.invalid_args",
-            "robot.unknown_subcommand",
-            "robot.not_implemented",
-            "robot.config_error",
-            "robot.feature_not_available",
-            "robot.wezterm_error",
-            "robot.wezterm_not_found",
-            "robot.wezterm_not_running",
-            "robot.wezterm_socket_not_found",
-            "robot.wezterm_command_failed",
-            "robot.wezterm_parse_error",
-            "robot.circuit_open",
-            "robot.storage_error",
-            "robot.fts_query_error",
-            "robot.policy_denied",
-            "robot.require_approval",
-            "robot.approval_error",
-            "robot.rate_limited",
-            "robot.pane_not_found",
-            "robot.reservation_conflict",
-            "robot.workflow_error",
-            "robot.internal_error",
-            "robot.timeout",
-        ];
-        for code in &known_codes {
+        for code in STANDARD_ROBOT_ERROR_CODES {
             let desc = error_code_description(code);
             assert_ne!(desc, "Unknown error code", "missing description for {code}");
         }
@@ -2166,32 +2198,10 @@ mod tests {
 
     #[test]
     fn error_code_each_has_unique_description() {
-        let codes = [
-            "robot.invalid_args",
-            "robot.unknown_subcommand",
-            "robot.not_implemented",
-            "robot.config_error",
-            "robot.feature_not_available",
-            "robot.wezterm_error",
-            "robot.wezterm_not_found",
-            "robot.wezterm_not_running",
-            "robot.wezterm_socket_not_found",
-            "robot.wezterm_command_failed",
-            "robot.wezterm_parse_error",
-            "robot.circuit_open",
-            "robot.storage_error",
-            "robot.fts_query_error",
-            "robot.policy_denied",
-            "robot.require_approval",
-            "robot.approval_error",
-            "robot.rate_limited",
-            "robot.pane_not_found",
-            "robot.reservation_conflict",
-            "robot.workflow_error",
-            "robot.internal_error",
-            "robot.timeout",
-        ];
-        let mut descs: Vec<&str> = codes.iter().map(|c| error_code_description(c)).collect();
+        let mut descs: Vec<&str> = STANDARD_ROBOT_ERROR_CODES
+            .iter()
+            .map(|c| error_code_description(c))
+            .collect();
         let original_len = descs.len();
         descs.sort();
         descs.dedup();

@@ -17,6 +17,10 @@ use proptest::prelude::*;
 // Strategies
 // ============================================================================
 
+/// Representative public `robot.*` codes used for typed-client coverage.
+///
+/// This is intentionally not exhaustive; the parser is forward-compatible for
+/// unknown `robot.*` codes as long as they match the public wire shape.
 const KNOWN_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.wezterm_not_found",
     "robot.wezterm_not_running",
@@ -25,14 +29,20 @@ const KNOWN_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.wezterm_command_failed",
     "robot.wezterm_parse_error",
     "robot.circuit_open",
+    "robot.rule_not_found",
     "robot.storage_error",
+    "robot.event_not_found",
     "robot.fts_query_error",
     "robot.reservation_conflict",
     "robot.policy_denied",
     "robot.require_approval",
     "robot.rate_limited",
-    "robot.workflow_error",
+    "robot.workflow_not_found",
+    "robot.mission_error",
+    "robot.tx_error",
     "robot.timeout",
+    "robot.cass_timeout",
+    "robot.feature_not_available",
     "robot.config_error",
     "robot.internal_error",
     "robot.code_not_found",
@@ -72,6 +82,10 @@ fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, Err
             ErrorCategory::Storage
         )),
         Just((
+            ErrorCode::parse("robot.rule_not_found").unwrap(),
+            ErrorCategory::Pattern
+        )),
+        Just((
             ErrorCode::parse("robot.policy_denied").unwrap(),
             ErrorCategory::Policy
         )),
@@ -80,7 +94,15 @@ fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, Err
             ErrorCategory::Policy
         )),
         Just((
-            ErrorCode::parse("robot.workflow_error").unwrap(),
+            ErrorCode::parse("robot.workflow_not_found").unwrap(),
+            ErrorCategory::Workflow
+        )),
+        Just((
+            ErrorCode::parse("robot.mission_error").unwrap(),
+            ErrorCategory::Workflow
+        )),
+        Just((
+            ErrorCode::parse("robot.tx_error").unwrap(),
             ErrorCategory::Workflow
         )),
         Just((
@@ -88,7 +110,15 @@ fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, Err
             ErrorCategory::Network
         )),
         Just((
+            ErrorCode::parse("robot.cass_timeout").unwrap(),
+            ErrorCategory::Network
+        )),
+        Just((
             ErrorCode::parse("robot.config_error").unwrap(),
+            ErrorCategory::Config
+        )),
+        Just((
+            ErrorCode::parse("robot.feature_not_available").unwrap(),
             ErrorCategory::Config
         )),
         Just((
@@ -117,9 +147,13 @@ fn arb_known_error_code_with_retryability() -> impl Strategy<Value = (ErrorCode,
         Just((ErrorCode::parse("robot.rate_limited").unwrap(), true)),
         Just((ErrorCode::parse("robot.circuit_open").unwrap(), true)),
         Just((ErrorCode::parse("robot.pane_not_found").unwrap(), false)),
+        Just((ErrorCode::parse("robot.rule_not_found").unwrap(), false)),
         Just((ErrorCode::parse("robot.storage_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.policy_denied").unwrap(), false)),
-        Just((ErrorCode::parse("robot.workflow_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.workflow_not_found").unwrap(), false)),
+        Just((ErrorCode::parse("robot.mission_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.tx_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.cass_timeout").unwrap(), false)),
         Just((ErrorCode::parse("robot.config_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.internal_error").unwrap(), false)),
     ]

@@ -966,20 +966,26 @@ fn error_envelope_into_result_preserves_code_and_hint() {
 }
 
 #[test]
-fn all_error_codes_parse_correctly() {
+fn representative_public_error_codes_parse_correctly() {
     let codes = [
         ("robot.wezterm_not_found", ErrorCategory::Wezterm, false),
         ("robot.wezterm_not_running", ErrorCategory::Wezterm, true),
         ("robot.pane_not_found", ErrorCategory::Wezterm, false),
+        ("robot.rule_not_found", ErrorCategory::Pattern, false),
         ("robot.storage_error", ErrorCategory::Storage, false),
+        ("robot.event_not_found", ErrorCategory::Storage, false),
         ("robot.fts_query_error", ErrorCategory::Storage, false),
         ("robot.reservation_conflict", ErrorCategory::Storage, false),
         ("robot.policy_denied", ErrorCategory::Policy, false),
         ("robot.require_approval", ErrorCategory::Policy, false),
         ("robot.rate_limited", ErrorCategory::Policy, true),
-        ("robot.workflow_error", ErrorCategory::Workflow, false),
+        ("robot.workflow_not_found", ErrorCategory::Workflow, false),
+        ("robot.mission_error", ErrorCategory::Workflow, false),
+        ("robot.tx_error", ErrorCategory::Workflow, false),
         ("robot.timeout", ErrorCategory::Network, true),
+        ("robot.cass_timeout", ErrorCategory::Network, false),
         ("robot.config_error", ErrorCategory::Config, false),
+        ("robot.feature_not_available", ErrorCategory::Config, false),
         ("robot.internal_error", ErrorCategory::Internal, false),
         ("robot.code_not_found", ErrorCategory::Internal, false),
     ];

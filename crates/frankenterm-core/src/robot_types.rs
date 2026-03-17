@@ -167,18 +167,27 @@ impl ErrorCode {
     /// not a projection of the internal `FT-*` catalog.
     pub fn category(&self) -> ErrorCategory {
         match self.as_str() {
-            "robot.storage_error" | "robot.fts_query_error" | "robot.reservation_conflict" => {
-                ErrorCategory::Storage
-            }
-            "robot.config_error" | "robot.invalid_service" | "robot.cass_not_installed" => {
-                ErrorCategory::Config
-            }
+            "robot.storage_error"
+            | "robot.fts_query_error"
+            | "robot.reservation_conflict"
+            | "robot.event_not_found" => ErrorCategory::Storage,
+            "robot.rule_not_found" => ErrorCategory::Pattern,
+            "robot.config_error"
+            | "robot.feature_not_available"
+            | "robot.invalid_service"
+            | "robot.cass_not_installed" => ErrorCategory::Config,
             "robot.policy_denied"
             | "robot.require_approval"
             | "robot.rate_limited"
             | "robot.approval_error" => ErrorCategory::Policy,
-            "robot.timeout" => ErrorCategory::Network,
-            code if code.starts_with("robot.workflow_") => ErrorCategory::Workflow,
+            "robot.timeout" | "robot.cass_timeout" => ErrorCategory::Network,
+            "robot.assignment_not_found" => ErrorCategory::Workflow,
+            code if code.starts_with("robot.workflow_")
+                || code.starts_with("robot.mission_")
+                || code.starts_with("robot.tx_") =>
+            {
+                ErrorCategory::Workflow
+            }
             "robot.wezterm_error"
             | "robot.wezterm_not_found"
             | "robot.wezterm_not_running"
@@ -1955,7 +1964,7 @@ mod tests {
             "robot.wezterm_not_found",
             "robot.reservation_conflict",
             "robot.require_approval",
-            "robot.workflow_error",
+            "robot.workflow_not_found",
             "robot.internal_error",
         ] {
             let parsed = ErrorCode::parse(code).unwrap();
@@ -1990,11 +1999,25 @@ mod tests {
             ErrorCategory::Storage
         );
         assert_eq!(
+            ErrorCode::parse("robot.rule_not_found").unwrap().category(),
+            ErrorCategory::Pattern
+        );
+        assert_eq!(
             ErrorCode::parse("robot.policy_denied").unwrap().category(),
             ErrorCategory::Policy
         );
         assert_eq!(
-            ErrorCode::parse("robot.workflow_error").unwrap().category(),
+            ErrorCode::parse("robot.workflow_not_found")
+                .unwrap()
+                .category(),
+            ErrorCategory::Workflow
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.mission_error").unwrap().category(),
+            ErrorCategory::Workflow
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.tx_error").unwrap().category(),
             ErrorCategory::Workflow
         );
         assert_eq!(
@@ -2002,7 +2025,13 @@ mod tests {
             ErrorCategory::Network
         );
         assert_eq!(
-            ErrorCode::parse("robot.config_error").unwrap().category(),
+            ErrorCode::parse("robot.cass_timeout").unwrap().category(),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.feature_not_available")
+                .unwrap()
+                .category(),
             ErrorCategory::Config
         );
         assert_eq!(
@@ -2878,7 +2907,7 @@ mod tests {
             "robot.reservation_conflict",
             "robot.policy_denied",
             "robot.require_approval",
-            "robot.workflow_error",
+            "robot.workflow_not_found",
             "robot.config_error",
             "robot.internal_error",
             "robot.future_error_code",
@@ -3202,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn error_code_all_variants_roundtrip_via_number() {
+    fn error_code_roundtrip_for_representative_robot_codes() {
         let variants = [
             "robot.wezterm_not_found",
             "robot.wezterm_not_running",
@@ -3211,14 +3240,20 @@ mod tests {
             "robot.wezterm_command_failed",
             "robot.wezterm_parse_error",
             "robot.circuit_open",
+            "robot.rule_not_found",
             "robot.storage_error",
+            "robot.event_not_found",
             "robot.fts_query_error",
             "robot.reservation_conflict",
             "robot.policy_denied",
             "robot.require_approval",
             "robot.rate_limited",
-            "robot.workflow_error",
+            "robot.workflow_not_found",
+            "robot.mission_error",
+            "robot.tx_error",
             "robot.timeout",
+            "robot.cass_timeout",
+            "robot.feature_not_available",
             "robot.config_error",
             "robot.internal_error",
         ];
