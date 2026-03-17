@@ -264,10 +264,16 @@ proptest! {
         let mut contract = make_contract(num_steps);
         contract.receipts.push(serde_json::to_value(TxReceipt {
             seq: 1,
+            phase: "commit".to_string(),
+            tx_id: contract.intent.tx_id.0.clone(),
+            plan_id: contract.plan.plan_id.0.clone(),
             state: terminal_state,
+            step_id: None,
+            outcome: "terminal".to_string(),
             emitted_at_ms: 5000,
-            reason_code: None,
+            reason_code: "terminal_state".to_string(),
             error_code: None,
+            decision_path: "resume_state_terminal_no_pending".to_string(),
         }).unwrap());
         let resume = reconstruct_tx_resume_state(&contract, None, None, 10_000);
         prop_assert!(resume.is_fully_resolved());

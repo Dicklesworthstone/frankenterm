@@ -1,4 +1,4 @@
-//! Typed client types for ft robot/MCP JSON responses.
+//! Typed client types for `ft robot` JSON responses.
 //!
 //! These types mirror the serialization-side types in the `wa` binary and provide
 //! `Deserialize` so consumers can parse robot JSON output without hand-parsing.
@@ -38,7 +38,7 @@ pub struct RobotResponse<T> {
     /// Human-readable error message (present when `ok == false`).
     #[serde(default)]
     pub error: Option<String>,
-    /// Machine-readable error code like `"FT-1001"` (present when `ok == false`).
+    /// Machine-readable error code like `"robot.pane_not_found"` (present when `ok == false`).
     #[serde(default)]
     pub error_code: Option<String>,
     /// Actionable hint for recovery (present on some errors).
@@ -113,7 +113,7 @@ impl<T: serde::de::DeserializeOwned> RobotResponse<T> {
 /// Error extracted from a failed `RobotResponse`.
 #[derive(Debug, Clone)]
 pub struct RobotError {
-    /// Machine-readable error code (e.g. `"FT-1001"`).
+    /// Machine-readable error code (e.g. `"robot.pane_not_found"`).
     pub code: Option<String>,
     /// Human-readable error message.
     pub message: String,
@@ -137,183 +137,56 @@ impl std::error::Error for RobotError {}
 // Error codes
 // ============================================================================
 
-/// Parsed error code from ft robot responses.
+/// Parsed error code from `ft robot` responses.
 ///
-/// Maps the `FT-xxxx` string codes from `error_codes.rs` into a structured enum
-/// for pattern matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
-    // WezTerm (1xxx)
-    /// WA-1001: WezTerm CLI not found
-    WeztermNotFound,
-    /// WA-1002: WezTerm CLI execution failed
-    WeztermExecFailed,
-    /// WA-1003: WezTerm pane not found
-    PaneNotFound,
-    /// WA-1004: WezTerm output parse error
-    WeztermParseFailed,
-    /// WA-1005: WezTerm connection refused
-    WeztermConnectionRefused,
-
-    // Storage (2xxx)
-    /// WA-2001: Database locked
-    DatabaseLocked,
-    /// WA-2002: Storage corruption detected
-    StorageCorruption,
-    /// WA-2003: FTS5 index error
-    FtsIndexError,
-    /// WA-2004: Migration failed
-    MigrationFailed,
-    /// WA-2005: Disk full
-    DiskFull,
-
-    // Pattern (3xxx)
-    /// WA-3001: Invalid regex pattern
-    InvalidRegex,
-    /// WA-3002: Rule pack not found
-    RulePackNotFound,
-    /// WA-3003: Pattern match timeout
-    PatternTimeout,
-
-    // Policy (4xxx)
-    /// WA-4001: Action denied by policy
-    ActionDenied,
-    /// WA-4002: Rate limit exceeded
-    RateLimitExceeded,
-    /// WA-4003: Approval required
-    ApprovalRequired,
-    /// WA-4004: Approval expired
-    ApprovalExpired,
-
-    // Workflow (5xxx)
-    /// WA-5001: Workflow not found
-    WorkflowNotFound,
-    /// WA-5002: Workflow step failed
-    WorkflowStepFailed,
-    /// WA-5003: Workflow timeout
-    WorkflowTimeout,
-    /// WA-5004: Workflow already running
-    WorkflowAlreadyRunning,
-
-    // Network (6xxx)
-    /// WA-6001: Network timeout
-    NetworkTimeout,
-    /// WA-6002: Connection refused
-    ConnectionRefused,
-
-    // Config (7xxx)
-    /// WA-7001: Config file invalid
-    ConfigInvalid,
-    /// WA-7002: Config file not found
-    ConfigNotFound,
-
-    // Internal (9xxx)
-    /// WA-9001: Internal error
-    InternalError,
-    /// WA-9002: Feature not available
-    FeatureNotAvailable,
-    /// WA-9003: Version mismatch
-    VersionMismatch,
-
-    /// Unknown code not in the catalog.
-    Unknown(u16),
-}
+/// Robot mode emits stable string codes like `robot.pane_not_found` and
+/// `robot.timeout`. The contract is string-based rather than the internal
+/// `FT-*` catalog, so the typed client preserves the exact robot code instead
+/// of projecting it onto the internal numeric catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ErrorCode(String);
 
 impl ErrorCode {
-    /// Parse a `"FT-xxxx"` string into an `ErrorCode`.
-    ///
-    /// Returns `None` if the string doesn't match the `WA-` prefix.
+    /// Parse a `robot.*` wire error code into an `ErrorCode`.
     pub fn parse(s: &str) -> Option<Self> {
-        let num_str = s.strip_prefix("FT-")?;
-        let num: u16 = num_str.parse().ok()?;
-        Some(Self::from_number(num))
-    }
-
-    /// Map a numeric code to the variant.
-    pub fn from_number(n: u16) -> Self {
-        match n {
-            1001 => Self::WeztermNotFound,
-            1002 => Self::WeztermExecFailed,
-            1003 => Self::PaneNotFound,
-            1004 => Self::WeztermParseFailed,
-            1005 => Self::WeztermConnectionRefused,
-            2001 => Self::DatabaseLocked,
-            2002 => Self::StorageCorruption,
-            2003 => Self::FtsIndexError,
-            2004 => Self::MigrationFailed,
-            2005 => Self::DiskFull,
-            3001 => Self::InvalidRegex,
-            3002 => Self::RulePackNotFound,
-            3003 => Self::PatternTimeout,
-            4001 => Self::ActionDenied,
-            4002 => Self::RateLimitExceeded,
-            4003 => Self::ApprovalRequired,
-            4004 => Self::ApprovalExpired,
-            5001 => Self::WorkflowNotFound,
-            5002 => Self::WorkflowStepFailed,
-            5003 => Self::WorkflowTimeout,
-            5004 => Self::WorkflowAlreadyRunning,
-            6001 => Self::NetworkTimeout,
-            6002 => Self::ConnectionRefused,
-            7001 => Self::ConfigInvalid,
-            7002 => Self::ConfigNotFound,
-            9001 => Self::InternalError,
-            9002 => Self::FeatureNotAvailable,
-            9003 => Self::VersionMismatch,
-            other => Self::Unknown(other),
+        if !is_valid_robot_error_code(s) {
+            return None;
         }
+        Some(Self(s.to_string()))
     }
 
-    /// Returns the `"FT-xxxx"` string form.
-    pub fn as_str(&self) -> String {
-        format!("FT-{}", self.number())
-    }
-
-    /// Returns the numeric part of the code.
-    pub fn number(&self) -> u16 {
-        match self {
-            Self::WeztermNotFound => 1001,
-            Self::WeztermExecFailed => 1002,
-            Self::PaneNotFound => 1003,
-            Self::WeztermParseFailed => 1004,
-            Self::WeztermConnectionRefused => 1005,
-            Self::DatabaseLocked => 2001,
-            Self::StorageCorruption => 2002,
-            Self::FtsIndexError => 2003,
-            Self::MigrationFailed => 2004,
-            Self::DiskFull => 2005,
-            Self::InvalidRegex => 3001,
-            Self::RulePackNotFound => 3002,
-            Self::PatternTimeout => 3003,
-            Self::ActionDenied => 4001,
-            Self::RateLimitExceeded => 4002,
-            Self::ApprovalRequired => 4003,
-            Self::ApprovalExpired => 4004,
-            Self::WorkflowNotFound => 5001,
-            Self::WorkflowStepFailed => 5002,
-            Self::WorkflowTimeout => 5003,
-            Self::WorkflowAlreadyRunning => 5004,
-            Self::NetworkTimeout => 6001,
-            Self::ConnectionRefused => 6002,
-            Self::ConfigInvalid => 7001,
-            Self::ConfigNotFound => 7002,
-            Self::InternalError => 9001,
-            Self::FeatureNotAvailable => 9002,
-            Self::VersionMismatch => 9003,
-            Self::Unknown(n) => *n,
-        }
+    /// Returns the exact `robot.*` wire code string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     /// Returns the error category.
+    ///
+    /// This is best-effort classification for the stable public robot surface,
+    /// not a projection of the internal `FT-*` catalog.
     pub fn category(&self) -> ErrorCategory {
-        match self.number() / 1000 {
-            1 => ErrorCategory::Wezterm,
-            2 => ErrorCategory::Storage,
-            3 => ErrorCategory::Pattern,
-            4 => ErrorCategory::Policy,
-            5 => ErrorCategory::Workflow,
-            6 => ErrorCategory::Network,
-            7 => ErrorCategory::Config,
+        match self.as_str() {
+            "robot.storage_error" | "robot.fts_query_error" | "robot.reservation_conflict" => {
+                ErrorCategory::Storage
+            }
+            "robot.config_error" | "robot.invalid_service" | "robot.cass_not_installed" => {
+                ErrorCategory::Config
+            }
+            "robot.policy_denied"
+            | "robot.require_approval"
+            | "robot.rate_limited"
+            | "robot.approval_error" => ErrorCategory::Policy,
+            "robot.timeout" => ErrorCategory::Network,
+            code if code.starts_with("robot.workflow_") => ErrorCategory::Workflow,
+            "robot.wezterm_error"
+            | "robot.wezterm_not_found"
+            | "robot.wezterm_not_running"
+            | "robot.wezterm_socket_not_found"
+            | "robot.wezterm_command_failed"
+            | "robot.wezterm_parse_error"
+            | "robot.pane_not_found"
+            | "robot.circuit_open" => ErrorCategory::Wezterm,
             _ => ErrorCategory::Internal,
         }
     }
@@ -321,13 +194,13 @@ impl ErrorCode {
     /// Returns `true` if this is a retryable error.
     pub fn is_retryable(&self) -> bool {
         matches!(
-            self,
-            Self::DatabaseLocked
-                | Self::RateLimitExceeded
-                | Self::NetworkTimeout
-                | Self::ConnectionRefused
-                | Self::PatternTimeout
-                | Self::WeztermConnectionRefused
+            self.as_str(),
+            "robot.wezterm_not_running"
+                | "robot.wezterm_socket_not_found"
+                | "robot.wezterm_command_failed"
+                | "robot.timeout"
+                | "robot.rate_limited"
+                | "robot.circuit_open"
         )
     }
 }
@@ -336,6 +209,26 @@ impl std::fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+fn is_valid_robot_error_code(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("robot.") else {
+        return false;
+    };
+
+    let mut saw_segment = false;
+    for segment in rest.split('.') {
+        if segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return false;
+        }
+        saw_segment = true;
+    }
+
+    saw_segment
 }
 
 // ============================================================================
@@ -1996,7 +1889,7 @@ mod tests {
         let json = json!({
             "ok": false,
             "error": "pane 42 not found",
-            "error_code": "FT-1003",
+            "error_code": "robot.pane_not_found",
             "hint": "check ft list-panes",
             "elapsed_ms": 2,
             "version": "0.1.0",
@@ -2006,7 +1899,7 @@ mod tests {
         assert!(!resp.ok);
         assert!(resp.data.is_none());
         assert_eq!(resp.error.as_deref(), Some("pane 42 not found"));
-        assert_eq!(resp.error_code.as_deref(), Some("FT-1003"));
+        assert_eq!(resp.error_code.as_deref(), Some("robot.pane_not_found"));
         assert_eq!(resp.hint.as_deref(), Some("check ft list-panes"));
     }
 
@@ -2029,7 +1922,7 @@ mod tests {
         let json = json!({
             "ok": false,
             "error": "denied",
-            "error_code": "FT-4001",
+            "error_code": "robot.policy_denied",
             "elapsed_ms": 1,
             "version": "0.1.0",
             "now": 0
@@ -2037,8 +1930,8 @@ mod tests {
         let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
         let err = resp.into_result().unwrap_err();
         assert_eq!(err.message, "denied");
-        assert_eq!(err.code.as_deref(), Some("FT-4001"));
-        assert!(err.to_string().contains("FT-4001"));
+        assert_eq!(err.code.as_deref(), Some("robot.policy_denied"));
+        assert!(err.to_string().contains("robot.policy_denied"));
     }
 
     #[test]
@@ -2058,65 +1951,113 @@ mod tests {
 
     #[test]
     fn error_code_roundtrip() {
-        for code in ["FT-1001", "FT-2003", "FT-4001", "FT-5004", "FT-9003"] {
+        for code in [
+            "robot.wezterm_not_found",
+            "robot.reservation_conflict",
+            "robot.require_approval",
+            "robot.workflow_error",
+            "robot.internal_error",
+        ] {
             let parsed = ErrorCode::parse(code).unwrap();
             assert_eq!(parsed.as_str(), code);
         }
     }
 
     #[test]
-    fn error_code_unknown() {
-        let parsed = ErrorCode::parse("FT-8888").unwrap();
-        assert_eq!(parsed, ErrorCode::Unknown(8888));
-        assert_eq!(parsed.number(), 8888);
+    fn error_code_forward_compatible_unknown() {
+        let parsed = ErrorCode::parse("robot.future_error_code").unwrap();
+        assert_eq!(parsed.as_str(), "robot.future_error_code");
+        assert_eq!(parsed.category(), ErrorCategory::Internal);
     }
 
     #[test]
     fn error_code_invalid_prefix() {
-        assert!(ErrorCode::parse("XX-1001").is_none());
+        assert!(ErrorCode::parse("FT-1001").is_none());
+        assert!(ErrorCode::parse("pane_not_found").is_none());
         assert!(ErrorCode::parse("garbage").is_none());
     }
 
     #[test]
     fn error_code_categories() {
         assert_eq!(
-            ErrorCode::WeztermNotFound.category(),
+            ErrorCode::parse("robot.wezterm_not_found")
+                .unwrap()
+                .category(),
             ErrorCategory::Wezterm
         );
-        assert_eq!(ErrorCode::DatabaseLocked.category(), ErrorCategory::Storage);
-        assert_eq!(ErrorCode::InvalidRegex.category(), ErrorCategory::Pattern);
-        assert_eq!(ErrorCode::ActionDenied.category(), ErrorCategory::Policy);
         assert_eq!(
-            ErrorCode::WorkflowNotFound.category(),
+            ErrorCode::parse("robot.storage_error").unwrap().category(),
+            ErrorCategory::Storage
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.policy_denied").unwrap().category(),
+            ErrorCategory::Policy
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.workflow_error").unwrap().category(),
             ErrorCategory::Workflow
         );
-        assert_eq!(ErrorCode::NetworkTimeout.category(), ErrorCategory::Network);
-        assert_eq!(ErrorCode::ConfigInvalid.category(), ErrorCategory::Config);
-        assert_eq!(ErrorCode::InternalError.category(), ErrorCategory::Internal);
+        assert_eq!(
+            ErrorCode::parse("robot.timeout").unwrap().category(),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.config_error").unwrap().category(),
+            ErrorCategory::Config
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.future_error_code")
+                .unwrap()
+                .category(),
+            ErrorCategory::Internal
+        );
     }
 
     #[test]
     fn error_code_retryable() {
-        assert!(ErrorCode::DatabaseLocked.is_retryable());
-        assert!(ErrorCode::RateLimitExceeded.is_retryable());
-        assert!(ErrorCode::NetworkTimeout.is_retryable());
-        assert!(!ErrorCode::ActionDenied.is_retryable());
-        assert!(!ErrorCode::ConfigInvalid.is_retryable());
-        assert!(!ErrorCode::InternalError.is_retryable());
+        assert!(
+            ErrorCode::parse("robot.wezterm_not_running")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.rate_limited")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(ErrorCode::parse("robot.timeout").unwrap().is_retryable());
+        assert!(
+            !ErrorCode::parse("robot.policy_denied")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.config_error")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.internal_error")
+                .unwrap()
+                .is_retryable()
+        );
     }
 
     #[test]
     fn parsed_error_code_from_response() {
         let json = json!({
             "ok": false,
-            "error": "locked",
-            "error_code": "FT-2001",
+            "error": "init failed",
+            "error_code": "robot.storage_error",
             "elapsed_ms": 1,
             "version": "0.1.0",
             "now": 0
         });
         let resp: RobotResponse<GetTextData> = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.parsed_error_code(), Some(ErrorCode::DatabaseLocked));
+        assert_eq!(
+            resp.parsed_error_code(),
+            Some(ErrorCode::parse("robot.storage_error").unwrap())
+        );
     }
 
     // -- Data type parsing --------------------------------------------------
@@ -2420,11 +2361,11 @@ mod tests {
         let json = json!({
             "ok": true,
             "data": {
-                "code": "FT-2001",
-                "category": "storage",
-                "title": "Database locked",
-                "explanation": "SQLite database is locked by another process.",
-                "suggestions": ["retry after 1s", "check for hung wa processes"]
+                "code": "robot.policy_denied",
+                "category": "robot",
+                "title": "Action denied by safety policy",
+                "explanation": "The requested action was blocked by policy.",
+                "suggestions": ["check workspace permissions", "run ft doctor"]
             },
             "elapsed_ms": 1,
             "version": "0.1.0",
@@ -2432,7 +2373,7 @@ mod tests {
         });
         let resp: RobotResponse<WhyData> = serde_json::from_value(json).unwrap();
         let data = resp.into_result().unwrap();
-        assert_eq!(data.code, "FT-2001");
+        assert_eq!(data.code, "robot.policy_denied");
         assert_eq!(data.suggestions.unwrap().len(), 2);
     }
 
@@ -2568,11 +2509,11 @@ mod tests {
     #[test]
     fn robot_error_display() {
         let err = RobotError {
-            code: Some("FT-1003".to_string()),
+            code: Some("robot.pane_not_found".to_string()),
             message: "pane not found".to_string(),
             hint: Some("check pane id".to_string()),
         };
-        assert_eq!(err.to_string(), "[FT-1003] pane not found");
+        assert_eq!(err.to_string(), "[robot.pane_not_found] pane not found");
 
         let err_no_code = RobotError {
             code: None,
@@ -2598,7 +2539,7 @@ mod tests {
                 }],
                 "tips": ["use --format json"],
                 "error_handling": {
-                    "common_codes": [{"code": "FT-1003", "meaning": "pane not found", "recovery": "check id"}],
+                    "common_codes": [{"code": "robot.pane_not_found", "meaning": "pane not found", "recovery": "check id"}],
                     "safety_notes": ["always check ok field"]
                 }
             },
@@ -2611,7 +2552,10 @@ mod tests {
         assert_eq!(data.global_flags.len(), 1);
         assert_eq!(data.core_loop[0].step, 1);
         assert_eq!(data.commands[0].name, "get-text");
-        assert_eq!(data.error_handling.common_codes[0].code, "FT-1003");
+        assert_eq!(
+            data.error_handling.common_codes[0].code,
+            "robot.pane_not_found"
+        );
     }
 
     #[test]
@@ -2840,7 +2784,7 @@ mod tests {
         let json = json!({
             "ok": false,
             "error": "rate limited",
-            "error_code": "FT-4002",
+            "error_code": "robot.rate_limited",
             "hint": "wait 60 seconds",
             "elapsed_ms": 1,
             "version": "0.1.0",
@@ -2870,7 +2814,7 @@ mod tests {
         let json = json!({
             "ok": false,
             "error": "bad",
-            "error_code": "XX-9999",
+            "error_code": "FT-9999",
             "elapsed_ms": 1,
             "version": "0.1.0",
             "now": 0
@@ -2880,90 +2824,92 @@ mod tests {
     }
 
     #[test]
-    fn error_code_parse_non_numeric_suffix() {
+    fn error_code_parse_invalid_format() {
         assert!(ErrorCode::parse("FT-abc").is_none());
-        assert!(ErrorCode::parse("FT-").is_none());
-        assert!(ErrorCode::parse("FT-12.5").is_none());
+        assert!(ErrorCode::parse("robot.").is_none());
+        assert!(ErrorCode::parse("robot.bad-code").is_none());
+        assert!(ErrorCode::parse("robot.BAD").is_none());
     }
 
     #[test]
     fn error_code_display_trait() {
-        assert_eq!(format!("{}", ErrorCode::PaneNotFound), "FT-1003");
-        assert_eq!(format!("{}", ErrorCode::DiskFull), "FT-2005");
-        assert_eq!(format!("{}", ErrorCode::Unknown(7777)), "FT-7777");
+        assert_eq!(
+            format!("{}", ErrorCode::parse("robot.pane_not_found").unwrap()),
+            "robot.pane_not_found"
+        );
+        assert_eq!(
+            format!("{}", ErrorCode::parse("robot.storage_error").unwrap()),
+            "robot.storage_error"
+        );
+        assert_eq!(
+            format!("{}", ErrorCode::parse("robot.future_error_code").unwrap()),
+            "robot.future_error_code"
+        );
     }
 
     #[test]
-    fn error_code_unknown_category_is_internal() {
-        // Unknown codes with number >= 9000 or in unmapped ranges
-        // fall into the Internal category via the catch-all.
-        let code = ErrorCode::Unknown(0);
+    fn error_code_unmapped_robot_code_is_internal() {
+        let code = ErrorCode::parse("robot.unknown_surface").unwrap();
         assert_eq!(code.category(), ErrorCategory::Internal);
-
-        let code2 = ErrorCode::Unknown(8500);
-        assert_eq!(code2.category(), ErrorCategory::Internal);
     }
 
     #[test]
     fn error_code_retryable_exhaustive() {
-        // All 6 retryable codes
-        assert!(ErrorCode::DatabaseLocked.is_retryable());
-        assert!(ErrorCode::RateLimitExceeded.is_retryable());
-        assert!(ErrorCode::NetworkTimeout.is_retryable());
-        assert!(ErrorCode::ConnectionRefused.is_retryable());
-        assert!(ErrorCode::PatternTimeout.is_retryable());
-        assert!(ErrorCode::WeztermConnectionRefused.is_retryable());
+        let retryable = [
+            "robot.wezterm_not_running",
+            "robot.wezterm_socket_not_found",
+            "robot.wezterm_command_failed",
+            "robot.timeout",
+            "robot.rate_limited",
+            "robot.circuit_open",
+        ];
+        for code in retryable {
+            assert!(
+                ErrorCode::parse(code).unwrap().is_retryable(),
+                "expected retryable: {code}"
+            );
+        }
 
-        // Spot-check a selection of non-retryable codes
         let non_retryable = [
-            ErrorCode::WeztermNotFound,
-            ErrorCode::WeztermExecFailed,
-            ErrorCode::PaneNotFound,
-            ErrorCode::WeztermParseFailed,
-            ErrorCode::StorageCorruption,
-            ErrorCode::FtsIndexError,
-            ErrorCode::MigrationFailed,
-            ErrorCode::DiskFull,
-            ErrorCode::InvalidRegex,
-            ErrorCode::RulePackNotFound,
-            ErrorCode::ActionDenied,
-            ErrorCode::ApprovalRequired,
-            ErrorCode::ApprovalExpired,
-            ErrorCode::WorkflowNotFound,
-            ErrorCode::WorkflowStepFailed,
-            ErrorCode::WorkflowTimeout,
-            ErrorCode::WorkflowAlreadyRunning,
-            ErrorCode::ConfigInvalid,
-            ErrorCode::ConfigNotFound,
-            ErrorCode::InternalError,
-            ErrorCode::FeatureNotAvailable,
-            ErrorCode::VersionMismatch,
-            ErrorCode::Unknown(9999),
+            "robot.wezterm_not_found",
+            "robot.wezterm_parse_error",
+            "robot.pane_not_found",
+            "robot.storage_error",
+            "robot.reservation_conflict",
+            "robot.policy_denied",
+            "robot.require_approval",
+            "robot.workflow_error",
+            "robot.config_error",
+            "robot.internal_error",
+            "robot.future_error_code",
         ];
         for code in non_retryable {
-            assert!(!code.is_retryable(), "expected non-retryable: {}", code);
+            assert!(
+                !ErrorCode::parse(code).unwrap().is_retryable(),
+                "expected non-retryable: {code}"
+            );
         }
     }
 
     #[test]
     fn error_code_clone_copy_eq_hash() {
-        let a = ErrorCode::DatabaseLocked;
-        let b = a; // Copy
-        let c = a; // Clone (Copy type)
+        let a = ErrorCode::parse("robot.storage_error").unwrap();
+        let b = a.clone();
+        let c = a.clone();
         assert_eq!(a, b);
         assert_eq!(b, c);
 
         // Verify Hash works by inserting into a HashSet
         let mut set = std::collections::HashSet::new();
-        set.insert(a);
-        set.insert(b);
+        set.insert(a.clone());
+        set.insert(b.clone());
         assert_eq!(set.len(), 1);
     }
 
     #[test]
     fn robot_error_implements_std_error() {
         let err = RobotError {
-            code: Some("FT-9001".to_string()),
+            code: Some("robot.internal_error".to_string()),
             message: "internal".to_string(),
             hint: None,
         };
@@ -3257,41 +3203,29 @@ mod tests {
 
     #[test]
     fn error_code_all_variants_roundtrip_via_number() {
-        // Exhaustively verify every named variant survives number() -> from_number() roundtrip.
-        let variants: Vec<ErrorCode> = vec![
-            ErrorCode::WeztermNotFound,
-            ErrorCode::WeztermExecFailed,
-            ErrorCode::PaneNotFound,
-            ErrorCode::WeztermParseFailed,
-            ErrorCode::WeztermConnectionRefused,
-            ErrorCode::DatabaseLocked,
-            ErrorCode::StorageCorruption,
-            ErrorCode::FtsIndexError,
-            ErrorCode::MigrationFailed,
-            ErrorCode::DiskFull,
-            ErrorCode::InvalidRegex,
-            ErrorCode::RulePackNotFound,
-            ErrorCode::PatternTimeout,
-            ErrorCode::ActionDenied,
-            ErrorCode::RateLimitExceeded,
-            ErrorCode::ApprovalRequired,
-            ErrorCode::ApprovalExpired,
-            ErrorCode::WorkflowNotFound,
-            ErrorCode::WorkflowStepFailed,
-            ErrorCode::WorkflowTimeout,
-            ErrorCode::WorkflowAlreadyRunning,
-            ErrorCode::NetworkTimeout,
-            ErrorCode::ConnectionRefused,
-            ErrorCode::ConfigInvalid,
-            ErrorCode::ConfigNotFound,
-            ErrorCode::InternalError,
-            ErrorCode::FeatureNotAvailable,
-            ErrorCode::VersionMismatch,
+        let variants = [
+            "robot.wezterm_not_found",
+            "robot.wezterm_not_running",
+            "robot.wezterm_socket_not_found",
+            "robot.pane_not_found",
+            "robot.wezterm_command_failed",
+            "robot.wezterm_parse_error",
+            "robot.circuit_open",
+            "robot.storage_error",
+            "robot.fts_query_error",
+            "robot.reservation_conflict",
+            "robot.policy_denied",
+            "robot.require_approval",
+            "robot.rate_limited",
+            "robot.workflow_error",
+            "robot.timeout",
+            "robot.config_error",
+            "robot.internal_error",
         ];
-        for v in &variants {
-            let n = v.number();
-            let reconstructed = ErrorCode::from_number(n);
-            assert_eq!(*v, reconstructed, "roundtrip failed for number {}", n);
+        for code in variants {
+            let parsed = ErrorCode::parse(code).unwrap();
+            assert_eq!(parsed.as_str(), code);
+            assert_eq!(ErrorCode::parse(parsed.as_str()).unwrap(), parsed);
         }
     }
 
@@ -3378,12 +3312,12 @@ mod tests {
         let json = json!({
             "ok": true,
             "data": {
-                "code": "FT-1001",
-                "category": "wezterm",
-                "title": "CLI not found",
-                "explanation": "WezTerm CLI binary could not be located.",
+                "code": "robot.wezterm_not_running",
+                "category": "robot",
+                "title": "Backend not running",
+                "explanation": "The current terminal backend is not available.",
                 "suggestions": ["install wezterm"],
-                "see_also": ["FT-1002", "FT-1005"]
+                "see_also": ["robot.wezterm_not_found", "robot.wezterm_socket_not_found"]
             },
             "elapsed_ms": 1,
             "version": "0.1.0",
@@ -3393,8 +3327,8 @@ mod tests {
         let data = resp.into_result().unwrap();
         let see_also = data.see_also.unwrap();
         assert_eq!(see_also.len(), 2);
-        assert_eq!(see_also[0], "FT-1002");
-        assert_eq!(see_also[1], "FT-1005");
+        assert_eq!(see_also[0], "robot.wezterm_not_found");
+        assert_eq!(see_also[1], "robot.wezterm_socket_not_found");
     }
 
     #[test]

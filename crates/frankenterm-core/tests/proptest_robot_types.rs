@@ -1,8 +1,8 @@
 //! Property-based tests for robot_types module.
 //!
 //! Verifies invariants for:
-//! - ErrorCode: parse/as_str roundtrip, from_number/number roundtrip,
-//!   category consistency, is_retryable classification, Unknown variant
+//! - ErrorCode: `robot.*` parse/as_str roundtrip,
+//!   category consistency, retryability, forward-compatible parsing
 //! - RobotResponse: serde roundtrip, into_result semantics
 //! - Data types: serde roundtrips for GetTextData, TruncationInfo,
 //!   WaitForData, SearchHit, WorkflowInfo, ReservationInfo, etc.
@@ -17,45 +17,111 @@ use proptest::prelude::*;
 // Strategies
 // ============================================================================
 
-/// All 27 known ErrorCode variants.
+const KNOWN_ROBOT_ERROR_CODES: &[&str] = &[
+    "robot.wezterm_not_found",
+    "robot.wezterm_not_running",
+    "robot.wezterm_socket_not_found",
+    "robot.pane_not_found",
+    "robot.wezterm_command_failed",
+    "robot.wezterm_parse_error",
+    "robot.circuit_open",
+    "robot.storage_error",
+    "robot.fts_query_error",
+    "robot.reservation_conflict",
+    "robot.policy_denied",
+    "robot.require_approval",
+    "robot.rate_limited",
+    "robot.workflow_error",
+    "robot.timeout",
+    "robot.config_error",
+    "robot.internal_error",
+    "robot.code_not_found",
+];
+
+fn arb_robot_error_code_string() -> impl Strategy<Value = String> {
+    proptest::collection::vec("[a-z0-9_]{1,12}", 1..5)
+        .prop_map(|segments| format!("robot.{}", segments.join(".")))
+}
+
 fn arb_known_error_code() -> impl Strategy<Value = ErrorCode> {
+    prop::sample::select(KNOWN_ROBOT_ERROR_CODES.to_vec())
+        .prop_map(|code| ErrorCode::parse(code).expect("known robot error code should parse"))
+}
+
+fn arb_error_code() -> impl Strategy<Value = ErrorCode> {
+    arb_robot_error_code_string()
+        .prop_map(|code| ErrorCode::parse(&code).expect("generated robot error code should parse"))
+}
+
+fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, ErrorCategory)> {
     prop_oneof![
-        Just(ErrorCode::WeztermNotFound),
-        Just(ErrorCode::WeztermExecFailed),
-        Just(ErrorCode::PaneNotFound),
-        Just(ErrorCode::WeztermParseFailed),
-        Just(ErrorCode::WeztermConnectionRefused),
-        Just(ErrorCode::DatabaseLocked),
-        Just(ErrorCode::StorageCorruption),
-        Just(ErrorCode::FtsIndexError),
-        Just(ErrorCode::MigrationFailed),
-        Just(ErrorCode::DiskFull),
-        Just(ErrorCode::InvalidRegex),
-        Just(ErrorCode::RulePackNotFound),
-        Just(ErrorCode::PatternTimeout),
-        Just(ErrorCode::ActionDenied),
-        Just(ErrorCode::RateLimitExceeded),
-        Just(ErrorCode::ApprovalRequired),
-        Just(ErrorCode::ApprovalExpired),
-        Just(ErrorCode::WorkflowNotFound),
-        Just(ErrorCode::WorkflowStepFailed),
-        Just(ErrorCode::WorkflowTimeout),
-        Just(ErrorCode::WorkflowAlreadyRunning),
-        Just(ErrorCode::NetworkTimeout),
-        Just(ErrorCode::ConnectionRefused),
-        Just(ErrorCode::ConfigInvalid),
-        Just(ErrorCode::ConfigNotFound),
-        Just(ErrorCode::InternalError),
-        Just(ErrorCode::FeatureNotAvailable),
-        Just(ErrorCode::VersionMismatch),
+        Just((
+            ErrorCode::parse("robot.wezterm_not_found").unwrap(),
+            ErrorCategory::Wezterm
+        )),
+        Just((
+            ErrorCode::parse("robot.wezterm_not_running").unwrap(),
+            ErrorCategory::Wezterm
+        )),
+        Just((
+            ErrorCode::parse("robot.storage_error").unwrap(),
+            ErrorCategory::Storage
+        )),
+        Just((
+            ErrorCode::parse("robot.fts_query_error").unwrap(),
+            ErrorCategory::Storage
+        )),
+        Just((
+            ErrorCode::parse("robot.policy_denied").unwrap(),
+            ErrorCategory::Policy
+        )),
+        Just((
+            ErrorCode::parse("robot.require_approval").unwrap(),
+            ErrorCategory::Policy
+        )),
+        Just((
+            ErrorCode::parse("robot.workflow_error").unwrap(),
+            ErrorCategory::Workflow
+        )),
+        Just((
+            ErrorCode::parse("robot.timeout").unwrap(),
+            ErrorCategory::Network
+        )),
+        Just((
+            ErrorCode::parse("robot.config_error").unwrap(),
+            ErrorCategory::Config
+        )),
+        Just((
+            ErrorCode::parse("robot.internal_error").unwrap(),
+            ErrorCategory::Internal
+        )),
+        Just((
+            ErrorCode::parse("robot.code_not_found").unwrap(),
+            ErrorCategory::Internal
+        )),
     ]
 }
 
-/// Any ErrorCode including Unknown variants.
-fn arb_error_code() -> impl Strategy<Value = ErrorCode> {
+fn arb_known_error_code_with_retryability() -> impl Strategy<Value = (ErrorCode, bool)> {
     prop_oneof![
-        arb_known_error_code(),
-        (0u16..=65535u16).prop_map(ErrorCode::Unknown),
+        Just((ErrorCode::parse("robot.wezterm_not_running").unwrap(), true)),
+        Just((
+            ErrorCode::parse("robot.wezterm_socket_not_found").unwrap(),
+            true
+        )),
+        Just((
+            ErrorCode::parse("robot.wezterm_command_failed").unwrap(),
+            true
+        )),
+        Just((ErrorCode::parse("robot.timeout").unwrap(), true)),
+        Just((ErrorCode::parse("robot.rate_limited").unwrap(), true)),
+        Just((ErrorCode::parse("robot.circuit_open").unwrap(), true)),
+        Just((ErrorCode::parse("robot.pane_not_found").unwrap(), false)),
+        Just((ErrorCode::parse("robot.storage_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.policy_denied").unwrap(), false)),
+        Just((ErrorCode::parse("robot.workflow_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.config_error").unwrap(), false)),
+        Just((ErrorCode::parse("robot.internal_error").unwrap(), false)),
     ]
 }
 
@@ -192,99 +258,68 @@ fn arb_lint_issue() -> impl Strategy<Value = LintIssue> {
 // ============================================================================
 
 proptest! {
-    /// Known ErrorCode: parse(as_str()) roundtrips.
+    /// ErrorCode: parse(as_str()) roundtrips for valid robot codes.
     #[test]
-    fn prop_known_code_parse_roundtrip(code in arb_known_error_code()) {
-        let s = code.as_str();
-        let parsed = ErrorCode::parse(&s).unwrap();
-        prop_assert_eq!(parsed.number(), code.number(),
-            "parse(as_str()) number mismatch for {}", s);
+    fn prop_code_parse_roundtrip(code in arb_error_code()) {
+        let parsed = ErrorCode::parse(code.as_str()).unwrap();
+        prop_assert_eq!(parsed, code, "parse(as_str()) mismatch");
     }
 
-    /// ErrorCode: from_number(number()) roundtrips.
-    #[test]
-    fn prop_code_from_number_roundtrip(code in arb_error_code()) {
-        let n = code.number();
-        let back = ErrorCode::from_number(n);
-        prop_assert_eq!(back.number(), n,
-            "from_number(number()) mismatch for number {}", n);
-    }
-
-    /// ErrorCode: as_str() always starts with "FT-".
+    /// ErrorCode: as_str() always starts with `robot.`.
     #[test]
     fn prop_code_as_str_prefix(code in arb_error_code()) {
-        let s = code.as_str();
-        prop_assert!(s.starts_with("FT-"), "as_str() missing FT- prefix: {}", s);
+        prop_assert!(
+            code.as_str().starts_with("robot."),
+            "as_str() missing robot. prefix: {}",
+            code.as_str()
+        );
     }
 
-    /// ErrorCode: as_str() contains the numeric code.
+    /// ErrorCode: parse rejects non-robot prefixes.
     #[test]
-    fn prop_code_as_str_contains_number(code in arb_error_code()) {
-        let s = code.as_str();
-        let num_str = s.strip_prefix("FT-").unwrap();
-        let parsed_num: u16 = num_str.parse().unwrap();
-        prop_assert_eq!(parsed_num, code.number(),
-            "as_str() number mismatch: {} vs {}", parsed_num, code.number());
-    }
-
-    /// ErrorCode: parse rejects non-FT- prefix.
-    #[test]
-    fn prop_code_parse_rejects_bad_prefix(prefix in "[A-Z]{2}", num in 0u16..10000) {
-        if prefix != "FT" {
-            let s = format!("{}-{}", prefix, num);
+    fn prop_code_parse_rejects_bad_prefix(prefix in "[A-Za-z]{1,8}", suffix in "[a-z0-9_]{1,12}") {
+        if prefix != "robot" {
+            let s = format!("{}.{}", prefix, suffix);
             prop_assert!(ErrorCode::parse(&s).is_none(),
-                "parse should reject non-FT prefix: {}", s);
+                "parse should reject non-robot prefix: {}", s);
         }
     }
 
-    /// ErrorCode: parse rejects non-numeric suffix.
+    /// ErrorCode: parse rejects invalid segments.
     #[test]
-    fn prop_code_parse_rejects_non_numeric(suffix in "[a-z]{1,10}") {
-        let s = format!("FT-{}", suffix);
-        prop_assert!(ErrorCode::parse(&s).is_none(),
-            "parse should reject non-numeric suffix: {}", s);
-    }
-
-    /// ErrorCode: category is consistent with number range.
-    #[test]
-    fn prop_code_category_consistent(code in arb_known_error_code()) {
-        let n = code.number();
-        let cat = code.category();
-        let expected_cat = match n / 1000 {
-            1 => ErrorCategory::Wezterm,
-            2 => ErrorCategory::Storage,
-            3 => ErrorCategory::Pattern,
-            4 => ErrorCategory::Policy,
-            5 => ErrorCategory::Workflow,
-            6 => ErrorCategory::Network,
-            7 => ErrorCategory::Config,
-            _ => ErrorCategory::Internal,
-        };
-        prop_assert_eq!(cat, expected_cat,
-            "Category mismatch for code {}: {:?} vs {:?}", n, cat, expected_cat);
-    }
-
-    /// ErrorCode: Unknown variant preserves its number.
-    #[test]
-    fn prop_code_unknown_preserves_number(n in 0u16..=65535u16) {
-        let code = ErrorCode::Unknown(n);
-        prop_assert_eq!(code.number(), n, "Unknown number mismatch");
-    }
-
-    /// ErrorCode: is_retryable matches exactly the specified set.
-    #[test]
-    fn prop_code_is_retryable(code in arb_known_error_code()) {
-        let expected = matches!(
-            code,
-            ErrorCode::DatabaseLocked
-                | ErrorCode::RateLimitExceeded
-                | ErrorCode::NetworkTimeout
-                | ErrorCode::ConnectionRefused
-                | ErrorCode::PatternTimeout
-                | ErrorCode::WeztermConnectionRefused
+    fn prop_code_parse_rejects_invalid_segment(invalid in prop_oneof![
+        Just("".to_string()),
+        "[A-Z][a-z0-9_]{0,7}".prop_map(|s| s),
+        "[a-z0-9_]{1,6}-[a-z0-9_]{1,6}".prop_map(|s| s),
+    ]) {
+        let s = format!("robot.{}", invalid);
+        prop_assert!(
+            ErrorCode::parse(&s).is_none(),
+            "parse should reject invalid robot code: {}",
+            s
         );
-        prop_assert_eq!(code.is_retryable(), expected,
-            "is_retryable mismatch for {:?}", code);
+    }
+
+    /// Known public robot codes keep their documented categories.
+    #[test]
+    fn prop_code_category_consistent((code, expected_category) in arb_known_error_code_with_category()) {
+        prop_assert_eq!(
+            code.category(),
+            expected_category,
+            "category mismatch for {}",
+            code.as_str()
+        );
+    }
+
+    /// Known public robot codes keep their retryability classification.
+    #[test]
+    fn prop_code_is_retryable((code, expected_retryable) in arb_known_error_code_with_retryability()) {
+        prop_assert_eq!(
+            code.is_retryable(),
+            expected_retryable,
+            "retryability mismatch for {}",
+            code.as_str()
+        );
     }
 
     /// ErrorCode: Display matches as_str().
@@ -346,7 +381,10 @@ proptest! {
 
     /// RobotResponse into_result: ok=false returns Err with message.
     #[test]
-    fn prop_response_into_result_err(msg in "[a-z ]{1,50}", code in proptest::option::of("[A-Z]{2}-[0-9]{4}")) {
+    fn prop_response_into_result_err(
+        msg in "[a-z ]{1,50}",
+        code in proptest::option::of(arb_robot_error_code_string()),
+    ) {
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: false,
             data: None,
@@ -383,13 +421,13 @@ proptest! {
 
     /// RobotResponse parsed_error_code matches manual parse.
     #[test]
-    fn prop_response_parsed_error_code(code in arb_known_error_code()) {
-        let code_str = code.as_str();
+    fn prop_response_parsed_error_code(code in arb_error_code()) {
+        let code_str = code.as_str().to_string();
         let resp: RobotResponse<GetTextData> = RobotResponse {
             ok: false,
             data: None,
             error: Some("test".to_string()),
-            error_code: Some(code_str.clone()),
+            error_code: Some(code_str),
             hint: None,
             elapsed_ms: 1,
             version: "0.1.0".to_string(),
@@ -397,7 +435,7 @@ proptest! {
         };
         let parsed = resp.parsed_error_code();
         prop_assert!(parsed.is_some(), "parsed_error_code should return Some");
-        prop_assert_eq!(parsed.unwrap().number(), code.number());
+        prop_assert_eq!(parsed.unwrap(), code);
     }
 }
 
@@ -497,7 +535,7 @@ proptest! {
     /// RobotError Display with code shows "[CODE] message".
     #[test]
     fn prop_robot_error_display_with_code(
-        code in "[A-Z]{2}-[0-9]{4}",
+        code in arb_robot_error_code_string(),
         msg in "[a-z ]{1,50}",
     ) {
         let err = RobotError {
@@ -528,44 +566,10 @@ proptest! {
 // ============================================================================
 
 proptest! {
-    /// All known error codes map to non-Internal category.
+    /// Known public robot codes keep their documented categories.
     #[test]
-    fn prop_known_codes_have_specific_category(code in arb_known_error_code()) {
-        let cat = code.category();
-        // Known codes should not all map to Internal (only 9xxx does)
-        if code.number() < 9000 {
-            prop_assert!(cat != ErrorCategory::Internal,
-                "Code {} should not be Internal", code.number());
-        }
-    }
-
-    /// ErrorCode from_number for all known numbers produces correct number.
-    #[test]
-    fn prop_from_number_for_known(code in arb_known_error_code()) {
-        let n = code.number();
-        let back = ErrorCode::from_number(n);
-        prop_assert_eq!(back.number(), n,
-            "from_number({}) produced number {}", n, back.number());
-    }
-
-    /// Unrecognized numbers produce Unknown variant.
-    #[test]
-    fn prop_unrecognized_numbers_are_unknown(n in 0u16..=65535u16) {
-        let known_numbers: Vec<u16> = vec![
-            1001, 1002, 1003, 1004, 1005,
-            2001, 2002, 2003, 2004, 2005,
-            3001, 3002, 3003,
-            4001, 4002, 4003, 4004,
-            5001, 5002, 5003, 5004,
-            6001, 6002,
-            7001, 7002,
-            9001, 9002, 9003,
-        ];
-        if !known_numbers.contains(&n) {
-            let code = ErrorCode::from_number(n);
-            prop_assert_eq!(code, ErrorCode::Unknown(n),
-                "from_number({}) should produce Unknown", n);
-        }
+    fn prop_known_codes_have_specific_category((code, category) in arb_known_error_code_with_category()) {
+        prop_assert_eq!(code.category(), category);
     }
 
     /// ErrorCategory Debug is non-empty.
@@ -576,11 +580,11 @@ proptest! {
         prop_assert!(!debug.is_empty());
     }
 
-    /// ErrorCode Clone preserves number.
+    /// ErrorCode clone preserves the exact wire code.
     #[test]
     fn prop_error_code_clone_preserves(code in arb_known_error_code()) {
-        let cloned = code;
-        prop_assert_eq!(cloned.number(), code.number());
+        let cloned = code.clone();
+        prop_assert_eq!(cloned, code);
     }
 
     /// ErrorCode Debug is non-empty.
@@ -2691,7 +2695,8 @@ proptest! {
             tips: vec!["Use --format json".to_string()],
             error_handling: QuickStartErrorHandling {
                 common_codes: vec![QuickStartErrorCode {
-                    code: "FT-1003".to_string(), meaning: "Pane not found".to_string(),
+                    code: "robot.pane_not_found".to_string(),
+                    meaning: "Pane not found".to_string(),
                     recovery: "Check pane ID".to_string(),
                 }],
                 safety_notes: vec!["Always check ok field".to_string()],

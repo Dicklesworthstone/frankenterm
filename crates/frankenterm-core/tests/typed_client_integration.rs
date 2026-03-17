@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use frankenterm_core::api_schema::SchemaRegistry;
+use frankenterm_core::error_codes::ErrorCategory;
 use frankenterm_core::robot_types::*;
 
 // ============================================================================
@@ -520,12 +521,12 @@ deser_test!(
     deser_why,
     WhyData,
     json!({
-        "code": "FT-2001",
-        "category": "storage",
-        "title": "Database locked",
-        "explanation": "The SQLite database is locked by another process.",
-        "suggestions": ["retry after a short delay"],
-        "see_also": ["FT-2002"]
+        "code": "robot.policy_denied",
+        "category": "robot",
+        "title": "Action denied by safety policy",
+        "explanation": "The requested action was blocked by policy.",
+        "suggestions": ["check workspace permissions"],
+        "see_also": ["robot.require_approval"]
     })
 );
 
@@ -539,7 +540,7 @@ deser_test!(
         "commands": [{"name": "get-text", "args": "--pane <ID>", "summary": "Get pane text", "examples": []}],
         "tips": ["use --format json"],
         "error_handling": {
-            "common_codes": [{"code": "FT-1003", "meaning": "pane not found", "recovery": "check id"}],
+            "common_codes": [{"code": "robot.pane_not_found", "meaning": "pane not found", "recovery": "check id"}],
             "safety_notes": ["always check ok field"]
         }
     })
@@ -629,10 +630,10 @@ schema_match_test!(
     WhyData,
     "wa-robot-why.json",
     json!({
-        "code": "FT-2001",
-        "category": "storage",
-        "title": "Database locked",
-        "explanation": "locked"
+        "code": "robot.policy_denied",
+        "category": "robot",
+        "title": "Action denied by safety policy",
+        "explanation": "policy denied"
     })
 );
 
@@ -939,12 +940,12 @@ fn compatible_schemas_have_no_field_drift() {
 
 #[test]
 fn error_envelope_deserializes_for_any_data_type() {
-    let error_json = wrap_error_envelope("FT-1003", "pane 42 not found");
+    let error_json = wrap_error_envelope("robot.pane_not_found", "pane 42 not found");
 
     let resp: RobotResponse<GetTextData> = serde_json::from_value(error_json.clone()).unwrap();
     assert!(!resp.ok);
     assert!(resp.data.is_none());
-    assert_eq!(resp.error_code.as_deref(), Some("FT-1003"));
+    assert_eq!(resp.error_code.as_deref(), Some("robot.pane_not_found"));
 
     let resp2: RobotResponse<EventsData> = serde_json::from_value(error_json.clone()).unwrap();
     assert!(!resp2.ok);
@@ -955,11 +956,11 @@ fn error_envelope_deserializes_for_any_data_type() {
 
 #[test]
 fn error_envelope_into_result_preserves_code_and_hint() {
-    let error_json = wrap_error_envelope("FT-4001", "action denied by policy");
+    let error_json = wrap_error_envelope("robot.policy_denied", "action denied by policy");
     let resp: RobotResponse<SendData> = serde_json::from_value(error_json).unwrap();
 
     let err = resp.into_result().unwrap_err();
-    assert_eq!(err.code.as_deref(), Some("FT-4001"));
+    assert_eq!(err.code.as_deref(), Some("robot.policy_denied"));
     assert!(err.message.contains("denied"));
     assert!(err.hint.is_some());
 }
@@ -967,28 +968,38 @@ fn error_envelope_into_result_preserves_code_and_hint() {
 #[test]
 fn all_error_codes_parse_correctly() {
     let codes = [
-        ("FT-1001", ErrorCode::WeztermNotFound),
-        ("FT-1002", ErrorCode::WeztermExecFailed),
-        ("FT-1003", ErrorCode::PaneNotFound),
-        ("FT-2001", ErrorCode::DatabaseLocked),
-        ("FT-2002", ErrorCode::StorageCorruption),
-        ("FT-3001", ErrorCode::InvalidRegex),
-        ("FT-4001", ErrorCode::ActionDenied),
-        ("FT-4002", ErrorCode::RateLimitExceeded),
-        ("FT-4003", ErrorCode::ApprovalRequired),
-        ("FT-5001", ErrorCode::WorkflowNotFound),
-        ("FT-5002", ErrorCode::WorkflowStepFailed),
-        ("FT-6001", ErrorCode::NetworkTimeout),
-        ("FT-7001", ErrorCode::ConfigInvalid),
-        ("FT-9001", ErrorCode::InternalError),
-        ("FT-9003", ErrorCode::VersionMismatch),
+        ("robot.wezterm_not_found", ErrorCategory::Wezterm, false),
+        ("robot.wezterm_not_running", ErrorCategory::Wezterm, true),
+        ("robot.pane_not_found", ErrorCategory::Wezterm, false),
+        ("robot.storage_error", ErrorCategory::Storage, false),
+        ("robot.fts_query_error", ErrorCategory::Storage, false),
+        ("robot.reservation_conflict", ErrorCategory::Storage, false),
+        ("robot.policy_denied", ErrorCategory::Policy, false),
+        ("robot.require_approval", ErrorCategory::Policy, false),
+        ("robot.rate_limited", ErrorCategory::Policy, true),
+        ("robot.workflow_error", ErrorCategory::Workflow, false),
+        ("robot.timeout", ErrorCategory::Network, true),
+        ("robot.config_error", ErrorCategory::Config, false),
+        ("robot.internal_error", ErrorCategory::Internal, false),
+        ("robot.code_not_found", ErrorCategory::Internal, false),
     ];
 
-    for (code_str, expected) in &codes {
+    for (code_str, expected_category, retryable) in codes {
         let parsed =
             ErrorCode::parse(code_str).unwrap_or_else(|| panic!("Failed to parse {}", code_str));
-        assert_eq!(&parsed, expected, "Mismatch for {}", code_str);
-        assert_eq!(parsed.as_str(), *code_str);
+        assert_eq!(parsed.as_str(), code_str);
+        assert_eq!(
+            parsed.category(),
+            expected_category,
+            "category mismatch for {}",
+            code_str
+        );
+        assert_eq!(
+            parsed.is_retryable(),
+            retryable,
+            "retryability mismatch for {}",
+            code_str
+        );
     }
 }
 
@@ -1120,10 +1131,10 @@ fn required_fields_coverage_why() {
     let required = schema_required_fields(&schema);
 
     let data = WhyData {
-        code: "FT-1001".to_string(),
-        category: "wezterm".to_string(),
-        title: "Not found".to_string(),
-        explanation: "WezTerm CLI not found".to_string(),
+        code: "robot.pane_not_found".to_string(),
+        category: "robot".to_string(),
+        title: "Pane not found".to_string(),
+        explanation: "The pane does not exist".to_string(),
         suggestions: None,
         see_also: None,
     };

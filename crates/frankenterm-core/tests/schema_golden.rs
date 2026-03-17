@@ -514,6 +514,54 @@ fn reference_has_error_codes() {
         content.contains("robot.policy_denied"),
         "missing specific error code"
     );
+    assert!(
+        content.contains("robot.reservation_conflict"),
+        "missing reservation conflict error code"
+    );
+    assert!(
+        content.contains("robot.require_approval"),
+        "missing approval-required error code"
+    );
+    assert!(
+        content.contains("robot.approval_error"),
+        "missing approval workflow error code"
+    );
+    assert!(
+        content.contains("robot.wezterm_not_running"),
+        "missing specific backend availability error code"
+    );
+}
+
+#[test]
+fn robot_envelope_schema_tracks_current_core_error_codes() {
+    let schemas = load_all_schemas();
+    let envelope = schemas
+        .iter()
+        .find(|(name, _)| name == "wa-robot-envelope.json")
+        .map(|(_, schema)| schema)
+        .expect("wa-robot-envelope.json should exist");
+
+    let codes: HashSet<&str> = envelope
+        .pointer("/$defs/error_codes/enum")
+        .and_then(Value::as_array)
+        .expect("wa-robot-envelope.json should define error_codes enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    for expected in [
+        "robot.wezterm_not_running",
+        "robot.fts_query_error",
+        "robot.require_approval",
+        "robot.approval_error",
+        "robot.rate_limited",
+        "robot.internal_error",
+    ] {
+        assert!(
+            codes.contains(expected),
+            "wa-robot-envelope.json missing documented error code {expected}"
+        );
+    }
 }
 
 #[test]

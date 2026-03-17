@@ -19,7 +19,7 @@
     },
     "error_code": {
       "type": "string",
-      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<category>' (e.g., 'robot.wezterm_error', 'robot.not_implemented').",
+      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running').",
       "pattern": "^robot\\.[a-z_]+$"
     },
     "hint": {
@@ -60,11 +60,24 @@
         "robot.unknown_subcommand",
         "robot.not_implemented",
         "robot.config_error",
+        "robot.feature_not_available",
         "robot.wezterm_error",
+        "robot.wezterm_not_found",
+        "robot.wezterm_not_running",
+        "robot.wezterm_socket_not_found",
+        "robot.wezterm_command_failed",
+        "robot.wezterm_parse_error",
+        "robot.circuit_open",
         "robot.storage_error",
+        "robot.fts_query_error",
         "robot.policy_denied",
+        "robot.require_approval",
+        "robot.approval_error",
+        "robot.rate_limited",
         "robot.pane_not_found",
+        "robot.reservation_conflict",
         "robot.workflow_error",
+        "robot.internal_error",
         "robot.timeout"
       ]
     }
