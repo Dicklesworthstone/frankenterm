@@ -422,6 +422,13 @@ impl SessionReplayGuard {
 
         Ok(())
     }
+
+    /// Remove a tracked session explicitly.
+    ///
+    /// Returns `true` when a session was present and removed.
+    pub fn remove(&mut self, session_id: &str) -> bool {
+        self.sessions.remove(session_id).is_some()
+    }
 }
 
 #[cfg(feature = "distributed")]
@@ -1650,6 +1657,16 @@ mod tests {
             guard.validate("session-b", 1).expect_err("session limit"),
             DistributedSecurityError::SessionLimitReached
         );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn replay_guard_remove_frees_capacity_for_new_session() {
+        let mut guard = SessionReplayGuard::new(1);
+        assert!(guard.validate("session-a", 1).is_ok());
+        assert!(guard.remove("session-a"));
+        assert!(!guard.remove("missing"));
+        assert!(guard.validate("session-b", 1).is_ok());
     }
 
     #[cfg(feature = "distributed")]

@@ -1,18 +1,10 @@
-//! Streaming event subscriptions with filtering, cursors, and wait primitives.
+//! Streaming event subscriptions, filters, cursors, and wait primitives.
 //!
-//! Provides deterministic, resumable event streams for autonomous agent
-//! coordination. Agents can subscribe to filtered event streams with cursor
-//! checkpoints, replay from storage, and condition-based wait primitives.
-//!
-//! # Architecture
-//!
-//! The streaming layer bridges two event sources:
-//! 1. **Storage** — Historical events persisted in SQLite (cursor-based replay)
-//! 2. **EventBus** — Live events from the broadcast bus (real-time)
-//!
-//! A `FilteredEventStream` first drains historical events from storage
-//! (starting from a cursor), then seamlessly transitions to live bus events.
-//! This ensures no events are missed during the handoff.
+//! This module currently provides live `EventBus` subscriptions plus reusable
+//! filter and wait-condition types that are shared with storage-backed event
+//! query surfaces elsewhere in the crate. `FilteredEventStream` itself is a
+//! live-bus stream; cursor metadata is tracked for callers, but historical
+//! replay is handled by `storage.rs` rather than this type.
 //!
 //! # Example
 //!
@@ -103,9 +95,11 @@ impl Default for StreamCursor {
 
 /// Predicate-based filter for event streams.
 ///
-/// Filters are applied both to storage queries (push-down) and to live bus
-/// events (in-memory). An event must match ALL specified criteria (AND logic).
-/// Empty filter fields match everything.
+/// The same shape is reused by both storage-backed event queries and live bus
+/// subscriptions. Live in-memory matching only evaluates predicates that can
+/// be derived from the `Event` payload itself. Time-range predicates are for
+/// storage/query surfaces; live `Event` variants do not carry a uniform event
+/// timestamp.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventStreamFilter {
     /// Filter to events from these pane IDs (empty = all panes)
@@ -118,9 +112,9 @@ pub struct EventStreamFilter {
     pub min_severity: Option<SeverityLevel>,
     /// Only unhandled events
     pub unhandled_only: bool,
-    /// Time range: events after this epoch ms (inclusive)
+    /// Storage/query time range: events after this epoch ms (inclusive)
     pub since_ms: Option<i64>,
-    /// Time range: events before this epoch ms (exclusive)
+    /// Storage/query time range: events before this epoch ms (exclusive)
     pub until_ms: Option<i64>,
 }
 
@@ -609,12 +603,18 @@ impl AllOfTracker {
 
     /// Check if an event satisfies any remaining condition.
     ///
-    /// Returns true when all conditions have been satisfied.
+    /// A single event may satisfy multiple remaining conditions. Returns true
+    /// when all conditions have been satisfied.
     pub fn check(&mut self, event: &Event) -> bool {
-        if let Some(idx) = self.remaining.iter().position(|c| c.matches(event)) {
-            self.remaining.remove(idx);
-            self.matched_events.push(event.clone());
+        let mut still_remaining = Vec::with_capacity(self.remaining.len());
+        for condition in self.remaining.drain(..) {
+            if condition.matches(event) {
+                self.matched_events.push(event.clone());
+            } else {
+                still_remaining.push(condition);
+            }
         }
+        self.remaining = still_remaining;
         self.remaining.is_empty()
     }
 
@@ -638,21 +638,20 @@ impl AllOfTracker {
 }
 
 // =============================================================================
-// FilteredEventStream — Cursor-based streaming with filter push-down
+// FilteredEventStream — Live streaming with caller-managed cursor metadata
 // =============================================================================
 
-/// A filtered, cursor-based event stream.
+/// A filtered live event stream backed by an `EventBus` subscription.
 ///
-/// Combines storage replay (for historical events) with live bus subscription
-/// (for new events), applying the same filter to both sources.
+/// Cursor state is maintained for callers that want to checkpoint delivered
+/// persisted detections, but this type does not perform historical replay.
+/// Storage replay and cursor-resume querying live in `storage.rs`.
 ///
 /// # Ordering Guarantees
 ///
-/// - Historical events are ordered by ascending storage ID (deterministic).
 /// - Live events arrive in publish order (broadcast channel FIFO).
-/// - The transition from historical to live is seamless: the cursor tracks
-///   the last historical event ID, and the bus subscription starts before
-///   the storage query completes to avoid gaps.
+/// - Cursor advancement is monotonic for persisted detections that carry an
+///   `event_id`.
 pub struct FilteredEventStream {
     /// Filter applied to all events.
     filter: EventStreamFilter,
@@ -660,7 +659,8 @@ pub struct FilteredEventStream {
     cursor: StreamCursor,
     /// Live event subscriber.
     subscriber: EventSubscriber,
-    /// Maximum events per batch (for bounded replay).
+    /// Configured replay batch hint retained for callers that coordinate with
+    /// storage-backed replay surfaces.
     batch_size: usize,
     /// Telemetry: total events delivered.
     delivered: Arc<AtomicU64>,
@@ -674,8 +674,8 @@ impl FilteredEventStream {
     /// # Arguments
     /// * `bus` - The event bus to subscribe to for live events
     /// * `filter` - Predicate filter for events
-    /// * `cursor` - Starting position (use `StreamCursor::from_beginning()` for all)
-    /// * `batch_size` - Max events per batch when replaying from storage
+    /// * `cursor` - Caller-managed checkpoint metadata
+    /// * `batch_size` - Replay batch hint for external storage-backed callers
     #[must_use]
     pub fn new(
         bus: &EventBus,
@@ -763,7 +763,7 @@ impl FilteredEventStream {
         &self.filter
     }
 
-    /// Get the batch size for storage replay.
+    /// Get the configured replay batch hint.
     #[must_use]
     pub fn batch_size(&self) -> usize {
         self.batch_size
@@ -1266,6 +1266,20 @@ mod tests {
         assert!(!tracker.is_complete());
     }
 
+    #[test]
+    fn all_of_tracker_single_event_can_satisfy_multiple_conditions() {
+        let mut tracker = AllOfTracker::new(vec![
+            WaitCondition::rule_id("target"),
+            WaitCondition::pane_detection(7),
+        ]);
+        let event = make_pattern_event(7, "target", None);
+
+        assert!(tracker.check(&event));
+        assert!(tracker.is_complete());
+        assert_eq!(tracker.remaining_count(), 0);
+        assert_eq!(tracker.matched_events().len(), 2);
+    }
+
     // --- WaitResult tests ---
 
     #[test]
@@ -1424,6 +1438,41 @@ mod tests {
                     assert!(matches!(
                         *event,
                         Event::PatternDetected { detection, .. } if detection.rule_id == "b"
+                    ));
+                }
+                other => panic!("expected matched result, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn event_waiter_all_of_matches_multiple_conditions_from_one_event() {
+        run_async_test(async {
+            let bus = Arc::new(EventBus::new(16));
+            let waiter = EventWaiter::new(WaitCondition::AllOf {
+                conditions: vec![
+                    WaitCondition::rule_id("target"),
+                    WaitCondition::pane_detection(7),
+                ],
+            })
+            .with_timeout(Duration::from_secs(1));
+            let wait_bus = Arc::clone(&bus);
+
+            let wait_task =
+                crate::runtime_compat::task::spawn(async move { waiter.wait(&wait_bus).await });
+
+            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            let _ = bus.publish(make_pattern_event(7, "target", Some(1)));
+
+            match wait_task.await.unwrap() {
+                WaitResult::Matched { event, .. } => {
+                    assert!(matches!(
+                        *event,
+                        Event::PatternDetected {
+                            pane_id: 7,
+                            detection,
+                            ..
+                        } if detection.rule_id == "target"
                     ));
                 }
                 other => panic!("expected matched result, got {other:?}"),
