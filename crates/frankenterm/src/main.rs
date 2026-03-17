@@ -11239,6 +11239,24 @@ const DISTRIBUTED_SEQUENCE_SCOPE_STALE_AFTER_MS: i64 =
     frankenterm_core::wire_protocol::DEFAULT_AGENT_STALE_AFTER_MS;
 
 #[cfg(feature = "distributed")]
+fn distributed_inferred_gap_bounds(expected: u64, actual: u64) -> (u64, u64) {
+    let seq_before = if expected == 0 {
+        0
+    } else {
+        expected.saturating_sub(1)
+    };
+    (seq_before, actual)
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_seq_gap_reason(sender: &str, expected: u64, actual: u64) -> String {
+    let (seq_before, seq_after) = distributed_inferred_gap_bounds(expected, actual);
+    format!(
+        "distributed_gap:distributed_seq_gap:sender={sender}:expected={expected}:actual={actual}:{seq_before}:{seq_after}"
+    )
+}
+
+#[cfg(feature = "distributed")]
 async fn distributed_register_sequence_scope(
     ingest_state: &DistributedIngestState,
     sequence_scope: &str,
@@ -11582,9 +11600,10 @@ async fn distributed_persist_payload(
                     ));
                 } else {
                     if delta.seq > expected {
-                        gap_reason = Some(format!(
-                            "distributed_seq_gap:sender={canonical_sender}:expected={expected}:actual={}",
-                            delta.seq
+                        gap_reason = Some(distributed_seq_gap_reason(
+                            &canonical_sender,
+                            expected,
+                            delta.seq,
                         ));
                     }
                     seq_guard.insert(seq_key, delta.seq);
@@ -12028,14 +12047,21 @@ async fn distributed_handle_connection<S>(
 
         let sender = canonical_sender;
         let session_scope = distributed_sender_session_scope(&session_id, &sender);
-        if connection_sequence_scopes.insert(session_scope.clone()) {
-            distributed_register_sequence_scope(&ingest_state, &session_scope, &replay_id).await;
-        }
         envelope.sender = session_scope.clone();
         let ingest_result = {
             let mut aggregator = ingest_state.aggregator.lock().await;
             aggregator.ingest_envelope(envelope)
         };
+        if matches!(
+            &ingest_result,
+            Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
+        ) {
+            let mut replay_guard = ingest_state.replay_guard.lock().await;
+            replay_guard.remove(&replay_id);
+        }
+        if ingest_result.is_ok() && connection_sequence_scopes.insert(session_scope.clone()) {
+            distributed_register_sequence_scope(&ingest_state, &session_scope, &replay_id).await;
+        }
 
         match ingest_result {
             Ok(frankenterm_core::wire_protocol::IngestResult::Duplicate { sender, seq }) => {
@@ -41863,6 +41889,80 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
+    fn distributed_persist_payload_initial_seq_gap_records_explicit_bounds() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_persist_payload_initial_seq_gap").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-initial-gap";
+            let source_pane_id = 61_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let marker = "DIST_PERSIST_PAYLOAD_INITIAL_GAP";
+
+            distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 4,
+                        content: marker.to_string(),
+                        content_len: marker.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let gaps = storage_handle.get_gaps().await.unwrap();
+                let gap = gaps
+                    .iter()
+                    .find(|gap| gap.pane_id == remote_pane_id)
+                    .expect("initial seq gap should be persisted with explicit bounds");
+                assert_eq!(gap.seq_before, 0);
+                assert_eq!(gap.seq_after, 4);
+                assert!(
+                    gap.reason.contains(
+                        "distributed_seq_gap:sender=agent-initial-gap:expected=0:actual=4"
+                    ),
+                    "stored gap reason should preserve the remote seq-gap diagnostic"
+                );
+
+                let segments = storage_handle
+                    .get_segments(remote_pane_id, 8)
+                    .await
+                    .unwrap();
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].content, marker);
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
     fn distributed_release_sequence_scopes_preserves_pane_ordering_across_same_session_reconnect() {
         run_async_test(async {
             let ingest_state = DistributedIngestState::new();
@@ -44468,6 +44568,93 @@ recorder_backend = "frankensqlite"
                 replay_guard
                     .validate(&replay_id, 1)
                     .expect("stale-pruned replay state should accept a fresh session");
+            }
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_capacity_reject_does_not_poison_replay_retry() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState {
+                aggregator: frankenterm_core::runtime_compat::Mutex::new(
+                    frankenterm_core::wire_protocol::Aggregator::with_stale_after(1, 0),
+                ),
+                replay_guard: frankenterm_core::runtime_compat::Mutex::new(
+                    frankenterm_core::distributed::SessionReplayGuard::new(8),
+                ),
+                active_sequence_scopes: frankenterm_core::runtime_compat::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+                pane_seq_by_sender: frankenterm_core::runtime_compat::Mutex::new(
+                    std::collections::HashMap::new(),
+                ),
+            };
+            let occupied_scope = "occupied.scope";
+            let replay_id = distributed_replay_session_key("session-capacity", "agent-capacity");
+            let session_scope =
+                distributed_sender_session_scope("session-capacity", "agent-capacity");
+
+            {
+                let mut aggregator = ingest_state.aggregator.lock().await;
+                aggregator
+                    .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
+                        1,
+                        occupied_scope,
+                        frankenterm_core::wire_protocol::WirePayload::Gap(
+                            frankenterm_core::wire_protocol::GapNotice {
+                                pane_id: 1,
+                                seq_before: 0,
+                                seq_after: 1,
+                                reason: "occupied".to_string(),
+                                detected_at_ms: now_ms_i64(),
+                            },
+                        ),
+                    ))
+                    .expect("seed aggregator to capacity");
+            }
+
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                replay_guard
+                    .validate(&replay_id, 1)
+                    .expect("first attempt should reserve replay state");
+            }
+
+            let ingest_result = {
+                let mut aggregator = ingest_state.aggregator.lock().await;
+                aggregator.ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
+                    1,
+                    &session_scope,
+                    frankenterm_core::wire_protocol::WirePayload::Gap(
+                        frankenterm_core::wire_protocol::GapNotice {
+                            pane_id: 2,
+                            seq_before: 0,
+                            seq_after: 1,
+                            reason: "capacity".to_string(),
+                            detected_at_ms: now_ms_i64(),
+                        },
+                    ),
+                ))
+            };
+
+            assert!(matches!(
+                ingest_result,
+                Err(frankenterm_core::wire_protocol::WireProtocolError::TooManyAgents { .. })
+            ));
+
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                assert_eq!(
+                    replay_guard
+                        .validate(&replay_id, 1)
+                        .expect_err("capacity rejection without rollback poisons replay retry"),
+                    frankenterm_core::distributed::DistributedSecurityError::ReplayDetected
+                );
+                replay_guard.remove(&replay_id);
+                replay_guard
+                    .validate(&replay_id, 1)
+                    .expect("capacity rejection rollback should allow retrying the same seq");
             }
         });
     }

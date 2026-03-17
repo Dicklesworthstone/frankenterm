@@ -199,9 +199,8 @@ impl DistributedBridge {
         let expected = self
             .pane_seq_by_pane
             .get(&delta.pane_id)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+            .map(|last_seen| last_seen.saturating_add(1))
+            .unwrap_or(0);
 
         if delta.seq < expected {
             // Out-of-order/duplicate at pane stream level: record deterministic diagnostic gap.
@@ -219,10 +218,7 @@ impl DistributedBridge {
 
         if delta.seq > expected {
             // Discontinuity in remote pane sequence: preserve it as explicit gap before persisting.
-            let reason = format!(
-                "distributed_seq_gap:expected={expected}:actual={}",
-                delta.seq
-            );
+            let reason = inferred_seq_gap_reason(expected, delta.seq);
             let _ = self.storage.record_gap(delta.pane_id, &reason).await?;
             self.diagnostics.pane_seq_gap_repairs += 1;
         }
@@ -301,6 +297,22 @@ fn pane_delta(pane_id: u64, seq: u64, content: &str) -> PaneDelta {
         content_len: content.len(),
         captured_at_ms: now_ms(),
     }
+}
+
+fn inferred_gap_bounds(expected: u64, actual: u64) -> (u64, u64) {
+    let seq_before = if expected == 0 {
+        0
+    } else {
+        expected.saturating_sub(1)
+    };
+    (seq_before, actual)
+}
+
+fn inferred_seq_gap_reason(expected: u64, actual: u64) -> String {
+    let (seq_before, seq_after) = inferred_gap_bounds(expected, actual);
+    format!(
+        "distributed_gap:distributed_seq_gap:expected={expected}:actual={actual}:{seq_before}:{seq_after}"
+    )
 }
 
 fn detection_notice(pane_id: u64) -> DetectionNotice {
@@ -561,6 +573,56 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
                 "search_hits": search_hits.len()
             }),
         );
+    });
+}
+
+#[test]
+fn distributed_streaming_e2e_initial_seq_gap_is_persisted_before_first_delta() {
+    run_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("distributed_streaming_initial_gap.db");
+        let mut bridge = DistributedBridge::new(db_path.to_str().expect("db path"))
+            .await
+            .expect("bridge");
+
+        let sender = "agent-initial-gap";
+        bridge
+            .ingest_envelope(WireEnvelope::new(
+                1,
+                sender,
+                WirePayload::PaneMeta(pane_meta(13)),
+            ))
+            .await
+            .expect("meta");
+        bridge
+            .ingest_envelope(WireEnvelope::new(
+                2,
+                sender,
+                WirePayload::PaneDelta(pane_delta(13, 4, "INITIAL_GAP_MARKER payload")),
+            ))
+            .await
+            .expect("delta after initial gap");
+
+        let gaps = bridge.storage.get_gaps().await.expect("gaps");
+        let gap = gaps
+            .iter()
+            .find(|gap| gap.pane_id == 13)
+            .expect("initial seq gap should be persisted");
+        assert_eq!(gap.seq_before, 0);
+        assert_eq!(gap.seq_after, 4);
+        assert!(
+            gap.reason
+                .contains("distributed_seq_gap:expected=0:actual=4"),
+            "gap reason should preserve the inferred initial seq-gap diagnostic"
+        );
+
+        let hits = bridge
+            .storage
+            .search("INITIAL_GAP_MARKER")
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 1);
     });
 }
 
