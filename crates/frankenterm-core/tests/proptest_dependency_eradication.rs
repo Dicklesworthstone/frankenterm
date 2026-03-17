@@ -11,6 +11,18 @@ use proptest::prelude::*;
 // Strategies
 // =============================================================================
 
+fn standard_surface_keep_count() -> usize {
+    frankenterm_core::runtime_compat::SURFACE_CONTRACT_V1
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.disposition,
+                frankenterm_core::runtime_compat::SurfaceDisposition::Keep
+            )
+        })
+        .count()
+}
+
 fn arb_forbidden_runtime() -> impl Strategy<Value = ForbiddenRuntime> {
     prop_oneof![
         Just(ForbiddenRuntime::Tokio),
@@ -467,7 +479,7 @@ proptest! {
         retire in 0..50usize,
     ) {
         let status = SurfaceContractStatus {
-            keep_count: 10,
+            keep_count: standard_surface_keep_count(),
             replace_count: replace,
             retire_count: retire,
             replaced_count: replace,
@@ -484,7 +496,7 @@ proptest! {
     ) {
         let replaced = done.min(replace - 1); // ensure at least 1 pending
         let status = SurfaceContractStatus {
-            keep_count: 10,
+            keep_count: standard_surface_keep_count(),
             replace_count: replace,
             retire_count: 0,
             replaced_count: replaced,

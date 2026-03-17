@@ -865,6 +865,23 @@ impl AlignmentReport {
 mod tests {
     use super::*;
 
+    fn standard_surface_contract_counts() -> (usize, usize, usize) {
+        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
+            (0, 0, 0),
+            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
+                crate::runtime_compat::SurfaceDisposition::Keep => {
+                    (keep_count + 1, replace_count, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Replace => {
+                    (keep_count, replace_count + 1, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Retire => {
+                    (keep_count, replace_count, retire_count + 1)
+                }
+            },
+        )
+    }
+
     // -------------------------------------------------------------------------
     // 1. dep_section_variants
     // -------------------------------------------------------------------------
@@ -1195,6 +1212,7 @@ mod tests {
     #[test]
     fn alignment_report_fully_aligned() {
         let mut report = AlignmentReport::new("full-aligned", 0);
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
 
         // Plan with all steps complete
         let mut plan = EradicationPlan::standard();
@@ -1214,11 +1232,11 @@ mod tests {
 
         // Surface fully resolved
         report.set_surface_status(SurfaceContractStatus {
-            keep_count: 5,
-            replace_count: 3,
-            retire_count: 2,
-            replaced_count: 3,
-            retired_count: 2,
+            keep_count,
+            replace_count,
+            retire_count,
+            replaced_count: replace_count,
+            retired_count: retire_count,
         });
 
         report.finalize();
@@ -1236,6 +1254,7 @@ mod tests {
     #[test]
     fn alignment_report_partially_aligned() {
         let mut report = AlignmentReport::new("partial", 0);
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
 
         // Zero steps complete
         let plan = EradicationPlan::standard();
@@ -1246,9 +1265,9 @@ mod tests {
 
         // Surface not resolved
         report.set_surface_status(SurfaceContractStatus {
-            keep_count: 5,
-            replace_count: 3,
-            retire_count: 2,
+            keep_count,
+            replace_count,
+            retire_count,
             replaced_count: 0,
             retired_count: 0,
         });
@@ -1270,12 +1289,13 @@ mod tests {
     #[test]
     fn alignment_report_summary_format() {
         let mut report = AlignmentReport::new("summary-test", 0);
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
         report.set_plan(EradicationPlan::standard());
         report.set_feature_alignments(standard_feature_alignments());
         report.set_surface_status(SurfaceContractStatus {
-            keep_count: 10,
-            replace_count: 5,
-            retire_count: 3,
+            keep_count,
+            replace_count,
+            retire_count,
             replaced_count: 0,
             retired_count: 0,
         });

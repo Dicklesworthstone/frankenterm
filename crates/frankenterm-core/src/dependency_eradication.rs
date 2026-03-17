@@ -695,6 +695,23 @@ impl MigrationReport {
 mod tests {
     use super::*;
 
+    fn standard_surface_contract_counts() -> (usize, usize, usize) {
+        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
+            (0, 0, 0),
+            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
+                crate::runtime_compat::SurfaceDisposition::Keep => {
+                    (keep_count + 1, replace_count, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Replace => {
+                    (keep_count, replace_count + 1, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Retire => {
+                    (keep_count, replace_count, retire_count + 1)
+                }
+            },
+        )
+    }
+
     #[test]
     fn test_standard_forbidden_patterns() {
         let patterns = standard_forbidden_patterns();
@@ -909,24 +926,37 @@ mod tests {
 
     #[test]
     fn test_surface_contract_status() {
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
+        assert!(
+            replace_count + retire_count > 0,
+            "standard surface contract should include transitional surfaces"
+        );
+
         let status = SurfaceContractStatus {
-            keep_count: 10,
-            replace_count: 5,
-            retire_count: 3,
-            replaced_count: 5,
-            retired_count: 2,
+            keep_count,
+            replace_count,
+            retire_count,
+            replaced_count: if retire_count == 0 {
+                replace_count - 1
+            } else {
+                replace_count
+            },
+            retired_count: retire_count.saturating_sub(1),
         };
 
         assert!(!status.all_transitional_resolved()); // 1 retire remaining
         assert_eq!(status.remaining_transitional(), 1);
-        assert_eq!(status.total_count(), 18);
+        assert_eq!(
+            status.total_count(),
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
+        );
 
         let complete = SurfaceContractStatus {
-            keep_count: 10,
-            replace_count: 5,
-            retire_count: 3,
-            replaced_count: 5,
-            retired_count: 3,
+            keep_count,
+            replace_count,
+            retire_count,
+            replaced_count: replace_count,
+            retired_count: retire_count,
         };
         assert!(complete.all_transitional_resolved());
         assert_eq!(complete.remaining_transitional(), 0);
