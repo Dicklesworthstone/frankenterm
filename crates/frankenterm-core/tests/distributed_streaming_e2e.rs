@@ -352,7 +352,7 @@ fn distributed_streaming_e2e_happy_path_persists_and_is_queryable() {
             .ingest_envelope(WireEnvelope::new(
                 2,
                 sender,
-                WirePayload::PaneDelta(pane_delta(7, 1, "DIST_STREAM_MARKER line one")),
+                WirePayload::PaneDelta(pane_delta(7, 0, "DIST_STREAM_MARKER line one")),
             ))
             .await
             .expect("delta 1");
@@ -360,7 +360,7 @@ fn distributed_streaming_e2e_happy_path_persists_and_is_queryable() {
             .ingest_envelope(WireEnvelope::new(
                 3,
                 sender,
-                WirePayload::PaneDelta(pane_delta(7, 2, "DIST_STREAM_MARKER line two")),
+                WirePayload::PaneDelta(pane_delta(7, 1, "DIST_STREAM_MARKER line two")),
             ))
             .await
             .expect("delta 2");
@@ -379,6 +379,7 @@ fn distributed_streaming_e2e_happy_path_persists_and_is_queryable() {
             .search("DIST_STREAM_MARKER")
             .await
             .expect("search");
+        let gaps = bridge.storage.get_gaps().await.expect("gaps");
         let events = bridge
             .storage
             .get_events(EventQuery {
@@ -390,7 +391,12 @@ fn distributed_streaming_e2e_happy_path_persists_and_is_queryable() {
 
         assert!(panes.iter().any(|pane| pane.pane_id == 7));
         assert_eq!(hits.len(), 2);
+        assert!(
+            gaps.is_empty(),
+            "happy-path first segment should not synthesize a distributed seq gap"
+        );
         assert_eq!(events.len(), 1);
+        assert_eq!(bridge.diagnostics.pane_seq_gap_repairs, 0);
 
         emit_artifact(
             "agent_log",
@@ -456,7 +462,7 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
             .ingest_envelope(WireEnvelope::new(
                 2,
                 sender,
-                WirePayload::PaneDelta(pane_delta(9, 1, "ROBUST_MARKER first")),
+                WirePayload::PaneDelta(pane_delta(9, 0, "ROBUST_MARKER first")),
             ))
             .await
             .expect("delta1");
@@ -466,7 +472,7 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
                 sender,
                 WirePayload::Gap(frankenterm_core::wire_protocol::GapNotice {
                     pane_id: 9,
-                    seq_before: 1,
+                    seq_before: 0,
                     seq_after: 3,
                     reason: "upstream_disconnect".to_string(),
                     detected_at_ms: now_ms(),
@@ -558,7 +564,7 @@ fn distributed_streaming_e2e_preserves_gap_and_handles_duplicate_out_of_order() 
             serde_json::json!({
                 "sender": sender,
                 "sequence_plan": [1,2,3,4,4,5],
-                "pane_seq_plan": [1,1,3,3,3,2],
+                "pane_seq_plan": [0,0,3,3,3,2],
                 "result": "robustness_validated"
             }),
         );
@@ -721,7 +727,7 @@ fn distributed_streaming_e2e_rejects_invalid_sender_and_recovers_with_valid_send
             .ingest_envelope(WireEnvelope::new(
                 3,
                 "agent-valid",
-                WirePayload::PaneDelta(pane_delta(31, 1, "INVALID_SENDER_RECOVERY_MARKER")),
+                WirePayload::PaneDelta(pane_delta(31, 0, "INVALID_SENDER_RECOVERY_MARKER")),
             ))
             .await
             .expect("valid sender delta");
