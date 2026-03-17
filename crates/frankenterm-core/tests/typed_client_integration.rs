@@ -979,6 +979,8 @@ fn representative_public_error_codes_parse_correctly() {
         ("robot.policy_denied", ErrorCategory::Policy, false),
         ("robot.require_approval", ErrorCategory::Policy, false),
         ("robot.rate_limited", ErrorCategory::Policy, true),
+        ("robot.workflow_aborted", ErrorCategory::Workflow, false),
+        ("robot.workflow_error", ErrorCategory::Workflow, false),
         ("robot.workflow_not_found", ErrorCategory::Workflow, false),
         ("robot.mission_error", ErrorCategory::Workflow, false),
         ("robot.tx_error", ErrorCategory::Workflow, false),

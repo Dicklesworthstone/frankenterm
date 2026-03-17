@@ -1964,6 +1964,8 @@ mod tests {
             "robot.wezterm_not_found",
             "robot.reservation_conflict",
             "robot.require_approval",
+            "robot.workflow_aborted",
+            "robot.workflow_error",
             "robot.workflow_not_found",
             "robot.internal_error",
         ] {
@@ -2005,6 +2007,16 @@ mod tests {
         assert_eq!(
             ErrorCode::parse("robot.policy_denied").unwrap().category(),
             ErrorCategory::Policy
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.workflow_aborted")
+                .unwrap()
+                .category(),
+            ErrorCategory::Workflow
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.workflow_error").unwrap().category(),
+            ErrorCategory::Workflow
         );
         assert_eq!(
             ErrorCode::parse("robot.workflow_not_found")
@@ -2907,6 +2919,8 @@ mod tests {
             "robot.reservation_conflict",
             "robot.policy_denied",
             "robot.require_approval",
+            "robot.workflow_aborted",
+            "robot.workflow_error",
             "robot.workflow_not_found",
             "robot.config_error",
             "robot.internal_error",
@@ -3248,6 +3262,8 @@ mod tests {
             "robot.policy_denied",
             "robot.require_approval",
             "robot.rate_limited",
+            "robot.workflow_aborted",
+            "robot.workflow_error",
             "robot.workflow_not_found",
             "robot.mission_error",
             "robot.tx_error",

@@ -526,6 +526,8 @@ const STANDARD_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.reservation_conflict",
     "robot.event_not_found",
     "robot.rule_not_found",
+    "robot.workflow_aborted",
+    "robot.workflow_error",
     "robot.workflow_not_found",
     "robot.code_not_found",
     "robot.invalid_service",
@@ -594,6 +596,10 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.reservation_conflict" => "Pane is already reserved by another owner",
         "robot.event_not_found" => "Requested event ID does not exist",
         "robot.rule_not_found" => "Requested rule ID does not exist",
+        "robot.workflow_aborted" => {
+            "Workflow execution stopped before completion without a policy denial"
+        }
+        "robot.workflow_error" => "Workflow execution failed with an unrecoverable runtime error",
         "robot.workflow_not_found" => "Requested workflow name is not registered or available",
         "robot.code_not_found" => "Requested explanation code has no matching template entry",
         "robot.invalid_service" => "Requested external service identifier is not supported",

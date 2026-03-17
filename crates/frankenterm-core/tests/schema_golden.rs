@@ -127,9 +127,12 @@ fn schema_files_have_required_fields() {
 
         // Data schemas (not envelope) should have type: "object"
         if name != "wa-robot-envelope.json" {
-            // Most schemas should have a type field
-            let has_type = schema.get("type").is_some();
-            assert!(has_type, "{name} missing 'type'");
+            let schema_type = schema.get("type").and_then(Value::as_str);
+            assert_eq!(
+                schema_type,
+                Some("object"),
+                "{name} should have type 'object'"
+            );
         }
     }
 }
@@ -572,6 +575,8 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
         "robot.reservation_conflict",
         "robot.event_not_found",
         "robot.rule_not_found",
+        "robot.workflow_aborted",
+        "robot.workflow_error",
         "robot.workflow_not_found",
         "robot.code_not_found",
         "robot.invalid_service",

@@ -37,6 +37,8 @@ const KNOWN_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.policy_denied",
     "robot.require_approval",
     "robot.rate_limited",
+    "robot.workflow_aborted",
+    "robot.workflow_error",
     "robot.workflow_not_found",
     "robot.mission_error",
     "robot.tx_error",
@@ -92,6 +94,14 @@ fn arb_known_error_code_with_category() -> impl Strategy<Value = (ErrorCode, Err
         Just((
             ErrorCode::parse("robot.require_approval").unwrap(),
             ErrorCategory::Policy
+        )),
+        Just((
+            ErrorCode::parse("robot.workflow_aborted").unwrap(),
+            ErrorCategory::Workflow
+        )),
+        Just((
+            ErrorCode::parse("robot.workflow_error").unwrap(),
+            ErrorCategory::Workflow
         )),
         Just((
             ErrorCode::parse("robot.workflow_not_found").unwrap(),
@@ -150,6 +160,8 @@ fn arb_known_error_code_with_retryability() -> impl Strategy<Value = (ErrorCode,
         Just((ErrorCode::parse("robot.rule_not_found").unwrap(), false)),
         Just((ErrorCode::parse("robot.storage_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.policy_denied").unwrap(), false)),
+        Just((ErrorCode::parse("robot.workflow_aborted").unwrap(), false)),
+        Just((ErrorCode::parse("robot.workflow_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.workflow_not_found").unwrap(), false)),
         Just((ErrorCode::parse("robot.mission_error").unwrap(), false)),
         Just((ErrorCode::parse("robot.tx_error").unwrap(), false)),

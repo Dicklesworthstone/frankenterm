@@ -78,6 +78,8 @@
         "robot.reservation_conflict",
         "robot.event_not_found",
         "robot.rule_not_found",
+        "robot.workflow_aborted",
+        "robot.workflow_error",
         "robot.workflow_not_found",
         "robot.code_not_found",
         "robot.invalid_service",
