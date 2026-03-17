@@ -136,27 +136,7 @@ impl WireEnvelope {
         }
         let envelope: Self =
             serde_json::from_slice(bytes).map_err(WireProtocolError::InvalidJson)?;
-        if envelope.version != PROTOCOL_VERSION {
-            return Err(WireProtocolError::VersionMismatch {
-                expected: PROTOCOL_VERSION,
-                got: envelope.version,
-            });
-        }
-        validate_sender_identity(&envelope.sender)?;
-        // Validate content_len matches actual content for PaneDelta payloads.
-        // The sender may set content_len != content.len() (accidentally or
-        // maliciously), which could mislead downstream buffer allocation.
-        if let WirePayload::PaneDelta(ref delta) = envelope.payload {
-            if !delta.content.is_empty() && delta.content_len != delta.content.len() {
-                return Err(WireProtocolError::InvalidJson(
-                    serde_json::Error::custom(format!(
-                        "PaneDelta content_len ({}) does not match content length ({})",
-                        delta.content_len,
-                        delta.content.len()
-                    )),
-                ));
-            }
-        }
+        validate_envelope_protocol(&envelope)?;
         Ok(envelope)
     }
 }
@@ -319,12 +299,14 @@ impl AgentStreamer {
             Event::SegmentCaptured {
                 pane_id,
                 seq,
-                content_len,
+                content_len: _,
             } => Some(WirePayload::PaneDelta(PaneDelta {
                 pane_id: *pane_id,
                 seq: *seq,
-                content: String::new(), // Content not in bus event; caller fills from storage
-                content_len: *content_len,
+                // Content is not carried on the bus event; callers that want to
+                // emit a real wire delta must fill both fields from storage.
+                content: String::new(),
+                content_len: 0,
                 captured_at_ms: epoch_ms_now(),
             })),
 
@@ -480,7 +462,7 @@ impl Aggregator {
         envelope: WireEnvelope,
         received_at_ms: i64,
     ) -> Result<IngestResult, WireProtocolError> {
-        if let Err(err) = validate_sender_identity(&envelope.sender) {
+        if let Err(err) = validate_envelope_protocol(&envelope) {
             self.total_rejected = self.total_rejected.saturating_add(1);
             return Err(err);
         }
@@ -530,6 +512,13 @@ impl Aggregator {
     #[must_use]
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// Remove a tracked sender session explicitly.
+    ///
+    /// Returns `true` when a session was present and removed.
+    pub fn remove_agent(&mut self, sender: &str) -> bool {
+        self.agents.remove(sender).is_some()
     }
 
     /// Total accepted messages across all agents.
@@ -600,6 +589,28 @@ fn validate_sender_identity(sender: &str) -> Result<(), WireProtocolError> {
             sender: sender.to_string(),
             reason: "sender contains invalid characters",
         });
+    }
+    Ok(())
+}
+
+fn validate_envelope_protocol(envelope: &WireEnvelope) -> Result<(), WireProtocolError> {
+    if envelope.version != PROTOCOL_VERSION {
+        return Err(WireProtocolError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            got: envelope.version,
+        });
+    }
+    validate_sender_identity(&envelope.sender)?;
+    if let WirePayload::PaneDelta(delta) = &envelope.payload {
+        if delta.content_len != delta.content.len() {
+            return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
+                format!(
+                    "PaneDelta content_len ({}) does not match content length ({})",
+                    delta.content_len,
+                    delta.content.len()
+                ),
+            )));
+        }
     }
     Ok(())
 }
@@ -823,6 +834,42 @@ mod tests {
         assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
     }
 
+    #[test]
+    fn rejects_pane_delta_content_len_mismatch_with_nonempty_content() {
+        let envelope = WireEnvelope::new(
+            1,
+            "agent",
+            WirePayload::PaneDelta(PaneDelta {
+                pane_id: 1,
+                seq: 1,
+                content: "abc".to_string(),
+                content_len: 99,
+                captured_at_ms: 123,
+            }),
+        );
+        let bytes = envelope.to_json().unwrap();
+        let err = WireEnvelope::from_json(&bytes).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn rejects_pane_delta_content_len_mismatch_with_empty_content() {
+        let envelope = WireEnvelope::new(
+            1,
+            "agent",
+            WirePayload::PaneDelta(PaneDelta {
+                pane_id: 1,
+                seq: 1,
+                content: String::new(),
+                content_len: 1,
+                captured_at_ms: 123,
+            }),
+        );
+        let bytes = envelope.to_json().unwrap();
+        let err = WireEnvelope::from_json(&bytes).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+    }
+
     // --- Golden fixture: a known-good serialized message ---
 
     #[test]
@@ -991,7 +1038,8 @@ mod tests {
             WirePayload::PaneDelta(d) => {
                 assert_eq!(d.pane_id, 1);
                 assert_eq!(d.seq, 42);
-                assert_eq!(d.content_len, 100);
+                assert!(d.content.is_empty());
+                assert_eq!(d.content_len, 0);
             }
             other => panic!("expected PaneDelta, got: {other:?}"),
         }
@@ -1294,6 +1342,27 @@ mod tests {
     }
 
     #[test]
+    fn aggregator_remove_agent_frees_capacity_for_new_sender() {
+        let mut agg = Aggregator::new(1);
+        let first = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let second = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+
+        assert!(matches!(
+            agg.ingest_envelope(first).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert!(agg.remove_agent("agent-a"));
+        assert!(!agg.remove_agent("missing"));
+        assert_eq!(agg.agent_count(), 0);
+        assert_eq!(agg.agent_last_seq("agent-a"), None);
+        assert!(matches!(
+            agg.ingest_envelope(second).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert_eq!(agg.agent_last_seq("agent-b"), Some(1));
+    }
+
+    #[test]
     fn aggregator_rejects_malformed_input() {
         let mut agg = Aggregator::new(10);
         let result = agg.ingest(b"not json");
@@ -1350,6 +1419,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregator_ingest_envelope_rejects_pane_delta_content_len_mismatch() {
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(
+            1,
+            "agent-valid",
+            WirePayload::PaneDelta(PaneDelta {
+                pane_id: 7,
+                seq: 3,
+                content: String::new(),
+                content_len: 5,
+                captured_at_ms: 123,
+            }),
+        );
+        let err = agg
+            .ingest_envelope(envelope)
+            .expect_err("decoded envelope path must enforce PaneDelta invariants");
+        assert!(matches!(err, WireProtocolError::InvalidJson(_)));
+        assert_eq!(agg.total_rejected(), 1);
+        assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
     fn aggregator_end_to_end_with_streamer() {
         let mut streamer = AgentStreamer::new("remote-agent");
         let mut agg = Aggregator::new(10);
@@ -1376,7 +1467,11 @@ mod tests {
         ];
 
         for event in &events {
-            if let Some(envelope) = streamer.event_to_envelope(event) {
+            if let Some(mut envelope) = streamer.event_to_envelope(event) {
+                if let WirePayload::PaneDelta(delta) = &mut envelope.payload {
+                    delta.content = "streamed segment".to_string();
+                    delta.content_len = delta.content.len();
+                }
                 let bytes = envelope.to_json().unwrap();
                 let result = agg.ingest(&bytes).unwrap();
                 assert!(matches!(result, IngestResult::Accepted(_)));

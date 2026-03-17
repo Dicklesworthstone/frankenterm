@@ -9904,8 +9904,106 @@ fn usize_to_i64(value: usize, label: &str) -> Result<i64> {
     })
 }
 
+fn sql_integer_decode_error(
+    column_index: usize,
+    label: &str,
+    value: i64,
+    reason: &str,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column_index,
+        rusqlite::types::Type::Integer,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} value {value} {reason}"),
+        )),
+    )
+}
+
+fn i64_to_u64_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| sql_integer_decode_error(column_index, label, value, "is out of u64 range"))
+}
+
+fn i64_to_bool_sql(value: i64, column_index: usize, label: &str) -> rusqlite::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(sql_integer_decode_error(
+            column_index,
+            label,
+            value,
+            "must be 0 or 1",
+        )),
+    }
+}
+
 fn i64_to_usize(value: i64) -> rusqlite::Result<usize> {
     usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
+
+fn pane_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneRecord> {
+    Ok(PaneRecord {
+        pane_id: i64_to_u64_sql(row.get(0)?, 0, "panes.pane_id")?,
+        pane_uuid: row.get(1)?,
+        domain: row.get(2)?,
+        window_id: row
+            .get::<_, Option<i64>>(3)?
+            .map(|v| i64_to_u64_sql(v, 3, "panes.window_id"))
+            .transpose()?,
+        tab_id: row
+            .get::<_, Option<i64>>(4)?
+            .map(|v| i64_to_u64_sql(v, 4, "panes.tab_id"))
+            .transpose()?,
+        title: row.get(5)?,
+        cwd: row.get(6)?,
+        tty_name: row.get(7)?,
+        first_seen_at: row.get(8)?,
+        last_seen_at: row.get(9)?,
+        observed: i64_to_bool_sql(row.get(10)?, 10, "panes.observed")?,
+        ignore_reason: row.get(11)?,
+        last_decision_at: row.get(12)?,
+    })
+}
+
+fn approval_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalTokenRecord> {
+    Ok(ApprovalTokenRecord {
+        id: row.get(0)?,
+        code_hash: row.get(1)?,
+        created_at: row.get(2)?,
+        expires_at: row.get(3)?,
+        used_at: row.get(4)?,
+        workspace_id: row.get(5)?,
+        action_kind: row.get(6)?,
+        pane_id: row
+            .get::<_, Option<i64>>(7)?
+            .map(|v| i64_to_u64_sql(v, 7, "approval_tokens.pane_id"))
+            .transpose()?,
+        action_fingerprint: row.get(8)?,
+        plan_hash: row.get(9)?,
+        plan_version: row.get(10)?,
+        risk_summary: row.get(11)?,
+    })
+}
+
+fn prepared_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreparedPlanRecord> {
+    Ok(PreparedPlanRecord {
+        plan_id: row.get(0)?,
+        plan_hash: row.get(1)?,
+        workspace_id: row.get(2)?,
+        action_kind: row.get(3)?,
+        pane_id: row
+            .get::<_, Option<i64>>(4)?
+            .map(|v| i64_to_u64_sql(v, 4, "prepared_plans.pane_id"))
+            .transpose()?,
+        pane_uuid: row.get(5)?,
+        params_json: row.get(6)?,
+        plan_json: row.get(7)?,
+        requires_approval: i64_to_bool_sql(row.get(8)?, 8, "prepared_plans.requires_approval")?,
+        created_at: row.get(9)?,
+        expires_at: row.get(10)?,
+        consumed_at: row.get(11)?,
+    })
 }
 
 /// Append a segment (synchronous, called from writer thread)
@@ -10922,12 +11020,14 @@ fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearc
         id: row.get(0)?,
         name: row.get(1)?,
         query: row.get(2)?,
-        pane_id: pane_id_raw.map(|v| v as u64),
+        pane_id: pane_id_raw
+            .map(|v| i64_to_u64_sql(v, 3, "saved_searches.pane_id"))
+            .transpose()?,
         limit: row.get(4)?,
         since_mode: row.get(5)?,
         since_ms: row.get(6)?,
         schedule_interval_ms: row.get(7)?,
-        enabled: enabled != 0,
+        enabled: i64_to_bool_sql(enabled, 8, "saved_searches.enabled")?,
         last_run_at: row.get(9)?,
         last_result_count: row.get(10)?,
         last_error: row.get(11)?,
@@ -11155,7 +11255,7 @@ fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookm
     let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
     Ok(PaneBookmarkRecord {
         id: row.get(0)?,
-        pane_id: pane_id_raw as u64,
+        pane_id: i64_to_u64_sql(pane_id_raw, 1, "pane_bookmarks.pane_id")?,
         alias: row.get(2)?,
         tags,
         description: row.get(4)?,
@@ -12324,26 +12424,9 @@ fn consume_prepared_plan_sync(
                 StorageError::Database(format!("Failed to prepare prepared plan query: {e}"))
             })?;
 
-        stmt.query_row(params![plan_id, now_ms], |row| {
-            let pane_id: Option<i64> = row.get(4)?;
-            let requires: i64 = row.get(8)?;
-            Ok(PreparedPlanRecord {
-                plan_id: row.get(0)?,
-                plan_hash: row.get(1)?,
-                workspace_id: row.get(2)?,
-                action_kind: row.get(3)?,
-                pane_id: pane_id.map(|v| v as u64),
-                pane_uuid: row.get(5)?,
-                params_json: row.get(6)?,
-                plan_json: row.get(7)?,
-                requires_approval: requires != 0,
-                created_at: row.get(9)?,
-                expires_at: row.get(10)?,
-                consumed_at: row.get(11)?,
-            })
-        })
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?
+        stmt.query_row(params![plan_id, now_ms], prepared_plan_from_row)
+            .optional()
+            .map_err(|e| StorageError::Database(format!("Prepared plan query failed: {e}")))?
     };
 
     if let Some(mut record) = record {
@@ -12421,28 +12504,9 @@ fn consume_approval_token_sync(
             StorageError::Database(format!("Failed to prepare approval query: {e}"))
         })?;
 
-        stmt.query_row(rusqlite::params_from_iter(params), |row| {
-            Ok(ApprovalTokenRecord {
-                id: row.get(0)?,
-                code_hash: row.get(1)?,
-                created_at: row.get(2)?,
-                expires_at: row.get(3)?,
-                used_at: row.get(4)?,
-                workspace_id: row.get(5)?,
-                action_kind: row.get(6)?,
-                pane_id: {
-                    let val: Option<i64> = row.get(7)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                action_fingerprint: row.get(8)?,
-                plan_hash: row.get(9)?,
-                plan_version: row.get(10)?,
-                risk_summary: row.get(11)?,
-            })
-        })
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
+        stmt.query_row(rusqlite::params_from_iter(params), approval_token_from_row)
+            .optional()
+            .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
     };
 
     if let Some(mut record) = record {
@@ -12490,28 +12554,9 @@ fn get_approval_token_by_code_sync(
         .prepare(sql)
         .map_err(|e| StorageError::Database(format!("Failed to prepare approval query: {e}")))?;
 
-    stmt.query_row([code_hash, workspace_id], |row| {
-        Ok(ApprovalTokenRecord {
-            id: row.get(0)?,
-            code_hash: row.get(1)?,
-            created_at: row.get(2)?,
-            expires_at: row.get(3)?,
-            used_at: row.get(4)?,
-            workspace_id: row.get(5)?,
-            action_kind: row.get(6)?,
-            pane_id: {
-                let val: Option<i64> = row.get(7)?;
-                #[allow(clippy::cast_sign_loss)]
-                val.map(|v| v as u64)
-            },
-            action_fingerprint: row.get(8)?,
-            plan_hash: row.get(9)?,
-            plan_version: row.get(10)?,
-            risk_summary: row.get(11)?,
-        })
-    })
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")).into())
+    stmt.query_row([code_hash, workspace_id], approval_token_from_row)
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")).into())
 }
 
 /// Consume an approval token by code hash only, without fingerprint validation (synchronous)
@@ -12539,26 +12584,10 @@ fn consume_approval_token_by_code_sync(
             StorageError::Database(format!("Failed to prepare approval query: {e}"))
         })?;
 
-        stmt.query_row([code_hash, workspace_id, &now.to_string()], |row| {
-            Ok(ApprovalTokenRecord {
-                id: row.get(0)?,
-                code_hash: row.get(1)?,
-                created_at: row.get(2)?,
-                expires_at: row.get(3)?,
-                used_at: row.get(4)?,
-                workspace_id: row.get(5)?,
-                action_kind: row.get(6)?,
-                pane_id: {
-                    let val: Option<i64> = row.get(7)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                action_fingerprint: row.get(8)?,
-                plan_hash: row.get(9)?,
-                plan_version: row.get(10)?,
-                risk_summary: row.get(11)?,
-            })
-        })
+        stmt.query_row(
+            params![code_hash, workspace_id, now],
+            approval_token_from_row,
+        )
         .optional()
         .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
     };
@@ -15047,26 +15076,7 @@ fn query_approval_token_by_hash(
          FROM approval_tokens
          WHERE code_hash = ?1",
         params![code_hash],
-        |row| {
-            Ok(ApprovalTokenRecord {
-                id: row.get(0)?,
-                code_hash: row.get(1)?,
-                created_at: row.get(2)?,
-                expires_at: row.get(3)?,
-                used_at: row.get(4)?,
-                workspace_id: row.get(5)?,
-                action_kind: row.get(6)?,
-                pane_id: {
-                    let val: Option<i64> = row.get(7)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                action_fingerprint: row.get(8)?,
-                plan_hash: row.get(9)?,
-                plan_version: row.get(10)?,
-                risk_summary: row.get(11)?,
-            })
-        },
+        approval_token_from_row,
     );
 
     match result {
@@ -15106,37 +15116,7 @@ fn query_panes(conn: &Connection) -> Result<Vec<PaneRecord>> {
         .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
 
     let rows = stmt
-        .query_map([], |row| {
-            Ok(PaneRecord {
-                pane_id: {
-                    let val: i64 = row.get(0)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                pane_uuid: row.get(1)?,
-                domain: row.get(2)?,
-                window_id: {
-                    let val: Option<i64> = row.get(3)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                tab_id: {
-                    let val: Option<i64> = row.get(4)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                title: row.get(5)?,
-                cwd: row.get(6)?,
-                tty_name: row.get(7)?,
-                first_seen_at: row.get(8)?,
-                last_seen_at: row.get(9)?,
-                observed: row.get::<_, i64>(10)? != 0,
-                ignore_reason: row.get(11)?,
-                last_decision_at: row.get(12)?,
-            })
-        })
+        .query_map([], pane_record_from_row)
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
 
     let mut results = Vec::new();
@@ -15156,37 +15136,7 @@ fn query_pane(conn: &Connection, pane_id: u64) -> Result<Option<PaneRecord>> {
          first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
          FROM panes WHERE pane_id = ?1",
         [pane_id_i64],
-        |row| {
-            Ok(PaneRecord {
-                pane_id: {
-                    let val: i64 = row.get(0)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                pane_uuid: row.get(1)?,
-                domain: row.get(2)?,
-                window_id: {
-                    let val: Option<i64> = row.get(3)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                tab_id: {
-                    let val: Option<i64> = row.get(4)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    val.map(|v| v as u64)
-                },
-                title: row.get(5)?,
-                cwd: row.get(6)?,
-                tty_name: row.get(7)?,
-                first_seen_at: row.get(8)?,
-                last_seen_at: row.get(9)?,
-                observed: row.get::<_, i64>(10)? != 0,
-                ignore_reason: row.get(11)?,
-                last_decision_at: row.get(12)?,
-            })
-        },
+        pane_record_from_row,
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
@@ -15428,24 +15378,7 @@ fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<Prepar
          FROM prepared_plans
          WHERE plan_id = ?1",
         [plan_id],
-        |row| {
-            let pane_id: Option<i64> = row.get(4)?;
-            let requires: i64 = row.get(8)?;
-            Ok(PreparedPlanRecord {
-                plan_id: row.get(0)?,
-                plan_hash: row.get(1)?,
-                workspace_id: row.get(2)?,
-                action_kind: row.get(3)?,
-                pane_id: pane_id.map(|v| v as u64),
-                pane_uuid: row.get(5)?,
-                params_json: row.get(6)?,
-                plan_json: row.get(7)?,
-                requires_approval: requires != 0,
-                created_at: row.get(9)?,
-                expires_at: row.get(10)?,
-                consumed_at: row.get(11)?,
-            })
-        },
+        prepared_plan_from_row,
     )
     .optional()
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
@@ -16691,6 +16624,30 @@ mod tests {
 
         assert_eq!(pane_id, 42);
         assert_eq!(domain, "local");
+    }
+
+    #[test]
+    fn query_pane_rejects_invalid_observed_flag() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                42i64,
+                "local",
+                1_700_000_000_000i64,
+                1_700_000_000_000i64,
+                2i64
+            ],
+        )
+        .unwrap();
+
+        let err = query_pane(&conn, 42).expect_err("invalid observed flag");
+        let message = err.to_string();
+        assert!(message.contains("panes.observed"), "{message}");
+        assert!(message.contains("must be 0 or 1"), "{message}");
     }
 
     #[test]
@@ -18109,6 +18066,80 @@ mod tests {
     }
 
     #[test]
+    fn saved_search_query_rejects_negative_pane_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO saved_searches (
+                id, name, query, pane_id, \"limit\", since_mode, since_ms,
+                schedule_interval_ms, enabled, last_run_at, last_result_count, last_error,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "ss-bad-pane",
+                "bad-pane",
+                "panic",
+                -1i64,
+                10i64,
+                SAVED_SEARCH_SINCE_MODE_LAST_RUN,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                0i64,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+
+        let err = query_saved_search_by_name(&conn, "bad-pane").expect_err("negative pane id");
+        let message = err.to_string();
+        assert!(message.contains("saved_searches.pane_id"), "{message}");
+        assert!(message.contains("-1"), "{message}");
+    }
+
+    #[test]
+    fn saved_search_query_rejects_invalid_enabled_flag() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO saved_searches (
+                id, name, query, pane_id, \"limit\", since_mode, since_ms,
+                schedule_interval_ms, enabled, last_run_at, last_result_count, last_error,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "ss-bad-enabled",
+                "bad-enabled",
+                "panic",
+                Option::<i64>::None,
+                10i64,
+                SAVED_SEARCH_SINCE_MODE_LAST_RUN,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                2i64,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+
+        let err = query_saved_search_by_name(&conn, "bad-enabled").expect_err("invalid enabled");
+        let message = err.to_string();
+        assert!(message.contains("saved_searches.enabled"), "{message}");
+        assert!(message.contains("must be 0 or 1"), "{message}");
+    }
+
+    #[test]
     fn can_insert_and_consume_approval_token() {
         let mut conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
@@ -18159,6 +18190,40 @@ mod tests {
         )
         .unwrap();
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn approval_token_query_rejects_negative_pane_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO approval_tokens (
+                code_hash, created_at, expires_at, used_at, workspace_id, action_kind, pane_id,
+                action_fingerprint, plan_hash, plan_version, risk_summary
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                "sha256:bad-token",
+                now,
+                now + 10_000,
+                Option::<i64>::None,
+                "ws",
+                "send_text",
+                -3i64,
+                "sha256:fp",
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+            ],
+        )
+        .unwrap();
+
+        let err = query_approval_token_by_hash(&conn, "sha256:bad-token")
+            .expect_err("negative approval pane id");
+        let message = err.to_string();
+        assert!(message.contains("approval_tokens.pane_id"), "{message}");
+        assert!(message.contains("-3"), "{message}");
     }
 
     // =========================================================================
@@ -19142,6 +19207,79 @@ fn can_insert_and_consume_prepared_plan() {
 
     let second = consume_prepared_plan_sync(&mut conn, "plan:abcd1234", now_ms + 2).unwrap();
     assert!(second.is_none());
+}
+
+#[test]
+fn prepared_plan_query_rejects_invalid_requires_approval_flag() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+        "INSERT INTO prepared_plans (
+            plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+            plan_json, requires_approval, created_at, expires_at, consumed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            "plan:bad-approval",
+            "sha256:bad-approval",
+            "/tmp/wa",
+            "send_text",
+            Option::<i64>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "{}",
+            2i64,
+            now_ms,
+            now_ms + 60_000,
+            Option::<i64>::None,
+        ],
+    )
+    .unwrap();
+
+    let err = query_prepared_plan(&conn, "plan:bad-approval")
+        .expect_err("invalid requires_approval flag");
+    let message = err.to_string();
+    assert!(
+        message.contains("prepared_plans.requires_approval"),
+        "{message}"
+    );
+    assert!(message.contains("must be 0 or 1"), "{message}");
+}
+
+#[test]
+fn prepared_plan_query_rejects_negative_pane_id() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+        "INSERT INTO prepared_plans (
+            plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+            plan_json, requires_approval, created_at, expires_at, consumed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            "plan:bad-pane",
+            "sha256:bad-pane",
+            "/tmp/wa",
+            "send_text",
+            -9i64,
+            Option::<String>::None,
+            Option::<String>::None,
+            "{}",
+            0i64,
+            now_ms,
+            now_ms + 60_000,
+            Option::<i64>::None,
+        ],
+    )
+    .unwrap();
+
+    let err =
+        query_prepared_plan(&conn, "plan:bad-pane").expect_err("negative prepared plan pane id");
+    let message = err.to_string();
+    assert!(message.contains("prepared_plans.pane_id"), "{message}");
+    assert!(message.contains("-9"), "{message}");
 }
 
 // =========================================================================
@@ -24617,6 +24755,33 @@ mod timeline_correlation_tests {
             .unwrap();
         assert_eq!(fetched.pane_id, 99);
         assert_eq!(fetched.description.as_deref(), Some("survives restart"));
+    }
+
+    #[test]
+    fn pane_bookmark_query_rejects_negative_pane_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO pane_bookmarks (pane_id, alias, tags, description, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                -7i64,
+                "bad-bookmark",
+                Option::<String>::None,
+                Option::<String>::None,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+
+        let err =
+            query_pane_bookmark_by_alias(&conn, "bad-bookmark").expect_err("negative pane id");
+        let message = err.to_string();
+        assert!(message.contains("pane_bookmarks.pane_id"), "{message}");
+        assert!(message.contains("-7"), "{message}");
     }
 
     #[test]

@@ -78,6 +78,14 @@ fn decode_opt_usize(
     value.map(|v| decode_usize(v, field)).transpose()
 }
 
+fn decode_bool(value: i64, field: &'static str) -> Result<bool, RestoreError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RestoreError::InvalidPersistedValue { field, value }),
+    }
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -193,43 +201,52 @@ fn open_conn(db_path: &str) -> Result<Connection, RestoreError> {
 pub fn find_unclean_sessions(db_path: &str) -> Result<Vec<SessionCandidate>, RestoreError> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id
+        "SELECT session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id,
+                shutdown_clean
          FROM mux_sessions
-         WHERE shutdown_clean = 0
          ORDER BY COALESCE(last_checkpoint_at, created_at) DESC",
     )?;
 
-    let raw_candidates = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
 
-    raw_candidates
-        .into_iter()
-        .map(
-            |(session_id, created_at, last_checkpoint_at, topology_json, ft_version, host_id)| {
-                Ok(SessionCandidate {
-                    session_id,
-                    created_at: decode_u64(created_at, "mux_sessions.created_at")?,
-                    last_checkpoint_at: decode_opt_u64(
-                        last_checkpoint_at,
-                        "mux_sessions.last_checkpoint_at",
-                    )?,
-                    topology_json,
-                    ft_version,
-                    host_id,
-                })
-            },
-        )
-        .collect()
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            session_id,
+            created_at,
+            last_checkpoint_at,
+            topology_json,
+            ft_version,
+            host_id,
+            shutdown_clean,
+        ) = row?;
+        if decode_bool(shutdown_clean, "mux_sessions.shutdown_clean")? {
+            continue;
+        }
+        candidates.push(SessionCandidate {
+            session_id,
+            created_at: decode_u64(created_at, "mux_sessions.created_at")?,
+            last_checkpoint_at: decode_opt_u64(
+                last_checkpoint_at,
+                "mux_sessions.last_checkpoint_at",
+            )?,
+            topology_json,
+            ft_version,
+            host_id,
+        });
+    }
+
+    Ok(candidates)
 }
 
 /// Load the latest checkpoint for a session, including pane states.
@@ -467,7 +484,7 @@ pub fn list_sessions(db_path: &str) -> Result<Vec<SessionInfo>, RestoreError> {
                         last_checkpoint_at,
                         "mux_sessions.last_checkpoint_at",
                     )?,
-                    shutdown_clean: shutdown_clean != 0,
+                    shutdown_clean: decode_bool(shutdown_clean, "mux_sessions.shutdown_clean")?,
                     ft_version,
                     host_id,
                     checkpoint_count: decode_usize(checkpoint_count, "session_checkpoints.count")?,
@@ -580,11 +597,14 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
     let total_sessions: i64 =
         conn.query_row("SELECT COUNT(*) FROM mux_sessions", [], |row| row.get(0))?;
 
-    let unclean_sessions: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM mux_sessions WHERE shutdown_clean = 0",
-        [],
-        |row| row.get(0),
-    )?;
+    let mut shutdown_stmt = conn.prepare("SELECT shutdown_clean FROM mux_sessions")?;
+    let shutdown_rows = shutdown_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    let mut unclean_sessions = 0usize;
+    for row in shutdown_rows {
+        if !decode_bool(row?, "mux_sessions.shutdown_clean")? {
+            unclean_sessions += 1;
+        }
+    }
 
     let total_checkpoints: i64 =
         conn.query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
@@ -606,7 +626,7 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
 
     Ok(SessionDoctorReport {
         total_sessions: decode_usize(total_sessions, "mux_sessions.count")?,
-        unclean_sessions: decode_usize(unclean_sessions, "mux_sessions.unclean_count")?,
+        unclean_sessions,
         total_checkpoints: decode_usize(total_checkpoints, "session_checkpoints.count")?,
         orphaned_pane_states: decode_usize(orphaned_pane_states, "mux_pane_state.orphaned_count")?,
         total_data_bytes: decode_usize(total_data_bytes, "session_checkpoints.total_bytes_sum")?,
@@ -1310,6 +1330,27 @@ mod tests {
     }
 
     #[test]
+    fn find_unclean_sessions_rejects_invalid_shutdown_clean_flag() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["sess-bad-clean", 1000i64, topology, "0.1.0", 2i64],
+        )
+        .unwrap();
+
+        let err = find_unclean_sessions(&db_path).expect_err("invalid shutdown_clean");
+        assert!(matches!(
+            err,
+            RestoreError::InvalidPersistedValue {
+                field: "mux_sessions.shutdown_clean",
+                value: 2
+            }
+        ));
+    }
+
+    #[test]
     fn load_checkpoint_returns_none_for_no_checkpoints() {
         let (db_path, conn, _dir) = setup_test_db();
         insert_session(&conn, "sess-no-cp", false);
@@ -1941,6 +1982,48 @@ mod tests {
             RestoreError::InvalidPersistedValue {
                 field: "mux_sessions.created_at",
                 value: -1
+            }
+        ));
+    }
+
+    #[test]
+    fn list_sessions_rejects_invalid_shutdown_clean_flag() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["sess-bad-clean", 1000i64, topology, "0.1.0", 2i64],
+        )
+        .unwrap();
+
+        let err = list_sessions(&db_path).expect_err("invalid shutdown_clean");
+        assert!(matches!(
+            err,
+            RestoreError::InvalidPersistedValue {
+                field: "mux_sessions.shutdown_clean",
+                value: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn session_doctor_rejects_invalid_shutdown_clean_flag() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let topology = r#"{"schema_version":1,"captured_at":1000,"windows":[]}"#;
+        conn.execute(
+            "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, shutdown_clean)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["sess-bad-clean", 1000i64, topology, "0.1.0", 2i64],
+        )
+        .unwrap();
+
+        let err = session_doctor(&db_path).expect_err("invalid shutdown_clean");
+        assert!(matches!(
+            err,
+            RestoreError::InvalidPersistedValue {
+                field: "mux_sessions.shutdown_clean",
+                value: 2
             }
         ));
     }

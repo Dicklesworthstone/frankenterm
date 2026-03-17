@@ -49,18 +49,18 @@ fn arb_pane_delta() -> impl Strategy<Value = PaneDelta> {
         0..1000u64,
         0..10000u64,
         "[a-zA-Z0-9 ]{0,100}",
-        0..10000usize,
         1_000_000_000_000i64..2_000_000_000_000i64,
     )
-        .prop_map(
-            |(pane_id, seq, content, content_len, captured_at_ms)| PaneDelta {
+        .prop_map(|(pane_id, seq, content, captured_at_ms)| {
+            let content_len = content.len();
+            PaneDelta {
                 pane_id,
                 seq,
                 content,
                 content_len,
                 captured_at_ms,
-            },
-        )
+            }
+        })
 }
 
 fn arb_gap_notice() -> impl Strategy<Value = GapNotice> {
@@ -704,6 +704,33 @@ fn empty_bytes_rejected() {
 fn invalid_json_rejected() {
     let err = WireEnvelope::from_json(b"not json");
     assert!(err.is_err());
+}
+
+#[test]
+fn pane_delta_with_mismatched_content_len_is_rejected() {
+    let invalid = serde_json::json!({
+        "version": PROTOCOL_VERSION,
+        "seq": 1,
+        "sender": "agent-a",
+        "sent_at_ms": 1_700_000_000_000i64,
+        "payload": {
+            "type": "pane_delta",
+            "pane_id": 7,
+            "seq": 3,
+            "content": "",
+            "content_len": 9,
+            "captured_at_ms": 1_700_000_000_100i64
+        }
+    });
+    let err = WireEnvelope::from_json(
+        serde_json::to_vec(&invalid)
+            .expect("serialize invalid pane delta fixture")
+            .as_slice(),
+    );
+    assert!(
+        err.is_err(),
+        "mismatched PaneDelta content_len must be rejected"
+    );
 }
 
 // ============================================================================
