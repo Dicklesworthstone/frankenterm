@@ -1,5 +1,4 @@
-// Disabled: references types not yet implemented in plan.rs
-#![cfg(feature = "__journal_types_placeholder")]
+#![cfg(feature = "subprocess-bridge")]
 
 //! Property-based tests for mission pause/resume/abort semantics (C5).
 //!

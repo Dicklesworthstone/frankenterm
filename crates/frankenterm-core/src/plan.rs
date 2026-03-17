@@ -1183,6 +1183,17 @@ pub struct MissionOwnership {
 }
 
 impl MissionOwnership {
+    /// Create ownership where a single actor fills all roles.
+    #[must_use]
+    pub fn solo(actor: impl Into<String>) -> Self {
+        let actor = actor.into();
+        Self {
+            planner: actor.clone(),
+            dispatcher: actor.clone(),
+            operator: actor,
+        }
+    }
+
     /// Resolve the actor name for a role.
     #[must_use]
     pub fn actor_for(&self, role: MissionActorRole) -> &str {
@@ -1790,10 +1801,27 @@ const MISSION_LIFECYCLE_TRANSITIONS: &[MissionLifecycleTransition] = &[
         via: MissionLifecycleTransitionKind::ExecutionBlocked,
         to: MissionLifecycleState::Paused,
     },
-    // NOTE: Dispatching/RetryPending → ExecutionBlocked intentionally omitted.
-    // ExecutionBlocked only makes sense from states where execution is active
-    // (Running or Executing). Dispatching hasn't started execution yet, and
-    // RetryPending hasn't retried yet.
+    // Pause support: ExecutionBlocked from additional states for mission pause.
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Dispatching,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::AwaitingApproval,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::Blocked,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
+    MissionLifecycleTransition {
+        from: MissionLifecycleState::RetryPending,
+        via: MissionLifecycleTransitionKind::ExecutionBlocked,
+        to: MissionLifecycleState::Paused,
+    },
 ];
 
 /// Errors from mission lifecycle state transitions.
@@ -2086,6 +2114,8 @@ pub struct Mission {
     pub candidates: Vec<CandidateAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignments: Vec<Assignment>,
+    #[serde(default)]
+    pub pause_resume_state: MissionPauseResumeState,
 }
 
 impl Mission {
@@ -2110,6 +2140,7 @@ impl Mission {
             updated_at_ms: None,
             candidates: Vec::new(),
             assignments: Vec::new(),
+            pause_resume_state: MissionPauseResumeState::default(),
         }
     }
 
@@ -3745,6 +3776,137 @@ pub fn mission_tx_transition_table() -> &'static [MissionTxTransitionRule] {
 }
 
 // ============================================================================
+// Mission Pause/Resume/Abort Types
+// ============================================================================
+
+/// A control command issued to a mission (pause, resume, abort).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum MissionControlCommand {
+    Pause {
+        requested_by: String,
+        reason_code: String,
+        requested_at_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    Resume {
+        requested_by: String,
+        reason_code: String,
+        requested_at_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+    Abort {
+        requested_by: String,
+        reason_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
+        requested_at_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+    },
+}
+
+impl MissionControlCommand {
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Self::Pause {
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                ..
+            } => format!("pause:by={requested_by},reason={reason_code},at={requested_at_ms}"),
+            Self::Resume {
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                ..
+            } => format!("resume:by={requested_by},reason={reason_code},at={requested_at_ms}"),
+            Self::Abort {
+                requested_by,
+                reason_code,
+                requested_at_ms,
+                ..
+            } => format!("abort:by={requested_by},reason={reason_code},at={requested_at_ms}"),
+        }
+    }
+}
+
+/// A checkpoint recording the state at a pause event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionCheckpoint {
+    pub checkpoint_id: String,
+    pub paused_from_state: MissionLifecycleState,
+    pub paused_by: String,
+    pub reason_code: String,
+    pub paused_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_by: Option<String>,
+    #[serde(default)]
+    pub assignment_entries: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// Tracks pause/resume/abort lifecycle for a mission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPauseResumeState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_checkpoint: Option<MissionCheckpoint>,
+    #[serde(default)]
+    pub checkpoint_history: Vec<MissionCheckpoint>,
+    pub total_pause_count: u32,
+    pub total_resume_count: u32,
+    pub total_abort_count: u32,
+    pub cumulative_pause_duration_ms: i64,
+}
+
+impl Default for MissionPauseResumeState {
+    fn default() -> Self {
+        Self {
+            current_checkpoint: None,
+            checkpoint_history: Vec::new(),
+            total_pause_count: 0,
+            total_resume_count: 0,
+            total_abort_count: 0,
+            cumulative_pause_duration_ms: 0,
+        }
+    }
+}
+
+impl MissionPauseResumeState {
+    /// Whether the mission is currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.current_checkpoint.is_some()
+    }
+
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "prs:paused={},pauses={},resumes={},aborts={},duration_ms={}",
+            self.is_paused(),
+            self.total_pause_count,
+            self.total_resume_count,
+            self.total_abort_count,
+            self.cumulative_pause_duration_ms,
+        )
+    }
+
+    /// Evict checkpoint history entries older than `cutoff_ms`.
+    pub fn evict_history_before(&mut self, cutoff_ms: i64) {
+        self.checkpoint_history
+            .retain(|cp| cp.paused_at_ms >= cutoff_ms);
+    }
+}
+
+// ============================================================================
 // Mission Lifecycle Decision (pause/resume/abort)
 // ============================================================================
 
@@ -3760,42 +3922,92 @@ pub struct MissionLifecycleDecision {
 }
 
 impl Mission {
-    /// Pause a running mission.
+    /// Pause a running mission, creating a checkpoint.
     pub fn pause_mission(
         &mut self,
-        _requested_by: &str,
+        requested_by: &str,
         reason: &str,
-        _requested_at_ms: i64,
-        checkpoint_id: Option<String>,
+        requested_at_ms: i64,
+        correlation_id: Option<String>,
     ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
         let from = self.lifecycle_state;
         let to = self
             .lifecycle_state
-            .apply_transition(MissionLifecycleTransitionKind::Block)?;
+            .apply_transition(MissionLifecycleTransitionKind::ExecutionBlocked)?;
+
+        // Create checkpoint with assignment snapshot
+        let assignment_entries: Vec<String> = self
+            .assignments
+            .iter()
+            .map(|a| a.assignment_id.0.clone())
+            .collect();
+
+        let checkpoint_id = format!(
+            "cp-{}-{}",
+            self.mission_id.0, self.pause_resume_state.total_pause_count
+        );
+
+        let checkpoint = MissionCheckpoint {
+            checkpoint_id: checkpoint_id.clone(),
+            paused_from_state: from,
+            paused_by: requested_by.to_string(),
+            reason_code: reason.to_string(),
+            paused_at_ms: requested_at_ms,
+            resumed_at_ms: None,
+            resumed_by: None,
+            assignment_entries,
+            correlation_id: correlation_id.clone(),
+        };
+
+        self.pause_resume_state.current_checkpoint = Some(checkpoint);
+        self.pause_resume_state.total_pause_count += 1;
         self.lifecycle_state = to;
+
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
             lifecycle_to: to,
             decision_path: "pause".to_string(),
             reason_code: reason.to_string(),
             error_code: None,
-            checkpoint_id,
+            checkpoint_id: Some(checkpoint_id),
         })
     }
 
     /// Resume a paused (blocked) mission.
     pub fn resume_mission(
         &mut self,
-        _requested_by: &str,
+        requested_by: &str,
         _reason_label: &str,
-        _requested_at_ms: i64,
-        checkpoint_id: Option<String>,
+        requested_at_ms: i64,
+        _correlation_id: Option<String>,
     ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
         let from = self.lifecycle_state;
-        let to = self
-            .lifecycle_state
-            .apply_transition(MissionLifecycleTransitionKind::Unblock)?;
+        // Resume restores the pre-pause state from the checkpoint.
+        let to = if let Some(cp) = &self.pause_resume_state.current_checkpoint {
+            cp.paused_from_state
+        } else {
+            // No checkpoint = use standard Unblock transition as fallback
+            self.lifecycle_state
+                .apply_transition(MissionLifecycleTransitionKind::RetryResumed)?
+        };
+
+        // Finalize checkpoint and move to history
+        let checkpoint_id = if let Some(mut cp) = self.pause_resume_state.current_checkpoint.take()
+        {
+            cp.resumed_at_ms = Some(requested_at_ms);
+            cp.resumed_by = Some(requested_by.to_string());
+            let duration = requested_at_ms.saturating_sub(cp.paused_at_ms);
+            self.pause_resume_state.cumulative_pause_duration_ms += duration;
+            let id = cp.checkpoint_id.clone();
+            self.pause_resume_state.checkpoint_history.push(cp);
+            Some(id)
+        } else {
+            None
+        };
+
+        self.pause_resume_state.total_resume_count += 1;
         self.lifecycle_state = to;
+
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
             lifecycle_to: to,
@@ -3809,24 +4021,46 @@ impl Mission {
     /// Abort a mission (cancel with error context).
     pub fn abort_mission(
         &mut self,
-        _requested_by: &str,
+        requested_by: &str,
         reason: &str,
         error_code: Option<String>,
-        _requested_at_ms: i64,
-        checkpoint_id: Option<String>,
+        requested_at_ms: i64,
+        _correlation_id: Option<String>,
     ) -> Result<MissionLifecycleDecision, MissionLifecycleError> {
         let from = self.lifecycle_state;
         let to = self
             .lifecycle_state
             .apply_transition(MissionLifecycleTransitionKind::Cancel)?;
+
+        // If paused, finalize checkpoint
+        if let Some(mut cp) = self.pause_resume_state.current_checkpoint.take() {
+            cp.resumed_at_ms = Some(requested_at_ms);
+            cp.resumed_by = Some(requested_by.to_string());
+            let duration = requested_at_ms.saturating_sub(cp.paused_at_ms);
+            self.pause_resume_state.cumulative_pause_duration_ms += duration;
+            self.pause_resume_state.checkpoint_history.push(cp);
+        }
+
+        // Cancel all in-flight assignments
+        for assignment in &mut self.assignments {
+            if assignment.outcome.is_none() {
+                assignment.outcome = Some(Outcome::Cancelled {
+                    reason_code: format!("mission_aborted:{reason}"),
+                    completed_at_ms: requested_at_ms,
+                });
+            }
+        }
+
+        self.pause_resume_state.total_abort_count += 1;
         self.lifecycle_state = to;
+
         Ok(MissionLifecycleDecision {
             lifecycle_from: from,
             lifecycle_to: to,
             decision_path: "abort".to_string(),
             reason_code: reason.to_string(),
             error_code,
-            checkpoint_id,
+            checkpoint_id: None,
         })
     }
 }
