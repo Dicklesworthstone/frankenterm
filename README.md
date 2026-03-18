@@ -8,11 +8,13 @@
 
 [![CI](https://github.com/Dicklesworthstone/frankenterm/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/frankenterm/actions/workflows/ci.yml)
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
+[![Lines of Code](https://img.shields.io/badge/core%20library-775k%20lines-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-45k%2B-green.svg)]()
 
 </div>
 
-**A swarm-native terminal platform designed to replace legacy terminal workflows for massive AI agent orchestration.**
+**A swarm-native terminal platform designed to replace legacy terminal workflows for massive AI agent orchestration.** 120 workspace crates. 482 core modules. 45,000+ tests. Built from the ground up for fleets of 200+ concurrent AI coding agents.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -27,16 +29,16 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 
 ## TL;DR
 
-**The Problem**: Running large AI coding swarms across ad-hoc terminal panes is chaos. You can't reliably observe state, detect rate limits or auth failures, coordinate handoffs, or automate safe recovery without brittle glue code.
+**The Problem**: Running large AI coding swarms across ad-hoc terminal panes is chaos. You can't reliably observe state, detect rate limits or auth failures, coordinate handoffs, or automate safe recovery without brittle glue code. When you're running 50+ Claude Code / Codex / Gemini agents simultaneously, a single undetected rate limit wastes hours of compute. A stuck agent silently burns tokens. An auth failure goes unnoticed for 30 minutes. You have no search across agent output, no audit trail, no way for one AI to safely control another.
 
-**The Solution**: `ft` is a **full terminal platform for agent swarms** — with first-class observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). Existing WezTerm integration is a migration bridge, not the product boundary.
+**The Solution**: `ft` is a **full terminal platform for agent swarms** — with first-class observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). It captures every byte of terminal output across every pane, detects state transitions via multi-pattern matching, triggers automated workflows in response, and exposes the entire system through a JSON API designed for AI-to-AI orchestration. Think of it as Kubernetes for terminal-based AI agents: observe, detect, react, audit.
 
 ### Platform Direction
 
 `ft` is developed as a replacement-class terminal runtime for multi-agent systems, not a thin wrapper around another terminal. The architecture is actively expanding with:
 
 - Concepts learned from Ghostty and Zellij (session model, ergonomics, and runtime resilience)
-- Ground-up `ft` subsystems purpose-built for agent swarms
+- Ground-up `ft` subsystems purpose-built for agent swarms (tiered scrollback, fleet memory, mission orchestration)
 - Targeted integrations and code adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/frankentui`
 
 ### Why Use ft?
@@ -44,11 +46,16 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 | Feature | What It Does |
 |---------|--------------|
 | **Perfect Observability** | Captures all terminal output across all panes with delta extraction (<50ms lag) |
-| **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions |
+| **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions across Codex, Claude Code, and Gemini |
 | **Event-Driven Automation** | Workflows trigger on patterns — no sleep loops or polling heuristics |
-| **Robot Mode API** | JSON interface optimized for AI agents to control other AI agents |
+| **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
-| **Policy Engine** | Capability gates, rate limiting, audit trails for safe multi-agent control |
+| **Policy Engine** | 21-subsystem policy framework with capability gates, rate limiting, audit trails, and approval tokens |
+| **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) keeps 200+ panes under 1GB vs 4GB+ in stock terminals |
+| **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
+| **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis |
+| **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
 
 ---
 
@@ -70,19 +77,19 @@ $ ft robot state
   }
 }
 
-# Compact TOON output (token-optimized)
+# Compact TOON output (40-60% fewer tokens for AI-to-AI comms)
 $ ft robot --format toon state
-
-# Token stats (printed to stderr so stdout stays data-only)
-$ ft robot --format toon --stats state
 
 # Get recent output from a specific pane
 $ ft robot get-text 0 --tail 50
 
+# Batch output from multiple panes in one call
+$ ft robot get-text --panes 0,1,2 --tail 20
+
 # Wait for a specific pattern (e.g., agent hitting rate limit)
 $ ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
 
-# Search all captured output (lexical default)
+# Search all captured output
 $ ft robot search "error: compilation failed"
 
 # Semantic/hybrid search mode
@@ -93,6 +100,12 @@ $ ft robot send 1 "/compact"
 
 # View recent detection events
 $ ft robot events --limit 10
+
+# Run a transactional multi-pane operation
+$ ft tx run --contract mission.json
+
+# Inspect the full tx lifecycle
+$ ft tx show --include-contract
 ```
 
 Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets.
@@ -103,23 +116,33 @@ Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robo
 
 ### 1. Passive-First Architecture
 
-The observation loop (discovery, capture, pattern detection) has **no side effects**. It only reads and stores. The action loop (sending input, running workflows) is strictly separated with explicit policy gates.
+The observation loop (discovery, capture, pattern detection) has **no side effects**. It only reads and stores. The action loop (sending input, running workflows) is strictly separated with explicit policy gates. This means `ft watch` can never accidentally send input to a pane or modify agent state — it is a pure observer.
 
 ### 2. Event-Driven, Not Time-Based
 
-No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic.
+No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. The `ft robot wait-for` command exemplifies this — it blocks until a specific rule fires, not until a timer expires.
 
 ### 3. Delta Extraction Over Full Capture
 
-Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4KB overlap matching to extract only new content. Efficient storage, minimal latency, explicit gap markers for discontinuities.
+Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4KB overlap matching to extract only new content. This produces efficient storage, minimal latency, and explicit gap markers for discontinuities. When the overlap match fails (terminal reset, scrollback clear), the gap is recorded as a first-class event rather than silently dropped.
 
 ### 4. Single-Writer Integrity
 
-A watcher lock ensures only one watcher can write to the database. No corruption from concurrent mutations. Graceful fallback for read-only introspection.
+A file-system lock (via `fs2`) ensures only one watcher can write to the database. No corruption from concurrent mutations. Graceful fallback for read-only introspection. The lock metadata records PID and start time for diagnostics.
 
 ### 5. Agent-First Interface
 
-Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. Designed for machines to parse, not humans to read.
+Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) output reduces token consumption by 40-60% for AI-to-AI communication. Designed for machines to parse, not humans to read.
+
+### 6. Transactional Safety
+
+Multi-pane operations use a prepare/commit/compensate lifecycle borrowed from distributed transaction protocols. If a commit step fails, compensation rolls back the committed steps. Kill switches and pause controls provide emergency intervention. Every transition emits an observability event with a reason code and decision path.
+
+### 7. Defense in Depth for Memory
+
+The fleet memory controller synthesizes pressure signals from three independent subsystems — pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets — into a unified 4-tier pressure model (Normal → Elevated → Critical → Emergency) with asymmetric hysteresis (escalate fast, de-escalate slow). Actions range from throttling poll intervals to emergency warm-scrollback eviction.
+
+---
 
 ## Safety Guarantees
 
@@ -127,16 +150,25 @@ Robot Mode returns structured JSON with consistent schemas. Every response inclu
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
 - **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 - **Policy-gated reads**: `get-text`/`search` surfaces enforce policy checks and return redacted text payloads.
+- **Transactional operations**: `ft tx run` uses prepare/commit/compensate phases with idempotency guards and deterministic replay.
+- **Approval tokens**: Allow-once approval codes scoped to specific action + pane + fingerprint combinations.
+- **Secret redaction**: Captured output is redacted before being returned through any API surface, with configurable sensitivity tiers (T1/T2/T3) and retention policies.
 
 ## Secure Distributed Mode
 
-Secure distributed mode is available as an optional feature-gated build and is
-off by default.
+Secure distributed mode is available as an optional feature-gated build and is off by default.
 
 ```bash
 # Build ft with distributed mode support
 cargo build -p frankenterm --release --features distributed
 ```
+
+The distributed wire protocol provides:
+- Versioned message envelopes with sender identity validation
+- Per-agent sequence-number dedup (no duplicate processing)
+- 1 MiB maximum message size enforcement
+- Stale-session pruning with configurable idle thresholds
+- Local receipt-clock decisions (untrusted remote clocks not used for liveness)
 
 Operator guidance:
 - Keep `distributed.bind_addr` on loopback unless you explicitly need remote access.
@@ -150,17 +182,22 @@ Operator guidance:
 
 | Feature | ft | WezTerm | Zellij | Ghostty |
 |---------|----|---------|--------|---------|
-| Swarm-native orchestration | First-class | External glue required | External glue required | External glue required |
+| Swarm-native orchestration | First-class (200+ panes) | External glue required | External glue required | External glue required |
 | Event-driven automation | Built-in workflows + policy gate | Not native | Not native | Not native |
-| Machine API for agents | Robot Mode + MCP | No equivalent | No equivalent | No equivalent |
+| Machine API for agents | Robot Mode + MCP + TOON | No equivalent | No equivalent | No equivalent |
 | Cross-session state + recovery | Built-in snapshots/sessions | Partial/manual | Session-centric, not swarm-centric | Minimal |
-| Agent-safe control plane | Capability/risk/approval/audit | Not native | Not native | Not native |
+| Agent-safe control plane | 21-subsystem policy engine | Not native | Not native | Not native |
+| Transactional multi-pane ops | Prepare/commit/compensate | No equivalent | No equivalent | No equivalent |
+| Full-text search over output | FTS5 + semantic/hybrid modes | No equivalent | No equivalent | No equivalent |
+| Memory management at scale | Three-tier scrollback + fleet controller | Single tier | Single tier | Single tier |
+| Replay and forensics | Decision graph + diff + provenance | No equivalent | No equivalent | No equivalent |
 | Backend extensibility | Explicit platform direction | Terminal app only | Terminal app only | Terminal app only |
 
 **When to use ft:**
 - Running 2+ AI coding agents that need coordination
 - Building automation that reacts to terminal output
 - Debugging multi-agent workflows with full observability
+- Operating large agent swarms (50-200+ panes) with memory and backpressure control
 
 **When ft might not be ideal:**
 - Single shell/single-agent usage where orchestration is unnecessary
@@ -170,7 +207,13 @@ Operator guidance:
 
 ## Installation
 
-### From Source (Recommended)
+### Via Cargo (Fastest)
+
+```bash
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
+```
+
+### From Source
 
 ```bash
 # Clone and build
@@ -182,17 +225,30 @@ cargo build --release
 cp target/release/ft ~/.local/bin/
 ```
 
-### Via Cargo
+### With Optional Features
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
+# MCP server support
+cargo build -p frankenterm --release --features mcp
+
+# Distributed mode (agent streaming)
+cargo build -p frankenterm --release --features distributed
+
+# Semantic search (ML embeddings)
+cargo build -p frankenterm --release --features semantic-search
+
+# TUI dashboard
+cargo build -p frankenterm --release --features tui
+
+# Everything
+cargo build -p frankenterm --release --all-features
 ```
 
 ### Requirements
 
-- **Rust 1.85+** (nightly required for Rust 2024 edition)
+- **Rust nightly** (Rust 2024 edition — see `rust-toolchain.toml`)
 - **Compatibility backend bridge (current):** WezTerm CLI available for existing pane/session interop while native runtime coverage expands
-- **SQLite** (bundled via rusqlite)
+- **SQLite** (bundled via rusqlite — no system dependency)
 
 ---
 
@@ -359,6 +415,8 @@ ft audit --decision deny                 # Only denied decisions
 ft triage                               # Summarize issues (health/crashes/events)
 ft diag bundle --output /tmp/ft-diag    # Collect diagnostic bundle
 ft reproduce --kind crash               # Export latest crash bundle
+ft doctor                               # Environment health check
+ft doctor --json                        # Machine-readable diagnostics
 ```
 
 ### Robot Mode (JSON API)
@@ -391,6 +449,18 @@ ft mcp serve
 
 MCP mirrors robot mode. See `docs/mcp-api-spec.md` for the tool list and `docs/json-schema/` for response schemas.
 For multi-agent operating procedures, see `docs/swarm-playbook.md`.
+
+### Session Persistence
+
+```bash
+ft snapshot save             # Capture current mux state
+ft snapshot list             # List recent snapshots
+ft snapshot inspect <id>     # Inspect snapshot contents
+ft snapshot diff <id1> <id2> # Compare two snapshots
+ft session list              # List saved sessions
+ft session show <session_id> # Show session + checkpoints
+ft session doctor            # Health check for session persistence
+```
 
 ### Configuration
 
@@ -481,34 +551,6 @@ retention_days = 30
 max_backups = 10
 # Optional destination root
 destination = "~/.local/share/ft/backups"
-# Optional tweaks
-compress = false
-metadata_only = false
-# Notifications
-notify_on_failure = true
-notify_on_success = false
-
-[sync]
-# Feature gate
-enabled = false
-# Require confirmation for any write
-require_confirmation = true
-# Default overwrite policy
-allow_overwrite = false
-# Payload toggles (global defaults)
-allow_binary = false
-allow_config = true
-allow_snapshots = true
-# Optional allow/deny path globs
-allow_paths = []
-deny_paths = ["~/.local/share/ft/ft.db", "~/.local/share/ft/ft.db-wal", "~/.local/share/ft/ft.db-shm"]
-
-[[sync.targets]]
-name = "staging"
-transport = "ssh"
-endpoint = "ft@staging-host"
-root = "~/.local/share/ft/sync"
-default_direction = "push"
 
 [patterns]
 # Which detection packs to enable
@@ -529,7 +571,24 @@ redact_secrets = true
 # Rate limits per action type
 [safety.rate_limits]
 send_text = { max_per_second = 2 }
+
+[agent_detection]
+# Agent pane state detection thresholds (milliseconds)
+enabled = true
+active_output_threshold_ms = 5000    # Output within 5s → Active (green)
+thinking_silence_ms = 5000           # Input sent, no output for 5s → Thinking (yellow)
+stuck_silence_ms = 30000             # No output for 30s after input → Stuck (red)
+idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ```
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `FT_OUTPUT_FORMAT` | Default format (`json` or `toon`) |
+| `TOON_DEFAULT_FORMAT` | Fallback default format |
+| `FT_WORKSPACE` | Workspace root directory |
+| `FT_SKIP_BUNDLED_FONT_INSTALL` | Skip automatic font install |
 
 ---
 
@@ -539,6 +598,7 @@ send_text = { max_per_second = 2 }
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         ft Swarm Runtime Core                           │
 │   Session Graph │ Pane Registry │ State Store │ Control Plane          │
+│   Mission Orchestrator │ Fleet Memory Controller │ Tx Engine           │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
                     Backend Adapters + Runtime Integrations
@@ -546,12 +606,14 @@ send_text = { max_per_second = 2 }
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                      Ingest + Normalization Pipeline                     │
 │   Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
+│   SIMD Scan → Pattern Trigger → zstd Compression                       │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Storage Layer (SQLite + FTS5)                   │
+│                    Storage Layer (SQLite + FTS5 + Tantivy)              │
 │   output_segments │ events │ workflow_executions │ audit_actions        │
+│   approval_tokens │ session_checkpoints │ mux_pane_state              │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
                     ┌──────────────┼──────────────┐
@@ -565,60 +627,95 @@ send_text = { max_per_second = 2 }
                     └──────────────┼──────────────┘
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         Policy Engine                                    │
+│                         Policy Engine (21 subsystems)                    │
 │   Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
+│   Secret Redaction │ Backpressure Tiers │ Circuit Breakers             │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                 Robot Mode API + MCP + Platform Interfaces               │
-│   ft robot state │ get-text │ send │ wait-for │ search │ events         │
-│   ft mcp serve (feature-gated, stdio transport)                          │
-└─────────────────────────────────────────────────────────────────────────┘
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+┌──────────────────────┐ ┌──────────────┐ ┌───────────────────────┐
+│   Robot Mode API     │ │  MCP Server  │ │  Distributed Streamer │
+│   JSON / TOON        │ │  (stdio)     │ │  (wire protocol)      │
+└──────────────────────┘ └──────────────┘ └───────────────────────┘
 ```
 
-### Key Source Files (Current)
+### Workspace Structure
 
-- `crates/frankenterm/src/main.rs` — CLI entrypoint and command routing (`watch`, `robot`, `workflow`, `mcp`, etc.)
-- `crates/frankenterm-core/src/runtime.rs` — watcher runtime orchestration (discovery, capture, persistence, maintenance)
-- `crates/frankenterm-core/src/runtime_compat.rs` — runtime/channel/net/time compatibility seam
-- `crates/frankenterm-core/src/ingest.rs` — pane discovery + delta extraction + gap semantics
-- `crates/frankenterm-core/src/storage.rs` — SQLite schema/migrations, writer path, FTS5 integration
-- `crates/frankenterm-core/src/patterns.rs` — rule packs and detection engine
-- `crates/frankenterm-core/src/events.rs` — event bus + typed runtime events
-- `crates/frankenterm-core/src/workflows/` — workflow engine modules (`engine.rs`, `runner.rs`, `lock.rs`, handlers/traits; no single `workflows.rs`)
-- `crates/frankenterm-core/src/policy.rs` — safety gates, approval/rate-limit decisions
-- `crates/frankenterm-core/src/robot_types.rs` + `src/ui_query.rs` — machine envelopes and shared query/view types
-- `crates/frankenterm-core/src/mcp.rs` + `src/mcp_*` — MCP tool/resource surface (feature-gated)
+```
+frankenterm/                              # 120 workspace crates
+├── crates/
+│   ├── frankenterm/                      # CLI binary (ft) — 53k lines
+│   ├── frankenterm-core/                 # Core library — 482 modules, 775k lines
+│   │   ├── src/
+│   │   │   ├── runtime.rs               # Observation runtime orchestration
+│   │   │   ├── ingest.rs                # Pane discovery + delta extraction
+│   │   │   ├── patterns.rs              # Pattern detection engine
+│   │   │   ├── events.rs                # Event bus and detection fanout
+│   │   │   ├── storage.rs               # SQLite + FTS5
+│   │   │   ├── policy.rs                # Safety/access control (8 modules)
+│   │   │   ├── plan.rs                  # Mission + Tx types
+│   │   │   ├── workflows/               # Workflow engine + handlers
+│   │   │   ├── search/                  # Search subsystem (28 modules)
+│   │   │   ├── replay_*.rs              # Replay/forensics (27 modules)
+│   │   │   ├── connector_*.rs           # Connector fabric (14 modules)
+│   │   │   ├── tx_*.rs                  # Transaction subsystem
+│   │   │   ├── scrollback_tiers.rs      # Three-tier scrollback storage
+│   │   │   ├── fleet_memory_controller.rs # Fleet memory orchestration
+│   │   │   ├── scan_pipeline.rs         # SIMD scan + trigger + compression
+│   │   │   ├── wire_protocol.rs         # Distributed messaging
+│   │   │   └── ...                      # 400+ additional modules
+│   │   ├── tests/                       # 696 test files, 496 proptest suites
+│   │   └── benches/                     # 62 Criterion benchmarks
+│   ├── frankenterm-gui/                  # GUI binary crate
+│   ├── frankenterm-mux-server/           # Headless mux server
+│   └── frankenterm-alloc/                # Allocator/telemetry support
+├── frankenterm/                          # In-tree vendored crates (105 crates)
+│   ├── codec/                           # Wire codec
+│   ├── config/                          # Config subsystem
+│   ├── mux/                             # Multiplexer
+│   ├── pty/                             # PTY layer
+│   ├── term/                            # Terminal emulator
+│   ├── termwiz/                         # Terminal primitives
+│   └── ...                              # Additional subsystem crates
+├── fuzz/                                 # 4 fuzzing targets
+├── docs/                                 # 114 documentation files
+├── tests/e2e/                            # 149 end-to-end test harnesses
+└── fixtures/                             # Test fixtures
+```
 
-For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, library map), see `docs/architecture.md`.
+### Key Algorithms and Techniques
 
-### Concise Module Map
-
-| Surface | Primary Location | Responsibility |
-|---------|------------------|----------------|
-| CLI dispatch | `crates/frankenterm/src/main.rs` | Command parsing and routing for watch/robot/workflow/mcp |
-| Runtime loop | `crates/frankenterm-core/src/runtime.rs` | Discovery/capture/persistence/maintenance task orchestration |
-| Runtime compatibility | `crates/frankenterm-core/src/runtime_compat.rs` | Async runtime and primitive compatibility layer |
-| Capture + delta | `crates/frankenterm-core/src/ingest.rs` | Overlap matching, gap detection, capture metadata |
-| Storage + query | `crates/frankenterm-core/src/storage.rs` + `src/search/` | SQLite schema, FTS5, lexical/semantic/hybrid retrieval |
-| Detection | `crates/frankenterm-core/src/patterns.rs` | Rule pack loading, anchor/regex matching, dedupe |
-| Events | `crates/frankenterm-core/src/events.rs` | Bounded broadcast fanout and typed event channels |
-| Workflows | `crates/frankenterm-core/src/workflows/` | Workflow traits, engine, runner, pane lock coordination |
-| Policy | `crates/frankenterm-core/src/policy.rs` | Authorization, rate limits, approvals, audit outcomes |
-| Robot + MCP types | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Structured machine contracts for robot and MCP surfaces |
+| Subsystem | Algorithm / Technique | Purpose |
+|-----------|----------------------|---------|
+| Delta extraction | 4KB overlap matching with gap semantics | Efficient incremental capture without full-buffer re-reads |
+| Pattern detection | Aho-Corasick multi-pattern + anchor filtering + Bloom pre-filter | Fast multi-agent pattern matching with probabilistic pre-rejection |
+| Scan pipeline | SIMD newline/ANSI density scan + batch trigger + zstd compression | Three-stage processing pipeline for raw pane output |
+| Search | FTS5 lexical + Tantivy + optional ML embeddings | Multi-mode search (lexical, semantic, hybrid) |
+| Backpressure | Four-tier model (Green/Yellow/Red/Black) with queue-depth gauges | Prevent OOM and cascading latency under load |
+| Fleet memory | Worst-of tier synthesis with asymmetric hysteresis | Coordinated pressure response across 200+ panes |
+| Scrollback | Hot (RAM) → Warm (zstd compressed) → Cold (evicted) tiering | Memory-efficient scrollback for large pane counts |
+| Tx execution | Prepare/commit/compensate with idempotency ledger | Safe multi-pane transactional operations |
+| Retry | Exponential backoff with jitter + circuit breaker integration | Robust I/O error handling without retry storms |
+| Rate monitoring | Time-bucketed sliding window counters | Throughput monitoring and burst detection |
+| Latency analysis | Min-plus algebra (network calculus) | Formal worst-case delay and backlog bounds |
+| Graph analysis | Dijkstra + Bellman-Ford + Floyd-Warshall | Agent routing and dependency chain analysis |
+| Decision replay | Normalized DAG + causal edges + diff engine | Post-incident forensics and regression testing |
+| Content dedup | SHA-256 content hashing + FNV-1a fast hash | Prevent duplicate indexing in search pipeline |
+| Quiescence detection | Composable gauge + activity tracker with atomic CAS | Wait for system to settle before taking action |
 
 ### Data Flow
 
 1. **Discovery**: Enumerate pane/session resources via active backend adapters
 2. **Capture**: Stream output and state deltas from adapters/runtime hooks
 3. **Delta**: Compare with previous capture using 4KB overlap matching
-4. **Store**: Append new segments to SQLite with FTS5 indexing
-5. **Detect**: Run pattern engine against new content
-6. **Event**: Broadcast detections to event bus subscribers
-7. **Workflow**: Execute registered workflows on matching events
-8. **Policy**: Gate all actions through capability and rate limit checks
-9. **API**: Expose everything via Robot Mode JSON interface
+4. **Scan**: Run three-stage pipeline (SIMD metrics → pattern trigger → compression)
+5. **Store**: Append new segments to SQLite with FTS5 indexing
+6. **Detect**: Run pattern engine against new content
+7. **Event**: Broadcast detections to event bus subscribers
+8. **Workflow**: Execute registered workflows on matching events
+9. **Policy**: Gate all actions through capability and rate limit checks
+10. **API**: Expose everything via Robot Mode JSON interface + MCP
 
 ---
 
@@ -628,8 +725,8 @@ For a deeper architecture writeup (OSC 133 prompt markers, gap semantics, librar
 
 | Agent | Pattern Examples |
 |-------|------------------|
-| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected` |
-| **Claude Code** | `claude_code.usage.reached`, `claude_code.approval_needed` |
+| **Codex** | `codex.usage.reached`, `codex.rate_limit.detected`, `codex.session.end` |
+| **Claude Code** | `claude_code.usage.reached`, `claude_code.approval_needed`, `claude_code.session.end` |
 | **Gemini** | `gemini.usage.reached`, `gemini.rate_limit.detected` |
 | **Terminal Runtime** | `wezterm.mux.connection_lost`, `wezterm.pane.exited` |
 
@@ -639,12 +736,27 @@ Every detection has a stable `rule_id` like `codex.usage.reached`. Use these in:
 - `ft robot wait-for <pane_id> <rule_id>` — wait for specific condition
 - Workflow triggers — automatically react to patterns
 - Allowlists — suppress false positives
+- `ft rules test "text"` — validate patterns against sample text
+
+### Agent Pane State Detection
+
+Beyond pattern matching, `ft` continuously classifies each agent pane into a visual state:
+
+| State | Color | Condition |
+|-------|-------|-----------|
+| **Active** | Green | Output received within 5 seconds |
+| **Thinking** | Yellow | Input sent, no output for 5-30 seconds |
+| **Stuck** | Red | No output for 30+ seconds after input, or flagged by watchdog |
+| **Idle** | Gray | No input or output for 60+ seconds |
+| **Human** | Default | Pane is not agent-controlled |
+
+These states drive GUI pane border colors and enable mass operations like "kill all stuck agents."
 
 ---
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/frankenterm-core/benches/` and use Criterion. Each bench includes a short, human-readable budget and emits machine-readable artifacts under `target/criterion/`.
+Benchmarks live under `crates/frankenterm-core/benches/` (62 Criterion benchmarks) and use human-readable budgets with machine-readable artifacts.
 
 ```bash
 # Compile benches (fast sanity check)
@@ -659,6 +771,47 @@ cargo bench -p frankenterm-core --bench fts_query
 When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 - `target/criterion/ft-bench-meta.jsonl` (budgets + environment)
 - `target/criterion/ft-bench-manifest-<bench>.json` (artifact manifest)
+
+### Performance Targets
+
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| Delta capture latency | <50ms | 4KB overlap matching |
+| Pattern detection | <1ms per rule pack | Bloom filter pre-rejection |
+| FTS5 query | <10ms | SQLite full-text search |
+| Robot Mode response | <5ms | JSON envelope generation |
+| Context snapshot | <100us | Per-event environment capture |
+| Memory per pane (hot) | ~200 bytes/line | Uncompressed in VecDeque |
+| Memory per pane (warm) | ~40 bytes/line | 5:1 zstd compression |
+
+---
+
+## Testing
+
+The project maintains extensive test coverage:
+
+| Category | Count | Purpose |
+|----------|-------|---------|
+| Lib unit tests | ~22,000 | Module-level correctness |
+| Property tests (proptest) | ~500 suites | Serde roundtrip, invariants, fuzzing |
+| Integration tests | ~700 files | Cross-module behavior |
+| E2E test harnesses | 149 scripts | Full-pipeline validation |
+| Criterion benchmarks | 62 | Performance regression detection |
+| Fuzz targets | 4 | Security/robustness |
+
+```bash
+# Run all tests
+cargo test --workspace
+
+# Run core library tests
+cargo test -p frankenterm-core --lib
+
+# Run with specific features
+cargo test -p frankenterm-core --features subprocess-bridge
+
+# Run property tests
+cargo test -p frankenterm-core --test 'proptest_*'
+```
 
 ---
 
@@ -690,7 +843,7 @@ rm ~/.local/share/ft/watcher.lock
 
 ### High memory usage
 
-Delta extraction is failing; falling back to full captures.
+Delta extraction may be failing, falling back to full captures. Or too many panes are accumulating warm scrollback.
 
 ```bash
 # Check for gaps in capture
@@ -710,6 +863,9 @@ ft -vv watch --foreground
 
 # Test pattern manually
 ft rules test "Usage limit reached. Try again later."
+
+# List all active rules
+ft rules list --verbose
 ```
 
 ### Robot mode returns errors
@@ -726,6 +882,19 @@ wezterm cli list
 
 # Check policy blocks
 ft robot send 0 "test" --dry-run
+```
+
+### Transaction failures
+
+```bash
+# Validate the contract before running
+ft tx plan --contract mission.json
+
+# Run with failure injection to test compensation
+ft tx run --fail-step tx-step:2
+
+# Inspect what happened
+ft tx show --include-contract
 ```
 
 ---
@@ -748,6 +917,7 @@ ft robot send 0 "test" --dry-run
 | MCP server integration | Feature-gated (stdio) | v0.2+ |
 | Web dashboard | Feature-gated (health-only) | v0.3+ |
 | Multi-host federation | Early distributed mode | v2.0+ |
+| Semantic search | Feature-gated (requires ML embeddings) | v0.2+ |
 
 ---
 
@@ -759,7 +929,7 @@ ft robot send 0 "test" --dry-run
 
 ### Is my terminal output stored permanently?
 
-By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`.
+By default, output is retained for 30 days (configurable via `storage.retention_days`). Data is stored locally in SQLite at `~/.local/share/ft/ft.db`. Backup and restore is supported via `ft backup export` / `ft backup import`.
 
 ### Does ft send data anywhere?
 
@@ -780,12 +950,44 @@ pattern = "FATAL ERROR:.*"
 severity = "critical"
 ```
 
+Then validate with:
+
+```bash
+ft rules test "FATAL ERROR: database connection lost"
+```
+
 ### What's the performance overhead?
 
 - **CPU**: <1% during idle; brief spikes during pattern detection
-- **Memory**: ~50MB for watcher with 100 panes
+- **Memory**: ~50MB for watcher with 100 panes (with tiered scrollback); ~200MB for 200 panes
 - **Disk**: ~10MB/day for typical multi-agent usage (compressed deltas)
 - **Latency**: <50ms average capture lag
+
+### How does the transaction system work?
+
+`ft tx` implements a prepare/commit/compensate lifecycle:
+
+1. **Prepare**: Validate preconditions (policy checks, pane liveness, reservations)
+2. **Commit**: Execute steps in dependency order with per-step receipts
+3. **Compensate**: If any commit step fails, undo committed steps in reverse order
+
+Each phase emits observability events with reason codes, and the entire execution is recorded in an idempotency ledger for safe resume after crashes.
+
+### How does tiered scrollback save memory?
+
+For 200 panes, stock terminal emulators keep all scrollback uncompressed in RAM (~4GB+). `ft` organizes scrollback into three tiers:
+
+| Tier | Storage | Access | Memory per 1000 lines |
+|------|---------|--------|----------------------|
+| **Hot** | VecDeque (RAM) | Instant | ~200KB |
+| **Warm** | zstd compressed (RAM) | Decompress on demand | ~40KB |
+| **Cold** | Evicted (re-fetch from SQLite) | Query on demand | 0KB |
+
+With default settings (1000 hot lines, 50MB warm cap per pane), 200 panes fit in under 1GB.
+
+### What agents does ft detect?
+
+Currently: **Codex** (OpenAI), **Claude Code** (Anthropic), **Gemini** (Google), and terminal runtime events. Custom patterns can detect any agent or application.
 
 ---
 
@@ -804,5 +1006,7 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 <div align="center">
 
 **Built to be the terminal runtime for the AI agent age.**
+
+*120 crates. 482 modules. 775,000 lines. 45,000 tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
