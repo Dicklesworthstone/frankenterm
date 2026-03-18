@@ -2,7 +2,10 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::{runtime_compat::SURFACE_CONTRACT_V1, vendored_async_contracts::*};
+use frankenterm_core::{
+    dependency_eradication::SurfaceContractStatus, runtime_compat::SURFACE_CONTRACT_V1,
+    vendored_async_contracts::*,
+};
 
 // =============================================================================
 // Strategies
@@ -87,6 +90,20 @@ proptest! {
         prop_assert_eq!(report.audit_id, back.audit_id);
         prop_assert_eq!(report.contracts.len(), back.contracts.len());
         prop_assert_eq!(report.overall_compliant, back.overall_compliant);
+        prop_assert_eq!(report.surface_status.keep_count, back.surface_status.keep_count);
+        prop_assert_eq!(
+            report.surface_status.replace_count,
+            back.surface_status.replace_count
+        );
+        prop_assert_eq!(report.surface_status.retire_count, back.surface_status.retire_count);
+        prop_assert_eq!(
+            report.surface_status.replaced_count,
+            back.surface_status.replaced_count
+        );
+        prop_assert_eq!(
+            report.surface_status.retired_count,
+            back.surface_status.retired_count
+        );
     }
 }
 
@@ -108,6 +125,31 @@ fn make_evidence(contract_id: &str, test_name: &str, passed: bool) -> ContractEv
     }
 }
 
+fn standard_surface_status() -> SurfaceContractStatus {
+    let (keep_count, replace_count, retire_count) = SURFACE_CONTRACT_V1.iter().fold(
+        (0, 0, 0),
+        |(keep_count, replace_count, retire_count), entry| match entry.disposition {
+            frankenterm_core::runtime_compat::SurfaceDisposition::Keep => {
+                (keep_count + 1, replace_count, retire_count)
+            }
+            frankenterm_core::runtime_compat::SurfaceDisposition::Replace => {
+                (keep_count, replace_count + 1, retire_count)
+            }
+            frankenterm_core::runtime_compat::SurfaceDisposition::Retire => {
+                (keep_count, replace_count, retire_count + 1)
+            }
+        },
+    );
+
+    SurfaceContractStatus {
+        keep_count,
+        replace_count,
+        retire_count,
+        replaced_count: replace_count,
+        retired_count: retire_count,
+    }
+}
+
 fn make_all_compliant_report() -> ContractAuditReport {
     let mut report = ContractAuditReport::new("prop-audit-001", 1_700_000_000_000);
     for contract in standard_contracts() {
@@ -115,6 +157,7 @@ fn make_all_compliant_report() -> ContractAuditReport {
         let evidence = vec![make_evidence(&id, "auto_test", true)];
         report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
     }
+    report.set_surface_status(standard_surface_status());
     report.finalize();
     report
 }

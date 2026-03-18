@@ -214,7 +214,7 @@ proptest! {
         store.save_session_meta(&session_id, &session_payload, now_ms)
             .expect("save should succeed");
 
-        prop_assert_eq!(store.key_count(), 3);
+        prop_assert_eq!(store.key_count(now_ms), 3);
 
         let loaded_pane = store.load_pane_state(id, now_ms)
             .expect("load pane should not fail");
@@ -229,7 +229,7 @@ proptest! {
 
         // Deleting one keyspace doesn't affect others
         store.delete_pane_state(id, now_ms);
-        prop_assert_eq!(store.key_count(), 2);
+        prop_assert_eq!(store.key_count(now_ms), 2);
 
         let loaded_window = store.load_window_layout(id, now_ms)
             .expect("load window should not fail");
@@ -260,7 +260,7 @@ proptest! {
             .expect("load should not fail");
         prop_assert_eq!(loaded, Some(second));
         // Overwrite doesn't increase key count
-        prop_assert_eq!(store.key_count(), 1);
+        prop_assert_eq!(store.key_count(now_ms + 1), 1);
     }
 
     #[test]
@@ -279,7 +279,7 @@ proptest! {
         let loaded = store.load_session_meta(&session_id, now_ms + 1)
             .expect("load should not fail");
         prop_assert_eq!(loaded, Some(second));
-        prop_assert_eq!(store.key_count(), 1);
+        prop_assert_eq!(store.key_count(now_ms + 1), 1);
     }
 }
 
@@ -402,7 +402,7 @@ proptest! {
             store.save_pane_state(id, &payload, now_ms);
         }
 
-        prop_assert_eq!(store.key_count(), ids.len());
+        prop_assert_eq!(store.key_count(now_ms), ids.len());
 
         // All panes can be loaded with correct payload
         for &id in &ids {
@@ -547,8 +547,8 @@ proptest! {
 
         // After any sequence, key_count should be non-negative (always true for usize)
         // and is_empty should be consistent with key_count
-        let is_empty_flag = store.is_empty();
-        let count = store.key_count();
+        let is_empty_flag = store.is_empty(now_ms);
+        let count = store.key_count(now_ms);
         prop_assert_eq!(is_empty_flag, count == 0);
     }
 }

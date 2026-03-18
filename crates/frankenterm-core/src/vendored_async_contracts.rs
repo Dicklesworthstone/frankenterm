@@ -580,6 +580,34 @@ mod tests {
     // Helpers
     // -------------------------------------------------------------------------
 
+    fn standard_surface_contract_counts() -> (usize, usize, usize) {
+        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
+            (0, 0, 0),
+            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
+                crate::runtime_compat::SurfaceDisposition::Keep => {
+                    (keep_count + 1, replace_count, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Replace => {
+                    (keep_count, replace_count + 1, retire_count)
+                }
+                crate::runtime_compat::SurfaceDisposition::Retire => {
+                    (keep_count, replace_count, retire_count + 1)
+                }
+            },
+        )
+    }
+
+    fn standard_surface_status() -> SurfaceContractStatus {
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
+        SurfaceContractStatus {
+            keep_count,
+            replace_count,
+            retire_count,
+            replaced_count: replace_count,
+            retired_count: retire_count,
+        }
+    }
+
     fn make_evidence(contract_id: &str, test_name: &str, passed: bool) -> ContractEvidence {
         ContractEvidence {
             contract_id: contract_id.to_owned(),
@@ -902,13 +930,7 @@ mod tests {
             let evidence = vec![make_evidence(&id, "auto_test", true)];
             report.add_compliance(ContractCompliance::from_evidence(contract, evidence));
         }
-        report.set_surface_status(SurfaceContractStatus {
-            keep_count: 8,
-            replace_count: 7,
-            retire_count: 3,
-            replaced_count: 7,
-            retired_count: 3,
-        });
+        report.set_surface_status(standard_surface_status());
         report.finalize();
         report
     }
@@ -916,12 +938,20 @@ mod tests {
     #[test]
     fn audit_report_all_compliant() {
         let report = make_all_compliant_report();
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
         assert!(report.overall_compliant);
         assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
         assert!(report.uncovered_contracts.is_empty());
         assert!(report.failing_contracts().is_empty());
-        assert_eq!(report.surface_status.keep_count, 8);
-        assert_eq!(report.surface_status.total_count(), 18);
+        assert_eq!(report.surface_status.keep_count, keep_count);
+        assert_eq!(report.surface_status.replace_count, replace_count);
+        assert_eq!(report.surface_status.retire_count, retire_count);
+        assert_eq!(report.surface_status.replaced_count, replace_count);
+        assert_eq!(report.surface_status.retired_count, retire_count);
+        assert_eq!(
+            report.surface_status.total_count(),
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
+        );
     }
 
     #[test]
@@ -1036,26 +1066,41 @@ mod tests {
 
     #[test]
     fn surface_status_integration() {
+        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
+        let pending_replace = replace_count.min(2);
+        let pending_retire = retire_count.min(1);
         let mut report = ContractAuditReport::new("surface-test", 42_000);
         let status = SurfaceContractStatus {
-            keep_count: 3,
-            replace_count: 7,
-            retire_count: 2,
-            replaced_count: 5,
-            retired_count: 1,
+            keep_count,
+            replace_count,
+            retire_count,
+            replaced_count: replace_count.saturating_sub(pending_replace),
+            retired_count: retire_count.saturating_sub(pending_retire),
         };
         report.set_surface_status(status);
         report.finalize();
 
-        assert_eq!(report.surface_status.keep_count, 3);
-        assert_eq!(report.surface_status.replace_count, 7);
-        assert_eq!(report.surface_status.retire_count, 2);
-        assert_eq!(report.surface_status.replaced_count, 5);
-        assert_eq!(report.surface_status.retired_count, 1);
-        // 1 replace + 1 retire still pending.
+        assert_eq!(report.surface_status.keep_count, keep_count);
+        assert_eq!(report.surface_status.replace_count, replace_count);
+        assert_eq!(report.surface_status.retire_count, retire_count);
+        assert_eq!(
+            report.surface_status.replaced_count,
+            replace_count.saturating_sub(pending_replace)
+        );
+        assert_eq!(
+            report.surface_status.retired_count,
+            retire_count.saturating_sub(pending_retire)
+        );
+        // Keep a few transitional surfaces pending so the arithmetic stays exercised.
         assert!(!report.surface_status.all_transitional_resolved());
-        assert_eq!(report.surface_status.remaining_transitional(), 3);
-        assert_eq!(report.surface_status.total_count(), 12);
+        assert_eq!(
+            report.surface_status.remaining_transitional(),
+            pending_replace + pending_retire
+        );
+        assert_eq!(
+            report.surface_status.total_count(),
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
+        );
     }
 
     // -------------------------------------------------------------------------

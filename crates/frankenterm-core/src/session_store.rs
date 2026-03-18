@@ -58,13 +58,13 @@ impl SessionStore {
     }
 
     #[must_use]
-    pub fn key_count(&self) -> usize {
-        self.store.len()
+    pub fn key_count(&mut self, now_ms: u64) -> usize {
+        self.store.dbsize(now_ms)
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.store.is_empty()
+    pub fn is_empty(&mut self, now_ms: u64) -> bool {
+        self.key_count(now_ms) == 0
     }
 
     pub fn save_pane_state(&mut self, pane_id: u64, state: &[u8], now_ms: u64) {
@@ -288,16 +288,16 @@ mod tests {
 
     #[test]
     fn new_store_is_empty() {
-        let store = SessionStore::new(SessionStoreConfig::default());
-        assert!(store.is_empty());
-        assert_eq!(store.key_count(), 0);
+        let mut store = SessionStore::new(SessionStoreConfig::default());
+        assert!(store.is_empty(0));
+        assert_eq!(store.key_count(0), 0);
     }
 
     #[test]
     fn default_store_is_empty() {
-        let store = SessionStore::default();
-        assert!(store.is_empty());
-        assert_eq!(store.key_count(), 0);
+        let mut store = SessionStore::default();
+        assert!(store.is_empty(0));
+        assert_eq!(store.key_count(0), 0);
     }
 
     #[test]
@@ -360,16 +360,16 @@ mod tests {
     fn key_count_increments_on_save() {
         let mut store = SessionStore::new(SessionStoreConfig::default());
         store.save_pane_state(1, b"a", 100);
-        assert_eq!(store.key_count(), 1);
-        assert!(!store.is_empty());
+        assert_eq!(store.key_count(100), 1);
+        assert!(!store.is_empty(100));
 
         store.save_window_layout(2, b"b", 100);
-        assert_eq!(store.key_count(), 2);
+        assert_eq!(store.key_count(100), 2);
 
         store
             .save_session_meta("s1", b"c", 100)
             .expect("save should succeed");
-        assert_eq!(store.key_count(), 3);
+        assert_eq!(store.key_count(100), 3);
     }
 
     #[test]
@@ -377,14 +377,14 @@ mod tests {
         let mut store = SessionStore::new(SessionStoreConfig::default());
         store.save_pane_state(1, b"a", 100);
         store.save_pane_state(2, b"b", 100);
-        assert_eq!(store.key_count(), 2);
+        assert_eq!(store.key_count(100), 2);
 
         store.delete_pane_state(1, 100);
-        assert_eq!(store.key_count(), 1);
+        assert_eq!(store.key_count(100), 1);
 
         store.delete_pane_state(2, 100);
-        assert_eq!(store.key_count(), 0);
-        assert!(store.is_empty());
+        assert_eq!(store.key_count(100), 0);
+        assert!(store.is_empty(100));
     }
 
     // ── TTL expiry ──────────────────────────────────────────────────
@@ -406,6 +406,8 @@ mod tests {
             store.load_pane_state(1, 1051).expect("load should succeed"),
             None
         );
+        assert_eq!(store.key_count(1051), 0);
+        assert!(store.is_empty(1051));
     }
 
     #[test]
@@ -431,6 +433,8 @@ mod tests {
                 .expect("load should succeed"),
             None
         );
+        assert_eq!(store.key_count(521), 0);
+        assert!(store.is_empty(521));
     }
 
     // ── Overwrite behavior ──────────────────────────────────────────
@@ -445,6 +449,7 @@ mod tests {
             store.load_pane_state(1, 200).expect("load should succeed"),
             Some(b"second".to_vec())
         );
+        assert_eq!(store.key_count(200), 1);
     }
 
     #[test]
@@ -459,6 +464,7 @@ mod tests {
                 .expect("load should succeed"),
             Some(b"layout-v2".to_vec())
         );
+        assert_eq!(store.key_count(200), 1);
     }
 
     #[test]
@@ -477,6 +483,7 @@ mod tests {
                 .expect("load should succeed"),
             Some(b"v2".to_vec())
         );
+        assert_eq!(store.key_count(200), 1);
     }
 
     // ── Validation ──────────────────────────────────────────────────
@@ -585,7 +592,7 @@ mod tests {
             .save_session_meta("1", b"session", 100)
             .expect("save should succeed");
 
-        assert_eq!(store.key_count(), 3);
+        assert_eq!(store.key_count(100), 3);
 
         assert_eq!(
             store.load_pane_state(1, 100).expect("load should succeed"),

@@ -511,6 +511,33 @@ struct ScanResult {
     valid_records: u64,
 }
 
+impl ScanResult {
+    fn matches_persisted_state(self, persisted: &PersistedState) -> bool {
+        persisted.next_offset == self.valid_len && persisted.next_ordinal == self.valid_records
+    }
+}
+
+fn recover_checkpoints_from_scan(
+    checkpoints: HashMap<String, RecorderCheckpoint>,
+    recovered_segment_id: u64,
+    scan: ScanResult,
+) -> HashMap<String, RecorderCheckpoint> {
+    checkpoints
+        .into_iter()
+        .filter_map(|(consumer, mut checkpoint)| {
+            let within_scanned_log = scan.valid_records > 0
+                && scan.valid_len > 0
+                && checkpoint.upto_offset.ordinal < scan.valid_records
+                && checkpoint.upto_offset.byte_offset < scan.valid_len;
+            if !within_scanned_log {
+                return None;
+            }
+            checkpoint.upto_offset.segment_id = recovered_segment_id;
+            Some((consumer, checkpoint))
+        })
+        .collect()
+}
+
 impl AppendLogRecorderStorage {
     /// Open or create an append-log recorder backend.
     pub fn open(config: AppendLogStorageConfig) -> std::result::Result<Self, RecorderStorageError> {
@@ -526,27 +553,41 @@ impl AppendLogRecorderStorage {
 
         let scan = scan_valid_prefix(&mut file)?;
         let persisted = load_persisted_state(&config.state_path)?;
+        let recovered_segment_id = 0;
+        let state_matches_scan = scan.matches_persisted_state(&persisted);
 
-        let next_offset = if persisted.next_offset == scan.valid_len {
+        let next_offset = if state_matches_scan {
             persisted.next_offset
         } else {
             scan.valid_len
         };
 
-        let next_ordinal = if persisted.next_offset == scan.valid_len {
+        let next_ordinal = if state_matches_scan {
             persisted.next_ordinal
         } else {
             scan.valid_records
+        };
+
+        let segment_id = if state_matches_scan {
+            persisted.segment_id
+        } else {
+            recovered_segment_id
+        };
+
+        let checkpoints = if state_matches_scan {
+            persisted.checkpoints
+        } else {
+            recover_checkpoints_from_scan(persisted.checkpoints, recovered_segment_id, scan)
         };
 
         file.seek(SeekFrom::End(0))?;
 
         let inner = AppendLogInner {
             writer: std::io::BufWriter::new(file),
-            segment_id: persisted.segment_id,
+            segment_id,
             next_offset,
             next_ordinal,
-            checkpoints: persisted.checkpoints,
+            checkpoints,
             idempotency_cache: HashMap::new(),
             idempotency_order: VecDeque::new(),
             last_error: None,
@@ -1983,6 +2024,135 @@ mod tests {
                 .unwrap();
 
             assert_eq!(resp.first_offset.ordinal, 3);
+        });
+    }
+
+    #[test]
+    fn reopen_uses_scanned_ordinal_when_state_ordinal_is_stale() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(dir.path());
+
+            {
+                let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+                let _ = storage
+                    .append_batch(AppendRequest {
+                        batch_id: "b1".to_string(),
+                        events: vec![sample_event("e1", 1, 0, "a"), sample_event("e2", 1, 1, "b")],
+                        required_durability: DurabilityLevel::Appended,
+                        producer_ts_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let mut persisted = load_persisted_state(&cfg.state_path).unwrap();
+            let recovered_offset = persisted.next_offset;
+            persisted.next_ordinal = 99;
+            write_persisted_state(&cfg.state_path, &persisted).unwrap();
+
+            let reopened = AppendLogRecorderStorage::open(cfg).unwrap();
+            let resp = reopened
+                .append_batch(AppendRequest {
+                    batch_id: "b2".to_string(),
+                    events: vec![sample_event("e3", 1, 2, "c")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(resp.first_offset.byte_offset, recovered_offset);
+            assert_eq!(resp.first_offset.ordinal, 2);
+        });
+    }
+
+    #[test]
+    fn reopen_drops_only_checkpoints_beyond_recovered_log_head() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(dir.path());
+            let keep_consumer = CheckpointConsumerId("keep".to_string());
+            let drop_consumer = CheckpointConsumerId("drop".to_string());
+
+            {
+                let storage = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+                let resp = storage
+                    .append_batch(AppendRequest {
+                        batch_id: "b1".to_string(),
+                        events: vec![sample_event("e1", 1, 0, "a"), sample_event("e2", 1, 1, "b")],
+                        required_durability: DurabilityLevel::Appended,
+                        producer_ts_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+
+                storage
+                    .commit_checkpoint(RecorderCheckpoint {
+                        consumer: keep_consumer.clone(),
+                        upto_offset: resp.first_offset,
+                        schema_version: "v1".to_string(),
+                        committed_at_ms: 10,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let actual_len = std::fs::metadata(&cfg.data_path).unwrap().len();
+            let mut persisted = load_persisted_state(&cfg.state_path).unwrap();
+            persisted.segment_id = 9;
+            persisted.next_offset = actual_len + 32;
+            persisted.next_ordinal = 3;
+            persisted
+                .checkpoints
+                .get_mut(&keep_consumer.0)
+                .unwrap()
+                .upto_offset
+                .segment_id = 9;
+            persisted.checkpoints.insert(
+                drop_consumer.0.clone(),
+                RecorderCheckpoint {
+                    consumer: drop_consumer.clone(),
+                    upto_offset: RecorderOffset {
+                        segment_id: 9,
+                        byte_offset: actual_len + 16,
+                        ordinal: 2,
+                    },
+                    schema_version: "v1".to_string(),
+                    committed_at_ms: 11,
+                },
+            );
+            write_persisted_state(&cfg.state_path, &persisted).unwrap();
+
+            let reopened = AppendLogRecorderStorage::open(cfg.clone()).unwrap();
+            let keep = reopened
+                .read_checkpoint(&keep_consumer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(keep.upto_offset.ordinal, 0);
+            assert_eq!(keep.upto_offset.segment_id, 0);
+            assert!(
+                reopened
+                    .read_checkpoint(&drop_consumer)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "checkpoint beyond recovered log head should be discarded"
+            );
+
+            let resp = reopened
+                .append_batch(AppendRequest {
+                    batch_id: "b2".to_string(),
+                    events: vec![sample_event("e3", 1, 2, "c")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+            assert_eq!(resp.first_offset.byte_offset, actual_len);
+            assert_eq!(resp.first_offset.ordinal, 2);
+            assert_eq!(resp.first_offset.segment_id, 0);
         });
     }
 
