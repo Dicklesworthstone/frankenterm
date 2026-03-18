@@ -154,7 +154,7 @@ impl SessionStore {
 
     // Maintenance
     pub fn run_expiry_cycle(&mut self, now_ms: u64) -> ExpiryCycleResult;
-    pub fn key_count(&self) -> usize;
+    pub fn key_count(&mut self, now_ms: u64) -> usize;
 }
 ```
 
