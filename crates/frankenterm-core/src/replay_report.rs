@@ -452,22 +452,18 @@ mod tests {
     use crate::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
 
     fn make_event(rule_id: &str, ts: u64, pane: u64, def: &str, out: &str) -> DecisionEvent {
-        DecisionEvent {
-            decision_type: DecisionType::PatternMatch,
-            rule_id: rule_id.into(),
-            definition_hash: def.into(),
-            input_hash: format!("in_{}", ts),
-            output_hash: out.into(),
-            timestamp_ms: ts,
-            pane_id: pane,
-            triggered_by: None,
-            overrides: None,
-            input_summary: String::new(),
-            parent_event_id: None,
-            confidence: None,
-            wall_clock_ms: 0,
-            replay_run_id: String::new(),
-        }
+        let input = format!("rule={rule_id};ts={ts};pane={pane}");
+        DecisionEvent::new(
+            DecisionType::PatternMatch,
+            pane,
+            rule_id,
+            def,
+            &input,
+            serde_json::Value::String(out.into()),
+            None,
+            Some(1.0),
+            ts,
+        )
     }
 
     fn sample_meta() -> ReportMeta {

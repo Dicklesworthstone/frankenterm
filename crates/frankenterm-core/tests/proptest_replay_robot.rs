@@ -274,19 +274,24 @@ proptest! {
         use frankenterm_core::replay_cli::InspectResult;
         use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
 
-        let events: Vec<DecisionEvent> = (0..n).map(|i| DecisionEvent {
-            decision_type: DecisionType::PatternMatch,
-            rule_id: format!("r_{}", i),
-            definition_hash: "d".into(),
-            input_hash: format!("in_{}", i),
-            output_hash: "out".into(),
-            timestamp_ms: (i as u64) * 10,
-            pane_id: i as u64 % 3,
-            triggered_by: None,
-            overrides: None,
-            wall_clock_ms: 0,
-            replay_run_id: String::new(),
-        }).collect();
+        let events: Vec<DecisionEvent> = (0..n)
+            .map(|i| {
+                let pane_id = i as u64 % 3;
+                let timestamp_ms = (i as u64) * 10;
+                let input = format!("rule=r_{i};ts={timestamp_ms};pane={pane_id}");
+                DecisionEvent::new(
+                    DecisionType::PatternMatch,
+                    pane_id,
+                    format!("r_{i}"),
+                    "d",
+                    &input,
+                    serde_json::Value::String("out".into()),
+                    None,
+                    Some(1.0),
+                    timestamp_ms,
+                )
+            })
+            .collect();
         let result = InspectResult::from_events("test.ftreplay", &events);
         let data = InspectData::from_inspect_result(&result);
         prop_assert_eq!(data.event_count, result.event_count);

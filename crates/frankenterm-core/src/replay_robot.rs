@@ -769,22 +769,17 @@ mod tests {
         use crate::replay_cli::InspectResult;
         use crate::replay_decision_graph::{DecisionEvent, DecisionType};
 
-        let events = vec![DecisionEvent {
-            decision_type: DecisionType::PatternMatch,
-            rule_id: "r1".into(),
-            definition_hash: "d".into(),
-            input_hash: "in".into(),
-            output_hash: "out".into(),
-            timestamp_ms: 100,
-            pane_id: 1,
-            triggered_by: None,
-            overrides: None,
-            input_summary: String::new(),
-            parent_event_id: None,
-            confidence: None,
-            wall_clock_ms: 0,
-            replay_run_id: String::new(),
-        }];
+        let events = vec![DecisionEvent::new(
+            DecisionType::PatternMatch,
+            1,
+            "r1",
+            "d",
+            "input payload",
+            serde_json::Value::String("out".into()),
+            None,
+            Some(1.0),
+            100,
+        )];
         let result = InspectResult::from_events("test.ftreplay", &events);
         let data = InspectData::from_inspect_result(&result);
         assert_eq!(data.event_count, 1);

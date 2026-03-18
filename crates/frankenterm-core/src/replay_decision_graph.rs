@@ -566,22 +566,23 @@ mod tests {
         triggered_by: Option<u64>,
         overrides: Option<u64>,
     ) -> DecisionEvent {
-        DecisionEvent {
+        let input = format!("rule={rule_id};ts={timestamp_ms};pane={pane_id}");
+        let mut event = DecisionEvent::new(
             decision_type,
-            rule_id: rule_id.into(),
-            definition_hash: format!("def_{}", rule_id),
-            input_hash: format!("in_{}", timestamp_ms),
-            output_hash: format!("out_{}_{}", rule_id, timestamp_ms),
-            timestamp_ms,
             pane_id,
-            triggered_by,
-            overrides,
-            input_summary: String::new(),
-            parent_event_id: None,
-            confidence: None,
-            wall_clock_ms: timestamp_ms * 2, // Transient.
-            replay_run_id: "run_001".into(),
-        }
+            rule_id,
+            &format!("def_{rule_id}"),
+            &input,
+            serde_json::Value::String(format!("out_{rule_id}_{timestamp_ms}")),
+            triggered_by.map(|id| format!("event_{id}")),
+            Some(1.0),
+            timestamp_ms,
+        );
+        event.triggered_by = triggered_by;
+        event.overrides = overrides;
+        event.wall_clock_ms = timestamp_ms * 2; // Transient.
+        event.replay_run_id = "run_001".into();
+        event
     }
 
     fn sample_events() -> Vec<DecisionEvent> {
@@ -1008,24 +1009,24 @@ mod tests {
 
     #[test]
     fn decision_event_serde() {
-        let event = DecisionEvent {
-            decision_type: DecisionType::AlertFired,
-            rule_id: "alert_1".into(),
-            definition_hash: "def".into(),
-            input_hash: "in".into(),
-            output_hash: "out".into(),
-            timestamp_ms: 100,
-            pane_id: 1,
-            triggered_by: Some(0),
-            overrides: None,
-            input_summary: String::new(),
-            parent_event_id: None,
-            confidence: None,
-            wall_clock_ms: 200,
-            replay_run_id: "run".into(),
-        };
+        let mut event = DecisionEvent::new(
+            DecisionType::AlertFired,
+            1,
+            "alert_1",
+            "def",
+            "input payload",
+            serde_json::Value::String("out".into()),
+            Some("event_0".into()),
+            Some(0.75),
+            100,
+        );
+        event.triggered_by = Some(0);
+        event.wall_clock_ms = 200;
+        event.replay_run_id = "run".into();
         let json = serde_json::to_string(&event).unwrap();
         let restored: DecisionEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.triggered_by, Some(0));
+        assert_eq!(restored.parent_event_id.as_deref(), Some("event_0"));
+        assert_eq!(restored.confidence, Some(0.75));
     }
 }

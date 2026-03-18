@@ -72,19 +72,18 @@ fn make_event(
     def: &str,
     out: &str,
 ) -> DecisionEvent {
-    DecisionEvent {
-        decision_type: dt,
-        rule_id: rule_id.into(),
-        definition_hash: def.into(),
-        input_hash: format!("in_{}", ts),
-        output_hash: out.into(),
-        timestamp_ms: ts,
-        pane_id: pane,
-        triggered_by: None,
-        overrides: None,
-        wall_clock_ms: 0,
-        replay_run_id: String::new(),
-    }
+    let input = format!("rule={rule_id};ts={ts};pane={pane}");
+    DecisionEvent::new(
+        dt,
+        pane,
+        rule_id,
+        def,
+        &input,
+        serde_json::Value::String(out.into()),
+        None,
+        Some(1.0),
+        ts,
+    )
 }
 
 /// Generate a pair of diffs with controlled divergences.

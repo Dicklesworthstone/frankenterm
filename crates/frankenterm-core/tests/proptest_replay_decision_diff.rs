@@ -53,6 +53,9 @@ fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
             pane_id,
             triggered_by: None,
             overrides: None,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: 0,
             replay_run_id: String::new(),
         }
@@ -347,6 +350,9 @@ proptest! {
             pane_id: 0,
             triggered_by: None,
             overrides: None,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: 0,
             replay_run_id: String::new(),
         }];
@@ -360,6 +366,9 @@ proptest! {
             pane_id: 0,
             triggered_by: None,
             overrides: None,
+            input_summary: String::new(),
+            parent_event_id: None,
+            confidence: None,
             wall_clock_ms: 0,
             replay_run_id: String::new(),
         }];

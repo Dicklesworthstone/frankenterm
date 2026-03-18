@@ -424,22 +424,18 @@ mod tests {
         def_hash: &str,
         output_hash: &str,
     ) -> DecisionEvent {
-        DecisionEvent {
+        let input = format!("rule={rule_id};ts={timestamp_ms};pane={pane_id}");
+        DecisionEvent::new(
             decision_type,
-            rule_id: rule_id.into(),
-            definition_hash: def_hash.into(),
-            input_hash: format!("in_{}", timestamp_ms),
-            output_hash: output_hash.into(),
-            timestamp_ms,
             pane_id,
-            triggered_by: None,
-            overrides: None,
-            input_summary: String::new(),
-            parent_event_id: None,
-            confidence: None,
-            wall_clock_ms: 0,
-            replay_run_id: String::new(),
-        }
+            rule_id,
+            def_hash,
+            &input,
+            serde_json::Value::String(output_hash.into()),
+            None,
+            Some(1.0),
+            timestamp_ms,
+        )
     }
 
     fn config() -> DiffConfig {

@@ -28,19 +28,18 @@ use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
 use frankenterm_core::replay_report::ReportMeta;
 
 fn make_event(rule_id: &str, ts: u64, pane: u64) -> DecisionEvent {
-    DecisionEvent {
-        decision_type: DecisionType::PatternMatch,
-        rule_id: rule_id.into(),
-        definition_hash: "d".into(),
-        input_hash: format!("in_{}", ts),
-        output_hash: "o".into(),
-        timestamp_ms: ts,
-        pane_id: pane,
-        triggered_by: None,
-        overrides: None,
-        wall_clock_ms: 0,
-        replay_run_id: String::new(),
-    }
+    let input = format!("rule={rule_id};ts={ts};pane={pane}");
+    DecisionEvent::new(
+        DecisionType::PatternMatch,
+        pane,
+        rule_id,
+        "d",
+        &input,
+        serde_json::Value::String("o".into()),
+        None,
+        Some(1.0),
+        ts,
+    )
 }
 
 fn arb_output_mode() -> impl Strategy<Value = ReplayOutputMode> {

@@ -23,6 +23,7 @@
 //! - DG-20: Root count <= node count
 
 use proptest::prelude::*;
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 use frankenterm_core::replay_decision_graph::{
@@ -59,19 +60,23 @@ fn arb_event(index: usize) -> impl Strategy<Value = DecisionEvent> {
             } else {
                 None
             };
-            DecisionEvent {
-                decision_type: dt,
-                rule_id,
-                definition_hash: format!("def_{}", index),
-                input_hash: format!("in_{}", index),
-                output_hash: format!("out_{}", index),
-                timestamp_ms: ts_offset + (index as u64) * 100,
+            let timestamp_ms = ts_offset + (index as u64) * 100;
+            let input = format!("rule={rule_id};index={index};pane={pane_id}");
+            let mut event = DecisionEvent::new(
+                dt,
                 pane_id,
-                triggered_by,
-                overrides: None,
-                wall_clock_ms: ts_offset * 2,
-                replay_run_id: "run_prop".into(),
-            }
+                rule_id,
+                &format!("def_{index}"),
+                &input,
+                Value::String(format!("out_{index}")),
+                triggered_by.map(|id| format!("event_{id}")),
+                Some((index % 101) as f64 / 100.0),
+                timestamp_ms,
+            );
+            event.triggered_by = triggered_by;
+            event.wall_clock_ms = ts_offset * 2;
+            event.replay_run_id = "run_prop".into();
+            event
         },
     )
 }
