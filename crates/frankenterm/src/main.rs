@@ -11359,6 +11359,22 @@ async fn distributed_release_sequence_scopes(
 }
 
 #[cfg(feature = "distributed")]
+async fn distributed_rollback_failed_persist(
+    ingest_state: &DistributedIngestState,
+    replay_id: &str,
+    previous_replay_seq: Option<u64>,
+    sequence_scope: &str,
+    previous_agent_session: Option<frankenterm_core::wire_protocol::AgentSessionSnapshot>,
+) {
+    let mut replay_guard = ingest_state.replay_guard.lock().await;
+    replay_guard.restore_session(replay_id, previous_replay_seq);
+    drop(replay_guard);
+
+    let mut aggregator = ingest_state.aggregator.lock().await;
+    aggregator.rollback_accepted(sequence_scope, previous_agent_session);
+}
+
+#[cfg(feature = "distributed")]
 fn distributed_remote_pane_uuid(
     sender: &str,
     pane_id: u64,
@@ -11584,9 +11600,11 @@ async fn distributed_persist_payload(
             let seq_key = (sequence_scope.clone(), delta.pane_id);
             let mut drop_due_to_reorder = false;
             let mut gap_reason: Option<String> = None;
+            let previous_seq;
 
             {
                 let mut seq_guard = pane_seq_by_sender.lock().await;
+                previous_seq = seq_guard.get(&seq_key).copied();
                 let expected = seq_guard
                     .get(&seq_key)
                     .map(|last_seen| last_seen.saturating_add(1))
@@ -11610,97 +11628,136 @@ async fn distributed_persist_payload(
                 }
             }
 
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
-                let ts = now_ms_i64();
-                distributed_upsert_pane(
-                    &storage_handle,
-                    remote_pane_id,
-                    distributed_remote_pane_uuid(&canonical_sender, delta.pane_id, None),
-                    distributed_remote_domain(&canonical_sender, "unknown"),
-                    Some(format!("remote:{canonical_sender}:{}", delta.pane_id)),
-                    Some("/remote".to_string()),
-                    true,
-                    ts,
-                )
-                .await?;
-            }
+            let persist_result: anyhow::Result<()> = async {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                if storage_handle.get_pane(remote_pane_id).await?.is_none() {
+                    let ts = now_ms_i64();
+                    distributed_upsert_pane(
+                        &storage_handle,
+                        remote_pane_id,
+                        distributed_remote_pane_uuid(&canonical_sender, delta.pane_id, None),
+                        distributed_remote_domain(&canonical_sender, "unknown"),
+                        Some(format!("remote:{canonical_sender}:{}", delta.pane_id)),
+                        Some("/remote".to_string()),
+                        true,
+                        ts,
+                    )
+                    .await?;
+                }
 
-            if let Some(reason) = gap_reason {
-                if let Some(gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
-                    let _ = event_bus.publish(Event::GapDetected {
-                        pane_id: gap.pane_id,
-                        seq_before: gap.seq_before,
-                        seq_after: gap.seq_after,
-                        reason: gap.reason,
-                        detected_at_ms: gap.detected_at,
-                    });
+                if let Some(reason) = gap_reason {
+                    if let Some(gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
+                        let _ = event_bus.publish(Event::GapDetected {
+                            pane_id: gap.pane_id,
+                            seq_before: gap.seq_before,
+                            seq_after: gap.seq_after,
+                            reason: gap.reason,
+                            detected_at_ms: gap.detected_at,
+                        });
+                    }
+                }
+
+                if drop_due_to_reorder {
+                    return Ok(());
+                }
+
+                let segment = storage_handle
+                    .append_segment(
+                        remote_pane_id,
+                        &delta.content,
+                        Some(format!(
+                            "remote_sender={canonical_sender};remote_seq={}",
+                            delta.seq
+                        )),
+                    )
+                    .await?;
+                drop(storage_handle);
+
+                let _ = event_bus.publish(Event::SegmentCaptured {
+                    pane_id: remote_pane_id,
+                    seq: segment.seq,
+                    content_len: segment.content_len,
+                });
+                Ok(())
+            }
+            .await;
+
+            if persist_result.is_err() && !drop_due_to_reorder {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                match previous_seq {
+                    Some(previous_seq) => {
+                        seq_guard.insert(seq_key, previous_seq);
+                    }
+                    None => {
+                        seq_guard.remove(&seq_key);
+                    }
                 }
             }
 
-            if drop_due_to_reorder {
-                return Ok(());
-            }
-
-            let segment = storage_handle
-                .append_segment(
-                    remote_pane_id,
-                    &delta.content,
-                    Some(format!(
-                        "remote_sender={canonical_sender};remote_seq={}",
-                        delta.seq
-                    )),
-                )
-                .await?;
-            drop(storage_handle);
-
-            let _ = event_bus.publish(Event::SegmentCaptured {
-                pane_id: remote_pane_id,
-                seq: segment.seq,
-                content_len: segment.content_len,
-            });
+            persist_result?;
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
             let seq_key = (sequence_scope.clone(), gap.pane_id);
-            let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
-                let ts = now_ms_i64();
-                distributed_upsert_pane(
-                    &storage_handle,
-                    remote_pane_id,
-                    distributed_remote_pane_uuid(&canonical_sender, gap.pane_id, None),
-                    distributed_remote_domain(&canonical_sender, "unknown"),
-                    Some(format!("remote:{canonical_sender}:{}", gap.pane_id)),
-                    Some("/remote".to_string()),
-                    true,
-                    ts,
-                )
-                .await?;
-            }
-
+            let previous_seq;
             {
                 let mut seq_guard = pane_seq_by_sender.lock().await;
+                previous_seq = seq_guard.get(&seq_key).copied();
                 let next_expected_seq = gap.seq_after.saturating_sub(1);
                 seq_guard
-                    .entry(seq_key)
+                    .entry(seq_key.clone())
                     .and_modify(|current| *current = (*current).max(next_expected_seq))
                     .or_insert(next_expected_seq);
             }
 
-            let reason = format!(
-                "distributed_gap:{}:{}:{}",
-                gap.reason, gap.seq_before, gap.seq_after
-            );
-            if let Some(stored_gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
-                let _ = event_bus.publish(Event::GapDetected {
-                    pane_id: stored_gap.pane_id,
-                    seq_before: stored_gap.seq_before,
-                    seq_after: stored_gap.seq_after,
-                    reason: stored_gap.reason,
-                    detected_at_ms: stored_gap.detected_at,
-                });
+            let persist_result: anyhow::Result<()> = async {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                if storage_handle.get_pane(remote_pane_id).await?.is_none() {
+                    let ts = now_ms_i64();
+                    distributed_upsert_pane(
+                        &storage_handle,
+                        remote_pane_id,
+                        distributed_remote_pane_uuid(&canonical_sender, gap.pane_id, None),
+                        distributed_remote_domain(&canonical_sender, "unknown"),
+                        Some(format!("remote:{canonical_sender}:{}", gap.pane_id)),
+                        Some("/remote".to_string()),
+                        true,
+                        ts,
+                    )
+                    .await?;
+                }
+
+                let reason = format!(
+                    "distributed_gap:{}:{}:{}",
+                    gap.reason, gap.seq_before, gap.seq_after
+                );
+                if let Some(stored_gap) = storage_handle.record_gap(remote_pane_id, &reason).await?
+                {
+                    let _ = event_bus.publish(Event::GapDetected {
+                        pane_id: stored_gap.pane_id,
+                        seq_before: stored_gap.seq_before,
+                        seq_after: stored_gap.seq_after,
+                        reason: stored_gap.reason,
+                        detected_at_ms: stored_gap.detected_at,
+                    });
+                }
+                Ok(())
             }
+            .await;
+
+            if persist_result.is_err() {
+                let mut seq_guard = pane_seq_by_sender.lock().await;
+                match previous_seq {
+                    Some(previous_seq) => {
+                        seq_guard.insert(seq_key, previous_seq);
+                    }
+                    None => {
+                        seq_guard.remove(&seq_key);
+                    }
+                }
+            }
+
+            persist_result?;
         }
         WirePayload::Detection(detection_notice) => {
             let remote_pane_id =
@@ -12035,9 +12092,11 @@ async fn distributed_handle_connection<S>(
         .await;
 
         let replay_id = distributed_replay_session_key(&session_id, &canonical_sender);
-        let validation_err = {
+        let (previous_replay_seq, validation_err) = {
             let mut replay_guard = ingest_state.replay_guard.lock().await;
-            replay_guard.validate(&replay_id, envelope.seq).err()
+            let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
+            let validation_err = replay_guard.validate(&replay_id, envelope.seq).err();
+            (previous_replay_seq, validation_err)
         };
 
         if let Some(err) = validation_err {
@@ -12048,9 +12107,11 @@ async fn distributed_handle_connection<S>(
         let sender = canonical_sender;
         let session_scope = distributed_sender_session_scope(&session_id, &sender);
         envelope.sender = session_scope.clone();
-        let ingest_result = {
+        let (previous_agent_session, ingest_result) = {
             let mut aggregator = ingest_state.aggregator.lock().await;
-            aggregator.ingest_envelope(envelope)
+            let previous_agent_session = aggregator.agent_session_snapshot(&session_scope);
+            let ingest_result = aggregator.ingest_envelope(envelope);
+            (previous_agent_session, ingest_result)
         };
         if matches!(
             &ingest_result,
@@ -12078,11 +12139,19 @@ async fn distributed_handle_connection<S>(
                 )
                 .await
                 {
+                    distributed_rollback_failed_persist(
+                        &ingest_state,
+                        &replay_id,
+                        previous_replay_seq,
+                        &session_scope,
+                        previous_agent_session,
+                    )
+                    .await;
                     tracing::warn!(
                         peer = %peer_addr,
                         sender = %sender,
                         error = %err,
-                        "Failed to persist distributed payload"
+                        "Failed to persist distributed payload; rolled back distributed admission state"
                     );
                 }
             }
@@ -42407,6 +42476,216 @@ recorder_backend = "frankensqlite"
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
                 storage_handle.shutdown().await.unwrap();
             }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_failed_delta_persist_rolls_back_retry_state() {
+        run_async_test(async {
+            let ingest_state = DistributedIngestState::new();
+            let (storage_handle, db_path) =
+                setup_storage("distributed_failed_delta_persist_rollback").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+
+            let sender = "agent-persist-failure";
+            let session_id = "session-persist-failure";
+            let replay_id = distributed_replay_session_key(session_id, sender);
+            let sequence_scope = distributed_sender_session_scope(session_id, sender);
+            let source_pane_id = 71_u64;
+            let payload_marker = "DIST_FAILED_PERSIST_RETRY";
+            let envelope_seq = 1_u64;
+
+            let previous_replay_seq = {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                let previous_replay_seq = replay_guard.session_last_seq(&replay_id);
+                replay_guard
+                    .validate(&replay_id, envelope_seq)
+                    .expect("first replay-guard validation should pass");
+                previous_replay_seq
+            };
+
+            let previous_agent_session = {
+                let mut aggregator = ingest_state.aggregator.lock().await;
+                let previous_agent_session = aggregator.agent_session_snapshot(&sequence_scope);
+                let ingest_result = aggregator
+                    .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
+                        envelope_seq,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                            frankenterm_core::wire_protocol::PaneDelta {
+                                pane_id: source_pane_id,
+                                seq: 0,
+                                content: payload_marker.to_string(),
+                                content_len: payload_marker.len(),
+                                captured_at_ms: now_ms(),
+                            },
+                        ),
+                    ))
+                    .expect("aggregator should accept first envelope");
+                assert!(matches!(
+                    ingest_result,
+                    frankenterm_core::wire_protocol::IngestResult::Accepted(_)
+                ));
+                previous_agent_session
+            };
+
+            let persist_err = distributed_persist_payload(
+                sender,
+                Some(&sequence_scope),
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 0,
+                        content: payload_marker.to_string(),
+                        content_len: payload_marker.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &ingest_state.pane_seq_by_sender,
+            )
+            .await
+            .expect_err("closed storage should fail distributed pane persistence");
+            assert!(
+                persist_err.to_string().contains("connection closed")
+                    || persist_err.to_string().contains("closed"),
+                "expected closed-storage failure, got {persist_err:?}"
+            );
+
+            distributed_rollback_failed_persist(
+                &ingest_state,
+                &replay_id,
+                previous_replay_seq,
+                &sequence_scope,
+                previous_agent_session,
+            )
+            .await;
+
+            {
+                let pane_seq_by_sender = ingest_state.pane_seq_by_sender.lock().await;
+                assert!(
+                    pane_seq_by_sender.is_empty(),
+                    "failed pane persistence must not advance sender pane ordering"
+                );
+            }
+
+            {
+                let mut replay_guard = ingest_state.replay_guard.lock().await;
+                replay_guard
+                    .validate(&replay_id, envelope_seq)
+                    .expect("rollback should make the same replay id+seq retryable");
+            }
+
+            {
+                let mut aggregator = ingest_state.aggregator.lock().await;
+                assert_eq!(
+                    aggregator.agent_last_seq(&sequence_scope),
+                    None,
+                    "failed persistence must not leave accepted seq state behind"
+                );
+                let retry_result = aggregator
+                    .ingest_envelope(frankenterm_core::wire_protocol::WireEnvelope::new(
+                        envelope_seq,
+                        &sequence_scope,
+                        frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                            frankenterm_core::wire_protocol::PaneDelta {
+                                pane_id: source_pane_id,
+                                seq: 0,
+                                content: payload_marker.to_string(),
+                                content_len: payload_marker.len(),
+                                captured_at_ms: now_ms(),
+                            },
+                        ),
+                    ))
+                    .expect("same envelope should remain retryable after rollback");
+                assert!(matches!(
+                    retry_result,
+                    frankenterm_core::wire_protocol::IngestResult::Accepted(_)
+                ));
+            }
+
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_failed_gap_persist_restores_sender_sequence_tracker() {
+        run_async_test(async {
+            let (storage_handle, db_path) =
+                setup_storage("distributed_failed_gap_persist_rollback").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_compat::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+
+            let sender = "agent-gap-failure";
+            let sequence_scope = distributed_sender_session_scope("session-gap-failure", sender);
+            let source_pane_id = 81_u64;
+
+            {
+                let mut pane_seq_guard = pane_seq_by_sender.lock().await;
+                pane_seq_guard.insert((sequence_scope.clone(), source_pane_id), 0);
+            }
+
+            let persist_err = distributed_persist_payload(
+                sender,
+                Some(&sequence_scope),
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 0,
+                        seq_after: 4,
+                        reason: "persist-failure".to_string(),
+                        detected_at_ms: now_ms_i64(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .expect_err("closed storage should fail distributed gap persistence");
+            assert!(
+                persist_err.to_string().contains("connection closed")
+                    || persist_err.to_string().contains("closed"),
+                "expected closed-storage failure, got {persist_err:?}"
+            );
+
+            {
+                let pane_seq_guard = pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    pane_seq_guard.get(&(sequence_scope.clone(), source_pane_id)),
+                    Some(&0),
+                    "failed gap persistence must restore the previous pane sequence tracker"
+                );
+            }
+
             drop(storage);
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_path}-wal"));
