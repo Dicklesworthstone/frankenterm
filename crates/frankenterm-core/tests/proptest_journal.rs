@@ -1,6 +1,4 @@
-// Disabled: MissionJournal types not yet implemented in plan.rs.
-// Re-enable when MissionJournal, MissionJournalEntry, etc. are added.
-#![cfg(feature = "__journal_types_placeholder")]
+#![cfg(feature = "subprocess-bridge")]
 //! Property-based tests for crash-consistent mission journal (C8).
 //!
 //! Covers:
@@ -149,6 +147,57 @@ fn arb_journal_entry() -> impl Strategy<Value = MissionJournalEntry> {
 }
 
 // ── Properties ──────────────────────────────────────────────────────────────
+
+#[test]
+fn compacting_away_latest_checkpoint_repairs_snapshot_checkpoint_state() {
+    let mission = Mission::new(
+        MissionId("m-journal-compact-checkpoint".into()),
+        "journal compact checkpoint repair",
+        "ws",
+        MissionOwnership::solo("agent"),
+        1_000,
+    );
+    let mut journal = MissionJournal::new(MissionId("m-journal-compact-checkpoint".into()));
+
+    journal
+        .append(
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                recovery_reason: "before".into(),
+            },
+            "before-checkpoint",
+            "op",
+            "test",
+            None,
+            1_500,
+        )
+        .unwrap();
+    let checkpoint_seq = journal.checkpoint(&mission, 2_000).unwrap();
+    journal
+        .append(
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: checkpoint_seq,
+                recovery_reason: "after".into(),
+            },
+            "after-checkpoint",
+            "op",
+            "test",
+            None,
+            2_500,
+        )
+        .unwrap();
+
+    journal.compact_before(checkpoint_seq + 1);
+
+    let snapshot = journal.snapshot_state();
+    assert_eq!(snapshot.last_checkpoint_seq, None);
+    assert!(snapshot.last_checkpoint_hash.is_empty());
+
+    let replay = journal.replay_from_checkpoint();
+    assert_eq!(replay.start_seq, checkpoint_seq + 1);
+    assert_eq!(replay.entries_scanned, 1);
+    assert_eq!(replay.checkpoints_found, 0);
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]

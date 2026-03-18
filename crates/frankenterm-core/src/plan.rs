@@ -1535,6 +1535,10 @@ pub enum MissionLifecycleTransitionKind {
     RetryResumed,
     ExecutionBlocked,
     MissionCancelled,
+    PauseRequested,
+    ResumeRequested,
+    AbortRequested,
+    ApprovalRequested,
 }
 
 impl fmt::Display for MissionLifecycleTransitionKind {
@@ -1556,6 +1560,10 @@ impl fmt::Display for MissionLifecycleTransitionKind {
             Self::RetryResumed => f.write_str("retry_resumed"),
             Self::ExecutionBlocked => f.write_str("execution_blocked"),
             Self::MissionCancelled => f.write_str("mission_cancelled"),
+            Self::PauseRequested => f.write_str("pause_requested"),
+            Self::ResumeRequested => f.write_str("resume_requested"),
+            Self::AbortRequested => f.write_str("abort_requested"),
+            Self::ApprovalRequested => f.write_str("approval_requested"),
         }
     }
 }
@@ -4148,6 +4156,367 @@ impl MissionAgentCapabilityProfile {
                 self.max_parallel_assignments
             }
         }
+    }
+}
+
+// ── Mission Journal ──────────────────────────────────────────────────────────
+// Crash-consistent, append-only journal for mission lifecycle decisions.
+
+/// Kind of mission journal entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MissionJournalEntryKind {
+    LifecycleTransition {
+        from: MissionLifecycleState,
+        to: MissionLifecycleState,
+        transition_kind: MissionLifecycleTransitionKind,
+    },
+    KillSwitchChange {
+        level_from: MissionKillSwitchLevel,
+        level_to: MissionKillSwitchLevel,
+    },
+    AssignmentOutcome {
+        assignment_id: AssignmentId,
+        outcome_before: Option<String>,
+        outcome_after: String,
+    },
+    Checkpoint {
+        mission_hash: String,
+        lifecycle_state: MissionLifecycleState,
+        assignment_count: usize,
+    },
+    RecoveryMarker {
+        recovered_through_seq: u64,
+        recovery_reason: String,
+    },
+}
+
+/// A single entry in the mission journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalEntry {
+    pub seq: u64,
+    pub timestamp_ms: i64,
+    pub correlation_id: String,
+    pub entry_hash: String,
+    pub kind: MissionJournalEntryKind,
+    pub mission_version: u32,
+    pub initiated_by: String,
+    pub reason_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl MissionJournalEntry {
+    /// Deterministic canonical string for replay comparison.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "je:seq={},ts={},cid={},kind={:?}",
+            self.seq, self.timestamp_ms, self.correlation_id, self.kind
+        )
+    }
+}
+
+/// Snapshot of journal state for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalState {
+    pub entry_count: u64,
+    pub last_seq: u64,
+    pub last_entry_hash: String,
+    pub last_checkpoint_seq: Option<u64>,
+    pub last_checkpoint_hash: String,
+    pub clean: bool,
+}
+
+impl MissionJournalState {
+    /// Whether the journal has never had any entries appended.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.entry_count == 0
+    }
+
+    /// Deterministic canonical string.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!(
+            "js:count={},seq={},clean={}",
+            self.entry_count, self.last_seq, self.clean
+        )
+    }
+}
+
+/// Report from replaying journal entries from a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionJournalReplayReport {
+    pub start_seq: u64,
+    pub entries_scanned: usize,
+    pub lifecycle_transitions: usize,
+    pub control_commands: usize,
+    pub kill_switch_changes: usize,
+    pub assignment_outcomes: usize,
+    pub checkpoints_found: usize,
+    pub recovery_markers: usize,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+impl MissionJournalReplayReport {
+    /// Whether the replay found no errors.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// Total entries (sum of all categories).
+    #[must_use]
+    pub fn total_entries(&self) -> usize {
+        self.entries_scanned
+    }
+}
+
+/// Error from journal operations.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum MissionJournalError {
+    #[error("duplicate correlation ID: {0}")]
+    DuplicateCorrelation(String),
+    #[error("journal error: {0}")]
+    Internal(String),
+}
+
+/// Crash-consistent, append-only mission journal.
+pub struct MissionJournal {
+    mission_id: MissionId,
+    entries: Vec<MissionJournalEntry>,
+    next_seq: u64,
+    correlation_index: std::collections::HashSet<String>,
+    last_checkpoint_seq: Option<u64>,
+    max_entries: Option<usize>,
+}
+
+impl MissionJournal {
+    /// Create a new empty journal for a mission.
+    #[must_use]
+    pub fn new(mission_id: MissionId) -> Self {
+        Self {
+            mission_id,
+            entries: Vec::new(),
+            next_seq: 1,
+            correlation_index: std::collections::HashSet::new(),
+            last_checkpoint_seq: None,
+            max_entries: None,
+        }
+    }
+
+    /// Set the maximum entries before compaction is needed.
+    #[must_use]
+    pub fn with_max_entries(mut self, limit: usize) -> Self {
+        self.max_entries = Some(limit);
+        self
+    }
+
+    /// Number of entries in the journal.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the journal is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Append a new entry. Rejects duplicate correlation IDs.
+    pub fn append(
+        &mut self,
+        kind: MissionJournalEntryKind,
+        correlation_id: impl Into<String>,
+        initiated_by: impl Into<String>,
+        reason_code: impl Into<String>,
+        error_code: Option<String>,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let cid = correlation_id.into();
+        if self.correlation_index.contains(&cid) {
+            return Err(MissionJournalError::DuplicateCorrelation(cid));
+        }
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        let entry_hash = format!("h:{seq}:{}", self.mission_id.0);
+        self.correlation_index.insert(cid.clone());
+        self.entries.push(MissionJournalEntry {
+            seq,
+            timestamp_ms,
+            correlation_id: cid,
+            entry_hash,
+            kind,
+            mission_version: MISSION_SCHEMA_VERSION,
+            initiated_by: initiated_by.into(),
+            reason_code: reason_code.into(),
+            error_code,
+        });
+
+        Ok(seq)
+    }
+
+    /// Append a recovery marker entry.
+    pub fn recovery_marker(
+        &mut self,
+        recovered_through_seq: u64,
+        recovery_reason: impl Into<String>,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let cid = format!("recovery:{}", self.next_seq);
+        self.append(
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq,
+                recovery_reason: recovery_reason.into(),
+            },
+            cid,
+            "system",
+            "recovery",
+            None,
+            timestamp_ms,
+        )
+    }
+
+    /// Record a checkpoint from the current mission state.
+    pub fn checkpoint(
+        &mut self,
+        mission: &Mission,
+        timestamp_ms: i64,
+    ) -> Result<u64, MissionJournalError> {
+        let cid = format!("checkpoint:{}", self.next_seq);
+        let seq = self.append(
+            MissionJournalEntryKind::Checkpoint {
+                mission_hash: format!("mhash:{}", mission.mission_id.0),
+                lifecycle_state: mission.lifecycle_state,
+                assignment_count: mission.assignments.len(),
+            },
+            cid,
+            "system",
+            "checkpoint",
+            None,
+            timestamp_ms,
+        )?;
+        self.last_checkpoint_seq = Some(seq);
+        Ok(seq)
+    }
+
+    /// All entries.
+    #[must_use]
+    pub fn entries(&self) -> &[MissionJournalEntry] {
+        &self.entries
+    }
+
+    /// Entries with seq >= since_seq.
+    #[must_use]
+    pub fn entries_since(&self, since_seq: u64) -> &[MissionJournalEntry] {
+        let start = self
+            .entries
+            .iter()
+            .position(|e| e.seq >= since_seq)
+            .unwrap_or(self.entries.len());
+        &self.entries[start..]
+    }
+
+    /// Whether a correlation ID exists in the journal.
+    #[must_use]
+    pub fn has_correlation(&self, cid: &str) -> bool {
+        self.correlation_index.contains(cid)
+    }
+
+    /// Whether the journal exceeds its max entry limit.
+    #[must_use]
+    pub fn needs_compaction(&self) -> bool {
+        self.max_entries
+            .is_some_and(|limit| self.entries.len() > limit)
+    }
+
+    /// Remove entries with seq < compact_seq.
+    pub fn compact_before(&mut self, compact_seq: u64) {
+        // Remove correlation IDs for compacted entries
+        let to_remove: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.seq < compact_seq)
+            .map(|e| e.correlation_id.clone())
+            .collect();
+        for cid in &to_remove {
+            self.correlation_index.remove(cid);
+        }
+        self.entries.retain(|e| e.seq >= compact_seq);
+        // Re-derive the checkpoint anchor from retained entries so compaction
+        // cannot leave stale checkpoint metadata behind.
+        self.last_checkpoint_seq = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| matches!(&entry.kind, MissionJournalEntryKind::Checkpoint { .. }))
+            .map(|entry| entry.seq);
+    }
+
+    /// Take a snapshot of journal state.
+    #[must_use]
+    pub fn snapshot_state(&self) -> MissionJournalState {
+        let last_entry = self.entries.last();
+        MissionJournalState {
+            entry_count: self.entries.len() as u64,
+            last_seq: last_entry.map_or(0, |e| e.seq),
+            last_entry_hash: last_entry.map_or_else(String::new, |e| e.entry_hash.clone()),
+            last_checkpoint_seq: self.last_checkpoint_seq,
+            last_checkpoint_hash: self
+                .last_checkpoint_seq
+                .and_then(|seq| self.entries.iter().find(|e| e.seq == seq))
+                .map_or_else(String::new, |e| e.entry_hash.clone()),
+            clean: true,
+        }
+    }
+
+    /// Replay entries from the last checkpoint (or beginning if none).
+    #[must_use]
+    pub fn replay_from_checkpoint(&self) -> MissionJournalReplayReport {
+        let start_idx = self
+            .last_checkpoint_seq
+            .and_then(|seq| self.entries.iter().position(|e| e.seq == seq))
+            .unwrap_or(0);
+
+        let replay_slice = &self.entries[start_idx..];
+        let mut report = MissionJournalReplayReport {
+            start_seq: replay_slice.first().map_or(0, |e| e.seq),
+            entries_scanned: replay_slice.len(),
+            lifecycle_transitions: 0,
+            control_commands: 0,
+            kill_switch_changes: 0,
+            assignment_outcomes: 0,
+            checkpoints_found: 0,
+            recovery_markers: 0,
+            errors: Vec::new(),
+        };
+
+        for entry in replay_slice {
+            match &entry.kind {
+                MissionJournalEntryKind::LifecycleTransition { .. } => {
+                    report.lifecycle_transitions += 1;
+                }
+                MissionJournalEntryKind::KillSwitchChange { .. } => {
+                    report.kill_switch_changes += 1;
+                }
+                MissionJournalEntryKind::AssignmentOutcome { .. } => {
+                    report.assignment_outcomes += 1;
+                }
+                MissionJournalEntryKind::Checkpoint { .. } => {
+                    report.checkpoints_found += 1;
+                }
+                MissionJournalEntryKind::RecoveryMarker { .. } => {
+                    report.recovery_markers += 1;
+                }
+            }
+        }
+
+        report
     }
 }
 
