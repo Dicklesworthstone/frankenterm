@@ -748,14 +748,6 @@ impl SnapshotEngine {
     ) -> std::result::Result<String, SnapshotError> {
         let existing_session_id = { self.session_id.read().await.clone() };
         if let Some(id) = existing_session_id {
-            // Update last_checkpoint_at and topology
-            let db_path = Arc::clone(&self.db_path);
-            let topo = topology_json.to_string();
-            let id_for_closure = id.clone();
-            Self::spawn_blocking_db(move || {
-                update_session_sync(&db_path, &id_for_closure, now_ms, &topo)
-            })
-            .await?;
             return Ok(id);
         }
 
@@ -1019,21 +1011,6 @@ fn create_session_sync(
     Ok(())
 }
 
-fn update_session_sync(
-    db_path: &str,
-    session_id: &str,
-    now_ms: u64,
-    topology_json: &str,
-) -> std::result::Result<(), rusqlite::Error> {
-    let conn = open_conn(db_path)?;
-    conn.execute(
-        "UPDATE mux_sessions SET last_checkpoint_at = ?1, topology_json = ?2
-         WHERE session_id = ?3",
-        rusqlite::params![now_ms as i64, topology_json, session_id],
-    )?;
-    Ok(())
-}
-
 fn mark_shutdown_sync(db_path: &str, session_id: &str) -> std::result::Result<(), rusqlite::Error> {
     let conn = open_conn(db_path)?;
     conn.execute(
@@ -1051,17 +1028,19 @@ fn save_checkpoint_sync(
     now_ms: u64,
     checkpoint_type: &str,
     state_hash: &str,
-    _topology_json: &str,
+    topology_json: &str,
     pane_states: &[PaneStateSnapshot],
 ) -> std::result::Result<(String, i64, usize), rusqlite::Error> {
-    type SerializedPaneState = (
-        u64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    );
+    struct SerializedPaneState {
+        pane_id: u64,
+        cwd: Option<String>,
+        command: Option<String>,
+        terminal_json: String,
+        env_json: Option<String>,
+        agent_json: Option<String>,
+        scrollback_seq: Option<i64>,
+        last_output_at: Option<i64>,
+    }
 
     let conn = open_conn(db_path)?;
 
@@ -1094,17 +1073,20 @@ fn save_checkpoint_sync(
             + env_json.as_ref().map_or(0, |s| s.len())
             + agent_json.as_ref().map_or(0, |s| s.len());
 
-        serialized_states.push((
-            ps.pane_id,
+        serialized_states.push(SerializedPaneState {
+            pane_id: ps.pane_id,
+            cwd: ps.cwd.clone(),
+            command: ps.foreground_process.as_ref().map(|p| p.name.clone()),
             terminal_json,
             env_json,
             agent_json,
             scrollback_seq,
             last_output_at,
-        ));
+        });
     }
 
     let tx = conn.unchecked_transaction()?;
+    let persisted_pane_count = serialized_states.len();
 
     // Insert checkpoint
     tx.execute(
@@ -1116,7 +1098,7 @@ fn save_checkpoint_sync(
             now_ms as i64,
             checkpoint_type,
             state_hash,
-            pane_states.len() as i64,
+            persisted_pane_count as i64,
             total_bytes as i64,
         ],
     )?;
@@ -1128,32 +1110,31 @@ fn save_checkpoint_sync(
         let mut stmt = tx.prepare_cached(
             "INSERT INTO mux_pane_state
              (checkpoint_id, pane_id, cwd, command, env_json, terminal_state_json,
-              agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
+             agent_metadata_json, scrollback_checkpoint_seq, last_output_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
 
-        for (i, ps) in pane_states.iter().enumerate() {
-            let (
-                _,
-                ref terminal_json,
-                ref env_json,
-                ref agent_json,
-                scrollback_seq,
-                last_output_at,
-            ) = serialized_states[i];
+        for ps in &serialized_states {
             stmt.execute(rusqlite::params![
                 checkpoint_id,
                 ps.pane_id as i64,
-                ps.cwd,
-                ps.foreground_process.as_ref().map(|p| &p.name),
-                env_json,
-                terminal_json,
-                agent_json,
-                scrollback_seq,
-                last_output_at,
+                ps.cwd.as_deref(),
+                ps.command.as_deref(),
+                ps.env_json.as_deref(),
+                &ps.terminal_json,
+                ps.agent_json.as_deref(),
+                ps.scrollback_seq,
+                ps.last_output_at,
             ])?;
         }
     } // drop stmt before commit
+
+    tx.execute(
+        "UPDATE mux_sessions
+         SET last_checkpoint_at = ?1, topology_json = ?2
+         WHERE session_id = ?3",
+        rusqlite::params![now_ms as i64, topology_json, session_id],
+    )?;
 
     tx.commit()?;
 
@@ -1180,13 +1161,23 @@ fn cleanup_sync(
         [cutoff_ms as i64],
     )?;
 
-    // Keep only the latest retention_count checkpoints per session
+    // Keep only the latest retention_count checkpoints per session.
+    // The ranking must be partitioned by session_id; a global LIMIT would let
+    // one busy session evict another session's newest retained checkpoints.
     let deleted_by_count: usize = tx.execute(
-        "DELETE FROM session_checkpoints WHERE id NOT IN (
-            SELECT id FROM session_checkpoints
-            ORDER BY checkpoint_at DESC
-            LIMIT ?1
-        )",
+        "DELETE FROM session_checkpoints
+         WHERE id IN (
+             SELECT id
+             FROM (
+                 SELECT id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY session_id
+                            ORDER BY checkpoint_at DESC, id DESC
+                        ) AS checkpoint_rank
+                 FROM session_checkpoints
+             )
+             WHERE checkpoint_rank > ?1
+         )",
         [retention_count as i64],
     )?;
 
@@ -1505,6 +1496,125 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(count, 2);
+        });
+    }
+
+    #[test]
+    fn save_checkpoint_sync_updates_session_row_to_match_checkpoint() {
+        let (_tmp, db_path) = setup_test_db();
+        create_session_sync(
+            db_path.as_str(),
+            "sess-atomic",
+            1000,
+            r#"{"version":"old"}"#,
+            crate::VERSION,
+        )
+        .unwrap();
+
+        let pane = PaneStateSnapshot::from_pane_info(&make_test_pane(7, 24, 80), 2000, false);
+        let (_session_id, checkpoint_id, _total_bytes) = save_checkpoint_sync(
+            db_path.as_str(),
+            "sess-atomic",
+            2000,
+            "event",
+            "state-hash-2",
+            r#"{"version":"new"}"#,
+            &[pane],
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.as_str()).unwrap();
+        let (last_checkpoint_at, topology_json): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT last_checkpoint_at, topology_json
+                 FROM mux_sessions
+                 WHERE session_id = 'sess-atomic'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_checkpoint_at, Some(2000));
+        assert_eq!(topology_json, r#"{"version":"new"}"#);
+
+        let (checkpoint_at, pane_count): (i64, i64) = conn
+            .query_row(
+                "SELECT checkpoint_at, pane_count
+                 FROM session_checkpoints
+                 WHERE id = ?1",
+                [checkpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_at, 2000);
+        assert_eq!(pane_count, 1);
+    }
+
+    #[test]
+    fn cleanup_retains_latest_checkpoints_per_session() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                retention_count: 1,
+                retention_days: 365,
+                ..SnapshotConfig::default()
+            };
+            let engine_a = SnapshotEngine::new(db_path.clone(), config.clone());
+            let engine_b = SnapshotEngine::new(db_path.clone(), config.clone());
+            let cleanup_engine = SnapshotEngine::new(db_path.clone(), config);
+
+            let first_a = engine_a
+                .capture(&[make_test_pane(1, 24, 80)], SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+            let first_b = engine_b
+                .capture(&[make_test_pane(2, 24, 80)], SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+            let latest_a = engine_a
+                .capture(&[make_test_pane(1, 30, 100)], SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+            let latest_b = engine_b
+                .capture(&[make_test_pane(2, 30, 100)], SnapshotTrigger::Manual)
+                .await
+                .unwrap();
+
+            let deleted = cleanup_engine.cleanup().await.unwrap();
+            assert_eq!(deleted, 2, "should delete one older checkpoint per session");
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let remaining: Vec<(String, i64)> = conn
+                .prepare(
+                    "SELECT session_id, id
+                     FROM session_checkpoints
+                     ORDER BY session_id, id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            assert_eq!(
+                remaining.len(),
+                2,
+                "one checkpoint should remain per session"
+            );
+            assert_eq!(
+                remaining,
+                vec![
+                    (first_a.session_id.clone(), latest_a.checkpoint_id),
+                    (first_b.session_id.clone(), latest_b.checkpoint_id),
+                ]
+            );
+            assert!(
+                !remaining.iter().any(|(_, id)| *id == first_a.checkpoint_id),
+                "older checkpoint from session A should be pruned"
+            );
+            assert!(
+                !remaining.iter().any(|(_, id)| *id == first_b.checkpoint_id),
+                "older checkpoint from session B should be pruned"
+            );
         });
     }
 
