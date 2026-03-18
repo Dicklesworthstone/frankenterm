@@ -21,7 +21,7 @@ use frankenterm_core::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use frankenterm_core::error::WeztermError;
 use frankenterm_core::wezterm::{
     BackendKind, BackendSelection, MockEvent, MockWezterm, MoveDirection, PaneInfo, PaneTextSource,
-    SplitDirection, UnifiedClient, WeztermFuture, WeztermHandle, WeztermHandleSource,
+    SpawnTarget, SplitDirection, UnifiedClient, WeztermFuture, WeztermHandle, WeztermHandleSource,
     WeztermInterface,
 };
 
@@ -64,6 +64,14 @@ impl WeztermInterface for FailingMockWezterm {
         Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
+        Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn spawn_targeted(
+        &self,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
         Box::pin(async { Err(frankenterm_core::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn activate_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
