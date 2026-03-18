@@ -1196,6 +1196,111 @@ mod tests {
         }
     }
 
+    struct SpawnFailSecondTabWezterm {
+        inner: MockWezterm,
+        spawn_calls: AtomicUsize,
+    }
+
+    impl SpawnFailSecondTabWezterm {
+        fn new() -> Self {
+            Self {
+                inner: MockWezterm::new(),
+                spawn_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl WeztermInterface for SpawnFailSecondTabWezterm {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            self.inner.list_panes()
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            self.inner.get_pane(pane_id)
+        }
+
+        fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+            self.inner.get_text(pane_id, escapes)
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text(pane_id, text)
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text_no_paste(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            no_paste: bool,
+            no_newline: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.inner
+                .send_text_with_options(pane_id, text, no_paste, no_newline)
+        }
+
+        fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+            if self.spawn_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Box::pin(async {
+                    Err(crate::Error::Runtime(
+                        "simulated second-tab spawn failure".to_string(),
+                    ))
+                });
+            }
+
+            self.inner.spawn(cwd, domain_name)
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            direction: SplitDirection,
+            cwd: Option<&str>,
+            percent: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            self.inner.split_pane(pane_id, direction, cwd, percent)
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            self.inner.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
+            self.inner.zoom_pane(pane_id, zoom)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.inner.circuit_status()
+        }
+    }
+
     fn setup_test_db() -> (String, Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
@@ -1761,6 +1866,105 @@ mod tests {
 
         let retry_candidate = restorer.detect().unwrap().expect("retryable session");
         assert_eq!(retry_candidate.session_id, "sess-partial");
+    }
+
+    #[test]
+    fn session_restorer_root_tab_failure_leaves_session_unclean_for_retry() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-tab-fail", false);
+
+        let multi_tab_topology = TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: None,
+            windows: vec![WindowSnapshot {
+                window_id: 0,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![
+                    TabSnapshot {
+                        tab_id: 0,
+                        title: None,
+                        active_pane_id: Some(1),
+                        pane_tree: PaneNode::Leaf {
+                            pane_id: 1,
+                            rows: 24,
+                            cols: 80,
+                            cwd: Some("/ok".to_string()),
+                            title: None,
+                            is_active: true,
+                        },
+                    },
+                    TabSnapshot {
+                        tab_id: 1,
+                        title: None,
+                        active_pane_id: Some(2),
+                        pane_tree: PaneNode::Leaf {
+                            pane_id: 2,
+                            rows: 24,
+                            cols: 80,
+                            cwd: Some("/fails".to_string()),
+                            title: None,
+                            is_active: false,
+                        },
+                    },
+                ],
+                active_tab_index: Some(0),
+            }],
+        };
+        conn.execute(
+            "UPDATE mux_sessions SET topology_json = ?2 WHERE session_id = ?1",
+            params![
+                "sess-tab-fail",
+                multi_tab_topology
+                    .to_json()
+                    .expect("serialize multi-tab topology"),
+            ],
+        )
+        .unwrap();
+
+        let checkpoint_id = insert_checkpoint(&conn, "sess-tab-fail", 5000, 2);
+        insert_pane_state(&conn, checkpoint_id, 1, Some("/ok"), Some("bash"));
+        insert_pane_state(&conn, checkpoint_id, 2, Some("/fails"), Some("python"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-tab-fail'",
+            [],
+        )
+        .unwrap();
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+
+        let wezterm = Arc::new(SpawnFailSecondTabWezterm::new());
+        let summary = run_async_test(restorer.restore(&session, &checkpoint, wezterm)).unwrap();
+
+        assert_eq!(summary.restored_count(), 1);
+        assert_eq!(summary.failed_count(), 1);
+        assert_eq!(
+            summary.layout_result.failed_panes,
+            vec![(
+                2,
+                "Runtime error: simulated second-tab spawn failure".to_string()
+            )]
+        );
+
+        let shutdown_clean: bool = conn
+            .query_row(
+                "SELECT shutdown_clean FROM mux_sessions WHERE session_id = 'sess-tab-fail'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !shutdown_clean,
+            "failed tab restore should leave the session unclean so it can be retried"
+        );
+
+        let retry_candidate = restorer.detect().unwrap().expect("retryable session");
+        assert_eq!(retry_candidate.session_id, "sess-tab-fail");
     }
 
     #[test]

@@ -611,6 +611,18 @@ pub mod task {
         }
     }
 
+    impl JoinError {
+        /// Create a new `JoinError` with the given message.
+        pub fn new(msg: impl Into<String>) -> Self {
+            Self { msg: msg.into() }
+        }
+
+        /// Returns `true` if the task was cancelled via `JoinHandle::abort()`.
+        pub fn is_cancelled(&self) -> bool {
+            self.msg.contains("aborted")
+        }
+    }
+
     impl std::error::Error for JoinError {}
 
     /// Handle to a spawned task. Awaiting it yields the task's output
@@ -618,14 +630,24 @@ pub mod task {
     ///
     /// Uses `Pin<Box<_>>` internally to avoid unsafe pin projection while
     /// maintaining `#![forbid(unsafe_code)]` compliance.
+    ///
+    /// The `aborted` flag is an `Arc<AtomicBool>` shared between the
+    /// `JoinHandle` and any clones used internally. When `abort()` is
+    /// called, the flag is set to `true` and subsequent polls immediately
+    /// return `Err(JoinError)` instead of polling the inner future.
     pub struct JoinHandle<T> {
         inner: Pin<Box<asupersync::runtime::JoinHandle<T>>>,
+        aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl<T> Future for JoinHandle<T> {
         type Output = Result<T, JoinError>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            // Check the abort flag before polling the inner future.
+            if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+                return Poll::Ready(Err(JoinError::new("task aborted")));
+            }
             match self.inner.as_mut().poll(cx) {
                 Poll::Ready(value) => Poll::Ready(Ok(value)),
                 Poll::Pending => Poll::Pending,
@@ -643,11 +665,14 @@ pub mod task {
 
         /// Request cancellation of the task.
         ///
-        /// Note: asupersync uses context-based cancellation; this is a
-        /// best-effort no-op provided for API compatibility with tokio.
+        /// Sets an internal abort flag that causes subsequent polls of this
+        /// handle to return `Err(JoinError)` immediately. The underlying
+        /// asupersync task may continue running to completion (asupersync
+        /// uses context-based cancellation), but the caller will observe
+        /// an abort error the next time the handle is polled.
         pub fn abort(&self) {
-            // asupersync JoinHandle does not support abort; cancellation
-            // is driven through Cx. This is a no-op for compatibility.
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -729,18 +754,27 @@ pub mod task {
 
         /// Cancel all tasks in the set.
         ///
-        /// Under asupersync, abort is a no-op (context-based cancellation).
-        /// This clears the handle set to release resources.
+        /// Sets the abort flag on each handle so that any subsequent polls
+        /// return `Err(JoinError)`, then clears the handle set. The
+        /// underlying asupersync tasks may continue running, but callers
+        /// observing these handles will see abort errors.
         pub fn abort_all(&mut self) {
-            // asupersync doesn't support handle-based abort.
-            // Best effort: drop all handles (tasks continue to completion).
+            for handle in &self.handles {
+                handle.abort();
+            }
             self.handles.clear();
         }
     }
 
-    struct HandleContextFuture<F> {
-        handle: asupersync::runtime::RuntimeHandle,
-        future: Pin<Box<F>>,
+    /// Wrapper future that installs the asupersync `RuntimeHandle` into
+    /// thread-local storage before each poll, enabling nested `task::spawn`
+    /// calls from within spawned futures.
+    ///
+    /// Visible to the parent module so that `spawn_detached` can also wrap
+    /// futures with the correct runtime context.
+    pub(super) struct HandleContextFuture<F> {
+        pub(super) handle: asupersync::runtime::RuntimeHandle,
+        pub(super) future: Pin<Box<F>>,
     }
 
     impl<F: Future> Future for HandleContextFuture<F> {
@@ -777,6 +811,7 @@ pub mod task {
         let inner = handle.spawn(wrapped);
         JoinHandle {
             inner: Box::pin(inner),
+            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -812,10 +847,31 @@ pub use tokio::join;
 
 /// Re-export `select!` macro for multiplexing futures.
 ///
-/// Uses `tokio::select!` in both paths during migration. The asupersync
-/// path will be replaced with a runtime-agnostic implementation once all
-/// select call-sites are audited.
+/// # SAFETY: cross-runtime `select!` under asupersync
+///
+/// Both cfg paths currently re-export `tokio::select!`. Under
+/// `asupersync-runtime` this means the select macro uses tokio's internal
+/// polling infrastructure while the rest of the runtime uses asupersync.
+///
+/// **Why this works today:** tokio is still a linked dependency because
+/// `broadcast`, `oneshot`, and `Notify` channels have not yet been
+/// migrated to asupersync equivalents. Those channel types initialize
+/// tokio's internal driver context (cooperative budget, waker plumbing)
+/// as a side-effect, which `tokio::select!` relies on. As long as at
+/// least one tokio channel/primitive is alive in the process, the tokio
+/// context is valid and `select!` behaves correctly.
+///
+/// **When this will break:** once `broadcast`, `oneshot`, and `Notify`
+/// are migrated away from tokio, the tokio internal context will no
+/// longer be initialized, and `tokio::select!` may panic or busy-loop.
+/// At that point this must be replaced with `asupersync::select!` (or a
+/// runtime-agnostic implementation such as `futures::select!` with
+/// `pin_mut!`).
+///
+/// Do **not** change this to a non-tokio select without first migrating
+/// all tokio channel types — the two changes must be coordinated.
 // TODO(asupersync): replace with asupersync-native select when available
+// and tokio channel dependencies have been fully migrated.
 #[cfg(feature = "asupersync-runtime")]
 pub use tokio::select;
 #[cfg(not(feature = "asupersync-runtime"))]
@@ -1170,7 +1226,15 @@ impl CompatRuntime for Runtime {
         F: Future<Output = ()> + Send + 'static,
     {
         let handle = self.inner.handle();
-        std::mem::drop(handle.spawn(future));
+        // Wrap in HandleContextFuture so that nested task::spawn() calls
+        // inside the detached future can find the runtime handle in
+        // thread-local storage. Without this, any nested spawn panics
+        // with "task::spawn called outside of Runtime::block_on context".
+        let wrapped = task::HandleContextFuture {
+            handle: handle.clone(),
+            future: Box::pin(future),
+        };
+        std::mem::drop(handle.spawn(wrapped));
     }
 }
 

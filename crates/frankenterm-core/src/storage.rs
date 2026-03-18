@@ -6988,7 +6988,12 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
-    /// Consume an approval token by code hash only (without fingerprint validation)
+    /// Consume an approval token by code hash only (without fingerprint validation).
+    ///
+    /// **Warning**: This does NOT validate `action_kind`, `pane_id`, or
+    /// `action_fingerprint`. A token issued for one action can be consumed
+    /// for a different action. Prefer [`consume_approval_token`] when the
+    /// full policy context is available.
     pub async fn consume_approval_token_by_code(
         &self,
         code_hash: &str,
@@ -9344,8 +9349,8 @@ fn mirror_segment_into_mmap(
 
 /// Main loop for the writer thread.
 ///
-/// Drains pending writes in small batches to amortize queue wakeups while
-/// preserving per-command durability semantics.
+/// Opportunistically processes burst traffic while preserving immediate
+/// per-command dispatch semantics.
 ///
 /// Every `WriteCommand` resolves a caller-facing oneshot from
 /// `dispatch_write_command()`. Wrapping multiple commands in an explicit
@@ -9353,6 +9358,10 @@ fn mirror_segment_into_mmap(
 /// `COMMIT` could still fail, turning a durability failure into a false `Ok`.
 /// Until the response path can defer replies until the transaction outcome is
 /// known, the writer must stay in SQLite's per-statement autocommit mode.
+///
+/// Additional queued commands are still drained opportunistically after the
+/// first wakeup, but each one is dispatched immediately after receipt rather
+/// than being staged in an undispatched in-memory batch.
 fn writer_loop(
     conn: &mut Connection,
     rx: &mut mpsc::Receiver<WriteCommand>,
@@ -9376,19 +9385,16 @@ fn writer_loop(
             break;
         };
 
-        // Drain any additional pending commands for batching
-        let mut batch = Vec::with_capacity(8);
-        batch.push(first_cmd);
-        while batch.len() < WRITER_BATCH_CAP {
-            match rx.try_recv() {
-                Ok(cmd) => batch.push(cmd),
-                Err(_) => break,
-            }
-        }
-
         let mut should_break = false;
-        for cmd in batch {
+        dispatch_write_command(conn, first_cmd, &mut should_break, mmap_mirror);
+
+        let mut drained = 1;
+        while drained < WRITER_BATCH_CAP && !should_break {
+            let Ok(cmd) = rx.try_recv() else {
+                break;
+            };
             dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
+            drained += 1;
         }
 
         if should_break {
@@ -12531,7 +12537,21 @@ fn get_approval_token_by_code_sync(
         .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")).into())
 }
 
-/// Consume an approval token by code hash only, without fingerprint validation (synchronous)
+/// Consume an approval token by code hash only, without fingerprint validation (synchronous).
+///
+/// # Security note: token scope is NOT validated
+///
+/// This function matches tokens solely on `code_hash` + `workspace_id`. It does
+/// **not** verify that the token's `action_kind`, `pane_id`, or
+/// `action_fingerprint` match the action being approved. A token originally
+/// issued for one action kind or pane can be consumed by a different action if
+/// the caller only has the code hash.
+///
+/// **Callers that have the original policy context available should prefer
+/// [`consume_approval_token`] (the fingerprint-validated version) instead.**
+/// This code-only variant exists for the CLI `ft approve` path where the user
+/// provides a short approval code and the full action context is not available
+/// at consumption time.
 fn consume_approval_token_by_code_sync(
     conn: &mut Connection,
     code_hash: &str,
@@ -12582,6 +12602,21 @@ fn consume_approval_token_by_code_sync(
         }
 
         record.used_at = Some(now);
+
+        // Warn that this token was consumed without scope validation — the
+        // token's action_kind/pane_id may not match what the caller intends
+        // to approve. This is expected for the CLI `ft approve` path but
+        // should be auditable.
+        tracing::warn!(
+            token_id = record.id,
+            token_action_kind = %record.action_kind,
+            token_pane_id = ?record.pane_id,
+            workspace_id = %workspace_id,
+            "approval token consumed by code-only path without action scope \
+             validation; token's action_kind/pane_id were not checked against \
+             the current approval context"
+        );
+
         tx.commit()
             .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
         return Ok(Some(record));
@@ -13385,6 +13420,12 @@ fn build_indexing_health_report(
 
 /// Current FTS index version. Increment when FTS schema changes require rebuild.
 const FTS_INDEX_VERSION: u32 = 1;
+/// Sentinel version used when a rebuild was started but did not finish.
+///
+/// `sync_fts_on_startup()` treats any non-current version as a forced full
+/// rebuild, so this leaves an explicit "must rebuild" marker instead of
+/// silently trusting a partially rebuilt index.
+const FTS_INDEX_REBUILD_PENDING_VERSION: u32 = 0;
 
 /// Get the current FTS index state
 fn get_fts_index_state_sync(conn: &Connection) -> Result<Option<FtsIndexState>> {
@@ -13426,6 +13467,25 @@ fn upsert_fts_index_state_sync(conn: &Connection, state: &FtsIndexState) -> Resu
     )
     .map_err(|e| StorageError::Database(format!("Failed to upsert FTS index state: {e}")))?;
     Ok(())
+}
+
+/// Mark the FTS index as needing a clean full rebuild.
+///
+/// This is used when a delete-all + reindex cycle fails after the old index
+/// contents have already been discarded. We intentionally leave the state in a
+/// forced-rebuild marker rather than restoring per-pane progress against an
+/// incomplete FTS table.
+fn mark_fts_rebuild_pending_sync(conn: &Connection, now: i64) -> Result<()> {
+    let created_at = get_fts_index_state_sync(conn)?
+        .map(|state| state.created_at)
+        .unwrap_or(now);
+    let pending_state = FtsIndexState {
+        index_version: FTS_INDEX_REBUILD_PENDING_VERSION,
+        last_full_rebuild_at: None,
+        created_at,
+        updated_at: now,
+    };
+    upsert_fts_index_state_sync(conn, &pending_state)
 }
 
 /// Get FTS progress for a specific pane
@@ -13621,6 +13681,11 @@ fn sync_fts_for_pane(
 /// Perform a full FTS rebuild with batched progress tracking
 ///
 /// This drops the FTS index content and reindexes all segments.
+///
+/// **Non-atomic risk**: The delete-all + re-index loop is NOT wrapped in a
+/// single SQLite transaction. If a hard database error occurs mid-rebuild, we
+/// fail closed: clear progress, mark the index state as rebuild-pending, and
+/// return an error rather than pretending the partial index is healthy.
 fn full_fts_rebuild_sync(conn: &Connection, config: &FtsSyncConfig) -> Result<FtsSyncResult> {
     use std::time::Instant;
     let start = Instant::now();
@@ -13661,13 +13726,67 @@ fn full_fts_rebuild_sync(conn: &Connection, config: &FtsSyncConfig) -> Result<Ft
 
     let mut total_indexed = 0u64;
     let panes_processed = pane_ids.len() as u64;
+    let mut hard_failure_panes: Vec<(u64, String)> = Vec::new();
 
-    // Sync each pane
-    for pane_id in pane_ids {
-        match sync_fts_for_pane(conn, pane_id, config) {
+    // Sync each pane — distinguish hard I/O errors from content parse warnings
+    for pane_id in &pane_ids {
+        match sync_fts_for_pane(conn, *pane_id, config) {
             Ok((indexed, _)) => total_indexed += indexed,
-            Err(e) => warnings.push(format!("Pane {pane_id} sync failed: {e}")),
+            Err(e) => {
+                let err_msg = format!("{e}");
+                // Classify: Database/IO errors are hard failures; others are warnings
+                let is_hard = matches!(
+                    &e,
+                    crate::Error::Storage(StorageError::Database(_)) | crate::Error::Io(_)
+                );
+                if is_hard {
+                    tracing::error!(
+                        pane_id = pane_id,
+                        error = %e,
+                        "FTS rebuild: pane completely failed to re-index (hard I/O error)"
+                    );
+                    hard_failure_panes.push((*pane_id, err_msg.clone()));
+                } else {
+                    tracing::warn!(
+                        pane_id = pane_id,
+                        error = %e,
+                        "FTS rebuild: pane sync produced non-fatal error"
+                    );
+                }
+                warnings.push(format!("Pane {pane_id} sync failed: {err_msg}"));
+            }
         }
+    }
+
+    // If any pane had a hard failure, the delete-all rebuild is incomplete.
+    // Restoring old per-pane progress here would make a structurally valid but
+    // incomplete FTS table look healthy enough to skip future rebuilds.
+    if !hard_failure_panes.is_empty() {
+        tracing::error!(
+            failed_count = hard_failure_panes.len(),
+            total_panes = pane_ids.len(),
+            "FTS rebuild had hard failures; marking index as rebuild-pending"
+        );
+        if let Err(cleanup_err) = conn.execute_batch(
+            "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+        ) {
+            tracing::error!(
+                error = %cleanup_err,
+                "Failed to clear partially rebuilt FTS contents after hard rebuild failure"
+            );
+        }
+        clear_fts_pane_progress_sync(conn)?;
+        mark_fts_rebuild_pending_sync(conn, now)?;
+
+        let failed_panes = hard_failure_panes
+            .iter()
+            .map(|(pane_id, _)| pane_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(StorageError::Database(format!(
+            "FTS rebuild incomplete after hard failures in panes [{failed_panes}]; index marked for full rebuild"
+        ))
+        .into());
     }
 
     // Update index state
@@ -13717,7 +13836,7 @@ pub fn sync_fts_on_startup(conn: &Connection, config: &FtsSyncConfig) -> Result<
             tracing::info!(
                 old_version = s.index_version,
                 new_version = FTS_INDEX_VERSION,
-                "FTS index version mismatch, performing full rebuild"
+                "FTS index version mismatch or rebuild-pending marker detected, performing full rebuild"
             );
             return full_fts_rebuild_sync(conn, config);
         }
@@ -20334,6 +20453,91 @@ mod fts_sync_tests {
     }
 
     #[test]
+    fn fts_rebuild_pending_version_triggers_full_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 1, "Test content");
+
+        let now = now_ms();
+        upsert_fts_index_state_sync(
+            &conn,
+            &FtsIndexState {
+                index_version: FTS_INDEX_REBUILD_PENDING_VERSION,
+                last_full_rebuild_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        clear_fts_pane_progress_sync(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO output_segments_fts(output_segments_fts) VALUES('delete-all')",
+        )
+        .unwrap();
+
+        let config = FtsSyncConfig::default();
+        let result = sync_fts_on_startup(&conn, &config).unwrap();
+
+        assert!(result.full_rebuild);
+
+        let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+        assert_eq!(state.index_version, FTS_INDEX_VERSION);
+        assert!(state.last_full_rebuild_at.is_some());
+
+        let fts_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM output_segments_fts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_rows, 1);
+    }
+
+    #[test]
+    fn fts_hard_rebuild_failure_marks_index_pending_and_clears_progress() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 1, "Alpha");
+
+        let now = now_ms();
+        upsert_fts_index_state_sync(
+            &conn,
+            &FtsIndexState {
+                index_version: FTS_INDEX_VERSION,
+                last_full_rebuild_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        upsert_fts_pane_progress_sync(
+            &conn,
+            &FtsPaneProgress {
+                pane_id: 1,
+                last_indexed_seq: 1,
+                indexed_count: 1,
+                last_indexed_at: now,
+            },
+        )
+        .unwrap();
+
+        conn.execute_batch("DROP TABLE output_segments_fts")
+            .unwrap();
+
+        let err = full_fts_rebuild_sync(&conn, &FtsSyncConfig::default()).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("FTS rebuild incomplete"));
+
+        let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
+        assert_eq!(state.index_version, FTS_INDEX_REBUILD_PENDING_VERSION);
+        assert_eq!(state.last_full_rebuild_at, None);
+        assert!(get_fts_pane_progress_sync(&conn, 1).unwrap().is_none());
+    }
+
+    #[test]
     fn batch_config_limits_work() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
@@ -21497,6 +21701,55 @@ mod storage_handle_tests {
 
             let _ = std::fs::remove_file(&db_path);
         });
+    }
+
+    #[test]
+    fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut mmap_mirror = None;
+
+        let (upsert_tx, _upsert_rx) = oneshot::channel();
+        assert!(
+            tx.try_send(WriteCommand::UpsertPane {
+                pane: test_pane(1),
+                respond: upsert_tx,
+            })
+            .is_ok()
+        );
+
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        assert!(
+            tx.try_send(WriteCommand::Shutdown {
+                respond: shutdown_tx,
+            })
+            .is_ok()
+        );
+
+        let (append_tx, _append_rx) = oneshot::channel();
+        assert!(
+            tx.try_send(WriteCommand::AppendSegment {
+                pane_id: 1,
+                content: "late".to_string(),
+                content_hash: None,
+                respond: append_tx,
+            })
+            .is_ok()
+        );
+        drop(tx);
+
+        writer_loop(&mut conn, &mut rx, &mut mmap_mirror);
+
+        let segment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments WHERE pane_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_count, 0);
     }
 
     #[test]
