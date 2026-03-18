@@ -20,7 +20,8 @@ use crate::patterns::AgentType;
 use crate::runtime_compat::RwLock;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
-    MoveDirection, PaneInfo, SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, PaneInfo, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
+    WeztermInterface,
 };
 
 // =============================================================================
@@ -710,6 +711,34 @@ impl ShardedWeztermClient {
 
         Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
     }
+
+    async fn route_for_window_id(&self, window_id: u64) -> Result<ShardId> {
+        if self.backends.len() == 1 {
+            return Ok(self.backends[0].id);
+        }
+
+        let panes = self.list_all_panes().await?;
+        let matching_shards: HashSet<_> = panes
+            .into_iter()
+            .filter(|pane| pane.window_id == window_id)
+            .filter_map(|pane| {
+                pane.extra
+                    .get("shard_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|id| ShardId(id as usize))
+            })
+            .collect();
+
+        match matching_shards.len() {
+            1 => Ok(matching_shards.iter().copied().next().unwrap_or(ShardId(0))),
+            0 => Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "spawn_targeted failed: window {window_id} not found on any shard"
+            )))),
+            _ => Err(crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                "spawn_targeted failed: window {window_id} is ambiguous across shards"
+            )))),
+        }
+    }
 }
 
 impl WeztermInterface for ShardedWeztermClient {
@@ -829,6 +858,42 @@ impl WeztermInterface for ShardedWeztermClient {
         Box::pin(async move {
             self.spawn_with_hints(cwd.as_deref(), domain_name.as_deref(), None)
                 .await
+        })
+    }
+
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
+        let cwd = cwd.map(ToString::to_string);
+        let domain_name = domain_name.map(ToString::to_string);
+        Box::pin(async move {
+            self.telemetry.spawns.fetch_add(1, Ordering::Relaxed);
+            let shard = if target.new_window || target.window_id.is_none() {
+                self.choose_spawn_shard(domain_name.as_deref(), None)
+            } else {
+                match target.window_id {
+                    Some(window_id) => self.route_for_window_id(window_id).await?,
+                    None => self.choose_spawn_shard(domain_name.as_deref(), None),
+                }
+            };
+            let backend = self.backend_for_id(shard)?;
+            let local_id = backend
+                .handle
+                .spawn_targeted(cwd.as_deref(), domain_name.as_deref(), target)
+                .await
+                .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
+            let global_id = encode_sharded_pane_id(shard, local_id);
+            self.pane_routes.write().await.insert(
+                global_id,
+                PaneRoute {
+                    shard_id: shard,
+                    local_pane_id: local_id,
+                },
+            );
+            Ok(global_id)
         })
     }
 
@@ -1183,6 +1248,106 @@ mod tests {
             assert_eq!(decode_sharded_pane_id(pane), (ShardId(1), 0));
             assert_eq!(shard0.pane_count().await, 0);
             assert_eq!(shard1.pane_count().await, 1);
+        });
+    }
+
+    #[test]
+    fn spawn_targeted_routes_existing_window_to_matching_shard() {
+        run_async_test(async {
+            let shard0 = Arc::new(MockWezterm::new());
+            let shard1 = Arc::new(MockWezterm::new());
+            shard0
+                .add_pane(
+                    10,
+                    crate::wezterm::MockPane {
+                        pane_id: 10,
+                        window_id: 41,
+                        tab_id: 0,
+                        title: "existing".to_string(),
+                        domain: "local".to_string(),
+                        cwd: "/tmp".to_string(),
+                        is_active: false,
+                        is_zoomed: false,
+                        cols: 80,
+                        rows: 24,
+                        content: String::new(),
+                    },
+                )
+                .await;
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), "zero", shard0.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(1), "one", shard1.clone() as WeztermHandle),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let spawned = client
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(41),
+                        new_window: false,
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(decode_sharded_pane_id(spawned).0, ShardId(0));
+            assert_eq!(shard0.pane_count().await, 2);
+            assert_eq!(shard1.pane_count().await, 0);
+        });
+    }
+
+    #[test]
+    fn spawn_targeted_rejects_ambiguous_window_id_across_shards() {
+        run_async_test(async {
+            let shard0 = Arc::new(MockWezterm::new());
+            let shard1 = Arc::new(MockWezterm::new());
+            for handle in [&shard0, &shard1] {
+                handle
+                    .add_pane(
+                        10,
+                        crate::wezterm::MockPane {
+                            pane_id: 10,
+                            window_id: 7,
+                            tab_id: 0,
+                            title: "existing".to_string(),
+                            domain: "local".to_string(),
+                            cwd: "/tmp".to_string(),
+                            is_active: false,
+                            is_zoomed: false,
+                            cols: 80,
+                            rows: 24,
+                            content: String::new(),
+                        },
+                    )
+                    .await;
+            }
+
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), "zero", shard0 as WeztermHandle),
+                    ShardBackend::new(ShardId(1), "one", shard1 as WeztermHandle),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let err = client
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(7),
+                        new_window: false,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("ambiguous across shards"));
         });
     }
 

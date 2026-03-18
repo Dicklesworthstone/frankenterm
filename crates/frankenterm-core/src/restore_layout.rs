@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
-use crate::wezterm::{SplitDirection, WeztermHandle};
+use crate::wezterm::{SpawnTarget, SplitDirection, WeztermHandle};
 
 // =============================================================================
 // Configuration
@@ -110,8 +110,10 @@ impl LayoutRestorer {
 
         for (win_idx, window) in snapshot.windows.iter().enumerate() {
             match self.restore_window(window, win_idx, &mut result).await {
-                Ok(()) => {
-                    result.windows_created += 1;
+                Ok(restored_any_tabs) => {
+                    if restored_any_tabs {
+                        result.windows_created += 1;
+                    }
                 }
                 Err(e) => {
                     warn!(window_id = window.window_id, error = %e, "failed to restore window");
@@ -139,19 +141,46 @@ impl LayoutRestorer {
         window: &WindowSnapshot,
         win_idx: usize,
         result: &mut RestoreResult,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         debug!(
             window_id = window.window_id,
             tabs = window.tabs.len(),
             "restoring window"
         );
 
+        let mut restored_window_id = None;
+        let mut active_window_pane_id = None;
+        let mut restored_any_tabs = false;
+
         for (tab_idx, tab) in window.tabs.iter().enumerate() {
-            match self.restore_tab(tab, win_idx, tab_idx, result).await {
-                Ok(()) => {
+            let target = SpawnTarget {
+                window_id: restored_window_id,
+                new_window: restored_window_id.is_none(),
+            };
+            match self
+                .restore_tab(tab, win_idx, tab_idx, target, result)
+                .await
+            {
+                Ok((window_id, active_pane_id)) => {
+                    restored_window_id.get_or_insert(window_id);
+                    let should_activate_tab = window.active_tab_index == Some(tab_idx)
+                        || (window.active_tab_index.is_none() && window.tabs.len() == 1);
+                    if should_activate_tab {
+                        active_window_pane_id = active_pane_id;
+                    }
                     result.tabs_created += 1;
+                    restored_any_tabs = true;
                 }
                 Err(e) => {
+                    if let Some(window_id) = self
+                        .window_id_from_partial_restore(tab, &result.pane_id_map)
+                        .await
+                    {
+                        restored_window_id.get_or_insert(window_id);
+                        restored_any_tabs = true;
+                        result.tabs_created += 1;
+                    }
+                    record_failed_tree(result, &tab.pane_tree, &e.to_string());
                     warn!(tab_id = tab.tab_id, error = %e, "failed to restore tab");
                     if !self.config.continue_on_error {
                         return Err(e);
@@ -160,7 +189,13 @@ impl LayoutRestorer {
             }
         }
 
-        Ok(())
+        if let Some(active_pane_id) = active_window_pane_id {
+            if let Err(e) = self.wezterm.activate_pane(active_pane_id).await {
+                debug!(pane_id = active_pane_id, error = %e, "failed to activate window pane");
+            }
+        }
+
+        Ok(restored_any_tabs)
     }
 
     /// Restore a single tab with its pane tree.
@@ -169,9 +204,16 @@ impl LayoutRestorer {
         tab: &TabSnapshot,
         win_idx: usize,
         tab_idx: usize,
+        spawn_target: SpawnTarget,
         result: &mut RestoreResult,
-    ) -> crate::Result<()> {
-        debug!(tab_id = tab.tab_id, win_idx, tab_idx, "restoring tab");
+    ) -> crate::Result<(u64, Option<u64>)> {
+        debug!(
+            tab_id = tab.tab_id,
+            win_idx,
+            tab_idx,
+            ?spawn_target,
+            "restoring tab"
+        );
 
         // Get initial CWD from the first leaf in the pane tree.
         let initial_cwd = if self.config.restore_working_dirs {
@@ -181,7 +223,11 @@ impl LayoutRestorer {
         };
 
         // Spawn the initial pane for this tab.
-        let root_pane_id = self.wezterm.spawn(initial_cwd.as_deref(), None).await?;
+        let root_pane_id = self
+            .wezterm
+            .spawn_targeted(initial_cwd.as_deref(), None, spawn_target)
+            .await?;
+        let root_pane = self.wezterm.get_pane(root_pane_id).await?;
 
         debug!(root_pane_id, tab_idx, "spawned root pane for tab");
 
@@ -189,16 +235,11 @@ impl LayoutRestorer {
         self.restore_pane_tree(&tab.pane_tree, root_pane_id, result)
             .await?;
 
-        // Activate the originally-active pane if known.
-        if let Some(active_id) = tab.active_pane_id {
-            if let Some(&new_id) = result.pane_id_map.get(&active_id) {
-                if let Err(e) = self.wezterm.activate_pane(new_id).await {
-                    debug!(old_pane = active_id, new_pane = new_id, error = %e, "failed to activate pane");
-                }
-            }
-        }
+        let active_pane_id = tab
+            .active_pane_id
+            .and_then(|active_id| result.pane_id_map.get(&active_id).copied());
 
-        Ok(())
+        Ok((root_pane.window_id, active_pane_id))
     }
 
     /// Recursively restore a pane tree.
@@ -337,6 +378,27 @@ impl LayoutRestorer {
             debug!(pane_id, path, error = %e, "failed to set cwd");
         }
     }
+
+    async fn window_id_from_partial_restore(
+        &self,
+        tab: &TabSnapshot,
+        pane_id_map: &HashMap<u64, u64>,
+    ) -> Option<u64> {
+        let restored_pane_id = collect_leaf_ids(&tab.pane_tree)
+            .into_iter()
+            .find_map(|old_pane_id| pane_id_map.get(&old_pane_id).copied())?;
+        match self.wezterm.get_pane(restored_pane_id).await {
+            Ok(pane) => Some(pane.window_id),
+            Err(e) => {
+                debug!(
+                    restored_pane_id,
+                    error = %e,
+                    "failed to inspect partially restored pane for window recovery"
+                );
+                None
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -358,6 +420,22 @@ fn collect_leaf_ids(node: &PaneNode) -> Vec<u64> {
     let mut ids = Vec::new();
     collect_leaf_ids_inner(node, &mut ids);
     ids
+}
+
+fn record_failed_tree(result: &mut RestoreResult, node: &PaneNode, error: &str) {
+    for pane_id in collect_leaf_ids(node) {
+        if result.pane_id_map.contains_key(&pane_id) {
+            continue;
+        }
+        if result
+            .failed_panes
+            .iter()
+            .any(|(existing_id, _)| *existing_id == pane_id)
+        {
+            continue;
+        }
+        result.failed_panes.push((pane_id, error.to_string()));
+    }
 }
 
 fn collect_leaf_ids_inner(node: &PaneNode, ids: &mut Vec<u64>) {
@@ -424,7 +502,9 @@ mod tests {
 
     use super::*;
     use crate::session_topology::{PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot};
-    use crate::wezterm::{MockWezterm, WeztermInterface};
+    use crate::wezterm::{
+        MockWezterm, SpawnTarget, WeztermFuture, WeztermHandle, WeztermInterface,
+    };
 
     fn run_async_test<F>(future: F)
     where
@@ -453,6 +533,227 @@ mod tests {
 
     fn make_restorer(mock: Arc<MockWezterm>) -> LayoutRestorer {
         LayoutRestorer::new(mock, RestoreConfig::default())
+    }
+
+    struct AlwaysFailSpawnWezterm;
+
+    struct AlwaysFailSplitWezterm {
+        inner: Arc<MockWezterm>,
+    }
+
+    impl WeztermInterface for AlwaysFailSpawnWezterm {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected get_pane({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn get_text(&self, pane_id: u64, _: bool) -> WeztermFuture<'_, String> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected get_text({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn send_text(&self, pane_id: u64, _: &str) -> WeztermFuture<'_, ()> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected send_text({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, _: &str) -> WeztermFuture<'_, ()> {
+            self.send_text(pane_id, "")
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            _: &str,
+            _: bool,
+            _: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.send_text(pane_id, "")
+        }
+
+        fn send_control(&self, pane_id: u64, _: &str) -> WeztermFuture<'_, ()> {
+            self.send_text(pane_id, "")
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.send_text(pane_id, "")
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.send_text(pane_id, "")
+        }
+
+        fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Err(crate::Error::Runtime("simulated spawn failure".to_string())) })
+        }
+
+        fn spawn_targeted(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Err(crate::Error::Runtime("simulated spawn failure".to_string())) })
+        }
+
+        fn split_pane(
+            &self,
+            pane_id: u64,
+            _: crate::wezterm::SplitDirection,
+            _: Option<&str>,
+            _: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected split_pane({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected activate_pane({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            _: crate::wezterm::MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected get_pane_direction({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected kill_pane({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn zoom_pane(&self, pane_id: u64, _: bool) -> WeztermFuture<'_, ()> {
+            Box::pin(async move {
+                Err(crate::Error::Runtime(format!(
+                    "unexpected zoom_pane({pane_id}) on failing spawn mock"
+                )))
+            })
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            crate::circuit_breaker::CircuitBreakerStatus::default()
+        }
+    }
+
+    impl WeztermInterface for AlwaysFailSplitWezterm {
+        fn list_panes(&self) -> WeztermFuture<'_, Vec<crate::wezterm::PaneInfo>> {
+            self.inner.list_panes()
+        }
+
+        fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, crate::wezterm::PaneInfo> {
+            self.inner.get_pane(pane_id)
+        }
+
+        fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
+            self.inner.get_text(pane_id, escapes)
+        }
+
+        fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text(pane_id, text)
+        }
+
+        fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_text_no_paste(pane_id, text)
+        }
+
+        fn send_text_with_options(
+            &self,
+            pane_id: u64,
+            text: &str,
+            bracketed_paste: bool,
+            normalize_newlines: bool,
+        ) -> WeztermFuture<'_, ()> {
+            self.inner
+                .send_text_with_options(pane_id, text, bracketed_paste, normalize_newlines)
+        }
+
+        fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
+            self.inner.send_control(pane_id, control_char)
+        }
+
+        fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_c(pane_id)
+        }
+
+        fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.send_ctrl_d(pane_id)
+        }
+
+        fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+            self.inner.spawn(cwd, domain_name)
+        }
+
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            self.inner.spawn_targeted(cwd, domain_name, target)
+        }
+
+        fn split_pane(
+            &self,
+            _: u64,
+            _: crate::wezterm::SplitDirection,
+            _: Option<&str>,
+            _: Option<u8>,
+        ) -> WeztermFuture<'_, u64> {
+            Box::pin(async { Err(crate::Error::Runtime("simulated split failure".to_string())) })
+        }
+
+        fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.activate_pane(pane_id)
+        }
+
+        fn get_pane_direction(
+            &self,
+            pane_id: u64,
+            direction: crate::wezterm::MoveDirection,
+        ) -> WeztermFuture<'_, Option<u64>> {
+            self.inner.get_pane_direction(pane_id, direction)
+        }
+
+        fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
+            self.inner.kill_pane(pane_id)
+        }
+
+        fn zoom_pane(&self, pane_id: u64, zoomed: bool) -> WeztermFuture<'_, ()> {
+            self.inner.zoom_pane(pane_id, zoomed)
+        }
+
+        fn circuit_status(&self) -> crate::circuit_breaker::CircuitBreakerStatus {
+            self.inner.circuit_status()
+        }
     }
 
     fn leaf(pane_id: u64, cwd: Option<&str>) -> PaneNode {
@@ -690,6 +991,14 @@ mod tests {
             for id in 1..=3 {
                 assert!(result.pane_id_map.contains_key(&id));
             }
+
+            let pane_one = mock.pane_state(result.pane_id_map[&1]).await.unwrap();
+            let pane_two = mock.pane_state(result.pane_id_map[&2]).await.unwrap();
+            let pane_three = mock.pane_state(result.pane_id_map[&3]).await.unwrap();
+            assert_eq!(pane_one.window_id, pane_two.window_id);
+            assert_eq!(pane_two.window_id, pane_three.window_id);
+            assert_ne!(pane_one.tab_id, pane_two.tab_id);
+            assert_eq!(pane_two.tab_id, pane_three.tab_id);
         });
     }
 
@@ -736,6 +1045,51 @@ mod tests {
 
             assert_eq!(result.windows_created, 2);
             assert_eq!(result.panes_created, 2);
+
+            let pane_one = mock.pane_state(result.pane_id_map[&1]).await.unwrap();
+            let pane_two = mock.pane_state(result.pane_id_map[&2]).await.unwrap();
+            assert_ne!(pane_one.window_id, pane_two.window_id);
+        });
+    }
+
+    #[test]
+    fn restore_multiple_tabs_respects_active_tab_index() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            let restorer = make_restorer(mock.clone());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![
+                        TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: leaf(1, None),
+                            active_pane_id: Some(1),
+                        },
+                        TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: vsplit(vec![(0.5, leaf(2, None)), (0.5, leaf(3, None))]),
+                            active_pane_id: Some(3),
+                        },
+                    ],
+                    active_tab_index: Some(0),
+                }],
+            };
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            let active_first = mock.pane_state(result.pane_id_map[&1]).await.unwrap();
+            let inactive_second = mock.pane_state(result.pane_id_map[&3]).await.unwrap();
+            assert!(active_first.is_active);
+            assert!(!inactive_second.is_active);
         });
     }
 
@@ -767,6 +1121,8 @@ mod tests {
 
             assert_eq!(result.panes_created, 2);
             assert!(result.pane_id_map.contains_key(&2));
+            let active = mock.pane_state(result.pane_id_map[&2]).await.unwrap();
+            assert!(active.is_active);
         });
     }
 
@@ -835,6 +1191,121 @@ mod tests {
             assert_eq!(result.windows_created, 0);
             assert_eq!(result.tabs_created, 0);
             assert_eq!(result.panes_created, 0);
+        });
+    }
+
+    #[test]
+    fn restore_failed_window_does_not_increment_window_count() {
+        run_async_test(async {
+            let wezterm: WeztermHandle = Arc::new(AlwaysFailSpawnWezterm);
+            let restorer = LayoutRestorer::new(wezterm, RestoreConfig::default());
+            let snapshot = single_tab_snapshot(leaf(1, None));
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            assert_eq!(result.windows_created, 0);
+            assert_eq!(result.tabs_created, 0);
+            assert_eq!(result.panes_created, 0);
+            assert_eq!(
+                result.failed_panes,
+                vec![(1, "simulated spawn failure".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn restore_window_partial_failure_does_not_mark_restored_leaf_failed() {
+        run_async_test(async {
+            let inner = Arc::new(MockWezterm::new());
+            let wezterm: WeztermHandle = Arc::new(AlwaysFailSplitWezterm {
+                inner: inner.clone(),
+            });
+            let restorer = LayoutRestorer::new(
+                wezterm,
+                RestoreConfig {
+                    continue_on_error: false,
+                    ..RestoreConfig::default()
+                },
+            );
+            let window = WindowSnapshot {
+                window_id: 0,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 0,
+                    title: None,
+                    pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
+                    active_pane_id: None,
+                }],
+                active_tab_index: None,
+            };
+            let mut result = RestoreResult::new();
+
+            assert!(
+                restorer
+                    .restore_window(&window, 0, &mut result)
+                    .await
+                    .is_err()
+            );
+            assert!(result.pane_id_map.contains_key(&1));
+            assert_eq!(
+                result.failed_panes,
+                vec![(2, "simulated split failure".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn restore_partial_first_tab_reuses_created_window_for_later_tabs() {
+        run_async_test(async {
+            let inner = Arc::new(MockWezterm::new());
+            let wezterm: WeztermHandle = Arc::new(AlwaysFailSplitWezterm {
+                inner: inner.clone(),
+            });
+            let restorer = LayoutRestorer::new(wezterm, RestoreConfig::default());
+            let snapshot = TopologySnapshot {
+                schema_version: 1,
+                captured_at: 1000,
+                workspace_id: None,
+                windows: vec![WindowSnapshot {
+                    window_id: 0,
+                    title: None,
+                    position: None,
+                    size: None,
+                    tabs: vec![
+                        TabSnapshot {
+                            tab_id: 0,
+                            title: None,
+                            pane_tree: vsplit(vec![(0.5, leaf(1, None)), (0.5, leaf(2, None))]),
+                            active_pane_id: None,
+                        },
+                        TabSnapshot {
+                            tab_id: 1,
+                            title: None,
+                            pane_tree: leaf(3, None),
+                            active_pane_id: None,
+                        },
+                    ],
+                    active_tab_index: None,
+                }],
+            };
+
+            let result = restorer.restore(&snapshot).await.unwrap();
+
+            assert_eq!(result.windows_created, 1);
+            assert_eq!(result.tabs_created, 2);
+            assert!(result.pane_id_map.contains_key(&1));
+            assert!(result.pane_id_map.contains_key(&3));
+            assert_eq!(
+                result.failed_panes,
+                vec![(2, "simulated split failure".to_string())]
+            );
+
+            let first_tab_pane = inner.pane_state(result.pane_id_map[&1]).await.unwrap();
+            let second_tab_pane = inner.pane_state(result.pane_id_map[&3]).await.unwrap();
+            assert_eq!(first_tab_pane.window_id, second_tab_pane.window_id);
+            assert_ne!(first_tab_pane.tab_id, second_tab_pane.tab_id);
         });
     }
 

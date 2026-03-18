@@ -62,8 +62,15 @@ pub trait WeztermInterface: Send + Sync {
     fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
     /// Send Ctrl+D.
     fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
-    /// Spawn a new pane.
+    /// Spawn a new root pane/tab using the backend default target.
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64>;
+    /// Spawn a new root pane/tab into a specific window or a new window.
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64>;
     /// Split an existing pane.
     fn split_pane(
         &self,
@@ -450,6 +457,15 @@ pub enum SplitDirection {
     Top,
     /// Split below
     Bottom,
+}
+
+/// Target for spawning a new root pane/tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpawnTarget {
+    /// Create the tab in an existing window when provided.
+    pub window_id: Option<u64>,
+    /// Force creation of a brand-new window.
+    pub new_window: bool,
 }
 
 /// Direction for pane navigation
@@ -842,7 +858,7 @@ impl WeztermClient {
     // Pane lifecycle commands (wa-4vx.2.3)
     // =========================================================================
 
-    /// Spawn a new pane in the current window
+    /// Spawn a new root pane/tab using the backend default target.
     ///
     /// # Arguments
     /// * `cwd` - Optional working directory for the new pane
@@ -851,7 +867,27 @@ impl WeztermClient {
     /// # Returns
     /// The pane ID of the newly spawned pane
     pub async fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> Result<u64> {
+        self.spawn_targeted(cwd, domain_name, SpawnTarget::default())
+            .await
+    }
+
+    /// Spawn a new root pane/tab into a specific window or into a new window.
+    pub async fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> Result<u64> {
         let mut args = vec!["cli", "spawn"];
+
+        let window_id_arg;
+        if target.new_window {
+            args.push("--new-window");
+        } else if let Some(window_id) = target.window_id {
+            window_id_arg = window_id.to_string();
+            args.push("--window-id");
+            args.push(&window_id_arg);
+        }
 
         // Add domain if specified
         let domain_arg;
@@ -1411,6 +1447,19 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::spawn(self, cwd.as_deref(), domain.as_deref()).await })
     }
 
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
+        let cwd = cwd.map(str::to_string);
+        let domain = domain_name.map(str::to_string);
+        Box::pin(async move {
+            WeztermClient::spawn_targeted(self, cwd.as_deref(), domain.as_deref(), target).await
+        })
+    }
+
     fn split_pane(
         &self,
         pane_id: u64,
@@ -1518,6 +1567,15 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
 
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
         self.as_ref().spawn(cwd, domain_name)
+    }
+
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
+        self.as_ref().spawn_targeted(cwd, domain_name, target)
     }
 
     fn split_pane(
@@ -3746,6 +3804,15 @@ impl WeztermInterface for UnifiedClient {
         self.inner.spawn(cwd, domain_name)
     }
 
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
+        self.inner.spawn_targeted(cwd, domain_name, target)
+    }
+
     fn split_pane(
         &self,
         pane_id: u64,
@@ -3797,6 +3864,8 @@ impl WeztermInterface for UnifiedClient {
 pub struct MockWezterm {
     panes: crate::runtime_compat::RwLock<std::collections::HashMap<u64, MockPane>>,
     next_pane_id: std::sync::atomic::AtomicU64,
+    next_window_id: std::sync::atomic::AtomicU64,
+    next_tab_id: std::sync::atomic::AtomicU64,
     watchdog_warnings: crate::runtime_compat::RwLock<Vec<String>>,
     watchdog_warning_error: crate::runtime_compat::RwLock<Option<String>>,
 }
@@ -3865,6 +3934,8 @@ impl MockWezterm {
         Self {
             panes: crate::runtime_compat::RwLock::new(std::collections::HashMap::new()),
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
+            next_window_id: std::sync::atomic::AtomicU64::new(0),
+            next_tab_id: std::sync::atomic::AtomicU64::new(0),
             watchdog_warnings: crate::runtime_compat::RwLock::new(Vec::new()),
             watchdog_warning_error: crate::runtime_compat::RwLock::new(None),
         }
@@ -3874,11 +3945,19 @@ impl MockWezterm {
     pub async fn add_pane(&self, pane: MockPane) {
         let mut panes = self.panes.write().await;
         let id = pane.pane_id;
+        let window_id = pane.window_id;
+        let tab_id = pane.tab_id;
         panes.insert(id, pane);
         // Ensure next_pane_id stays above any manually inserted pane
         let _ = self
             .next_pane_id
             .fetch_max(id + 1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .next_window_id
+            .fetch_max(window_id + 1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .next_tab_id
+            .fetch_max(tab_id + 1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Create a simple mock pane with defaults.
@@ -4027,16 +4106,38 @@ impl WeztermInterface for MockWezterm {
     }
 
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
+        self.spawn_targeted(cwd, domain_name, SpawnTarget::default())
+    }
+
+    fn spawn_targeted(
+        &self,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
         let cwd = cwd.unwrap_or("/home/user").to_string();
         let domain = domain_name.unwrap_or("local").to_string();
         Box::pin(async move {
             let pane_id = self
                 .next_pane_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let window_id = if target.new_window {
+                self.next_window_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            } else {
+                let existing_window_id = target.window_id.unwrap_or(0);
+                let _ = self
+                    .next_window_id
+                    .fetch_max(existing_window_id + 1, std::sync::atomic::Ordering::SeqCst);
+                existing_window_id
+            };
+            let tab_id = self
+                .next_tab_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let pane = MockPane {
                 pane_id,
-                window_id: 0,
-                tab_id: 0,
+                window_id,
+                tab_id,
                 title: format!("pane-{pane_id}"),
                 domain,
                 cwd,
@@ -4053,12 +4154,40 @@ impl WeztermInterface for MockWezterm {
 
     fn split_pane(
         &self,
-        _pane_id: u64,
+        pane_id: u64,
         _direction: SplitDirection,
         cwd: Option<&str>,
         _percent: Option<u8>,
     ) -> WeztermFuture<'_, u64> {
-        self.spawn(cwd, None)
+        let cwd = cwd.map(str::to_string);
+        Box::pin(async move {
+            let parent = {
+                let panes = self.panes.read().await;
+                panes
+                    .get(&pane_id)
+                    .cloned()
+                    .ok_or(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))?
+            };
+
+            let new_pane_id = self
+                .next_pane_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pane = MockPane {
+                pane_id: new_pane_id,
+                window_id: parent.window_id,
+                tab_id: parent.tab_id,
+                title: format!("pane-{new_pane_id}"),
+                domain: parent.domain,
+                cwd: cwd.unwrap_or(parent.cwd),
+                is_active: false,
+                is_zoomed: false,
+                cols: parent.cols,
+                rows: parent.rows,
+                content: String::new(),
+            };
+            self.panes.write().await.insert(new_pane_id, pane);
+            Ok(new_pane_id)
+        })
     }
 
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
@@ -4160,6 +4289,14 @@ impl WeztermInterface for FailingMockWezterm {
         Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
+        Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
+    }
+    fn spawn_targeted(
+        &self,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
         Box::pin(async { Err(crate::Error::Wezterm(WeztermError::Timeout(5))) })
     }
     fn activate_pane(&self, _: u64) -> WeztermFuture<'_, ()> {
@@ -4467,16 +4604,37 @@ mod mock_tests {
     }
 
     #[test]
-    fn mock_split_ignores_parent_creates_new() {
+    fn mock_split_requires_existing_parent() {
         run_async_test(async {
             let mock = MockWezterm::new();
-            // split_pane delegates to spawn, ignoring parent pane ID
-            let new_id = mock
-                .split_pane(99, SplitDirection::Right, None, None)
+            assert!(
+                mock.split_pane(99, SplitDirection::Right, None, None)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn mock_new_window_spawn_does_not_reuse_default_window_id() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let first = mock.spawn(None, None).await.unwrap();
+            let second = mock
+                .spawn_targeted(
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: None,
+                        new_window: true,
+                    },
+                )
                 .await
                 .unwrap();
-            assert_eq!(mock.pane_count().await, 1);
-            assert_eq!(new_id, 0);
+
+            let first_state = mock.pane_state(first).await.unwrap();
+            let second_state = mock.pane_state(second).await.unwrap();
+            assert_ne!(first_state.window_id, second_state.window_id);
         });
     }
 }

@@ -1155,6 +1155,15 @@ mod tests {
             self.inner.spawn(cwd, domain_name)
         }
 
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: crate::wezterm::SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            self.inner.spawn_targeted(cwd, domain_name, target)
+        }
+
         fn split_pane(
             &self,
             pane_id: u64,
@@ -1264,6 +1273,23 @@ mod tests {
             }
 
             self.inner.spawn(cwd, domain_name)
+        }
+
+        fn spawn_targeted(
+            &self,
+            cwd: Option<&str>,
+            domain_name: Option<&str>,
+            target: crate::wezterm::SpawnTarget,
+        ) -> WeztermFuture<'_, u64> {
+            if self.spawn_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Box::pin(async {
+                    Err(crate::Error::Runtime(
+                        "simulated second-tab spawn failure".to_string(),
+                    ))
+                });
+            }
+
+            self.inner.spawn_targeted(cwd, domain_name, target)
         }
 
         fn split_pane(

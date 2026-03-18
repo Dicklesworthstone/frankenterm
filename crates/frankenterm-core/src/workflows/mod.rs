@@ -772,6 +772,15 @@ mod tests {
             Box::pin(async { Ok(1) })
         }
 
+        fn spawn_targeted(
+            &self,
+            _cwd: Option<&str>,
+            _domain_name: Option<&str>,
+            _target: crate::wezterm::SpawnTarget,
+        ) -> crate::wezterm::WeztermFuture<'_, u64> {
+            Box::pin(async { Ok(1) })
+        }
+
         fn split_pane(
             &self,
             _pane_id: u64,

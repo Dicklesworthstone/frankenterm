@@ -14,7 +14,8 @@ mod common;
 use frankenterm_core::circuit_breaker::CircuitBreakerStatus;
 use frankenterm_core::watchdog::{HealthStatus, MuxWatchdog, MuxWatchdogConfig};
 use frankenterm_core::wezterm::{
-    MoveDirection, PaneInfo, SplitDirection, WeztermFuture, WeztermHandle, WeztermInterface,
+    MoveDirection, PaneInfo, SpawnTarget, SplitDirection, WeztermFuture, WeztermHandle,
+    WeztermInterface,
 };
 
 use common::fixtures::RuntimeFixture;
@@ -92,6 +93,18 @@ impl WeztermInterface for FailingMockWezterm {
         })
     }
     fn spawn(&self, _: Option<&str>, _: Option<&str>) -> WeztermFuture<'_, u64> {
+        Box::pin(async {
+            Err(frankenterm_core::Error::Wezterm(
+                frankenterm_core::error::WeztermError::Timeout(5),
+            ))
+        })
+    }
+    fn spawn_targeted(
+        &self,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: SpawnTarget,
+    ) -> WeztermFuture<'_, u64> {
         Box::pin(async {
             Err(frankenterm_core::Error::Wezterm(
                 frankenterm_core::error::WeztermError::Timeout(5),
