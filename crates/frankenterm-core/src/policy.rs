@@ -5231,8 +5231,17 @@ impl PolicyEngine {
             );
         }
 
-        // Check alt-screen state for send actions (always checked for safety)
-        if matches!(input.action, ActionKind::SendText | ActionKind::SendControl) {
+        // Check alt-screen state for send actions (always checked for safety).
+        // Control characters (Ctrl-C/D/Z) are included because SendCtrlD can
+        // close a shell and SendCtrlZ can orphan background processes.
+        if matches!(
+            input.action,
+            ActionKind::SendText
+                | ActionKind::SendControl
+                | ActionKind::SendCtrlC
+                | ActionKind::SendCtrlD
+                | ActionKind::SendCtrlZ
+        ) {
             // Deny if in alt-screen mode (vim, less, htop, etc.)
             if input.capabilities.alt_screen == Some(true) {
                 context.record_rule(
@@ -5272,8 +5281,14 @@ impl PolicyEngine {
         );
 
         // Check for recent capture gaps (safety check for send actions)
-        if matches!(input.action, ActionKind::SendText | ActionKind::SendControl)
-            && input.capabilities.has_recent_gap
+        if matches!(
+            input.action,
+            ActionKind::SendText
+                | ActionKind::SendControl
+                | ActionKind::SendCtrlC
+                | ActionKind::SendCtrlD
+                | ActionKind::SendCtrlZ
+        ) && input.capabilities.has_recent_gap
         {
             // Recent gap means we might have missed output - require approval
             if !input.actor.is_trusted() {
@@ -5299,8 +5314,14 @@ impl PolicyEngine {
         );
 
         // Check prompt state for send actions
-        if matches!(input.action, ActionKind::SendText | ActionKind::SendControl)
-            && self.require_prompt_active
+        if matches!(
+            input.action,
+            ActionKind::SendText
+                | ActionKind::SendControl
+                | ActionKind::SendCtrlC
+                | ActionKind::SendCtrlD
+                | ActionKind::SendCtrlZ
+        ) && self.require_prompt_active
             && !input.capabilities.prompt_active
         {
             // If command is running, deny

@@ -14,7 +14,7 @@
 
 </div>
 
-**A swarm-native terminal platform designed to replace legacy terminal workflows for massive AI agent orchestration.** 120 workspace crates. 482 core modules. 45,000+ tests. Built from the ground up for fleets of 200+ concurrent AI coding agents.
+**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 120 workspace crates. 482 core modules. 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -31,7 +31,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 
 **The Problem**: Running large AI coding swarms across ad-hoc terminal panes is chaos. You can't reliably observe state, detect rate limits or auth failures, coordinate handoffs, or automate safe recovery without brittle glue code. When you're running 50+ Claude Code / Codex / Gemini agents simultaneously, a single undetected rate limit wastes hours of compute. A stuck agent silently burns tokens. An auth failure goes unnoticed for 30 minutes. You have no search across agent output, no audit trail, no way for one AI to safely control another.
 
-**The Solution**: `ft` is a **full terminal platform for agent swarms** — with first-class observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). It captures every byte of terminal output across every pane, detects state transitions via multi-pattern matching, triggers automated workflows in response, and exposes the entire system through a JSON API designed for AI-to-AI orchestration. Think of it as Kubernetes for terminal-based AI agents: observe, detect, react, audit.
+**The Solution**: `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). It captures every byte of terminal output across every pane, detects state transitions via multi-pattern matching, triggers automated workflows in response, and exposes all of it through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit.
 
 ### Platform Direction
 
@@ -47,7 +47,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
 |---------|--------------|
 | **Perfect Observability** | Captures all terminal output across all panes with delta extraction (<50ms lag) |
 | **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions across Codex, Claude Code, and Gemini |
-| **Event-Driven Automation** | Workflows trigger on patterns — no sleep loops or polling heuristics |
+| **Event-Driven Automation** | Workflows trigger on patterns, not sleep loops or polling heuristics |
 | **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
 | **Policy Engine** | 21-subsystem policy framework with capability gates, rate limiting, audit trails, and approval tokens |
@@ -116,15 +116,15 @@ Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robo
 
 ### 1. Passive-First Architecture
 
-The observation loop (discovery, capture, pattern detection) has **no side effects**. It only reads and stores. The action loop (sending input, running workflows) is strictly separated with explicit policy gates. This means `ft watch` can never accidentally send input to a pane or modify agent state — it is a pure observer.
+The observation loop (discovery, capture, pattern detection) has **no side effects**. It only reads and stores. The action loop (sending input, running workflows) is strictly separated with explicit policy gates. In practice, `ft watch` can never accidentally send input to a pane or modify agent state; it is a pure observer.
 
 ### 2. Event-Driven, Not Time-Based
 
-No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. The `ft robot wait-for` command exemplifies this — it blocks until a specific rule fires, not until a timer expires.
+No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. The `ft robot wait-for` command blocks until a specific rule fires, not until a timer expires.
 
 ### 3. Delta Extraction Over Full Capture
 
-Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4KB overlap matching to extract only new content. This produces efficient storage, minimal latency, and explicit gap markers for discontinuities. When the overlap match fails (terminal reset, scrollback clear), the gap is recorded as a first-class event rather than silently dropped.
+Instead of repeatedly capturing entire scrollback buffers, `ft` uses 4KB overlap matching to extract only new content. This produces efficient storage, minimal latency, and explicit gap markers for discontinuities. When the overlap match fails (terminal reset, scrollback clear), the gap is recorded as an explicit event rather than silently dropped.
 
 ### 4. Single-Writer Integrity
 
@@ -132,7 +132,7 @@ A file-system lock (via `fs2`) ensures only one watcher can write to the databas
 
 ### 5. Agent-First Interface
 
-Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) output reduces token consumption by 40-60% for AI-to-AI communication. Designed for machines to parse, not humans to read.
+Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) output reduces token consumption by 40-60% for AI-to-AI communication. Built for machines to parse, not humans to read.
 
 ### 6. Transactional Safety
 
@@ -140,7 +140,7 @@ Multi-pane operations use a prepare/commit/compensate lifecycle borrowed from di
 
 ### 7. Defense in Depth for Memory
 
-The fleet memory controller synthesizes pressure signals from three independent subsystems — pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets — into a unified 4-tier pressure model (Normal → Elevated → Critical → Emergency) with asymmetric hysteresis (escalate fast, de-escalate slow). Actions range from throttling poll intervals to emergency warm-scrollback eviction.
+The fleet memory controller synthesizes pressure signals from three independent subsystems: pipeline backpressure (queue depths), system memory utilization, and per-pane memory budgets. These feed a unified 4-tier pressure model (Normal, Elevated, Critical, Emergency) with asymmetric hysteresis that escalates fast and de-escalates slow. Actions range from throttling poll intervals to emergency warm-scrollback eviction.
 
 ---
 
@@ -595,26 +595,26 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ft Swarm Runtime Core                           │
-│   Session Graph │ Pane Registry │ State Store │ Control Plane          │
-│   Mission Orchestrator │ Fleet Memory Controller │ Tx Engine           │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                       ft Swarm Runtime Core                           │
+│ Session Graph │ Pane Registry │ State Store │ Control Plane           │
+│ Mission Orchestrator │ Fleet Memory Controller │ Tx Engine            │
+└───────────────────────────────────────────────────────────────────────┘
                                    │
                     Backend Adapters + Runtime Integrations
                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      Ingest + Normalization Pipeline                     │
-│   Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
-│   SIMD Scan → Pattern Trigger → zstd Compression                       │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                  Ingest + Normalization Pipeline                       │
+│ Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
+│ SIMD Scan → Pattern Trigger → zstd Compression                        │
+└───────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    Storage Layer (SQLite + FTS5 + Tantivy)              │
-│   output_segments │ events │ workflow_executions │ audit_actions        │
-│   approval_tokens │ session_checkpoints │ mux_pane_state              │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                  Storage Layer (SQLite + FTS5 + Tantivy)              │
+│ output_segments │ events │ workflow_executions │ audit_actions        │
+│ approval_tokens │ session_checkpoints │ mux_pane_state                │
+└───────────────────────────────────────────────────────────────────────┘
                                    │
                     ┌──────────────┼──────────────┐
                     ▼              ▼              ▼
@@ -626,11 +626,11 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
                     │              │              │
                     └──────────────┼──────────────┘
                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Policy Engine (21 subsystems)                    │
-│   Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
-│   Secret Redaction │ Backpressure Tiers │ Circuit Breakers             │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│                   Policy Engine (21 subsystems)                        │
+│ Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
+│ Secret Redaction │ Backpressure Tiers │ Circuit Breakers              │
+└───────────────────────────────────────────────────────────────────────┘
                                    │
                     ┌──────────────┼──────────────┐
                     ▼              ▼              ▼
@@ -719,6 +719,99 @@ frankenterm/                              # 120 workspace crates
 
 ---
 
+## Deep Dive: How the Scan Pipeline Works
+
+Every byte of pane output passes through a three-stage scan pipeline before reaching storage. The stages run in sequence on the same thread, avoiding cross-thread coordination overhead:
+
+```
+raw bytes ──► ScanPipeline::process()
+               ├── Stage 1: simd_scan (newline + ANSI density metrics)
+               ├── Stage 2: pattern_trigger (Aho-Corasick multi-pattern match)
+               └── Stage 3: byte_compression (zstd compress)
+                   └── ScanOutput { metrics, triggers, compressed, stats }
+```
+
+**Stage 1 (Metrics)** counts newlines and ANSI escape byte density using a linear scan. The ANSI density metric is useful for detecting panes running TUI applications (which produce high escape-sequence volume) vs plain text output.
+
+**Stage 2 (Pattern Trigger)** runs an Aho-Corasick automaton that matches all registered trigger patterns in a single pass over the buffer. An important subtlety: Aho-Corasick's LeftmostFirst non-overlapping mode is not composable across chunk boundaries. Earlier bytes consume match positions, preventing later patterns from matching. To handle this, the chunked pipeline accumulates all data in a `trigger_data_buffer` and re-scans the full buffer at flush time for exact parity with batch mode.
+
+**Stage 3 (Compression)** applies zstd to the raw bytes. For typical terminal output, compression ratios of 5:1 to 10:1 are common. Compression is skipped for buffers below a configurable threshold (default: 256 bytes) where the overhead exceeds the savings.
+
+The pipeline supports two modes: **batch** (process a complete buffer at once) and **chunked** (process output incrementally with cross-boundary state carry, suitable for streaming ingestion from pane tailers).
+
+---
+
+## Deep Dive: Bayesian Regime Detection (BOCPD)
+
+Regex patterns catch known failure modes. But what about novel failures that nobody wrote a pattern for? `ft` includes a Bayesian Online Change-Point Detection (BOCPD) engine that detects *statistical* regime changes in pane output:
+
+- Infinite loops producing repetitive output at unusual cadence
+- Output quality degradation (token ratio shifts, response length changes)
+- Novel failure modes that don't match any existing pattern
+- Subtle behavioral drift over multi-hour agent sessions
+
+The BOCPD module maintains a posterior distribution over possible "run lengths" (how long the current regime has lasted). When the posterior probability of a regime change exceeds a configurable threshold, a change-point event is emitted. This triggers a context snapshot that captures the execution environment (CWD, env vars, process info, shell state) at microsecond precision.
+
+The system also includes ARS (Adaptive Regime Scoring) modules for drift detection, evidence ledgers, blast radius estimation, and compile-time regime analysis. These are used for post-incident forensics and proactive monitoring.
+
+---
+
+## Deep Dive: Probabilistic Data Structures
+
+Several subsystems use space-efficient probabilistic data structures to avoid costly exact lookups:
+
+**Bloom Filter (Pattern Engine)**: Before evaluating regex patterns against captured text, the pattern engine checks a Bloom filter seeded with the anchor strings from each rule. If the Bloom filter rejects, the text cannot possibly match, and the full regex evaluation is skipped. This reduces CPU cost by 10-100x for rule packs with dozens of patterns, since most text chunks match zero rules.
+
+**XOR Filter (Search Dedup)**: The search indexing pipeline uses XOR filters for space-efficient content-hash membership testing. An XOR filter uses approximately 1.23 * n * fingerprint_bytes to represent a set of n items, which is more compact than Bloom filters at equivalent false-positive rates. XOR filters are static (built once from a known set) which fits the dedup use case where the known-hash set changes infrequently.
+
+**FNV-1a Hash (Fast Content Fingerprinting)**: For real-time dedup decisions where SHA-256 is too expensive, the pipeline uses FNV-1a (64-bit, non-cryptographic) as a fast fingerprint. FNV-1a processes one byte per cycle and is deterministic across platforms. The offset basis (0xcbf29ce484222325) and prime (0x100000001b3) are the standard FNV-1a constants.
+
+---
+
+## Deep Dive: Session Persistence and Restore
+
+When `ft watch` starts, it checks for sessions that did not shut down cleanly (`shutdown_clean = 0` in the database). If found, it loads the latest checkpoint and offers to restore the mux topology:
+
+```
+Database → SessionCandidate → RestoreDecision → LayoutRestorer → RestoreSummary
+```
+
+Each checkpoint records:
+- Topology snapshot (which panes existed, their tab/window arrangement)
+- Per-pane terminal state (cursor position, alt-screen flag, scrollback reference)
+- Per-pane agent metadata (agent type, session ID, CWD, process info)
+- Curated environment variables (redacted for sensitive values)
+
+The restore process creates new panes in the current mux server, maps old pane IDs to new ones, and optionally replays scrollback content. The ID mapping is recorded as a "startup" checkpoint so subsequent operations can correlate pre-crash and post-restore pane identifiers.
+
+Scheduled backups use the SQLite online backup API for consistent snapshots. Backup archives include the database binary, a JSON manifest with SHA-256 checksums, and optional SQL text dumps. Retention and rotation are configurable by day count and maximum backup count, with 5-field cron scheduling support.
+
+---
+
+## Deep Dive: Disaster Recovery Drills
+
+The `disaster_recovery_drills` module provides structured, repeatable DR drill scenarios that exercise the backup/restore pipeline and measure RTO/RPO compliance. Each drill scenario specifies:
+
+- **RTO target** (Recovery Time Objective): maximum acceptable time to restore service
+- **RPO target** (Recovery Point Objective): maximum acceptable data loss window
+- **Completeness threshold**: minimum fraction of panes that must be restored successfully
+
+Drills produce scored reports with pass/fail/degraded verdicts and per-metric breakdowns. This lets operators verify that backup infrastructure actually works before they need it in production. The verdict logic uses asymmetric scoring: completeness failures are always "Fail," but missing one RTO/RPO target while meeting completeness produces "Degraded" rather than outright failure.
+
+---
+
+## Deep Dive: Connection Pool and Circuit Breaker
+
+The mux connection pool reduces overhead by reusing persistent connections to the WezTerm mux server. Key design choices:
+
+- **Semaphore-based concurrency**: A `Semaphore` (via `runtime_compat`) limits concurrent connections. Each `acquire` returns a guard that holds a permit; dropping the guard releases the slot. This prevents pool starvation even when operations fail.
+- **Recovery with retry**: On transient/recoverable errors, the pool discards the failed connection (guard drop releases the semaphore) and retries with a new connection using configurable backoff. The connection is intentionally not returned to the pool after an error since its state may be corrupted.
+- **Circuit breaker integration**: After exhausting retries, failure is reported to a circuit breaker state machine. When the circuit opens (too many recent failures), subsequent operations fail immediately rather than waiting for timeouts. The circuit transitions through Closed → Open → Half-Open → Closed states with configurable cooldown periods.
+
+The retry layer supports exponential backoff with random jitter (uniform +-10% by default) and per-use-case policies (WezTerm CLI: 3 attempts / 100ms initial; database writes: 5 attempts / 50ms initial; webhooks: 5 attempts / 1s initial).
+
+---
+
 ## Pattern Detection
 
 `ft` detects state transitions across multiple AI coding agents:
@@ -733,14 +826,14 @@ frankenterm/                              # 120 workspace crates
 ### Pattern IDs
 
 Every detection has a stable `rule_id` like `codex.usage.reached`. Use these in:
-- `ft robot wait-for <pane_id> <rule_id>` — wait for specific condition
-- Workflow triggers — automatically react to patterns
-- Allowlists — suppress false positives
-- `ft rules test "text"` — validate patterns against sample text
+- `ft robot wait-for <pane_id> <rule_id>` to wait for a specific condition
+- Workflow triggers that automatically react to patterns
+- Allowlists to suppress false positives
+- `ft rules test "text"` to validate patterns against sample text
 
 ### Agent Pane State Detection
 
-Beyond pattern matching, `ft` continuously classifies each agent pane into a visual state:
+Separately from pattern matching, `ft` continuously classifies each agent pane into a visual state:
 
 | State | Color | Condition |
 |-------|-------|-----------|

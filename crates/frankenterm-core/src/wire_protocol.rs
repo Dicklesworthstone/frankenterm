@@ -381,7 +381,7 @@ impl AgentStreamer {
 use std::collections::HashMap;
 
 /// Per-agent tracking state within the aggregator.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AgentSession {
     /// Last sequence number received from this agent (for ordering/dedup).
     last_seq: u64,
@@ -390,6 +390,14 @@ struct AgentSession {
     /// Total duplicates skipped.
     duplicates_skipped: u64,
     /// Local receipt timestamp of the last accepted or duplicate envelope.
+    last_seen_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSessionSnapshot {
+    last_seq: u64,
+    messages_received: u64,
+    duplicates_skipped: u64,
     last_seen_ms: i64,
 }
 
@@ -519,6 +527,36 @@ impl Aggregator {
     /// Returns `true` when a session was present and removed.
     pub fn remove_agent(&mut self, sender: &str) -> bool {
         self.agents.remove(sender).is_some()
+    }
+
+    #[must_use]
+    pub fn agent_session_snapshot(&self, sender: &str) -> Option<AgentSessionSnapshot> {
+        self.agents.get(sender).map(|session| AgentSessionSnapshot {
+            last_seq: session.last_seq,
+            messages_received: session.messages_received,
+            duplicates_skipped: session.duplicates_skipped,
+            last_seen_ms: session.last_seen_ms,
+        })
+    }
+
+    pub fn rollback_accepted(&mut self, sender: &str, previous: Option<AgentSessionSnapshot>) {
+        match previous {
+            Some(previous) => {
+                self.agents.insert(
+                    sender.to_string(),
+                    AgentSession {
+                        last_seq: previous.last_seq,
+                        messages_received: previous.messages_received,
+                        duplicates_skipped: previous.duplicates_skipped,
+                        last_seen_ms: previous.last_seen_ms,
+                    },
+                );
+            }
+            None => {
+                self.agents.remove(sender);
+            }
+        }
+        self.total_accepted = self.total_accepted.saturating_sub(1);
     }
 
     /// Total accepted messages across all agents.

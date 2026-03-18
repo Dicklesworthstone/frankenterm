@@ -423,6 +423,22 @@ impl SessionReplayGuard {
         Ok(())
     }
 
+    #[must_use]
+    pub fn session_last_seq(&self, session_id: &str) -> Option<u64> {
+        self.sessions.get(session_id).copied()
+    }
+
+    pub fn restore_session(&mut self, session_id: &str, previous: Option<u64>) {
+        match previous {
+            Some(last_seq) => {
+                self.sessions.insert(session_id.to_string(), last_seq);
+            }
+            None => {
+                self.sessions.remove(session_id);
+            }
+        }
+    }
+
     /// Remove a tracked session explicitly.
     ///
     /// Returns `true` when a session was present and removed.

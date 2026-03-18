@@ -9409,14 +9409,18 @@ fn writer_loop(
         for cmd in batch {
             // Control commands must run outside a transaction
             if is_control_command(&cmd) && txn_open {
-                let _ = conn.execute_batch("COMMIT");
+                if let Err(err) = conn.execute_batch("COMMIT") {
+                    tracing::error!(%err, "COMMIT failed before control command; batch data may be lost");
+                }
                 txn_open = false;
             }
             dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
         }
 
         if txn_open {
-            let _ = conn.execute_batch("COMMIT");
+            if let Err(err) = conn.execute_batch("COMMIT") {
+                tracing::error!(%err, "COMMIT failed for write batch; data may be lost");
+            }
         }
 
         if should_break {
