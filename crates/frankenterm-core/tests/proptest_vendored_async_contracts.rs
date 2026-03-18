@@ -305,6 +305,8 @@ proptest! {
         prop_assert!(report.overall_compliant);
         prop_assert!((report.compliance_rate - 1.0).abs() < f64::EPSILON);
         prop_assert!(report.uncovered_contracts.is_empty());
+        prop_assert!(report.surface_status.all_transitional_resolved());
+        prop_assert_eq!(report.surface_status.total_count(), SURFACE_CONTRACT_V1.len());
     }
 
     #[test]

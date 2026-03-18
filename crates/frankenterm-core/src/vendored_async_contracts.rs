@@ -948,6 +948,7 @@ mod tests {
         assert_eq!(report.surface_status.retire_count, retire_count);
         assert_eq!(report.surface_status.replaced_count, replace_count);
         assert_eq!(report.surface_status.retired_count, retire_count);
+        assert!(report.surface_status.all_transitional_resolved());
         assert_eq!(
             report.surface_status.total_count(),
             crate::runtime_compat::SURFACE_CONTRACT_V1.len()
@@ -1069,6 +1070,7 @@ mod tests {
         let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
         let pending_replace = replace_count.min(2);
         let pending_retire = retire_count.min(1);
+        let pending_transitional = pending_replace + pending_retire;
         let mut report = ContractAuditReport::new("surface-test", 42_000);
         let status = SurfaceContractStatus {
             keep_count,
@@ -1091,11 +1093,13 @@ mod tests {
             report.surface_status.retired_count,
             retire_count.saturating_sub(pending_retire)
         );
-        // Keep a few transitional surfaces pending so the arithmetic stays exercised.
-        assert!(!report.surface_status.all_transitional_resolved());
+        assert_eq!(
+            report.surface_status.all_transitional_resolved(),
+            pending_transitional == 0
+        );
         assert_eq!(
             report.surface_status.remaining_transitional(),
-            pending_replace + pending_retire
+            pending_transitional
         );
         assert_eq!(
             report.surface_status.total_count(),
