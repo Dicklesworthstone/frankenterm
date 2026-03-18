@@ -9342,22 +9342,17 @@ fn mirror_segment_into_mmap(
     }
 }
 
-/// Returns true if the command is a control operation that must run outside a
-/// transaction (Shutdown, Vacuum, Checkpoint).
-fn is_control_command(cmd: &WriteCommand) -> bool {
-    matches!(
-        cmd,
-        WriteCommand::Shutdown { .. }
-            | WriteCommand::Vacuum { .. }
-            | WriteCommand::Checkpoint { .. }
-    )
-}
-
 /// Main loop for the writer thread.
 ///
-/// Batches pending writes into SQLite transactions to amortize journal/fsync
-/// overhead.  Control commands (Shutdown, Vacuum, Checkpoint) commit any open
-/// transaction first, then execute outside a transaction.
+/// Drains pending writes in small batches to amortize queue wakeups while
+/// preserving per-command durability semantics.
+///
+/// Every `WriteCommand` resolves a caller-facing oneshot from
+/// `dispatch_write_command()`. Wrapping multiple commands in an explicit
+/// transaction would let individual commands report success before a later
+/// `COMMIT` could still fail, turning a durability failure into a false `Ok`.
+/// Until the response path can defer replies until the transaction outcome is
+/// known, the writer must stay in SQLite's per-statement autocommit mode.
 fn writer_loop(
     conn: &mut Connection,
     rx: &mut mpsc::Receiver<WriteCommand>,
@@ -9391,36 +9386,9 @@ fn writer_loop(
             }
         }
 
-        // Open a transaction when the batch has multiple DML commands.
-        // Single-command batches skip the transaction wrapper (SQLite
-        // auto-commits each statement anyway).
-        let use_txn = batch.len() > 1 && !batch.iter().all(is_control_command);
-        let mut txn_open = false;
-        if use_txn {
-            match conn.execute_batch("BEGIN IMMEDIATE") {
-                Ok(()) => txn_open = true,
-                Err(err) => {
-                    tracing::warn!(%err, "Failed to start batch transaction, falling back to individual statements");
-                }
-            }
-        }
-
         let mut should_break = false;
         for cmd in batch {
-            // Control commands must run outside a transaction
-            if is_control_command(&cmd) && txn_open {
-                if let Err(err) = conn.execute_batch("COMMIT") {
-                    tracing::error!(%err, "COMMIT failed before control command; batch data may be lost");
-                }
-                txn_open = false;
-            }
             dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
-        }
-
-        if txn_open {
-            if let Err(err) = conn.execute_batch("COMMIT") {
-                tracing::error!(%err, "COMMIT failed for write batch; data may be lost");
-            }
         }
 
         if should_break {
