@@ -604,7 +604,7 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
                     Backend Adapters + Runtime Integrations
                                    ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│                  Ingest + Normalization Pipeline                       │
+│                  Ingest + Normalization Pipeline                      │
 │ Discovery → Delta Extraction → Fingerprinting → Observation Filter    │
 │ SIMD Scan → Pattern Trigger → zstd Compression                        │
 └───────────────────────────────────────────────────────────────────────┘
@@ -627,7 +627,7 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
                     └──────────────┼──────────────┘
                                    ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│                   Policy Engine (21 subsystems)                        │
+│                   Policy Engine (21 subsystems)                       │
 │ Capability Gates │ Rate Limiting │ Audit Trail │ Approval Tokens      │
 │ Secret Redaction │ Backpressure Tiers │ Circuit Breakers              │
 └───────────────────────────────────────────────────────────────────────┘
