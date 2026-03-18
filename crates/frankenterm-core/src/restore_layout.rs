@@ -172,14 +172,6 @@ impl LayoutRestorer {
                     restored_any_tabs = true;
                 }
                 Err(e) => {
-                    if let Some(window_id) = self
-                        .window_id_from_partial_restore(tab, &result.pane_id_map)
-                        .await
-                    {
-                        restored_window_id.get_or_insert(window_id);
-                        restored_any_tabs = true;
-                        result.tabs_created += 1;
-                    }
                     record_failed_tree(result, &tab.pane_tree, &e.to_string());
                     warn!(tab_id = tab.tab_id, error = %e, "failed to restore tab");
                     if !self.config.continue_on_error {
@@ -376,27 +368,6 @@ impl LayoutRestorer {
         let cmd = format!("cd {}\n", shell_escape(path));
         if let Err(e) = self.wezterm.send_text(pane_id, &cmd).await {
             debug!(pane_id, path, error = %e, "failed to set cwd");
-        }
-    }
-
-    async fn window_id_from_partial_restore(
-        &self,
-        tab: &TabSnapshot,
-        pane_id_map: &HashMap<u64, u64>,
-    ) -> Option<u64> {
-        let restored_pane_id = collect_leaf_ids(&tab.pane_tree)
-            .into_iter()
-            .find_map(|old_pane_id| pane_id_map.get(&old_pane_id).copied())?;
-        match self.wezterm.get_pane(restored_pane_id).await {
-            Ok(pane) => Some(pane.window_id),
-            Err(e) => {
-                debug!(
-                    restored_pane_id,
-                    error = %e,
-                    "failed to inspect partially restored pane for window recovery"
-                );
-                None
-            }
         }
     }
 }
