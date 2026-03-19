@@ -723,10 +723,13 @@ impl crate::TermWindow {
     }
 
     fn use_reverse_video_cursor(&self, params: &ComputeCellFgBgParams) -> bool {
-        self.config.force_reverse_video_cursor
-            && params.cursor_is_default_color
-            && params.fg_color.contrast_ratio(&params.bg_color)
-                >= self.config.reverse_video_cursor_min_contrast
+        should_use_reverse_video_cursor(
+            self.config.force_reverse_video_cursor,
+            self.config.reverse_video_cursor_min_contrast,
+            params.cursor_is_default_color,
+            params.fg_color,
+            params.bg_color,
+        )
     }
 
     fn glyph_infos_to_glyphs(
@@ -957,6 +960,155 @@ fn update_next_frame_time(storage: &mut Option<Instant>, next_due: Option<Instan
 fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
         _ => false,
+    }
+}
+
+fn should_use_reverse_video_cursor(
+    force_reverse_video_cursor: bool,
+    reverse_video_cursor_min_contrast: f32,
+    cursor_is_default_color: bool,
+    fg_color: LinearRgba,
+    bg_color: LinearRgba,
+) -> bool {
+    force_reverse_video_cursor
+        && cursor_is_default_color
+        && fg_color.contrast_ratio(&bg_color) >= reverse_video_cursor_min_contrast
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_fg_color_attr, same_hyperlink, should_use_reverse_video_cursor,
+        update_next_frame_time,
+    };
+    use config::{ConfigHandle, TextStyle};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use termwiz::hyperlink::Hyperlink;
+    use wezterm_term::color::{ColorAttribute, ColorPalette};
+    use wezterm_term::{CellAttributes, Intensity};
+    use window::color::LinearRgba;
+
+    #[test]
+    fn resolve_fg_color_attr_prefers_style_foreground_for_default_text() {
+        let attrs = CellAttributes::default();
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+        let mut style = TextStyle::default();
+        style.foreground = Some((0x12, 0x34, 0x56).into());
+
+        assert_eq!(
+            resolve_fg_color_attr(&attrs, ColorAttribute::Default, &palette, &config, &style),
+            LinearRgba::with_srgba(0x12, 0x34, 0x56, 0xff)
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_keeps_default_foreground_unbrightened_when_bold() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_foreground(ColorAttribute::PaletteIndex(1));
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::Default,
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(1))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_brightens_explicit_ansi_foreground_when_bold() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let config = ConfigHandle::default_config();
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(1),
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(9))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn update_next_frame_time_preserves_the_earliest_deadline() {
+        let base = Instant::now();
+        let first = base + Duration::from_millis(30);
+        let later = base + Duration::from_millis(60);
+        let earlier = base + Duration::from_millis(10);
+        let mut storage = None;
+
+        update_next_frame_time(&mut storage, Some(first));
+        assert_eq!(storage, Some(first));
+
+        update_next_frame_time(&mut storage, Some(later));
+        assert_eq!(storage, Some(first));
+
+        update_next_frame_time(&mut storage, Some(earlier));
+        assert_eq!(storage, Some(earlier));
+    }
+
+    #[test]
+    fn update_next_frame_time_ignores_absent_deadlines() {
+        let base = Instant::now();
+        let due = base + Duration::from_millis(25);
+        let mut storage = None;
+
+        update_next_frame_time(&mut storage, None);
+        assert_eq!(storage, None);
+
+        update_next_frame_time(&mut storage, Some(due));
+        update_next_frame_time(&mut storage, None);
+        assert_eq!(storage, Some(due));
+    }
+
+    #[test]
+    fn same_hyperlink_requires_the_same_arc_instance() {
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let alias = Arc::clone(&link);
+        let distinct = Arc::new(Hyperlink::new("https://example.com"));
+
+        assert!(same_hyperlink(Some(&link), Some(&alias)));
+        assert!(!same_hyperlink(Some(&link), Some(&distinct)));
+        assert!(!same_hyperlink(Some(&link), None));
+        assert!(same_hyperlink(None, None));
+    }
+
+    #[test]
+    fn should_use_reverse_video_cursor_requires_feature_flag_and_default_color() {
+        let fg = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        let bg = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+
+        assert!(!should_use_reverse_video_cursor(false, 1.0, true, fg, bg));
+        assert!(!should_use_reverse_video_cursor(true, 1.0, false, fg, bg));
+        assert!(should_use_reverse_video_cursor(true, 1.0, true, fg, bg));
+    }
+
+    #[test]
+    fn should_use_reverse_video_cursor_requires_enough_contrast() {
+        let fg = LinearRgba::with_components(0.5, 0.5, 0.5, 1.0);
+        let bg = LinearRgba::with_components(0.5, 0.5, 0.5, 1.0);
+
+        assert!(!should_use_reverse_video_cursor(true, 1.1, true, fg, bg));
     }
 }
