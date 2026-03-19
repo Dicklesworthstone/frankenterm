@@ -2372,6 +2372,39 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_pipeline_depth_one_with_cx() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let cx = crate::cx::for_testing();
+
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig::default(),
+                pipeline_depth: 1,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![10, 20, 30])
+                .await
+                .expect("depth=1 batch with cx should succeed");
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].pane_id, 10);
+            assert_eq!(result[1].pane_id, 20);
+            assert_eq!(result[2].pane_id, 30);
+        });
+    }
+
     #[test]
     fn pool_batch_render_falls_back_to_sequential_after_pipeline_error() {
         run_async_test(async {
