@@ -195,6 +195,30 @@ fn build_execution_record(
     }
 }
 
+fn lifecycle_checkpoint_receipt(
+    contract: &MissionTxContract,
+    seq: u64,
+    state: MissionTxState,
+    reason_code: &str,
+    emitted_at_ms: i64,
+) -> serde_json::Value {
+    serde_json::to_value(TxReceipt {
+        seq,
+        // These fixtures model contract-level checkpoints, not per-step receipts.
+        phase: "lifecycle".into(),
+        tx_id: contract.intent.tx_id.0.clone(),
+        plan_id: contract.plan.plan_id.0.clone(),
+        state,
+        step_id: None,
+        outcome: "state_checkpoint".into(),
+        emitted_at_ms,
+        reason_code: reason_code.into(),
+        error_code: None,
+        decision_path: "test_fixture->lifecycle_checkpoint".into(),
+    })
+    .unwrap()
+}
+
 // ── Scenario 1: Nominal full commit ──────────────────────────────────────
 
 #[test]
@@ -625,16 +649,15 @@ fn resume_after_full_commit() {
 
     // Add terminal receipt so reconstruct sees a resolved state.
     let mut terminal_contract = build_contract("resume2", NUM_STEPS, MissionTxState::Prepared);
-    terminal_contract.receipts.push(
-        serde_json::to_value(TxReceipt {
-            seq: 1,
-            state: MissionTxState::Committed,
-            emitted_at_ms: 11_000,
-            reason_code: None,
-            error_code: None,
-        })
-        .unwrap(),
-    );
+    terminal_contract
+        .receipts
+        .push(lifecycle_checkpoint_receipt(
+            &terminal_contract,
+            1,
+            MissionTxState::Committed,
+            "committed",
+            11_000,
+        ));
 
     let state = reconstruct_tx_resume_state(&terminal_contract, Some(&commit_report), None, 30_000);
     assert!(
@@ -693,16 +716,13 @@ fn resume_after_full_pipeline() {
 
     // Add terminal receipt so reconstruct sees resolved state.
     let mut final_contract = build_contract("resume4", NUM_STEPS, MissionTxState::Prepared);
-    final_contract.receipts.push(
-        serde_json::to_value(TxReceipt {
-            seq: 1,
-            state: MissionTxState::RolledBack,
-            emitted_at_ms: 21_000,
-            reason_code: None,
-            error_code: None,
-        })
-        .unwrap(),
-    );
+    final_contract.receipts.push(lifecycle_checkpoint_receipt(
+        &final_contract,
+        1,
+        MissionTxState::RolledBack,
+        "rolled_back",
+        21_000,
+    ));
 
     let state = reconstruct_tx_resume_state(
         &final_contract,

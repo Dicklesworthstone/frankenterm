@@ -5568,6 +5568,71 @@ enum WriteCommand {
     Shutdown { respond: oneshot::Sender<()> },
 }
 
+impl std::fmt::Debug for WriteCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::AppendSegment { .. } => "AppendSegment",
+            Self::RecordGap { .. } => "RecordGap",
+            Self::RecordEvent { .. } => "RecordEvent",
+            Self::MarkEventHandled { .. } => "MarkEventHandled",
+            Self::SetEventTriageState { .. } => "SetEventTriageState",
+            Self::SetEventNote { .. } => "SetEventNote",
+            Self::AddEventLabel { .. } => "AddEventLabel",
+            Self::RemoveEventLabel { .. } => "RemoveEventLabel",
+            Self::UpsertEventMute { .. } => "UpsertEventMute",
+            Self::DeleteEventMute { .. } => "DeleteEventMute",
+            Self::UpsertPane { .. } => "UpsertPane",
+            Self::UpsertWorkflow { .. } => "UpsertWorkflow",
+            Self::UpsertActionPlan { .. } => "UpsertActionPlan",
+            Self::InsertPreparedPlan { .. } => "InsertPreparedPlan",
+            Self::ConsumePreparedPlan { .. } => "ConsumePreparedPlan",
+            Self::InsertStepLog { .. } => "InsertStepLog",
+            Self::UpsertActionUndo { .. } => "UpsertActionUndo",
+            Self::MarkActionUndone { .. } => "MarkActionUndone",
+            Self::UpsertSession { .. } => "UpsertSession",
+            Self::RecordAuditAction { .. } => "RecordAuditAction",
+            Self::PurgeAuditActions { .. } => "PurgeAuditActions",
+            Self::InsertApprovalToken { .. } => "InsertApprovalToken",
+            Self::ConsumeApprovalToken { .. } => "ConsumeApprovalToken",
+            Self::GetApprovalTokenByCode { .. } => "GetApprovalTokenByCode",
+            Self::ConsumeApprovalTokenByCode { .. } => "ConsumeApprovalTokenByCode",
+            Self::RecordMaintenance { .. } => "RecordMaintenance",
+            Self::RecordSecretScanReport { .. } => "RecordSecretScanReport",
+            Self::InsertSavedSearch { .. } => "InsertSavedSearch",
+            Self::UpdateSavedSearchRun { .. } => "UpdateSavedSearchRun",
+            Self::UpdateSavedSearchSchedule { .. } => "UpdateSavedSearchSchedule",
+            Self::DeleteSavedSearch { .. } => "DeleteSavedSearch",
+            Self::PruneSegments { .. } => "PruneSegments",
+            Self::Vacuum { .. } => "Vacuum",
+            Self::UpsertAccount { .. } => "UpsertAccount",
+            Self::UpdateAccountLastUsed { .. } => "UpdateAccountLastUsed",
+            Self::DeleteAccount { .. } => "DeleteAccount",
+            Self::CreateReservation { .. } => "CreateReservation",
+            Self::ReleaseReservation { .. } => "ReleaseReservation",
+            Self::ExpireStaleReservations { .. } => "ExpireStaleReservations",
+            Self::Checkpoint { .. } => "Checkpoint",
+            Self::RecordUsageMetric { .. } => "RecordUsageMetric",
+            Self::RecordUsageMetricsBatch { .. } => "RecordUsageMetricsBatch",
+            Self::PurgeUsageMetrics { .. } => "PurgeUsageMetrics",
+            Self::RecordNotification { .. } => "RecordNotification",
+            Self::UpdateNotificationStatus { .. } => "UpdateNotificationStatus",
+            Self::AcknowledgeNotification { .. } => "AcknowledgeNotification",
+            Self::IncrementNotificationRetry { .. } => "IncrementNotificationRetry",
+            Self::PurgeNotificationHistory { .. } => "PurgeNotificationHistory",
+            Self::DeleteEventsBefore { .. } => "DeleteEventsBefore",
+            Self::DeleteEventsByTier { .. } => "DeleteEventsByTier",
+            Self::InsertPaneBookmark { .. } => "InsertPaneBookmark",
+            Self::DeletePaneBookmark { .. } => "DeletePaneBookmark",
+            Self::InsertMuxSession { .. } => "InsertMuxSession",
+            Self::InsertSessionCheckpoint { .. } => "InsertSessionCheckpoint",
+            Self::PruneSessionCheckpoints { .. } => "PruneSessionCheckpoints",
+            Self::MarkSessionShutdownClean { .. } => "MarkSessionShutdownClean",
+            Self::Shutdown { .. } => "Shutdown",
+        };
+        write!(f, "WriteCommand::{variant}")
+    }
+}
+
 /// Row data for inserting into mux_pane_state.
 #[derive(Debug, Clone)]
 pub struct SessionPaneStateRow {

@@ -1257,22 +1257,19 @@ mod tests {
             let shard0 = Arc::new(MockWezterm::new());
             let shard1 = Arc::new(MockWezterm::new());
             shard0
-                .add_pane(
-                    10,
-                    crate::wezterm::MockPane {
-                        pane_id: 10,
-                        window_id: 41,
-                        tab_id: 0,
-                        title: "existing".to_string(),
-                        domain: "local".to_string(),
-                        cwd: "/tmp".to_string(),
-                        is_active: false,
-                        is_zoomed: false,
-                        cols: 80,
-                        rows: 24,
-                        content: String::new(),
-                    },
-                )
+                .add_pane(crate::wezterm::MockPane {
+                    pane_id: 10,
+                    window_id: 41,
+                    tab_id: 0,
+                    title: "existing".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    is_active: false,
+                    is_zoomed: false,
+                    cols: 80,
+                    rows: 24,
+                    content: String::new(),
+                })
                 .await;
             let client = ShardedWeztermClient::new(
                 vec![
@@ -1308,22 +1305,19 @@ mod tests {
             let shard1 = Arc::new(MockWezterm::new());
             for handle in [&shard0, &shard1] {
                 handle
-                    .add_pane(
-                        10,
-                        crate::wezterm::MockPane {
-                            pane_id: 10,
-                            window_id: 7,
-                            tab_id: 0,
-                            title: "existing".to_string(),
-                            domain: "local".to_string(),
-                            cwd: "/tmp".to_string(),
-                            is_active: false,
-                            is_zoomed: false,
-                            cols: 80,
-                            rows: 24,
-                            content: String::new(),
-                        },
-                    )
+                    .add_pane(crate::wezterm::MockPane {
+                        pane_id: 10,
+                        window_id: 7,
+                        tab_id: 0,
+                        title: "existing".to_string(),
+                        domain: "local".to_string(),
+                        cwd: "/tmp".to_string(),
+                        is_active: false,
+                        is_zoomed: false,
+                        cols: 80,
+                        rows: 24,
+                        content: String::new(),
+                    })
                     .await;
             }
 
