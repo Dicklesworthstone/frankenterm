@@ -1179,7 +1179,7 @@ mod tests {
             assert_eq!(result.panes_created, 0);
             assert_eq!(
                 result.failed_panes,
-                vec![(1, "simulated spawn failure".to_string())]
+                vec![(1, "Runtime error: simulated spawn failure".to_string())]
             );
         });
     }
@@ -1222,7 +1222,7 @@ mod tests {
             assert!(result.pane_id_map.contains_key(&1));
             assert_eq!(
                 result.failed_panes,
-                vec![(2, "simulated split failure".to_string())]
+                vec![(2, "Runtime error: simulated split failure".to_string())]
             );
         });
     }
@@ -1270,7 +1270,7 @@ mod tests {
             assert!(result.pane_id_map.contains_key(&3));
             assert_eq!(
                 result.failed_panes,
-                vec![(2, "simulated split failure".to_string())]
+                vec![(2, "Runtime error: simulated split failure".to_string())]
             );
 
             let first_tab_pane = inner.pane_state(result.pane_id_map[&1]).await.unwrap();
