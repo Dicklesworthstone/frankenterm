@@ -24,6 +24,7 @@ _LIB_RCH_GUARDS_LOADED=1
 
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|Remote execution failed: .*running locally|running locally|Failed to connect to ubuntu@|too long for Unix domain socket'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+RCH_SMOKE_TIMEOUT_SECS="${RCH_SMOKE_TIMEOUT_SECS:-90}"
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-0}"
 
 # Populated by rch_init().
@@ -63,17 +64,53 @@ check_rch_fallback() {
     fi
 }
 
-# Usage: run_rch_cargo_logged <output_file> <args passed to rch exec -- ...>
+rch_timeout_queue_log() {
+    local output_file="$1"
+    local queue_log="${output_file%.log}.rch_queue_timeout.log"
+    if ! run_rch queue >"${queue_log}" 2>&1; then
+        queue_log="${output_file}"
+    fi
+    printf '%s\n' "${queue_log}"
+}
+
+rch_timeout_reason_code() {
+    local output_file="$1"
+    if grep -Eq 'Retrieving (build )?artifacts?( from)?' "${output_file}" 2>/dev/null; then
+        printf '%s\n' "RCH-ARTIFACT-STALL"
+    else
+        printf '%s\n' "RCH-REMOTE-STALL"
+    fi
+}
+
+rch_timeout_reason_message() {
+    local reason_code="$1"
+    local timeout_secs="$2"
+    if [[ "${reason_code}" == "RCH-ARTIFACT-STALL" ]]; then
+        printf '%s\n' "rch remote command timed out after ${timeout_secs}s while retrieving artifacts from the worker"
+    else
+        printf '%s\n' "rch remote command timed out after ${timeout_secs}s"
+    fi
+}
+
+# Usage: run_rch_cargo_logged_with_timeout <timeout_secs> <output_file> <args passed to rch exec -- ...>
 # The caller is responsible for including `env CARGO_TARGET_DIR=... cargo ...`
 # in the args.
-run_rch_cargo_logged() {
-    local output_file="$1"
-    shift
+run_rch_cargo_logged_with_timeout() {
+    local timeout_secs="$1"
+    local output_file="$2"
+    shift 2
+
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        resolve_timeout_bin
+    fi
+    if [[ -z "${TIMEOUT_BIN}" ]]; then
+        rch_fatal "timeout or gtimeout is required to fail closed on stalled remote execution."
+    fi
 
     set +e
     (
         cd "${_RCH_REPO_ROOT}"
-        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
+        env TMPDIR=/tmp "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" \
             rch exec -- "$@"
     ) >"${output_file}" 2>&1
     local rc=$?
@@ -81,13 +118,22 @@ run_rch_cargo_logged() {
 
     check_rch_fallback "${output_file}"
     if [[ ${rc} -eq 124 || ${rc} -eq 137 ]]; then
-        local queue_log="${output_file%.log}.rch_queue_timeout.log"
-        if ! run_rch queue >"${queue_log}" 2>&1; then
-            queue_log="${output_file}"
-        fi
-        rch_fatal "RCH-REMOTE-STALL: rch remote command timed out after ${RCH_STEP_TIMEOUT_SECS}s. See ${queue_log}"
+        local queue_log
+        queue_log="$(rch_timeout_queue_log "${output_file}")"
+        local reason_code
+        reason_code="$(rch_timeout_reason_code "${output_file}")"
+        rch_fatal "${reason_code}: $(rch_timeout_reason_message "${reason_code}" "${timeout_secs}"). See ${queue_log}"
     fi
     return "${rc}"
+}
+
+# Usage: run_rch_cargo_logged <output_file> <args passed to rch exec -- ...>
+# The caller is responsible for including `env CARGO_TARGET_DIR=... cargo ...`
+# in the args.
+run_rch_cargo_logged() {
+    local output_file="$1"
+    shift
+    run_rch_cargo_logged_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "${output_file}" "$@"
 }
 
 # Call once at harness start. Sets up internal variables.
@@ -127,7 +173,8 @@ ensure_rch_ready() {
     fi
 
     set +e
-    run_rch_cargo_logged "${_RCH_SMOKE_LOG}" env CARGO_TARGET_DIR="${_RCH_SMOKE_TARGET_DIR}" cargo check --help
+    run_rch_cargo_logged_with_timeout "${RCH_SMOKE_TIMEOUT_SECS}" "${_RCH_SMOKE_LOG}" \
+        env CARGO_TARGET_DIR="${_RCH_SMOKE_TARGET_DIR}" cargo check --help
     local smoke_rc=$?
     set -e
     if [[ ${smoke_rc} -ne 0 ]]; then
