@@ -175,7 +175,7 @@ def iter_workspace_manifests(workspace_root: Path):
 
     member_patterns = workspace.get("members", [])
     exclude_patterns = workspace.get("exclude", [])
-    manifests = set()
+    manifests = {root_manifest.resolve()}
     excluded = set()
 
     for pattern in member_patterns:
@@ -347,14 +347,19 @@ probe_worker_remote_paths() {
 set -euo pipefail
 remote_base="$1"
 shift
+missing=0
 
 for dep in "$@"; do
   target="${remote_base}/${dep}"
   if [[ ! -f "${target}" ]]; then
     echo "missing:${target}"
-    exit 12
+    missing=12
   fi
 done
+
+if [[ ${missing} -ne 0 ]]; then
+  exit "${missing}"
+fi
 
 echo "ok"
 EOF
