@@ -2130,6 +2130,29 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_empty_pane_ids_with_cx() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, Vec::new())
+                .await
+                .expect("empty batch with cx should succeed");
+            assert!(result.is_empty(), "empty input → empty output");
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.connections_created, 0,
+                "empty batch with cx should not create connections"
+            );
+        });
+    }
+
     #[test]
     fn pool_batch_render_single_pane() {
         run_async_test(async {
@@ -2142,6 +2165,24 @@ mod tests {
                 .get_pane_render_changes_batch(vec![42])
                 .await
                 .expect("single-pane batch should succeed");
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].pane_id, 42);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_batch_render_single_pane_with_cx() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let cx = crate::cx::for_testing();
+
+            let result = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![42])
+                .await
+                .expect("single-pane batch with cx should succeed");
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].pane_id, 42);
         });

@@ -26,6 +26,8 @@
 //! visible at every layer.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 pub use asupersync::runtime::{JoinHandle, Runtime, RuntimeConfig, RuntimeHandle, SpawnError};
@@ -166,6 +168,28 @@ where
     f(cx).await
 }
 
+struct HandleContextFuture<F> {
+    handle: RuntimeHandle,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for HandleContextFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        install_runtime_handle_for_poll(self.handle.clone());
+        self.future.as_mut().poll(cx)
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn install_runtime_handle_for_poll(handle: RuntimeHandle) {
+    crate::runtime_compat::install_runtime_handle(handle);
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+fn install_runtime_handle_for_poll(_handle: RuntimeHandle) {}
+
 /// Spawn a runtime task after cloning and threading a `Cx` into the task body.
 pub fn spawn_with_cx<F, Fut, T>(handle: &RuntimeHandle, cx: &Cx, task: F) -> JoinHandle<T>
 where
@@ -174,7 +198,11 @@ where
     T: Send + 'static,
 {
     let child_cx = cx.clone();
-    handle.spawn(async move { task(child_cx).await })
+    let wrapped = HandleContextFuture {
+        handle: handle.clone(),
+        future: Box::pin(async move { task(child_cx).await }),
+    };
+    handle.spawn(wrapped)
 }
 
 /// Fallible variant of [`spawn_with_cx`] that exposes admission errors.
@@ -189,7 +217,11 @@ where
     T: Send + 'static,
 {
     let child_cx = cx.clone();
-    handle.try_spawn(async move { task(child_cx).await })
+    let wrapped = HandleContextFuture {
+        handle: handle.clone(),
+        future: Box::pin(async move { task(child_cx).await }),
+    };
+    handle.try_spawn(wrapped)
 }
 
 /// Spawn a batch of child tasks with explicit `Cx` threading and bounded
@@ -498,6 +530,40 @@ mod tests {
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_with_cx_installs_runtime_handle_for_child_polls() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        let handle = runtime.handle();
+
+        let result = runtime.block_on(async {
+            let join = spawn_with_cx(&handle, &cx, |_cx| async move {
+                crate::runtime_compat::current_runtime_handle().is_some()
+            });
+            join.await
+        });
+        assert!(result);
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_with_cx_supports_nested_runtime_compat_spawn() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        let handle = runtime.handle();
+
+        let result = runtime.block_on(async {
+            let join = spawn_with_cx(&handle, &cx, |_cx| async move {
+                crate::runtime_compat::task::spawn(async { 42 })
+                    .await
+                    .expect("nested spawn should succeed")
+            });
+            join.await
+        });
+        assert_eq!(result, 42);
+    }
+
     // -----------------------------------------------------------------------
     // try_spawn_with_cx tests
     // -----------------------------------------------------------------------
@@ -514,6 +580,25 @@ mod tests {
             join.await
         });
         assert_eq!(result, "spawned");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn try_spawn_with_cx_preserves_runtime_handle_for_nested_spawn() {
+        let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = for_testing();
+        let handle = runtime.handle();
+
+        let result = runtime.block_on(async {
+            let join = try_spawn_with_cx(&handle, &cx, |_cx| async move {
+                crate::runtime_compat::task::spawn(async { "nested" })
+                    .await
+                    .expect("nested spawn should succeed")
+            })
+            .expect("try_spawn should succeed");
+            join.await
+        });
+        assert_eq!(result, "nested");
     }
 
     // -----------------------------------------------------------------------
