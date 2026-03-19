@@ -68,6 +68,15 @@ emit_log() {
 
 extract_rch_remote_base() {
   local configured
+  if command -v rch >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    configured="$(rch config show --json 2>/dev/null | jq -r '.data.transfer.remote_base // empty' 2>/dev/null || true)"
+  else
+    configured=""
+  fi
+  if [[ -n "${configured}" ]]; then
+    printf '%s\n' "${configured}"
+    return
+  fi
   configured="$(awk -F'"' '/^[[:space:]]*remote_base[[:space:]]*=/{print $2; exit}' "${RCH_CONFIG_FILE}" 2>/dev/null || true)"
   if [[ -n "${configured}" ]]; then
     printf '%s\n' "${configured}"
@@ -121,21 +130,6 @@ def iter_workspace_manifests(workspace_root: Path):
     for manifest in sorted(manifests - excluded):
         yield manifest
 
-def add_required_path(path: Path):
-    resolved = path.resolve()
-    if not resolved.is_file():
-        return
-
-    if resolved == root or str(resolved).startswith(str(root) + "/"):
-        found.add(str(resolved.relative_to(root)))
-        return
-
-    try:
-        rel = resolved.relative_to(project_parent)
-    except ValueError:
-        return
-    found.add(str(rel))
-
 def iter_dependency_tables(doc: dict):
     for key in ("dependencies", "dev-dependencies", "build-dependencies"):
         table = doc.get(key)
@@ -171,14 +165,6 @@ for manifest in iter_workspace_manifests(root):
         doc = tomllib.loads(manifest.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError):
         continue
-
-    package = doc.get("package")
-    if isinstance(package, dict):
-        build_spec = package.get("build")
-        if isinstance(build_spec, str):
-            add_required_path(manifest.parent / build_spec)
-        else:
-            add_required_path(manifest.parent / "build.rs")
 
     for table in iter_dependency_tables(doc):
         for spec in table.values():
@@ -269,14 +255,29 @@ probe_worker_remote_paths() {
     "${user}@${host}" \
     bash -s -- "${remote_base}" "$@" >"${worker_log}" 2>&1 <<'EOF'
 set -euo pipefail
-remote_base="$1"
+remote_base="${1%/}"
 shift
 missing=0
+candidate_prefixes=("/data/projects" "/dp")
+if [[ -n "${remote_base}" ]]; then
+  candidate_prefixes+=("${remote_base}")
+fi
 
 for dep in "$@"; do
-  target="${remote_base}/${dep}"
-  if [[ ! -f "${target}" ]]; then
-    echo "missing:${target}"
+  found_target=""
+  for prefix in "${candidate_prefixes[@]}"; do
+    target="${prefix}/${dep}"
+    if [[ -f "${target}" ]]; then
+      found_target="${target}"
+      break
+    fi
+  done
+
+  if [[ -z "${found_target}" ]]; then
+    echo "missing:${dep}"
+    for prefix in "${candidate_prefixes[@]}"; do
+      echo "checked:${prefix}/${dep}"
+    done
     missing=12
   fi
 done
@@ -336,7 +337,7 @@ run_rch_topology_preflight() {
     "remote_required_paths_detected" \
     "none" \
     "$(basename "${required_paths_file}")" \
-    "checking remote worker topology for external Cargo path dependencies and workspace build scripts"
+      "checking remote worker topology for external Cargo path dependencies"
 
   if ! worker_rows_raw="$(load_worker_topology_tsv)"; then
     emit_log \
