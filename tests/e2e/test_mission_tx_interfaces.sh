@@ -76,7 +76,7 @@ extract_rch_remote_base() {
   fi
 }
 
-collect_external_cargo_manifest_paths() {
+collect_remote_cargo_required_paths() {
   python3 - "${ROOT_DIR}" <<'PY'
 from pathlib import Path
 import sys
@@ -85,6 +85,56 @@ import tomllib
 root = Path(sys.argv[1]).resolve()
 project_parent = root.parent
 found = set()
+
+def iter_workspace_manifests(workspace_root: Path):
+    root_manifest = workspace_root / "Cargo.toml"
+    try:
+        root_doc = tomllib.loads(root_manifest.read_text(encoding="utf-8"))
+    except (FileNotFoundError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return
+
+    workspace = root_doc.get("workspace")
+    if not isinstance(workspace, dict):
+        return
+
+    member_patterns = workspace.get("members", [])
+    exclude_patterns = workspace.get("exclude", [])
+    manifests = set()
+    excluded = set()
+
+    for pattern in member_patterns:
+        if not isinstance(pattern, str):
+            continue
+        for candidate in workspace_root.glob(pattern):
+            manifest = candidate / "Cargo.toml" if candidate.is_dir() else candidate
+            if manifest.is_file():
+                manifests.add(manifest.resolve())
+
+    for pattern in exclude_patterns:
+        if not isinstance(pattern, str):
+            continue
+        for candidate in workspace_root.glob(pattern):
+            manifest = candidate / "Cargo.toml" if candidate.is_dir() else candidate
+            if manifest.is_file():
+                excluded.add(manifest.resolve())
+
+    for manifest in sorted(manifests - excluded):
+        yield manifest
+
+def add_required_path(path: Path):
+    resolved = path.resolve()
+    if not resolved.is_file():
+        return
+
+    if resolved == root or str(resolved).startswith(str(root) + "/"):
+        found.add(str(resolved.relative_to(root)))
+        return
+
+    try:
+        rel = resolved.relative_to(project_parent)
+    except ValueError:
+        return
+    found.add(str(rel))
 
 def iter_dependency_tables(doc: dict):
     for key in ("dependencies", "dev-dependencies", "build-dependencies"):
@@ -116,11 +166,19 @@ def iter_dependency_tables(doc: dict):
             if isinstance(registry_cfg, dict):
                 yield registry_cfg
 
-for manifest in root.rglob("Cargo.toml"):
+for manifest in iter_workspace_manifests(root):
     try:
         doc = tomllib.loads(manifest.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError):
         continue
+
+    package = doc.get("package")
+    if isinstance(package, dict):
+        build_spec = package.get("build")
+        if isinstance(build_spec, str):
+            add_required_path(manifest.parent / build_spec)
+        else:
+            add_required_path(manifest.parent / "build.rs")
 
     for table in iter_dependency_tables(doc):
         for spec in table.values():
@@ -230,23 +288,23 @@ EOF
 }
 
 run_rch_topology_preflight() {
-  local remote_base deps_file topology_report worker_rows_raw worker_row
+  local remote_base required_paths_file topology_report worker_rows_raw worker_row
   local worker_id host user identity_file worker_log
   local missing_any="false"
   local worker_count=0
-  local -a dep_paths=() worker_rows=()
+  local -a required_paths=() worker_rows=()
 
   remote_base="$(extract_rch_remote_base)"
-  mapfile -t dep_paths < <(collect_external_cargo_manifest_paths)
+  mapfile -t required_paths < <(collect_remote_cargo_required_paths)
 
-  if [[ ${#dep_paths[@]} -eq 0 ]]; then
+  if [[ ${#required_paths[@]} -eq 0 ]]; then
     emit_log \
       "skipped" \
       "preflight_rch_topology" \
-      "no_external_path_dependencies" \
+      "no_remote_cargo_required_paths" \
       "none" \
       "$(basename "${LOG_FILE}")" \
-      "no external Cargo path dependencies require remote topology checks"
+      "no remote cargo required paths need topology checks"
     return 0
   fi
 
@@ -262,18 +320,18 @@ run_rch_topology_preflight() {
     return 2
   fi
 
-  deps_file="${LOG_DIR}/${STDOUT_BASENAME}.rch_external_path_deps.txt"
+  required_paths_file="${LOG_DIR}/${STDOUT_BASENAME}.rch_remote_required_paths.txt"
   topology_report="${LOG_DIR}/${STDOUT_BASENAME}.rch_worker_topology.jsonl"
-  printf '%s\n' "${dep_paths[@]}" >"${deps_file}"
+  printf '%s\n' "${required_paths[@]}" >"${required_paths_file}"
   : >"${topology_report}"
 
   emit_log \
     "running" \
     "preflight_rch_topology" \
-    "external_path_dependencies_detected" \
+    "remote_required_paths_detected" \
     "none" \
-    "$(basename "${deps_file}")" \
-    "checking remote worker topology for external Cargo path dependencies"
+    "$(basename "${required_paths_file}")" \
+    "checking remote worker topology for external Cargo path dependencies and workspace build scripts"
 
   if ! worker_rows_raw="$(load_worker_topology_tsv)"; then
     emit_log \
@@ -281,7 +339,7 @@ run_rch_topology_preflight() {
       "preflight_rch_topology" \
       "invalid_workers_toml" \
       "RCH-WORKERS-CONFIG-INVALID" \
-      "$(basename "${deps_file}")" \
+      "$(basename "${required_paths_file}")" \
       "failed to parse rch workers config during topology preflight"
     echo "failed to parse rch workers config: ${RCH_WORKERS_TOML}" >&2
     return 2
@@ -293,7 +351,7 @@ run_rch_topology_preflight() {
       "preflight_rch_topology" \
       "no_workers_declared" \
       "RCH-WORKERS-CONFIG-EMPTY" \
-      "$(basename "${deps_file}")" \
+      "$(basename "${required_paths_file}")" \
       "rch workers config contains no workers for topology preflight"
     echo "rch workers config contains no workers: ${RCH_WORKERS_TOML}" >&2
     return 2
@@ -307,8 +365,8 @@ run_rch_topology_preflight() {
     worker_count=$((worker_count + 1))
     worker_log="${LOG_DIR}/${STDOUT_BASENAME}.${worker_id}.topology.log"
 
-    if probe_worker_remote_paths "${worker_id}" "${host}" "${user}" "${identity_file}" "${remote_base}" "${worker_log}" "${dep_paths[@]}"; then
-      append_topology_report "${topology_report}" "${worker_id}" "${host}" "ok" "all external path manifests present"
+    if probe_worker_remote_paths "${worker_id}" "${host}" "${user}" "${identity_file}" "${remote_base}" "${worker_log}" "${required_paths[@]}"; then
+      append_topology_report "${topology_report}" "${worker_id}" "${host}" "ok" "all required cargo paths present"
     else
       missing_any="true"
       append_topology_report "${topology_report}" "${worker_id}" "${host}" "missing" "$(tr '\n' ' ' < "${worker_log}")"
@@ -334,7 +392,7 @@ run_rch_topology_preflight() {
       "rch_worker_topology_drift" \
       "RCH-REMOTE-TOPOLOGY" \
       "$(basename "${topology_report}")" \
-      "remote worker topology drift detected for external Cargo path dependencies"
+      "remote worker topology drift detected for required cargo paths"
     echo "rch worker topology drift detected; see ${topology_report}" >&2
     return 2
   fi
@@ -342,10 +400,10 @@ run_rch_topology_preflight() {
   emit_log \
     "passed" \
     "preflight_rch_topology" \
-    "remote_path_dependencies_present" \
+    "remote_required_paths_present" \
     "none" \
     "$(basename "${topology_report}")" \
-    "remote worker topology satisfied external Cargo path dependencies"
+    "remote worker topology satisfied required cargo paths"
 }
 
 if ! command -v jq >/dev/null 2>&1; then
