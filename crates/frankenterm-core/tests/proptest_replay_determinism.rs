@@ -246,7 +246,7 @@ fn arb_decision_chain(max_len: usize) -> impl Strategy<Value = DecisionChain> {
                 &input_text,
                 json!({ "idx": idx, "decision_type": format!("{decision_type:?}") }),
                 correlation_id,
-                override_node,
+                override_node.map(|v| v as f64),
                 timestamp_ms.saturating_add(idx as u64),
             );
             decision.triggered_by = triggered_by;
