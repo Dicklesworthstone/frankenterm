@@ -6,8 +6,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[cfg(test)]
-use serde::Deserialize;
 use serde::Serialize;
 
 #[cfg(test)]

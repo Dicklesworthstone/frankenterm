@@ -510,8 +510,10 @@ impl EventBus {
             .fetch_add(1, Ordering::Relaxed);
         let mut delivered = 0usize;
 
-        if let Ok(count) = self.all_sender.send(event.clone()) {
-            delivered += count;
+        if self.all_sender.receiver_count() > 0 {
+            if let Ok(count) = self.all_sender.send(event.clone()) {
+                delivered += count;
+            }
         }
 
         delivered += match event {
@@ -1492,6 +1494,28 @@ mod tests {
             });
 
             assert!(delta_sub.try_recv().is_none());
+        });
+    }
+
+    #[test]
+    fn routed_subscriber_counts_delivery_without_all_subscribers() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut delta_sub = bus.subscribe_deltas();
+
+            let count = bus.publish(Event::SegmentCaptured {
+                pane_id: 5,
+                seq: 1,
+                content_len: 10,
+            });
+
+            assert_eq!(count, 1);
+            let metrics = bus.metrics().snapshot();
+            assert_eq!(metrics.events_published, 1);
+            assert_eq!(metrics.events_dropped_no_subscribers, 0);
+
+            let event = delta_sub.recv().await.unwrap();
+            assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
         });
     }
 

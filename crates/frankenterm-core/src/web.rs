@@ -26,28 +26,17 @@ use server::poke_listener;
 pub use server::{run_web_server, start_web_server};
 
 #[cfg(test)]
-use crate::events::{Event, RecvError};
+use crate::VERSION;
+#[cfg(test)]
+use crate::events::Event;
 #[cfg(test)]
 use crate::policy::Redactor;
 #[cfg(test)]
-use crate::runtime_compat::{mpsc, select, signal, sleep, task, timeout};
-#[cfg(test)]
-use crate::storage::{EventQuery, PaneRecord, SearchOptions, SearchResult, SegmentScanQuery};
+use crate::storage::{PaneRecord, SearchResult};
 #[cfg(test)]
 use crate::ui_query;
 #[cfg(test)]
-use crate::web_framework::{
-    BoxFuture, ControlFlow, Method, Middleware, RequestContext, ResponseBody,
-};
-#[cfg(test)]
-use crate::{Error, VERSION};
-#[cfg(test)]
-use error::{json_err, json_ok};
-#[cfg(test)]
-use extractors::{
-    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, require_event_bus,
-    require_storage, require_storage_and_event_bus,
-};
+use extractors::{parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value};
 #[cfg(test)]
 use handlers::{
     BookmarkView, BookmarksResponse, EventAnnotationsView, EventView, EventsResponse,
@@ -55,24 +44,11 @@ use handlers::{
     SavedSearchView, SavedSearchesResponse, SearchHit, SearchResponse,
 };
 #[cfg(test)]
-use handlers::{
-    handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
-    handle_search, health_response,
-};
-#[cfg(test)]
-use middleware::{AppState, BodySizeGuard, RequestSpanLogger, StateInjector};
-#[cfg(test)]
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
 #[cfg(test)]
-use std::net::TcpStream;
-#[cfg(test)]
-use std::task::{Context, Poll};
-#[cfg(test)]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(test)]
-use tracing::{info, warn};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;

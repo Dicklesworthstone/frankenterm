@@ -2552,7 +2552,6 @@ impl ObservationRuntime {
                 }
                 let pane_id = event.segment.pane_id;
                 let bounded_segment = bounded_segment_for_persistence(&event.segment);
-                let content = bounded_segment.content.clone();
                 let captured_at = bounded_segment.captured_at;
                 let captured_seq = bounded_segment.seq;
 
@@ -2644,7 +2643,8 @@ impl ObservationRuntime {
 
                             let detections = {
                                 let engine = pattern_engine.read().await;
-                                engine.detect_with_context(&content, &mut ctx)
+                                engine
+                                    .detect_with_context(bounded_segment.content.as_str(), &mut ctx)
                             };
 
                             {
