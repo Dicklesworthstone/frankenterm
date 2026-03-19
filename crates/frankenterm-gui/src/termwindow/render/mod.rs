@@ -960,6 +960,13 @@ fn update_next_frame_time(storage: &mut Option<Instant>, next_due: Option<Instan
 fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn same_hyperlink_or_both_none(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
     }
@@ -980,8 +987,8 @@ fn should_use_reverse_video_cursor(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_fg_color_attr, same_hyperlink, should_use_reverse_video_cursor,
-        update_next_frame_time,
+        resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
+        should_use_reverse_video_cursor, update_next_frame_time,
     };
     use config::{ConfigHandle, TextStyle};
     use std::sync::Arc;
@@ -1091,7 +1098,19 @@ mod tests {
         assert!(same_hyperlink(Some(&link), Some(&alias)));
         assert!(!same_hyperlink(Some(&link), Some(&distinct)));
         assert!(!same_hyperlink(Some(&link), None));
-        assert!(same_hyperlink(None, None));
+        assert!(!same_hyperlink(None, None));
+    }
+
+    #[test]
+    fn same_hyperlink_or_both_none_treats_absent_hover_as_unchanged() {
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let alias = Arc::clone(&link);
+        let distinct = Arc::new(Hyperlink::new("https://example.com"));
+
+        assert!(same_hyperlink_or_both_none(Some(&link), Some(&alias)));
+        assert!(!same_hyperlink_or_both_none(Some(&link), Some(&distinct)));
+        assert!(!same_hyperlink_or_both_none(Some(&link), None));
+        assert!(same_hyperlink_or_both_none(None, None));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::termwindow::LineToElementShapeItem;
 use crate::termwindow::render::{
     ClusterStyleCache, ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams,
     LineToElementShape, RenderScreenLineParams, RenderScreenLineResult, resolve_fg_color_attr,
-    same_hyperlink, update_next_frame_time,
+    same_hyperlink, same_hyperlink_or_both_none, update_next_frame_time,
 };
 use ::window::DeadKeyStatus;
 use anyhow::Context;
@@ -121,7 +121,7 @@ impl crate::TermWindow {
             if let Some(entry) = cache.get(shape_key) {
                 let expired = entry.expires.map(|i| Instant::now() >= i).unwrap_or(false);
                 let hover_changed = if entry.invalidate_on_hover_change {
-                    !same_hyperlink(
+                    !same_hyperlink_or_both_none(
                         entry.current_highlight.as_ref(),
                         self.current_highlight.as_ref(),
                     )

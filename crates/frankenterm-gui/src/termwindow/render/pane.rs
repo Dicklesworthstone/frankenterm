@@ -3,7 +3,7 @@ use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
     CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
-    RenderScreenLineParams, same_hyperlink,
+    RenderScreenLineParams, same_hyperlink_or_both_none,
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
 use ::window::DeadKeyStatus;
@@ -489,7 +489,7 @@ impl crate::TermWindow {
                             .map(|i| Instant::now() >= i)
                             .unwrap_or(false);
                         let hover_changed = if cached_quad.invalidate_on_hover_change {
-                            !same_hyperlink(
+                            !same_hyperlink_or_both_none(
                                 cached_quad.current_highlight.as_ref(),
                                 self.term_window.current_highlight.as_ref(),
                             )
