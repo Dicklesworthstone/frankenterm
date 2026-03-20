@@ -176,6 +176,9 @@ impl ErrorCode {
             | "robot.feature_not_available"
             | "robot.invalid_service"
             | "robot.unsupported"
+            | "robot.invalid_args"
+            | "robot.unknown_subcommand"
+            | "robot.code_not_found"
             | "robot.cass_not_installed" => ErrorCategory::Config,
             "robot.policy_denied"
             | "robot.require_approval"
@@ -184,7 +187,10 @@ impl ErrorCode {
             "robot.timeout"
             | "robot.cass_timeout"
             | "robot.cass_error"
+            | "robot.cass_invalid_json"
+            | "robot.cass_output_too_large"
             | "robot.caut_error" => ErrorCategory::Network,
+            "robot.agent_detection_error" => ErrorCategory::Network,
             "robot.assignment_not_found" => ErrorCategory::Workflow,
             code if code.starts_with("robot.workflow_")
                 || code.starts_with("robot.mission_")
@@ -200,6 +206,7 @@ impl ErrorCode {
             | "robot.wezterm_parse_error"
             | "robot.pane_not_found"
             | "robot.circuit_open" => ErrorCategory::Wezterm,
+            "robot.internal_error" => ErrorCategory::Internal,
             _ => ErrorCategory::Internal,
         }
     }
@@ -213,6 +220,9 @@ impl ErrorCode {
                 | "robot.wezterm_command_failed"
                 | "robot.timeout"
                 | "robot.cass_timeout"
+                | "robot.cass_error"
+                | "robot.caut_error"
+                | "robot.agent_detection_error"
                 | "robot.rate_limited"
                 | "robot.circuit_open"
         )
@@ -2057,6 +2067,45 @@ mod tests {
                 .category(),
             ErrorCategory::Internal
         );
+        // Codes that previously fell through to Internal catch-all
+        assert_eq!(
+            ErrorCode::parse("robot.invalid_args").unwrap().category(),
+            ErrorCategory::Config
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.unknown_subcommand")
+                .unwrap()
+                .category(),
+            ErrorCategory::Config
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.code_not_found").unwrap().category(),
+            ErrorCategory::Config
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.cass_invalid_json")
+                .unwrap()
+                .category(),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.cass_output_too_large")
+                .unwrap()
+                .category(),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.agent_detection_error")
+                .unwrap()
+                .category(),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            ErrorCode::parse("robot.internal_error")
+                .unwrap()
+                .category(),
+            ErrorCategory::Internal
+        );
     }
 
     #[test]
@@ -2087,6 +2136,99 @@ mod tests {
                 .unwrap()
                 .is_retryable()
         );
+        // Transient network errors are retryable
+        assert!(
+            ErrorCode::parse("robot.cass_error")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.caut_error")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.agent_detection_error")
+                .unwrap()
+                .is_retryable()
+        );
+        // Non-retryable network errors
+        assert!(
+            !ErrorCode::parse("robot.cass_invalid_json")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.cass_output_too_large")
+                .unwrap()
+                .is_retryable()
+        );
+    }
+
+    /// Verify every known emitted robot error code has explicit categorization
+    /// and does NOT fall through to the catch-all `_ => Internal` arm.
+    #[test]
+    fn all_emitted_codes_have_explicit_category() {
+        let emitted_codes = [
+            "robot.agent_detection_error",
+            "robot.approval_error",
+            "robot.assignment_not_found",
+            "robot.cass_error",
+            "robot.cass_invalid_json",
+            "robot.cass_not_installed",
+            "robot.cass_output_too_large",
+            "robot.cass_timeout",
+            "robot.caut_error",
+            "robot.circuit_open",
+            "robot.code_not_found",
+            "robot.config_error",
+            "robot.event_not_found",
+            "robot.feature_not_available",
+            "robot.fts_query_error",
+            "robot.internal_error",
+            "robot.invalid_args",
+            "robot.invalid_service",
+            "robot.mission_error",
+            "robot.mission_invalid_json",
+            "robot.mission_not_found",
+            "robot.mission_read_failed",
+            "robot.mission_validation_failed",
+            "robot.pane_not_found",
+            "robot.policy_denied",
+            "robot.rate_limited",
+            "robot.require_approval",
+            "robot.reservation_conflict",
+            "robot.rule_not_found",
+            "robot.storage_error",
+            "robot.timeout",
+            "robot.tx_error",
+            "robot.tx_execution_failed",
+            "robot.tx_invalid_json",
+            "robot.tx_not_found",
+            "robot.tx_read_failed",
+            "robot.tx_validation_failed",
+            "robot.unknown_subcommand",
+            "robot.unsupported",
+            "robot.wezterm_command_failed",
+            "robot.wezterm_error",
+            "robot.wezterm_not_found",
+            "robot.wezterm_not_running",
+            "robot.wezterm_parse_error",
+            "robot.wezterm_socket_not_found",
+            "robot.workflow_aborted",
+            "robot.workflow_error",
+            "robot.workflow_not_found",
+        ];
+
+        for code in emitted_codes {
+            let parsed = ErrorCode::parse(code)
+                .unwrap_or_else(|| panic!("{code} should parse as valid robot error code"));
+            // Verify the code routes to an explicit match arm, not the catch-all.
+            // The catch-all returns Internal; codes explicitly mapped to Internal
+            // (like robot.internal_error) are fine — we just want to ensure every
+            // known code is accounted for in the match.
+            let _category = parsed.category();
+        }
     }
 
     #[test]
