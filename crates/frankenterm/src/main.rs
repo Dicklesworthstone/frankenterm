@@ -11624,7 +11624,7 @@ async fn distributed_persist_payload(
                             delta.seq,
                         ));
                     }
-                    seq_guard.insert(seq_key, delta.seq);
+                    seq_guard.insert(seq_key.clone(), delta.seq);
                 }
             }
 
@@ -13712,6 +13712,27 @@ async fn run_watcher(
     );
 
     let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    // Ensure system pane (id=0) exists for lifecycle/system events (FK constraint)
+    {
+        use frankenterm_core::storage::PaneRecord;
+        let now = now_epoch_ms();
+        let system_pane = PaneRecord {
+            pane_id: 0,
+            pane_uuid: Some("00000000-0000-0000-0000-000000000000".to_string()),
+            domain: "system".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("system".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: false,
+            ignore_reason: Some("system-internal pane for lifecycle events".to_string()),
+            last_decision_at: Some(now),
+        };
+        let _ = storage.upsert_pane(system_pane).await;
+    }
     let lifecycle_event_id =
         emit_recorder_backend_lifecycle_event(&storage, &recorder_startup_selection).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
