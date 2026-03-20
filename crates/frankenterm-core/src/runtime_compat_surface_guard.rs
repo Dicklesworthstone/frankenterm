@@ -254,164 +254,35 @@ impl SurfaceGuardReport {
 // Standard surface entries (hardcoded mirror of SURFACE_CONTRACT_V1)
 // =============================================================================
 
-/// Returns a serialisable mirror of the 18 entries in `SURFACE_CONTRACT_V1`.
+fn surface_disposition_label(
+    disposition: crate::runtime_compat::SurfaceDisposition,
+) -> &'static str {
+    match disposition {
+        crate::runtime_compat::SurfaceDisposition::Keep => "Keep",
+        crate::runtime_compat::SurfaceDisposition::Replace => "Replace",
+        crate::runtime_compat::SurfaceDisposition::Retire => "Retire",
+    }
+}
+
+/// Returns a serialisable mirror of the entries in `SURFACE_CONTRACT_V1`.
 #[must_use]
 pub fn standard_surface_entries() -> Vec<SurfaceApiEntry> {
-    vec![
-        SurfaceApiEntry {
-            api_name: "RuntimeBuilder".into(),
-            disposition: "Keep".into(),
-            rationale: "Canonical runtime bootstrap seam shared by CLI/watch/test harnesses.".into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "Runtime".into(),
-            disposition: "Keep".into(),
-            rationale: "Owns active runtime instance behind migration boundary.".into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "CompatRuntime::block_on".into(),
-            disposition: "Keep".into(),
-            rationale:
-                "Used by deterministic tests and bridge code while call-graph migration continues."
-                    .into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "CompatRuntime::spawn_detached".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Detached execution masks scope ownership semantics in target asupersync state."
-                    .into(),
-            replacement: Some("cx::spawn_with_cx / explicit scope-owned spawn".into()),
-        },
-        SurfaceApiEntry {
-            api_name: "sleep".into(),
-            disposition: "Keep".into(),
-            rationale: "Cross-runtime time seam with stable call-site behavior.".into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "timeout".into(),
-            disposition: "Keep".into(),
-            rationale: "Shared timeout boundary used by IPC/web/watchdog call paths.".into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "spawn_blocking".into(),
-            disposition: "Keep".into(),
-            rationale: "Canonical blocking-work seam with normalized error mapping.".into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "task::spawn_blocking".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "JoinHandle-centric blocking helper should be reserved for explicit abortable workflows only."
-                    .into(),
-            replacement: Some(
-                "spawn_blocking (use task::spawn_blocking only when JoinHandle control is required)"
-                    .into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "mpsc_recv_option".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Option-normalized receive can hide cancellation semantics in asupersync mode."
-                    .into(),
-            replacement: Some(
-                "mpsc::Receiver::recv with explicit cx/cancellation handling".into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "mpsc_send".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Send helper abstracts over reserve/commit vs direct send semantics.".into(),
-            replacement: Some(
-                "cx-aware channel send path (reserve/commit where required)".into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "watch_has_changed".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Boolean-normalized change checks hide backend-specific closure semantics."
-                    .into(),
-            replacement: Some(
-                "watch::Receiver::has_changed with explicit closure/error handling".into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "watch_borrow_and_update_clone".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Clone-and-mark helper hides backend differences in watch-consume semantics."
-                    .into(),
-            replacement: Some(
-                "watch receiver borrow/consume path with explicit backend behavior".into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "watch_changed".into(),
-            disposition: "Replace".into(),
-            rationale:
-                "Implicit test-cx helper hides cancellation and wake-up ownership semantics."
-                    .into(),
-            replacement: Some(
-                "watch::Receiver::changed with explicit cx/lifecycle context".into(),
-            ),
-        },
-        SurfaceApiEntry {
-            api_name: "broadcast".into(),
-            disposition: "Keep".into(),
-            rationale:
-                "Canonical fan-out channel seam that confines direct tokio broadcast usage to runtime_compat while backend migration continues."
-                    .into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "oneshot".into(),
-            disposition: "Keep".into(),
-            rationale:
-                "Canonical request-response channel seam that centralizes the active backend behind runtime_compat."
-                    .into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "notify".into(),
-            disposition: "Keep".into(),
-            rationale:
-                "Canonical async notification primitive seam used by production coordination paths during runtime migration."
-                    .into(),
-            replacement: None,
-        },
-        SurfaceApiEntry {
-            api_name: "process::Command".into(),
-            disposition: "Retire".into(),
-            rationale:
-                "Tokio process shim remains temporary and should be replaced by asupersync-native process layer."
-                    .into(),
-            replacement: Some("asupersync process abstraction".into()),
-        },
-        SurfaceApiEntry {
-            api_name: "signal".into(),
-            disposition: "Retire".into(),
-            rationale:
-                "Tokio-only signal shim is transitional and should be removed after native runtime integration."
-                    .into(),
-            replacement: Some("asupersync-native signal handling".into()),
-        },
-    ]
+    crate::runtime_compat::SURFACE_CONTRACT_V1
+        .iter()
+        .map(|entry| SurfaceApiEntry {
+            api_name: entry.api.to_owned(),
+            disposition: surface_disposition_label(entry.disposition).to_owned(),
+            rationale: entry.rationale.to_owned(),
+            replacement: entry.replacement.map(str::to_owned),
+        })
+        .collect()
 }
 
 // =============================================================================
 // Standard guard checks
 // =============================================================================
 
-/// Build the standard set of 18 guard checks — one per `SURFACE_CONTRACT_V1`
+/// Build the standard set of guard checks — one per `SURFACE_CONTRACT_V1`
 /// entry.
 ///
 /// Standard checks model the current expected clean state of the migration
@@ -630,9 +501,33 @@ mod tests {
         report.with_standard_surface();
         assert_eq!(
             report.surface_entries.len(),
-            18,
-            "expected 18 SURFACE_CONTRACT_V1 entries"
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
+            "expected one serialized entry per SURFACE_CONTRACT_V1 item"
         );
+    }
+
+    #[test]
+    fn standard_surface_entries_match_runtime_contract_exactly() {
+        let entries = standard_surface_entries();
+
+        assert_eq!(
+            entries.len(),
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
+            "serialized surface mirror must stay in lockstep with SURFACE_CONTRACT_V1"
+        );
+
+        for (entry, contract) in entries
+            .iter()
+            .zip(crate::runtime_compat::SURFACE_CONTRACT_V1.iter())
+        {
+            assert_eq!(entry.api_name, contract.api);
+            assert_eq!(
+                entry.disposition,
+                surface_disposition_label(contract.disposition)
+            );
+            assert_eq!(entry.rationale, contract.rationale);
+            assert_eq!(entry.replacement.as_deref(), contract.replacement);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -724,8 +619,8 @@ mod tests {
         let checks = standard_guard_checks();
         assert_eq!(
             checks.len(),
-            18,
-            "expected exactly 18 standard guard checks"
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
+            "expected exactly one standard guard check per surface contract entry"
         );
     }
 
@@ -739,14 +634,36 @@ mod tests {
         let keep_count = checks.iter().filter(|c| c.disposition == "Keep").count();
         let replace_count = checks.iter().filter(|c| c.disposition == "Replace").count();
         let retire_count = checks.iter().filter(|c| c.disposition == "Retire").count();
+        let (expected_keep, expected_replace, expected_retire) =
+            crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
+                (0, 0, 0),
+                |(keep, replace, retire), entry| match entry.disposition {
+                    crate::runtime_compat::SurfaceDisposition::Keep => (keep + 1, replace, retire),
+                    crate::runtime_compat::SurfaceDisposition::Replace => {
+                        (keep, replace + 1, retire)
+                    }
+                    crate::runtime_compat::SurfaceDisposition::Retire => {
+                        (keep, replace, retire + 1)
+                    }
+                },
+            );
 
-        assert!(keep_count > 0, "must have at least one Keep entry");
-        assert!(replace_count > 0, "must have at least one Replace entry");
-        assert!(retire_count > 0, "must have at least one Retire entry");
+        assert_eq!(
+            keep_count, expected_keep,
+            "Keep count drifted from runtime contract"
+        );
+        assert_eq!(
+            replace_count, expected_replace,
+            "Replace count drifted from runtime contract"
+        );
+        assert_eq!(
+            retire_count, expected_retire,
+            "Retire count drifted from runtime contract"
+        );
         assert_eq!(
             keep_count + replace_count + retire_count,
-            18,
-            "all 18 checks must have a known disposition"
+            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
+            "all standard guard checks must have a known disposition"
         );
 
         // Disposition tracks migration state, not live compliance. A clean

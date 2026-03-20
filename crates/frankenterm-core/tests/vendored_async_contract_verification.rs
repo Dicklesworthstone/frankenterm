@@ -21,9 +21,12 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use frankenterm_core::vendored_async_contracts::{
-    AsyncBoundaryContract, BoundaryDirection, ContractCategory, ContractCompliance,
-    ContractEvidence, EvidenceType, standard_contracts,
+use frankenterm_core::{
+    runtime_compat::{SURFACE_CONTRACT_V1, SurfaceDisposition},
+    vendored_async_contracts::{
+        AsyncBoundaryContract, BoundaryDirection, ContractCategory, ContractCompliance,
+        ContractEvidence, EvidenceType, standard_contracts,
+    },
 };
 
 // =============================================================================
@@ -681,23 +684,47 @@ fn v26_drift_no_direct_tokio_imports_in_vendored() {
 /// V27: runtime_compat surface contract count is stable.
 #[test]
 fn v27_drift_surface_contract_count_stable() {
-    let compat_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_compat.rs");
+    let (keep_count, replace_count, retire_count) =
+        SURFACE_CONTRACT_V1
+            .iter()
+            .fold((0, 0, 0), |(keep, replace, retire), entry| {
+                match entry.disposition {
+                    SurfaceDisposition::Keep => (keep + 1, replace, retire),
+                    SurfaceDisposition::Replace => (keep, replace + 1, retire),
+                    SurfaceDisposition::Retire => (keep, replace, retire + 1),
+                }
+            });
 
-    if let Ok(contents) = std::fs::read_to_string(compat_path) {
-        // Count SURFACE_CONTRACT_V1 entries
-        let surface_entries = contents.matches("SurfaceContractEntry").count();
-        assert!(
-            surface_entries >= 10,
-            "SURFACE_CONTRACT_V1 should have >= 10 entries (found {surface_entries})"
-        );
+    assert_eq!(
+        SURFACE_CONTRACT_V1.len(),
+        18,
+        "SURFACE_CONTRACT_V1 size changed; update contract guards and serialized mirrors"
+    );
+    assert_eq!(
+        keep_count, 9,
+        "Keep disposition count changed; update vendored async contract expectations"
+    );
+    assert_eq!(
+        replace_count, 7,
+        "Replace disposition count changed; update vendored async contract expectations"
+    );
+    assert_eq!(
+        retire_count, 2,
+        "Retire disposition count changed; update vendored async contract expectations"
+    );
 
-        emit_contract_log(
-            "v27",
-            "drift",
-            "surface_contract_count",
-            &format!("pass:entries={surface_entries}"),
-        );
-    }
+    emit_contract_log(
+        "v27",
+        "drift",
+        "surface_contract_count",
+        &format!(
+            "pass:entries={},keep={},replace={},retire={}",
+            SURFACE_CONTRACT_V1.len(),
+            keep_count,
+            replace_count,
+            retire_count
+        ),
+    );
 }
 
 /// V28: Vendored modules reference runtime_compat (not raw runtime primitives).

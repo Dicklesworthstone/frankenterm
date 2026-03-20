@@ -510,10 +510,8 @@ impl EventBus {
             .fetch_add(1, Ordering::Relaxed);
         let mut delivered = 0usize;
 
-        if self.all_sender.receiver_count() > 0 {
-            if let Ok(count) = self.all_sender.send(event.clone()) {
-                delivered += count;
-            }
+        if let Ok(count) = self.all_sender.send(event.clone()) {
+            delivered += count;
         }
 
         delivered += match event {
