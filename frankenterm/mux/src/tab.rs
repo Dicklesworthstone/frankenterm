@@ -59,6 +59,10 @@ struct TabInner {
     /// slots than panes, overflow panes are stacked in the last slot.
     /// Only the active pane in each stack is visible in the tree.
     pane_stacks: HashMap<usize, PaneStack>,
+    /// Runtime overrides applied via the mux protocol.
+    /// These override `Pane::pane_constraints()` without requiring the
+    /// underlying pane implementation to expose mutation hooks.
+    constraint_overrides: HashMap<PaneId, PaneConstraints>,
 }
 
 /// A Tab is a container of Panes
@@ -387,7 +391,17 @@ where
 
 /// Computes the minimum (x, y) size based on the panes in this portion
 /// of the tree.
-fn compute_min_size(tree: &Tree) -> (usize, usize) {
+fn effective_pane_constraints(
+    pane: &Arc<dyn Pane>,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) -> PaneConstraints {
+    overrides
+        .get(&pane.pane_id())
+        .copied()
+        .unwrap_or_else(|| pane.pane_constraints())
+}
+
+fn compute_min_size(tree: &Tree, overrides: &HashMap<PaneId, PaneConstraints>) -> (usize, usize) {
     match tree {
         Tree::Node { data: None, .. } | Tree::Empty => (1, 1),
         Tree::Node {
@@ -395,15 +409,15 @@ fn compute_min_size(tree: &Tree) -> (usize, usize) {
             right,
             data: Some(data),
         } => {
-            let (left_x, left_y) = compute_min_size(&*left);
-            let (right_x, right_y) = compute_min_size(&*right);
+            let (left_x, left_y) = compute_min_size(&*left, overrides);
+            let (right_x, right_y) = compute_min_size(&*right, overrides);
             match data.direction {
                 SplitDirection::Vertical => (left_x.max(right_x), left_y + right_y + 1),
                 SplitDirection::Horizontal => (left_x + right_x + 1, left_y.max(right_y)),
             }
         }
         Tree::Leaf(pane) => {
-            let constraints = pane.pane_constraints();
+            let constraints = effective_pane_constraints(pane, overrides);
             let min_width = constraints.min_width.max(1);
             let min_height = constraints.min_height.max(1);
             if constraints.fixed {
@@ -480,8 +494,36 @@ fn axis_constraints_from_pane_constraints(
     .normalized()
 }
 
-fn pane_axis_constraints(pane: &Arc<dyn Pane>, axis: Axis) -> AxisConstraints {
-    let constraints = pane.pane_constraints();
+fn normalize_runtime_pane_constraints(mut constraints: PaneConstraints) -> PaneConstraints {
+    constraints.min_width = constraints.min_width.max(1);
+    constraints.min_height = constraints.min_height.max(1);
+    constraints.max_width = constraints
+        .max_width
+        .map(|value| value.max(constraints.min_width));
+    constraints.max_height = constraints
+        .max_height
+        .map(|value| value.max(constraints.min_height));
+    constraints.preferred_width = constraints.preferred_width.map(|value| {
+        let clamped = value.max(constraints.min_width);
+        constraints
+            .max_width
+            .map_or(clamped, |max| clamped.min(max))
+    });
+    constraints.preferred_height = constraints.preferred_height.map(|value| {
+        let clamped = value.max(constraints.min_height);
+        constraints
+            .max_height
+            .map_or(clamped, |max| clamped.min(max))
+    });
+    constraints
+}
+
+fn pane_axis_constraints(
+    pane: &Arc<dyn Pane>,
+    axis: Axis,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) -> AxisConstraints {
+    let constraints = effective_pane_constraints(pane, overrides);
     let dims = pane.get_dimensions();
     let fixed_size = match axis {
         Axis::Width => Some(dims.cols),
@@ -536,21 +578,25 @@ fn additive_axis_constraints(left: AxisConstraints, right: AxisConstraints) -> A
     .normalized()
 }
 
-fn compute_axis_constraints(tree: &Tree, axis: Axis) -> AxisConstraints {
+fn compute_axis_constraints(
+    tree: &Tree,
+    axis: Axis,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) -> AxisConstraints {
     match tree {
         Tree::Empty | Tree::Node { data: None, .. } => AxisConstraints {
             min: 1,
             max: None,
             preferred: None,
         },
-        Tree::Leaf(pane) => pane_axis_constraints(pane, axis),
+        Tree::Leaf(pane) => pane_axis_constraints(pane, axis, overrides),
         Tree::Node {
             left,
             right,
             data: Some(data),
         } => {
-            let left_constraints = compute_axis_constraints(&*left, axis);
-            let right_constraints = compute_axis_constraints(&*right, axis);
+            let left_constraints = compute_axis_constraints(&*left, axis, overrides);
+            let right_constraints = compute_axis_constraints(&*right, axis, overrides);
             match (data.direction, axis) {
                 (SplitDirection::Horizontal, Axis::Width)
                 | (SplitDirection::Vertical, Axis::Height) => {
@@ -680,14 +726,18 @@ fn collapse_order(priority: CollapsePriority) -> Option<u8> {
 /// Compute the minimum size of a tree when a given set of panes are
 /// treated as collapsed (contributing zero space).  This is used to
 /// determine whether collapsing certain panes makes the tree fit.
-fn compute_min_size_with_collapsed(tree: &Tree, collapsed: &HashSet<PaneId>) -> (usize, usize) {
+fn compute_min_size_with_collapsed(
+    tree: &Tree,
+    collapsed: &HashSet<PaneId>,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) -> (usize, usize) {
     match tree {
         Tree::Empty | Tree::Node { data: None, .. } => (0, 0),
         Tree::Leaf(pane) => {
             if collapsed.contains(&pane.pane_id()) {
                 (0, 0)
             } else {
-                let c = pane.pane_constraints();
+                let c = effective_pane_constraints(pane, overrides);
                 (c.min_width.max(1), c.min_height.max(1))
             }
         }
@@ -696,8 +746,8 @@ fn compute_min_size_with_collapsed(tree: &Tree, collapsed: &HashSet<PaneId>) -> 
             right,
             data: Some(data),
         } => {
-            let (lw, lh) = compute_min_size_with_collapsed(left, collapsed);
-            let (rw, rh) = compute_min_size_with_collapsed(right, collapsed);
+            let (lw, lh) = compute_min_size_with_collapsed(left, collapsed, overrides);
+            let (rw, rh) = compute_min_size_with_collapsed(right, collapsed, overrides);
             match data.direction {
                 SplitDirection::Horizontal => {
                     let w = if lw == 0 && rw == 0 {
@@ -738,14 +788,15 @@ fn compute_split_resize_budget(
     direction: SplitDirection,
     first_size: &TerminalSize,
     second_size: &TerminalSize,
+    overrides: &HashMap<PaneId, PaneConstraints>,
 ) -> (isize, isize) {
     let (left_wc, left_hc) = (
-        compute_axis_constraints(left, Axis::Width),
-        compute_axis_constraints(left, Axis::Height),
+        compute_axis_constraints(left, Axis::Width, overrides),
+        compute_axis_constraints(left, Axis::Height, overrides),
     );
     let (right_wc, right_hc) = (
-        compute_axis_constraints(right, Axis::Width),
-        compute_axis_constraints(right, Axis::Height),
+        compute_axis_constraints(right, Axis::Width, overrides),
+        compute_axis_constraints(right, Axis::Height, overrides),
     );
 
     match direction {
@@ -881,6 +932,7 @@ fn find_split_budget(
     tree: &Tree,
     target_index: usize,
     counter: &mut usize,
+    overrides: &HashMap<PaneId, PaneConstraints>,
 ) -> Option<(isize, isize)> {
     match tree {
         Tree::Empty | Tree::Leaf(_) | Tree::Node { data: None, .. } => None,
@@ -896,19 +948,25 @@ fn find_split_budget(
                     data.direction,
                     &data.first,
                     &data.second,
+                    overrides,
                 ));
             }
             *counter += 1;
-            if let Some(result) = find_split_budget(left, target_index, counter) {
+            if let Some(result) = find_split_budget(left, target_index, counter, overrides) {
                 return Some(result);
             }
-            find_split_budget(right, target_index, counter)
+            find_split_budget(right, target_index, counter, overrides)
         }
     }
 }
 
-fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
-    let x_constraints = compute_axis_constraints(tree, Axis::Width);
+fn adjust_x_size(
+    tree: &mut Tree,
+    mut x_adjust: isize,
+    cell_dimensions: &TerminalSize,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) {
+    let x_constraints = compute_axis_constraints(tree, Axis::Width, overrides);
     let min_x = x_constraints.min;
     let max_x = x_constraints.max;
     while x_adjust != 0 {
@@ -933,21 +991,22 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                         x_adjust = new_cols.saturating_sub(data.first.cols as isize);
 
                         if x_adjust != 0 {
-                            adjust_x_size(&mut *left, x_adjust, cell_dimensions);
+                            adjust_x_size(&mut *left, x_adjust, cell_dimensions, overrides);
                             data.first.cols = new_cols.max(0) as usize;
                             data.first.pixel_width =
                                 data.first.cols.saturating_mul(cell_dimensions.pixel_width);
 
-                            adjust_x_size(&mut *right, x_adjust, cell_dimensions);
+                            adjust_x_size(&mut *right, x_adjust, cell_dimensions, overrides);
                             data.second.cols = data.first.cols;
                             data.second.pixel_width = data.first.pixel_width;
                         }
                         return;
                     }
                     SplitDirection::Horizontal if x_adjust > 0 => {
-                        let left_max_x = compute_axis_constraints(&*left, Axis::Width).max;
+                        let left_max_x =
+                            compute_axis_constraints(&*left, Axis::Width, overrides).max;
                         if left_max_x.map_or(true, |max_cols| data.first.cols < max_cols) {
-                            adjust_x_size(&mut *left, 1, cell_dimensions);
+                            adjust_x_size(&mut *left, 1, cell_dimensions, overrides);
                             data.first.cols += 1;
                             data.first.pixel_width =
                                 data.first.cols.saturating_mul(cell_dimensions.pixel_width);
@@ -955,9 +1014,10 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                         }
 
                         if x_adjust > 0 {
-                            let right_max_x = compute_axis_constraints(&*right, Axis::Width).max;
+                            let right_max_x =
+                                compute_axis_constraints(&*right, Axis::Width, overrides).max;
                             if right_max_x.map_or(true, |max_cols| data.second.cols < max_cols) {
-                                adjust_x_size(&mut *right, 1, cell_dimensions);
+                                adjust_x_size(&mut *right, 1, cell_dimensions, overrides);
                                 data.second.cols += 1;
                                 data.second.pixel_width =
                                     data.second.cols.saturating_mul(cell_dimensions.pixel_width);
@@ -969,17 +1029,17 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                     }
                     SplitDirection::Horizontal => {
                         // x_adjust is negative
-                        let (left_min_x, _) = compute_min_size(&*left);
-                        let (right_min_x, _) = compute_min_size(&*right);
+                        let (left_min_x, _) = compute_min_size(&*left, overrides);
+                        let (right_min_x, _) = compute_min_size(&*right, overrides);
                         if data.first.cols > left_min_x {
-                            adjust_x_size(&mut *left, -1, cell_dimensions);
+                            adjust_x_size(&mut *left, -1, cell_dimensions, overrides);
                             data.first.cols -= 1;
                             data.first.pixel_width =
                                 data.first.cols.saturating_mul(cell_dimensions.pixel_width);
                             x_adjust += 1;
                         }
                         if x_adjust < 0 && data.second.cols > right_min_x {
-                            adjust_x_size(&mut *right, -1, cell_dimensions);
+                            adjust_x_size(&mut *right, -1, cell_dimensions, overrides);
                             data.second.cols -= 1;
                             data.second.pixel_width =
                                 data.second.cols.saturating_mul(cell_dimensions.pixel_width);
@@ -992,8 +1052,13 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &TerminalSize) {
-    let y_constraints = compute_axis_constraints(tree, Axis::Height);
+fn adjust_y_size(
+    tree: &mut Tree,
+    mut y_adjust: isize,
+    cell_dimensions: &TerminalSize,
+    overrides: &HashMap<PaneId, PaneConstraints>,
+) {
+    let y_constraints = compute_axis_constraints(tree, Axis::Height, overrides);
     let min_y = y_constraints.min;
     let max_y = y_constraints.max;
     while y_adjust != 0 {
@@ -1018,30 +1083,32 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         y_adjust = new_rows.saturating_sub(data.first.rows as isize);
 
                         if y_adjust != 0 {
-                            adjust_y_size(&mut *left, y_adjust, cell_dimensions);
+                            adjust_y_size(&mut *left, y_adjust, cell_dimensions, overrides);
                             data.first.rows = new_rows.max(0) as usize;
                             data.first.pixel_height =
                                 data.first.rows.saturating_mul(cell_dimensions.pixel_height);
 
-                            adjust_y_size(&mut *right, y_adjust, cell_dimensions);
+                            adjust_y_size(&mut *right, y_adjust, cell_dimensions, overrides);
                             data.second.rows = data.first.rows;
                             data.second.pixel_height = data.first.pixel_height;
                         }
                         return;
                     }
                     SplitDirection::Vertical if y_adjust > 0 => {
-                        let left_max_y = compute_axis_constraints(&*left, Axis::Height).max;
+                        let left_max_y =
+                            compute_axis_constraints(&*left, Axis::Height, overrides).max;
                         if left_max_y.map_or(true, |max_rows| data.first.rows < max_rows) {
-                            adjust_y_size(&mut *left, 1, cell_dimensions);
+                            adjust_y_size(&mut *left, 1, cell_dimensions, overrides);
                             data.first.rows += 1;
                             data.first.pixel_height =
                                 data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust -= 1;
                         }
                         if y_adjust > 0 {
-                            let right_max_y = compute_axis_constraints(&*right, Axis::Height).max;
+                            let right_max_y =
+                                compute_axis_constraints(&*right, Axis::Height, overrides).max;
                             if right_max_y.map_or(true, |max_rows| data.second.rows < max_rows) {
-                                adjust_y_size(&mut *right, 1, cell_dimensions);
+                                adjust_y_size(&mut *right, 1, cell_dimensions, overrides);
                                 data.second.rows += 1;
                                 data.second.pixel_height = data
                                     .second
@@ -1055,17 +1122,17 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                     }
                     SplitDirection::Vertical => {
                         // y_adjust is negative
-                        let (_, left_min_y) = compute_min_size(&*left);
-                        let (_, right_min_y) = compute_min_size(&*right);
+                        let (_, left_min_y) = compute_min_size(&*left, overrides);
+                        let (_, right_min_y) = compute_min_size(&*right, overrides);
                         if data.first.rows > left_min_y {
-                            adjust_y_size(&mut *left, -1, cell_dimensions);
+                            adjust_y_size(&mut *left, -1, cell_dimensions, overrides);
                             data.first.rows -= 1;
                             data.first.pixel_height =
                                 data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
                         }
                         if y_adjust < 0 && data.second.rows > right_min_y {
-                            adjust_y_size(&mut *right, -1, cell_dimensions);
+                            adjust_y_size(&mut *right, -1, cell_dimensions, overrides);
                             data.second.rows -= 1;
                             data.second.pixel_height = data
                                 .second
@@ -1304,12 +1371,22 @@ impl Tab {
         self.inner.lock().bring_floating_pane_to_front(pane_id)
     }
 
+    pub fn set_floating_pane_z_order(&self, pane_id: PaneId, z_order: u32) -> bool {
+        self.inner
+            .lock()
+            .set_floating_pane_z_order(pane_id, z_order)
+    }
+
     pub fn remove_floating_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
         self.inner.lock().remove_floating_pane(pane_id)
     }
 
     pub fn iter_floating_panes(&self) -> Vec<PositionedFloatingPane> {
         self.inner.lock().iter_floating_panes()
+    }
+
+    pub fn has_floating_pane(&self, pane_id: PaneId) -> bool {
+        self.inner.lock().has_floating_pane(pane_id)
     }
 
     pub fn rotate_counter_clockwise(&self) {
@@ -1382,6 +1459,25 @@ impl Tab {
         self.inner.lock().collapsed_pane_ids().clone()
     }
 
+    /// Returns the effective constraints for a pane after runtime overrides.
+    pub fn effective_pane_constraints(&self, pane_id: PaneId) -> Option<PaneConstraints> {
+        self.inner.lock().effective_pane_constraints_for(pane_id)
+    }
+
+    /// Apply runtime constraint overrides to an existing pane.
+    pub fn update_pane_constraints(
+        &self,
+        pane_id: PaneId,
+        min_width: Option<usize>,
+        max_width: Option<usize>,
+        min_height: Option<usize>,
+        max_height: Option<usize>,
+    ) -> Option<PaneConstraints> {
+        self.inner
+            .lock()
+            .update_pane_constraints(pane_id, min_width, max_width, min_height, max_height)
+    }
+
     /// Set the layout cycle for swap-layout support.
     pub fn set_layout_cycle(&self, cycle: LayoutCycle) {
         self.inner.lock().set_layout_cycle(cycle)
@@ -1411,6 +1507,11 @@ impl Tab {
     /// Cycle to the previous pane in a stack at the given slot index.
     pub fn cycle_stack_backward(&self, slot_index: usize) -> Option<PaneId> {
         self.inner.lock().cycle_stack_backward(slot_index)
+    }
+
+    /// Select a specific pane in a stack by index.
+    pub fn select_stack_pane(&self, slot_index: usize, pane_index: usize) -> Option<PaneId> {
+        self.inner.lock().select_stack_pane(slot_index, pane_index)
     }
 
     /// Returns the current layout name, if a cycle is active.
@@ -1571,6 +1672,7 @@ impl TabInner {
             collapsed_panes: HashSet::new(),
             layout_cycle: Some(crate::layout::default_cycle()),
             pane_stacks: HashMap::new(),
+            constraint_overrides: HashMap::new(),
         }
     }
 
@@ -1869,6 +1971,15 @@ impl TabInner {
         true
     }
 
+    fn set_floating_pane_z_order(&mut self, pane_id: PaneId, z_order: u32) -> bool {
+        let idx = match self.floating_index_by_id(pane_id) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        self.floating_panes[idx].z_order = z_order;
+        true
+    }
+
     fn set_floating_pane_focus(&mut self, pane_id: PaneId) -> bool {
         let idx = match self.floating_index_by_id(pane_id) {
             Some(idx) => idx,
@@ -1892,6 +2003,7 @@ impl TabInner {
         if self.floating_focus == Some(pane_id) {
             self.floating_focus = None;
         }
+        self.constraint_overrides.remove(&pane_id);
         self.advise_focus_change(prior);
         Some(removed.pane)
     }
@@ -1932,14 +2044,19 @@ impl TabInner {
 
     fn remove_floating_panes_in_domain(&mut self, domain: DomainId) -> Vec<Arc<dyn Pane>> {
         let mut removed = vec![];
+        let mut removed_ids = vec![];
         self.floating_panes.retain(|floating| {
             if floating.pane.domain_id() == domain {
+                removed_ids.push(floating.pane.pane_id());
                 removed.push(Arc::clone(&floating.pane));
                 false
             } else {
                 true
             }
         });
+        for pane_id in removed_ids {
+            self.constraint_overrides.remove(&pane_id);
+        }
         if let Some(pane_id) = self.floating_focus {
             if !self
                 .floating_panes
@@ -1991,7 +2108,8 @@ impl TabInner {
         candidates.sort_by_key(|&(_, order)| order);
 
         for (pane_id, _) in candidates {
-            let (min_w, min_h) = compute_min_size_with_collapsed(tree, &collapsed);
+            let (min_w, min_h) =
+                compute_min_size_with_collapsed(tree, &collapsed, &self.constraint_overrides);
             if min_w <= cols && min_h <= rows {
                 break;
             }
@@ -2032,7 +2150,8 @@ impl TabInner {
         for pane_id in restore_candidates {
             let mut trial = collapsed.clone();
             trial.remove(&pane_id);
-            let (min_w, min_h) = compute_min_size_with_collapsed(tree, &trial);
+            let (min_w, min_h) =
+                compute_min_size_with_collapsed(tree, &trial, &self.constraint_overrides);
             if min_w <= cols && min_h <= rows {
                 collapsed = trial;
             }
@@ -2184,6 +2303,18 @@ impl TabInner {
         Some(new_pane_id)
     }
 
+    fn select_stack_pane(&mut self, slot_index: usize, pane_index: usize) -> Option<PaneId> {
+        let stack = self.pane_stacks.get_mut(&slot_index)?;
+        let old_pane_id = stack.active_pane().pane_id();
+        if !stack.select(pane_index) {
+            return None;
+        }
+        let new_pane = stack.active_pane().clone();
+        let new_pane_id = new_pane.pane_id();
+        self.replace_pane_in_tree(old_pane_id, new_pane);
+        Some(new_pane_id)
+    }
+
     /// Replace a pane in the tree by its ID with a new pane.
     fn replace_pane_in_tree(&mut self, old_id: PaneId, new_pane: Arc<dyn Pane>) {
         if let Some(tree) = self.pane.as_mut() {
@@ -2220,13 +2351,69 @@ impl TabInner {
         ids
     }
 
+    fn find_pane_by_id(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
+        if let Some(idx) = self.floating_index_by_id(pane_id) {
+            return self
+                .floating_panes
+                .get(idx)
+                .map(|floating| Arc::clone(&floating.pane));
+        }
+
+        self.iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|positioned| positioned.pane.pane_id() == pane_id)
+            .map(|positioned| positioned.pane)
+    }
+
+    fn effective_pane_constraints_for(&mut self, pane_id: PaneId) -> Option<PaneConstraints> {
+        let pane = self.find_pane_by_id(pane_id)?;
+        Some(effective_pane_constraints(
+            &pane,
+            &self.constraint_overrides,
+        ))
+    }
+
+    fn update_pane_constraints(
+        &mut self,
+        pane_id: PaneId,
+        min_width: Option<usize>,
+        max_width: Option<usize>,
+        min_height: Option<usize>,
+        max_height: Option<usize>,
+    ) -> Option<PaneConstraints> {
+        let pane = self.find_pane_by_id(pane_id)?;
+        let mut updated = effective_pane_constraints(&pane, &self.constraint_overrides);
+        if let Some(value) = min_width {
+            updated.min_width = value;
+        }
+        if let Some(value) = max_width {
+            updated.max_width = Some(value);
+        }
+        if let Some(value) = min_height {
+            updated.min_height = value;
+        }
+        if let Some(value) = max_height {
+            updated.max_height = Some(value);
+        }
+        let updated = normalize_runtime_pane_constraints(updated);
+        if updated == pane.pane_constraints() {
+            self.constraint_overrides.remove(&pane_id);
+        } else {
+            self.constraint_overrides.insert(pane_id, updated);
+        }
+
+        let size = self.size;
+        self.resize(size);
+        Some(updated)
+    }
+
     /// Compute the resize budget for a split identified by its topological
     /// index.  Returns `None` if the index is out of range, otherwise
     /// `(max_shrink, max_grow)` for the first child.
     fn compute_split_budget(&self, split_index: usize) -> Option<(isize, isize)> {
         let tree = self.pane.as_ref()?;
         let mut counter = 0usize;
-        find_split_budget(tree, split_index, &mut counter)
+        find_split_budget(tree, split_index, &mut counter, &self.constraint_overrides)
     }
 
     /// Walks the pane tree to produce the topologically ordered flattened
@@ -2451,10 +2638,16 @@ impl TabInner {
             zoomed.resize(size).ok();
         } else {
             let dims = cell_dimensions(&size);
-            let width_constraints =
-                compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Width);
-            let height_constraints =
-                compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Height);
+            let width_constraints = compute_axis_constraints(
+                self.pane.as_ref().unwrap(),
+                Axis::Width,
+                &self.constraint_overrides,
+            );
+            let height_constraints = compute_axis_constraints(
+                self.pane.as_ref().unwrap(),
+                Axis::Height,
+                &self.constraint_overrides,
+            );
             let current_size = self.size;
 
             // If the tree minimum exceeds available space, collapse panes
@@ -2490,11 +2683,13 @@ impl TabInner {
                 self.pane.as_mut().unwrap(),
                 cols as isize - current_size.cols as isize,
                 &dims,
+                &self.constraint_overrides,
             );
             adjust_y_size(
                 self.pane.as_mut().unwrap(),
                 rows as isize - current_size.rows as isize,
                 &dims,
+                &self.constraint_overrides,
             );
 
             // Redistribute space away from collapsed subtrees so that
@@ -2537,10 +2732,14 @@ impl TabInner {
                 right,
                 data: Some(_),
             } => {
-                let left_width_constraints = compute_axis_constraints(&**left, Axis::Width);
-                let left_height_constraints = compute_axis_constraints(&**left, Axis::Height);
-                let right_width_constraints = compute_axis_constraints(&**right, Axis::Width);
-                let right_height_constraints = compute_axis_constraints(&**right, Axis::Height);
+                let left_width_constraints =
+                    compute_axis_constraints(&**left, Axis::Width, &self.constraint_overrides);
+                let left_height_constraints =
+                    compute_axis_constraints(&**left, Axis::Height, &self.constraint_overrides);
+                let right_width_constraints =
+                    compute_axis_constraints(&**right, Axis::Width, &self.constraint_overrides);
+                let right_height_constraints =
+                    compute_axis_constraints(&**right, Axis::Height, &self.constraint_overrides);
                 (
                     left_width_constraints,
                     left_height_constraints,
@@ -2683,10 +2882,14 @@ impl TabInner {
                 right,
                 data: Some(_),
             } => {
-                let left_width_constraints = compute_axis_constraints(&**left, Axis::Width);
-                let left_height_constraints = compute_axis_constraints(&**left, Axis::Height);
-                let right_width_constraints = compute_axis_constraints(&**right, Axis::Width);
-                let right_height_constraints = compute_axis_constraints(&**right, Axis::Height);
+                let left_width_constraints =
+                    compute_axis_constraints(&**left, Axis::Width, &self.constraint_overrides);
+                let left_height_constraints =
+                    compute_axis_constraints(&**left, Axis::Height, &self.constraint_overrides);
+                let right_width_constraints =
+                    compute_axis_constraints(&**right, Axis::Width, &self.constraint_overrides);
+                let right_height_constraints =
+                    compute_axis_constraints(&**right, Axis::Height, &self.constraint_overrides);
                 (
                     left_width_constraints,
                     left_height_constraints,
@@ -3155,6 +3358,9 @@ impl TabInner {
             })
             .detach();
         }
+        for pane in &dead_panes {
+            self.constraint_overrides.remove(&pane.pane_id());
+        }
         dead_panes
     }
 
@@ -3341,10 +3547,16 @@ impl TabInner {
 
         if request.top_level {
             let size = self.size;
-            let tree_width_constraints =
-                compute_axis_constraints(self.pane.as_ref().unwrap_or(&Tree::Empty), Axis::Width);
-            let tree_height_constraints =
-                compute_axis_constraints(self.pane.as_ref().unwrap_or(&Tree::Empty), Axis::Height);
+            let tree_width_constraints = compute_axis_constraints(
+                self.pane.as_ref().unwrap_or(&Tree::Empty),
+                Axis::Width,
+                &self.constraint_overrides,
+            );
+            let tree_height_constraints = compute_axis_constraints(
+                self.pane.as_ref().unwrap_or(&Tree::Empty),
+                Axis::Height,
+                &self.constraint_overrides,
+            );
 
             let ((width1, width2), (height1, height2)) = match request.direction {
                 SplitDirection::Horizontal => {
@@ -3411,7 +3623,8 @@ impl TabInner {
         self.set_zoomed(false);
 
         self.iter_panes().iter().nth(pane_index).and_then(|pos| {
-            let existing_constraints = pos.pane.pane_constraints();
+            let existing_constraints =
+                effective_pane_constraints(&pos.pane, &self.constraint_overrides);
             let existing_width_constraints = axis_constraints_from_pane_constraints(
                 existing_constraints,
                 Axis::Width,
@@ -3521,12 +3734,20 @@ impl TabInner {
             }
 
             if request.top_level && self.pane.as_ref().unwrap().num_leaves() > 0 {
-                let existing_width_constraints =
-                    compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Width);
-                let existing_height_constraints =
-                    compute_axis_constraints(self.pane.as_ref().unwrap(), Axis::Height);
-                let new_width_constraints = pane_axis_constraints(&pane, Axis::Width);
-                let new_height_constraints = pane_axis_constraints(&pane, Axis::Height);
+                let existing_width_constraints = compute_axis_constraints(
+                    self.pane.as_ref().unwrap(),
+                    Axis::Width,
+                    &self.constraint_overrides,
+                );
+                let existing_height_constraints = compute_axis_constraints(
+                    self.pane.as_ref().unwrap(),
+                    Axis::Height,
+                    &self.constraint_overrides,
+                );
+                let new_width_constraints =
+                    pane_axis_constraints(&pane, Axis::Width, &self.constraint_overrides);
+                let new_height_constraints =
+                    pane_axis_constraints(&pane, Axis::Height, &self.constraint_overrides);
 
                 let (existing_size, new_size) = if request.target_is_second {
                     (split_info.first, split_info.second)
@@ -3614,10 +3835,14 @@ impl TabInner {
                 (pane, existing_pane)
             };
 
-            let pane1_width_constraints = pane_axis_constraints(&pane1, Axis::Width);
-            let pane1_height_constraints = pane_axis_constraints(&pane1, Axis::Height);
-            let pane2_width_constraints = pane_axis_constraints(&pane2, Axis::Width);
-            let pane2_height_constraints = pane_axis_constraints(&pane2, Axis::Height);
+            let pane1_width_constraints =
+                pane_axis_constraints(&pane1, Axis::Width, &self.constraint_overrides);
+            let pane1_height_constraints =
+                pane_axis_constraints(&pane1, Axis::Height, &self.constraint_overrides);
+            let pane2_width_constraints =
+                pane_axis_constraints(&pane2, Axis::Width, &self.constraint_overrides);
+            let pane2_height_constraints =
+                pane_axis_constraints(&pane2, Axis::Height, &self.constraint_overrides);
             if !pane_size_satisfies_constraints(
                 &split_info.first,
                 pane1_width_constraints,

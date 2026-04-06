@@ -17,12 +17,15 @@ use crate::runtime_compat::task;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
-    CODEC_VERSION, CompressionMode, DecodedPdu, GetCodecVersion, GetCodecVersionResponse, GetLines,
-    GetLinesResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse, ListPanes,
-    ListPanesResponse, Pdu, SendPaste, SetClientId, UnitResponse, WriteToPane,
+    CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion,
+    GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
+    GetPaneRenderChangesResponse, ListPanes, ListPanesResponse, MoveFloatingPane, Pdu,
+    RemoveFloatingPane, SelectStackPane, SendPaste, SetClientId, SetFloatingPaneZ, SetLayoutCycle,
+    SwapToLayout, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use config as wezterm_config;
 use mux::client::ClientId;
+use mux::tab::FloatingPaneRect;
 
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
@@ -600,6 +603,146 @@ impl DirectMuxClient {
                 got: other.pdu_name().to_string(),
             }),
         }
+    }
+
+    async fn expect_unit_response(&mut self, request: Pdu) -> Result<UnitResponse, DirectMuxError> {
+        match self.send_request(request).await? {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    pub async fn create_floating_pane(
+        &mut self,
+        tab_id: usize,
+        pane_id: u64,
+        rect: FloatingPaneRect,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::CreateFloatingPane(CreateFloatingPane {
+            tab_id,
+            pane_id: pane_id as usize,
+            rect,
+        }))
+        .await
+    }
+
+    pub async fn move_floating_pane(
+        &mut self,
+        pane_id: u64,
+        rect: FloatingPaneRect,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::MoveFloatingPane(MoveFloatingPane {
+            pane_id: pane_id as usize,
+            rect,
+        }))
+        .await
+    }
+
+    pub async fn set_floating_pane_z(
+        &mut self,
+        pane_id: u64,
+        z_order: u32,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+            pane_id: pane_id as usize,
+            z_order,
+        }))
+        .await
+    }
+
+    pub async fn toggle_floating_pane(
+        &mut self,
+        pane_id: u64,
+        visible: bool,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::ToggleFloatingPane(ToggleFloatingPane {
+            pane_id: pane_id as usize,
+            visible,
+        }))
+        .await
+    }
+
+    pub async fn remove_floating_pane(
+        &mut self,
+        pane_id: u64,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::RemoveFloatingPane(RemoveFloatingPane {
+            pane_id: pane_id as usize,
+        }))
+        .await
+    }
+
+    pub async fn swap_to_layout(
+        &mut self,
+        tab_id: usize,
+        layout_index: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::SwapToLayout(SwapToLayout {
+            tab_id,
+            layout_index,
+        }))
+        .await
+    }
+
+    pub async fn set_layout_cycle(
+        &mut self,
+        tab_id: usize,
+        layout_names: Vec<String>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::SetLayoutCycle(SetLayoutCycle {
+            tab_id,
+            layout_names,
+        }))
+        .await
+    }
+
+    pub async fn cycle_stack(
+        &mut self,
+        tab_id: usize,
+        slot_index: usize,
+        forward: bool,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::CycleStack(CycleStack {
+            tab_id,
+            slot_index,
+            forward,
+        }))
+        .await
+    }
+
+    pub async fn select_stack_pane(
+        &mut self,
+        tab_id: usize,
+        slot_index: usize,
+        pane_index: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::SelectStackPane(SelectStackPane {
+            tab_id,
+            slot_index,
+            pane_index,
+        }))
+        .await
+    }
+
+    pub async fn update_pane_constraints(
+        &mut self,
+        pane_id: u64,
+        min_width: Option<usize>,
+        max_width: Option<usize>,
+        min_height: Option<usize>,
+        max_height: Option<usize>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response(Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+            pane_id: pane_id as usize,
+            min_width,
+            max_width,
+            min_height,
+            max_height,
+        }))
+        .await
     }
 
     /// Send paste text using an explicit capability context.

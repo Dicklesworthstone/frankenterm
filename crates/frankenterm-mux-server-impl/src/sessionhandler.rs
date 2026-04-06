@@ -2,17 +2,18 @@
 use crate::PKI;
 use anyhow::{Context, anyhow};
 use codec::{
-    ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CycleStack, DecodedPdu,
-    EraseScrollbackRequest, ErrorResponse, GetClientList, GetClientListResponse,
+    ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CreateFloatingPane, CycleStack,
+    DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList, GetClientListResponse,
     GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
     GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCredsResponse,
-    InputSerial, KillPane, ListPanes, ListPanesResponse, LivenessResponse, MovePaneToNewTab,
-    MovePaneToNewTabResponse, NotifyAlert, Pdu, Ping, Pong, RenameWorkspace, Resize,
-    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp,
-    SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId, SetFocusedPane, SetLayoutCycle,
-    SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    InputSerial, KillPane, ListPanes, ListPanesResponse, LivenessResponse, MoveFloatingPane,
+    MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, Pdu, Ping, Pong, RemoveFloatingPane,
+    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
+    SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
+    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout, TabTitleChanged,
+    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use config::TermConfig;
 use mux::client::ClientId;
@@ -224,6 +225,31 @@ fn maybe_push_pane_changes(
         }
     }
     Ok(())
+}
+
+fn find_tab_matching<F>(mux: &Mux, mut predicate: F) -> Option<Arc<mux::tab::Tab>>
+where
+    F: FnMut(&Arc<mux::tab::Tab>) -> bool,
+{
+    for window_id in mux.iter_windows() {
+        let Some(window) = mux.get_window(window_id) else {
+            continue;
+        };
+        for tab in window.iter() {
+            if predicate(tab) {
+                return Some(Arc::clone(tab));
+            }
+        }
+    }
+    None
+}
+
+fn find_tab_with_floating_pane(mux: &Mux, pane_id: PaneId) -> Option<Arc<mux::tab::Tab>> {
+    find_tab_matching(mux, |tab| tab.has_floating_pane(pane_id))
+}
+
+fn find_tab_containing_pane(mux: &Mux, pane_id: PaneId) -> Option<Arc<mux::tab::Tab>> {
+    find_tab_matching(mux, |tab| tab.contains_pane(pane_id))
 }
 
 pub struct SessionHandler {
@@ -1070,6 +1096,128 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::CreateFloatingPane(CreateFloatingPane {
+                tab_id,
+                pane_id,
+                rect,
+            }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = mux
+                                    .get_tab(tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                if tab.has_floating_pane(pane_id) {
+                                    tab.set_floating_pane_rect(pane_id, rect);
+                                    tab.set_floating_pane_focus(pane_id);
+                                    return Ok(Pdu::UnitResponse(UnitResponse {}));
+                                }
+                                if tab.contains_pane(pane_id) {
+                                    return Err(anyhow!(
+                                        "pane {} is already tiled in tab {}; floating create expects a detached pane",
+                                        pane_id,
+                                        tab_id
+                                    ));
+                                }
+                                let pane = mux
+                                    .get_pane(pane_id)
+                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                                tab.add_floating_pane(pane, rect);
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
+            }
+            Pdu::MoveFloatingPane(MoveFloatingPane { pane_id, rect }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
+                                    || anyhow!("floating pane {} not found", pane_id),
+                                )?;
+                                tab.set_floating_pane_rect(pane_id, rect).ok_or_else(|| {
+                                    anyhow!("floating pane {} not found", pane_id)
+                                })?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
+            }
+            Pdu::SetFloatingPaneZ(SetFloatingPaneZ { pane_id, z_order }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
+                                    || anyhow!("floating pane {} not found", pane_id),
+                                )?;
+                                if !tab.set_floating_pane_z_order(pane_id, z_order) {
+                                    return Err(anyhow!("floating pane {} not found", pane_id));
+                                }
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
+            }
+            Pdu::ToggleFloatingPane(ToggleFloatingPane { pane_id, visible }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
+                                    || anyhow!("floating pane {} not found", pane_id),
+                                )?;
+                                if !tab.set_floating_pane_visible(pane_id, visible) {
+                                    return Err(anyhow!("floating pane {} not found", pane_id));
+                                }
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
+            }
+            Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id }) => {
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
+                                    || anyhow!("floating pane {} not found", pane_id),
+                                )?;
+                                tab.remove_floating_pane(pane_id).ok_or_else(|| {
+                                    anyhow!("floating pane {} not found", pane_id)
+                                })?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
+            }
             Pdu::SwapToLayout(SwapToLayout {
                 tab_id,
                 layout_index,
@@ -1136,7 +1284,7 @@ impl SessionHandler {
             Pdu::CycleStack(CycleStack {
                 tab_id,
                 slot_index,
-                forward: _,
+                forward,
             }) => {
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
@@ -1147,7 +1295,11 @@ impl SessionHandler {
                                 let tab = mux
                                     .get_tab(tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
-                                tab.cycle_stack(slot_index);
+                                if forward {
+                                    tab.cycle_stack(slot_index);
+                                } else {
+                                    tab.cycle_stack_backward(slot_index);
+                                }
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             },
                             send_response,
@@ -1157,22 +1309,64 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SelectStackPane(SelectStackPane {
-                tab_id: _,
-                slot_index: _,
-                pane_index: _,
+                tab_id,
+                slot_index,
+                pane_index,
             }) => {
-                // Select a specific pane within a stack — not yet wired to Tab API.
-                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab = mux
+                                    .get_tab(tab_id)
+                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
+                                tab.select_stack_pane(slot_index, pane_index)
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "stack slot {} or pane index {} not found in tab {}",
+                                            slot_index,
+                                            pane_index,
+                                            tab_id
+                                        )
+                                    })?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
             }
             Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
-                pane_id: _,
-                min_width: _,
-                max_width: _,
-                min_height: _,
-                max_height: _,
+                pane_id,
+                min_width,
+                max_width,
+                min_height,
+                max_height,
             }) => {
-                // Constraint updates are local-only for now; acknowledge receipt.
-                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                spawn_into_main_thread({
+                    let send_response = send_response.clone();
+                    async move {
+                        catch(
+                            move || {
+                                let mux = Mux::get();
+                                let tab =
+                                    find_tab_containing_pane(&mux, pane_id).ok_or_else(|| {
+                                        anyhow!("pane {} not found in any tab", pane_id)
+                                    })?;
+                                tab.update_pane_constraints(
+                                    pane_id, min_width, max_width, min_height, max_height,
+                                )
+                                .ok_or_else(|| anyhow!("pane {} not found in tab", pane_id))?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            },
+                            send_response,
+                        );
+                    }
+                })
+                .detach();
             }
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
@@ -1200,9 +1394,6 @@ impl SessionHandler {
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)));
             }
-            // Catch-all for newly added PDU variants (floating panes, etc.)
-            // that this server implementation doesn't handle yet.
-            _ => send_response(Err(anyhow!("unhandled PDU: {:?}", decoded.pdu))),
         }
     }
 }
@@ -1330,7 +1521,8 @@ mod tests {
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
 
-    static SET_CLIENT_ID_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    // These tests mutate process-global mux/executor state, so they must not run in parallel.
+    static GLOBAL_STATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -1371,8 +1563,15 @@ mod tests {
 
     impl FakePane {
         fn new(tiered_scrollback_status: Option<PaneTieredScrollbackStatus>) -> Self {
+            Self::new_with_id(77, tiered_scrollback_status)
+        }
+
+        fn new_with_id(
+            pane_id: PaneId,
+            tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
+        ) -> Self {
             Self {
-                pane_id: 77,
+                pane_id,
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -1472,7 +1671,7 @@ mod tests {
         }
 
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
 
         fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -1483,20 +1682,27 @@ mod tests {
             unimplemented!()
         }
 
-        fn resize(&self, _size: TerminalSize) -> anyhow::Result<()> {
-            unimplemented!()
+        fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.dimensions.cols = size.cols;
+            state.dimensions.viewport_rows = size.rows;
+            state.dimensions.scrollback_rows = size.rows;
+            state.dimensions.dpi = size.dpi;
+            state.dimensions.pixel_width = size.pixel_width;
+            state.dimensions.pixel_height = size.pixel_height;
+            Ok(())
         }
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
 
         fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
 
         fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
 
         fn is_dead(&self) -> bool {
@@ -1504,11 +1710,11 @@ mod tests {
         }
 
         fn palette(&self) -> ColorPalette {
-            unimplemented!()
+            ColorPalette::default()
         }
 
         fn domain_id(&self) -> DomainId {
-            unimplemented!()
+            DomainId::default()
         }
 
         fn is_mouse_grabbed(&self) -> bool {
@@ -1562,6 +1768,49 @@ mod tests {
         let mut v = captured.lock().unwrap();
         assert_eq!(v.len(), 1, "expected exactly one response PDU");
         v.remove(0)
+    }
+
+    fn tick_until_response(
+        executor: &SimpleExecutor,
+        captured: &Arc<Mutex<Vec<DecodedPdu>>>,
+        expected: usize,
+    ) {
+        for _ in 0..16 {
+            if captured.lock().unwrap().len() >= expected {
+                return;
+            }
+            executor.tick().unwrap();
+        }
+
+        let observed = captured.lock().unwrap().len();
+        panic!("timed out waiting for {expected} response PDUs; saw {observed}");
+    }
+
+    fn test_tab_size() -> TerminalSize {
+        TerminalSize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 1600,
+            pixel_height: 1000,
+            dpi: 96,
+        }
+    }
+
+    fn install_tab_with_window(
+        tab: &Arc<mux::tab::Tab>,
+        extra_panes: &[Arc<dyn Pane>],
+    ) -> (Arc<Mux>, ScopedMux) {
+        let mux = Arc::new(Mux::new(None));
+        let guard = ScopedMux::install(&mux);
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_and_active_pane(tab).unwrap();
+        for pane in extra_panes {
+            mux.add_pane(pane).unwrap();
+        }
+        mux.add_tab_to_window(tab, window_id).unwrap();
+        drop(window);
+        (mux, guard)
     }
 
     #[test]
@@ -1618,26 +1867,65 @@ mod tests {
     }
 
     #[test]
-    fn select_stack_pane_stub_returns_unit_response() {
+    fn select_stack_pane_pdu_selects_requested_stack_member() {
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        let pane1: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
+        let pane2: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(2, None));
+        let pane3: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(3, None));
+        tab.assign_pane(&pane1);
+        let first_request = mux::tab::SplitRequest {
+            direction: mux::tab::SplitDirection::Horizontal,
+            ..Default::default()
+        };
+        tab.split_and_insert(0, first_request, Arc::clone(&pane2))
+            .unwrap();
+        let second_request = mux::tab::SplitRequest {
+            direction: mux::tab::SplitDirection::Horizontal,
+            ..Default::default()
+        };
+        tab.split_and_insert(0, second_request, Arc::clone(&pane3))
+            .unwrap();
+        tab.set_layout_cycle(mux::layout::default_cycle());
+        tab.swap_to_layout_index(2).unwrap();
+        let (_mux, _guard) =
+            install_tab_with_window(&tab, &[Arc::clone(&pane2), Arc::clone(&pane3)]);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
         handler.process_one(DecodedPdu {
             serial: 100,
             pdu: Pdu::SelectStackPane(SelectStackPane {
-                tab_id: 5,
+                tab_id: tab.tab_id(),
                 slot_index: 0,
                 pane_index: 2,
             }),
         });
+        tick_until_response(&executor, &captured, 1);
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 100);
         assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+        let visible = tab.iter_panes_ignoring_zoom();
+        assert_eq!(visible.len(), 1);
+        assert_ne!(visible[0].pane.pane_id(), 1);
     }
 
     #[test]
-    fn update_pane_constraints_stub_returns_unit_response() {
+    fn update_pane_constraints_pdu_updates_effective_constraints() {
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7, None));
+        tab.assign_pane(&pane);
+        let (_mux, _guard) = install_tab_with_window(&tab, &[]);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -1651,10 +1939,118 @@ mod tests {
                 max_height: Some(50),
             }),
         });
+        tick_until_response(&executor, &captured, 1);
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 101);
         assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+        let constraints = tab.effective_pane_constraints(7).unwrap();
+        assert_eq!(constraints.min_width, 20);
+        assert_eq!(constraints.max_width, Some(200));
+        assert_eq!(constraints.min_height, 3);
+        assert_eq!(constraints.max_height, Some(50));
+    }
+
+    #[test]
+    fn floating_pane_pdus_update_live_tab_state() {
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        let tiled: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
+        tab.assign_pane(&tiled);
+        let (mux, _guard) = install_tab_with_window(&tab, &[]);
+        let floating: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(2, None));
+        mux.add_pane(&floating).unwrap();
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        let rect = mux::tab::FloatingPaneRect {
+            left: 4,
+            top: 5,
+            width: 30,
+            height: 12,
+        };
+        handler.process_one(DecodedPdu {
+            serial: 110,
+            pdu: Pdu::CreateFloatingPane(CreateFloatingPane {
+                tab_id: tab.tab_id(),
+                pane_id: 2,
+                rect,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        assert!(tab.has_floating_pane(2));
+        let floating_panes = tab.iter_floating_panes();
+        assert_eq!(floating_panes.len(), 1);
+        assert_eq!(floating_panes[0].left, 4);
+
+        let moved = mux::tab::FloatingPaneRect {
+            left: 10,
+            top: 7,
+            width: 24,
+            height: 10,
+        };
+        handler.process_one(DecodedPdu {
+            serial: 111,
+            pdu: Pdu::MoveFloatingPane(MoveFloatingPane {
+                pane_id: 2,
+                rect: moved,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        let floating_panes = tab.iter_floating_panes();
+        assert_eq!(floating_panes[0].left, 10);
+        assert_eq!(floating_panes[0].top, 7);
+
+        handler.process_one(DecodedPdu {
+            serial: 112,
+            pdu: Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+                pane_id: 2,
+                z_order: 99,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        assert_eq!(tab.iter_floating_panes()[0].z_order, 99);
+
+        handler.process_one(DecodedPdu {
+            serial: 113,
+            pdu: Pdu::ToggleFloatingPane(ToggleFloatingPane {
+                pane_id: 2,
+                visible: false,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        assert!(!tab.iter_floating_panes()[0].visible);
+
+        handler.process_one(DecodedPdu {
+            serial: 114,
+            pdu: Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id: 2 }),
+        });
+        tick_until_response(&executor, &captured, 1);
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        assert!(!tab.has_floating_pane(2));
     }
 
     #[test]
@@ -1752,7 +2148,16 @@ mod tests {
     }
 
     #[test]
-    fn update_pane_constraints_all_none_returns_unit() {
+    fn update_pane_constraints_all_none_keeps_default_constraints() {
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
+        tab.assign_pane(&pane);
+        let (_mux, _guard) = install_tab_with_window(&tab, &[]);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -1766,9 +2171,14 @@ mod tests {
                 max_height: None,
             }),
         });
+        tick_until_response(&executor, &captured, 1);
 
         let resp = take_response(&captured);
         assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert_eq!(
+            tab.effective_pane_constraints(1).unwrap(),
+            mux::pane::PaneConstraints::default()
+        );
     }
 
     #[test]
@@ -1882,7 +2292,9 @@ mod tests {
 
     #[test]
     fn set_client_id_replaces_prior_registered_client_without_leaking_stale_entries() {
-        let _lock = SET_CLIENT_ID_TEST_LOCK.lock().unwrap();
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let first = test_client_id("review-first", 41_001);
         let second = test_client_id("review-second", 41_002);
         let mux = Arc::new(Mux::new(None));
@@ -1929,7 +2341,9 @@ mod tests {
 
     #[test]
     fn dropping_handler_after_mux_shutdown_does_not_panic() {
-        let _lock = SET_CLIENT_ID_TEST_LOCK.lock().unwrap();
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
         let _mux_guard = ScopedMux::install(&mux);
         let client = test_client_id("shutdown-safe", 41_003);
@@ -1950,7 +2364,9 @@ mod tests {
 
     #[test]
     fn set_active_workspace_updates_registered_client_workspace() {
-        let _lock = SET_CLIENT_ID_TEST_LOCK.lock().unwrap();
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _mux_guard = ScopedMux::install(&mux);
@@ -1973,7 +2389,7 @@ mod tests {
                 workspace: "remote-dev".to_string(),
             }),
         });
-        executor.tick().unwrap();
+        tick_until_response(&executor, &captured, 1);
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 22);
