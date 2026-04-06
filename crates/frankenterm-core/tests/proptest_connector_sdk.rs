@@ -851,6 +851,7 @@ proptest! {
             verdict,
             phases: vec![],
             trust_level: None,
+            integration_probe: None,
             total_elapsed_ms: 0,
         };
         let expected_passed = matches!(verdict, CertificationVerdict::Certified | CertificationVerdict::ConditionalPass);
@@ -865,6 +866,7 @@ proptest! {
             verdict,
             phases: vec![],
             trust_level: None,
+            integration_probe: None,
             total_elapsed_ms: 42,
         };
         let display = report.to_string();

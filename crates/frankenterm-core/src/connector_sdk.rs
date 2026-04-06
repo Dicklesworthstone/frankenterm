@@ -21,7 +21,8 @@ use thiserror::Error;
 
 use crate::connector_host_runtime::{
     ConnectorCapability, ConnectorCapabilityEnvelope, ConnectorHostConfig, ConnectorHostRuntime,
-    ConnectorLifecyclePhase, ConnectorSandboxZone,
+    ConnectorLifecyclePhase, ConnectorOperationRequest, ConnectorProtocolVersion,
+    ConnectorSandboxZone, StartupProbeResult,
 };
 use crate::connector_registry::{
     ConnectorManifest, ConnectorRegistryClient, ConnectorRegistryConfig, TrustLevel, TrustPolicy,
@@ -37,6 +38,15 @@ const MAX_PACKAGE_ID_LEN: usize = 128;
 const MAX_DISPLAY_NAME_LEN: usize = 256;
 const MAX_DESCRIPTION_LEN: usize = 4096;
 const MAX_AUTHOR_LEN: usize = 256;
+const CURRENT_FT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Manifest metadata key required to probe `filesystem_read` capability claims.
+pub const PROBE_METADATA_FILESYSTEM_READ_TARGET: &str = "certification.probe.fs_read_target";
+/// Manifest metadata key required to probe `filesystem_write` capability claims.
+pub const PROBE_METADATA_FILESYSTEM_WRITE_TARGET: &str = "certification.probe.fs_write_target";
+/// Manifest metadata key required to probe `network_egress` capability claims.
+pub const PROBE_METADATA_NETWORK_TARGET: &str = "certification.probe.network_target";
+/// Manifest metadata key required to probe `process_exec` capability claims.
+pub const PROBE_METADATA_EXEC_TARGET: &str = "certification.probe.exec_target";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1006,6 +1016,41 @@ pub struct PhaseResult {
     pub elapsed_ms: u64,
 }
 
+/// Execution status for the integration probe stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationProbeStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// One capability round-trip attempted during certification probing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationProbeAction {
+    pub capability: ConnectorCapability,
+    pub action: String,
+    pub target: Option<String>,
+    pub operation_id: String,
+    pub decision_id: String,
+}
+
+/// Structured evidence emitted by the certification integration probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationProbeEvidence {
+    pub status: IntegrationProbeStatus,
+    pub host_id: String,
+    pub protocol_version: ConnectorProtocolVersion,
+    pub current_ft_version: String,
+    pub min_ft_version: Option<String>,
+    pub health_live: bool,
+    pub health_ready: bool,
+    pub heartbeat_recorded: bool,
+    pub stopped_cleanly: bool,
+    pub actions: Vec<IntegrationProbeAction>,
+    pub detail: Option<String>,
+}
+
 /// Overall certification verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1040,6 +1085,7 @@ pub struct CertificationReport {
     pub verdict: CertificationVerdict,
     pub phases: Vec<PhaseResult>,
     pub trust_level: Option<TrustLevel>,
+    pub integration_probe: Option<IntegrationProbeEvidence>,
     pub total_elapsed_ms: u64,
 }
 
@@ -1047,10 +1093,15 @@ impl CertificationReport {
     /// True if the certification passed (certified or conditional).
     #[must_use]
     pub fn passed(&self) -> bool {
-        matches!(
+        let verdict_passed = matches!(
             self.verdict,
             CertificationVerdict::Certified | CertificationVerdict::ConditionalPass
-        )
+        );
+        let probe_passed = self
+            .integration_probe
+            .as_ref()
+            .is_none_or(|probe| probe.status == IntegrationProbeStatus::Passed);
+        verdict_passed && probe_passed
     }
 }
 
@@ -1096,6 +1147,266 @@ pub struct CertificationTelemetrySnapshot {
     pub phase_failures: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntegrationProbePlan {
+    host_config: ConnectorHostConfig,
+    requests: Vec<ConnectorOperationRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IntegrationProbePlanError {
+    MissingPrerequisite { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntegrationProbeExecution {
+    verdict: PhaseVerdict,
+    evidence: IntegrationProbeEvidence,
+    warning: bool,
+    failure: bool,
+}
+
+fn sanitize_probe_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "connector".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn probe_host_id(package_id: &str) -> String {
+    format!("cert-probe-{}", sanitize_probe_component(package_id))
+}
+
+fn probe_zone_id(package_id: &str) -> String {
+    format!("cert.probe.{}", sanitize_probe_component(package_id))
+}
+
+fn parse_semver_components(version: &str) -> Option<(u64, u64, u64)> {
+    if !is_basic_semver(version) {
+        return None;
+    }
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        Some(value) => value.parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor, patch))
+}
+
+fn current_ft_satisfies(min_ft_version: &str) -> Result<bool, String> {
+    let current = parse_semver_components(CURRENT_FT_VERSION).ok_or_else(|| {
+        format!("current certification runtime version '{CURRENT_FT_VERSION}' is not valid semver")
+    })?;
+    let minimum = parse_semver_components(min_ft_version)
+        .ok_or_else(|| format!("connector declares invalid min_ft_version '{min_ft_version}'"))?;
+    Ok(current >= minimum)
+}
+
+fn missing_probe_target_reason(
+    capability: ConnectorCapability,
+    metadata_key: &str,
+) -> IntegrationProbePlanError {
+    IntegrationProbePlanError::MissingPrerequisite {
+        reason: format!(
+            "integration probe requires metadata '{metadata_key}' for capability '{}'",
+            capability.as_str()
+        ),
+    }
+}
+
+fn build_integration_probe_plan(
+    manifest: &ConnectorManifest,
+) -> Result<IntegrationProbePlan, IntegrationProbePlanError> {
+    let mut allowed_capabilities = manifest.required_capabilities.clone();
+    allowed_capabilities.sort_by_key(|capability| capability.as_str());
+    allowed_capabilities.dedup();
+    if allowed_capabilities.is_empty() {
+        allowed_capabilities.push(ConnectorCapability::Invoke);
+    }
+
+    let mut envelope = ConnectorCapabilityEnvelope {
+        allowed_capabilities,
+        ..ConnectorCapabilityEnvelope::default()
+    };
+    let mut requests = Vec::with_capacity(manifest.required_capabilities.len());
+
+    for (idx, capability) in manifest.required_capabilities.iter().copied().enumerate() {
+        let correlation_id = format!("probe-{idx:02}");
+        let request = match capability {
+            ConnectorCapability::Invoke => {
+                ConnectorOperationRequest::new("connector.invoke.ping", correlation_id, capability)
+            }
+            ConnectorCapability::ReadState => ConnectorOperationRequest::new(
+                "connector.state.snapshot",
+                correlation_id,
+                capability,
+            ),
+            ConnectorCapability::StreamEvents => ConnectorOperationRequest::new(
+                "connector.events.subscribe",
+                correlation_id,
+                capability,
+            ),
+            ConnectorCapability::SecretBroker => {
+                ConnectorOperationRequest::new("connector.secret.fetch", correlation_id, capability)
+            }
+            ConnectorCapability::FilesystemRead => {
+                let target = manifest
+                    .metadata
+                    .get(PROBE_METADATA_FILESYSTEM_READ_TARGET)
+                    .cloned()
+                    .ok_or_else(|| {
+                        missing_probe_target_reason(
+                            capability,
+                            PROBE_METADATA_FILESYSTEM_READ_TARGET,
+                        )
+                    })?;
+                envelope.filesystem_read_prefixes.push(target.clone());
+                ConnectorOperationRequest::new("connector.fs.read", correlation_id, capability)
+                    .with_target(target)
+            }
+            ConnectorCapability::FilesystemWrite => {
+                let target = manifest
+                    .metadata
+                    .get(PROBE_METADATA_FILESYSTEM_WRITE_TARGET)
+                    .cloned()
+                    .ok_or_else(|| {
+                        missing_probe_target_reason(
+                            capability,
+                            PROBE_METADATA_FILESYSTEM_WRITE_TARGET,
+                        )
+                    })?;
+                envelope.filesystem_write_prefixes.push(target.clone());
+                ConnectorOperationRequest::new("connector.fs.write", correlation_id, capability)
+                    .with_target(target)
+            }
+            ConnectorCapability::NetworkEgress => {
+                let target = manifest
+                    .metadata
+                    .get(PROBE_METADATA_NETWORK_TARGET)
+                    .cloned()
+                    .ok_or_else(|| {
+                        missing_probe_target_reason(capability, PROBE_METADATA_NETWORK_TARGET)
+                    })?;
+                envelope.network_allow_hosts.push(target.clone());
+                ConnectorOperationRequest::new(
+                    "connector.network.egress",
+                    correlation_id,
+                    capability,
+                )
+                .with_target(target)
+            }
+            ConnectorCapability::ProcessExec => {
+                let target = manifest
+                    .metadata
+                    .get(PROBE_METADATA_EXEC_TARGET)
+                    .cloned()
+                    .ok_or_else(|| {
+                        missing_probe_target_reason(capability, PROBE_METADATA_EXEC_TARGET)
+                    })?;
+                envelope.allowed_exec_commands.push(target.clone());
+                ConnectorOperationRequest::new("connector.process.exec", correlation_id, capability)
+                    .with_target(target)
+            }
+        };
+        requests.push(request);
+    }
+
+    let host_config = ConnectorHostConfig {
+        host_id: probe_host_id(&manifest.package_id),
+        sandbox: ConnectorSandboxZone {
+            zone_id: probe_zone_id(&manifest.package_id),
+            fail_closed: true,
+            capability_envelope: envelope,
+        },
+        ..ConnectorHostConfig::default()
+    };
+
+    Ok(IntegrationProbePlan {
+        host_config,
+        requests,
+    })
+}
+
+fn base_integration_probe_evidence(manifest: &ConnectorManifest) -> IntegrationProbeEvidence {
+    IntegrationProbeEvidence {
+        status: IntegrationProbeStatus::Skipped,
+        host_id: probe_host_id(&manifest.package_id),
+        protocol_version: ConnectorProtocolVersion::default(),
+        current_ft_version: CURRENT_FT_VERSION.to_string(),
+        min_ft_version: manifest.min_ft_version.clone(),
+        health_live: false,
+        health_ready: false,
+        heartbeat_recorded: false,
+        stopped_cleanly: false,
+        actions: Vec::new(),
+        detail: None,
+    }
+}
+
+fn failed_probe_execution(
+    mut evidence: IntegrationProbeEvidence,
+    reason: impl Into<String>,
+) -> IntegrationProbeExecution {
+    let reason = reason.into();
+    evidence.status = IntegrationProbeStatus::Failed;
+    evidence.detail = Some(reason.clone());
+    IntegrationProbeExecution {
+        verdict: PhaseVerdict::Failed {
+            reasons: vec![reason],
+        },
+        evidence,
+        warning: false,
+        failure: true,
+    }
+}
+
+fn skipped_probe_execution(
+    mut evidence: IntegrationProbeEvidence,
+    reason: impl Into<String>,
+) -> IntegrationProbeExecution {
+    let reason = reason.into();
+    evidence.status = IntegrationProbeStatus::Skipped;
+    evidence.detail = Some(reason.clone());
+    IntegrationProbeExecution {
+        verdict: PhaseVerdict::Skipped { reason },
+        evidence,
+        warning: true,
+        failure: false,
+    }
+}
+
+fn passed_probe_execution(mut evidence: IntegrationProbeEvidence) -> IntegrationProbeExecution {
+    evidence.status = IntegrationProbeStatus::Passed;
+    evidence.detail = Some(if evidence.actions.is_empty() {
+        "validated startup, heartbeat, and health semantics".to_string()
+    } else {
+        format!(
+            "validated startup, heartbeat, health, and {} capability round-trip(s)",
+            evidence.actions.len()
+        )
+    });
+    IntegrationProbeExecution {
+        verdict: PhaseVerdict::Passed,
+        evidence,
+        warning: false,
+        failure: false,
+    }
+}
+
 impl CertificationPipeline {
     /// Create a new certification pipeline with the given trust policy.
     #[must_use]
@@ -1114,6 +1425,7 @@ impl CertificationPipeline {
         let mut phases = Vec::new();
         let mut any_failure = false;
         let mut any_warning = false;
+        let integration_probe;
 
         // Phase 1: Schema validation (manifest.validate() returns ConnectorRegistryError)
         let phase_start = std::time::Instant::now();
@@ -1249,18 +1561,22 @@ impl CertificationPipeline {
             elapsed_ms: phase_start.elapsed().as_millis() as u64,
         });
 
-        // Phase 6: Integration probe (stub — would run sandbox lifecycle test)
+        // Phase 6: Integration probe (sandbox lifecycle + capability round-trip)
         let phase_start = std::time::Instant::now();
-        let integration_verdict = if any_failure {
-            PhaseVerdict::Skipped {
-                reason: "skipped due to prior failures".to_string(),
-            }
+        let probe_execution = if any_failure {
+            skipped_probe_execution(
+                base_integration_probe_evidence(manifest),
+                "skipped due to prior failures",
+            )
         } else {
-            PhaseVerdict::Passed
+            self.execute_integration_probe(manifest)
         };
+        integration_probe = Some(probe_execution.evidence.clone());
+        any_failure |= probe_execution.failure;
+        any_warning |= probe_execution.warning;
         phases.push(PhaseResult {
             phase: CertificationPhase::IntegrationProbe,
-            verdict: integration_verdict,
+            verdict: probe_execution.verdict,
             elapsed_ms: phase_start.elapsed().as_millis() as u64,
         });
 
@@ -1298,6 +1614,7 @@ impl CertificationPipeline {
             verdict,
             phases,
             trust_level: Some(trust_level),
+            integration_probe,
             total_elapsed_ms,
         };
 
@@ -1325,6 +1642,107 @@ impl CertificationPipeline {
             rejections: self.telemetry.rejections,
             phase_failures: self.telemetry.phase_failures.clone(),
         }
+    }
+
+    fn execute_integration_probe(&self, manifest: &ConnectorManifest) -> IntegrationProbeExecution {
+        let mut evidence = base_integration_probe_evidence(manifest);
+
+        if let Some(min_ft_version) = manifest.min_ft_version.as_deref() {
+            match current_ft_satisfies(min_ft_version) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return failed_probe_execution(
+                        evidence,
+                        format!(
+                            "connector requires FrankenTerm >= {min_ft_version}, current certification runtime is {CURRENT_FT_VERSION}"
+                        ),
+                    );
+                }
+                Err(reason) => return failed_probe_execution(evidence, reason),
+            }
+        }
+
+        let plan = match build_integration_probe_plan(manifest) {
+            Ok(plan) => plan,
+            Err(IntegrationProbePlanError::MissingPrerequisite { reason }) => {
+                return skipped_probe_execution(evidence, reason);
+            }
+        };
+        evidence.host_id = plan.host_config.host_id.clone();
+        evidence.protocol_version = plan.host_config.protocol_version;
+
+        let mut runtime = match ConnectorHostRuntime::new(plan.host_config) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                return failed_probe_execution(
+                    evidence,
+                    format!("integration probe runtime creation failed: {err}"),
+                );
+            }
+        };
+
+        if let Err(err) = runtime.start_with_probe(1_000, StartupProbeResult::healthy()) {
+            return failed_probe_execution(
+                evidence,
+                format!("integration probe startup failed: {err}"),
+            );
+        }
+
+        if let Err(err) = runtime.record_heartbeat(1_500) {
+            return failed_probe_execution(
+                evidence,
+                format!("integration probe heartbeat failed: {err}"),
+            );
+        }
+        evidence.heartbeat_recorded = true;
+
+        for (idx, request) in plan.requests.into_iter().enumerate() {
+            let action = request.action.clone();
+            let target = request.target.clone();
+            let capability = request.capability;
+            let now_ms = 2_000 + idx as u64;
+            match runtime.authorize_operation(now_ms, request) {
+                Ok(envelope) => evidence.actions.push(IntegrationProbeAction {
+                    capability,
+                    action,
+                    target,
+                    operation_id: envelope.operation_id,
+                    decision_id: envelope.decision_id,
+                }),
+                Err(err) => {
+                    return failed_probe_execution(
+                        evidence,
+                        format!(
+                            "integration probe authorization failed for capability '{}': {err}",
+                            capability.as_str()
+                        ),
+                    );
+                }
+            }
+        }
+
+        let health = runtime.health_snapshot(3_000);
+        evidence.health_live = health.is_live;
+        evidence.health_ready = health.is_ready;
+        if !health.is_live || !health.is_ready {
+            return failed_probe_execution(
+                evidence,
+                "integration probe health snapshot is not live and ready",
+            );
+        }
+
+        if let Err(err) = runtime.stop(4_000) {
+            return failed_probe_execution(
+                evidence,
+                format!("integration probe stop failed: {err}"),
+            );
+        }
+        evidence.stopped_cleanly = runtime.state().phase() == ConnectorLifecyclePhase::Stopped;
+        if !evidence.stopped_cleanly {
+            return failed_probe_execution(evidence, "integration probe did not stop cleanly");
+        }
+
+        passed_probe_execution(evidence)
     }
 }
 
@@ -1608,6 +2026,13 @@ mod tests {
                 ConnectorCapability::ReadState,
                 ConnectorCapability::StreamEvents,
             ])
+            .build()
+    }
+
+    fn trusted_policy(caps: &[ConnectorCapability]) -> TrustPolicy {
+        TrustPolicyBuilder::new()
+            .allow_capabilities(caps)
+            .trusted_publisher("dev@example.com")
             .build()
     }
 
@@ -1978,6 +2403,9 @@ mod tests {
         assert!(report.passed());
         assert_eq!(report.phases.len(), 6);
         assert!(report.trust_level.is_some());
+        let probe = report.integration_probe.as_ref().unwrap();
+        assert_eq!(probe.status, IntegrationProbeStatus::Passed);
+        assert_eq!(probe.actions.len(), 1);
     }
 
     #[test]
@@ -2057,6 +2485,96 @@ mod tests {
             .find(|p| p.phase == CertificationPhase::IntegrationProbe)
             .unwrap();
         assert!(matches!(probe.verdict, PhaseVerdict::Skipped { .. }));
+        assert_eq!(
+            report.integration_probe.as_ref().unwrap().status,
+            IntegrationProbeStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn certification_integration_probe_skips_missing_target_prerequisite() {
+        let policy = trusted_policy(&[ConnectorCapability::FilesystemRead]);
+        let mut pipeline = CertificationPipeline::new(policy);
+        let payload = test_payload();
+        let manifest = ManifestBuilder::new("fs-read-probe")
+            .version("1.0.0")
+            .author("dev@example.com")
+            .publisher_signature("test-sig")
+            .capability(ConnectorCapability::FilesystemRead)
+            .build_with_digest(&payload)
+            .unwrap();
+
+        let report = pipeline.certify(&manifest, &payload);
+        assert_eq!(report.verdict, CertificationVerdict::ConditionalPass);
+        assert!(!report.passed());
+        let probe = report.integration_probe.as_ref().unwrap();
+        assert_eq!(probe.status, IntegrationProbeStatus::Skipped);
+        assert!(
+            probe
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains(PROBE_METADATA_FILESYSTEM_READ_TARGET)
+        );
+    }
+
+    #[test]
+    fn certification_integration_probe_fails_invalid_target_contract() {
+        let policy = trusted_policy(&[ConnectorCapability::FilesystemRead]);
+        let mut pipeline = CertificationPipeline::new(policy);
+        let payload = test_payload();
+        let mut manifest = ManifestBuilder::new("fs-read-bad-target")
+            .version("1.0.0")
+            .author("dev@example.com")
+            .publisher_signature("test-sig")
+            .capability(ConnectorCapability::FilesystemRead)
+            .build_with_digest(&payload)
+            .unwrap();
+        manifest.metadata.insert(
+            PROBE_METADATA_FILESYSTEM_READ_TARGET.to_string(),
+            "relative/path.txt".to_string(),
+        );
+
+        let report = pipeline.certify(&manifest, &payload);
+        assert_eq!(report.verdict, CertificationVerdict::Rejected);
+        assert!(!report.passed());
+        let probe = report.integration_probe.as_ref().unwrap();
+        assert_eq!(probe.status, IntegrationProbeStatus::Failed);
+        assert!(
+            probe
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("authorization failed")
+        );
+    }
+
+    #[test]
+    fn certification_integration_probe_rejects_incompatible_min_ft_version() {
+        let policy = trusted_policy(&[ConnectorCapability::Invoke]);
+        let mut pipeline = CertificationPipeline::new(policy);
+        let payload = test_payload();
+        let manifest = ManifestBuilder::new("future-connector")
+            .version("1.0.0")
+            .author("dev@example.com")
+            .publisher_signature("test-sig")
+            .min_ft_version("999.0.0")
+            .capability(ConnectorCapability::Invoke)
+            .build_with_digest(&payload)
+            .unwrap();
+
+        let report = pipeline.certify(&manifest, &payload);
+        assert_eq!(report.verdict, CertificationVerdict::Rejected);
+        assert!(!report.passed());
+        let probe = report.integration_probe.as_ref().unwrap();
+        assert_eq!(probe.status, IntegrationProbeStatus::Failed);
+        assert!(
+            probe
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("current certification runtime")
+        );
     }
 
     #[test]
@@ -2148,6 +2666,27 @@ mod tests {
         let report = sim
             .register(&manifest, &payload, default_host_config())
             .unwrap();
+        assert!(!report.passed());
+        assert_eq!(sim.connector_count(), 0);
+    }
+
+    #[test]
+    fn simulator_probe_skip_does_not_register_connector() {
+        let policy = trusted_policy(&[ConnectorCapability::FilesystemRead]);
+        let mut sim = ConnectorSimulator::new(policy);
+        let payload = test_payload();
+        let manifest = ManifestBuilder::new("needs-fs-target")
+            .version("1.0.0")
+            .author("dev@example.com")
+            .publisher_signature("test-sig")
+            .capability(ConnectorCapability::FilesystemRead)
+            .build_with_digest(&payload)
+            .unwrap();
+
+        let report = sim
+            .register(&manifest, &payload, default_host_config())
+            .unwrap();
+        assert_eq!(report.verdict, CertificationVerdict::ConditionalPass);
         assert!(!report.passed());
         assert_eq!(sim.connector_count(), 0);
     }
@@ -2272,6 +2811,7 @@ mod tests {
                 elapsed_ms: 0,
             }],
             trust_level: Some(TrustLevel::Trusted),
+            integration_probe: None,
             total_elapsed_ms: 1,
         };
         let json = serde_json::to_string(&report).unwrap();
@@ -2355,6 +2895,7 @@ mod tests {
             verdict: CertificationVerdict::Certified,
             phases: vec![],
             trust_level: None,
+            integration_probe: None,
             total_elapsed_ms: 42,
         };
         let s = format!("{report}");

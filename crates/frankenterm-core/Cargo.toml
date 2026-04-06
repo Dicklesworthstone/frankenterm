@@ -348,6 +348,11 @@ harness = false
 required-features = ["native-wezterm"]
 
 [[bench]]
+name = "socket_throughput"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "ipc_throughput"
 harness = false
 
