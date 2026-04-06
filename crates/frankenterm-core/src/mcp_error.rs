@@ -17,6 +17,7 @@ pub(crate) const MCP_ERR_FTS_QUERY: &str = "FT-MCP-0011";
 pub(crate) const MCP_ERR_RESERVATION_CONFLICT: &str = "FT-MCP-0012";
 pub(crate) const MCP_ERR_CAUT: &str = "FT-MCP-0013";
 pub(crate) const MCP_ERR_CASS: &str = "FT-MCP-0014";
+pub(crate) const MCP_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "FT-MCP-0015";
 
 #[derive(Debug)]
 pub(crate) struct McpToolError {
@@ -133,8 +134,9 @@ mod tests {
     use super::{
         MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
         MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
-        MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-        MCP_ERR_WORKFLOW, McpToolError, map_cass_error, map_caut_error, map_mcp_error,
+        MCP_ERR_REMOTE_TEXT_UNAVAILABLE, MCP_ERR_RESERVATION_CONFLICT, MCP_ERR_STORAGE,
+        MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, map_cass_error,
+        map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
     use crate::caut::CautError;
@@ -160,6 +162,7 @@ mod tests {
             MCP_ERR_RESERVATION_CONFLICT,
             MCP_ERR_CAUT,
             MCP_ERR_CASS,
+            MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
         ];
         let mut seen = std::collections::HashSet::new();
         for code in codes {

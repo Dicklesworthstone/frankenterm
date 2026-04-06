@@ -21,7 +21,10 @@ REMOTE_TMPDIR="${RCH_REMOTE_TMPDIR:-/var/tmp}"
 REMOTE_TARGET_DIR="${RCH_REMOTE_TARGET_DIR:-${REMOTE_SCRATCH_ROOT}/cargo-target}"
 RCH_FAIL_OPEN_REGEX='\[RCH\][[:space:]]+local|running locally'
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-900}"
+BENCH_RCH_STEP_TIMEOUT_SECS="${BENCH_RCH_STEP_TIMEOUT_SECS:-1800}"
 TIMEOUT_BIN=""
+COMPOSE_STEP_TIMEOUT_SECS="${COMPOSE_STEP_TIMEOUT_SECS:-300}"
+RCH_TRANSIENT_RETRY_MAX="${RCH_TRANSIENT_RETRY_MAX:-1}"
 
 # `cargo bench` uses RCH's build timeout bucket. Cold workers need longer than
 # the default 300s for the wa-agent benchmark crate graph, and the fail-open
@@ -124,6 +127,49 @@ run_with_timeout() {
   "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${timeout_secs}" "$@"
 }
 
+is_transient_remote_cargo_failure() {
+  local output_log="$1"
+
+  grep -Eq 'could not parse/generate dep info at: .*cargo-target/.+\.d' "${output_log}" &&
+    grep -Eq 'No such file or directory \(os error 2\)' "${output_log}"
+}
+
+retry_remote_target_dir() {
+  local base_target_dir="$1"
+  local scenario="$2"
+  local attempt="$3"
+  local scenario_slug
+
+  scenario_slug="$(printf '%s' "${scenario}" | tr -c '[:alnum:]' '-')"
+  printf '%s-%s-retry%s\n' "${base_target_dir}" "${scenario_slug}" "${attempt}"
+}
+
+run_logged_command() {
+  local output_log="$1"
+  shift
+  local runner_pid=""
+  local monitor_pid=""
+  local cmd_status=0
+
+  : > "${output_log}"
+
+  set +e
+  (
+    cd "${ROOT_DIR}"
+    "$@"
+  ) > "${output_log}" 2>&1 &
+  runner_pid="$!"
+  monitor_pid="$(start_rch_fallback_monitor "${runner_pid}" "${output_log}")"
+
+  wait "${runner_pid}"
+  cmd_status=$?
+  set -e
+  stop_rch_fallback_monitor "${monitor_pid}"
+  cat "${output_log}"
+
+  return "${cmd_status}"
+}
+
 run_rch_guarded() {
   local scenario="$1"
   local decision_path="$2"
@@ -132,73 +178,100 @@ run_rch_guarded() {
   local failure_code="$5"
   local output_log="$6"
   local queue_log=""
+  local base_remote_target_dir="${REMOTE_TARGET_DIR}"
+  local attempt=0
+  local active_output_log=""
   shift 6
 
-  local cmd_status=0
-  set +e
-  if declare -F "$1" >/dev/null 2>&1; then
-    local shell_fn="$1"
-    shift
-    export -f "${shell_fn}"
-    export REMOTE_TMPDIR REMOTE_TARGET_DIR
-    local shell_cmd
-    printf -v shell_cmd '%q ' "${shell_fn}" "$@"
-    (
-      cd "${ROOT_DIR}"
-      run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" bash -lc "${shell_cmd}"
-    ) 2>&1 | tee "${output_log}"
-    cmd_status=${PIPESTATUS[0]}
-  else
-    (
-      cd "${ROOT_DIR}"
-      run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@"
-    ) 2>&1 | tee "${output_log}"
-    cmd_status=${PIPESTATUS[0]}
-  fi
-  set -e
-
-  if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${output_log}"; then
-    fail_now \
-      "${scenario}" \
-      "${decision_path}.offload_guard" \
-      "rch_local_fallback" \
-      "remote_offload_required" \
-      "$(basename "${output_log}")" \
-      "rch fell back to local execution; refusing local CPU-intensive run"
-  fi
-
-  if [[ ${cmd_status} -eq 124 || ${cmd_status} -eq 137 ]]; then
-    queue_log="${output_log%.log}.rch_queue_timeout.log"
-    if ! rch queue > "${queue_log}" 2>&1; then
-      queue_log="${output_log}"
+  while :; do
+    local cmd_status=0
+    active_output_log="${output_log}"
+    if [[ ${attempt} -gt 0 ]]; then
+      active_output_log="${output_log%.log}.retry${attempt}.log"
     fi
-    fail_now \
-      "${scenario}" \
-      "${decision_path}.stall_guard" \
-      "rch_remote_step_timeout" \
-      "RCH-REMOTE-STALL" \
-      "$(basename "${queue_log}")" \
-      "rch command exceeded ${RCH_STEP_TIMEOUT_SECS}s without producing a final result"
-  fi
 
-  if [[ ${cmd_status} -ne 0 ]]; then
+    set +e
+    if declare -F "$1" >/dev/null 2>&1; then
+      local shell_fn="$1"
+      shift
+      export -f "${shell_fn}"
+      export REMOTE_TMPDIR REMOTE_TARGET_DIR
+      local shell_cmd
+      printf -v shell_cmd '%q ' "${shell_fn}" "$@"
+      run_logged_command \
+        "${active_output_log}" \
+        run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" bash -lc "${shell_cmd}"
+      cmd_status=$?
+      set -- "${shell_fn}" "$@"
+    else
+      run_logged_command \
+        "${active_output_log}" \
+        run_with_timeout "${RCH_STEP_TIMEOUT_SECS}" "$@"
+      cmd_status=$?
+    fi
+    set -e
+
+    if grep -Eq "${RCH_FAIL_OPEN_REGEX}" "${active_output_log}"; then
+      fail_now \
+        "${scenario}" \
+        "${decision_path}.offload_guard" \
+        "rch_local_fallback" \
+        "remote_offload_required" \
+        "$(basename "${active_output_log}")" \
+        "rch fell back to local execution; refusing local CPU-intensive run"
+    fi
+
+    if [[ ${cmd_status} -eq 124 || ${cmd_status} -eq 137 ]]; then
+      queue_log="${active_output_log%.log}.rch_queue_timeout.log"
+      if ! rch queue > "${queue_log}" 2>&1; then
+        queue_log="${active_output_log}"
+      fi
+      fail_now \
+        "${scenario}" \
+        "${decision_path}.stall_guard" \
+        "rch_remote_step_timeout" \
+        "RCH-REMOTE-STALL" \
+        "$(basename "${queue_log}")" \
+        "rch command exceeded ${RCH_STEP_TIMEOUT_SECS}s without producing a final result"
+    fi
+
+    if [[ ${cmd_status} -eq 0 ]]; then
+      if [[ "${active_output_log}" != "${output_log}" ]]; then
+        cp "${active_output_log}" "${output_log}"
+      fi
+      emit_log \
+        "passed" \
+        "${scenario}" \
+        "${decision_path}" \
+        "${success_reason}" \
+        "none" \
+        "$(basename "${output_log}")" \
+        "rch remote execution succeeded after ${attempt} transient retries"
+      return 0
+    fi
+
+    if [[ ${attempt} -lt ${RCH_TRANSIENT_RETRY_MAX} ]] && is_transient_remote_cargo_failure "${active_output_log}"; then
+      attempt=$((attempt + 1))
+      REMOTE_TARGET_DIR="$(retry_remote_target_dir "${base_remote_target_dir}" "${scenario}" "${attempt}")"
+      emit_log \
+        "started" \
+        "${scenario}" \
+        "${decision_path}.retry" \
+        "rch_transient_retry_requested" \
+        "none" \
+        "$(basename "${active_output_log}")" \
+        "retry ${attempt}/${RCH_TRANSIENT_RETRY_MAX}; switching remote_target_dir=${REMOTE_TARGET_DIR}"
+      continue
+    fi
+
     fail_now \
       "${scenario}" \
       "${decision_path}" \
       "${failure_reason}" \
       "${failure_code}" \
-      "$(basename "${output_log}")" \
+      "$(basename "${active_output_log}")" \
       "rch command failed"
-  fi
-
-  emit_log \
-    "passed" \
-    "${scenario}" \
-    "${decision_path}" \
-    "${success_reason}" \
-    "none" \
-    "$(basename "${output_log}")" \
-    "rch remote execution succeeded"
+  done
 }
 
 rch_remote_exec() {
@@ -206,6 +279,32 @@ rch_remote_exec() {
     rch exec -- \
     env TMPDIR="${REMOTE_TMPDIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
     "$@"
+}
+
+rch_remote_build_ft_linux_binary() {
+  local workspace_relative_output="$1"
+  local remote_workspace_q=""
+  local remote_output_q=""
+  local remote_target_q=""
+  local remote_tmpdir_q=""
+  local remote_cmd=""
+
+  printf -v remote_workspace_q '%q' "${REMOTE_WORKSPACE_ROOT}"
+  printf -v remote_output_q '%q' "${workspace_relative_output}"
+  printf -v remote_target_q '%q' "${REMOTE_TARGET_DIR}"
+  printf -v remote_tmpdir_q '%q' "${REMOTE_TMPDIR}"
+  remote_cmd="set -euo pipefail; "
+  remote_cmd+="cd ${remote_workspace_q}; "
+  remote_cmd+="export TMPDIR=${remote_tmpdir_q}; "
+  remote_cmd+="export CARGO_TARGET_DIR=${remote_target_q}; "
+  remote_cmd+="cargo build -p frankenterm --bin ft --features distributed; "
+  remote_cmd+="mkdir -p \$(dirname ${remote_output_q}); "
+  remote_cmd+="cp ${remote_target_q}/debug/ft ${remote_output_q}; "
+  remote_cmd+="chmod +x ${remote_output_q}"
+
+  env TMPDIR=/tmp \
+    rch exec -- \
+    bash -lc "${remote_cmd}"
 }
 
 emit_log \
@@ -363,7 +462,7 @@ run_rch_guarded \
   cargo test -p frankenterm --features distributed distributed_listener_persists_agent_stream_and_surfaces_remote_status_and_query -- --nocapture
 
 BENCH_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_wa_agent_streaming_bench.log"
-run_rch_guarded \
+RCH_STEP_TIMEOUT_SECS="${BENCH_RCH_STEP_TIMEOUT_SECS}" run_rch_guarded \
   "benchmark_smoke" \
   "cargo_bench_wa_agent_streaming_quick" \
   "wa_agent_streaming_bench_passed" \
@@ -372,6 +471,62 @@ run_rch_guarded \
   "${BENCH_LOG}" \
   rch_remote_exec \
   cargo bench -p frankenterm-core --features distributed,asupersync-runtime --bench wa_agent_streaming -- --quick
+
+COMPOSE_BINARY_REL="artifacts/e2e/ft_nu4_4_3_2/${RUN_ID}/ft-linux-amd64"
+COMPOSE_BINARY_PATH="${ROOT_DIR}/${COMPOSE_BINARY_REL}"
+COMPOSE_BUILD_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_compose_binary_build.log"
+run_rch_guarded \
+  "compose_binary_build" \
+  "cargo_build_ft_linux_binary" \
+  "distributed_compose_binary_built" \
+  "distributed_compose_binary_build_failed" \
+  "cargo_build_failed" \
+  "${COMPOSE_BUILD_LOG}" \
+  rch_remote_build_ft_linux_binary \
+  "${COMPOSE_BINARY_REL}"
+
+if [[ ! -x "${COMPOSE_BINARY_PATH}" ]]; then
+  fail_now \
+    "compose_binary_build" \
+    "cargo_build_ft_linux_binary.artifact_sync" \
+    "compose_binary_missing" \
+    "compose_binary_not_found" \
+    "$(basename "${COMPOSE_BUILD_LOG}")" \
+    "rch reported success but synchronized ft binary is missing at ${COMPOSE_BINARY_PATH}"
+fi
+
+COMPOSE_ARTIFACT_DIR="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_compose_smoke"
+COMPOSE_SMOKE_LOG="${LOG_DIR}/ft_nu4_4_3_2_${RUN_ID}_compose_smoke.log"
+set +e
+(
+  cd "${ROOT_DIR}"
+  run_with_timeout "${COMPOSE_STEP_TIMEOUT_SECS}" \
+    bash tests/e2e/distributed_compose_smoke.sh \
+    "${COMPOSE_BINARY_PATH}" \
+    "${COMPOSE_ARTIFACT_DIR}" \
+    "${RUN_ID}"
+) 2>&1 | tee "${COMPOSE_SMOKE_LOG}"
+compose_status=${PIPESTATUS[0]}
+set -e
+
+if [[ ${compose_status} -ne 0 ]]; then
+  fail_now \
+    "compose_smoke" \
+    "docker_compose_distributed_topology" \
+    "distributed_compose_smoke_failed" \
+    "compose_smoke_failed" \
+    "$(basename "${COMPOSE_SMOKE_LOG}")" \
+    "compose topology failed; see compose log and exported artifacts directory"
+fi
+
+emit_log \
+  "passed" \
+  "compose_smoke" \
+  "docker_compose_distributed_topology" \
+  "distributed_compose_smoke_passed" \
+  "none" \
+  "$(basename "${COMPOSE_SMOKE_LOG}")" \
+  "docker compose validated fake-agent, aggregator listener, security rejection, and query visibility"
 
 emit_log \
   "passed" \
@@ -392,6 +547,9 @@ jq -cn \
   --arg core_log "$(basename "${CORE_E2E_LOG}")" \
   --arg listener_log "$(basename "${LISTENER_E2E_LOG}")" \
   --arg bench_log "$(basename "${BENCH_LOG}")" \
+  --arg compose_build_log "$(basename "${COMPOSE_BUILD_LOG}")" \
+  --arg compose_smoke_log "$(basename "${COMPOSE_SMOKE_LOG}")" \
+  --arg compose_artifacts "${COMPOSE_ARTIFACT_DIR}" \
   --arg rch_check "$(basename "${RCH_CHECK_LOG}")" \
   --arg rch_probe "$(basename "${RCH_PROBE_LOG}")" \
   --arg rch_status "$(basename "${RCH_STATUS_LOG}")" \
@@ -410,7 +568,10 @@ jq -cn \
       rch_status: $rch_status,
       core_streaming_e2e_log: $core_log,
       listener_stream_e2e_log: $listener_log,
-      wa_agent_streaming_bench_log: $bench_log
+      wa_agent_streaming_bench_log: $bench_log,
+      compose_binary_build_log: $compose_build_log,
+      compose_smoke_log: $compose_smoke_log,
+      compose_artifacts_dir: $compose_artifacts
     }
   }' > "${SUMMARY_FILE}"
 

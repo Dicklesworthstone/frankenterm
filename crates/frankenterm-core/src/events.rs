@@ -510,7 +510,7 @@ impl EventBus {
             .fetch_add(1, Ordering::Relaxed);
         let mut delivered = 0usize;
 
-        if let Ok(count) = self.all_sender.send(event.clone()) {
+        if let Ok(count) = crate::runtime_compat::broadcast_send(&self.all_sender, event.clone()) {
             delivered += count;
         }
 
@@ -622,7 +622,7 @@ impl EventBus {
         sender: &broadcast::Sender<Event>,
         times: &Mutex<VecDeque<Instant>>,
     ) -> usize {
-        match sender.send(event) {
+        match crate::runtime_compat::broadcast_send(sender, event) {
             Ok(count) => {
                 Self::record_timestamp(times, self.capacity);
                 count
@@ -704,7 +704,7 @@ impl EventSubscriber {
     /// - `RecvError::Closed` if the event bus was dropped
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
-        match self.receiver.recv().await {
+        match crate::runtime_compat::broadcast_recv(&mut self.receiver).await {
             Ok(event) => Ok(event),
             Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
             Err(broadcast::RecvError::Lagged(n)) => {

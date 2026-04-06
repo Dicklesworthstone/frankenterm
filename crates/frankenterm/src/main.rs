@@ -152,13 +152,15 @@ SEE ALSO:
     /// Distributed mode commands (requires --features distributed)
     #[cfg(feature = "distributed")]
     #[command(after_help = r#"EXAMPLES:
+    ft watch --foreground                      Run local watcher; acts as aggregator when distributed.enabled=true
     ft distributed agent                        Run local capture agent and stream to aggregator
     ft distributed agent --connect 10.0.0.5:4141 --agent-id host-a
                                                 Override upstream and explicit agent identity
 
 NOTES:
     Uses distributed auth settings from config (`distributed.token*`).
-    Aggregator endpoint defaults to --connect-addr, then `distributed.bind_addr`."#)]
+    Aggregator endpoint defaults to --connect-addr, then `distributed.bind_addr`.
+    Connected remote panes surface through `ft status`, `ft query`, `ft robot state`, and MCP `wa.state`."#)]
     Distributed {
         #[command(subcommand)]
         command: DistributedCommands,
@@ -1419,6 +1421,16 @@ SEE ALSO:
     #[command(after_help = r#"EXAMPLES:
     ft web                            Start web server on 127.0.0.1:8000
     ft web --port 0                   Bind to an ephemeral port (tests)
+    curl -N http://127.0.0.1:8000/stream/events
+                                     Subscribe to live EventBus traffic as SSE
+    curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
+                                     Detection-only stream for one pane
+    curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+                                     Redacted output deltas and gaps for one pane
+
+STREAMING ENDPOINTS:
+    GET /stream/events                Live EventBus SSE (`channel`, `pane_id`, `max_hz`)
+    GET /stream/deltas                Live delta SSE (`pane_id`, `max_hz`)
 
 SEE ALSO:
     ft status     CLI status overview
@@ -4540,6 +4552,11 @@ const ROBOT_ERR_WORKFLOW_ABORTED: &str = "robot.workflow_aborted";
 const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
 const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
 const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
+const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
+const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
+    "Live get-text is unavailable for distributed panes";
+const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_HINT: &str =
+    "Use `ft query`, `ft search`, or `ft robot search` to inspect persisted remote output.";
 const ROBOT_BATCH_GET_TEXT_MAX_CONCURRENT: usize = 16;
 /// Cooldown period between account refreshes (milliseconds)
 const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
@@ -5493,6 +5510,21 @@ impl PaneState {
             cwd: info.cwd.clone(),
             observed: ignore_reason.is_none(),
             ignore_reason,
+        }
+    }
+
+    fn from_pane_record(record: &frankenterm_core::storage::PaneRecord) -> Self {
+        Self {
+            pane_id: record.pane_id,
+            pane_uuid: record.pane_uuid.clone(),
+            // Distributed panes are persisted without a local tab/window anchor.
+            tab_id: record.tab_id.unwrap_or(0),
+            window_id: record.window_id.unwrap_or(0),
+            domain: record.domain.clone(),
+            title: record.title.clone(),
+            cwd: record.cwd.clone(),
+            observed: record.observed,
+            ignore_reason: record.ignore_reason.clone(),
         }
     }
 
@@ -6948,17 +6980,53 @@ async fn authorize_read_or_search_policy(
         input = input.with_pane(pane_id);
         let resolution = resolve_pane_capabilities(pane_id, storage, ipc_socket_path).await;
         input = input.with_capabilities(resolution.capabilities);
+        let distributed_remote_pane = if let Some(storage) = storage {
+            match storage.get_pane(pane_id).await {
+                Ok(record) => record.filter(|pane| is_distributed_remote_domain(&pane.domain)),
+                Err(err) => {
+                    tracing::warn!(
+                        pane_id,
+                        error = %err,
+                        "Failed to load distributed pane metadata during read/search authorization"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-        if let Ok(pane_info) = wezterm.get_pane(pane_id).await {
-            let inferred_domain = pane_info.inferred_domain();
-            domain = Some(inferred_domain.clone());
-            input = input.with_domain(inferred_domain);
-            if let Some(title) = pane_info.title {
-                input = input.with_pane_title(title);
+        match wezterm.get_pane(pane_id).await {
+            Ok(pane_info) => {
+                let inferred_domain = pane_info.inferred_domain();
+                domain = Some(inferred_domain.clone());
+                input = input.with_domain(inferred_domain);
+                if let Some(title) = pane_info.title {
+                    input = input.with_pane_title(title);
+                }
+                if let Some(cwd) = pane_info.cwd {
+                    input = input.with_pane_cwd(cwd);
+                }
             }
-            if let Some(cwd) = pane_info.cwd {
-                input = input.with_pane_cwd(cwd);
+            Err(err) => {
+                if let Some(record) = distributed_remote_pane {
+                    let distributed_domain = record.domain.clone();
+                    domain = Some(distributed_domain.clone());
+                    input = input.with_domain(distributed_domain);
+                    if let Some(title) = record.title {
+                        input = input.with_pane_title(title);
+                    }
+                    if let Some(cwd) = record.cwd {
+                        input = input.with_pane_cwd(cwd);
+                    }
+                } else {
+                    tracing::debug!(
+                        pane_id,
+                        error = %err,
+                        "Failed to load live pane metadata during read/search authorization"
+                    );
+                }
             }
         }
     } else {
@@ -10783,6 +10851,62 @@ async fn load_distributed_remote_panes(
         .into_iter()
         .filter(|pane| is_distributed_remote_domain(&pane.domain))
         .collect())
+}
+
+async fn load_distributed_remote_pane_record(
+    storage: Option<&frankenterm_core::storage::StorageHandle>,
+    pane_id: u64,
+) -> Result<Option<frankenterm_core::storage::PaneRecord>, frankenterm_core::Error> {
+    let Some(storage) = storage else {
+        return Ok(None);
+    };
+
+    Ok(storage
+        .get_pane(pane_id)
+        .await?
+        .filter(|pane| is_distributed_remote_domain(&pane.domain)))
+}
+
+fn distributed_remote_pane_text_unavailable_hint() -> String {
+    DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_HINT.to_string()
+}
+
+fn distributed_remote_pane_text_unavailable_result() -> RobotPaneTextResult {
+    RobotPaneTextResult::Error {
+        code: ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE.to_string(),
+        message: DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE.to_string(),
+        hint: Some(distributed_remote_pane_text_unavailable_hint()),
+    }
+}
+
+fn merge_distributed_remote_pane_states(
+    states: &mut Vec<PaneState>,
+    remote_records: Vec<frankenterm_core::storage::PaneRecord>,
+) {
+    let mut existing_pane_ids: HashSet<u64> = states.iter().map(|state| state.pane_id).collect();
+    for record in remote_records {
+        if !existing_pane_ids.insert(record.pane_id) {
+            continue;
+        }
+        states.push(PaneState::from_pane_record(&record));
+    }
+
+    states.sort_by_key(|state| state.pane_id);
+}
+
+fn add_distributed_remote_pane_text_placeholders(
+    states: &[PaneState],
+    pane_text: &mut BTreeMap<u64, RobotPaneTextResult>,
+) {
+    for state in states {
+        if !is_distributed_remote_domain(&state.domain) || pane_text.contains_key(&state.pane_id) {
+            continue;
+        }
+        pane_text.insert(
+            state.pane_id,
+            distributed_remote_pane_text_unavailable_result(),
+        );
+    }
 }
 
 async fn batch_get_pane_text(
@@ -16378,21 +16502,50 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             match wezterm.list_panes().await {
                                 Ok(panes) => {
                                     let filter = &config.ingest.panes;
-                                    let states: Vec<PaneState> = panes
+                                    let mut states: Vec<PaneState> = panes
                                         .iter()
                                         .map(|p| PaneState::from_pane_info(p, filter))
                                         .collect();
 
+                                    if config.distributed.enabled {
+                                        let db_path = Path::new(&ctx.effective.paths.db_path);
+                                        if has_distributed_panes_in_db(db_path) {
+                                            match load_distributed_remote_panes(db_path).await {
+                                                Ok(remote_records) => {
+                                                    merge_distributed_remote_pane_states(
+                                                        &mut states,
+                                                        remote_records,
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    tracing::warn!(
+                                                        error = %err,
+                                                        "Failed to load distributed panes for robot state"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     if include_text {
-                                        let pane_ids: Vec<u64> =
-                                            states.iter().map(|state| state.pane_id).collect();
-                                        let pane_text = batch_get_pane_text(
+                                        let pane_ids: Vec<u64> = states
+                                            .iter()
+                                            .filter(|state| {
+                                                !is_distributed_remote_domain(&state.domain)
+                                            })
+                                            .map(|state| state.pane_id)
+                                            .collect();
+                                        let mut pane_text = batch_get_pane_text(
                                             wezterm.clone(),
                                             &pane_ids,
                                             escapes,
                                             tail,
                                         )
                                         .await;
+                                        add_distributed_remote_pane_text_placeholders(
+                                            &states,
+                                            &mut pane_text,
+                                        );
                                         let data = RobotStateWithTextData {
                                             panes: states,
                                             tail_lines: tail,
@@ -16632,6 +16785,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         return Ok(());
                                     }
                                 };
+                                let remote_pane = match load_distributed_remote_pane_record(
+                                    storage.as_ref(),
+                                    pane_id,
+                                )
+                                .await
+                                {
+                                    Ok(record) => record,
+                                    Err(e) => {
+                                        let response = RobotResponse::<RobotGetTextData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to inspect pane metadata: {e}"),
+                                                Some(
+                                                    "Open storage before querying remote pane metadata."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
                                 if !decision.is_allowed() {
                                     let status = if decision.requires_approval() {
                                         "require_approval"
@@ -16656,6 +16830,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &code,
                                             message,
                                             hint,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                                if remote_pane.is_some() {
+                                    record_read_search_policy_audit(
+                                        storage.as_ref(),
+                                        frankenterm_core::policy::ActorKind::Robot,
+                                        frankenterm_core::policy::ActionKind::ReadOutput,
+                                        Some(pane_id),
+                                        domain.as_deref(),
+                                        &summary,
+                                        &decision,
+                                        "remote_unavailable",
+                                    )
+                                    .await;
+                                    let response =
+                                        RobotResponse::<RobotGetTextData>::error_with_code(
+                                            ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE,
+                                            DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE,
+                                            Some(distributed_remote_pane_text_unavailable_hint()),
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -16754,7 +16950,47 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     domains.insert(*target_pane_id, domain.clone());
 
                                     if decision.is_allowed() {
-                                        authorized_panes.push(*target_pane_id);
+                                        match load_distributed_remote_pane_record(
+                                            storage.as_ref(),
+                                            *target_pane_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(_record)) => {
+                                                record_read_search_policy_audit(
+                                                    storage.as_ref(),
+                                                    frankenterm_core::policy::ActorKind::Robot,
+                                                    frankenterm_core::policy::ActionKind::ReadOutput,
+                                                    Some(*target_pane_id),
+                                                    domain.as_deref(),
+                                                    &summary,
+                                                    &decision,
+                                                    "remote_unavailable",
+                                                )
+                                                .await;
+                                                results.insert(
+                                                    *target_pane_id,
+                                                    distributed_remote_pane_text_unavailable_result(
+                                                    ),
+                                                );
+                                            }
+                                            Ok(None) => authorized_panes.push(*target_pane_id),
+                                            Err(e) => {
+                                                results.insert(
+                                                    *target_pane_id,
+                                                    RobotPaneTextResult::Error {
+                                                        code: ROBOT_ERR_STORAGE.to_string(),
+                                                        message: format!(
+                                                            "Failed to inspect pane metadata: {e}"
+                                                        ),
+                                                        hint: Some(
+                                                            "Open storage before querying remote pane metadata."
+                                                                .to_string(),
+                                                        ),
+                                                    },
+                                                );
+                                            }
+                                        }
                                     } else {
                                         let status = if decision.requires_approval() {
                                             "require_approval"
@@ -43106,6 +43342,117 @@ recorder_backend = "frankensqlite"
     }
 
     #[test]
+    fn merge_distributed_remote_pane_states_adds_unique_remote_panes() {
+        let mut states = vec![PaneState {
+            pane_id: 1,
+            pane_uuid: None,
+            tab_id: 2,
+            window_id: 3,
+            domain: "local".to_string(),
+            title: Some("local-pane".to_string()),
+            cwd: Some("/tmp".to_string()),
+            observed: true,
+            ignore_reason: None,
+        }];
+        let mut remote = make_pane_record(2, "distributed:agent-a:prod", Some("remote-pane"));
+        remote.pane_uuid = Some("uuid-2".to_string());
+        let duplicate = make_pane_record(2, "distributed:agent-a:prod", Some("duplicate-pane"));
+
+        merge_distributed_remote_pane_states(&mut states, vec![remote, duplicate]);
+
+        assert_eq!(states.len(), 2);
+        let remote_state = states
+            .iter()
+            .find(|state| state.pane_id == 2)
+            .expect("remote pane state");
+        assert_eq!(remote_state.pane_uuid.as_deref(), Some("uuid-2"));
+        assert_eq!(remote_state.tab_id, 0);
+        assert_eq!(remote_state.window_id, 0);
+        assert_eq!(remote_state.domain, "distributed:agent-a:prod");
+    }
+
+    #[test]
+    fn add_distributed_remote_pane_text_placeholders_only_marks_remote_panes() {
+        let states = vec![
+            PaneState {
+                pane_id: 1,
+                pane_uuid: None,
+                tab_id: 2,
+                window_id: 3,
+                domain: "local".to_string(),
+                title: Some("local-pane".to_string()),
+                cwd: None,
+                observed: true,
+                ignore_reason: None,
+            },
+            PaneState {
+                pane_id: 2,
+                pane_uuid: Some("remote-uuid".to_string()),
+                tab_id: 0,
+                window_id: 0,
+                domain: "distributed:agent-a:prod".to_string(),
+                title: Some("remote-pane".to_string()),
+                cwd: None,
+                observed: true,
+                ignore_reason: None,
+            },
+        ];
+        let mut pane_text = BTreeMap::from([(
+            1_u64,
+            RobotPaneTextResult::Ok {
+                text: "local output".to_string(),
+                truncated: false,
+                truncation_info: None,
+            },
+        )]);
+
+        add_distributed_remote_pane_text_placeholders(&states, &mut pane_text);
+
+        assert!(matches!(
+            pane_text.get(&1),
+            Some(RobotPaneTextResult::Ok { text, .. }) if text == "local output"
+        ));
+        assert!(matches!(
+            pane_text.get(&2),
+            Some(RobotPaneTextResult::Error { code, .. }) if code == ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE
+        ));
+    }
+
+    #[test]
+    fn load_distributed_remote_pane_record_filters_non_remote_domains() {
+        run_async_test(async {
+            let (storage_handle, db_path) = setup_storage("distributed_remote_pane_lookup").await;
+            storage_handle
+                .upsert_pane(make_pane_record(
+                    7,
+                    "distributed:agent-a:prod",
+                    Some("remote-pane"),
+                ))
+                .await
+                .expect("seed remote pane");
+            storage_handle
+                .upsert_pane(make_pane_record(9, "local", Some("local-pane")))
+                .await
+                .expect("seed local pane");
+
+            let remote = load_distributed_remote_pane_record(Some(&storage_handle), 7)
+                .await
+                .expect("load remote pane");
+            let local = load_distributed_remote_pane_record(Some(&storage_handle), 9)
+                .await
+                .expect("load local pane");
+
+            assert_eq!(remote.as_ref().map(|pane| pane.pane_id), Some(7));
+            assert!(
+                local.is_none(),
+                "local panes should not be treated as distributed"
+            );
+
+            cleanup_storage(storage_handle, &db_path).await;
+        });
+    }
+
+    #[test]
     fn load_distributed_remote_panes_only_returns_distributed_domains() {
         run_async_test(async {
             let (storage, db_path) = setup_storage("distributed_remote_load").await;
@@ -53549,6 +53896,65 @@ log_level = "debug"
                 context.surface,
                 frankenterm_core::policy::PolicySurface::Mux
             );
+        });
+    }
+
+    #[test]
+    fn read_search_policy_uses_distributed_storage_metadata_when_live_pane_missing() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("read_search_policy_distributed_remote").await;
+            let remote_pane_id = 62_007;
+
+            storage
+                .upsert_pane(make_pane_record(
+                    remote_pane_id,
+                    "distributed:agent-a:prod",
+                    Some("remote-pane"),
+                ))
+                .await
+                .expect("seed distributed pane");
+
+            let mut config = frankenterm_core::config::Config::default();
+            config.safety.rules.enabled = true;
+            config
+                .safety
+                .rules
+                .rules
+                .push(frankenterm_core::config::PolicyRule {
+                    id: "test.deny.robot.remote.read".to_string(),
+                    description: Some("deny remote robot reads".to_string()),
+                    priority: 1,
+                    match_on: frankenterm_core::config::PolicyRuleMatch {
+                        actions: vec!["read_output".to_string()],
+                        actors: vec!["robot".to_string()],
+                        pane_domains: vec!["distributed:agent-a:prod".to_string()],
+                        ..Default::default()
+                    },
+                    decision: frankenterm_core::config::PolicyRuleDecision::Deny,
+                    message: Some("remote robot read blocked".to_string()),
+                });
+
+            let (decision, domain) = authorize_read_or_search_policy(
+                &config,
+                Some(&storage),
+                None,
+                None,
+                frankenterm_core::policy::ActionKind::ReadOutput,
+                frankenterm_core::policy::ActorKind::Robot,
+                Some(remote_pane_id),
+                "robot read test",
+            )
+            .await
+            .expect("distributed-pane authorization should succeed");
+
+            assert!(
+                decision.is_denied(),
+                "domain rule should match remote pane metadata"
+            );
+            assert_eq!(decision.reason(), Some("remote robot read blocked"));
+            assert_eq!(domain.as_deref(), Some("distributed:agent-a:prod"));
+
+            cleanup_storage(storage, &db_path).await;
         });
     }
 

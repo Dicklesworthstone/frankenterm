@@ -10803,6 +10803,37 @@ EOF
         log_pass "[$case_name] logs/artifacts remained redacted"
     fi
 
+    local compose_binary="${FT_E2E_DISTRIBUTED_COMPOSE_BINARY:-}"
+    local compose_log="$scenario_dir/distributed_compose_smoke.log"
+    if [[ -n "$compose_binary" ]]; then
+        log_info "[$case_name] Step 5: running optional docker compose smoke topology"
+        if [[ ! -x "$compose_binary" ]]; then
+            log_fail "[$case_name] compose binary is not executable: $compose_binary"
+            result=1
+        elif ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+            log_fail "[$case_name] docker compose unavailable for optional compose smoke"
+            result=1
+        else
+            set +e
+            timeout "$TIMEOUT" bash "$PROJECT_ROOT/tests/e2e/distributed_compose_smoke.sh" \
+                "$compose_binary" "$scenario_dir/compose_smoke" "$case_name" >"$compose_log" 2>&1
+            local compose_rc=$?
+            set -e
+
+            if [[ "$compose_rc" -eq 0 ]]; then
+                log_pass "[$case_name] optional compose smoke passed"
+            elif [[ "$compose_rc" -eq 124 ]]; then
+                log_fail "[$case_name] optional compose smoke timed out"
+                result=1
+            else
+                log_fail "[$case_name] optional compose smoke failed (exit=$compose_rc)"
+                result=1
+            fi
+        fi
+    else
+        log_info "[$case_name] Step 5: optional compose smoke skipped (set FT_E2E_DISTRIBUTED_COMPOSE_BINARY to enable)"
+    fi
+
     local case_duration=$(( $(date +%s) - case_started ))
     log_info "[$case_name] completed in ${case_duration}s"
     return $result

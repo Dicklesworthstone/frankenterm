@@ -5908,6 +5908,16 @@ impl StorageHandle {
             .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
     }
 
+    async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
+        crate::runtime_compat::oneshot_recv(rx)
+            .await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    async fn recv_writer_shutdown_ack(rx: oneshot::Receiver<()>) {
+        let _ = crate::runtime_compat::oneshot_recv(rx).await;
+    }
+
     /// Create a storage handle with custom configuration
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
@@ -5976,8 +5986,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a gap event
@@ -5995,8 +6004,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record an event (pattern detection)
@@ -6009,8 +6017,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Mark an event as handled
@@ -6031,8 +6038,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Set or clear an event's triage state.
@@ -6055,8 +6061,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Set or clear an event's note.
@@ -6079,8 +6084,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Add a label to an event.
@@ -6103,8 +6107,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Remove a label from an event.
@@ -6121,8 +6124,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Fetch triage state, note, and labels for an event.
@@ -6148,8 +6150,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Remove a persistent event mute by identity key.
@@ -6163,8 +6164,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Check whether an identity key is muted (and not expired).
@@ -6221,8 +6221,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record an audit action after applying redaction
@@ -6243,8 +6242,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert undo metadata after applying redaction
@@ -6284,8 +6282,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge audit actions older than a cutoff timestamp
@@ -6299,8 +6296,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a maintenance event
@@ -6314,8 +6310,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a secret scan report (checkpoint + payload).
@@ -6329,8 +6324,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a saved search definition.
@@ -6344,8 +6338,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Update last-run metadata for a saved search.
@@ -6368,8 +6361,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Update scheduling settings for a saved search.
@@ -6390,8 +6382,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete a saved search by name. Returns number of rows deleted.
@@ -6405,8 +6396,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Fetch a saved search by name.
@@ -6445,8 +6435,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
@@ -6460,8 +6449,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get a pane bookmark by alias.
@@ -6516,8 +6504,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Run retention cleanup and log the maintenance event
@@ -6550,8 +6537,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Record multiple usage metrics for analytics tracking in a single transaction.
@@ -6570,8 +6556,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge usage metrics older than a cutoff timestamp.
@@ -6585,8 +6570,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Query usage metrics with filters (read-only, uses read connection).
@@ -6638,8 +6622,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Update the delivery status of a notification.
@@ -6660,8 +6643,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Acknowledge a notification (marks when and by whom).
@@ -6682,8 +6664,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Increment the retry count for a notification and reset its status to pending.
@@ -6694,8 +6675,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge notification history older than the given timestamp.
@@ -6709,8 +6689,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     // =========================================================================
@@ -6809,8 +6788,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete events matching tier criteria older than a cutoff (write-path).
@@ -6835,8 +6813,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Query notification history with filters.
@@ -6887,8 +6864,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Lightweight WAL checkpoint (PASSIVE) + PRAGMA optimize.
@@ -6902,8 +6878,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
@@ -6998,8 +6973,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume an approval token if it matches scope and is valid
@@ -7025,8 +6999,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get an approval token by code hash (without consuming)
@@ -7045,8 +7018,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume an approval token by code hash only (without fingerprint validation).
@@ -7070,8 +7042,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a pane record
@@ -7082,8 +7053,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a workflow execution record
@@ -7097,8 +7067,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a workflow action plan (canonical JSON + hash)
@@ -7117,8 +7086,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a prepared plan preview for later commit
@@ -7132,8 +7100,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume a prepared plan by plan_id (marks as used if valid)
@@ -7152,8 +7119,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a workflow step log entry
@@ -7195,8 +7161,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     // Upsert an agent session record
@@ -7226,8 +7191,7 @@ impl StorageHandle {
             })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a session checkpoint with per-pane state rows.
@@ -7256,8 +7220,7 @@ impl StorageHandle {
             })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Prune old checkpoints beyond the retention limit.
@@ -7276,8 +7239,7 @@ impl StorageHandle {
             })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Mark a session as cleanly shut down.
@@ -7290,8 +7252,7 @@ impl StorageHandle {
             })
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get the state_hash of the latest checkpoint for a session.
@@ -7316,8 +7277,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get an agent session by ID
@@ -8052,8 +8012,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Update an account's last_used_at timestamp
@@ -8076,8 +8035,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete an account by service and account_id
@@ -8094,8 +8052,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get all accounts for a service
@@ -8174,8 +8131,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Release a pane reservation by ID.
@@ -8191,8 +8147,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Get the active reservation for a pane (read-only).
@@ -8368,8 +8323,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        rx.await
-            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+        Self::recv_writer_response(rx).await
     }
 
     /// Shutdown the storage handle
@@ -8385,7 +8339,7 @@ impl StorageHandle {
             .await;
 
         // Wait for acknowledgment
-        let _ = rx.await;
+        Self::recv_writer_shutdown_ack(rx).await;
 
         // Wait for thread to finish (only the first caller does this)
         let handle = self

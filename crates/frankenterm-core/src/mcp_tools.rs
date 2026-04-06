@@ -1,11 +1,12 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(all(test, unix))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -142,6 +143,84 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
         input = input.with_pane(pane_id);
     }
     input
+}
+
+fn mcp_pane_matches_agent_filter(agent_filter: &str, pane_title: &str) -> bool {
+    let title_lower = pane_title.to_lowercase();
+    let filter_lower = agent_filter.to_lowercase();
+    match filter_lower.as_str() {
+        "codex" => title_lower.contains("codex") || title_lower.contains("openai"),
+        "claude_code" | "claude" => title_lower.contains("claude"),
+        "gemini" => title_lower.contains("gemini"),
+        _ => title_lower.contains(&filter_lower),
+    }
+}
+
+fn mcp_is_distributed_remote_domain(domain: &str) -> bool {
+    domain.starts_with("distributed:")
+}
+
+async fn load_distributed_remote_panes(
+    db_path: &Path,
+) -> std::result::Result<Vec<crate::storage::PaneRecord>, crate::Error> {
+    let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+    let panes = storage.get_panes().await?;
+    if let Err(err) = storage.shutdown().await {
+        tracing::warn!(error = %err, "Failed to shutdown storage cleanly after MCP pane query");
+    }
+
+    Ok(panes
+        .into_iter()
+        .filter(|pane| mcp_is_distributed_remote_domain(&pane.domain))
+        .collect())
+}
+
+async fn load_distributed_remote_pane(
+    storage: Option<&StorageHandle>,
+    pane_id: u64,
+) -> std::result::Result<Option<crate::storage::PaneRecord>, crate::Error> {
+    let Some(storage) = storage else {
+        return Ok(None);
+    };
+
+    Ok(storage
+        .get_pane(pane_id)
+        .await?
+        .filter(|pane| mcp_is_distributed_remote_domain(&pane.domain)))
+}
+
+fn merge_distributed_remote_mcp_states(
+    states: &mut Vec<McpPaneState>,
+    remote_records: Vec<crate::storage::PaneRecord>,
+    params: &StateParams,
+) {
+    let mut existing_pane_ids: std::collections::HashSet<u64> =
+        states.iter().map(|state| state.pane_id).collect();
+
+    for record in remote_records {
+        if !existing_pane_ids.insert(record.pane_id) {
+            continue;
+        }
+        if let Some(pane_id) = params.pane_id {
+            if record.pane_id != pane_id {
+                continue;
+            }
+        }
+        if let Some(domain) = params.domain.as_deref() {
+            if record.domain != domain {
+                continue;
+            }
+        }
+        if let Some(agent) = params.agent.as_deref() {
+            let title = record.title.as_deref().unwrap_or("");
+            if !mcp_pane_matches_agent_filter(agent, title) {
+                continue;
+            }
+        }
+        states.push(McpPaneState::from_pane_record(&record));
+    }
+
+    states.sort_by_key(|state| state.pane_id);
 }
 
 fn serialize_mcp_audit_decision_context(
@@ -688,11 +767,12 @@ impl ToolHandler for WaCassStatusTool {
 
 pub(super) struct WaStateTool {
     filter: PaneFilterConfig,
+    db_path: Option<Arc<PathBuf>>,
 }
 
 impl WaStateTool {
-    pub(super) fn new(filter: PaneFilterConfig) -> Self {
-        Self { filter }
+    pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
+        Self { filter, db_path }
     }
 }
 
@@ -737,42 +817,55 @@ impl ToolHandler for WaStateTool {
             }
         };
 
+        let db_path = self.db_path.as_ref().map(Arc::clone);
+
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async {
             let wezterm = default_wezterm_handle();
-            wezterm.list_panes().await
+            let panes = wezterm.list_panes().await?;
+            let mut states: Vec<McpPaneState> = panes
+                .iter()
+                .filter(|pane| match params.pane_id {
+                    Some(pane_id) => pane.pane_id == pane_id,
+                    None => true,
+                })
+                .filter(|pane| match params.domain.as_ref() {
+                    Some(domain) => pane.inferred_domain() == *domain,
+                    None => true,
+                })
+                .filter(|pane| match params.agent.as_ref() {
+                    Some(agent) => {
+                        let title = pane.title.as_deref().unwrap_or("");
+                        mcp_pane_matches_agent_filter(agent, title)
+                    }
+                    None => true,
+                })
+                .map(|pane| McpPaneState::from_pane_info(pane, &self.filter))
+                .collect();
+
+            if let Some(db_path) = db_path.as_ref() {
+                match load_distributed_remote_panes(db_path.as_path()).await {
+                    Ok(remote_records) => {
+                        merge_distributed_remote_mcp_states(&mut states, remote_records, &params);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            path = %db_path.display(),
+                            "Failed to load distributed panes for wa.state"
+                        );
+                    }
+                }
+            }
+
+            Ok::<Vec<McpPaneState>, crate::Error>(states)
         });
 
         match result {
-            Ok(panes) => {
-                let states: Vec<McpPaneState> = panes
-                    .iter()
-                    .filter(|pane| match params.pane_id {
-                        Some(pane_id) => pane.pane_id == pane_id,
-                        None => true,
-                    })
-                    .filter(|pane| match params.domain.as_ref() {
-                        Some(domain) => pane.inferred_domain() == *domain,
-                        None => true,
-                    })
-                    .filter(|pane| match params.agent.as_ref() {
-                        Some(agent) => {
-                            let title = pane.title.as_deref().unwrap_or("").to_lowercase();
-                            let filter = agent.to_lowercase();
-                            match filter.as_str() {
-                                "codex" => title.contains("codex") || title.contains("openai"),
-                                "claude_code" | "claude" => title.contains("claude"),
-                                "gemini" => title.contains("gemini"),
-                                _ => title.contains(&filter),
-                            }
-                        }
-                        None => true,
-                    })
-                    .map(|pane| McpPaneState::from_pane_info(pane, &self.filter))
-                    .collect();
+            Ok(states) => {
                 let envelope = McpEnvelope::success(states, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
@@ -855,12 +948,31 @@ impl ToolHandler for WaGetTextTool {
                     None
                 };
 
-                let wezterm = default_wezterm_handle();
-                let pane_info = wezterm
-                    .get_pane(params.pane_id)
+                let remote_pane = load_distributed_remote_pane(storage.as_ref(), params.pane_id)
                     .await
                     .map_err(McpToolError::from_error)?;
-                let domain = pane_info.inferred_domain();
+                let wezterm = default_wezterm_handle();
+                let pane_info = match wezterm.get_pane(params.pane_id).await {
+                    Ok(pane_info) => Some(pane_info),
+                    Err(err) => {
+                        if remote_pane.is_some() {
+                            None
+                        } else {
+                            return Err(McpToolError::from_error(err));
+                        }
+                    }
+                };
+                let domain = pane_info
+                    .as_ref()
+                    .map(|pane| pane.inferred_domain())
+                    .or_else(|| remote_pane.as_ref().map(|pane| pane.domain.clone()))
+                    .ok_or_else(|| {
+                        McpToolError::new(
+                            MCP_ERR_PANE_NOT_FOUND,
+                            format!("Pane {} not found", params.pane_id),
+                            Some("Use wa.state to list available panes.".to_string()),
+                        )
+                    })?;
                 let resolution =
                     resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
                 let capabilities = resolution.capabilities;
@@ -868,12 +980,21 @@ impl ToolHandler for WaGetTextTool {
                 let mut engine = build_policy_engine(&config, false);
                 let summary = format!("wa.get_text pane_id={}", params.pane_id);
                 let mut input =
-                    mcp_get_text_policy_input(params.pane_id, domain, capabilities, &summary);
-                if let Some(title) = &pane_info.title {
-                    input = input.with_pane_title(title.clone());
-                }
-                if let Some(cwd) = &pane_info.cwd {
-                    input = input.with_pane_cwd(cwd.clone());
+                    mcp_get_text_policy_input(params.pane_id, domain.clone(), capabilities, &summary);
+                if let Some(pane_info) = pane_info.as_ref() {
+                    if let Some(title) = &pane_info.title {
+                        input = input.with_pane_title(title.clone());
+                    }
+                    if let Some(cwd) = &pane_info.cwd {
+                        input = input.with_pane_cwd(cwd.clone());
+                    }
+                } else if let Some(record) = remote_pane.as_ref() {
+                    if let Some(title) = &record.title {
+                        input = input.with_pane_title(title.clone());
+                    }
+                    if let Some(cwd) = &record.cwd {
+                        input = input.with_pane_cwd(cwd.clone());
+                    }
                 }
 
                 let decision = engine.authorize(&input);
@@ -907,6 +1028,17 @@ impl ToolHandler for WaGetTextTool {
                         .unwrap_or("Read requires approval")
                         .to_string();
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+
+                if remote_pane.is_some() {
+                    return Err(McpToolError::new(
+                        MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+                        "Live get-text is unavailable for distributed panes".to_string(),
+                        Some(
+                            "Use wa.search, ft search, or ft robot search to inspect persisted remote output."
+                                .to_string(),
+                        ),
+                    ));
                 }
 
                 let full_text = wezterm
@@ -4392,11 +4524,14 @@ mod tests {
         mcp_event_mutation_decision_context, mcp_get_text_policy_input,
         mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
         mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, serialize_mcp_audit_decision_context,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        serialize_mcp_audit_decision_context,
     };
+    use crate::mcp::mcp_types::{McpPaneState, StateParams};
     #[cfg(unix)]
-    use crate::mcp_error::MCP_ERR_CASS;
-    use crate::mcp_error::MCP_ERR_INVALID_ARGS;
+    use crate::mcp_error::{
+        MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+    };
     use crate::plan::{
         MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
         MissionTxState, StepAction, TxCommitStepInput, TxCompensation, TxId, TxIntent, TxOutcome,
@@ -4711,7 +4846,7 @@ mod tests {
             WaCassSearchTool.definition(),
             WaCassViewTool.definition(),
             WaCassStatusTool.definition(),
-            WaStateTool::new(PaneFilterConfig::default()).definition(),
+            WaStateTool::new(PaneFilterConfig::default(), None).definition(),
             WaGetTextTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaWaitForTool.definition(),
             WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
@@ -5528,7 +5663,7 @@ exit 17",
 
     #[test]
     fn state_tool_schema_has_domain_and_pane_id() {
-        let def = WaStateTool::new(PaneFilterConfig::default()).definition();
+        let def = WaStateTool::new(PaneFilterConfig::default(), None).definition();
         let props = def.input_schema.get("properties").unwrap();
         assert!(
             props.get("domain").is_some(),
@@ -5541,6 +5676,125 @@ exit 17",
     }
 
     #[test]
+    fn mcp_pane_state_from_pane_record_preserves_remote_metadata() {
+        let record = crate::storage::PaneRecord {
+            pane_id: 42,
+            pane_uuid: Some("remote-uuid".to_string()),
+            domain: "distributed:agent-a:prod".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("remote-pane".to_string()),
+            cwd: Some("/srv/agent".to_string()),
+            tty_name: None,
+            first_seen_at: 1,
+            last_seen_at: 2,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+
+        let state = McpPaneState::from_pane_record(&record);
+        assert_eq!(state.pane_id, 42);
+        assert_eq!(state.pane_uuid.as_deref(), Some("remote-uuid"));
+        assert_eq!(state.tab_id, 0);
+        assert_eq!(state.window_id, 0);
+        assert_eq!(state.domain, "distributed:agent-a:prod");
+        assert_eq!(state.title.as_deref(), Some("remote-pane"));
+    }
+
+    #[test]
+    fn merge_distributed_remote_mcp_states_filters_and_dedupes() {
+        let mut states = vec![McpPaneState {
+            pane_id: 1,
+            pane_uuid: None,
+            tab_id: 10,
+            window_id: 20,
+            domain: "local".to_string(),
+            title: Some("local-pane".to_string()),
+            cwd: None,
+            observed: true,
+            ignore_reason: None,
+        }];
+        let remote_a = crate::storage::PaneRecord {
+            pane_id: 2,
+            pane_uuid: Some("uuid-2".to_string()),
+            domain: "distributed:agent-a:prod".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("OpenAI Codex".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1,
+            last_seen_at: 2,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        let remote_a_duplicate = crate::storage::PaneRecord {
+            title: Some("duplicate".to_string()),
+            ..remote_a.clone()
+        };
+        let remote_b = crate::storage::PaneRecord {
+            pane_id: 3,
+            pane_uuid: Some("uuid-3".to_string()),
+            domain: "distributed:agent-b:prod".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("Gemini CLI".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1,
+            last_seen_at: 2,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        let params = StateParams {
+            domain: Some("distributed:agent-a:prod".to_string()),
+            agent: Some("codex".to_string()),
+            pane_id: None,
+        };
+
+        merge_distributed_remote_mcp_states(
+            &mut states,
+            vec![remote_a, remote_a_duplicate, remote_b],
+            &params,
+        );
+
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().any(|state| state.pane_id == 1));
+        assert!(states.iter().any(|state| state.pane_id == 2));
+        assert!(!states.iter().any(|state| state.pane_id == 3));
+    }
+
+    fn seed_distributed_remote_pane(db_path: &Path, pane_id: u64, domain: &str) {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should open");
+            storage
+                .upsert_pane(crate::storage::PaneRecord {
+                    pane_id,
+                    pane_uuid: Some(format!("distributed-{pane_id}")),
+                    domain: domain.to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("remote-pane".to_string()),
+                    cwd: Some("/srv/agent".to_string()),
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("distributed pane should seed");
+        });
+    }
+
+    #[test]
     fn get_text_tool_requires_pane_id() {
         let def = WaGetTextTool::new(config(), Some(db_path())).definition();
         let required = def
@@ -5550,6 +5804,73 @@ exit 17",
             .expect("wa.get_text should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.get_text should require pane_id");
+    }
+
+    #[test]
+    fn get_text_tool_returns_remote_text_unavailable_for_distributed_panes() {
+        let (_dir, db) = temp_db_path();
+        seed_distributed_remote_pane(&db, 4_242, "distributed:agent-a:prod");
+        let tool = WaGetTextTool::new(config(), Some(Arc::clone(&db)));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 4242,
+                    "tail": 20
+                }),
+            )
+            .expect("wa.get_text remote pane call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_REMOTE_TEXT_UNAVAILABLE);
+        assert_eq!(
+            envelope["error"],
+            "Live get-text is unavailable for distributed panes"
+        );
+        assert!(
+            envelope["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("wa.search")),
+            "remote-pane guidance should point callers at persisted-output search"
+        );
+    }
+
+    #[test]
+    fn get_text_tool_applies_policy_rules_to_distributed_panes() {
+        let (_dir, db) = temp_db_path();
+        seed_distributed_remote_pane(&db, 7_777, "distributed:agent-b:prod");
+        let mut cfg = Config::default();
+        cfg.safety.rules.enabled = true;
+        cfg.safety.rules.rules.push(crate::config::PolicyRule {
+            id: "test.deny.distributed.get_text".to_string(),
+            description: Some("deny distributed pane reads".to_string()),
+            priority: 1,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["read_output".to_string()],
+                actors: vec!["mcp".to_string()],
+                pane_domains: vec!["distributed:agent-b:prod".to_string()],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::Deny,
+            message: Some("distributed pane reads are blocked".to_string()),
+        });
+        let tool = WaGetTextTool::new(Arc::new(cfg), Some(Arc::clone(&db)));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 7777
+                }),
+            )
+            .expect("wa.get_text remote pane policy call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "distributed pane reads are blocked");
     }
 
     #[test]

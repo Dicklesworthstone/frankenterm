@@ -115,11 +115,12 @@ fn read_reservations_resource(
 
 pub(super) struct WaPanesResource {
     filter: PaneFilterConfig,
+    db_path: Option<Arc<PathBuf>>,
 }
 
 impl WaPanesResource {
-    pub(super) fn new(filter: PaneFilterConfig) -> Self {
-        Self { filter }
+    pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
+        Self { filter, db_path }
     }
 }
 
@@ -137,7 +138,7 @@ impl ResourceHandler for WaPanesResource {
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        let tool = WaStateTool::new(self.filter.clone());
+        let tool = WaStateTool::new(self.filter.clone(), self.db_path.as_ref().map(Arc::clone));
         let contents = tool.call(ctx, serde_json::Value::Null)?;
         tool_output_as_resource("wa://panes", contents)
     }
@@ -639,7 +640,7 @@ mod tests {
 
     #[test]
     fn panes_resource_definition_uri() {
-        let resource = WaPanesResource::new(PaneFilterConfig::default());
+        let resource = WaPanesResource::new(PaneFilterConfig::default(), None);
         let def = resource.definition();
         assert_eq!(def.uri, "wa://panes");
         assert_eq!(def.mime_type.as_deref(), Some("application/json"));
@@ -731,7 +732,7 @@ mod tests {
     fn all_resource_uris_are_unique() {
         let db = db_path();
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default())
+            WaPanesResource::new(PaneFilterConfig::default(), None)
                 .definition()
                 .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
@@ -771,7 +772,7 @@ mod tests {
     fn all_resource_uris_use_wa_scheme() {
         let db = db_path();
         let uris = [
-            WaPanesResource::new(PaneFilterConfig::default())
+            WaPanesResource::new(PaneFilterConfig::default(), None)
                 .definition()
                 .uri,
             WaEventsResource::new(Arc::clone(&db)).definition().uri,
@@ -796,7 +797,7 @@ mod tests {
     fn all_definitions_have_json_mime_type() {
         let db = db_path();
         let defs = [
-            WaPanesResource::new(PaneFilterConfig::default()).definition(),
+            WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
@@ -820,7 +821,7 @@ mod tests {
     fn all_definitions_have_version() {
         let db = db_path();
         let defs = [
-            WaPanesResource::new(PaneFilterConfig::default()).definition(),
+            WaPanesResource::new(PaneFilterConfig::default(), None).definition(),
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),

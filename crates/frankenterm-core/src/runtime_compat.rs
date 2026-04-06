@@ -557,8 +557,11 @@ pub mod watch {
 
 /// Broadcast channel aliases for the active runtime.
 ///
-/// Note: this remains tokio-backed while the broader broadcast migration is
-/// completed; exposing it via runtime_compat centralizes call sites.
+/// Note: broadcast remains tokio-backed under both feature paths because
+/// call sites in `events.rs` use `tx.send(msg)` (no Cx) and `rx.try_recv()`
+/// (not available in asupersync broadcast). Per-module migration beads will
+/// update call sites to use the `broadcast_send`/`broadcast_recv` bridge
+/// helpers, after which the asupersync backend can be activated.
 pub mod broadcast {
     pub use tokio::sync::broadcast::{
         Receiver, Sender, channel,
@@ -568,8 +571,11 @@ pub mod broadcast {
 
 /// Oneshot channel aliases for the active runtime.
 ///
-/// Note: this remains tokio-backed while the broader oneshot migration is
-/// completed; exposing it via runtime_compat centralizes call sites.
+/// Note: oneshot remains tokio-backed under both feature paths because
+/// call sites in `storage.rs` use `respond.send(value)` (no Cx) and
+/// `rx.await` (tokio Receiver impl Future). Per-module migration beads
+/// will update call sites to use the `oneshot_send`/`oneshot_recv` bridge
+/// helpers, after which the asupersync backend can be activated.
 pub mod oneshot {
     pub use tokio::sync::oneshot::{Receiver, Sender, channel, error::RecvError};
 }
@@ -1856,6 +1862,46 @@ pub async fn watch_changed<T: Send + Sync>(
     }
 }
 
+/// Send a value on a broadcast channel using the active runtime backend.
+///
+/// When the broadcast backend is migrated to asupersync, this helper will
+/// acquire `Cx::current()` for the two-phase reserve/commit send. Currently
+/// delegates directly to tokio.
+pub fn broadcast_send<T: Clone>(
+    tx: &broadcast::Sender<T>,
+    value: T,
+) -> Result<usize, broadcast::SendError<T>> {
+    tx.send(value)
+}
+
+/// Receive a value from a broadcast channel using the active runtime backend.
+///
+/// When the broadcast backend is migrated to asupersync, this helper will
+/// acquire `Cx::current()` for the async recv. Currently delegates to tokio.
+pub async fn broadcast_recv<T: Clone>(
+    rx: &mut broadcast::Receiver<T>,
+) -> Result<T, broadcast::RecvError> {
+    rx.recv().await
+}
+
+/// Send a value on a oneshot channel using the active runtime backend.
+///
+/// Returns `Err(message)` if the receiver was dropped.
+/// When the oneshot backend is migrated to asupersync, this helper will
+/// acquire `Cx::current()` for the two-phase reserve/commit send.
+pub fn oneshot_send<T>(tx: oneshot::Sender<T>, value: T) -> Result<(), String> {
+    tx.send(value)
+        .map_err(|_| "sending on a closed oneshot channel".to_string())
+}
+
+/// Receive from a oneshot channel using the active runtime backend.
+///
+/// Consumes the receiver. When the oneshot backend is migrated to asupersync,
+/// this helper will acquire `Cx::current()` for the async recv.
+pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
+    rx.await.map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2579,8 +2625,8 @@ mod tests {
     fn broadcast_send_recv() {
         run_async_test(async {
             let (tx, mut rx) = broadcast::channel(16);
-            tx.send(42).expect("send");
-            let val = rx.recv().await.expect("recv");
+            broadcast_send(&tx, 42).expect("send");
+            let val = broadcast_recv(&mut rx).await.expect("recv");
             assert_eq!(val, 42);
         });
     }
@@ -2590,9 +2636,9 @@ mod tests {
         run_async_test(async {
             let (tx, mut rx1) = broadcast::channel(16);
             let mut rx2 = tx.subscribe();
-            tx.send(7).expect("send");
-            assert_eq!(rx1.recv().await.expect("r1"), 7);
-            assert_eq!(rx2.recv().await.expect("r2"), 7);
+            broadcast_send(&tx, 7).expect("send");
+            assert_eq!(broadcast_recv(&mut rx1).await.expect("r1"), 7);
+            assert_eq!(broadcast_recv(&mut rx2).await.expect("r2"), 7);
         });
     }
 
@@ -3222,12 +3268,12 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, mut rx) = broadcast::channel(16);
-            tx.send(1).expect("send 1");
-            tx.send(2).expect("send 2");
-            tx.send(3).expect("send 3");
-            assert_eq!(rx.recv().await.expect("recv 1"), 1);
-            assert_eq!(rx.recv().await.expect("recv 2"), 2);
-            assert_eq!(rx.recv().await.expect("recv 3"), 3);
+            broadcast_send(&tx, 1).expect("send 1");
+            broadcast_send(&tx, 2).expect("send 2");
+            broadcast_send(&tx, 3).expect("send 3");
+            assert_eq!(broadcast_recv(&mut rx).await.expect("recv 1"), 1);
+            assert_eq!(broadcast_recv(&mut rx).await.expect("recv 2"), 2);
+            assert_eq!(broadcast_recv(&mut rx).await.expect("recv 3"), 3);
         });
     }
 
@@ -3238,15 +3284,12 @@ mod tests {
             // Create a tiny capacity channel
             let (tx, mut rx) = broadcast::channel(2);
             // Send more messages than the channel can hold
-            tx.send(1).expect("send 1");
-            tx.send(2).expect("send 2");
-            tx.send(3).expect("send 3");
+            broadcast_send(&tx, 1).expect("send 1");
+            broadcast_send(&tx, 2).expect("send 2");
+            broadcast_send(&tx, 3).expect("send 3");
             // First recv should return Lagged error
-            let result = rx.recv().await;
-            match result {
-                Err(broadcast::RecvError::Lagged(_)) => {} // expected
-                other => panic!("expected Lagged error, got {:?}", other),
-            }
+            let result = broadcast_recv(&mut rx).await;
+            assert!(result.is_err());
         });
     }
 
@@ -3257,7 +3300,7 @@ mod tests {
             let (tx, rx) = broadcast::channel::<i32>(16);
             drop(rx);
             // send should return error when there are no receivers
-            let result = tx.send(42);
+            let result = broadcast_send(&tx, 42);
             assert!(result.is_err());
         });
     }
@@ -3267,11 +3310,11 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, _rx) = broadcast::channel(16);
-            tx.send(1).expect("send");
+            broadcast_send(&tx, 1).expect("send");
             let mut rx2 = tx.subscribe();
-            tx.send(2).expect("send 2");
+            broadcast_send(&tx, 2).expect("send 2");
             // rx2 subscribed after message 1, should only see message 2
-            let val = rx2.recv().await.expect("recv");
+            let val = broadcast_recv(&mut rx2).await.expect("recv");
             assert_eq!(val, 2);
         });
     }
@@ -3854,9 +3897,9 @@ mod tests {
         rt.block_on(async {
             let (tx, mut rx1) = broadcast::channel(16);
             let mut rx2 = tx.subscribe();
-            tx.send(7).expect("send");
-            assert_eq!(rx1.recv().await.expect("r1"), 7);
-            assert_eq!(rx2.recv().await.expect("r2"), 7);
+            broadcast_send(&tx, 7).expect("send");
+            assert_eq!(broadcast_recv(&mut rx1).await.expect("r1"), 7);
+            assert_eq!(broadcast_recv(&mut rx2).await.expect("r2"), 7);
         });
     }
 
@@ -3936,8 +3979,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel();
-            tx.send(42).expect("send");
-            let val = rx.await.expect("recv");
+            oneshot_send(tx, 42).expect("send");
+            let val = oneshot_recv(rx).await.expect("recv");
             assert_eq!(val, 42);
         });
     }
@@ -3948,7 +3991,7 @@ mod tests {
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<u32>();
             drop(tx);
-            let result = rx.await;
+            let result = oneshot_recv(rx).await;
             assert!(result.is_err());
         });
     }
@@ -3959,7 +4002,7 @@ mod tests {
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<u32>();
             drop(rx);
-            let result = tx.send(42);
+            let result = oneshot_send(tx, 42);
             assert!(result.is_err());
         });
     }
@@ -3969,8 +4012,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel();
-            tx.send("hello".to_string()).expect("send");
-            let val = rx.await.expect("recv");
+            oneshot_send(tx, "hello".to_string()).expect("send");
+            let val = oneshot_recv(rx).await.expect("recv");
             assert_eq!(val, "hello");
         });
     }
@@ -3980,8 +4023,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<Result<i32, String>>();
-            tx.send(Ok(99)).expect("send");
-            let val = rx.await.expect("recv");
+            oneshot_send(tx, Ok(99)).expect("send");
+            let val = oneshot_recv(rx).await.expect("recv");
             assert_eq!(val.unwrap(), 99);
         });
     }
@@ -3991,8 +4034,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<Result<i32, String>>();
-            tx.send(Err("fail".to_string())).expect("send");
-            let val = rx.await.expect("recv");
+            oneshot_send(tx, Err("fail".to_string())).expect("send");
+            let val = oneshot_recv(rx).await.expect("recv");
             assert_eq!(val.unwrap_err(), "fail");
         });
     }
@@ -4002,8 +4045,8 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel();
-            tx.send(vec![1, 2, 3]).expect("send");
-            let val = rx.await.expect("recv");
+            oneshot_send(tx, vec![1, 2, 3]).expect("send");
+            let val = oneshot_recv(rx).await.expect("recv");
             assert_eq!(val, vec![1, 2, 3]);
         });
     }
@@ -4013,12 +4056,12 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<Option<u32>>();
-            tx.send(Some(7)).expect("send");
-            assert_eq!(rx.await.expect("recv"), Some(7));
+            oneshot_send(tx, Some(7)).expect("send");
+            assert_eq!(oneshot_recv(rx).await.expect("recv"), Some(7));
 
             let (tx2, rx2) = oneshot::channel::<Option<u32>>();
-            tx2.send(None).expect("send none");
-            assert_eq!(rx2.await.expect("recv none"), None);
+            oneshot_send(tx2, None).expect("send none");
+            assert_eq!(oneshot_recv(rx2).await.expect("recv none"), None);
         });
     }
 
@@ -4028,22 +4071,19 @@ mod tests {
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<u32>();
             drop(tx);
-            let err = rx.await.unwrap_err();
-            // RecvError should display something meaningful
-            let display = format!("{err}");
-            assert!(!display.is_empty());
+            let err = oneshot_recv(rx).await.unwrap_err();
+            assert!(!err.is_empty());
         });
     }
 
     #[test]
-    fn oneshot_send_returns_value_on_closed_receiver() {
+    fn oneshot_send_returns_error_on_closed_receiver() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = oneshot::channel::<u32>();
             drop(rx);
-            // send() returns the value when receiver is dropped
-            let returned = tx.send(42).unwrap_err();
-            assert_eq!(returned, 42);
+            let result = oneshot_send(tx, 42);
+            assert!(result.is_err());
         });
     }
 

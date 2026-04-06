@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::PaneFilterConfig;
 use crate::policy::{InjectionResult, PaneCapabilities};
 use crate::query_contract::UnifiedSearchMode;
+use crate::storage::PaneRecord;
 use crate::wezterm::PaneInfo;
 
 pub(super) const MCP_VERSION: &str = "v1";
@@ -827,6 +828,21 @@ impl McpPaneState {
             cwd: info.cwd.clone(),
             observed: ignore_reason.is_none(),
             ignore_reason,
+        }
+    }
+
+    pub fn from_pane_record(record: &PaneRecord) -> Self {
+        Self {
+            pane_id: record.pane_id,
+            pane_uuid: record.pane_uuid.clone(),
+            // Distributed panes are persisted without a live local tab/window.
+            tab_id: record.tab_id.unwrap_or(0),
+            window_id: record.window_id.unwrap_or(0),
+            domain: record.domain.clone(),
+            title: record.title.clone(),
+            cwd: record.cwd.clone(),
+            observed: record.observed,
+            ignore_reason: record.ignore_reason.clone(),
         }
     }
 }

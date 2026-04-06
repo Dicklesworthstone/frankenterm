@@ -39,7 +39,10 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .on_shutdown(|| {
             tracing::info!("MCP server shutting down");
         })
-        .tool(FormatAwareToolHandler::new(WaStateTool::new(filter)))
+        .tool(FormatAwareToolHandler::new(WaStateTool::new(
+            filter,
+            db_path.clone(),
+        )))
         .tool(FormatAwareToolHandler::new(WaWaitForTool))
         .tool(FormatAwareToolHandler::new(WaRulesListTool))
         .tool(FormatAwareToolHandler::new(WaRulesTestTool))
@@ -73,7 +76,10 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaMissionAbortTool::new(
             Arc::clone(&config),
         )))
-        .resource(WaPanesResource::new(config.ingest.panes.clone()))
+        .resource(WaPanesResource::new(
+            config.ingest.panes.clone(),
+            db_path.clone(),
+        ))
         .resource(WaWorkflowsResource::new(Arc::clone(&config)))
         .resource(WaRulesResource)
         .resource(WaRulesByAgentTemplateResource);
