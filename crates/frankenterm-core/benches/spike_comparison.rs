@@ -297,7 +297,7 @@ fn bench_select_race(c: &mut Criterion) {
     group.bench_function("asupersync", |b| {
         b.iter(|| {
             let selected = asup_rt.block_on(async { Select::new(ready(1_u8), ready(2_u8)).await });
-            black_box(selected.is_left());
+            black_box(selected.expect("select ready futures").is_left());
 
             let cx = Cx::for_testing();
             let futures: Vec<Pin<Box<dyn std::future::Future<Output = u8> + Send>>> =

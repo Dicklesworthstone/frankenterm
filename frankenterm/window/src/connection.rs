@@ -184,7 +184,7 @@ mod tests {
             Poll::Ready(Err(err)) => {
                 assert_eq!(err.to_string(), "Wayland window 42 has been destroyed");
             }
-            other => panic!("expected Ready(Err), got {other:?}"),
+            other => panic!("expected Ready(Err), got {:?}", other),
         }
     }
 }

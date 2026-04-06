@@ -113,7 +113,7 @@ pub fn refresh_appearance_in_background() {
 
             match &refreshed {
                 Ok(appearance) => {
-                    let changed = state.appearance != CachedAppearance::Some(appearance);
+                    let changed = state.appearance != CachedAppearance::Some(*appearance);
                     state.appearance = CachedAppearance::Some(*appearance);
                     changed.then_some(*appearance)
                 }
