@@ -169,6 +169,11 @@ The distributed wire protocol provides:
 - Stale-session pruning with configurable idle thresholds
 - Local receipt-clock decisions (untrusted remote clocks not used for liveness)
 
+Operational topology:
+- Run `ft watch` on the aggregator host with `[distributed].enabled = true`; the watcher starts the distributed listener alongside normal local capture.
+- Run `ft distributed agent --connect <host:port> --agent-id <name>` on remote hosts to stream pane metadata, deltas, gaps, and detections into the aggregator.
+- Persisted remote panes then appear in `ft status`, `ft query` / `ft search`, `ft robot state`, MCP `wa.state`, and the `wa://panes` resource. Remote output remains searchable through the normal SQLite-backed query surfaces.
+
 Operator guidance:
 - Keep `distributed.bind_addr` on loopback unless you explicitly need remote access.
 - For non-loopback binds, enable TLS and use file/env token sources (avoid inline tokens).
@@ -229,6 +234,9 @@ cp target/release/ft ~/.local/bin/
 ```bash
 # MCP server support
 cargo build -p frankenterm --release --features mcp
+
+# Web API with SSE event/delta streaming
+cargo build -p frankenterm --release --features web
 
 # Distributed mode (agent streaming)
 cargo build -p frankenterm --release --features distributed
@@ -326,6 +334,27 @@ ft robot wait-for 0 "codex.usage.reached"
 ft robot send 0 "/compact"
 ```
 
+### 7. Stream Live Updates (optional `web` feature)
+
+```bash
+# Start the local web server
+ft web
+
+# Subscribe to all live events as Server-Sent Events
+curl -N http://127.0.0.1:8000/stream/events
+
+# Subscribe only to detection events for a single pane
+curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
+
+# Subscribe to captured output deltas for one pane
+curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+```
+
+Notes:
+- `/stream/events` streams live `EventBus` traffic as `text/event-stream`.
+- `/stream/deltas` streams redacted pane output deltas and gap markers from storage.
+- `max_hz` bounds fan-out rate; `pane_id` narrows to one pane; `channel` accepts `all`, `deltas`, `detections`, or `signals`.
+
 ---
 
 ## Commands
@@ -417,6 +446,25 @@ ft reproduce --kind crash               # Export latest crash bundle
 ft doctor                               # Environment health check
 ft doctor --json                        # Machine-readable diagnostics
 ```
+
+### Web API (feature-gated)
+
+Build with `--features web`, then run `ft web` to expose a local HTTP surface on `127.0.0.1:8000` by default.
+
+```bash
+ft web                                  # Start the local web server
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/panes
+curl -N http://127.0.0.1:8000/stream/events
+curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=3&max_hz=50"
+```
+
+Streaming query parameters:
+- `pane_id` filters to one pane.
+- `max_hz` caps delivery rate for backpressure control.
+- `/stream/events` also accepts `channel=all|deltas|detections|signals`.
+
+Streaming responses use schema `ft.stream.v1`, send keepalive comments when idle, and redact secret material before emission.
 
 ### Robot Mode (JSON API)
 

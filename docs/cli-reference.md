@@ -16,6 +16,22 @@ ft show <pane_id> [--output]        # stub (not yet implemented)
 ft get-text <pane_id> [--tail <n>] [--escapes]
 ```
 
+Distributed mode notes:
+- With `--features distributed` and `[distributed].enabled = true`, `ft watch` also acts as the aggregator listener.
+- Remote agents connect with `ft distributed agent --connect <host:port> --agent-id <name>`.
+- Aggregated remote panes are persisted into the same DB and surface through `ft status`, `ft query` / `ft search`, `ft robot state`, MCP `wa.state`, and `wa://panes`.
+
+### Distributed mode
+
+```bash
+ft distributed agent [--connect <host:port>] [--connect-addr <host:port>] [--agent-id <name>]
+```
+
+Behavior notes:
+- `--connect` overrides both `--connect-addr` and the config default for a single run.
+- `--connect-addr` separates the agent's upstream target from the server-side `distributed.bind_addr`.
+- Live readback for distributed panes is not available through `get-text`; use the normal search/query surfaces against persisted output instead.
+
 ### Search and events
 
 ```bash
@@ -102,6 +118,53 @@ ft diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
 ft reproduce [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
 ```
 
+### Web server and streaming API
+
+Requires `--features web`.
+
+```bash
+ft web [--port <n>]
+```
+
+Default bind is `127.0.0.1:8000`. The web server exposes:
+
+```bash
+GET /health
+GET /panes
+GET /events
+GET /search
+GET /bookmarks
+GET /ruleset-profile
+GET /saved-searches
+GET /stream/events
+GET /stream/deltas
+```
+
+Streaming endpoints return `text/event-stream` with schema `ft.stream.v1`.
+
+`/stream/events` query parameters:
+- `channel=<all|deltas|detections|signals>` to select the live bus lane
+- `pane_id=<id>` to filter to one pane
+- `max_hz=<n>` to cap event delivery rate
+
+`/stream/deltas` query parameters:
+- `pane_id=<id>` to stream one pane's captured output
+- `max_hz=<n>` to cap frame rate
+
+Examples:
+
+```bash
+ft web
+curl -N http://127.0.0.1:8000/stream/events
+curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
+curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
+```
+
+Behavior notes:
+- Streams emit keepalive comments while idle.
+- Secret material is redacted before SSE frames are emitted.
+- Bounded channels and `max_hz` provide fan-out backpressure control.
+
 ### Setup and config
 
 ```bash
@@ -151,7 +214,7 @@ Notes:
 ```bash
 ft tui          # requires --features tui
 ft mcp serve    # requires --features mcp
-ft web          # requires --features web
+ft web          # requires --features web; serves HTTP + SSE `/stream/*`
 ft sync         # requires --features sync
 ```
 
