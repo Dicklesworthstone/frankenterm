@@ -109,6 +109,7 @@ pub use reranker::CrossEncoderReranker;
 #[must_use]
 pub fn advertised_embedder_tiers(search_enabled: bool, reranker_enabled: bool) -> Vec<String> {
     let _ = (search_enabled, reranker_enabled);
+    #[allow(unused_mut)] // mut needed when semantic-search feature is enabled
     let mut tiers = vec!["hash".to_string()];
 
     #[cfg(feature = "semantic-search")]
