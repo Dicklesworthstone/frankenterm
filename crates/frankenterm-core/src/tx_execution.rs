@@ -23,6 +23,7 @@ use crate::plan::{
     TxPreparePolicyAuthorizer, TxPrepareReport, TxPrepareTargetLookup, evaluate_prepare_phase,
     execute_commit_phase, execute_compensation_phase,
 };
+use crate::runtime_compat::CompatRuntime;
 use crate::tx_idempotency::{
     IdempotencyKey, IdempotencyStore, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
 };
@@ -298,7 +299,8 @@ fn execute_step_action(
                 crate::plan::WaitCondition::StableTail { .. } => String::new(),
                 crate::plan::WaitCondition::External { key } => key.clone(),
             };
-            let timeout = std::time::Duration::from_millis(*timeout_ms);
+            let timeout_val = *timeout_ms;
+            let timeout = std::time::Duration::from_millis(timeout_val);
             let h = handle.clone();
             let result = std::thread::spawn(move || {
                 let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
@@ -323,7 +325,7 @@ fn execute_step_action(
                         }
                         if std::time::Instant::now() >= deadline {
                             return Err(crate::Error::Runtime(format!(
-                                "wait_for timed out after {timeout_ms}ms on pane {target_pane}"
+                                "wait_for timed out after {timeout_val}ms on pane {target_pane}"
                             )));
                         }
                         std::thread::sleep(poll_interval);
