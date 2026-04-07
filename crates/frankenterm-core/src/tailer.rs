@@ -2659,8 +2659,15 @@ mod tests {
 
     #[test]
     fn detect_mode_with_socket_path_config() {
+        // discover_mux_socket requires the path to exist on disk.
+        let sock_path = std::env::temp_dir().join(format!(
+            "ft-test-mux-{}.sock",
+            std::process::id()
+        ));
+        std::fs::write(&sock_path, b"").expect("create temp socket file");
+
         let mut config = crate::config::Config::default();
-        config.vendored.mux_socket_path = Some("/tmp/test-mux.sock".to_string());
+        config.vendored.mux_socket_path = Some(sock_path.to_string_lossy().to_string());
         #[cfg(feature = "vendored")]
         {
             assert_eq!(
@@ -2676,6 +2683,8 @@ mod tests {
         {
             assert_eq!(detect_tailer_mode(&config), TailerMode::Polling);
         }
+
+        let _ = std::fs::remove_file(&sock_path);
     }
 
     #[test]

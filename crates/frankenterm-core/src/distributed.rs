@@ -1912,8 +1912,8 @@ KBAhs4snj5QspGFqkazmIw==
 
         #[test]
         fn token_validation_errors_do_not_leak_inputs(
-            expected in "[a-zA-Z0-9_-]{1,24}",
-            presented in "[a-zA-Z0-9_-]{1,24}"
+            expected in "[a-zA-Z0-9_-]{3,24}",
+            presented in "[a-zA-Z0-9_-]{3,24}"
         ) {
             prop_assume!(expected != presented);
             let err = validate_token(

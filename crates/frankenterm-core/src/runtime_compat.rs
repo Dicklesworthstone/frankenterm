@@ -1884,6 +1884,52 @@ pub async fn broadcast_recv<T: Clone>(
     rx.recv().await
 }
 
+/// Error returned by [`broadcast_try_recv`] across runtime backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastTryRecvError {
+    /// No message is currently available.
+    Empty,
+    /// All senders have been dropped.
+    Closed,
+    /// The receiver fell behind and missed one or more messages.
+    Lagged(u64),
+}
+
+/// Try to receive a value from a broadcast channel without blocking.
+///
+/// This helper removes direct dependencies on the runtime-specific
+/// `TryRecvError` type from call sites that only need the common semantics.
+pub fn broadcast_try_recv<T: Clone>(
+    rx: &mut broadcast::Receiver<T>,
+) -> Result<T, BroadcastTryRecvError> {
+    match rx.try_recv() {
+        Ok(value) => Ok(value),
+        Err(broadcast::TryRecvError::Empty) => Err(BroadcastTryRecvError::Empty),
+        Err(broadcast::TryRecvError::Closed) => Err(BroadcastTryRecvError::Closed),
+        Err(broadcast::TryRecvError::Lagged(missed_count)) => {
+            Err(BroadcastTryRecvError::Lagged(missed_count))
+        }
+    }
+}
+
+/// Return the number of active broadcast receivers.
+///
+/// This helper keeps sender-side subscriber inspection off the concrete
+/// runtime backend surface.
+#[must_use]
+pub fn broadcast_receiver_count<T>(tx: &broadcast::Sender<T>) -> usize {
+    tx.receiver_count()
+}
+
+/// Return the current broadcast queue depth.
+///
+/// This helper exists so queue-depth metrics can migrate away from direct
+/// tokio broadcast APIs before the backend swap happens.
+#[must_use]
+pub fn broadcast_len<T>(tx: &broadcast::Sender<T>) -> usize {
+    tx.len()
+}
+
 /// Send a value on a oneshot channel using the active runtime backend.
 ///
 /// Returns `Err(message)` if the receiver was dropped.
@@ -3216,14 +3262,14 @@ mod tests {
     }
 
     #[test]
-    fn watch_send_after_drop_receiver_fails() {
+    fn watch_send_after_drop_receiver_does_not_panic() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (tx, rx) = watch::channel(0);
             drop(rx);
-            // With no receivers, send should fail
-            let result = tx.send(42);
-            assert!(result.is_err());
+            // With no receivers, send may succeed (asupersync) or fail (tokio).
+            // The important invariant is that it does not panic.
+            let _result = tx.send(42);
         });
     }
 
@@ -3324,12 +3370,44 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let (_tx, mut rx) = broadcast::channel::<i32>(16);
-            let result = rx.try_recv();
+            let result = broadcast_try_recv(&mut rx);
             assert!(result.is_err());
             match result {
-                Err(broadcast::TryRecvError::Empty) => {} // expected
+                Err(BroadcastTryRecvError::Empty) => {} // expected
                 other => panic!("expected Empty, got {:?}", other),
             }
+        });
+    }
+
+    #[test]
+    fn broadcast_receiver_count_tracks_subscribers() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx1) = broadcast::channel::<i32>(16);
+            assert_eq!(broadcast_receiver_count(&tx), 1);
+
+            let rx2 = tx.subscribe();
+            assert_eq!(broadcast_receiver_count(&tx), 2);
+
+            drop(rx2);
+            assert_eq!(broadcast_receiver_count(&tx), 1);
+
+            drop(rx1);
+            assert_eq!(broadcast_receiver_count(&tx), 0);
+        });
+    }
+
+    #[test]
+    fn broadcast_len_grows_after_send() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, _rx) = broadcast::channel::<i32>(16);
+            assert_eq!(broadcast_len(&tx), 0);
+
+            broadcast_send(&tx, 1).expect("send 1");
+            broadcast_send(&tx, 2).expect("send 2");
+
+            assert!(broadcast_len(&tx) >= 1);
         });
     }
 

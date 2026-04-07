@@ -3639,9 +3639,15 @@ mod tests {
             assert_eq!(r1.events_read, 3);
             assert!(!r1.caught_up);
 
-            // Second run: should pick up remaining 3
+            // Second run: should pick up remaining 3. Use unlimited batches
+            // so the reader can discover EOF and set caught_up.
+            let icfg2 = IndexerConfig {
+                batch_size: 3,
+                max_batches: 0, // unlimited
+                ..test_indexer_config(dir.path())
+            };
             let writer2 = MockIndexWriter::new();
-            let mut indexer2 = IncrementalIndexer::new(icfg, writer2);
+            let mut indexer2 = IncrementalIndexer::new(icfg2, writer2);
             let r2 = indexer2.run_with_reader(&storage, &source).await.unwrap();
             assert_eq!(r2.events_read, 3);
             assert!(r2.caught_up);
