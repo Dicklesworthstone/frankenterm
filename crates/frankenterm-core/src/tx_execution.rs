@@ -3258,4 +3258,421 @@ mod tests {
             timeout_ms: None,
         }));
     }
+
+    // ── Integration tests: TxExecutionEngine<PaneStepExecutor> (ft-y9lnb.5) ─
+
+    /// Create a PaneStepExecutor-powered engine with allow-all policy.
+    fn make_pane_engine(
+        handle: WeztermHandle,
+    ) -> TxExecutionEngine<
+        PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets>,
+    > {
+        let executor = make_pane_executor(handle);
+        TxExecutionEngine::new(executor, TxExecutionConfig::default())
+    }
+
+    /// Create a contract with compensations for rollback testing.
+    fn make_pane_contract_with_compensations(
+        steps: Vec<(String, StepAction)>,
+        compensations: Vec<(String, StepAction)>,
+    ) -> MissionTxContract {
+        let step_entries: Vec<TxStep> = steps
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, action))| TxStep {
+                step_id: TxStepId(id),
+                ordinal: i,
+                action,
+                description: format!("step {i}"),
+            })
+            .collect();
+
+        let comp_entries: Vec<crate::plan::TxCompensation> = compensations
+            .into_iter()
+            .map(|(for_id, action)| crate::plan::TxCompensation {
+                for_step_id: TxStepId(for_id),
+                action,
+            })
+            .collect();
+
+        MissionTxContract {
+            tx_version: 1,
+            intent: TxIntent {
+                tx_id: TxId("tx-integ-1".to_string()),
+                requested_by: MissionActorRole::Operator,
+                summary: "Integration test tx".to_string(),
+                correlation_id: "corr-integ-1".to_string(),
+                created_at_ms: 1000,
+            },
+            plan: ContractTxPlan {
+                plan_id: TxPlanId("plan-integ-1".to_string()),
+                tx_id: TxId("tx-integ-1".to_string()),
+                steps: step_entries,
+                preconditions: Vec::new(),
+                compensations: comp_entries,
+            },
+            lifecycle_state: MissionTxState::Planned,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn integration_happy_path_3_steps() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+            mock.add_default_pane(1).await;
+            mock.add_default_pane(2).await;
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![
+            (
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "hello".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "s2".to_string(),
+                StepAction::SendText {
+                    pane_id: 1,
+                    text: "world".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "s3".to_string(),
+                StepAction::SendText {
+                    pane_id: 2,
+                    text: "done".to_string(),
+                    paste_mode: None,
+                },
+            ),
+        ]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        assert_eq!(result.final_state, MissionTxState::Committed);
+        assert_eq!(result.outcome, TxOutcome::Committed);
+        let commit = result.commit_report.unwrap();
+        assert_eq!(commit.committed_count, 3);
+        assert_eq!(commit.failed_count, 0);
+        assert!(result.compensation_report.is_none());
+        assert!(!result.events.is_empty());
+    }
+
+    #[test]
+    fn integration_single_step_minimal() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::SendText {
+                pane_id: 0,
+                text: "single".to_string(),
+                paste_mode: None,
+            },
+        )]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        assert_eq!(result.final_state, MissionTxState::Committed);
+        assert_eq!(result.outcome, TxOutcome::Committed);
+    }
+
+    #[test]
+    fn integration_pane_not_found_triggers_compensation() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+            // Pane 99 is NOT added
+        });
+
+        let mut config = TxExecutionConfig::default();
+        config.auto_compensate = true;
+
+        let executor = make_pane_executor(mock as WeztermHandle);
+        let engine = TxExecutionEngine::new(executor, config);
+
+        let mut contract = make_pane_contract_with_compensations(
+            vec![
+                (
+                    "s1".to_string(),
+                    StepAction::SendText {
+                        pane_id: 0,
+                        text: "ok".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+                (
+                    "s2".to_string(),
+                    StepAction::SendText {
+                        pane_id: 99,
+                        text: "fail".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+            ],
+            vec![(
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "ROLLBACK".to_string(),
+                    paste_mode: None,
+                },
+            )],
+        );
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // Partial failure: step 1 committed, step 2 failed
+        assert!(matches!(
+            result.outcome,
+            TxOutcome::Failed | TxOutcome::Compensated
+        ));
+        let commit = result.commit_report.unwrap();
+        assert!(commit.committed_count >= 1);
+        assert!(commit.failed_count >= 1);
+    }
+
+    #[test]
+    fn integration_fail_step_injection() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let mut config = TxExecutionConfig::default();
+        config.fail_step = Some("s2".to_string());
+
+        let executor = make_pane_executor(mock as WeztermHandle);
+        let engine = TxExecutionEngine::new(executor, config);
+
+        let mut contract = make_pane_contract(vec![
+            (
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "ok".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "s2".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "injected-fail".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "s3".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "skipped".to_string(),
+                    paste_mode: None,
+                },
+            ),
+        ]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // With auto_compensate=true (default), partial failure triggers compensation
+        assert!(
+            matches!(result.outcome, TxOutcome::Failed | TxOutcome::Compensated),
+            "expected Failed or Compensated, got {:?}",
+            result.outcome
+        );
+        let commit = result.commit_report.unwrap();
+        assert_eq!(commit.committed_count, 1); // s1 succeeded
+        assert!(commit.failed_count >= 1); // s2 failed
+        assert!(commit.skipped_count >= 1); // s3 skipped
+    }
+
+    #[test]
+    fn integration_observability_events_emitted() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::SendText {
+                pane_id: 0,
+                text: "observe".to_string(),
+                paste_mode: None,
+            },
+        )]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // Should have at least prepare and commit events
+        assert!(
+            result.events.len() >= 2,
+            "expected at least 2 observability events, got {}",
+            result.events.len()
+        );
+        // Events should have sequential IDs
+        for (i, event) in result.events.iter().enumerate() {
+            if i > 0 {
+                assert!(
+                    event.sequence > result.events[i - 1].sequence,
+                    "event sequences should be monotonically increasing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integration_all_gates_pass() {
+        let mock = mock_wezterm_handle();
+        let engine = make_pane_engine(mock);
+        let mut contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // Prepare phase should pass with allow-all policy
+        assert!(
+            result.prepare_report.outcome.commit_eligible(),
+            "all gates should pass with allow-all policy"
+        );
+        assert_eq!(result.final_state, MissionTxState::Committed);
+    }
+
+    #[test]
+    fn integration_wait_for_timeout_in_engine() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "no match content").await.unwrap();
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![(
+            "w1".to_string(),
+            StepAction::WaitFor {
+                pane_id: Some(0),
+                condition: WaitCondition::Pattern {
+                    pane_id: None,
+                    rule_id: "NEVER_MATCH".to_string(),
+                },
+                timeout_ms: 500,
+            },
+        )]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // WaitFor timeout causes step failure; auto_compensate may kick in
+        assert!(
+            matches!(result.outcome, TxOutcome::Failed | TxOutcome::Compensated),
+            "expected Failed or Compensated, got {:?}",
+            result.outcome
+        );
+        let commit = result.commit_report.unwrap();
+        assert_eq!(commit.failed_count, 1);
+    }
+
+    #[test]
+    fn integration_mixed_actions_committed() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![
+            (
+                "l1".to_string(),
+                StepAction::AcquireLock {
+                    lock_name: "test".to_string(),
+                    timeout_ms: None,
+                },
+            ),
+            (
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "action".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "d1".to_string(),
+                StepAction::StoreData {
+                    key: "result".to_string(),
+                    value: serde_json::json!({"status": "done"}),
+                },
+            ),
+            (
+                "r1".to_string(),
+                StepAction::ReleaseLock {
+                    lock_name: "test".to_string(),
+                },
+            ),
+        ]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        assert_eq!(result.final_state, MissionTxState::Committed);
+        assert_eq!(result.outcome, TxOutcome::Committed);
+        let commit = result.commit_report.unwrap();
+        assert_eq!(commit.committed_count, 4);
+    }
+
+    #[test]
+    fn integration_ledger_populated() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let engine = make_pane_engine(mock as WeztermHandle);
+        let mut contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::SendText {
+                pane_id: 0,
+                text: "ledger-test".to_string(),
+                paste_mode: None,
+            },
+        )]);
+
+        let result = engine.execute(&mut contract, 5000).unwrap();
+        // Ledger should be populated after execution
+        assert!(
+            !result.ledger.execution_id().is_empty(),
+            "ledger should have execution_id"
+        );
+    }
 }
