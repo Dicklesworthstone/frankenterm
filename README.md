@@ -8,12 +8,14 @@
 
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
-[![Lines of Code](https://img.shields.io/badge/core%20library-775k%20lines-blue.svg)]()
+[![Lines of Code](https://img.shields.io/badge/core%20library-790k%2B%20lines-blue.svg)]()
 [![Tests](https://img.shields.io/badge/tests-45k%2B-green.svg)]()
 
 </div>
 
-**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 120 workspace crates. 482 core modules. 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
+**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 54 workspace crates. 483 core modules. 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
+
+_Summary counts last verified against the current checkout on April 6, 2026: 54 workspace crates, 47 vendored workspace crates under `frankenterm/`, 483 `crates/frankenterm-core/src` Rust modules, and 790k+ core-library Rust lines._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -699,10 +701,10 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # 120 workspace crates
+frankenterm/                              # 54 workspace crates
 ├── crates/
-│   ├── frankenterm/                      # CLI binary (ft) — 53k lines
-│   ├── frankenterm-core/                 # Core library — 482 modules, 775k lines
+│   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
+│   ├── frankenterm-core/                 # Core library — 483 modules, 790k+ lines
 │   │   ├── src/
 │   │   │   ├── runtime.rs               # Observation runtime orchestration
 │   │   │   ├── ingest.rs                # Pane discovery + delta extraction
@@ -721,12 +723,12 @@ frankenterm/                              # 120 workspace crates
 │   │   │   ├── scan_pipeline.rs         # SIMD scan + trigger + compression
 │   │   │   ├── wire_protocol.rs         # Distributed messaging
 │   │   │   └── ...                      # 400+ additional modules
-│   │   ├── tests/                       # 696 test files, 496 proptest suites
-│   │   └── benches/                     # 62 Criterion benchmarks
+│   │   ├── tests/                       # 711 test files, 500+ proptest suites
+│   │   └── benches/                     # 65 Criterion benchmarks
 │   ├── frankenterm-gui/                  # GUI binary crate
 │   ├── frankenterm-mux-server/           # Headless mux server
 │   └── frankenterm-alloc/                # Allocator/telemetry support
-├── frankenterm/                          # In-tree vendored crates (105 crates)
+├── frankenterm/                          # In-tree vendored workspace crates (47 crates)
 │   ├── codec/                           # Wire codec
 │   ├── config/                          # Config subsystem
 │   ├── mux/                             # Multiplexer
@@ -1156,6 +1158,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*120 crates. 482 modules. 775,000 lines. 45,000 tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*54 crates. 483 modules. 790,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
