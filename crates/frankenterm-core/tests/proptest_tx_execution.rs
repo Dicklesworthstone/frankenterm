@@ -438,4 +438,32 @@ proptest! {
             "must emit CommitCompleted event"
         );
     }
+
+    // ── PaneStepExecutorConfig (ft-y9lnb.4) ────────────────────────────
+
+    #[test]
+    fn pane_step_config_serde_roundtrip(
+        default_send in 1000u64..120_000,
+        phase_buffer in 0u64..120_000,
+        bp_enabled in any::<bool>(),
+    ) {
+        let config = PaneStepExecutorConfig {
+            default_send_timeout_ms: default_send,
+            phase_timeout_buffer_ms: phase_buffer,
+            backpressure_enabled: bp_enabled,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: PaneStepExecutorConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(restored.default_send_timeout_ms, config.default_send_timeout_ms);
+        prop_assert_eq!(restored.phase_timeout_buffer_ms, config.phase_timeout_buffer_ms);
+        prop_assert_eq!(restored.backpressure_enabled, config.backpressure_enabled);
+    }
+
+    #[test]
+    fn pane_step_config_default_values(_dummy in 0u8..1) {
+        let config = PaneStepExecutorConfig::default();
+        prop_assert_eq!(config.default_send_timeout_ms, 30_000);
+        prop_assert_eq!(config.phase_timeout_buffer_ms, 30_000);
+        prop_assert!(config.backpressure_enabled);
+    }
 }
