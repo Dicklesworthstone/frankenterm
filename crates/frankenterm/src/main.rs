@@ -15,12 +15,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
+use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
 use frankenterm_core::plan::mission_tx_synthetic_commit_report as build_robot_tx_synthetic_commit_report;
+#[cfg(test)]
 use frankenterm_core::plan::{
     mission_tx_commit_step_inputs as build_robot_tx_commit_step_inputs,
     mission_tx_compensation_inputs as build_robot_tx_compensation_inputs,
-    mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report,
     tx_prepare_gate_inputs_allow_all as build_robot_tx_prepare_gate_inputs,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
@@ -3193,6 +3194,10 @@ enum RobotTxCommands {
         /// Kill-switch level for prepare/commit gates
         #[arg(long, value_enum, default_value = "off")]
         kill_switch: RobotMissionKillSwitchLevelArg,
+
+        /// Preview prepare-phase results without executing commit/compensation
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Execute compensation phase (rollback) for committed steps
     Rollback {
@@ -3618,6 +3623,10 @@ enum TxCommands {
         /// Kill-switch level for prepare/commit gates
         #[arg(long, value_enum, default_value = "off")]
         kill_switch: RobotMissionKillSwitchLevelArg,
+
+        /// Preview prepare-phase results without executing commit/compensation
+        #[arg(long)]
+        dry_run: bool,
 
         /// Output format: plain or json
         #[arg(long, short = 'f', default_value = "plain", value_parser = ["plain", "json"])]
@@ -20601,10 +20610,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     fail_step,
                                     paused,
                                     kill_switch,
+                                    dry_run,
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
+                                    let mut contract =
                                         match load_mission_tx_contract_from_path(&contract_path) {
                                             Ok(contract) => contract,
                                             Err(err) => {
@@ -20638,135 +20648,113 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     let now_ms = mission_now_ms();
-                                    let gate_inputs = build_robot_tx_prepare_gate_inputs(&contract);
-                                    let prepare_report =
-                                        match frankenterm_core::plan::evaluate_prepare_phase(
-                                            &contract.intent.tx_id,
-                                            &contract.plan,
-                                            &gate_inputs,
-                                            kill_switch.into(),
-                                            now_ms,
-                                        ) {
-                                            Ok(report) => report,
-                                            Err(err) => {
-                                                let response =
-                                                    RobotResponse::<RobotTxRunData>::error_with_code(
-                                                        "robot.tx_execution_failed",
-                                                        format!(
-                                                            "prepare phase failed: {err}"
-                                                        ),
-                                                        None,
-                                                        elapsed_ms(start),
-                                                    );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
-
-                                    let mut commit_report = None;
-                                    let mut compensation_report = None;
-                                    let mut final_state = match prepare_report.outcome {
-                                        frankenterm_core::plan::TxPrepareOutcome::AllReady => {
-                                            frankenterm_core::plan::MissionTxState::Prepared
-                                        }
-                                        frankenterm_core::plan::TxPrepareOutcome::RequireApproval => {
-                                            frankenterm_core::plan::MissionTxState::Planned
-                                        }
-                                        frankenterm_core::plan::TxPrepareOutcome::Denied => {
-                                            frankenterm_core::plan::MissionTxState::Failed
-                                        }
-                                        frankenterm_core::plan::TxPrepareOutcome::Deferred => {
-                                            frankenterm_core::plan::MissionTxState::Planned
-                                        }
+                                    let kill_switch = kill_switch.into();
+                                    let (real_runtime, fallback_reason) =
+                                        resolve_real_tx_runtime(&config, &layout).await;
+                                    let executor_label = if real_runtime.is_some() {
+                                        "pane_executor"
+                                    } else {
+                                        "synthetic_fallback"
                                     };
-
-                                    if prepare_report.outcome.commit_eligible() {
-                                        let mut prepared_contract = contract.clone();
-                                        prepared_contract.lifecycle_state =
-                                            frankenterm_core::plan::MissionTxState::Prepared;
-                                        let commit_inputs = build_robot_tx_commit_step_inputs(
-                                            &prepared_contract,
-                                            fail_step.as_deref(),
-                                            now_ms,
+                                    tracing::info!(
+                                        command = "robot.tx.run",
+                                        tx_id = %contract.intent.tx_id.0,
+                                        plan_id = %contract.plan.plan_id.0,
+                                        contract_file = %contract_path.display(),
+                                        executor_type = executor_label,
+                                        dry_run,
+                                        paused,
+                                        fail_step = fail_step.as_deref().unwrap_or(""),
+                                        "robot tx run starting"
+                                    );
+                                    let data = if let Some((storage, wezterm)) = real_runtime {
+                                        let policy_engine = std::cell::RefCell::new(
+                                            frankenterm_core::policy::PolicyEngine::new(
+                                                config.safety.rate_limit_per_pane,
+                                                config.safety.rate_limit_global,
+                                                config.safety.require_prompt_active,
+                                            )
+                                            .with_tuning(&config.tuning)
+                                            .with_command_gate_config(
+                                                config.safety.command_gate.clone(),
+                                            )
+                                            .with_policy_rules(config.safety.rules.clone()),
                                         );
-
-                                        let commit =
-                                            match frankenterm_core::plan::execute_commit_phase(
-                                                &prepared_contract,
-                                                &commit_inputs,
-                                                kill_switch.into(),
-                                                paused,
-                                                now_ms,
-                                            ) {
-                                                Ok(report) => report,
-                                                Err(err) => {
-                                                    let response =
-                                                    RobotResponse::<RobotTxRunData>::error_with_code(
-                                                        "robot.tx_execution_failed",
-                                                        format!(
-                                                            "commit phase failed: {err}"
-                                                        ),
-                                                        None,
-                                                        elapsed_ms(start),
-                                                    );
-                                                    print_robot_response(&response, format, stats)?;
-                                                    return Ok(());
-                                                }
-                                            };
-
-                                        final_state = commit.outcome.target_tx_state();
-                                        if commit.failed_count > 0 && commit.committed_count > 0 {
-                                            let mut compensating_contract =
-                                                prepared_contract.clone();
-                                            compensating_contract.lifecycle_state =
-                                                frankenterm_core::plan::MissionTxState::Compensating;
-                                            compensating_contract
-                                                .receipts
-                                                .clone_from(&commit.receipts);
-                                            let comp_inputs = build_robot_tx_compensation_inputs(
-                                                &commit, None, now_ms,
+                                        let approvals =
+                                            frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
+                                                Some(&storage),
                                             );
-                                            let compensation =
-                                                match frankenterm_core::plan::execute_compensation_phase(
-                                                    &compensating_contract,
-                                                    &commit,
-                                                    &comp_inputs,
-                                                    now_ms,
-                                                ) {
-                                                    Ok(report) => report,
-                                                    Err(err) => {
-                                                        let response = RobotResponse::<
-                                                            RobotTxRunData,
-                                                        >::error_with_code(
-                                                            "robot.tx_execution_failed",
-                                                            format!(
-                                                                "compensation phase failed: {err}"
-                                                            ),
-                                                            None,
-                                                            elapsed_ms(start),
-                                                        );
-                                                        print_robot_response(
-                                                            &response, format, stats,
-                                                        )?;
-                                                        return Ok(());
-                                                    }
-                                                };
-                                            final_state = compensation.outcome.target_tx_state();
-                                            compensation_report = Some(compensation);
+                                        let targets =
+                                            frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                                                None,
+                                                Some(&storage),
+                                            );
+                                        let prepare_context =
+                                            frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                                                layout.root.to_string_lossy().to_string(),
+                                            );
+                                        let executor =
+                                            frankenterm_core::tx_execution::PaneStepExecutor::new(
+                                                wezterm,
+                                                policy_engine,
+                                                approvals,
+                                                targets,
+                                                prepare_context,
+                                            );
+                                        execute_tx_run_with_executor(
+                                            executor,
+                                            &contract_path,
+                                            &mut contract,
+                                            kill_switch,
+                                            paused,
+                                            fail_step.clone(),
+                                            dry_run,
+                                            now_ms,
+                                        )
+                                    } else {
+                                        if let Some(reason) = fallback_reason.as_deref() {
+                                            tracing::warn!(
+                                                %reason,
+                                                "falling back to synthetic robot tx executor"
+                                            );
                                         }
-
-                                        commit_report = Some(commit);
-                                    }
-
-                                    let data = RobotTxRunData {
-                                        contract_file: contract_path.display().to_string(),
-                                        tx_id: contract.intent.tx_id.0.clone(),
-                                        plan_id: contract.plan.plan_id.0.clone(),
-                                        prepare_report,
-                                        commit_report,
-                                        compensation_report,
-                                        final_state,
+                                        execute_tx_run_with_executor(
+                                            frankenterm_core::tx_execution::SyntheticStepExecutor,
+                                            &contract_path,
+                                            &mut contract,
+                                            kill_switch,
+                                            paused,
+                                            fail_step.clone(),
+                                            dry_run,
+                                            now_ms,
+                                        )
                                     };
+                                    let data = match data {
+                                        Ok(data) => data,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotTxRunData>::error_with_code(
+                                                    "robot.tx_execution_failed",
+                                                    err,
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    tracing::info!(
+                                        command = "robot.tx.run",
+                                        tx_id = %data.tx_id,
+                                        plan_id = %data.plan_id,
+                                        contract_file = %data.contract_file,
+                                        executor_type = executor_label,
+                                        dry_run,
+                                        final_state = %data.final_state,
+                                        prepare_outcome = tx_prepare_outcome_label(&data.prepare_report.outcome),
+                                        response_time_ms = elapsed_ms(start),
+                                        "robot tx run completed"
+                                    );
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
                                 }
@@ -20835,47 +20823,105 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
-                                    let comp_inputs = build_robot_tx_compensation_inputs(
-                                        &commit_report,
-                                        fail_compensation_for_step.as_deref(),
-                                        now_ms,
-                                    );
-                                    let mut compensating_contract = contract.clone();
-                                    compensating_contract.lifecycle_state =
-                                        frankenterm_core::plan::MissionTxState::Compensating;
-                                    compensating_contract
-                                        .receipts
-                                        .clone_from(&contract.receipts);
-                                    let compensation_report =
-                                        match frankenterm_core::plan::execute_compensation_phase(
-                                            &compensating_contract,
-                                            &commit_report,
-                                            &comp_inputs,
-                                            now_ms,
-                                        ) {
-                                            Ok(report) => report,
-                                            Err(err) => {
-                                                let response =
-                                                    RobotResponse::<RobotTxRollbackData>::error_with_code(
-                                                        "robot.tx_execution_failed",
-                                                        format!(
-                                                            "rollback compensation failed: {err}"
-                                                        ),
-                                                        None,
-                                                        elapsed_ms(start),
-                                                    );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
-
-                                    let data = RobotTxRollbackData {
-                                        contract_file: contract_path.display().to_string(),
-                                        tx_id: contract.intent.tx_id.0.clone(),
-                                        plan_id: contract.plan.plan_id.0.clone(),
-                                        final_state: compensation_report.outcome.target_tx_state(),
-                                        compensation_report,
+                                    let (real_runtime, fallback_reason) =
+                                        resolve_real_tx_runtime(&config, &layout).await;
+                                    let executor_label = if real_runtime.is_some() {
+                                        "pane_executor"
+                                    } else {
+                                        "synthetic_fallback"
                                     };
+                                    tracing::info!(
+                                        command = "robot.tx.rollback",
+                                        tx_id = %contract.intent.tx_id.0,
+                                        plan_id = %contract.plan.plan_id.0,
+                                        contract_file = %contract_path.display(),
+                                        executor_type = executor_label,
+                                        fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
+                                        "robot tx rollback starting"
+                                    );
+                                    let data = if let Some((storage, wezterm)) = real_runtime {
+                                        let policy_engine = std::cell::RefCell::new(
+                                            frankenterm_core::policy::PolicyEngine::new(
+                                                config.safety.rate_limit_per_pane,
+                                                config.safety.rate_limit_global,
+                                                config.safety.require_prompt_active,
+                                            )
+                                            .with_tuning(&config.tuning)
+                                            .with_command_gate_config(
+                                                config.safety.command_gate.clone(),
+                                            )
+                                            .with_policy_rules(config.safety.rules.clone()),
+                                        );
+                                        let approvals =
+                                            frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
+                                                Some(&storage),
+                                            );
+                                        let targets =
+                                            frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                                                None,
+                                                Some(&storage),
+                                            );
+                                        let prepare_context =
+                                            frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                                                layout.root.to_string_lossy().to_string(),
+                                            );
+                                        let executor =
+                                            frankenterm_core::tx_execution::PaneStepExecutor::new(
+                                                wezterm,
+                                                policy_engine,
+                                                approvals,
+                                                targets,
+                                                prepare_context,
+                                            );
+                                        execute_tx_rollback_with_executor(
+                                            executor,
+                                            &contract_path,
+                                            &contract,
+                                            &commit_report,
+                                            fail_compensation_for_step.as_deref(),
+                                            now_ms,
+                                        )
+                                    } else {
+                                        if let Some(reason) = fallback_reason.as_deref() {
+                                            tracing::warn!(
+                                                %reason,
+                                                "falling back to synthetic robot tx rollback executor"
+                                            );
+                                        }
+                                        execute_tx_rollback_with_executor(
+                                            frankenterm_core::tx_execution::SyntheticStepExecutor,
+                                            &contract_path,
+                                            &contract,
+                                            &commit_report,
+                                            fail_compensation_for_step.as_deref(),
+                                            now_ms,
+                                        )
+                                    };
+                                    let data = match data {
+                                        Ok(data) => data,
+                                        Err(err) => {
+                                            let response =
+                                                RobotResponse::<RobotTxRollbackData>::error_with_code(
+                                                    "robot.tx_execution_failed",
+                                                    err,
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
+                                    tracing::info!(
+                                        command = "robot.tx.rollback",
+                                        tx_id = %data.tx_id,
+                                        plan_id = %data.plan_id,
+                                        contract_file = %data.contract_file,
+                                        executor_type = executor_label,
+                                        final_state = %data.final_state,
+                                        compensation_outcome = tx_compensation_outcome_label(&data.compensation_report.outcome),
+                                        response_time_ms = elapsed_ms(start),
+                                        "robot tx rollback completed"
+                                    );
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     print_robot_response(&response, format, stats)?;
                                 }
@@ -24767,7 +24813,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Tx { command }) => {
-            handle_tx_command(command, &layout)?;
+            handle_tx_command(command, &layout, &config).await?;
         }
 
         Some(Commands::Status {
@@ -35184,6 +35230,151 @@ fn tx_compensation_outcome_label(
     }
 }
 
+fn tx_prepare_target_state(
+    outcome: &frankenterm_core::plan::TxPrepareOutcome,
+) -> frankenterm_core::plan::MissionTxState {
+    match outcome {
+        frankenterm_core::plan::TxPrepareOutcome::AllReady => {
+            frankenterm_core::plan::MissionTxState::Prepared
+        }
+        frankenterm_core::plan::TxPrepareOutcome::RequireApproval
+        | frankenterm_core::plan::TxPrepareOutcome::Deferred => {
+            frankenterm_core::plan::MissionTxState::Planned
+        }
+        frankenterm_core::plan::TxPrepareOutcome::Denied => {
+            frankenterm_core::plan::MissionTxState::Failed
+        }
+    }
+}
+
+async fn resolve_real_tx_runtime(
+    config: &frankenterm_core::config::Config,
+    layout: &frankenterm_core::config::WorkspaceLayout,
+) -> (
+    Option<(
+        frankenterm_core::storage::StorageHandle,
+        frankenterm_core::wezterm::WeztermHandle,
+    )>,
+    Option<String>,
+) {
+    let db_path = layout.db_path.to_string_lossy();
+    let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+        Ok(storage) => storage,
+        Err(err) => {
+            return (
+                None,
+                Some(format!(
+                    "storage unavailable at {}: {err}",
+                    layout.db_path.display()
+                )),
+            );
+        }
+    };
+
+    let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    match wezterm.list_panes().await {
+        Ok(_) => (Some((storage, wezterm)), None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "terminal backend unavailable for real tx execution: {err}"
+            )),
+        ),
+    }
+}
+
+fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
+    executor: E,
+    contract_path: &Path,
+    contract: &mut frankenterm_core::plan::MissionTxContract,
+    kill_switch: frankenterm_core::plan::MissionKillSwitchLevel,
+    paused: bool,
+    fail_step: Option<String>,
+    dry_run: bool,
+    now_ms: i64,
+) -> Result<RobotTxRunData, String> {
+    let tx_id = contract.intent.tx_id.0.clone();
+    let plan_id = contract.plan.plan_id.0.clone();
+
+    if dry_run {
+        let gate_inputs = executor.evaluate_gates(contract, now_ms);
+        let prepare_report = frankenterm_core::plan::evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            kill_switch,
+            now_ms,
+        )
+        .map_err(|err| format!("prepare phase failed: {err}"))?;
+
+        return Ok(RobotTxRunData {
+            contract_file: contract_path.display().to_string(),
+            tx_id,
+            plan_id,
+            final_state: tx_prepare_target_state(&prepare_report.outcome),
+            prepare_report,
+            commit_report: None,
+            compensation_report: None,
+        });
+    }
+
+    let result = frankenterm_core::tx_execution::TxExecutionEngine::new(
+        executor,
+        frankenterm_core::tx_execution::TxExecutionConfig {
+            kill_switch,
+            paused,
+            fail_step,
+            ..Default::default()
+        },
+    )
+    .execute(contract, now_ms)
+    .map_err(|err| format!("tx execution failed: {err}"))?;
+
+    Ok(RobotTxRunData {
+        contract_file: contract_path.display().to_string(),
+        tx_id,
+        plan_id,
+        final_state: result.final_state,
+        prepare_report: result.prepare_report,
+        commit_report: result.commit_report,
+        compensation_report: result.compensation_report,
+    })
+}
+
+fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
+    executor: E,
+    contract_path: &Path,
+    contract: &frankenterm_core::plan::MissionTxContract,
+    commit_report: &frankenterm_core::plan::TxCommitReport,
+    fail_compensation_for_step: Option<&str>,
+    now_ms: i64,
+) -> Result<RobotTxRollbackData, String> {
+    let compensation_inputs =
+        executor.execute_compensations(commit_report, fail_compensation_for_step, now_ms);
+
+    let mut compensating_contract = contract.clone();
+    compensating_contract.lifecycle_state = frankenterm_core::plan::MissionTxState::Compensating;
+    compensating_contract
+        .receipts
+        .clone_from(&contract.receipts);
+
+    let compensation_report = frankenterm_core::plan::execute_compensation_phase(
+        &compensating_contract,
+        commit_report,
+        &compensation_inputs,
+        now_ms,
+    )
+    .map_err(|err| format!("rollback compensation failed: {err}"))?;
+
+    Ok(RobotTxRollbackData {
+        contract_file: contract_path.display().to_string(),
+        tx_id: contract.intent.tx_id.0.clone(),
+        plan_id: contract.plan.plan_id.0.clone(),
+        final_state: compensation_report.outcome.target_tx_state(),
+        compensation_report,
+    })
+}
+
 fn persist_mission_to_path(
     path: &Path,
     mission: &frankenterm_core::plan::Mission,
@@ -36087,9 +36278,10 @@ fn emit_mission_error(format: MissionCommandOutputFormat, err: MissionCommandErr
     std::process::exit(err.exit_code);
 }
 
-fn handle_tx_command(
+async fn handle_tx_command(
     command: TxCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
 ) -> anyhow::Result<()> {
     match command {
         TxCommands::Plan {
@@ -36140,11 +36332,12 @@ fn handle_tx_command(
             fail_step,
             paused,
             kill_switch,
+            dry_run,
             format,
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let contract_path = resolve_mission_tx_file_path(layout, contract_file);
-            let contract = match load_mission_tx_contract_from_path(&contract_path) {
+            let mut contract = match load_mission_tx_contract_from_path(&contract_path) {
                 Ok(contract) => contract,
                 Err(err) => emit_mission_error(output_format, err),
             };
@@ -36170,123 +36363,114 @@ fn handle_tx_command(
                 );
             }
 
+            let started = Instant::now();
             let now_ms = mission_now_ms();
-            let gate_inputs = build_robot_tx_prepare_gate_inputs(&contract);
-            let prepare_report = match frankenterm_core::plan::evaluate_prepare_phase(
-                &contract.intent.tx_id,
-                &contract.plan,
-                &gate_inputs,
-                kill_switch.into(),
-                now_ms,
-            ) {
-                Ok(report) => report,
-                Err(err) => emit_mission_error(
-                    output_format,
-                    MissionCommandError {
-                        exit_code: MISSION_EXIT_VALIDATION,
-                        error_code: "mission.tx.execution_failed",
-                        message: format!("prepare phase failed: {err}"),
-                        hint: None,
-                    },
-                ),
+            let kill_switch = kill_switch.into();
+            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(config, layout).await;
+            let executor_label = if real_runtime.is_some() {
+                "pane_executor"
+            } else {
+                "synthetic_fallback"
             };
-
-            let mut commit_report = None;
-            let mut compensation_report = None;
-            let mut final_state = match prepare_report.outcome {
-                frankenterm_core::plan::TxPrepareOutcome::AllReady => {
-                    frankenterm_core::plan::MissionTxState::Prepared
-                }
-                frankenterm_core::plan::TxPrepareOutcome::RequireApproval => {
-                    frankenterm_core::plan::MissionTxState::Planned
-                }
-                frankenterm_core::plan::TxPrepareOutcome::Denied => {
-                    frankenterm_core::plan::MissionTxState::Failed
-                }
-                frankenterm_core::plan::TxPrepareOutcome::Deferred => {
-                    frankenterm_core::plan::MissionTxState::Planned
-                }
-            };
-
-            if prepare_report.outcome.commit_eligible() {
-                let mut prepared_contract = contract.clone();
-                prepared_contract.lifecycle_state =
-                    frankenterm_core::plan::MissionTxState::Prepared;
-                let commit_inputs = build_robot_tx_commit_step_inputs(
-                    &prepared_contract,
-                    fail_step.as_deref(),
-                    now_ms,
+            tracing::info!(
+                command = "tx.run",
+                tx_id = %contract.intent.tx_id.0,
+                plan_id = %contract.plan.plan_id.0,
+                contract_file = %contract_path.display(),
+                executor_type = executor_label,
+                dry_run,
+                paused,
+                fail_step = fail_step.as_deref().unwrap_or(""),
+                "tx run starting"
+            );
+            let data = if let Some((storage, wezterm)) = real_runtime {
+                let policy_engine = std::cell::RefCell::new(
+                    frankenterm_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        config.safety.require_prompt_active,
+                    )
+                    .with_tuning(&config.tuning)
+                    .with_command_gate_config(config.safety.command_gate.clone())
+                    .with_policy_rules(config.safety.rules.clone()),
                 );
-                let commit = match frankenterm_core::plan::execute_commit_phase(
-                    &prepared_contract,
-                    &commit_inputs,
-                    kill_switch.into(),
+                let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
+                    Some(&storage),
+                );
+                let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                    None,
+                    Some(&storage),
+                );
+                let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                    layout.root.to_string_lossy().to_string(),
+                );
+                let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
+                    wezterm,
+                    policy_engine,
+                    approvals,
+                    targets,
+                    prepare_context,
+                );
+                execute_tx_run_with_executor(
+                    executor,
+                    &contract_path,
+                    &mut contract,
+                    kill_switch,
                     paused,
+                    fail_step.clone(),
+                    dry_run,
                     now_ms,
-                ) {
-                    Ok(report) => report,
-                    Err(err) => emit_mission_error(
-                        output_format,
-                        MissionCommandError {
-                            exit_code: MISSION_EXIT_VALIDATION,
-                            error_code: "mission.tx.execution_failed",
-                            message: format!("commit phase failed: {err}"),
-                            hint: None,
-                        },
-                    ),
-                };
-
-                final_state = commit.outcome.target_tx_state();
-                if commit.failed_count > 0 && commit.committed_count > 0 {
-                    let mut compensating_contract = prepared_contract.clone();
-                    compensating_contract.lifecycle_state =
-                        frankenterm_core::plan::MissionTxState::Compensating;
-                    compensating_contract.receipts.clone_from(&commit.receipts);
-                    let compensation_inputs =
-                        build_robot_tx_compensation_inputs(&commit, None, now_ms);
-                    let compensation = match frankenterm_core::plan::execute_compensation_phase(
-                        &compensating_contract,
-                        &commit,
-                        &compensation_inputs,
-                        now_ms,
-                    ) {
-                        Ok(report) => report,
-                        Err(err) => emit_mission_error(
-                            output_format,
-                            MissionCommandError {
-                                exit_code: MISSION_EXIT_VALIDATION,
-                                error_code: "mission.tx.execution_failed",
-                                message: format!("compensation phase failed: {err}"),
-                                hint: None,
-                            },
-                        ),
-                    };
-                    final_state = compensation.outcome.target_tx_state();
-                    compensation_report = Some(compensation);
+                )
+            } else {
+                if let Some(reason) = fallback_reason.as_deref() {
+                    tracing::warn!(%reason, "falling back to synthetic tx executor");
                 }
-
-                commit_report = Some(commit);
+                execute_tx_run_with_executor(
+                    frankenterm_core::tx_execution::SyntheticStepExecutor,
+                    &contract_path,
+                    &mut contract,
+                    kill_switch,
+                    paused,
+                    fail_step.clone(),
+                    dry_run,
+                    now_ms,
+                )
             }
+            .map_err(|message| MissionCommandError {
+                exit_code: MISSION_EXIT_VALIDATION,
+                error_code: "mission.tx.execution_failed",
+                message,
+                hint: None,
+            })
+            .unwrap_or_else(|err| emit_mission_error(output_format, err));
 
-            let data = RobotTxRunData {
-                contract_file: contract_path.display().to_string(),
-                tx_id: contract.intent.tx_id.0.clone(),
-                plan_id: contract.plan.plan_id.0.clone(),
-                prepare_report,
-                commit_report,
-                compensation_report,
-                final_state,
-            };
+            tracing::info!(
+                command = "tx.run",
+                tx_id = %data.tx_id,
+                plan_id = %data.plan_id,
+                contract_file = %data.contract_file,
+                executor_type = executor_label,
+                dry_run,
+                final_state = %data.final_state,
+                prepare_outcome = tx_prepare_outcome_label(&data.prepare_report.outcome),
+                elapsed_ms = started.elapsed().as_millis(),
+                "tx run completed"
+            );
 
             let mut plain_lines = vec![
                 format!("Tx run summary for {}", data.tx_id),
                 format!("  File: {}", data.contract_file),
                 format!("  Plan: {}", data.plan_id),
+                format!("  Mode: {}", if dry_run { "dry_run" } else { "execute" }),
+                format!("  Executor: {executor_label}"),
                 format!(
                     "  Prepare outcome: {}",
                     tx_prepare_outcome_label(&data.prepare_report.outcome)
                 ),
             ];
+            if let Some(reason) = fallback_reason.as_deref() {
+                plain_lines.push(format!("  Fallback reason: {reason}"));
+            }
             if let Some(commit_report) = data.commit_report.as_ref() {
                 plain_lines.push(format!(
                     "  Commit outcome: {}",
@@ -36365,46 +36549,95 @@ fn handle_tx_command(
                     },
                 );
             }
-            let compensation_inputs = build_robot_tx_compensation_inputs(
-                &commit_report,
-                fail_compensation_for_step.as_deref(),
-                now_ms,
+            let started = Instant::now();
+            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(config, layout).await;
+            let executor_label = if real_runtime.is_some() {
+                "pane_executor"
+            } else {
+                "synthetic_fallback"
+            };
+            tracing::info!(
+                command = "tx.rollback",
+                tx_id = %contract.intent.tx_id.0,
+                plan_id = %contract.plan.plan_id.0,
+                contract_file = %contract_path.display(),
+                executor_type = executor_label,
+                fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
+                "tx rollback starting"
             );
-            let mut compensating_contract = contract.clone();
-            compensating_contract.lifecycle_state =
-                frankenterm_core::plan::MissionTxState::Compensating;
-            compensating_contract
-                .receipts
-                .clone_from(&contract.receipts);
-            let compensation_report = match frankenterm_core::plan::execute_compensation_phase(
-                &compensating_contract,
-                &commit_report,
-                &compensation_inputs,
-                now_ms,
-            ) {
-                Ok(report) => report,
-                Err(err) => emit_mission_error(
-                    output_format,
-                    MissionCommandError {
-                        exit_code: MISSION_EXIT_VALIDATION,
-                        error_code: "mission.tx.execution_failed",
-                        message: format!("rollback compensation failed: {err}"),
-                        hint: None,
-                    },
-                ),
-            };
+            let data = if let Some((storage, wezterm)) = real_runtime {
+                let policy_engine = std::cell::RefCell::new(
+                    frankenterm_core::policy::PolicyEngine::new(
+                        config.safety.rate_limit_per_pane,
+                        config.safety.rate_limit_global,
+                        config.safety.require_prompt_active,
+                    )
+                    .with_tuning(&config.tuning)
+                    .with_command_gate_config(config.safety.command_gate.clone())
+                    .with_policy_rules(config.safety.rules.clone()),
+                );
+                let approvals = frankenterm_core::plan::StorageBackedPrepareApprovalChecker::new(
+                    Some(&storage),
+                );
+                let targets = frankenterm_core::plan::StorageBackedPrepareTargetLookup::new(
+                    None,
+                    Some(&storage),
+                );
+                let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
+                    layout.root.to_string_lossy().to_string(),
+                );
+                let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
+                    wezterm,
+                    policy_engine,
+                    approvals,
+                    targets,
+                    prepare_context,
+                );
+                execute_tx_rollback_with_executor(
+                    executor,
+                    &contract_path,
+                    &contract,
+                    &commit_report,
+                    fail_compensation_for_step.as_deref(),
+                    now_ms,
+                )
+            } else {
+                if let Some(reason) = fallback_reason.as_deref() {
+                    tracing::warn!(%reason, "falling back to synthetic tx rollback executor");
+                }
+                execute_tx_rollback_with_executor(
+                    frankenterm_core::tx_execution::SyntheticStepExecutor,
+                    &contract_path,
+                    &contract,
+                    &commit_report,
+                    fail_compensation_for_step.as_deref(),
+                    now_ms,
+                )
+            }
+            .map_err(|message| MissionCommandError {
+                exit_code: MISSION_EXIT_VALIDATION,
+                error_code: "mission.tx.execution_failed",
+                message,
+                hint: None,
+            })
+            .unwrap_or_else(|err| emit_mission_error(output_format, err));
 
-            let data = RobotTxRollbackData {
-                contract_file: contract_path.display().to_string(),
-                tx_id: contract.intent.tx_id.0.clone(),
-                plan_id: contract.plan.plan_id.0.clone(),
-                final_state: compensation_report.outcome.target_tx_state(),
-                compensation_report,
-            };
+            tracing::info!(
+                command = "tx.rollback",
+                tx_id = %data.tx_id,
+                plan_id = %data.plan_id,
+                contract_file = %data.contract_file,
+                executor_type = executor_label,
+                final_state = %data.final_state,
+                compensation_outcome = tx_compensation_outcome_label(&data.compensation_report.outcome),
+                elapsed_ms = started.elapsed().as_millis(),
+                "tx rollback completed"
+            );
             let plain_lines = vec![
                 format!("Tx rollback summary for {}", data.tx_id),
                 format!("  File: {}", data.contract_file),
                 format!("  Plan: {}", data.plan_id),
+                format!("  Executor: {executor_label}"),
                 format!(
                     "  Compensation outcome: {}",
                     tx_compensation_outcome_label(&data.compensation_report.outcome)
@@ -36417,6 +36650,13 @@ fn handle_tx_command(
                 ),
                 format!("  Final state: {}", data.final_state),
             ];
+            let plain_lines = if let Some(reason) = fallback_reason.as_deref() {
+                let mut lines = plain_lines;
+                lines.push(format!("  Fallback reason: {reason}"));
+                lines
+            } else {
+                plain_lines
+            };
             emit_mission_success(output_format, serde_json::to_value(&data)?, &plain_lines)?;
         }
         TxCommands::Show {
@@ -42430,6 +42670,7 @@ mod tests {
             "--fail-step",
             "tx-step:commit",
             "--paused",
+            "--dry-run",
             "--kill-switch",
             "safe-mode",
         ])
@@ -42442,12 +42683,14 @@ mod tests {
                         fail_step,
                         paused,
                         kill_switch,
+                        dry_run,
                         format,
                     },
             }) => {
                 assert_eq!(contract_file, Some(PathBuf::from("/tmp/tx.json")));
                 assert_eq!(fail_step.as_deref(), Some("tx-step:commit"));
                 assert!(paused);
+                assert!(dry_run);
                 assert_eq!(kill_switch, RobotMissionKillSwitchLevelArg::SafeMode);
                 assert_eq!(format, "plain");
             }
@@ -42881,6 +43124,7 @@ mod tests {
             "--fail-step",
             "tx-step:commit",
             "--paused",
+            "--dry-run",
             "--kill-switch",
             "safe-mode",
         ])
@@ -42894,11 +43138,13 @@ mod tests {
                             fail_step,
                             paused,
                             kill_switch,
+                            dry_run,
                         },
                 }) => {
                     assert_eq!(contract_file, Some(PathBuf::from("/tmp/tx.json")));
                     assert_eq!(fail_step.as_deref(), Some("tx-step:commit"));
                     assert!(paused);
+                    assert!(dry_run);
                     assert_eq!(kill_switch, RobotMissionKillSwitchLevelArg::SafeMode);
                 }
                 _ => panic!("expected RobotCommands::Tx::Run"),
@@ -42994,6 +43240,201 @@ mod tests {
         assert_eq!(comp_inputs[0].error_code.as_deref(), Some("FTX4999"));
         assert_eq!(comp_inputs[1].for_step_id.0, "tx-step:2");
         assert!(comp_inputs[1].success);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingStepExecutor {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl RecordingStepExecutor {
+        fn recorded_calls(&self) -> Vec<&'static str> {
+            self.calls.lock().expect("recorded calls lock").clone()
+        }
+    }
+
+    impl frankenterm_core::tx_execution::StepExecutor for RecordingStepExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+            let _ = now_ms;
+            self.calls
+                .lock()
+                .expect("recorded calls lock")
+                .push("evaluate_gates");
+            build_robot_tx_prepare_gate_inputs(contract)
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+            self.calls
+                .lock()
+                .expect("recorded calls lock")
+                .push("execute_steps");
+            build_robot_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            commit_report: &frankenterm_core::plan::TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
+            self.calls
+                .lock()
+                .expect("recorded calls lock")
+                .push("execute_compensations");
+            build_robot_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn tx_run_helper_dry_run_stops_after_prepare_phase() {
+        let mut contract = sample_robot_tx_contract();
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_run_with_executor(
+            executor.clone(),
+            Path::new("/tmp/tx.json"),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            true,
+            4_242,
+        )
+        .expect("dry run should succeed");
+
+        assert_eq!(executor.recorded_calls(), vec!["evaluate_gates"]);
+        assert_eq!(
+            data.prepare_report.outcome,
+            frankenterm_core::plan::TxPrepareOutcome::AllReady
+        );
+        assert_eq!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Prepared
+        );
+        assert!(data.commit_report.is_none());
+        assert!(data.compensation_report.is_none());
+        assert_eq!(
+            contract.lifecycle_state,
+            frankenterm_core::plan::MissionTxState::Planned
+        );
+    }
+
+    #[test]
+    fn tx_run_helper_execute_maps_engine_result_into_robot_data() {
+        let mut contract = sample_robot_tx_contract();
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_run_with_executor(
+            executor.clone(),
+            Path::new("/tmp/tx.json"),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_151,
+        )
+        .expect("execution should succeed");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec!["evaluate_gates", "execute_steps"]
+        );
+        assert_eq!(data.contract_file, "/tmp/tx.json");
+        assert_eq!(data.tx_id, "tx:robot-interface-test");
+        assert_eq!(data.plan_id, "tx-plan:robot-interface-test");
+        assert_eq!(
+            data.final_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+
+        let commit_report = data
+            .commit_report
+            .as_ref()
+            .expect("commit report should be present");
+        assert_eq!(
+            commit_report.outcome,
+            frankenterm_core::plan::TxCommitOutcome::FullyCommitted
+        );
+        assert_eq!(commit_report.committed_count, 2);
+        assert!(data.compensation_report.is_none());
+        assert_eq!(
+            contract.lifecycle_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+    }
+
+    #[test]
+    fn tx_run_helper_fail_step_surfaces_compensation_and_failed_final_state() {
+        let mut contract = sample_robot_tx_contract();
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_run_with_executor(
+            executor.clone(),
+            Path::new("/tmp/tx.json"),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            Some("tx-step:2".to_string()),
+            false,
+            6_161,
+        )
+        .expect("execution with injected failure should still return a tx report");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec!["evaluate_gates", "execute_steps", "execute_compensations"]
+        );
+        let commit_report = data
+            .commit_report
+            .as_ref()
+            .expect("commit report should be present");
+        assert_eq!(commit_report.failed_count, 1);
+        let compensation_report = data
+            .compensation_report
+            .as_ref()
+            .expect("compensation report should be present");
+        assert_eq!(
+            data.final_state,
+            compensation_report.outcome.target_tx_state()
+        );
+        assert_eq!(data.final_state, contract.lifecycle_state);
+    }
+
+    #[test]
+    fn tx_rollback_helper_maps_compensation_report_into_robot_data() {
+        let contract = sample_robot_tx_contract();
+        let commit_report = build_robot_tx_synthetic_commit_report(&contract, 7_171);
+        let executor = RecordingStepExecutor::default();
+
+        let data = execute_tx_rollback_with_executor(
+            executor.clone(),
+            Path::new("/tmp/tx.json"),
+            &contract,
+            &commit_report,
+            Some("tx-step:1"),
+            8_181,
+        )
+        .expect("rollback should succeed");
+
+        assert_eq!(executor.recorded_calls(), vec!["execute_compensations"]);
+        assert_eq!(data.contract_file, "/tmp/tx.json");
+        assert_eq!(data.tx_id, "tx:robot-interface-test");
+        assert_eq!(data.plan_id, "tx-plan:robot-interface-test");
+        assert_eq!(data.compensation_report.failed_count, 1);
+        assert_eq!(
+            data.final_state,
+            data.compensation_report.outcome.target_tx_state()
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ default = [
     "native-wezterm",
     "rollout",
     "semantic-search",
+    "subprocess-bridge",
     "sync",
     "tui",
     "tui-dashboard",
@@ -74,6 +75,7 @@ rollout = ["frankenterm-core/rollout", "tui", "ftui"]
 metrics = ["frankenterm-core/metrics"]
 native-wezterm = ["frankenterm-core/native-wezterm"]
 distributed = ["frankenterm-core/distributed"]
+subprocess-bridge = ["frankenterm-core/subprocess-bridge"]
 sync = ["frankenterm-core/sync"]
 asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 semantic-search = ["frankenterm-core/semantic-search"]
