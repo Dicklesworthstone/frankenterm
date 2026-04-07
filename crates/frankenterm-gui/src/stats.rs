@@ -354,6 +354,7 @@ impl Recorder for Stats {
     }
 }
 
+#[allow(dead_code)]
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let metrics_mod = get_or_create_sub_module(lua, "metrics")?;
     metrics_mod.set(

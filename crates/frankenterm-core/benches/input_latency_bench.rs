@@ -180,13 +180,20 @@ fn bench_collector_recording(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("input_latency", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_record_stage,
-    bench_percentile_computation,
-    bench_budget_evaluation,
-    bench_report_generation,
-    bench_collector_recording,
+    name = benches;
+    config = bench_config();
+    targets =
+        bench_record_stage,
+        bench_percentile_computation,
+        bench_budget_evaluation,
+        bench_report_generation,
+        bench_collector_recording
 );
 
 criterion_main!(benches);

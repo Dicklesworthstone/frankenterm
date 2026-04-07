@@ -15,6 +15,7 @@ fn luaerr(err: anyhow::Error) -> mlua::Error {
     mlua::Error::external(err)
 }
 
+#[allow(dead_code)]
 pub fn register(lua: &Lua) -> anyhow::Result<()> {
     let window_mod = get_or_create_sub_module(lua, "gui")?;
 

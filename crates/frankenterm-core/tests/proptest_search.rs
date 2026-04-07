@@ -16,8 +16,6 @@
 //! - Filter commutativity (order doesn't affect results)
 //! - Idempotent map_event_to_document (same input → same output)
 
-#![feature(stmt_expr_attributes)]
-
 use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;

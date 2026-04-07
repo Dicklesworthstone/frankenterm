@@ -17,6 +17,8 @@ path = "src/main.rs"
 [features]
 default = []
 wayland = ["window/wayland"]
+dhat-heap = ["dep:dhat"]
+dhat-ad-hoc = ["dep:dhat"]
 
 [build-dependencies]
 anyhow.workspace = true
@@ -85,6 +87,7 @@ lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
 metrics.workspace = true
+dhat = { workspace = true, optional = true }
 mlua = { workspace = true, features = ["send", "serialize"] }
 nucleo-matcher.workspace = true
 ordered-float.workspace = true

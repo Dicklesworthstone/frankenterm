@@ -36,6 +36,7 @@ fn now_ms() -> u64 {
 }
 
 /// A mux-to-wire event that's ready to serialize.
+#[allow(dead_code)]
 enum BridgeEvent {
     PaneOutput {
         pane_id: u64,

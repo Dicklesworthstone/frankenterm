@@ -10,6 +10,7 @@
 //!
 //! Data sources: mux pane state, agent_pane_state detection,
 //! backpressure manager, watchdog health reports.
+#![allow(dead_code)]
 
 use frankenterm_core::agent_pane_state::{AgentPaneState, AutoLayoutPolicy};
 use mux::pane::PaneId;

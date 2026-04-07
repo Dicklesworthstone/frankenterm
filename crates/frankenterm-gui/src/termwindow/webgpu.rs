@@ -32,6 +32,7 @@ pub struct WebGpuState {
     pub render_pipeline: wgpu::RenderPipeline,
     shader_uniform_buffer: wgpu::Buffer,
     shader_uniform_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
     shader_uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_nearest_sampler: wgpu::Sampler,

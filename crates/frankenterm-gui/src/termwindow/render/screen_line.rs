@@ -674,7 +674,6 @@ impl crate::TermWindow {
                         }
                     }
                 }
-                phys_cell_idx += info.pos.num_cells as usize;
                 visual_cell_idx += info.pos.num_cells as usize;
                 cluster_x_pos += if params.use_pixel_positioning {
                     glyph.x_advance.get() as f32 * width_scale
