@@ -19,7 +19,8 @@
 use crate::plan::{
     MissionKillSwitchLevel, MissionTxContract, MissionTxState, TxCommitOutcome, TxCommitReport,
     TxCommitStepInput, TxCompensationReport, TxCompensationStepInput, TxOutcome,
-    TxPrepareGateInput, TxPrepareOutcome, TxPrepareReport, evaluate_prepare_phase,
+    TxPrepareApprovalChecker, TxPrepareEvaluationContext, TxPrepareGateInput, TxPrepareOutcome,
+    TxPreparePolicyAuthorizer, TxPrepareReport, TxPrepareTargetLookup, evaluate_prepare_phase,
     execute_commit_phase, execute_compensation_phase,
 };
 use crate::tx_idempotency::{
@@ -79,7 +80,7 @@ impl Default for TxExecutionConfig {
 /// uses deterministic inputs for testing.
 pub trait StepExecutor {
     /// Evaluate prepare-phase gates for all steps.
-    fn evaluate_gates(&self, contract: &MissionTxContract) -> Vec<TxPrepareGateInput>;
+    fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput>;
 
     /// Execute commit-phase steps and return inputs.
     fn execute_steps(
@@ -102,8 +103,75 @@ pub trait StepExecutor {
 pub struct SyntheticStepExecutor;
 
 impl StepExecutor for SyntheticStepExecutor {
-    fn evaluate_gates(&self, contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
-        crate::plan::mission_tx_prepare_gate_inputs(contract)
+    fn evaluate_gates(
+        &self,
+        contract: &MissionTxContract,
+        _now_ms: i64,
+    ) -> Vec<TxPrepareGateInput> {
+        crate::plan::tx_prepare_gate_inputs_allow_all(contract)
+    }
+
+    fn execute_steps(
+        &self,
+        contract: &MissionTxContract,
+        fail_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<TxCommitStepInput> {
+        crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+    }
+
+    fn execute_compensations(
+        &self,
+        commit_report: &TxCommitReport,
+        fail_for_step: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<TxCompensationStepInput> {
+        crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+    }
+}
+
+/// Step executor that wires the prepare phase to the real policy engine,
+/// approval store, and target-state providers while keeping deterministic
+/// commit/compensation behavior for tx execution scaffolding.
+pub struct PolicyPrepareStepExecutor<P, A, T> {
+    policy: P,
+    approvals: A,
+    targets: T,
+    prepare_context: TxPrepareEvaluationContext,
+}
+
+impl<P, A, T> PolicyPrepareStepExecutor<P, A, T> {
+    #[must_use]
+    pub fn new(
+        policy: P,
+        approvals: A,
+        targets: T,
+        prepare_context: TxPrepareEvaluationContext,
+    ) -> Self {
+        Self {
+            policy,
+            approvals,
+            targets,
+            prepare_context,
+        }
+    }
+}
+
+impl<P, A, T> StepExecutor for PolicyPrepareStepExecutor<P, A, T>
+where
+    P: TxPreparePolicyAuthorizer,
+    A: TxPrepareApprovalChecker,
+    T: TxPrepareTargetLookup,
+{
+    fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput> {
+        crate::plan::mission_tx_prepare_gate_inputs(
+            contract,
+            &self.policy,
+            &self.approvals,
+            &self.targets,
+            &self.prepare_context,
+            now_ms,
+        )
     }
 
     fn execute_steps(
@@ -213,8 +281,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         )?;
 
         if !prepare_report.outcome.commit_eligible() {
-            let final_state = match prepare_report.outcome {
+            let final_state = match &prepare_report.outcome {
                 TxPrepareOutcome::Denied => MissionTxState::Failed,
+                TxPrepareOutcome::RequireApproval => MissionTxState::Planned,
                 _ => MissionTxState::Planned,
             };
             contract.lifecycle_state = final_state;
@@ -395,6 +464,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     outcome,
                     prepare_report: TxPrepareReport {
                         outcome: TxPrepareOutcome::AllReady,
+                        gate_inputs: Vec::new(),
                     },
                     commit_report: None,
                     compensation_report: None,
@@ -465,7 +535,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
-        let gate_inputs = self.executor.evaluate_gates(contract);
+        let gate_inputs = self.executor.evaluate_gates(contract, now_ms);
+        self.record_prepare_gate_events(contract, execution_id, events, &gate_inputs, now_ms);
 
         let report = evaluate_prepare_phase(
             &contract.intent.tx_id,
@@ -478,6 +549,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         let reason = match &report.outcome {
             TxPrepareOutcome::AllReady => "tx.prepare.all_ready",
+            TxPrepareOutcome::RequireApproval => "tx.prepare.require_approval",
             TxPrepareOutcome::Denied => "tx.prepare.denied",
             TxPrepareOutcome::Deferred => "tx.prepare.deferred",
         };
@@ -788,6 +860,86 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             chain_hash: String::new(),
             agent_id: String::new(),
             details: HashMap::new(),
+        }
+    }
+
+    fn record_prepare_gate_events(
+        &self,
+        contract: &MissionTxContract,
+        execution_id: &str,
+        events: &mut Vec<TxObservabilityEvent>,
+        gate_inputs: &[TxPrepareGateInput],
+        now_ms: i64,
+    ) {
+        for gate_input in gate_inputs {
+            let gate_results = [
+                (
+                    "policy",
+                    gate_input.policy_passed,
+                    gate_input.policy_reason_code.as_deref(),
+                ),
+                (
+                    "reservation",
+                    gate_input.reservation_available,
+                    gate_input.reservation_reason_code.as_deref(),
+                ),
+                (
+                    "approval",
+                    gate_input.approval_satisfied,
+                    gate_input.approval_reason_code.as_deref(),
+                ),
+                (
+                    "liveness",
+                    gate_input.target_liveness,
+                    gate_input.liveness_reason_code.as_deref(),
+                ),
+            ];
+
+            for (gate_name, passed, gate_reason_code) in gate_results {
+                let mut event = self.make_event(
+                    if passed {
+                        TxEventKind::PreconditionValidated
+                    } else {
+                        TxEventKind::PreconditionFailed
+                    },
+                    TxObservabilityPhase::Prepare,
+                    if passed {
+                        crate::tx_observability::reason_codes::PRECONDITION_PASS
+                    } else {
+                        crate::tx_observability::reason_codes::PRECONDITION_FAIL
+                    },
+                    execution_id,
+                    &contract.plan.plan_id.0,
+                    TxPhase::Preparing,
+                    now_ms,
+                );
+                event.step_id = gate_input.step_id.0.clone();
+                event.details.insert(
+                    "gate".to_string(),
+                    serde_json::Value::String(gate_name.to_string()),
+                );
+                event
+                    .details
+                    .insert("passed".to_string(), serde_json::Value::Bool(passed));
+                if let Some(pane_id) = gate_input.pane_id {
+                    event.details.insert(
+                        "pane_id".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(pane_id)),
+                    );
+                }
+                if let Some(reason_code) = gate_reason_code {
+                    event.details.insert(
+                        "gate_reason_code".to_string(),
+                        serde_json::Value::String(reason_code.to_string()),
+                    );
+                }
+                if let Some(required_approval) = &gate_input.required_approval
+                    && let Ok(value) = serde_json::to_value(required_approval)
+                {
+                    event.details.insert("required_approval".to_string(), value);
+                }
+                events.push(event);
+            }
         }
     }
 }
@@ -1150,6 +1302,31 @@ mod tests {
     }
 
     #[test]
+    fn prepare_gate_events_emitted_for_each_gate_check() {
+        let mut contract = make_test_contract(2);
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        let prepare_gate_events: Vec<_> = result
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TxEventKind::PreconditionValidated | TxEventKind::PreconditionFailed
+                )
+            })
+            .collect();
+
+        assert_eq!(prepare_gate_events.len(), 8);
+        assert!(
+            prepare_gate_events
+                .iter()
+                .all(|event| event.details.contains_key("gate"))
+        );
+    }
+
+    #[test]
     fn ledger_records_commit_steps() {
         let mut contract = make_test_contract(3);
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
@@ -1337,13 +1514,18 @@ mod tests {
     struct DenyingExecutor;
 
     impl StepExecutor for DenyingExecutor {
-        fn evaluate_gates(&self, contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
             contract
                 .plan
                 .steps
                 .iter()
                 .map(|step| TxPrepareGateInput {
                     step_id: step.step_id.clone(),
+                    pane_id: Some(step.ordinal as u64),
                     policy_passed: false,
                     policy_reason_code: Some("policy.denied".to_string()),
                     reservation_available: true,
@@ -1352,6 +1534,7 @@ mod tests {
                     approval_reason_code: None,
                     target_liveness: true,
                     liveness_reason_code: None,
+                    required_approval: None,
                 })
                 .collect()
         }
@@ -1387,6 +1570,74 @@ mod tests {
         assert_eq!(result.ledger.phase(), TxPhase::Aborted);
     }
 
+    struct ApprovalBlockingExecutor;
+
+    impl StepExecutor for ApprovalBlockingExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            contract
+                .plan
+                .steps
+                .iter()
+                .map(|step| TxPrepareGateInput {
+                    step_id: step.step_id.clone(),
+                    pane_id: Some(step.ordinal as u64),
+                    policy_passed: true,
+                    policy_reason_code: None,
+                    reservation_available: true,
+                    reservation_reason_code: None,
+                    approval_satisfied: false,
+                    approval_reason_code: Some("policy.test.require_approval".to_string()),
+                    target_liveness: true,
+                    liveness_reason_code: None,
+                    required_approval: Some(crate::plan::TxPrepareApprovalRequirement {
+                        workspace_id: "workspace:test".to_string(),
+                        action_kind: "send_text".to_string(),
+                        pane_id: Some(step.ordinal as u64),
+                        action_fingerprint: format!("sha256:step-{}", step.ordinal),
+                        reason_code: Some("policy.test.require_approval".to_string()),
+                    }),
+                })
+                .collect()
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    #[test]
+    fn custom_executor_require_approval_blocks_without_failing_tx() {
+        let mut contract = make_test_contract(2);
+        let engine = TxExecutionEngine::new(ApprovalBlockingExecutor, TxExecutionConfig::default());
+        let result = engine.execute(&mut contract, 5000).unwrap();
+
+        assert_eq!(
+            result.prepare_report.outcome,
+            TxPrepareOutcome::RequireApproval
+        );
+        assert!(result.commit_report.is_none());
+        assert_eq!(result.final_state, MissionTxState::Planned);
+        assert_eq!(result.outcome, TxOutcome::Pending);
+    }
+
     #[test]
     fn reason_code_mapping() {
         assert_eq!(reason_code_for_outcome(&TxOutcome::Pending), "pending");
@@ -1402,7 +1653,7 @@ mod tests {
     fn synthetic_executor_implements_trait() {
         let executor = SyntheticStepExecutor;
         let contract = make_test_contract(2);
-        let gates = executor.evaluate_gates(&contract);
+        let gates = executor.evaluate_gates(&contract, 5_000);
         assert_eq!(gates.len(), 2);
         assert!(gates[0].policy_passed);
         assert!(gates[0].target_liveness);

@@ -666,11 +666,15 @@ proptest! {
     fn tx_prepare_report_serde_roundtrip(
         outcome in prop_oneof![
             Just(TxPrepareOutcome::AllReady),
+            Just(TxPrepareOutcome::RequireApproval),
             Just(TxPrepareOutcome::Denied),
             Just(TxPrepareOutcome::Deferred),
         ],
     ) {
-        let val = TxPrepareReport { outcome: outcome.clone() };
+        let val = TxPrepareReport {
+            outcome: outcome.clone(),
+            gate_inputs: Vec::new(),
+        };
         let json = serde_json::to_string(&val).unwrap();
         let restored: TxPrepareReport = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(outcome.commit_eligible(), restored.outcome.commit_eligible());
@@ -681,6 +685,7 @@ proptest! {
     fn prepare_outcome_only_all_ready_eligible(
         outcome in prop_oneof![
             Just(TxPrepareOutcome::AllReady),
+            Just(TxPrepareOutcome::RequireApproval),
             Just(TxPrepareOutcome::Denied),
             Just(TxPrepareOutcome::Deferred),
         ],

@@ -20,8 +20,8 @@ use frankenterm_core::plan::mission_tx_synthetic_commit_report as build_robot_tx
 use frankenterm_core::plan::{
     mission_tx_commit_step_inputs as build_robot_tx_commit_step_inputs,
     mission_tx_compensation_inputs as build_robot_tx_compensation_inputs,
-    mission_tx_prepare_gate_inputs as build_robot_tx_prepare_gate_inputs,
     mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report,
+    tx_prepare_gate_inputs_allow_all as build_robot_tx_prepare_gate_inputs,
 };
 use frankenterm_core::storage::{MigrationPlan, MigrationStatusReport};
 
@@ -20669,6 +20669,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         frankenterm_core::plan::TxPrepareOutcome::AllReady => {
                                             frankenterm_core::plan::MissionTxState::Prepared
                                         }
+                                        frankenterm_core::plan::TxPrepareOutcome::RequireApproval => {
+                                            frankenterm_core::plan::MissionTxState::Planned
+                                        }
                                         frankenterm_core::plan::TxPrepareOutcome::Denied => {
                                             frankenterm_core::plan::MissionTxState::Failed
                                         }
@@ -35153,6 +35156,7 @@ fn tx_outcome_label(outcome: &frankenterm_core::plan::TxOutcome) -> &'static str
 fn tx_prepare_outcome_label(outcome: &frankenterm_core::plan::TxPrepareOutcome) -> &'static str {
     match outcome {
         frankenterm_core::plan::TxPrepareOutcome::AllReady => "all_ready",
+        frankenterm_core::plan::TxPrepareOutcome::RequireApproval => "require_approval",
         frankenterm_core::plan::TxPrepareOutcome::Denied => "denied",
         frankenterm_core::plan::TxPrepareOutcome::Deferred => "deferred",
     }
@@ -36192,6 +36196,9 @@ fn handle_tx_command(
             let mut final_state = match prepare_report.outcome {
                 frankenterm_core::plan::TxPrepareOutcome::AllReady => {
                     frankenterm_core::plan::MissionTxState::Prepared
+                }
+                frankenterm_core::plan::TxPrepareOutcome::RequireApproval => {
+                    frankenterm_core::plan::MissionTxState::Planned
                 }
                 frankenterm_core::plan::TxPrepareOutcome::Denied => {
                     frankenterm_core::plan::MissionTxState::Failed

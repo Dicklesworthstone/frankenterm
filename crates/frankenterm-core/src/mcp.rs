@@ -48,8 +48,8 @@ use crate::patterns::{AgentType, PatternEngine};
 use crate::plan::{
     mission_tx_commit_step_inputs as mcp_build_tx_commit_step_inputs,
     mission_tx_compensation_inputs as mcp_build_tx_compensation_inputs,
-    mission_tx_prepare_gate_inputs as mcp_build_tx_prepare_gate_inputs,
     mission_tx_synthetic_commit_report as mcp_build_tx_synthetic_commit_report,
+    tx_prepare_gate_inputs_allow_all as mcp_build_tx_prepare_gate_inputs,
 };
 use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,

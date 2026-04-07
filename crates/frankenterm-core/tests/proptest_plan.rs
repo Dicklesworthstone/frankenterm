@@ -1672,6 +1672,7 @@ fn arb_tx_outcome() -> impl Strategy<Value = TxOutcome> {
 fn arb_tx_prepare_outcome() -> impl Strategy<Value = TxPrepareOutcome> {
     prop_oneof![
         Just(TxPrepareOutcome::AllReady),
+        Just(TxPrepareOutcome::RequireApproval),
         Just(TxPrepareOutcome::Denied),
         Just(TxPrepareOutcome::Deferred),
     ]

@@ -84,6 +84,7 @@ fn all_gates_pass(num_steps: usize) -> Vec<TxPrepareGateInput> {
     (1..=num_steps)
         .map(|i| TxPrepareGateInput {
             step_id: TxStepId(format!("s{i}")),
+            pane_id: None,
             policy_passed: true,
             policy_reason_code: None,
             reservation_available: true,
@@ -92,6 +93,7 @@ fn all_gates_pass(num_steps: usize) -> Vec<TxPrepareGateInput> {
             approval_reason_code: None,
             target_liveness: true,
             liveness_reason_code: None,
+            required_approval: None,
         })
         .collect()
 }
@@ -375,13 +377,10 @@ fn sc4_approval_timeout() {
     )
     .unwrap();
 
-    // Approval timeout is a deferral (not a hard deny).
+    // Approval timeout should surface as an explicit approval requirement.
     assert!(
-        matches!(
-            prep.outcome,
-            TxPrepareOutcome::Deferred | TxPrepareOutcome::Denied
-        ),
-        "[sc4] should be Deferred or Denied, got {:?}",
+        matches!(prep.outcome, TxPrepareOutcome::RequireApproval),
+        "[sc4] should be RequireApproval, got {:?}",
         prep.outcome
     );
 }

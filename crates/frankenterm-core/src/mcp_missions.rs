@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn prepare_gate_inputs_match_step_count() {
         let contract = make_tx_contract(3);
-        let inputs = crate::plan::mission_tx_prepare_gate_inputs(&contract);
+        let inputs = crate::plan::tx_prepare_gate_inputs_allow_all(&contract);
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs[0].step_id, TxStepId("step-0".to_string()));
         assert_eq!(inputs[2].step_id, TxStepId("step-2".to_string()));
@@ -868,7 +868,7 @@ mod tests {
     #[test]
     fn prepare_gate_inputs_all_pass_by_default() {
         let contract = make_tx_contract(2);
-        let inputs = crate::plan::mission_tx_prepare_gate_inputs(&contract);
+        let inputs = crate::plan::tx_prepare_gate_inputs_allow_all(&contract);
         for input in &inputs {
             assert!(input.policy_passed);
             assert!(input.reservation_available);

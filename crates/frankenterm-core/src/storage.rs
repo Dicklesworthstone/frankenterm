@@ -7819,6 +7819,16 @@ impl StorageHandle {
         .await
     }
 
+    /// Get a specific pane using a synchronous read path.
+    ///
+    /// This is intended for prepare-phase policy evaluation, where the caller
+    /// is already on a synchronous execution path.
+    pub fn get_pane_blocking(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
+        let conn = Connection::open(self.db_path.as_str())
+            .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+        query_pane(&conn, pane_id)
+    }
+
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8161,6 +8171,13 @@ impl StorageHandle {
         .await
     }
 
+    /// Get the active reservation for a pane using a synchronous read path.
+    pub fn get_active_reservation_blocking(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
+        let conn = Connection::open(self.db_path.as_str())
+            .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+        get_active_reservation_sync(&conn, pane_id)
+    }
+
     /// List all active (unexpired) pane reservations (read-only).
     pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
         let db_path = self.db_path.clone();
@@ -8170,6 +8187,28 @@ impl StorageHandle {
             list_active_reservations_sync(&conn)
         })
         .await
+    }
+
+    /// Check whether there is an active approval token for the exact scope on a
+    /// synchronous read path.
+    pub fn has_active_approval_for_scope_blocking(
+        &self,
+        workspace_id: &str,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        action_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let conn = Connection::open(self.db_path.as_str())
+            .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+        query_active_approval_for_scope(
+            &conn,
+            workspace_id,
+            action_kind,
+            pane_id,
+            action_fingerprint,
+            now_ms,
+        )
     }
 
     // =========================================================================
@@ -15182,6 +15221,69 @@ fn query_approval_token_by_hash(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(StorageError::Database(format!("Approval token lookup failed: {e}")).into()),
     }
+}
+
+fn query_active_approval_for_scope(
+    conn: &Connection,
+    workspace_id: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    action_fingerprint: &str,
+    now_ms: i64,
+) -> Result<bool> {
+    let found = if let Some(pane_id) = pane_id {
+        #[allow(clippy::cast_possible_wrap)]
+        let pane_id = pane_id as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT 1 FROM approval_tokens
+                 WHERE workspace_id = ?1
+                   AND action_kind = ?2
+                   AND pane_id = ?3
+                   AND action_fingerprint = ?4
+                   AND used_at IS NULL
+                   AND expires_at >= ?5
+                 LIMIT 1",
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to prepare approval scope query: {e}"))
+            })?;
+        stmt.query_row(
+            params![
+                workspace_id,
+                action_kind,
+                pane_id,
+                action_fingerprint,
+                now_ms
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Approval scope query failed: {e}")))?
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT 1 FROM approval_tokens
+                 WHERE workspace_id = ?1
+                   AND action_kind = ?2
+                   AND pane_id IS NULL
+                   AND action_fingerprint = ?3
+                   AND used_at IS NULL
+                   AND expires_at >= ?4
+                 LIMIT 1",
+            )
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to prepare approval scope query: {e}"))
+            })?;
+        stmt.query_row(
+            params![workspace_id, action_kind, action_fingerprint, now_ms],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Approval scope query failed: {e}")))?
+    };
+
+    Ok(found.is_some())
 }
 
 /// Query maximum sequence number for a pane

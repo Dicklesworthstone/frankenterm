@@ -27,9 +27,13 @@
 //!     .build();
 //! ```
 
+use crate::approval::ApprovalScope;
+use crate::policy::{
+    ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyInput, PolicySurface,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fmt};
+use std::{cell::RefCell, collections::HashMap, fmt};
 
 /// Current schema version for action plans.
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
@@ -2696,6 +2700,7 @@ pub enum TxOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum TxPrepareOutcome {
     AllReady,
+    RequireApproval,
     Denied,
     Deferred,
 }
@@ -2859,17 +2864,37 @@ impl MissionTxContract {
 }
 
 /// Input for a single prepare-phase gate evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxPrepareApprovalRequirement {
+    pub workspace_id: String,
+    pub action_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    pub action_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+/// Input for a single prepare-phase gate evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxPrepareGateInput {
     pub step_id: TxStepId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
     pub policy_passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_reason_code: Option<String>,
     pub reservation_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation_reason_code: Option<String>,
     pub approval_satisfied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_reason_code: Option<String>,
     pub target_liveness: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_approval: Option<TxPrepareApprovalRequirement>,
 }
 
 /// Input for a single commit step.
@@ -2906,6 +2931,8 @@ pub struct TxCommitStepResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxPrepareReport {
     pub outcome: TxPrepareOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_inputs: Vec<TxPrepareGateInput>,
 }
 
 /// Report from the commit phase.
@@ -3006,15 +3033,416 @@ impl TxCompensationReport {
     }
 }
 
-/// Build the default prepare-gate inputs used by tx control surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxPrepareTargetSnapshot {
+    pub pane_id: u64,
+    pub capabilities: PaneCapabilities,
+    pub last_seen_at_ms: Option<i64>,
+    pub observed: bool,
+    pub known_dead: bool,
+    pub domain: Option<String>,
+    pub pane_title: Option<String>,
+    pub pane_cwd: Option<String>,
+    pub reserved_by: Option<String>,
+    pub reservation_lookup_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxPrepareEvaluationContext {
+    pub workspace_id: String,
+    pub surface: PolicySurface,
+    pub workflow_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub stale_after_ms: i64,
+}
+
+impl TxPrepareEvaluationContext {
+    pub const DEFAULT_STALE_AFTER_MS: i64 = 30_000;
+
+    #[must_use]
+    pub fn new(workspace_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            surface: PolicySurface::Workflow,
+            workflow_id: None,
+            agent_type: None,
+            stale_after_ms: Self::DEFAULT_STALE_AFTER_MS,
+        }
+    }
+
+    #[must_use]
+    pub fn with_surface(mut self, surface: PolicySurface) -> Self {
+        self.surface = surface;
+        self
+    }
+
+    #[must_use]
+    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.workflow_id = Some(workflow_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent_type(mut self, agent_type: impl Into<String>) -> Self {
+        self.agent_type = Some(agent_type.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_stale_after_ms(mut self, stale_after_ms: i64) -> Self {
+        self.stale_after_ms = stale_after_ms.max(0);
+        self
+    }
+}
+
+pub trait TxPreparePolicyAuthorizer {
+    fn authorize_prepare(&self, input: &PolicyInput) -> PolicyDecision;
+}
+
+impl TxPreparePolicyAuthorizer for RefCell<crate::policy::PolicyEngine> {
+    fn authorize_prepare(&self, input: &PolicyInput) -> PolicyDecision {
+        self.borrow_mut().authorize(input)
+    }
+}
+
+pub trait TxPrepareApprovalChecker {
+    fn has_active_approval(
+        &self,
+        scope: &ApprovalScope,
+        now_ms: i64,
+    ) -> std::result::Result<bool, String>;
+}
+
+pub struct StorageBackedPrepareApprovalChecker<'a> {
+    storage: Option<&'a crate::storage::StorageHandle>,
+}
+
+impl<'a> StorageBackedPrepareApprovalChecker<'a> {
+    #[must_use]
+    pub fn new(storage: Option<&'a crate::storage::StorageHandle>) -> Self {
+        Self { storage }
+    }
+}
+
+impl TxPrepareApprovalChecker for StorageBackedPrepareApprovalChecker<'_> {
+    fn has_active_approval(
+        &self,
+        scope: &ApprovalScope,
+        now_ms: i64,
+    ) -> std::result::Result<bool, String> {
+        let Some(storage) = self.storage else {
+            return Ok(false);
+        };
+
+        storage
+            .has_active_approval_for_scope_blocking(
+                &scope.workspace_id,
+                &scope.action_kind,
+                scope.pane_id,
+                &scope.action_fingerprint,
+                now_ms,
+            )
+            .map_err(|err| err.to_string())
+    }
+}
+
+pub trait TxPrepareTargetLookup {
+    fn lookup_target(
+        &self,
+        pane_id: u64,
+    ) -> std::result::Result<Option<TxPrepareTargetSnapshot>, String>;
+}
+
+pub struct StorageBackedPrepareTargetLookup<'a> {
+    registry: Option<&'a crate::ingest::PaneRegistry>,
+    storage: Option<&'a crate::storage::StorageHandle>,
+}
+
+impl<'a> StorageBackedPrepareTargetLookup<'a> {
+    #[must_use]
+    pub fn new(
+        registry: Option<&'a crate::ingest::PaneRegistry>,
+        storage: Option<&'a crate::storage::StorageHandle>,
+    ) -> Self {
+        Self { registry, storage }
+    }
+
+    fn reservation_state(&self, pane_id: u64) -> (Option<String>, Option<String>) {
+        let Some(storage) = self.storage else {
+            return (None, None);
+        };
+
+        match storage.get_active_reservation_blocking(pane_id) {
+            Ok(Some(reservation)) => (Some(reservation.owner_id), None),
+            Ok(None) => (None, None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    }
+}
+
+impl TxPrepareTargetLookup for StorageBackedPrepareTargetLookup<'_> {
+    fn lookup_target(
+        &self,
+        pane_id: u64,
+    ) -> std::result::Result<Option<TxPrepareTargetSnapshot>, String> {
+        if let Some(registry) = self.registry
+            && let Some(entry) = registry.get_entry(pane_id)
+        {
+            let cursor = registry.get_cursor(pane_id);
+            let (reserved_by, reservation_lookup_error) = self.reservation_state(pane_id);
+            let capabilities = PaneCapabilities::from_ingest_state(
+                None,
+                cursor.map(|cursor| cursor.in_alt_screen),
+                cursor.is_none_or(|cursor| cursor.in_gap),
+            );
+
+            return Ok(Some(TxPrepareTargetSnapshot {
+                pane_id,
+                capabilities,
+                last_seen_at_ms: Some(entry.last_seen_at),
+                observed: entry.should_observe(),
+                known_dead: false,
+                domain: Some(entry.info.inferred_domain()),
+                pane_title: entry.info.title.clone(),
+                pane_cwd: entry.info.cwd.clone(),
+                reserved_by,
+                reservation_lookup_error,
+            }));
+        }
+
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+
+        let pane = storage
+            .get_pane_blocking(pane_id)
+            .map_err(|err| err.to_string())?;
+        let Some(pane) = pane else {
+            return Ok(None);
+        };
+        let (reserved_by, reservation_lookup_error) = self.reservation_state(pane_id);
+        Ok(Some(TxPrepareTargetSnapshot {
+            pane_id,
+            capabilities: PaneCapabilities::unknown(),
+            last_seen_at_ms: Some(pane.last_seen_at),
+            observed: pane.observed,
+            known_dead: false,
+            domain: Some(pane.domain),
+            pane_title: pane.title,
+            pane_cwd: pane.cwd,
+            reserved_by,
+            reservation_lookup_error,
+        }))
+    }
+}
+
+fn tx_prepare_actor_kind(role: MissionActorRole) -> ActorKind {
+    match role {
+        MissionActorRole::Operator => ActorKind::Human,
+        MissionActorRole::Planner | MissionActorRole::Dispatcher => ActorKind::Workflow,
+    }
+}
+
+fn tx_prepare_action_kind(action: &StepAction) -> ActionKind {
+    match action {
+        StepAction::SendText { .. } => ActionKind::SendText,
+        StepAction::WaitFor { .. } => ActionKind::ReadOutput,
+        StepAction::AcquireLock { .. } => ActionKind::ReservePane,
+        StepAction::ReleaseLock { .. } => ActionKind::ReleasePane,
+        StepAction::StoreData { .. } => ActionKind::WriteFile,
+        StepAction::RunWorkflow { .. } => ActionKind::WorkflowRun,
+        StepAction::MarkEventHandled { .. } => ActionKind::WriteFile,
+        StepAction::ValidateApproval { .. } => ActionKind::ExecCommand,
+        StepAction::NestedPlan { .. } | StepAction::Custom { .. } => ActionKind::ExecCommand,
+    }
+}
+
+fn tx_prepare_pane_id(action: &StepAction) -> Option<u64> {
+    match action {
+        StepAction::SendText { pane_id, .. } => Some(*pane_id),
+        StepAction::WaitFor {
+            pane_id, condition, ..
+        } => (*pane_id).or(match condition {
+            WaitCondition::Pattern { pane_id, .. }
+            | WaitCondition::PaneIdle { pane_id, .. }
+            | WaitCondition::StableTail { pane_id, .. } => *pane_id,
+            WaitCondition::External { .. } => None,
+        }),
+        StepAction::AcquireLock { .. }
+        | StepAction::ReleaseLock { .. }
+        | StepAction::StoreData { .. }
+        | StepAction::RunWorkflow { .. }
+        | StepAction::MarkEventHandled { .. }
+        | StepAction::ValidateApproval { .. }
+        | StepAction::NestedPlan { .. }
+        | StepAction::Custom { .. } => None,
+    }
+}
+
+fn tx_prepare_text_summary(step: &TxStep) -> String {
+    if step.description.trim().is_empty() {
+        step.action.action_type_name().to_string()
+    } else {
+        step.description.clone()
+    }
+}
+
+fn tx_prepare_liveness(
+    pane_id: Option<u64>,
+    snapshot_result: Option<&std::result::Result<Option<TxPrepareTargetSnapshot>, String>>,
+    context: &TxPrepareEvaluationContext,
+    now_ms: i64,
+) -> (bool, Option<String>) {
+    let Some(pane_id) = pane_id else {
+        return (true, None);
+    };
+
+    let Some(snapshot_result) = snapshot_result else {
+        return (false, Some(format!("tx.prepare.target_missing:{pane_id}")));
+    };
+
+    let snapshot = match snapshot_result {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return (false, Some(format!("tx.prepare.target_missing:{pane_id}"))),
+        Err(_) => {
+            return (
+                false,
+                Some(format!("tx.prepare.target_lookup_failed:{pane_id}")),
+            );
+        }
+    };
+
+    if snapshot.known_dead {
+        return (false, Some(format!("tx.prepare.target_dead:{pane_id}")));
+    }
+    if !snapshot.observed {
+        return (
+            false,
+            Some(format!("tx.prepare.target_unobserved:{pane_id}")),
+        );
+    }
+
+    let Some(last_seen_at_ms) = snapshot.last_seen_at_ms else {
+        return (false, Some(format!("tx.prepare.target_unknown:{pane_id}")));
+    };
+
+    if context.stale_after_ms > 0 && now_ms.saturating_sub(last_seen_at_ms) > context.stale_after_ms
+    {
+        return (false, Some(format!("tx.prepare.target_stale:{pane_id}")));
+    }
+
+    (true, None)
+}
+
+fn tx_prepare_reservation(
+    pane_id: Option<u64>,
+    snapshot_result: Option<&std::result::Result<Option<TxPrepareTargetSnapshot>, String>>,
+    context: &TxPrepareEvaluationContext,
+) -> (bool, Option<String>) {
+    let Some(pane_id) = pane_id else {
+        return (true, None);
+    };
+
+    let Some(snapshot_result) = snapshot_result else {
+        return (
+            false,
+            Some(format!("tx.prepare.reservation_unknown:{pane_id}")),
+        );
+    };
+
+    let snapshot = match snapshot_result {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return (
+                false,
+                Some(format!("tx.prepare.reservation_unknown:{pane_id}")),
+            );
+        }
+        Err(_) => {
+            return (
+                false,
+                Some(format!("tx.prepare.reservation_lookup_failed:{pane_id}")),
+            );
+        }
+    };
+
+    if snapshot.reservation_lookup_error.is_some() {
+        return (
+            false,
+            Some(format!("tx.prepare.reservation_lookup_failed:{pane_id}")),
+        );
+    }
+
+    match snapshot.reserved_by.as_deref() {
+        None => (true, None),
+        Some(owner) if context.workflow_id.as_deref() == Some(owner) => (true, None),
+        Some(_) => (
+            false,
+            Some(format!("tx.prepare.reservation_conflict:{pane_id}")),
+        ),
+    }
+}
+
+fn tx_prepare_policy_input(
+    contract: &MissionTxContract,
+    step: &TxStep,
+    pane_id: Option<u64>,
+    snapshot: Option<&TxPrepareTargetSnapshot>,
+    context: &TxPrepareEvaluationContext,
+) -> PolicyInput {
+    let mut capabilities = snapshot
+        .map(|snapshot| snapshot.capabilities.clone())
+        .unwrap_or_else(PaneCapabilities::unknown);
+    if let Some(snapshot) = snapshot
+        && let Some(reserved_by) = snapshot.reserved_by.clone()
+    {
+        capabilities.is_reserved = true;
+        capabilities.reserved_by = Some(reserved_by);
+    }
+
+    let mut input = PolicyInput::new(
+        tx_prepare_action_kind(&step.action),
+        tx_prepare_actor_kind(contract.intent.requested_by),
+    )
+    .with_surface(context.surface)
+    .with_capabilities(capabilities)
+    .with_text_summary(tx_prepare_text_summary(step));
+
+    if let Some(pane_id) = pane_id {
+        input = input.with_pane(pane_id);
+    }
+    if let Some(domain) = snapshot.and_then(|snapshot| snapshot.domain.clone()) {
+        input = input.with_domain(domain);
+    }
+    if let Some(workflow_id) = context.workflow_id.clone() {
+        input = input.with_workflow(workflow_id);
+    }
+    if let Some(agent_type) = context.agent_type.clone() {
+        input = input.with_agent_type(agent_type);
+    }
+    if let Some(title) = snapshot.and_then(|snapshot| snapshot.pane_title.clone()) {
+        input = input.with_pane_title(title);
+    }
+    if let Some(cwd) = snapshot.and_then(|snapshot| snapshot.pane_cwd.clone()) {
+        input = input.with_pane_cwd(cwd);
+    }
+    if let StepAction::SendText { text, .. } = &step.action {
+        input = input.with_command_text(text.clone());
+    }
+
+    input
+}
+
+/// Build explicit allow-all prepare-gate inputs used by synthetic tx surfaces.
 #[must_use]
-pub fn mission_tx_prepare_gate_inputs(contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
+pub fn tx_prepare_gate_inputs_allow_all(contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
     contract
         .plan
         .steps
         .iter()
         .map(|step| TxPrepareGateInput {
             step_id: step.step_id.clone(),
+            pane_id: tx_prepare_pane_id(&step.action),
             policy_passed: true,
             policy_reason_code: None,
             reservation_available: true,
@@ -3023,6 +3451,117 @@ pub fn mission_tx_prepare_gate_inputs(contract: &MissionTxContract) -> Vec<TxPre
             approval_reason_code: None,
             target_liveness: true,
             liveness_reason_code: None,
+            required_approval: None,
+        })
+        .collect()
+}
+
+/// Build prepare-gate inputs by evaluating policy, approval, reservation, and liveness.
+#[must_use]
+pub fn mission_tx_prepare_gate_inputs<P, A, T>(
+    contract: &MissionTxContract,
+    policy: &P,
+    approvals: &A,
+    targets: &T,
+    context: &TxPrepareEvaluationContext,
+    now_ms: i64,
+) -> Vec<TxPrepareGateInput>
+where
+    P: TxPreparePolicyAuthorizer,
+    A: TxPrepareApprovalChecker,
+    T: TxPrepareTargetLookup,
+{
+    let mut target_cache: HashMap<
+        u64,
+        std::result::Result<Option<TxPrepareTargetSnapshot>, String>,
+    > = HashMap::new();
+
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| {
+            let pane_id = tx_prepare_pane_id(&step.action);
+            let snapshot_result = pane_id.map(|pane_id| {
+                target_cache
+                    .entry(pane_id)
+                    .or_insert_with(|| targets.lookup_target(pane_id))
+                    .clone()
+            });
+            let snapshot = snapshot_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok().and_then(|snapshot| snapshot.as_ref()));
+            let (target_liveness, liveness_reason_code) =
+                tx_prepare_liveness(pane_id, snapshot_result.as_ref(), context, now_ms);
+            let (reservation_available, reservation_reason_code) =
+                tx_prepare_reservation(pane_id, snapshot_result.as_ref(), context);
+
+            let policy_input = tx_prepare_policy_input(contract, step, pane_id, snapshot, context);
+            let policy_decision = policy.authorize_prepare(&policy_input);
+
+            let (
+                policy_passed,
+                policy_reason_code,
+                required_approval,
+                approval_satisfied,
+                approval_reason_code,
+            ) = match &policy_decision {
+                PolicyDecision::Allow { .. } => (true, None, None, true, None),
+                PolicyDecision::Deny { .. } => (
+                    false,
+                    policy_decision
+                        .rule_id()
+                        .map(ToString::to_string)
+                        .or_else(|| policy_decision.reason().map(ToString::to_string)),
+                    None,
+                    true,
+                    None,
+                ),
+                PolicyDecision::RequireApproval { .. } => {
+                    let scope = ApprovalScope::from_input(&context.workspace_id, &policy_input);
+                    let requirement = TxPrepareApprovalRequirement {
+                        workspace_id: scope.workspace_id.clone(),
+                        action_kind: scope.action_kind.clone(),
+                        pane_id: scope.pane_id,
+                        action_fingerprint: scope.action_fingerprint.clone(),
+                        reason_code: policy_decision.rule_id().map(ToString::to_string),
+                    };
+                    let (approval_satisfied, approval_reason_code) = match approvals
+                        .has_active_approval(&scope, now_ms)
+                    {
+                        Ok(true) => (true, None),
+                        Ok(false) => (
+                            false,
+                            requirement
+                                .reason_code
+                                .clone()
+                                .or_else(|| Some("tx.prepare.approval_required".to_string())),
+                        ),
+                        Err(_) => (false, Some("tx.prepare.approval_lookup_failed".to_string())),
+                    };
+                    (
+                        true,
+                        None,
+                        Some(requirement),
+                        approval_satisfied,
+                        approval_reason_code,
+                    )
+                }
+            };
+
+            TxPrepareGateInput {
+                step_id: step.step_id.clone(),
+                pane_id,
+                policy_passed,
+                policy_reason_code,
+                reservation_available,
+                reservation_reason_code,
+                approval_satisfied,
+                approval_reason_code,
+                target_liveness,
+                liveness_reason_code,
+                required_approval,
+            }
         })
         .collect()
 }
@@ -3371,19 +3910,30 @@ pub fn evaluate_prepare_phase(
     if kill_switch == MissionKillSwitchLevel::HardStop {
         return Ok(TxPrepareReport {
             outcome: TxPrepareOutcome::Denied,
+            gate_inputs: gate_inputs.to_vec(),
         });
     }
 
     let mut all_ready = true;
+    let mut approval_required = false;
+    let mut denied = false;
     for step in &plan.steps {
         let mut matched_any = false;
         let mut step_ready = true;
+        let mut step_denied = false;
+        let mut step_requires_approval = false;
 
         for gate in gate_inputs
             .iter()
             .filter(|gate| gate.step_id == step.step_id)
         {
             matched_any = true;
+            step_denied |=
+                !gate.policy_passed || !gate.reservation_available || !gate.target_liveness;
+            step_requires_approval |= gate.policy_passed
+                && gate.reservation_available
+                && gate.target_liveness
+                && !gate.approval_satisfied;
             step_ready &= gate.policy_passed
                 && gate.reservation_available
                 && gate.approval_satisfied
@@ -3393,18 +3943,26 @@ pub fn evaluate_prepare_phase(
         if !matched_any {
             return Ok(TxPrepareReport {
                 outcome: TxPrepareOutcome::Deferred,
+                gate_inputs: gate_inputs.to_vec(),
             });
         }
 
+        denied |= step_denied;
+        approval_required |= !step_denied && step_requires_approval;
         all_ready &= step_ready;
     }
 
     Ok(TxPrepareReport {
-        outcome: if all_ready {
+        outcome: if denied {
+            TxPrepareOutcome::Denied
+        } else if approval_required {
+            TxPrepareOutcome::RequireApproval
+        } else if all_ready {
             TxPrepareOutcome::AllReady
         } else {
             TxPrepareOutcome::Denied
         },
+        gate_inputs: gate_inputs.to_vec(),
     })
 }
 
@@ -4858,6 +5416,7 @@ pub fn reconstruct_tx_resume_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_plan_hash_determinism() {
@@ -7204,10 +7763,141 @@ mod tests {
             .collect()
     }
 
+    #[derive(Clone)]
+    struct MockPolicyAuthorizer {
+        default: PolicyDecision,
+        decisions: HashMap<String, PolicyDecision>,
+    }
+
+    impl MockPolicyAuthorizer {
+        fn allow_all() -> Self {
+            Self {
+                default: PolicyDecision::allow(),
+                decisions: HashMap::new(),
+            }
+        }
+
+        fn with_pane_decision(mut self, pane_id: u64, decision: PolicyDecision) -> Self {
+            self.decisions.insert(format!("pane:{pane_id}"), decision);
+            self
+        }
+    }
+
+    impl TxPreparePolicyAuthorizer for MockPolicyAuthorizer {
+        fn authorize_prepare(&self, input: &PolicyInput) -> PolicyDecision {
+            input
+                .pane_id
+                .and_then(|pane_id| self.decisions.get(&format!("pane:{pane_id}")).cloned())
+                .unwrap_or_else(|| self.default.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockApprovalChecker {
+        approved: HashSet<String>,
+        lookup_failures: HashSet<String>,
+    }
+
+    impl MockApprovalChecker {
+        fn grant(&mut self, scope: &ApprovalScope) {
+            self.approved.insert(Self::scope_key(scope));
+        }
+
+        fn fail_lookup(&mut self, scope: &ApprovalScope) {
+            self.lookup_failures.insert(Self::scope_key(scope));
+        }
+
+        fn scope_key(scope: &ApprovalScope) -> String {
+            format!(
+                "{}|{}|{}|{}",
+                scope.workspace_id,
+                scope.action_kind,
+                scope
+                    .pane_id
+                    .map_or_else(|| "none".to_string(), |pane_id| pane_id.to_string()),
+                scope.action_fingerprint
+            )
+        }
+    }
+
+    impl TxPrepareApprovalChecker for MockApprovalChecker {
+        fn has_active_approval(
+            &self,
+            scope: &ApprovalScope,
+            _now_ms: i64,
+        ) -> std::result::Result<bool, String> {
+            let key = Self::scope_key(scope);
+            if self.lookup_failures.contains(&key) {
+                return Err("lookup failed".to_string());
+            }
+            Ok(self.approved.contains(&key))
+        }
+    }
+
+    #[derive(Default)]
+    struct MockTargetLookup {
+        snapshots: HashMap<u64, TxPrepareTargetSnapshot>,
+        failures: HashMap<u64, String>,
+    }
+
+    impl MockTargetLookup {
+        fn with_snapshot(mut self, snapshot: TxPrepareTargetSnapshot) -> Self {
+            self.snapshots.insert(snapshot.pane_id, snapshot);
+            self
+        }
+    }
+
+    impl TxPrepareTargetLookup for MockTargetLookup {
+        fn lookup_target(
+            &self,
+            pane_id: u64,
+        ) -> std::result::Result<Option<TxPrepareTargetSnapshot>, String> {
+            if let Some(reason) = self.failures.get(&pane_id) {
+                return Err(reason.clone());
+            }
+            Ok(self.snapshots.get(&pane_id).cloned())
+        }
+    }
+
+    fn sample_prepare_context() -> TxPrepareEvaluationContext {
+        TxPrepareEvaluationContext::new("workspace:test")
+            .with_surface(PolicySurface::Workflow)
+            .with_workflow_id("wf-test")
+            .with_stale_after_ms(30_000)
+    }
+
+    fn live_target_snapshot(pane_id: u64, last_seen_at_ms: i64) -> TxPrepareTargetSnapshot {
+        TxPrepareTargetSnapshot {
+            pane_id,
+            capabilities: PaneCapabilities::prompt(),
+            last_seen_at_ms: Some(last_seen_at_ms),
+            observed: true,
+            known_dead: false,
+            domain: Some("local".to_string()),
+            pane_title: Some(format!("pane-{pane_id}")),
+            pane_cwd: Some(format!("/tmp/pane-{pane_id}")),
+            reserved_by: None,
+            reservation_lookup_error: None,
+        }
+    }
+
     #[test]
     fn tx_surface_prepare_gate_inputs_default_to_ready() {
         let contract = sample_tx_contract(MissionTxState::Planned);
-        let inputs = mission_tx_prepare_gate_inputs(&contract);
+        let policy = RefCell::new(crate::policy::PolicyEngine::new(100, 100, false));
+        let approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs[0].step_id.0, "tx-step:1");
@@ -7215,6 +7905,384 @@ mod tests {
             && input.reservation_available
             && input.approval_satisfied
             && input.target_liveness));
+    }
+
+    #[test]
+    fn tx_prepare_gate_policy_denial_marks_only_targeted_step() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            2,
+            PolicyDecision::deny_with_rule("pane blocked", "policy.test.blocked"),
+        );
+        let approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(inputs[0].policy_passed);
+        assert!(!inputs[1].policy_passed);
+        assert_eq!(
+            inputs[1].policy_reason_code.as_deref(),
+            Some("policy.test.blocked")
+        );
+        assert!(inputs[2].policy_passed);
+    }
+
+    #[test]
+    fn tx_prepare_gate_policy_allows_non_pane_workflow_steps() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.plan.steps = vec![TxStep {
+            step_id: TxStepId("tx-step:workflow".to_string()),
+            ordinal: 1,
+            action: StepAction::RunWorkflow {
+                workflow_id: "wf-child".to_string(),
+                params: None,
+            },
+            description: "run workflow".to_string(),
+        }];
+
+        let policy = MockPolicyAuthorizer::allow_all();
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default(),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].policy_passed);
+        assert!(inputs[0].target_liveness);
+        assert!(inputs[0].reservation_available);
+        assert_eq!(inputs[0].pane_id, None);
+    }
+
+    #[test]
+    fn tx_prepare_phase_denied_when_policy_gate_fails() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            2,
+            PolicyDecision::deny_with_rule("pane blocked", "policy.test.blocked"),
+        );
+        let approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+        let gate_inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+        assert_eq!(report.gate_inputs.len(), 3);
+    }
+
+    #[test]
+    fn tx_prepare_gate_missing_approval_is_reported_without_failing_policy() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            1,
+            PolicyDecision::require_approval_with_rule(
+                "need approval",
+                "policy.test.require_approval",
+            ),
+        );
+        let approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(inputs[0].policy_passed);
+        assert!(!inputs[0].approval_satisfied);
+        assert_eq!(
+            inputs[0].approval_reason_code.as_deref(),
+            Some("policy.test.require_approval")
+        );
+        assert!(inputs[0].required_approval.is_some());
+    }
+
+    #[test]
+    fn tx_prepare_gate_matching_approval_satisfies_requirement() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            1,
+            PolicyDecision::require_approval_with_rule(
+                "need approval",
+                "policy.test.require_approval",
+            ),
+        );
+        let mut approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+
+        let first_pass = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+        approvals.grant(&ApprovalScope {
+            workspace_id: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .workspace_id
+                .clone(),
+            action_kind: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .action_kind
+                .clone(),
+            pane_id: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .pane_id,
+            action_fingerprint: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .action_fingerprint
+                .clone(),
+        });
+
+        let second_pass = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(second_pass[0].approval_satisfied);
+        assert!(second_pass[0].required_approval.is_some());
+    }
+
+    #[test]
+    fn tx_prepare_gate_lookup_failure_surfaces_as_missing_approval() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            1,
+            PolicyDecision::require_approval_with_rule(
+                "need approval",
+                "policy.test.require_approval",
+            ),
+        );
+        let mut approvals = MockApprovalChecker::default();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+
+        let first_pass = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+        let scope = ApprovalScope {
+            workspace_id: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .workspace_id
+                .clone(),
+            action_kind: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .action_kind
+                .clone(),
+            pane_id: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .pane_id,
+            action_fingerprint: first_pass[0]
+                .required_approval
+                .as_ref()
+                .expect("approval scope")
+                .action_fingerprint
+                .clone(),
+        };
+        approvals.fail_lookup(&scope);
+
+        let second_pass = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &approvals,
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(!second_pass[0].approval_satisfied);
+        assert_eq!(
+            second_pass[0].approval_reason_code.as_deref(),
+            Some("tx.prepare.approval_lookup_failed")
+        );
+    }
+
+    #[test]
+    fn tx_prepare_phase_reports_require_approval_when_only_approval_is_missing() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let policy = MockPolicyAuthorizer::allow_all().with_pane_decision(
+            1,
+            PolicyDecision::require_approval_with_rule(
+                "need approval",
+                "policy.test.require_approval",
+            ),
+        );
+        let gate_inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &policy,
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &gate_inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+
+        assert_eq!(report.outcome, TxPrepareOutcome::RequireApproval);
+    }
+
+    #[test]
+    fn tx_prepare_gate_live_target_passes_liveness_check() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(inputs.iter().all(|input| input.target_liveness));
+    }
+
+    #[test]
+    fn tx_prepare_gate_missing_target_fails_liveness() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(!inputs[1].target_liveness);
+        assert_eq!(
+            inputs[1].liveness_reason_code.as_deref(),
+            Some("tx.prepare.target_missing:2")
+        );
+    }
+
+    #[test]
+    fn tx_prepare_gate_stale_target_fails_liveness() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(2, 1_699_999_900_000))
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(!inputs[1].target_liveness);
+        assert_eq!(
+            inputs[1].liveness_reason_code.as_deref(),
+            Some("tx.prepare.target_stale:2")
+        );
+    }
+
+    #[test]
+    fn tx_prepare_gate_unobserved_target_fails_liveness() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut unobserved = live_target_snapshot(2, 1_700_000_000_000);
+        unobserved.observed = false;
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(unobserved)
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(!inputs[1].target_liveness);
+        assert_eq!(
+            inputs[1].liveness_reason_code.as_deref(),
+            Some("tx.prepare.target_unobserved:2")
+        );
     }
 
     #[test]
@@ -7364,6 +8432,7 @@ mod tests {
         let gate_inputs = vec![
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:1".to_string()),
+                pane_id: Some(1),
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -7372,9 +8441,11 @@ mod tests {
                 approval_reason_code: None,
                 target_liveness: true,
                 liveness_reason_code: None,
+                required_approval: None,
             },
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:1".to_string()),
+                pane_id: Some(1),
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -7383,9 +8454,11 @@ mod tests {
                 approval_reason_code: None,
                 target_liveness: true,
                 liveness_reason_code: None,
+                required_approval: None,
             },
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:2".to_string()),
+                pane_id: Some(2),
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -7394,6 +8467,7 @@ mod tests {
                 approval_reason_code: None,
                 target_liveness: true,
                 liveness_reason_code: None,
+                required_approval: None,
             },
         ];
 
@@ -7412,9 +8486,10 @@ mod tests {
     #[test]
     fn tx_prepare_phase_ignores_unrelated_gate_inputs() {
         let contract = sample_tx_contract(MissionTxState::Planned);
-        let mut gate_inputs = mission_tx_prepare_gate_inputs(&contract);
+        let mut gate_inputs = tx_prepare_gate_inputs_allow_all(&contract);
         gate_inputs.push(TxPrepareGateInput {
             step_id: TxStepId("tx-step:unrelated".to_string()),
+            pane_id: Some(99),
             policy_passed: false,
             policy_reason_code: Some("policy_denied".to_string()),
             reservation_available: false,
@@ -7423,6 +8498,7 @@ mod tests {
             approval_reason_code: Some("approval_missing".to_string()),
             target_liveness: false,
             liveness_reason_code: Some("target_unreachable".to_string()),
+            required_approval: None,
         });
 
         let report = evaluate_prepare_phase(

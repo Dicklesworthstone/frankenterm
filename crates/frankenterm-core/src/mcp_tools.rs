@@ -2474,8 +2474,9 @@ impl ToolHandler for WaTxRunTool {
 
         let mut commit_report = None;
         let mut compensation_report = None;
-        let mut final_state = match prepare_report.outcome {
+        let mut final_state = match &prepare_report.outcome {
             crate::plan::TxPrepareOutcome::AllReady => crate::plan::MissionTxState::Prepared,
+            crate::plan::TxPrepareOutcome::RequireApproval => crate::plan::MissionTxState::Planned,
             crate::plan::TxPrepareOutcome::Denied => crate::plan::MissionTxState::Failed,
             crate::plan::TxPrepareOutcome::Deferred => crate::plan::MissionTxState::Planned,
         };

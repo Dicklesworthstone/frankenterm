@@ -609,6 +609,7 @@ fn b1_multi_gate_denial_cascade() {
     let gates: Vec<TxPrepareGateInput> = (1..=NUM_STEPS)
         .map(|i| TxPrepareGateInput {
             step_id: TxStepId(format!("s{i}")),
+            pane_id: None,
             policy_passed: i != 1,
             policy_reason_code: if i == 1 {
                 Some("org-policy-block".into())
@@ -621,6 +622,7 @@ fn b1_multi_gate_denial_cascade() {
             approval_reason_code: None,
             target_liveness: i != 3,
             liveness_reason_code: if i == 3 { Some("FTX1004".into()) } else { None },
+            required_approval: None,
         })
         .collect();
 
