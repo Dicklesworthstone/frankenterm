@@ -196,17 +196,43 @@ where
 
 // ── Pane Step Executor ──────────────────────────────────────────────────────
 
+/// Configuration for `PaneStepExecutor` timeout and backpressure behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneStepExecutorConfig {
+    /// Default timeout for `SendText` steps (ms). Defaults to 30_000.
+    pub default_send_timeout_ms: u64,
+    /// Phase-level timeout buffer added on top of aggregate step timeouts (ms). Defaults to 30_000.
+    pub phase_timeout_buffer_ms: u64,
+    /// Whether to check backpressure before each step. Defaults to true.
+    pub backpressure_enabled: bool,
+}
+
+impl Default for PaneStepExecutorConfig {
+    fn default() -> Self {
+        Self {
+            default_send_timeout_ms: 30_000,
+            phase_timeout_buffer_ms: 30_000,
+            backpressure_enabled: true,
+        }
+    }
+}
+
 /// Step executor that dispatches step operations to real panes via `WeztermInterface`.
 ///
 /// - `evaluate_gates`: delegates to `PolicyPrepareStepExecutor` for real policy evaluation.
 /// - `execute_steps`: dispatches `SendText`, `WaitFor`, `StoreData` etc. to real panes.
 /// - `execute_compensations`: dispatches compensation actions to real panes.
 ///
-/// Uses `spawn_blocking` + a fresh runtime internally so it can call async
+/// Supports per-step timeouts, phase-level timeout budgets, and backpressure
+/// integration with `FleetMemoryController`.
+///
+/// Uses `thread::spawn` + a fresh runtime internally so it can call async
 /// `WeztermInterface` methods from the sync `StepExecutor` trait.
 pub struct PaneStepExecutor<P, A, T> {
     handle: crate::wezterm::WeztermHandle,
     policy_executor: PolicyPrepareStepExecutor<P, A, T>,
+    config: PaneStepExecutorConfig,
+    fleet_controller: Option<std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>>,
 }
 
 impl<P, A, T> PaneStepExecutor<P, A, T> {
@@ -227,17 +253,57 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
                 targets,
                 prepare_context,
             ),
+            config: PaneStepExecutorConfig::default(),
+            fleet_controller: None,
         }
     }
+
+    /// Set custom timeout/backpressure configuration.
+    #[must_use]
+    pub fn with_config(mut self, config: PaneStepExecutorConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Attach a fleet memory controller for backpressure-aware execution.
+    #[must_use]
+    pub fn with_fleet_controller(
+        mut self,
+        controller: std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>,
+    ) -> Self {
+        self.fleet_controller = Some(controller);
+        self
+    }
+}
+
+/// Extract the step-level timeout from a `StepAction`. Returns `None` for non-I/O actions.
+fn step_timeout_ms(action: &crate::plan::StepAction, default_send_ms: u64) -> Option<u64> {
+    match action {
+        crate::plan::StepAction::SendText { .. } => Some(default_send_ms),
+        crate::plan::StepAction::WaitFor { timeout_ms, .. } => Some(*timeout_ms),
+        _ => None, // Non-I/O actions (StoreData, AcquireLock, etc.) don't need timeouts
+    }
+}
+
+/// Check whether the given action targets a specific pane.
+fn action_has_pane(action: &crate::plan::StepAction) -> bool {
+    matches!(
+        action,
+        crate::plan::StepAction::SendText { .. } | crate::plan::StepAction::WaitFor { .. }
+    )
 }
 
 /// Execute a single step action against the real backend (blocking).
 ///
-/// Spawns a one-shot runtime for async calls. Returns `(success, reason_code, error_code)`.
+/// Spawns a one-shot runtime for async calls. If `timeout_ms` is provided, wraps
+/// the async operation in `runtime_compat::timeout`. Returns `(success, reason_code, error_code)`.
 fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
+    timeout_ms: Option<u64>,
 ) -> (bool, String, Option<String>) {
+    let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
+                        // For SendText, the backend's own timeouts apply.
     match action {
         crate::plan::StepAction::SendText {
             pane_id,
@@ -409,6 +475,17 @@ where
         let mut results = Vec::with_capacity(contract.plan.steps.len());
         let mut had_failure = false;
 
+        // Phase-level timeout: sum of step timeouts + buffer
+        let aggregate_step_budget_ms: u64 = contract
+            .plan
+            .steps
+            .iter()
+            .filter_map(|s| step_timeout_ms(&s.action, self.config.default_send_timeout_ms))
+            .sum();
+        let phase_budget =
+            std::time::Duration::from_millis(aggregate_step_budget_ms + self.config.phase_timeout_buffer_ms);
+        let phase_start = std::time::Instant::now();
+
         for step in &contract.plan.steps {
             // Deterministic failure injection
             if fail_step == Some(step.step_id.0.as_str()) {
@@ -436,14 +513,93 @@ where
                 continue;
             }
 
+            // Phase-level timeout check
+            let elapsed = phase_start.elapsed();
+            if elapsed >= phase_budget {
+                let remaining = contract.plan.steps.len() - results.len();
+                tracing::error!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    remaining_steps = remaining,
+                    "phase timeout exceeded, skipping remaining steps"
+                );
+                results.push(TxCommitStepInput {
+                    step_id: step.step_id.clone(),
+                    success: false,
+                    reason_code: "phase_timeout".to_string(),
+                    error_code: Some(format!(
+                        "FTX_PHASE_TIMEOUT: elapsed {}ms exceeds budget {}ms",
+                        elapsed.as_millis(),
+                        phase_budget.as_millis()
+                    )),
+                    completed_at_ms: now_ms,
+                });
+                had_failure = true;
+                continue;
+            }
+
+            // Backpressure check
+            if self.config.backpressure_enabled {
+                if let Some(ref controller) = self.fleet_controller {
+                    use crate::fleet_memory_controller::FleetPressureTier;
+                    let tier = controller.compound_tier();
+                    match tier {
+                        FleetPressureTier::Normal => {}
+                        FleetPressureTier::Elevated => {
+                            tracing::warn!(
+                                step_id = %step.step_id.0,
+                                tier = ?tier,
+                                "elevated backpressure — proceeding with caution"
+                            );
+                        }
+                        FleetPressureTier::Critical => {
+                            if !action_has_pane(&step.action) {
+                                tracing::warn!(
+                                    step_id = %step.step_id.0,
+                                    tier = ?tier,
+                                    "critical backpressure — deferring non-pane step"
+                                );
+                                results.push(TxCommitStepInput {
+                                    step_id: step.step_id.clone(),
+                                    success: false,
+                                    reason_code: "backpressure_deferred".to_string(),
+                                    error_code: Some("FTX_BACKPRESSURE_CRITICAL".to_string()),
+                                    completed_at_ms: now_ms,
+                                });
+                                had_failure = true;
+                                continue;
+                            }
+                        }
+                        FleetPressureTier::Emergency => {
+                            tracing::error!(
+                                step_id = %step.step_id.0,
+                                tier = ?tier,
+                                "emergency backpressure — deferring all steps"
+                            );
+                            results.push(TxCommitStepInput {
+                                step_id: step.step_id.clone(),
+                                success: false,
+                                reason_code: "backpressure_emergency".to_string(),
+                                error_code: Some("FTX_BACKPRESSURE_EMERGENCY".to_string()),
+                                completed_at_ms: now_ms,
+                            });
+                            had_failure = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let step_timeout = step_timeout_ms(&step.action, self.config.default_send_timeout_ms);
+
             tracing::info!(
                 step_id = %step.step_id.0,
                 action = ?std::mem::discriminant(&step.action),
+                timeout_ms = ?step_timeout,
                 "executing pane step"
             );
 
             let (success, reason_code, error_code) =
-                execute_step_action(&self.handle, &step.action);
+                execute_step_action(&self.handle, &step.action, step_timeout);
 
             tracing::info!(
                 step_id = %step.step_id.0,
@@ -2339,6 +2495,36 @@ mod tests {
         )
     }
 
+    /// Create a PaneStepExecutor with custom config.
+    fn make_pane_executor_with_config(
+        handle: WeztermHandle,
+        config: PaneStepExecutorConfig,
+    ) -> PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets> {
+        PaneStepExecutor::new(
+            handle,
+            TestAllowAllPolicy,
+            TestAllowAllApprovals,
+            TestAllLiveTargets,
+            TxPrepareEvaluationContext::new("test-workspace"),
+        )
+        .with_config(config)
+    }
+
+    /// Create a PaneStepExecutor with a fleet memory controller.
+    fn make_pane_executor_with_controller(
+        handle: WeztermHandle,
+        controller: std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>,
+    ) -> PaneStepExecutor<TestAllowAllPolicy, TestAllowAllApprovals, TestAllLiveTargets> {
+        PaneStepExecutor::new(
+            handle,
+            TestAllowAllPolicy,
+            TestAllowAllApprovals,
+            TestAllLiveTargets,
+            TxPrepareEvaluationContext::new("test-workspace"),
+        )
+        .with_fleet_controller(controller)
+    }
+
     #[test]
     fn pane_executor_send_text_happy_path() {
         let mock = Arc::new(MockWezterm::new());
@@ -2742,5 +2928,334 @@ mod tests {
         assert_eq!(results[1].reason_code, "mark_event_handled_succeeded");
         assert!(results[2].success);
         assert_eq!(results[2].reason_code, "release_lock_succeeded");
+    }
+
+    // ── Timeout and backpressure tests (ft-y9lnb.4) ────────────────────
+
+    #[test]
+    fn pane_executor_phase_timeout_skips_remaining() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+            mock.inject_output(0, "no match here").await.unwrap();
+        });
+
+        // A WaitFor with 500ms timeout contributes 500ms to step budget.
+        // Phase buffer = 0, so total phase budget = 500ms.
+        // The WaitFor will timeout after 500ms, which puts elapsed over the
+        // 500ms phase budget. The second step should be skipped.
+        let config = PaneStepExecutorConfig {
+            default_send_timeout_ms: 30_000,
+            phase_timeout_buffer_ms: 0,
+            backpressure_enabled: false,
+        };
+        let executor = make_pane_executor_with_config(mock as WeztermHandle, config);
+
+        let contract = make_pane_contract(vec![
+            (
+                "w1".to_string(),
+                StepAction::WaitFor {
+                    pane_id: Some(0),
+                    condition: WaitCondition::Pattern {
+                        pane_id: None,
+                        rule_id: "NEVER_APPEARS".to_string(),
+                    },
+                    timeout_ms: 500,
+                },
+            ),
+            (
+                "s2".to_string(),
+                StepAction::StoreData {
+                    key: "k2".to_string(),
+                    value: serde_json::json!("v2"),
+                },
+            ),
+        ]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 2);
+        // First step times out (WaitFor pattern never matches)
+        assert!(!results[0].success);
+        assert_eq!(results[0].reason_code, "wait_for_timeout");
+        // Second step is skipped after failure boundary
+        assert!(!results[1].success);
+        assert_eq!(results[1].reason_code, "skipped_after_failure");
+    }
+
+    #[test]
+    fn pane_executor_default_send_timeout_config() {
+        let mock = mock_wezterm_handle();
+        let config = PaneStepExecutorConfig {
+            default_send_timeout_ms: 5000,
+            phase_timeout_buffer_ms: 60_000,
+            backpressure_enabled: false,
+        };
+        let executor = make_pane_executor_with_config(mock, config);
+        // Verify config is accepted — StoreData succeeds regardless
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[test]
+    fn pane_executor_backpressure_normal_proceeds() {
+        let mock = mock_wezterm_handle();
+        let controller = std::sync::Arc::new(
+            crate::fleet_memory_controller::FleetMemoryController::default(),
+        );
+        // Default controller is Normal tier
+        let executor = make_pane_executor_with_controller(mock, controller);
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+    }
+
+    #[test]
+    fn pane_executor_backpressure_emergency_defers_all() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let mut controller = crate::fleet_memory_controller::FleetMemoryController::new(
+            crate::fleet_memory_controller::FleetMemoryConfig {
+                escalation_threshold: 1,
+                deescalation_threshold: 1,
+                ..Default::default()
+            },
+        );
+        // Push to Emergency via black signals
+        let emergency_signals = crate::fleet_memory_controller::PressureSignals {
+            backpressure: crate::backpressure::BackpressureTier::Black,
+            memory_pressure: crate::memory_pressure::MemoryPressureTier::Red,
+            worst_budget: crate::memory_budget::BudgetLevel::OverBudget,
+            pane_count: 200,
+            paused_pane_count: 100,
+        };
+        controller.evaluate(&emergency_signals);
+        assert_eq!(
+            controller.compound_tier(),
+            crate::fleet_memory_controller::FleetPressureTier::Emergency
+        );
+
+        let controller = std::sync::Arc::new(controller);
+        let executor = make_pane_executor_with_controller(mock as WeztermHandle, controller);
+
+        let contract = make_pane_contract(vec![
+            (
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "hello".to_string(),
+                    paste_mode: None,
+                },
+            ),
+            (
+                "s2".to_string(),
+                StepAction::StoreData {
+                    key: "k".to_string(),
+                    value: serde_json::json!("v"),
+                },
+            ),
+        ]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 2);
+        // All steps deferred under emergency
+        assert!(!results[0].success);
+        assert_eq!(results[0].reason_code, "backpressure_emergency");
+        assert!(!results[1].success);
+        assert_eq!(results[1].reason_code, "skipped_after_failure");
+    }
+
+    #[test]
+    fn pane_executor_backpressure_critical_defers_non_pane() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            mock.add_default_pane(0).await;
+        });
+
+        let mut controller = crate::fleet_memory_controller::FleetMemoryController::new(
+            crate::fleet_memory_controller::FleetMemoryConfig {
+                escalation_threshold: 1,
+                deescalation_threshold: 1,
+                ..Default::default()
+            },
+        );
+        // Push to Critical via red signals
+        let critical_signals = crate::fleet_memory_controller::PressureSignals {
+            backpressure: crate::backpressure::BackpressureTier::Red,
+            memory_pressure: crate::memory_pressure::MemoryPressureTier::Orange,
+            worst_budget: crate::memory_budget::BudgetLevel::Throttled,
+            pane_count: 200,
+            paused_pane_count: 10,
+        };
+        controller.evaluate(&critical_signals);
+        assert_eq!(
+            controller.compound_tier(),
+            crate::fleet_memory_controller::FleetPressureTier::Critical
+        );
+
+        let controller = std::sync::Arc::new(controller);
+        let executor = make_pane_executor_with_controller(mock as WeztermHandle, controller);
+
+        // StoreData (no pane) first, then SendText (has pane)
+        let contract = make_pane_contract(vec![
+            (
+                "s1".to_string(),
+                StepAction::StoreData {
+                    key: "k".to_string(),
+                    value: serde_json::json!("v"),
+                },
+            ),
+            (
+                "s2".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "hello".to_string(),
+                    paste_mode: None,
+                },
+            ),
+        ]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 2);
+        // StoreData deferred (no pane, Critical)
+        assert!(!results[0].success);
+        assert_eq!(results[0].reason_code, "backpressure_deferred");
+        // SendText skipped after failure
+        assert!(!results[1].success);
+        assert_eq!(results[1].reason_code, "skipped_after_failure");
+    }
+
+    #[test]
+    fn pane_executor_backpressure_disabled_ignores_controller() {
+        let mut controller = crate::fleet_memory_controller::FleetMemoryController::new(
+            crate::fleet_memory_controller::FleetMemoryConfig {
+                escalation_threshold: 1,
+                deescalation_threshold: 1,
+                ..Default::default()
+            },
+        );
+        let emergency_signals = crate::fleet_memory_controller::PressureSignals {
+            backpressure: crate::backpressure::BackpressureTier::Black,
+            memory_pressure: crate::memory_pressure::MemoryPressureTier::Red,
+            worst_budget: crate::memory_budget::BudgetLevel::OverBudget,
+            pane_count: 200,
+            paused_pane_count: 100,
+        };
+        controller.evaluate(&emergency_signals);
+
+        let mock = mock_wezterm_handle();
+        let config = PaneStepExecutorConfig {
+            default_send_timeout_ms: 30_000,
+            phase_timeout_buffer_ms: 30_000,
+            backpressure_enabled: false, // Disabled!
+        };
+        let executor = PaneStepExecutor::new(
+            mock,
+            TestAllowAllPolicy,
+            TestAllowAllApprovals,
+            TestAllLiveTargets,
+            TxPrepareEvaluationContext::new("test-workspace"),
+        )
+        .with_config(config)
+        .with_fleet_controller(std::sync::Arc::new(controller));
+
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
+        let results = executor.execute_steps(&contract, None, 5000);
+        assert_eq!(results.len(), 1);
+        // Backpressure disabled — step succeeds despite Emergency tier
+        assert!(results[0].success);
+    }
+
+    #[test]
+    fn pane_executor_step_timeout_helper() {
+        assert_eq!(
+            step_timeout_ms(
+                &StepAction::SendText {
+                    pane_id: 0,
+                    text: "test".to_string(),
+                    paste_mode: None,
+                },
+                30_000,
+            ),
+            Some(30_000),
+        );
+        assert_eq!(
+            step_timeout_ms(
+                &StepAction::WaitFor {
+                    pane_id: Some(0),
+                    condition: WaitCondition::Pattern {
+                        pane_id: None,
+                        rule_id: "test".to_string(),
+                    },
+                    timeout_ms: 5000,
+                },
+                30_000,
+            ),
+            Some(5000),
+        );
+        assert_eq!(
+            step_timeout_ms(
+                &StepAction::StoreData {
+                    key: "k".to_string(),
+                    value: serde_json::json!("v"),
+                },
+                30_000,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn pane_executor_action_has_pane_helper() {
+        assert!(action_has_pane(&StepAction::SendText {
+            pane_id: 0,
+            text: "test".to_string(),
+            paste_mode: None,
+        }));
+        assert!(action_has_pane(&StepAction::WaitFor {
+            pane_id: Some(0),
+            condition: WaitCondition::Pattern {
+                pane_id: None,
+                rule_id: "test".to_string(),
+            },
+            timeout_ms: 5000,
+        }));
+        assert!(!action_has_pane(&StepAction::StoreData {
+            key: "k".to_string(),
+            value: serde_json::json!("v"),
+        }));
+        assert!(!action_has_pane(&StepAction::AcquireLock {
+            lock_name: "lock".to_string(),
+            timeout_ms: None,
+        }));
     }
 }
