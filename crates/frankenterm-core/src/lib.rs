@@ -245,6 +245,8 @@ pub mod migration_rehearsal;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_agent_mail;
 #[cfg(feature = "subprocess-bridge")]
+pub mod mission_dispatch;
+#[cfg(feature = "subprocess-bridge")]
 pub mod mission_events;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
