@@ -303,7 +303,7 @@ fn execute_step_action(
     timeout_ms: Option<u64>,
 ) -> (bool, String, Option<String>) {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
-                        // For SendText, the backend's own timeouts apply.
+    // For SendText, the backend's own timeouts apply.
     match action {
         crate::plan::StepAction::SendText {
             pane_id,
@@ -458,11 +458,7 @@ where
     A: TxPrepareApprovalChecker,
     T: TxPrepareTargetLookup,
 {
-    fn evaluate_gates(
-        &self,
-        contract: &MissionTxContract,
-        now_ms: i64,
-    ) -> Vec<TxPrepareGateInput> {
+    fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput> {
         self.policy_executor.evaluate_gates(contract, now_ms)
     }
 
@@ -482,8 +478,9 @@ where
             .iter()
             .filter_map(|s| step_timeout_ms(&s.action, self.config.default_send_timeout_ms))
             .sum();
-        let phase_budget =
-            std::time::Duration::from_millis(aggregate_step_budget_ms + self.config.phase_timeout_buffer_ms);
+        let phase_budget = std::time::Duration::from_millis(
+            aggregate_step_budget_ms + self.config.phase_timeout_buffer_ms,
+        );
         let phase_start = std::time::Instant::now();
 
         for step in &contract.plan.steps {
@@ -2402,7 +2399,7 @@ mod tests {
         TxPrepareTargetSnapshot, WaitCondition,
     };
     use crate::policy::{PolicyDecision, PolicyInput};
-    use crate::wezterm::{mock_wezterm_handle, MockWezterm, WeztermHandle};
+    use crate::wezterm::{MockWezterm, WeztermHandle, mock_wezterm_handle};
     use std::sync::Arc;
 
     /// Allow-all policy authorizer for PaneStepExecutor tests.
@@ -2680,11 +2677,13 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert_eq!(results[0].reason_code, "unsupported_action");
-        assert!(results[0]
-            .error_code
-            .as_ref()
-            .unwrap()
-            .contains("RunWorkflow"));
+        assert!(
+            results[0]
+                .error_code
+                .as_ref()
+                .unwrap()
+                .contains("RunWorkflow")
+        );
     }
 
     #[test]
@@ -3009,9 +3008,8 @@ mod tests {
     #[test]
     fn pane_executor_backpressure_normal_proceeds() {
         let mock = mock_wezterm_handle();
-        let controller = std::sync::Arc::new(
-            crate::fleet_memory_controller::FleetMemoryController::default(),
-        );
+        let controller =
+            std::sync::Arc::new(crate::fleet_memory_controller::FleetMemoryController::default());
         // Default controller is Normal tier
         let executor = make_pane_executor_with_controller(mock, controller);
         let contract = make_pane_contract(vec![(

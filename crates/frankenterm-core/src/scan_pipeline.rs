@@ -155,6 +155,11 @@ pub struct ChunkedPipelineState {
     uncompressed_buffer: Vec<u8>,
     /// Sliding overlap window used to recover trigger matches split across chunks.
     trigger_overlap_buffer: Vec<u8>,
+    /// Scratch buffer reused for overlap-aware trigger scans.
+    ///
+    /// This avoids a fresh overlap+chunk allocation on every chunk in the
+    /// hot path while keeping the trigger scan logic identical to batch mode.
+    trigger_scan_buffer: Vec<u8>,
     /// Accumulated raw data for definitive trigger scan at flush time when
     /// compression is disabled.
     ///
@@ -183,6 +188,7 @@ impl ChunkedPipelineState {
             ends_with_newline: false,
             uncompressed_buffer: Vec::with_capacity(max_buffer_bytes.min(1_048_576)),
             trigger_overlap_buffer: Vec::new(),
+            trigger_scan_buffer: Vec::new(),
             trigger_data_buffer: Vec::new(),
             max_buffer_bytes,
         }
@@ -274,6 +280,7 @@ impl ChunkedPipelineState {
         self.ends_with_newline = false;
         self.uncompressed_buffer.clear();
         self.trigger_overlap_buffer.clear();
+        self.trigger_scan_buffer.clear();
         self.trigger_data_buffer.clear();
     }
 }
@@ -358,14 +365,20 @@ impl ScanPipeline {
         }
     }
 
-    fn scan_chunk_triggers_with_overlap(&self, bytes: &[u8], overlap: &[u8]) -> TriggerScanResult {
+    fn scan_chunk_triggers_with_overlap(
+        &self,
+        bytes: &[u8],
+        overlap: &[u8],
+        scratch: &mut Vec<u8>,
+    ) -> TriggerScanResult {
         if overlap.is_empty() {
             return self.trigger_scanner.scan_counts(bytes);
         }
 
-        let mut combined = Vec::with_capacity(overlap.len() + bytes.len());
-        combined.extend_from_slice(overlap);
-        combined.extend_from_slice(bytes);
+        scratch.clear();
+        scratch.reserve(overlap.len().saturating_add(bytes.len()));
+        scratch.extend_from_slice(overlap);
+        scratch.extend_from_slice(bytes);
 
         let overlap_len = overlap.len();
         let mut result = TriggerScanResult {
@@ -373,7 +386,7 @@ impl ScanPipeline {
             ..Default::default()
         };
 
-        for matched in self.trigger_scanner.scan_locate(&combined) {
+        for matched in self.trigger_scanner.scan_locate(scratch) {
             if matched.offset.saturating_add(matched.length) <= overlap_len {
                 continue;
             }
@@ -447,8 +460,11 @@ impl ScanPipeline {
         // Stage 2: Pattern trigger scan on this chunk
         if self.config.enable_triggers {
             // Incremental scan with overlap for real-time feedback
-            let chunk_triggers =
-                self.scan_chunk_triggers_with_overlap(bytes, &state.trigger_overlap_buffer);
+            let chunk_triggers = self.scan_chunk_triggers_with_overlap(
+                bytes,
+                &state.trigger_overlap_buffer,
+                &mut state.trigger_scan_buffer,
+            );
             state.total_trigger_matches = state
                 .total_trigger_matches
                 .saturating_add(chunk_triggers.total_matches);

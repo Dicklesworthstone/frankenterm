@@ -478,10 +478,10 @@ impl EventBus {
     /// Get the number of active subscribers
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        self.all_sender.receiver_count()
-            + self.delta_sender.receiver_count()
-            + self.detection_sender.receiver_count()
-            + self.signal_sender.receiver_count()
+        crate::runtime_compat::broadcast_receiver_count(&self.all_sender)
+            + crate::runtime_compat::broadcast_receiver_count(&self.delta_sender)
+            + crate::runtime_compat::broadcast_receiver_count(&self.detection_sender)
+            + crate::runtime_compat::broadcast_receiver_count(&self.signal_sender)
     }
 
     /// Get shared reference to metrics
@@ -598,18 +598,22 @@ impl EventBus {
     /// Snapshot queue depths and oldest message lag per channel
     #[must_use]
     pub fn stats(&self) -> EventBusStats {
-        let delta_queued = self.delta_sender.len();
-        let detection_queued = self.detection_sender.len();
-        let signal_queued = self.signal_sender.len();
+        let delta_queued = crate::runtime_compat::broadcast_len(&self.delta_sender);
+        let detection_queued = crate::runtime_compat::broadcast_len(&self.detection_sender);
+        let signal_queued = crate::runtime_compat::broadcast_len(&self.signal_sender);
 
         EventBusStats {
             capacity: self.capacity,
             delta_queued,
             detection_queued,
             signal_queued,
-            delta_subscribers: self.delta_sender.receiver_count(),
-            detection_subscribers: self.detection_sender.receiver_count(),
-            signal_subscribers: self.signal_sender.receiver_count(),
+            delta_subscribers: crate::runtime_compat::broadcast_receiver_count(&self.delta_sender),
+            detection_subscribers: crate::runtime_compat::broadcast_receiver_count(
+                &self.detection_sender,
+            ),
+            signal_subscribers: crate::runtime_compat::broadcast_receiver_count(
+                &self.signal_sender,
+            ),
             delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
             detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
             signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
@@ -630,7 +634,7 @@ impl EventBus {
             Err(_) => {
                 // Broadcast send failed — either no receivers or all lagging.
                 // Track as backpressure if there ARE active subscribers.
-                if sender.receiver_count() > 0 {
+                if crate::runtime_compat::broadcast_receiver_count(sender) > 0 {
                     self.metrics
                         .subscriber_lag_events
                         .fetch_add(1, Ordering::Relaxed);
@@ -722,11 +726,13 @@ impl EventSubscriber {
     ///
     /// Returns `None` if no event is immediately available.
     pub fn try_recv(&mut self) -> Option<Result<Event, RecvError>> {
-        match self.receiver.try_recv() {
+        match crate::runtime_compat::broadcast_try_recv(&mut self.receiver) {
             Ok(event) => Some(Ok(event)),
-            Err(broadcast::TryRecvError::Empty) => None,
-            Err(broadcast::TryRecvError::Closed) => Some(Err(RecvError::Closed)),
-            Err(broadcast::TryRecvError::Lagged(n)) => {
+            Err(crate::runtime_compat::BroadcastTryRecvError::Empty) => None,
+            Err(crate::runtime_compat::BroadcastTryRecvError::Closed) => {
+                Some(Err(RecvError::Closed))
+            }
+            Err(crate::runtime_compat::BroadcastTryRecvError::Lagged(n)) => {
                 self.lagged_count += n;
                 self.metrics
                     .subscriber_lag_events

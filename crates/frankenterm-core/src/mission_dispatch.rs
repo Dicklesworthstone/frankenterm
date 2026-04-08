@@ -129,9 +129,7 @@ impl MissionDispatcher {
         // is async but we need to stay sync for mission loop integration.
         let results: Vec<DispatchResult> = contracts
             .iter()
-            .map(|contract| {
-                self.dispatch_single(contract, runner, event_bus, cycle_id, now_ms)
-            })
+            .map(|contract| self.dispatch_single(contract, runner, event_bus, cycle_id, now_ms))
             .collect();
 
         let accepted_count = results.iter().filter(|r| r.accepted).count();
@@ -180,8 +178,14 @@ impl MissionDispatcher {
                 "dispatch_started",
                 &contract.assignment_id,
                 vec![
-                    ("assignment_id".to_string(), serde_json::json!(&contract.assignment_id)),
-                    ("target_agent".to_string(), serde_json::json!(&contract.target_agent)),
+                    (
+                        "assignment_id".to_string(),
+                        serde_json::json!(&contract.assignment_id),
+                    ),
+                    (
+                        "target_agent".to_string(),
+                        serde_json::json!(&contract.target_agent),
+                    ),
                 ],
             );
             let _ = event; // Event bus expects Event enum, not MissionEvent.
@@ -216,10 +220,7 @@ impl MissionDispatcher {
                 assignment_id: contract.assignment_id.clone(),
                 target_agent: contract.target_agent.clone(),
                 accepted: true,
-                execution_id: Some(format!(
-                    "dispatch-{}-{}",
-                    contract.assignment_id, now_ms
-                )),
+                execution_id: Some(format!("dispatch-{}-{}", contract.assignment_id, now_ms)),
                 reason: None,
                 dispatch_ms,
             }

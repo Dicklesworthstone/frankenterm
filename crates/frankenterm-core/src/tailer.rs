@@ -453,6 +453,11 @@ where
     ///
     /// This is updated by the runtime at sync ticks (config rules + runtime overrides).
     pane_priorities: HashMap<u64, u32>,
+    /// Round-robin offsets for equal-priority scheduling groups.
+    ///
+    /// Without this, a stable `(priority, pane_id)` sort can permanently starve
+    /// higher pane ids when ready panes recycle faster than the queue drains.
+    priority_round_robin_offsets: HashMap<u32, usize>,
     /// Weighted capture scheduler with budget enforcement.
     scheduler: CaptureScheduler,
     /// Metrics
@@ -552,6 +557,7 @@ where
             tailers: HashMap::new(),
             capturing_panes: HashSet::new(),
             pane_priorities: HashMap::new(),
+            priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(CaptureBudgetConfig::default()),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
@@ -586,6 +592,7 @@ where
             tailers: HashMap::new(),
             capturing_panes: HashSet::new(),
             pane_priorities: HashMap::new(),
+            priority_round_robin_offsets: HashMap::new(),
             scheduler: CaptureScheduler::new(budget),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
@@ -707,6 +714,37 @@ where
         self.scheduler.snapshot()
     }
 
+    fn rotate_equal_priority_ready_panes(
+        &self,
+        ready_panes: &mut [(u64, u32)],
+    ) -> HashMap<u32, usize> {
+        let mut group_lengths = HashMap::new();
+        let mut start = 0usize;
+        while start < ready_panes.len() {
+            let priority = ready_panes[start].1;
+            let mut end = start + 1;
+            while end < ready_panes.len() && ready_panes[end].1 == priority {
+                end += 1;
+            }
+
+            let group_len = end - start;
+            group_lengths.insert(priority, group_len);
+            if group_len > 1 {
+                let rotate_by = self
+                    .priority_round_robin_offsets
+                    .get(&priority)
+                    .copied()
+                    .unwrap_or(0)
+                    % group_len;
+                ready_panes[start..end].rotate_left(rotate_by);
+            }
+
+            start = end;
+        }
+
+        group_lengths
+    }
+
     /// Spawn tasks for all ready panes that are not currently being captured.
     ///
     /// Uses weighted scheduling: panes are sorted by priority (lower = higher),
@@ -738,10 +776,13 @@ where
 
         // Order by priority (lower = higher), tie-breaker pane_id for determinism.
         ready_panes.sort_by_key(|&(pane_id, prio)| (prio, pane_id));
+        let ready_group_lengths = self.rotate_equal_priority_ready_panes(&mut ready_panes);
 
         // Apply weighted scheduling with budget enforcement.
         let available = self.semaphore.available_permits();
         let selected = self.scheduler.select_panes(&ready_panes, available);
+        let selected_priorities: HashMap<u64, u32> = ready_panes.iter().copied().collect();
+        let mut started_per_priority = HashMap::<u32, usize>::new();
 
         macro_rules! reserve_capture_event_permit {
             ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
@@ -788,6 +829,9 @@ where
 
             // Mark as capturing to prevent duplicate spawns
             self.capturing_panes.insert(pane_id);
+            if let Some(priority) = selected_priorities.get(&pane_id) {
+                *started_per_priority.entry(*priority).or_insert(0) += 1;
+            }
 
             let tx = self.tx.clone();
             let cursors = Arc::clone(&self.cursors);
@@ -972,6 +1016,18 @@ where
                     (pane_id, PollOutcome::NoChange)
                 }
             });
+        }
+
+        for (priority, started) in started_per_priority {
+            if started == 0 {
+                continue;
+            }
+            let group_len = ready_group_lengths.get(&priority).copied().unwrap_or(1);
+            let offset = self
+                .priority_round_robin_offsets
+                .entry(priority)
+                .or_insert(0);
+            *offset = (*offset + started) % group_len;
         }
     }
 
@@ -1717,6 +1773,60 @@ mod tests {
             supervisor.handle_poll_result(pane_id, outcome);
 
             assert_eq!(pane_id, 2, "higher priority pane should spawn first");
+        });
+    }
+
+    #[test]
+    fn supervisor_round_robins_equal_priority_panes_under_saturation() {
+        run_async_test(async {
+            let config = TailerConfig {
+                min_interval: Duration::from_millis(1),
+                max_interval: Duration::from_millis(5),
+                max_concurrent: 10,
+                send_timeout: Duration::from_millis(50),
+                ..Default::default()
+            };
+
+            let (tx, rx) = mpsc::channel(64);
+            let _keep_rx_alive = rx;
+            let cursors = Arc::new(RwLock::new(HashMap::new()));
+            let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let source = Arc::new(StaticSource);
+
+            {
+                let mut cursor_guard = cursors.write().await;
+                for pane_id in 1..=20 {
+                    cursor_guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
+            }
+
+            let mut supervisor =
+                TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+            let mut panes = HashMap::new();
+            for pane_id in 1..=20 {
+                panes.insert(pane_id, make_pane(pane_id));
+            }
+            supervisor.sync_tailers(&panes);
+
+            let mut seen = HashSet::new();
+            for _round in 0..2 {
+                crate::runtime_compat::sleep(Duration::from_millis(2)).await;
+                let mut poll_tasks = TailerPollTaskSet::new();
+                supervisor.spawn_ready(&mut poll_tasks);
+                while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                    seen.insert(pane_id);
+                    supervisor.handle_poll_result(pane_id, outcome);
+                }
+            }
+
+            assert_eq!(
+                seen.len(),
+                20,
+                "equal-priority panes should all receive turns under sustained load, saw {:?}",
+                seen
+            );
         });
     }
 
@@ -2660,10 +2770,8 @@ mod tests {
     #[test]
     fn detect_mode_with_socket_path_config() {
         // discover_mux_socket requires the path to exist on disk.
-        let sock_path = std::env::temp_dir().join(format!(
-            "ft-test-mux-{}.sock",
-            std::process::id()
-        ));
+        let sock_path =
+            std::env::temp_dir().join(format!("ft-test-mux-{}.sock", std::process::id()));
         std::fs::write(&sock_path, b"").expect("create temp socket file");
 
         let mut config = crate::config::Config::default();
