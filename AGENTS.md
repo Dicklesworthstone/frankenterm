@@ -32,6 +32,19 @@ This rule exists because agents have REPEATEDLY deleted this entire crate (860+ 
 
 ---
 
+## AGENT MAIL (am) PROCESS PROTECTION — DO NOT TOUCH
+
+**NEVER run any of these commands:**
+- `am service restart` / `am service stop`
+- `am doctor fix` / `am doctor repair` / `am doctor reconstruct`
+- `kill` targeting any `am`, `am serve-http`, or `mcp-agent-mail` process
+
+The `am serve-http` process is a **shared singleton** that all agents depend on. Restarting or killing it disrupts every other agent. Multiple agents running `am service restart` create a **restart cascade** that makes the service permanently unavailable.
+
+**If `am` commands fail or the API is unreachable:** retry once after a few seconds, then proceed with your work WITHOUT agent-mail. Do NOT attempt to diagnose, repair, or restart the service.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.

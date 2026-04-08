@@ -4,20 +4,21 @@
 //! session-restore query path (`session_restore`) against a real SQLite file.
 //! They intentionally avoid requiring a live WezTerm instance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use frankenterm_core::config::SnapshotConfig;
+use frankenterm_core::restore_process::LaunchConfig;
 use frankenterm_core::session_restore::{
     RestoredPaneState, SessionRestoreConfig, SessionRestorer, load_checkpoint_by_id,
     load_latest_checkpoint, session_doctor, show_session,
 };
-use frankenterm_core::session_topology::TopologySnapshot;
+use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
 use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
 use frankenterm_core::wezterm::{MockWezterm, PaneInfo, PaneSize, WeztermInterface};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -60,6 +61,14 @@ struct PaneTestReport {
     content_match: bool,
     layout_match: bool,
     process_match: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FixturePaneState {
+    pane_id: u64,
+    window_id: u64,
+    tab_id: u64,
+    cwd: Option<String>,
 }
 
 fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
@@ -106,13 +115,46 @@ fn setup_test_db() -> (tempfile::NamedTempFile, Arc<String>) {
             last_output_at INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS output_segments (
+            id INTEGER PRIMARY KEY,
+            pane_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            content_len INTEGER NOT NULL,
+            content_hash TEXT,
+            captured_at INTEGER NOT NULL,
+            UNIQUE(pane_id, seq)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON session_checkpoints(session_id, checkpoint_at);
         CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
         CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
+        CREATE INDEX IF NOT EXISTS idx_output_segments_pane_seq ON output_segments(pane_id, seq);
         ",
     )
     .expect("create schema");
     (tmp, db_path)
+}
+
+fn insert_output_segment(
+    conn: &Connection,
+    pane_id: u64,
+    seq: i64,
+    content: &str,
+    captured_at: i64,
+) {
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            pane_id as i64,
+            seq,
+            content,
+            content.len() as i64,
+            captured_at
+        ],
+    )
+    .expect("insert output segment");
 }
 
 fn make_pane(
@@ -242,6 +284,43 @@ fn fixture_path(file_name: &str) -> PathBuf {
         .join("fixtures")
         .join("session_persistence")
         .join(file_name)
+}
+
+fn collect_fixture_panes_from_node(
+    window_id: u64,
+    tab_id: u64,
+    node: &PaneNode,
+    panes: &mut Vec<FixturePaneState>,
+) {
+    match node {
+        PaneNode::Leaf { pane_id, cwd, .. } => panes.push(FixturePaneState {
+            pane_id: *pane_id,
+            window_id,
+            tab_id,
+            cwd: cwd.clone(),
+        }),
+        PaneNode::HSplit { children } | PaneNode::VSplit { children } => {
+            for (_, child) in children {
+                collect_fixture_panes_from_node(window_id, tab_id, child, panes);
+            }
+        }
+    }
+}
+
+fn collect_fixture_panes(topology: &TopologySnapshot) -> Vec<FixturePaneState> {
+    let mut panes = Vec::new();
+    for window in &topology.windows {
+        for tab in &window.tabs {
+            collect_fixture_panes_from_node(
+                window.window_id,
+                tab.tab_id,
+                &tab.pane_tree,
+                &mut panes,
+            );
+        }
+    }
+    panes.sort_by_key(|pane| pane.pane_id);
+    panes
 }
 
 #[test]
@@ -875,4 +954,446 @@ fn e2e_snapshot_fixture_topology_roundtrip() {
         "{}",
         serde_json::to_string_pretty(&report).expect("pretty report")
     );
+}
+
+#[test]
+fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
+    run_async_test(async {
+        let run_start = Instant::now();
+        let mut report = E2ETestReport {
+            test_name: "e2e_fixture_complex_layout_restore_executes_real_restore_flow".to_string(),
+            phases: Vec::new(),
+            total_duration_ms: 0,
+            passed: false,
+            failure_reason: None,
+            pane_reports: Vec::new(),
+        };
+
+        let (_tmp, db_path) = setup_test_db();
+        let fixture_json = std::fs::read_to_string(fixture_path("snapshot_complex_layout.json"))
+            .expect("read complex layout fixture");
+        let topology =
+            TopologySnapshot::from_json(&fixture_json).expect("parse complex layout fixture");
+        let fixture_panes = collect_fixture_panes(&topology);
+        let checkpoint_at = i64::try_from(topology.captured_at).expect("fixture timestamp fits");
+        let session_id = "sess-fixture-complex";
+
+        let seed_start = Instant::now();
+        {
+            let conn = Connection::open(db_path.as_str()).expect("open seeded fixture db");
+            conn.execute(
+                "INSERT INTO mux_sessions
+                 (session_id, created_at, last_checkpoint_at, shutdown_clean, topology_json, ft_version)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    session_id,
+                    checkpoint_at,
+                    checkpoint_at,
+                    fixture_json,
+                    "0.1.0",
+                ],
+            )
+            .expect("insert fixture session");
+            conn.execute(
+                "INSERT INTO session_checkpoints
+                 (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
+                 VALUES (?1, ?2, 'event', ?3, ?4, ?5, ?6)",
+                params![
+                    session_id,
+                    checkpoint_at,
+                    "fixture-complex-hash",
+                    fixture_panes.len() as i64,
+                    0i64,
+                    json!({"fixture":"snapshot_complex_layout.json"}).to_string(),
+                ],
+            )
+            .expect("insert fixture checkpoint");
+            let checkpoint_id = conn.last_insert_rowid();
+
+            for pane in &fixture_panes {
+                let terminal_json = json!({
+                    "rows": 24,
+                    "cols": 80,
+                    "cursor_row": 0,
+                    "cursor_col": 0,
+                    "is_alt_screen": false,
+                    "title": format!("fixture-pane-{}", pane.pane_id),
+                })
+                .to_string();
+                conn.execute(
+                    "INSERT INTO mux_pane_state
+                     (checkpoint_id, pane_id, cwd, command, terminal_state_json)
+                     VALUES (?1, ?2, ?3, NULL, ?4)",
+                    params![
+                        checkpoint_id,
+                        pane.pane_id as i64,
+                        normalize_cwd(pane.cwd.as_deref()),
+                        terminal_json,
+                    ],
+                )
+                .expect("insert fixture pane state");
+            }
+
+            add_phase(
+                &mut report,
+                "seed_fixture_checkpoint",
+                seed_start,
+                "ok",
+                json!({
+                    "session_id": session_id,
+                    "checkpoint_at": checkpoint_at,
+                    "pane_count": fixture_panes.len(),
+                    "window_count": topology.windows.len(),
+                    "tab_count": topology.windows.iter().map(|window| window.tabs.len()).sum::<usize>(),
+                }),
+            );
+        }
+
+        let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
+        let load_start = Instant::now();
+        let session = restorer
+            .detect()
+            .expect("detect fixture restore candidate")
+            .expect("fixture session should be restorable");
+        let checkpoint = restorer
+            .load_checkpoint(&session)
+            .expect("load fixture checkpoint");
+        add_phase(
+            &mut report,
+            "detect_and_load",
+            load_start,
+            "ok",
+            json!({
+                "detected_session": session.session_id,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "pane_states_loaded": checkpoint.pane_states.len(),
+            }),
+        );
+
+        let wezterm = Arc::new(MockWezterm::new());
+        let restore_start = Instant::now();
+        let summary = restorer
+            .restore(&session, &checkpoint, wezterm.clone())
+            .await
+            .expect("restore from fixture should succeed");
+        add_phase(
+            &mut report,
+            "restore",
+            restore_start,
+            "ok",
+            json!({
+                "restored_count": summary.restored_count(),
+                "failed_count": summary.failed_count(),
+                "windows_created": summary.layout_result.windows_created,
+                "tabs_created": summary.layout_result.tabs_created,
+            }),
+        );
+
+        let verify_start = Instant::now();
+        let restored_panes = wezterm.list_panes().await.expect("list restored panes");
+        let unique_windows: HashSet<_> = restored_panes.iter().map(|pane| pane.window_id).collect();
+        let unique_tabs: HashSet<_> = restored_panes.iter().map(|pane| pane.tab_id).collect();
+        let active_old_pane_id = topology.windows[0].tabs[topology.windows[0]
+            .active_tab_index
+            .expect("fixture active tab index")]
+        .active_pane_id
+        .expect("fixture active pane id");
+        let active_new_pane_id = *summary
+            .layout_result
+            .pane_id_map
+            .get(&active_old_pane_id)
+            .expect("active pane must be mapped");
+        let active_new_pane = wezterm
+            .pane_state(active_new_pane_id)
+            .await
+            .expect("active pane state should exist");
+
+        let mut restored_tabs_by_old_tab = HashMap::new();
+        for pane in &fixture_panes {
+            let new_pane_id = *summary
+                .layout_result
+                .pane_id_map
+                .get(&pane.pane_id)
+                .expect("fixture pane must be restored");
+            let restored = wezterm
+                .pane_state(new_pane_id)
+                .await
+                .expect("restored pane state should exist");
+            let tab_consistent = match restored_tabs_by_old_tab.get(&pane.tab_id) {
+                Some(expected_tab_id) => *expected_tab_id == restored.tab_id,
+                None => {
+                    restored_tabs_by_old_tab.insert(pane.tab_id, restored.tab_id);
+                    true
+                }
+            };
+            let active_matches = restored.is_active == (pane.pane_id == active_old_pane_id);
+            let cwd_matches = pane.cwd.as_deref().map(normalize_cwd_str).as_deref()
+                == Some(restored.cwd.as_str());
+
+            report.pane_reports.push(PaneTestReport {
+                pane_id: pane.pane_id,
+                original_content_hash: hash_text(
+                    &json!({
+                        "window_id": pane.window_id,
+                        "tab_id": pane.tab_id,
+                        "cwd": pane.cwd.as_deref().map(normalize_cwd_str),
+                    })
+                    .to_string(),
+                ),
+                restored_content_hash: hash_text(
+                    &json!({
+                        "window_id": restored.window_id,
+                        "tab_id": restored.tab_id,
+                        "cwd": restored.cwd,
+                        "is_active": restored.is_active,
+                    })
+                    .to_string(),
+                ),
+                content_match: cwd_matches,
+                layout_match: tab_consistent,
+                process_match: active_matches,
+            });
+        }
+
+        let mapped_new_ids: HashSet<_> = summary
+            .layout_result
+            .pane_id_map
+            .values()
+            .copied()
+            .collect();
+        let success = summary.restored_count() == fixture_panes.len()
+            && summary.failed_count() == 0
+            && summary.layout_result.windows_created == 1
+            && summary.layout_result.tabs_created == 2
+            && restored_panes.len() == fixture_panes.len()
+            && unique_windows.len() == 1
+            && unique_tabs.len() == 2
+            && mapped_new_ids.len() == fixture_panes.len()
+            && active_new_pane.is_active
+            && report.pane_reports.iter().all(|pane_result| {
+                pane_result.content_match && pane_result.layout_match && pane_result.process_match
+            });
+
+        add_phase(
+            &mut report,
+            "verify_restored_layout",
+            verify_start,
+            if success { "ok" } else { "error" },
+            json!({
+                "restored_panes": restored_panes.len(),
+                "unique_windows": unique_windows.len(),
+                "unique_tabs": unique_tabs.len(),
+                "active_old_pane_id": active_old_pane_id,
+                "active_new_pane_id": active_new_pane_id,
+            }),
+        );
+
+        report.total_duration_ms = run_start.elapsed().as_millis() as u64;
+        report.passed = success;
+        report.failure_reason = if success {
+            None
+        } else {
+            Some("fixture-backed restore flow assertions failed".to_string())
+        };
+        emit_report(&report);
+        assert!(
+            report.passed,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("pretty report")
+        );
+    });
+}
+
+#[test]
+fn e2e_restore_replays_scrollback_then_relaunches_agent() {
+    run_async_test(async {
+        let run_start = Instant::now();
+        let mut report = E2ETestReport {
+            test_name: "e2e_restore_replays_scrollback_then_relaunches_agent".to_string(),
+            phases: Vec::new(),
+            total_duration_ms: 0,
+            passed: false,
+            failure_reason: None,
+            pane_reports: Vec::new(),
+        };
+
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let pane = make_pane(7, 0, 0, 24, 80, "codex-agent", "file:///tmp/agents");
+
+        let capture_start = Instant::now();
+        let snapshot = engine
+            .capture(std::slice::from_ref(&pane), SnapshotTrigger::Startup)
+            .await
+            .expect("capture source snapshot");
+        add_phase(
+            &mut report,
+            "capture",
+            capture_start,
+            "ok",
+            json!({
+                "session_id": snapshot.session_id,
+                "checkpoint_id": snapshot.checkpoint_id,
+                "pane_count": snapshot.pane_count,
+            }),
+        );
+
+        let seed_start = Instant::now();
+        {
+            let conn = Connection::open(db_path.as_str()).expect("open db for scrollback seed");
+            let agent_json = r#"{"agent_type":"codex","session_id":"sess-42","state":"running"}"#;
+            conn.execute(
+                "UPDATE mux_pane_state
+                 SET command = ?3,
+                     agent_metadata_json = ?4,
+                     scrollback_checkpoint_seq = ?5,
+                     last_output_at = ?6
+                 WHERE checkpoint_id = ?1 AND pane_id = ?2",
+                params![
+                    snapshot.checkpoint_id,
+                    pane.pane_id as i64,
+                    "codex",
+                    agent_json,
+                    1i64,
+                    5_200i64,
+                ],
+            )
+            .expect("seed pane restore metadata");
+            insert_output_segment(&conn, pane.pane_id, 0, "first line\n", 5_100);
+            insert_output_segment(&conn, pane.pane_id, 1, "second line\n", 5_200);
+        }
+        add_phase(
+            &mut report,
+            "seed_scrollback_and_agent_metadata",
+            seed_start,
+            "ok",
+            json!({
+                "pane_id": pane.pane_id,
+                "scrollback_checkpoint_seq": 1,
+                "segments_seeded": 2,
+                "agent_type": "codex",
+            }),
+        );
+
+        let restorer = SessionRestorer::new(
+            db_path.clone(),
+            SessionRestoreConfig {
+                restore_scrollback: true,
+                process_relaunch: LaunchConfig {
+                    launch_agents: true,
+                    launch_delay_ms: 0,
+                    agent_commands: HashMap::from([(
+                        "codex".to_string(),
+                        "codex --resume".to_string(),
+                    )]),
+                    ..LaunchConfig::default()
+                },
+                ..SessionRestoreConfig::default()
+            },
+        );
+        let session = restorer
+            .detect()
+            .expect("detect scrollback restore candidate")
+            .expect("scrollback restore candidate should exist");
+        let checkpoint = restorer
+            .load_checkpoint(&session)
+            .expect("load checkpoint for scrollback restore");
+
+        let wezterm = Arc::new(MockWezterm::new());
+        let restore_start = Instant::now();
+        let summary = restorer
+            .restore(&session, &checkpoint, wezterm.clone())
+            .await
+            .expect("restore with scrollback + relaunch should succeed");
+        add_phase(
+            &mut report,
+            "restore",
+            restore_start,
+            "ok",
+            json!({
+                "restored_count": summary.restored_count(),
+                "scrollback_restored": summary.scrollback_restored_count(),
+                "scrollback_failed": summary.scrollback_failed_count(),
+                "scrollback_skipped": summary.scrollback_skipped_count(),
+            }),
+        );
+
+        let verify_start = Instant::now();
+        let new_pane_id = *summary
+            .layout_result
+            .pane_id_map
+            .get(&pane.pane_id)
+            .expect("restored pane mapping should exist");
+        let content = wezterm
+            .get_text(new_pane_id, false)
+            .await
+            .expect("read restored pane content");
+        let expected_cd = format!(
+            "cd {}\r",
+            normalize_cwd_str(pane.cwd.as_deref().unwrap_or(""))
+        );
+        let first_line_offset = content.find("first line").expect("replayed first line");
+        let second_line_offset = content.find("second line").expect("replayed second line");
+        let banner_offset = content
+            .find("Session restored")
+            .expect("restore banner should exist");
+        let cd_offset = content.find(&expected_cd).expect("expected cd command");
+        let agent_offset = content
+            .find("codex --resume\r")
+            .expect("expected agent relaunch command");
+        let redetected = restorer
+            .detect()
+            .expect("detect after successful restore should work");
+
+        let content_order_ok = first_line_offset < second_line_offset
+            && second_line_offset < banner_offset
+            && banner_offset < cd_offset
+            && cd_offset < agent_offset;
+        let success = summary.restored_count() == 1
+            && summary.failed_count() == 0
+            && summary.scrollback_restored_count() == 1
+            && summary.scrollback_failed_count() == 0
+            && summary.scrollback_skipped_count() == 0
+            && summary.scrollback_error.is_none()
+            && content_order_ok
+            && redetected.is_none();
+
+        report.pane_reports.push(PaneTestReport {
+            pane_id: pane.pane_id,
+            original_content_hash: hash_text("first line\nsecond line\n"),
+            restored_content_hash: hash_text(&content),
+            content_match: content.contains("first line")
+                && content.contains("second line")
+                && content_order_ok,
+            layout_match: summary.restored_count() == 1 && summary.failed_count() == 0,
+            process_match: content.contains(&expected_cd) && content.contains("codex --resume\r"),
+        });
+
+        add_phase(
+            &mut report,
+            "verify_content_and_relaunch_order",
+            verify_start,
+            if success { "ok" } else { "error" },
+            json!({
+                "new_pane_id": new_pane_id,
+                "content_order_ok": content_order_ok,
+                "banner_before_relaunch": banner_offset < cd_offset,
+                "detect_cleared": redetected.is_none(),
+            }),
+        );
+
+        report.total_duration_ms = run_start.elapsed().as_millis() as u64;
+        report.passed = success;
+        report.failure_reason = if success {
+            None
+        } else {
+            Some("scrollback replay + agent relaunch assertions failed".to_string())
+        };
+        emit_report(&report);
+        assert!(
+            report.passed,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("pretty report")
+        );
+    });
 }

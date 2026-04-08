@@ -172,11 +172,32 @@ def resolve_ft_binary() -> BinaryChoice:
     return BinaryChoice(None, None, candidates)
 
 
+def resolve_wezterm_binary() -> tuple[str | None, str, str | None]:
+    env_binary = os.environ.get("FT_WEZTERM_CLI")
+    if env_binary:
+        env_path = Path(env_binary).expanduser()
+        if env_path.is_file() and os.access(env_path, os.X_OK):
+            return str(env_path), "env:FT_WEZTERM_CLI", None
+        return str(env_path), "env:FT_WEZTERM_CLI", "FT_WEZTERM_CLI is not executable"
+
+    path_binary = shutil.which("wezterm")
+    if path_binary:
+        return path_binary, "path:which_wezterm", None
+    return None, "path:which_wezterm", "wezterm is not available in PATH"
+
+
+def wezterm_binary() -> str:
+    path, _, error = resolve_wezterm_binary()
+    if not path:
+        raise RuntimeError(error or "wezterm backend is unavailable")
+    return path
+
+
 def resolve_wezterm() -> dict[str, Any]:
-    wezterm = shutil.which("wezterm")
-    info: dict[str, Any] = {"path": wezterm, "available": False}
-    if not wezterm:
-        info["error"] = "wezterm is not available in PATH"
+    wezterm, source, error = resolve_wezterm_binary()
+    info: dict[str, Any] = {"path": wezterm, "source": source, "available": False}
+    if error:
+        info["error"] = error
         return info
 
     list_result = run([wezterm, "cli", "list"], cwd=REPO_ROOT)
@@ -232,7 +253,7 @@ def ft_cmd(ft_binary: str, workspace: Path, config_path: Path, *args: str) -> li
 
 def spawn_pane(workspace: Path, script_path: Path) -> int:
     result = run(
-        ["wezterm", "cli", "spawn", "--cwd", str(workspace), "--", "bash", str(script_path)],
+        [wezterm_binary(), "cli", "spawn", "--cwd", str(workspace), "--", "bash", str(script_path)],
         cwd=REPO_ROOT,
         check=False,
     )
@@ -245,7 +266,7 @@ def spawn_pane(workspace: Path, script_path: Path) -> int:
 
 
 def close_pane(pane_id: int) -> None:
-    run(["wezterm", "cli", "kill-pane", "--pane-id", str(pane_id)], cwd=REPO_ROOT)
+    run([wezterm_binary(), "cli", "kill-pane", "--pane-id", str(pane_id)], cwd=REPO_ROOT)
 
 
 def stop_process(proc: subprocess.Popen[str] | None) -> None:

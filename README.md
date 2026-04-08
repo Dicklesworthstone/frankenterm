@@ -21,8 +21,10 @@ _Summary counts last verified against the current checkout on April 6, 2026: 54 
 <h3>Quick Install</h3>
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
 ```
+
+`ft --version` should work immediately after install. `ft doctor` / `ft doctor --json` also run immediately, but current builds will report diagnostic errors on a fresh machine until the active compatibility backend bridge is available: WezTerm CLI installed in `PATH` and a reachable WezTerm GUI/mux for `wezterm cli list`.
 
 </div>
 
@@ -216,8 +218,14 @@ Operator guidance:
 ### Via Cargo (Fastest)
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
 ```
+
+Post-install expectations:
+- `ft --version` should succeed immediately.
+- `ft doctor` / `ft doctor --json` should emit diagnostics immediately.
+- On a clean host, doctor may report errors until the current WezTerm compatibility bridge is installed and running (`wezterm --version` and `wezterm cli list --format json` must succeed).
+- `.ft`, logs, and the SQLite database are created on first daemon/watch startup if they do not already exist.
 
 ### From Source
 

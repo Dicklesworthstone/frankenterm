@@ -9,7 +9,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 /// Build a wa command configured to run in a temp workspace.
 ///
@@ -47,6 +47,12 @@ fn artifact_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ft_smoke_artifacts_{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok();
     dir
+}
+
+fn repo_file(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative)
 }
 
 fn save_artifact(name: &str, content: &str) {
@@ -217,6 +223,29 @@ fn smoke_ft_robot_quick_start() {
     assert!(
         parsed.is_ok(),
         "ft robot quick-start should output valid JSON"
+    );
+}
+
+#[test]
+fn install_docs_use_package_name_and_bin() {
+    let readme = fs::read_to_string(repo_file("README.md")).expect("read README");
+    let remote_setup =
+        fs::read_to_string(repo_file("docs/remote-setup-spec.md")).expect("read remote setup spec");
+
+    let wrong = "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git ft";
+    let correct = "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm";
+
+    assert!(
+        !readme.contains(wrong),
+        "README must not advertise the binary name as the cargo package"
+    );
+    assert!(
+        readme.contains(correct),
+        "README should advertise the explicit package+bin cargo install command"
+    );
+    assert!(
+        remote_setup.contains(correct),
+        "remote setup spec should use the explicit package+bin cargo install command"
     );
 }
 

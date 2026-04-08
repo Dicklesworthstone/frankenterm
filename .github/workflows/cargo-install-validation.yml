@@ -1,0 +1,75 @@
+name: Cargo Install Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_url:
+        description: Git URL to validate (defaults to the current repository)
+        required: false
+        type: string
+      git_ref:
+        description: Commit, tag, or branch to install (defaults to the triggering SHA)
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-install:
+    name: Cargo Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: cargo-install-linux-amd64
+          - os: macos-14
+            artifact: cargo-install-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-install-${{ matrix.os }}
+
+      - name: Run cargo install validation
+        env:
+          INPUT_GIT_URL: ${{ inputs.git_url }}
+          INPUT_GIT_REF: ${{ inputs.git_ref }}
+          DEFAULT_GIT_URL: https://github.com/${{ github.repository }}.git
+          E2E_ARTIFACTS_BASE: ${{ github.workspace }}/e2e-artifacts
+        run: |
+          if [ -n "${INPUT_GIT_URL}" ]; then
+            export FT_INSTALL_GIT_URL="${INPUT_GIT_URL}"
+          else
+            export FT_INSTALL_GIT_URL="${DEFAULT_GIT_URL}"
+          fi
+
+          if [ -n "${INPUT_GIT_REF}" ]; then
+            export FT_INSTALL_GIT_REF="${INPUT_GIT_REF}"
+          else
+            export FT_INSTALL_GIT_REF="${GITHUB_SHA}"
+          fi
+
+          bash tests/e2e/test_ft_gofz5_1_cargo_install.sh
+
+      - name: Upload cargo install artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: e2e-artifacts/**
+          if-no-files-found: ignore

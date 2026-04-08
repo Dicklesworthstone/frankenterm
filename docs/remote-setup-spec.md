@@ -162,8 +162,10 @@ ssh <host> "chmod +x ~/.local/bin/ft"
 ```
 - Alternative (if no local binary):
 ```
-ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git frankenterm"
+ssh <host> "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm"
 ```
+- `ft --version` should succeed immediately after install.
+- `ft doctor` / `ft doctor --json` emit diagnostics immediately, but current builds will report backend-prerequisite errors until WezTerm CLI is installed and `wezterm cli list --format json` can reach a running WezTerm GUI/mux.
 
 ---
 

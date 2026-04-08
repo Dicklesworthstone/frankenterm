@@ -40335,11 +40335,11 @@ where
                 )?;
             } else if let Some(version) = options.ft_version {
                 let install_cmd = if version.eq_ignore_ascii_case("git") {
-                    "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git frankenterm"
+                    "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm"
                         .to_string()
                 } else {
                     format!(
-                        "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --tag {} frankenterm",
+                        "cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --tag {} --bin ft frankenterm",
                         version
                     )
                 };
@@ -40361,7 +40361,7 @@ where
             if let Some(path) = options.ft_path {
                 println!("  Would scp {}", path.display());
             } else if let Some(version) = options.ft_version {
-                println!("  Would cargo install frankenterm ({version})");
+                println!("  Would cargo install package frankenterm as binary ft ({version})");
             } else {
                 println!("  Provide --ft-path or --ft-version to install ft");
             }
