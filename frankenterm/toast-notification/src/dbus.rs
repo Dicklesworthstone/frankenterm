@@ -1,4 +1,5 @@
 #![cfg(all(not(target_os = "macos"), not(windows)))]
+#![allow(clippy::too_many_arguments)]
 //! See <https://developer.gnome.org/notification-spec/>
 
 use crate::ToastNotification;

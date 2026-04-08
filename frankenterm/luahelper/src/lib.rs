@@ -333,12 +333,10 @@ fn is_array_style_table(t: &mlua::Table) -> bool {
 
     // Now see if we have contiguous keys.
     // The BTreeSet will iterate the keys in ascending order.
-    let mut expect = 1;
-    for key in keys {
+    for (expect, key) in (1..).zip(keys) {
         if key != expect {
             return false;
         }
-        expect += 1;
     }
 
     true

@@ -1020,8 +1020,7 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::ChangeDynamicColors(first_color, colors) => {
                 log::trace!("ChangeDynamicColors: {:?} {:?}", first_color, colors);
                 use frankenterm_escape_parser::osc::DynamicColorNumber;
-                let mut idx: u8 = first_color as u8;
-                for color in colors {
+                for (idx, color) in (first_color as u8..).zip(colors) {
                     let which_color: Option<DynamicColorNumber> = FromPrimitive::from_u8(idx);
                     log::trace!("ChangeDynamicColors item: {:?}", which_color);
                     if let Some(which_color) = which_color {
@@ -1066,7 +1065,6 @@ impl<'a> Performer<'a> {
                             | DynamicColorNumber::TektronixCursorColor => {}
                         }
                     }
-                    idx += 1;
                 }
                 self.implicit_palette_reset_if_same_as_configured();
                 self.palette_did_change();

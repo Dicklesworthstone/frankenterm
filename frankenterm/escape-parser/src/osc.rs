@@ -319,7 +319,7 @@ impl OperatingSystemCommand {
                 if osc.len() >= 3 && osc[1] == b"4" {
                     fn get_pct(v: &&[u8]) -> u8 {
                         let number = str::from_utf8(v).unwrap_or("0");
-                        number.parse::<u8>().unwrap_or(0).max(0).min(100)
+                        number.parse::<u8>().unwrap_or(0).min(100)
                     }
                     match osc[2] {
                         b"0" => return Ok(OperatingSystemCommand::ConEmuProgress(Progress::None)),

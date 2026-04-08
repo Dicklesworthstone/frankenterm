@@ -284,7 +284,7 @@ impl<T: BufferItem> Buffer<T> {
         Buffer {
             glyphs: infos
                 .into_iter()
-                .zip(positions.into_iter())
+                .zip(positions)
                 .map(|(i, p)| T::from_c(i, p))
                 .collect(),
             _ptr: ptr,

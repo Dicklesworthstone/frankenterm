@@ -737,7 +737,7 @@ mod tests {
         let original = unsafe { umask(0o055) };
         let _saver = UmaskSaver::new();
         let saved = UmaskSaver::saved_umask().unwrap();
-        assert_eq!(saved as u32, 0o055u32);
+        assert_eq!(saved, 0o055u32);
         drop(_saver);
         unsafe { umask(original) };
     }

@@ -169,7 +169,7 @@ fn encode_iterm_inline_image(
             ..
         } => {
             let mut encoded_frames = Vec::with_capacity(frames.len());
-            for (frame_data, duration) in frames.into_iter().zip(durations.into_iter()) {
+            for (frame_data, duration) in frames.into_iter().zip(durations) {
                 let frame = crop_rgba_region(width, height, &frame_data, top_left, bottom_right)?;
                 encoded_frames.push(Frame::from_parts(
                     frame,

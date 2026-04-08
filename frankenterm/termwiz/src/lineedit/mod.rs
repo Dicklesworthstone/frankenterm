@@ -203,7 +203,7 @@ impl<'term> LineEditor<'term> {
             let x = (cursor_x + delta) % screen_cols;
 
             let row = cursor_y + y as isize;
-            let col = x.max(0) as usize;
+            let col = x;
 
             (col, row)
         }

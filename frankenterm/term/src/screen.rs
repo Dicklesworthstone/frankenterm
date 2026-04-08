@@ -1075,8 +1075,8 @@ impl Screen {
     {
         let mut hasher = DefaultHasher::new();
         let mut line_count = 0usize;
-        for line in lines {
-            line_count += 1;
+        for (idx, line) in lines.into_iter().enumerate() {
+            line_count = idx + 1;
             line.len().hash(&mut hasher);
             line.last_cell_was_wrapped().hash(&mut hasher);
             line.compute_shape_hash().hash(&mut hasher);
