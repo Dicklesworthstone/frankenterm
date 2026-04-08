@@ -3512,6 +3512,8 @@ name = "frankenterm-mux-server-impl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asupersync",
+ "async-channel",
  "async_ossl",
  "codec",
  "config",
@@ -3529,7 +3531,6 @@ dependencies = [
  "promise",
  "rangeset",
  "rcgen",
- "smol",
  "termwiz 0.24.0",
  "url",
  "wezterm-client",
@@ -11439,7 +11440,8 @@ name = "wezterm-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-io",
+ "asupersync",
+ "async-channel",
  "async-trait",
  "async_ossl",
  "codec",
@@ -11462,7 +11464,6 @@ dependencies = [
  "promise",
  "rangeset",
  "ratelim",
- "smol",
  "termwiz 0.24.0",
  "textwrap",
  "thiserror 2.0.18",

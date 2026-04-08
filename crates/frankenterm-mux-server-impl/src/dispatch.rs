@@ -2,11 +2,13 @@
 #![allow(clippy::type_repetition_in_bounds)]
 use crate::sessionhandler::{PduSender, SessionHandler};
 use anyhow::Context;
+use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use async_channel::unbounded;
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
-use futures::FutureExt;
+use futures::future::{Either, select};
+use futures::{FutureExt, pin_mut};
 use mux::{Mux, MuxNotification};
-use smol::prelude::*;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -67,7 +69,7 @@ where
 {
     log::trace!("process_async called");
 
-    let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
+    let (item_tx, item_rx) = unbounded::<Item>();
 
     let pdu_sender = PduSender::new({
         let item_tx = item_tx.clone();
@@ -86,14 +88,22 @@ where
         let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
 
         loop {
-            let rx_msg = item_rx
-                .recv()
-                .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
-            let wait_for_read = stream
-                .wait_for_readable()
-                .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
+            let next_item = {
+                let rx_msg = item_rx
+                    .recv()
+                    .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
+                let wait_for_read = stream
+                    .wait_for_readable()
+                    .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
 
-            match smol::future::or(rx_msg, wait_for_read).await {
+                pin_mut!(rx_msg);
+                pin_mut!(wait_for_read);
+                match select(rx_msg, wait_for_read).await {
+                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                }
+            };
+
+            match next_item {
                 Ok(Item::Readable) => {
                     let decoded = match Pdu::decode_async(&mut stream, None).await {
                         Ok(data) => data,
@@ -244,7 +254,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use std::io;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    static GLOBAL_STATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct ScopedMux(Option<Arc<Mux>>);
+
+    impl ScopedMux {
+        fn install(mux: &Arc<Mux>) -> Self {
+            let prior = Mux::try_get();
+            Mux::set_mux(mux);
+            Self(prior)
+        }
+    }
+
+    impl Drop for ScopedMux {
+        fn drop(&mut self) {
+            if let Some(prior) = self.0.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct EofDispatchStream;
+
+    impl DispatchStream for EofDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for EofDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for EofDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn subscription_guard_eagerly_unsubscribes_on_drop() {
@@ -268,5 +341,17 @@ mod tests {
         );
         mux.notify(MuxNotification::Empty);
         assert_eq!(observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn process_async_treats_unexpected_eof_as_clean_disconnect() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let mux = Arc::new(Mux::new(None));
+        let _scoped_mux = ScopedMux::install(&mux);
+        let result = promise::spawn::block_on(process_async(EofDispatchStream));
+        assert!(
+            result.is_ok(),
+            "EOF should be treated as a normal client disconnect"
+        );
     }
 }

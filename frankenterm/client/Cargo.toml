@@ -9,10 +9,11 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-async-io.workspace = true
+async-channel.workspace = true
 async-trait.workspace = true
+asupersync.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
-codec = { workspace = true, default-features = false, features = ["async-smol"] }
+codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 filedescriptor.workspace = true
 futures.workspace = true
@@ -28,7 +29,6 @@ portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 rangeset.workspace = true
 ratelim.workspace = true
-smol.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true

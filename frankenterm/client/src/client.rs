@@ -1,12 +1,17 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
+use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use asupersync::runtime::{Interest, IoRegistration};
+use asupersync::Cx;
+use async_channel::{bounded, unbounded, Receiver, Sender};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
 use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::FutureExt;
+use futures::future::{select, Either};
+use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
@@ -16,20 +21,17 @@ use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
-use smol::channel::{bounded, unbounded, Receiver, Sender};
-use smol::prelude::*;
-use smol::Async;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::future::poll_fn;
+use std::io::{IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-#[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -48,7 +50,6 @@ enum ReaderMessage {
         pdu: Box<Pdu>,
         promise: Sender<anyhow::Result<Pdu>>,
     },
-    Readable,
 }
 
 #[derive(Clone)]
@@ -370,6 +371,17 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+const FALLBACK_IO_BACKOFF: Duration = Duration::from_millis(1);
+
+fn fallback_rewake(task_cx: &TaskContext<'_>) {
+    if let Some(timer) = Cx::current().and_then(|current| current.timer_driver()) {
+        let deadline = timer.now() + FALLBACK_IO_BACKOFF;
+        let _ = timer.register(deadline, task_cx.waker().clone());
+    } else {
+        task_cx.waker().wake_by_ref();
+    }
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
@@ -411,14 +423,27 @@ async fn client_thread_async(
         anyhow::anyhow!("mux client stream not available — connection not established")
     })?;
 
-    loop {
-        let rx_msg = rx.recv();
-        let wait_for_read = stream
-            .wait_for_readable()
-            .map(|_| Ok(ReaderMessage::Readable));
+    enum NextEvent {
+        Message(Result<ReaderMessage, async_channel::RecvError>),
+        Readable(anyhow::Result<()>),
+    }
 
-        match smol::future::or(rx_msg, wait_for_read).await {
-            Ok(ReaderMessage::SendPdu { pdu, promise }) => {
+    loop {
+        let next_event = {
+            let rx_msg = rx.recv();
+            let wait_for_read = stream.wait_for_readable();
+
+            pin_mut!(rx_msg);
+            pin_mut!(wait_for_read);
+
+            match select(rx_msg, wait_for_read).await {
+                Either::Left((message, _)) => NextEvent::Message(message),
+                Either::Right((readable, _)) => NextEvent::Readable(readable),
+            }
+        };
+
+        match next_event {
+            NextEvent::Message(Ok(ReaderMessage::SendPdu { pdu, promise })) => {
                 let serial = next_serial;
                 next_serial += 1;
                 promises.map.insert(serial, promise);
@@ -428,7 +453,10 @@ async fn client_thread_async(
                     .context("encoding a PDU to send to the server")?;
                 stream.flush().await.context("flushing PDU to server")?;
             }
-            Ok(ReaderMessage::Readable) => {
+            NextEvent::Message(Err(_)) => {
+                return Err(NotReconnectableError::ClientWasDestroyed.into());
+            }
+            NextEvent::Readable(Ok(())) => {
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
                         log::debug!(
@@ -462,8 +490,11 @@ async fn client_thread_async(
                     }
                 }
             }
-            Err(_) => {
-                return Err(NotReconnectableError::ClientWasDestroyed.into());
+            NextEvent::Readable(Err(err)) => {
+                let reason = format!("Error while waiting for stream readability: {:#}", err);
+                log::error!("{}", reason);
+                promises.fail_all(&reason);
+                return Err(err).context("Error while waiting for stream readability");
             }
         }
     }
@@ -575,16 +606,9 @@ impl AsyncReadAndWrite for AsyncSslStream {
 }
 
 #[async_trait(?Send)]
-impl<T> AsyncReadAndWrite for Async<T>
-where
-    T: std::fmt::Debug,
-    T: std::io::Write,
-    T: std::io::Read,
-    T: Send,
-    T: async_io::IoSafe,
-{
+impl AsyncReadAndWrite for SshStream {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
-        Ok(self.readable().await?)
+        SshStream::wait_for_readable(self).await.map_err(Into::into)
     }
 }
 
@@ -598,9 +622,9 @@ struct Reconnectable {
 struct SshStream {
     stdin: FileDescriptor,
     stdout: FileDescriptor,
+    read_registration: Mutex<Option<IoRegistration>>,
+    write_registration: Mutex<Option<IoRegistration>>,
 }
-
-unsafe impl async_io::IoSafe for SshStream {}
 
 impl std::fmt::Debug for SshStream {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
@@ -608,31 +632,102 @@ impl std::fmt::Debug for SshStream {
     }
 }
 
-#[cfg(unix)]
-impl AsFd for SshStream {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.stdout.as_fd()
+impl SshStream {
+    fn new(mut stdin: FileDescriptor, mut stdout: FileDescriptor) -> std::io::Result<Self> {
+        stdin
+            .set_non_blocking(true)
+            .map_err(std::io::Error::other)?;
+        stdout
+            .set_non_blocking(true)
+            .map_err(std::io::Error::other)?;
+        Ok(Self {
+            stdin,
+            stdout,
+            read_registration: Mutex::new(None),
+            write_registration: Mutex::new(None),
+        })
     }
-}
 
-#[cfg(unix)]
-impl AsRawFd for SshStream {
-    fn as_raw_fd(&self) -> RawFd {
-        self.stdout.as_raw_fd()
+    async fn wait_for_readable(&self) -> std::io::Result<()> {
+        let mut armed = false;
+        poll_fn(|task_cx| {
+            if armed {
+                return Poll::Ready(Ok(()));
+            }
+            self.register_interest_for_read(task_cx)?;
+            armed = true;
+            Poll::Pending
+        })
+        .await
     }
-}
 
-#[cfg(windows)]
-impl AsRawSocket for SshStream {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.stdout.as_raw_socket()
+    fn register_interest_for_read(&self, task_cx: &TaskContext<'_>) -> std::io::Result<()> {
+        self.register_interest(
+            &self.stdout,
+            &self.read_registration,
+            Interest::READABLE,
+            task_cx,
+        )
     }
-}
 
-#[cfg(windows)]
-impl AsSocket for SshStream {
-    fn as_socket(&self) -> BorrowedSocket {
-        self.stdout.as_socket()
+    fn register_interest_for_write(&self, task_cx: &TaskContext<'_>) -> std::io::Result<()> {
+        self.register_interest(
+            &self.stdin,
+            &self.write_registration,
+            Interest::WRITABLE,
+            task_cx,
+        )
+    }
+
+    fn register_interest(
+        &self,
+        desc: &FileDescriptor,
+        registration: &Mutex<Option<IoRegistration>>,
+        interest: Interest,
+        task_cx: &TaskContext<'_>,
+    ) -> std::io::Result<()> {
+        let mut registration = registration
+            .lock()
+            .map_err(|_| std::io::Error::other("SSH registration lock poisoned"))?;
+        if let Some(existing) = registration.as_mut() {
+            match existing.rearm(interest, task_cx.waker()) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    *registration = None;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {
+                    *registration = None;
+                    drop(registration);
+                    fallback_rewake(task_cx);
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let Some(current) = Cx::current() else {
+            drop(registration);
+            fallback_rewake(task_cx);
+            return Ok(());
+        };
+        match current.register_io(desc, interest) {
+            Ok(new_registration) => {
+                let _ = new_registration.update_waker(task_cx.waker().clone());
+                *registration = Some(new_registration);
+                Ok(())
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                drop(registration);
+                fallback_rewake(task_cx);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -648,6 +743,95 @@ impl Write for SshStream {
     }
     fn flush(&mut self) -> Result<(), std::io::Error> {
         self.stdin.flush()
+    }
+}
+
+impl AsyncRead for SshStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.stdout.read(buf.unfilled()) {
+            Ok(read) => {
+                buf.advance(read);
+                Poll::Ready(Ok(()))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(register_err) = this.register_interest_for_read(task_cx) {
+                    return Poll::Ready(Err(register_err));
+                }
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+}
+
+impl AsyncWrite for SshStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match this.stdin.write(buf) {
+            Ok(written) => Poll::Ready(Ok(written)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(register_err) = this.register_interest_for_write(task_cx) {
+                    return Poll::Ready(Err(register_err));
+                }
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match this.stdin.write_vectored(bufs) {
+            Ok(written) => Poll::Ready(Ok(written)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(register_err) = this.register_interest_for_write(task_cx) {
+                    return Poll::Ready(Err(register_err));
+                }
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        task_cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.stdin.flush() {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Err(register_err) = this.register_interest_for_write(task_cx) {
+                    return Poll::Ready(Err(register_err));
+                }
+                Poll::Pending
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _task_cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -800,10 +984,7 @@ impl Reconnectable {
             _ => {}
         });
 
-        let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(SshStream {
-            stdin: exec.stdin,
-            stdout: exec.stdout,
-        })?);
+        let stream: Box<dyn AsyncReadAndWrite> = Box::new(SshStream::new(exec.stdin, exec.stdout)?);
         self.stream.replace(stream);
         Ok(())
     }
@@ -1219,14 +1400,23 @@ impl Client {
         &self,
         ui: &ConnectionUI,
     ) -> anyhow::Result<GetCodecVersionResponse> {
-        match self
-            .get_codec_version(GetCodecVersion {})
-            .or(async {
+        let version_info = {
+            let codec_version = self.get_codec_version(GetCodecVersion {});
+            let timeout = async {
                 promise::spawn::sleep(Duration::from_secs(60)).await;
                 Err(Timeout).context("Timeout")
-            })
-            .await
-        {
+            };
+
+            pin_mut!(codec_version);
+            pin_mut!(timeout);
+
+            match select(codec_version, timeout).await {
+                Either::Left((result, _)) => result,
+                Either::Right((result, _)) => result,
+            }
+        };
+
+        match version_info {
             Ok(info) if info.codec_vers == CODEC_VERSION => {
                 log::trace!(
                     "Server version is {} (codec version {})",
@@ -1494,7 +1684,15 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use codec::{PaneRemoved, WindowTitleChanged, WindowWorkspaceChanged};
+
+    fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build wezterm-client asupersync runtime")
+            .block_on(future)
+    }
 
     #[test]
     fn wezterm_bin_path_defaults_to_wezterm() {
@@ -1609,6 +1807,42 @@ mod tests {
             &StandaloneUnilateralError::RequiresAttachedDomain {
                 pdu_name: "PaneRemoved",
             }
+        );
+    }
+
+    #[test]
+    fn ssh_stream_asupersync_roundtrip_handles_initial_would_block() {
+        use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (stdin, mut remote_stdin) =
+            filedescriptor::socketpair().expect("create stdin socketpair");
+        let (mut remote_stdout, stdout) =
+            filedescriptor::socketpair().expect("create stdout socketpair");
+        let mut stream = SshStream::new(stdin, stdout).expect("construct ssh stream");
+
+        let remote = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            std::thread::sleep(Duration::from_millis(50));
+            remote_stdout.write_all(b"ping")?;
+            remote_stdout.flush()?;
+
+            let mut buf = [0u8; 4];
+            remote_stdin.read_exact(&mut buf)?;
+            Ok(buf.to_vec())
+        });
+
+        let received = asupersync_block_on(async {
+            let mut buf = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut buf).await?;
+            AsyncWriteExt::write_all(&mut stream, b"pong").await?;
+            AsyncWriteExt::flush(&mut stream).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf.to_vec())
+        })
+        .expect("client roundtrip should succeed");
+
+        assert_eq!(received, b"ping");
+        assert_eq!(
+            remote.join().expect("remote thread should join").unwrap(),
+            b"pong"
         );
     }
 }

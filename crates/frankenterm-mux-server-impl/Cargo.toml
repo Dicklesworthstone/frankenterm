@@ -11,8 +11,10 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
+asupersync.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
-codec = { workspace = true, default-features = false, features = ["async-smol"] }
+codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 dns-lookup.workspace = true
 futures.workspace = true
@@ -26,7 +28,6 @@ parking_lot.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 rcgen.workspace = true
-smol.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true
 wezterm-client.workspace = true
