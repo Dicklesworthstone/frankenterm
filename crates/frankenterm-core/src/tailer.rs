@@ -1173,6 +1173,14 @@ impl std::fmt::Display for TailerMode {
 /// established. Otherwise returns `Polling`.
 #[cfg(feature = "vendored")]
 fn streaming_socket_configured(config: &crate::config::Config) -> bool {
+    // When the user explicitly sets mux_socket_path to empty/whitespace,
+    // treat that as "streaming disabled" — do not fall through to env or
+    // canonical discovery.
+    if let Some(ref path) = config.vendored.mux_socket_path {
+        if path.trim().is_empty() {
+            return false;
+        }
+    }
     // Use the shared resolver that checks config, env, AND canonical WezTerm
     // unix-domain defaults (GH #48).
     crate::wezterm::discover_mux_socket(config.vendored.mux_socket_path.as_deref()).is_some()
