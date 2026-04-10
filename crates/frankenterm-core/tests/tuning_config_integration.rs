@@ -6,19 +6,17 @@ use std::thread;
 use std::time::Duration;
 
 use frankenterm_core::config::{Config, ConfigOverrides};
-use frankenterm_core::ipc;
 use frankenterm_core::policy::{
     ActionKind, ActorKind, PaneCapabilities, PolicyEngine, PolicyInput,
 };
 use frankenterm_core::recorder_audit::{
     AuditLogConfig, approval_ttl_seconds_from_tuning, max_raw_query_rows_from_tuning,
 };
+#[cfg(feature = "recorder-lexical")]
 use frankenterm_core::recorder_lexical_ingest::LexicalIndexerConfig;
 use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
 use frankenterm_core::runtime_compat::RwLock;
 use frankenterm_core::storage::StorageHandle;
-use frankenterm_core::web;
-use frankenterm_core::wire_protocol;
 use frankenterm_core::workflows::{DescriptorLimits, WorkflowDescriptor};
 use frankenterm_core::{patterns::PatternEngine, tuning_config::TuningConfig};
 use tempfile::TempDir;
@@ -56,13 +54,9 @@ where
 }
 
 #[test]
-fn t2_critical_limits_load_into_web_wire_and_ipc_resolvers() {
+fn t2_wire_and_ipc_limits_load_from_tuning() {
     let config = load_config(
-        r#"
-[tuning.web]
-default_host = "0.0.0.0"
-default_port = 9911
-
+        r"
 [tuning.wire_protocol]
 max_message_size = 2097152
 max_sender_id_len = 144
@@ -70,19 +64,38 @@ max_sender_id_len = 144
 [tuning.ipc]
 max_message_size = 262144
 accept_poll_interval_ms = 250
-"#,
+",
     );
 
-    assert_eq!(web::resolve_host(Some(&config.tuning.web)), "0.0.0.0");
-    assert_eq!(web::resolve_port(Some(&config.tuning.web)), 9911);
-
-    let wire_limits = wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
+    let wire_limits =
+        frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
     assert_eq!(wire_limits.max_message_size, 2_097_152);
     assert_eq!(wire_limits.max_sender_id_len, 144);
 
-    let ipc_limits = ipc::resolve_limits(Some(&config.tuning.ipc));
+    let ipc_limits = frankenterm_core::ipc::resolve_limits(Some(&config.tuning.ipc));
     assert_eq!(ipc_limits.max_message_size, 262_144);
     assert_eq!(ipc_limits.accept_poll_interval_ms, 250);
+}
+
+#[cfg(feature = "web")]
+#[test]
+fn t2_web_limits_load_from_tuning() {
+    let config = load_config(
+        r#"
+[tuning.web]
+default_host = "0.0.0.0"
+default_port = 9911
+"#,
+    );
+
+    assert_eq!(
+        frankenterm_core::web::resolve_host(Some(&config.tuning.web)),
+        "0.0.0.0"
+    );
+    assert_eq!(
+        frankenterm_core::web::resolve_port(Some(&config.tuning.web)),
+        9911
+    );
 }
 
 #[test]
@@ -121,6 +134,7 @@ idle_window_secs = 42
     });
 }
 
+#[cfg(feature = "recorder-lexical")]
 #[test]
 fn t4_search_indexer_uses_loaded_tuning_values() {
     let config = load_config(
@@ -213,6 +227,7 @@ max_match_len = 4
     );
 }
 
+#[cfg(feature = "web")]
 #[test]
 fn t7_web_stream_limits_use_loaded_tuning_values() {
     let config = load_config(
@@ -229,7 +244,7 @@ stream_scan_max_pages = 9
 ",
     );
 
-    let limits = web::resolve_runtime_limits(Some(&config.tuning.web));
+    let limits = frankenterm_core::web::resolve_runtime_limits(Some(&config.tuning.web));
     assert_eq!(limits.max_list_limit, 123);
     assert_eq!(limits.default_list_limit, 45);
     assert_eq!(limits.max_request_body_bytes, 54_321);

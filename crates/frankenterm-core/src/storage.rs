@@ -23146,6 +23146,7 @@ mod backpressure_integration_tests {
             // - Verify send times out (reserve with timeout)
             use std::time::Duration;
 
+            #[allow(unused_variables)]
             let (tx, rx) = mpsc::channel::<u8>(2);
             #[allow(unused_variables)]
             let max_cap = 2usize;

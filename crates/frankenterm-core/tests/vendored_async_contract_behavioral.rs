@@ -16,6 +16,7 @@
 //   B21–B23r: Cross-layer integration scenarios
 // =============================================================================
 
+#[cfg(all(feature = "vendored", unix))]
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
