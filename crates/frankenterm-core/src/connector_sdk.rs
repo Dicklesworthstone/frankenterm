@@ -1425,8 +1425,6 @@ impl CertificationPipeline {
         let mut phases = Vec::new();
         let mut any_failure = false;
         let mut any_warning = false;
-        let integration_probe;
-
         // Phase 1: Schema validation (manifest.validate() returns ConnectorRegistryError)
         let phase_start = std::time::Instant::now();
         let schema_verdict = match manifest.validate() {
@@ -1571,7 +1569,7 @@ impl CertificationPipeline {
         } else {
             self.execute_integration_probe(manifest)
         };
-        integration_probe = Some(probe_execution.evidence.clone());
+        let integration_probe = Some(probe_execution.evidence.clone());
         any_failure |= probe_execution.failure;
         any_warning |= probe_execution.warning;
         phases.push(PhaseResult {
@@ -1645,6 +1643,7 @@ impl CertificationPipeline {
     }
 
     fn execute_integration_probe(&self, manifest: &ConnectorManifest) -> IntegrationProbeExecution {
+        let _ = self; // future integration probes may use pipeline state
         let mut evidence = base_integration_probe_evidence(manifest);
 
         if let Some(min_ft_version) = manifest.min_ft_version.as_deref() {
@@ -1668,7 +1667,7 @@ impl CertificationPipeline {
                 return skipped_probe_execution(evidence, reason);
             }
         };
-        evidence.host_id = plan.host_config.host_id.clone();
+        evidence.host_id.clone_from(&plan.host_config.host_id);
         evidence.protocol_version = plan.host_config.protocol_version;
 
         let mut runtime = match ConnectorHostRuntime::new(plan.host_config) {

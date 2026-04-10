@@ -313,7 +313,7 @@ fn execute_step_action(
             let h = handle.clone();
             let pane_id = *pane_id;
             let text = text.clone();
-            let no_paste = paste_mode.map_or(false, |pm| !pm);
+            let no_paste = paste_mode.is_some_and(|pm| !pm);
             let result = std::thread::spawn(move || {
                 let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
                     .build()
@@ -1392,7 +1392,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     TxPhase::Preparing,
                     now_ms,
                 );
-                event.step_id = gate_input.step_id.0.clone();
+                event.step_id.clone_from(&gate_input.step_id.0);
                 event.details.insert(
                     "gate".to_string(),
                     serde_json::Value::String(gate_name.to_string()),

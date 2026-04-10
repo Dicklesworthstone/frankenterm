@@ -265,6 +265,7 @@ impl MissionDispatcher {
 
     /// Build a synthetic detection for a dispatch contract.
     fn build_detection(&self, contract: &MissionDispatchContract) -> Detection {
+        let _ = self; // future dispatch may use dispatcher state
         Detection {
             rule_id: format!("mission.dispatch.{}", contract.assignment_id),
             agent_type: AgentType::Unknown,
