@@ -8790,7 +8790,7 @@ enum RestartWorkflowResult {
     },
     Restored {
         snapshot: frankenterm_core::snapshot_engine::SnapshotResult,
-        summary: frankenterm_core::session_restore::RestoreSummary,
+        summary: Box<frankenterm_core::session_restore::RestoreSummary>,
         layout_only: bool,
     },
     RestoreFailed {
@@ -8980,7 +8980,7 @@ where
     {
         Ok(summary) => Ok(RestartWorkflowResult::Restored {
             snapshot,
-            summary,
+            summary: Box::new(summary),
             layout_only: options.layout_only,
         }),
         Err(error) => Ok(RestartWorkflowResult::RestoreFailed {
@@ -42270,7 +42270,7 @@ mod tests {
         let summary = sample_restart_restore_summary();
         let payload = restart_result_json(&RestartWorkflowResult::Restored {
             snapshot,
-            summary,
+            summary: Box::new(summary),
             layout_only: false,
         });
 
@@ -44147,15 +44147,15 @@ recorder_backend = "frankensqlite"
                     .expect("canonical remote pane should exist");
                 assert_eq!(remote.domain, "distributed:agent-mapped:prod");
 
-                let distributed_panes: Vec<_> = storage_handle
+                let distributed_pane_count = storage_handle
                     .get_panes()
                     .await
                     .unwrap()
                     .into_iter()
                     .filter(|pane| pane.domain.starts_with("distributed:"))
-                    .collect();
+                    .count();
                 assert_eq!(
-                    distributed_panes.len(),
+                    distributed_pane_count,
                     1,
                     "case-only sender variants should not fork remote panes"
                 );
@@ -46069,15 +46069,15 @@ recorder_backend = "frankensqlite"
                         "stale lower-seq mixed-case sender metadata must be ignored"
                     );
 
-                    let distributed_panes: Vec<_> = storage_handle
+                    let distributed_pane_count = storage_handle
                         .get_panes()
                         .await
                         .unwrap()
                         .into_iter()
                         .filter(|pane| pane.domain.starts_with("distributed:"))
-                        .collect();
+                        .count();
                     assert_eq!(
-                        distributed_panes.len(),
+                        distributed_pane_count,
                         1,
                         "listener should not fork sender state on case-only identity changes"
                     );
@@ -46325,15 +46325,15 @@ recorder_backend = "frankensqlite"
                         "mixed-case reconnect without explicit session_id must not bypass replay protection"
                     );
 
-                    let distributed_panes: Vec<_> = storage_handle
+                    let distributed_pane_count = storage_handle
                         .get_panes()
                         .await
                         .unwrap()
                         .into_iter()
                         .filter(|pane| pane.domain.starts_with("distributed:"))
-                        .collect();
+                        .count();
                     assert_eq!(
-                        distributed_panes.len(),
+                        distributed_pane_count,
                         1,
                         "case-only reconnects should not fork remote pane state"
                     );
@@ -52485,9 +52485,11 @@ log_level = "debug"
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                path.file_name()
+                let name_match = path
+                    .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".cursorrules.") && name.ends_with(".bak"))
+                    .is_some_and(|name| name.starts_with(".cursorrules."));
+                name_match && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
             })
             .collect();
         assert_eq!(backups.len(), 1, "expected exactly one backup file");
