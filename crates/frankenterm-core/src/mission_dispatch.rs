@@ -351,7 +351,7 @@ mod tests {
         let detection = dispatcher.build_detection(&contract);
         assert_eq!(detection.rule_id, "mission.dispatch.assign-42");
         assert_eq!(detection.event_type, "mission_dispatch");
-        assert_eq!(detection.confidence, 1.0);
+        assert!((detection.confidence - 1.0).abs() < f64::EPSILON);
         assert_eq!(detection.severity, Severity::Info);
         assert!(detection.extracted["assignment_id"] == "assign-42");
         assert!(detection.extracted["target_agent"] == "agent-alpha");

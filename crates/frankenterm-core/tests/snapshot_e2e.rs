@@ -1115,20 +1115,20 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
                 .pane_id_map
                 .get(&pane.pane_id)
                 .expect("fixture pane must be restored");
-            let restored = wezterm
+            let new_state = wezterm
                 .pane_state(new_pane_id)
                 .await
                 .expect("restored pane state should exist");
             let tab_consistent = match restored_tabs_by_old_tab.get(&pane.tab_id) {
-                Some(expected_tab_id) => *expected_tab_id == restored.tab_id,
+                Some(expected_tab_id) => *expected_tab_id == new_state.tab_id,
                 None => {
-                    restored_tabs_by_old_tab.insert(pane.tab_id, restored.tab_id);
+                    restored_tabs_by_old_tab.insert(pane.tab_id, new_state.tab_id);
                     true
                 }
             };
-            let active_matches = restored.is_active == (pane.pane_id == active_old_pane_id);
+            let active_matches = new_state.is_active == (pane.pane_id == active_old_pane_id);
             let cwd_matches = pane.cwd.as_deref().map(normalize_cwd_str).as_deref()
-                == Some(restored.cwd.as_str());
+                == Some(new_state.cwd.as_str());
 
             report.pane_reports.push(PaneTestReport {
                 pane_id: pane.pane_id,
@@ -1142,10 +1142,10 @@ fn e2e_fixture_complex_layout_restore_executes_real_restore_flow() {
                 ),
                 restored_content_hash: hash_text(
                     &json!({
-                        "window_id": restored.window_id,
-                        "tab_id": restored.tab_id,
-                        "cwd": restored.cwd,
-                        "is_active": restored.is_active,
+                        "window_id": new_state.window_id,
+                        "tab_id": new_state.tab_id,
+                        "cwd": new_state.cwd,
+                        "is_active": new_state.is_active,
                     })
                     .to_string(),
                 ),
