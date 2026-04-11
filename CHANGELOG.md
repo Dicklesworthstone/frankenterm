@@ -9,7 +9,60 @@ Organized by landed capabilities, not raw diff order. Each section describes wha
 
 ---
 
-## [Unreleased] -- development on `main` since 2026-02-17
+## [0.1.0] -- 2026-04-11
+
+First tagged release. Establishes the baseline for what works, what is feature-gated, and what is in progress.
+
+### Working (passes end-to-end)
+
+- **Observation pipeline** — `ft watch` discovers panes via WezTerm CLI polling or native push events, populates SQLite pane table
+- **Pattern detection** — Aho-Corasick multi-pattern scanner with configurable triggers, BOCPD change-point detection
+- **Robot Mode** — `ft robot state`, `ft robot send-text`, `ft robot wait-for` for machine-driven pane interaction
+- **Full-text search** — FrankenSearch hybrid (BM25 + semantic) with RRF fusion, tantivy indexing
+- **Policy engine** — rule-based allow/deny with actor, surface, action, and pane-id matching
+- **Fleet memory controller** — 4-tier pressure management (Normal/Elevated/Critical/Emergency) with tiered scrollback eviction
+- **Session persistence** — SQLite-backed workspace state with atomic snapshot/restore
+- **Connector SDK** — inbound/outbound bridge, mesh routing, capability envelopes
+- **Transactional execution** — `ft tx run` with prepare gates (policy, liveness, reservation, approval), commit/compensate phases, audit trail
+- **Diagnostic subsystem** — `ft doctor --json` with 31 health checks
+
+### Feature-gated (compile-time opt-in)
+
+- **MCP** (`--features mcp`) — Model Context Protocol tool surface with bridge/middleware/proxy
+- **Distributed mode** (`--features distributed`) — mTLS node-to-node communication scaffolding
+- **Semantic search** (`--features semantic-search`) — fastembed v5.11 vector embeddings
+- **Web API** (`--features web`) — FastAPI-based HTTP server for `/health`, `/panes`, `/events`, `/search`
+- **TUI** (`--features tui`) — FrankenTUI operator dashboard (in development)
+
+### Partial (framework complete, data plane in progress)
+
+- **Mission dispatch** — planner, event log, lifecycle state machine implemented; live agent coordination pending
+- **Native mux server** — lifecycle engine, topology orchestration, command transport; vendored WezTerm backend still primary
+
+### Known limitations
+
+- **Build requirements** — Rust nightly, ~4 GB RAM, ~30 GB disk for full build; macOS needs `CC`/`CXX` set to avoid shell alias conflicts
+- **WezTerm dependency** — core observation loop requires WezTerm mux server as backend
+- **Codebase scale** — ~793k LOC across 120 crates; cold build takes 15-30 minutes
+
+### Installation
+
+```sh
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+```
+
+On macOS, if `cc` is aliased to something other than the C compiler:
+```sh
+CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
+```
+
+---
+
+## [Unreleased] -- development on `main` since v0.1.0
+
+> Continued development after the v0.1.0 baseline.
+
+## [Pre-0.1.0] -- development on `main` since 2026-02-17
 
 > ~3,500 commits since the `backup-before-rewrite` tag. Active daily development by concurrent agent swarms. The project grew from a WezTerm automation wrapper to a full terminal platform with its own GUI, mux server, and 120-crate workspace (~775k lines of code, 45,000+ tests).
 
