@@ -39,11 +39,32 @@ use std::time::Duration;
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// TLS configuration bundle for distributed mode.
+///
+/// Holds pre-built rustls configurations that can be converted into
+/// asupersync [`TlsAcceptor`](asupersync::tls::TlsAcceptor) and
+/// [`TlsConnector`](asupersync::tls::TlsConnector) for production use.
 #[cfg(feature = "distributed")]
 #[derive(Clone)]
 pub struct DistributedTlsBundle {
     pub server: Arc<ServerConfig>,
     pub client: Arc<ClientConfig>,
+}
+
+#[cfg(feature = "distributed")]
+impl DistributedTlsBundle {
+    /// Create an asupersync [`TlsAcceptor`](asupersync::tls::TlsAcceptor)
+    /// from the server configuration for accepting inbound TLS connections.
+    #[must_use]
+    pub fn acceptor(&self) -> asupersync::tls::TlsAcceptor {
+        asupersync::tls::TlsAcceptor::new((*self.server).clone())
+    }
+
+    /// Create an asupersync [`TlsConnector`](asupersync::tls::TlsConnector)
+    /// from the client configuration for initiating outbound TLS connections.
+    #[must_use]
+    pub fn connector(&self) -> asupersync::tls::TlsConnector {
+        asupersync::tls::TlsConnector::new((*self.client).clone())
+    }
 }
 
 /// TLS errors for distributed mode.
@@ -858,6 +879,62 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
     }
     ServerName::try_from(name)
         .map_err(|_| DistributedTlsError::Config("invalid server name".to_string()))
+}
+
+// =============================================================================
+// Distributed HTTP client (asupersync-native, wa-1u55z)
+// =============================================================================
+
+/// HTTP client for distributed node-to-node communication.
+///
+/// Wraps [`asupersync::http::h1::http_client::HttpClient`] for making
+/// requests between distributed nodes without requiring reqwest.
+///
+/// For plain HTTP (loopback testing, health checks), use [`Self::plaintext()`].
+/// For HTTPS with standard WebPKI roots, use [`Self::new()`].
+/// For mTLS with custom certificates, use [`DistributedTlsBundle::connector()`]
+/// with raw [`asupersync::net::TcpStream`] + TLS handshake + HTTP/1.1 framing.
+#[cfg(feature = "distributed")]
+pub struct DistributedHttpClient {
+    inner: asupersync::http::h1::http_client::HttpClient,
+}
+
+#[cfg(feature = "distributed")]
+impl DistributedHttpClient {
+    /// Create a client with default configuration (WebPKI roots for HTTPS).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: asupersync::http::h1::http_client::HttpClient::new(),
+        }
+    }
+
+    /// Create a plaintext-only client for loopback/testing.
+    #[must_use]
+    pub fn plaintext() -> Self {
+        Self::new()
+    }
+
+    /// Send a GET request.
+    pub async fn get(
+        &self,
+        cx: &asupersync::cx::Cx,
+        url: &str,
+    ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
+    {
+        self.inner.get(cx, url).await
+    }
+
+    /// Send a POST request with a body.
+    pub async fn post(
+        &self,
+        cx: &asupersync::cx::Cx,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
+    {
+        self.inner.post(cx, url, body).await
+    }
 }
 
 #[cfg(feature = "distributed")]
@@ -3223,5 +3300,278 @@ KBAhs4snj5QspGFqkazmIw==
         // no token source at all
         let err = resolve_expected_token(&config).unwrap_err();
         assert!(matches!(err, DistributedCredentialError::TokenMissing));
+    }
+
+    // =========================================================================
+    // wa-1u55z: Production bundle → asupersync TLS integration tests
+    // =========================================================================
+
+    /// Verify `DistributedTlsBundle::acceptor()` and `connector()` produce
+    /// working asupersync TLS types that complete a handshake.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn bundle_acceptor_connector_handshake() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
+
+            let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("build bundle");
+
+            let acceptor = bundle.acceptor();
+            let connector = bundle.connector();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(stream).await.expect("tls accept");
+                let mut buf = [0u8; 5];
+                tls.read_exact(&mut buf).await.expect("read");
+                buf
+            });
+
+            let mut client = connector
+                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .await
+                .expect("tls connect");
+            client.write_all(b"hello").await.expect("write");
+
+            let received = server_task.await.expect("join");
+            assert_eq!(&received, b"hello");
+        });
+    }
+
+    /// Verify `DistributedTlsBundle::acceptor()` and `connector()` work with
+    /// mTLS (mutual authentication).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn bundle_acceptor_connector_mtls() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+            let client_cert = temp_pem(CLIENT_CERT);
+            let client_key = temp_pem(CLIENT_KEY);
+
+            let mut server_cfg = DistributedConfig::default();
+            server_cfg.enabled = true;
+            server_cfg.auth_mode = DistributedAuthMode::Mtls;
+            server_cfg.tls.enabled = true;
+            server_cfg.tls.cert_path = Some(server_cert.path().display().to_string());
+            server_cfg.tls.key_path = Some(server_key.path().display().to_string());
+            server_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
+            server_cfg.allow_agent_ids = vec!["wa-client".to_string()];
+
+            let mut client_cfg = DistributedConfig::default();
+            client_cfg.enabled = true;
+            client_cfg.auth_mode = DistributedAuthMode::Mtls;
+            client_cfg.tls.enabled = true;
+            client_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
+            client_cfg.tls.key_path = Some(client_key.path().display().to_string());
+
+            let server_bundle =
+                build_tls_bundle(&server_cfg, Some(ca_cert.path())).expect("server bundle");
+            let client_bundle =
+                build_tls_bundle(&client_cfg, Some(ca_cert.path())).expect("client bundle");
+
+            let acceptor = server_bundle.acceptor();
+            let connector = client_bundle.connector();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(stream).await.expect("mtls accept");
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf).await.expect("read");
+                buf
+            });
+
+            let mut client = connector
+                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .await
+                .expect("mtls connect");
+            client.write_all(b"mtls").await.expect("write");
+
+            let received = server_task.await.expect("join");
+            assert_eq!(&received, b"mtls");
+        });
+    }
+
+    /// Verify the bundle is cloneable and both clones produce working TLS types.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn bundle_clone_produces_working_tls() {
+        let ca_cert = temp_pem(CA_CERT);
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+
+        let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("build");
+        let cloned = bundle.clone();
+
+        // Both produce acceptors/connectors without panic
+        let _a1 = bundle.acceptor();
+        let _c1 = bundle.connector();
+        let _a2 = cloned.acceptor();
+        let _c2 = cloned.connector();
+    }
+
+    /// Verify `DistributedHttpClient::new()` creates without panic.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_creates() {
+        let _client = DistributedHttpClient::new();
+        let _plaintext = DistributedHttpClient::plaintext();
+    }
+
+    /// Verify `DistributedHttpClient` can make a request to a local server.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_local_get() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            // Spin up a minimal HTTP server
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown().await.expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/health", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
+    /// Verify bidirectional data exchange over TLS using bundle helpers.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn bundle_tls_bidirectional_exchange() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
+
+            let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("build bundle");
+            let acceptor = bundle.acceptor();
+            let connector = bundle.connector();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(stream).await.expect("tls accept");
+
+                // Read request
+                let mut buf = [0u8; 7];
+                tls.read_exact(&mut buf).await.expect("read");
+                assert_eq!(&buf, b"request");
+
+                // Write response
+                tls.write_all(b"response").await.expect("write");
+            });
+
+            let mut client = connector
+                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .await
+                .expect("tls connect");
+
+            // Write request
+            client.write_all(b"request").await.expect("write");
+
+            // Read response
+            let mut buf = [0u8; 8];
+            client.read_exact(&mut buf).await.expect("read");
+            assert_eq!(&buf, b"response");
+
+            server_task.await.expect("join");
+        });
+    }
+
+    /// Verify TLS throughput path with larger payload using bundle helpers.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn bundle_tls_large_payload() {
+        run_async_test(async {
+            let ca_cert = temp_pem(CA_CERT);
+            let server_cert = temp_pem(SERVER_CERT);
+            let server_key = temp_pem(SERVER_KEY);
+
+            let mut config = DistributedConfig::default();
+            config.enabled = true;
+            config.tls.enabled = true;
+            config.tls.cert_path = Some(server_cert.path().display().to_string());
+            config.tls.key_path = Some(server_key.path().display().to_string());
+
+            let bundle = build_tls_bundle(&config, Some(ca_cert.path())).expect("build bundle");
+            let acceptor = bundle.acceptor();
+            let connector = bundle.connector();
+
+            let payload_size = 256 * 1024; // 256 KiB
+            let payload = vec![0xABu8; payload_size];
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(stream).await.expect("tls accept");
+                let mut received = Vec::new();
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    let n = tls.read(&mut buf).await.expect("read");
+                    if n == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..n]);
+                }
+                received.len()
+            });
+
+            let mut client = connector
+                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .await
+                .expect("tls connect");
+            client.write_all(&payload).await.expect("write");
+            client.shutdown().await.expect("shutdown");
+
+            let received_len = server_task.await.expect("join");
+            assert_eq!(received_len, payload_size);
+        });
     }
 }
