@@ -3204,6 +3204,387 @@ mod tests {
         });
     }
 
+    // ── ft-2h5wv.6: Pre-cancelled Cx counter regression suite ─────────────
+    //
+    // These tests verify that pre-cancelled Cx operations leave pool stats in
+    // a fully clean state: zero connections created/failed, zero acquire
+    // timeout increments, zero recovery attempts, zero permanent failures,
+    // and no effect on idle/active connection counts.
+    //
+    // Key regression targets:
+    //   - recovery ENABLED but pre-cancelled Cx still fast-fails (no retry)
+    //   - multi-operation accumulation produces no side-effects
+    //   - pre-cancelled ops after a successful op leave idle connections intact
+    //   - get_pane_render_changes and batch render paths also fast-fail
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_get_lines_with_recovery_enabled_skips_retry() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-lines-rec.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled get_lines recovery-enabled"),
+            );
+
+            let err = pool
+                .get_lines_with_cx(&cx, 42, std::iter::once(0..10).collect())
+                .await
+                .expect_err("pre-cancelled with recovery enabled should still fail");
+            assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0, "no acquire attempt");
+            assert_eq!(stats.pool.total_timeouts, 0, "no timeout");
+            assert_eq!(stats.pool.idle_count, 0, "no idle connections");
+            assert_eq!(stats.pool.active_count, 0, "no active connections");
+            assert_eq!(stats.connections_created, 0, "no connection created");
+            assert_eq!(stats.connections_failed, 0, "no connection failure");
+            assert_eq!(stats.recovery_attempts, 0, "recovery not attempted");
+            assert_eq!(stats.recovery_successes, 0, "no recovery success");
+            assert_eq!(stats.permanent_failures, 0, "no permanent failure");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_write_to_pane_with_recovery_enabled_skips_retry() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-write-rec.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled write_to_pane recovery-enabled"),
+            );
+
+            let err = pool
+                .write_to_pane_with_cx(&cx, 7, b"recovery test\n".to_vec())
+                .await
+                .expect_err("pre-cancelled write with recovery should still fail");
+            assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.permanent_failures, 0);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_send_paste_with_recovery_enabled_skips_retry() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-paste-rec.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled send_paste recovery-enabled"),
+            );
+
+            let err = pool
+                .send_paste_with_cx(&cx, 8, "paste recovery test\n".to_string())
+                .await
+                .expect_err("pre-cancelled paste with recovery should still fail");
+            assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.permanent_failures, 0);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_multiple_precancelled_ops_accumulate_no_side_effects() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 4,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-multi.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(3),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled multi-op"),
+            );
+
+            // Run all three precancelled operations in sequence.
+            let _ = pool
+                .get_lines_with_cx(&cx, 1, std::iter::once(0..5).collect())
+                .await;
+            let _ = pool
+                .write_to_pane_with_cx(&cx, 2, b"data\n".to_vec())
+                .await;
+            let _ = pool
+                .send_paste_with_cx(&cx, 3, "text\n".to_string())
+                .await;
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0, "no acquires across 3 ops");
+            assert_eq!(stats.pool.total_timeouts, 0, "no timeouts across 3 ops");
+            assert_eq!(stats.pool.total_returned, 0, "no returns across 3 ops");
+            assert_eq!(stats.pool.total_evicted, 0, "no evictions across 3 ops");
+            assert_eq!(stats.pool.idle_count, 0, "zero idle");
+            assert_eq!(stats.pool.active_count, 0, "zero active");
+            assert_eq!(stats.connections_created, 0, "no connections across 3 ops");
+            assert_eq!(stats.connections_failed, 0, "no failures across 3 ops");
+            assert_eq!(stats.recovery_attempts, 0, "no recovery across 3 ops");
+            assert_eq!(stats.recovery_successes, 0, "no recovery success");
+            assert_eq!(stats.permanent_failures, 0, "no permanent across 3 ops");
+            assert_eq!(stats.health_checks, 0, "no health checks from data ops");
+            assert_eq!(stats.health_check_failures, 0, "no health failures");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_after_successful_op_leaves_idle_intact() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server(&temp_dir).await;
+
+            let pool = MuxPool::new(pool_config(socket_path, 4));
+            let good_cx = crate::cx::for_testing();
+
+            // Successful operation creates a connection.
+            pool.list_panes_with_cx(&good_cx)
+                .await
+                .expect("first list succeeds");
+            let stats_after_success = pool.stats().await;
+            assert_eq!(stats_after_success.connections_created, 1);
+            assert_eq!(stats_after_success.pool.idle_count, 1);
+            assert_eq!(stats_after_success.pool.total_acquired, 1);
+            assert_eq!(stats_after_success.pool.total_returned, 1);
+
+            // Now run precancelled operations — they must not touch the pool.
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let bad_cx = Cx::for_testing_with_budget(budget);
+            bad_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled after success"),
+            );
+
+            let _ = pool
+                .get_lines_with_cx(&bad_cx, 1, std::iter::once(0..5).collect())
+                .await;
+            let _ = pool
+                .write_to_pane_with_cx(&bad_cx, 2, b"cancelled\n".to_vec())
+                .await;
+            let _ = pool
+                .send_paste_with_cx(&bad_cx, 3, "cancelled\n".to_string())
+                .await;
+
+            let stats = pool.stats().await;
+            // Connection counters unchanged from the single successful op.
+            assert_eq!(stats.connections_created, 1, "still just the one connection");
+            assert_eq!(stats.connections_failed, 0, "no new failures");
+            assert_eq!(stats.pool.idle_count, 1, "idle connection preserved");
+            assert_eq!(stats.pool.active_count, 0, "no active checkouts");
+            // Acquire counter unchanged — precancelled ops never acquire.
+            assert_eq!(stats.pool.total_acquired, 1, "only the first acquire");
+            assert_eq!(stats.pool.total_returned, 1, "only the first return");
+            assert_eq!(stats.pool.total_timeouts, 0, "no timeouts");
+            // Recovery counters remain zero.
+            assert_eq!(stats.recovery_attempts, 0, "no recovery");
+            assert_eq!(stats.recovery_successes, 0, "no recovery success");
+            assert_eq!(stats.permanent_failures, 0, "no permanent failure");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_get_pane_render_changes_returns_cancelled_without_connecting() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-render.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    ..MuxRecoveryConfig::default()
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled get_pane_render_changes"),
+            );
+
+            let err = pool
+                .get_pane_render_changes_with_cx(&cx, 99)
+                .await
+                .expect_err("pre-cancelled render changes should fail");
+            assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.total_timeouts, 0);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.permanent_failures, 0);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_precancelled_batch_render_returns_cancelled_without_connecting() {
+        run_async_test(async {
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 2,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default()
+                    .with_socket_path("/tmp/wa-mux-pool-ctr-batch.sock"),
+                recovery: MuxRecoveryConfig {
+                    enabled: false,
+                    ..MuxRecoveryConfig::default()
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("precancelled batch render"),
+            );
+
+            let err = pool
+                .get_pane_render_changes_batch_with_cx(&cx, vec![1, 2, 3])
+                .await
+                .expect_err("pre-cancelled batch render should fail");
+            assert!(matches!(err, MuxPoolError::Pool(PoolError::Cancelled)));
+
+            let stats = pool.stats().await;
+            assert_eq!(stats.pool.total_acquired, 0);
+            assert_eq!(stats.pool.total_timeouts, 0);
+            assert_eq!(stats.pool.idle_count, 0);
+            assert_eq!(stats.pool.active_count, 0);
+            assert_eq!(stats.connections_created, 0);
+            assert_eq!(stats.connections_failed, 0);
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
+            assert_eq!(stats.permanent_failures, 0);
+        });
+    }
+
     #[test]
     fn pool_clear_then_new_connection() {
         run_async_test(async {
