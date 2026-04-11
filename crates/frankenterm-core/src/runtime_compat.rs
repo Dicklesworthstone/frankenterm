@@ -557,11 +557,19 @@ pub mod watch {
 
 /// Broadcast channel aliases for the active runtime.
 ///
-/// Note: broadcast remains tokio-backed under both feature paths because
-/// call sites in `events.rs` use `tx.send(msg)` (no Cx) and `rx.try_recv()`
-/// (not available in asupersync broadcast). Per-module migration beads will
-/// update call sites to use the `broadcast_send`/`broadcast_recv` bridge
-/// helpers, after which the asupersync backend can be activated.
+/// Broadcast remains tokio-backed under **all** feature paths.  Migrating
+/// to `asupersync::channel::broadcast` is blocked by three missing APIs in
+/// the asupersync broadcast primitive:
+///
+/// 1. `Receiver::try_recv()` — used by `broadcast_try_recv` /
+///    `EventSubscription::try_next()` in `events.rs`.
+/// 2. `Sender::receiver_count()` — used by `broadcast_receiver_count` for
+///    telemetry in `events.rs`.
+/// 3. `Sender::len()` — used by `broadcast_len` for queue-depth metrics
+///    in `events.rs`.
+///
+/// Once these are added to asupersync, the migration can follow the same
+/// wrapper pattern used for `oneshot` above.
 pub mod broadcast {
     pub use tokio::sync::broadcast::{
         Receiver, Sender, channel,
@@ -571,11 +579,81 @@ pub mod broadcast {
 
 /// Oneshot channel aliases for the active runtime.
 ///
-/// Note: oneshot remains tokio-backed under both feature paths because
-/// call sites in `storage.rs` use `respond.send(value)` (no Cx) and
-/// `rx.await` (tokio Receiver impl Future). Per-module migration beads
-/// will update call sites to use the `oneshot_send`/`oneshot_recv` bridge
-/// helpers, after which the asupersync backend can be activated.
+/// When `asupersync-runtime` is enabled, provides wrapper types around
+/// `asupersync::channel::oneshot` that acquire a `Cx` internally, keeping
+/// the tokio-compatible `Sender::send(value)` signature so that existing
+/// call sites (e.g. the ~30 `respond.send(result)` calls in `storage.rs`)
+/// need no changes.
+///
+/// `Receiver` does **not** impl `Future` under asupersync — callers that
+/// previously used `rx.await` must go through [`oneshot_recv`] instead.
+#[cfg(feature = "asupersync-runtime")]
+pub mod oneshot {
+    use asupersync::channel::oneshot as inner;
+
+    /// Compatibility error type matching tokio's `oneshot::error::RecvError`.
+    #[derive(Debug)]
+    pub struct RecvError;
+
+    impl std::fmt::Display for RecvError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "channel closed")
+        }
+    }
+
+    impl std::error::Error for RecvError {}
+
+    /// Wrapper around [`asupersync::channel::oneshot::Sender`] that acquires
+    /// a `Cx` internally, preserving the tokio-compatible `.send(value)` API.
+    pub struct Sender<T> {
+        inner: inner::Sender<T>,
+    }
+
+    impl<T> std::fmt::Debug for Sender<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("oneshot::Sender").finish_non_exhaustive()
+        }
+    }
+
+    /// Wrapper around [`asupersync::channel::oneshot::Receiver`].
+    ///
+    /// Does **not** implement `Future` — use [`super::oneshot_recv`] to
+    /// receive from the channel asynchronously.
+    pub struct Receiver<T> {
+        pub(super) inner: inner::Receiver<T>,
+    }
+
+    impl<T> std::fmt::Debug for Receiver<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("oneshot::Receiver").finish_non_exhaustive()
+        }
+    }
+
+    /// Creates a new oneshot channel.
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        let (tx, rx) = inner::channel();
+        (Sender { inner: tx }, Receiver { inner: rx })
+    }
+
+    impl<T> Sender<T> {
+        /// Sends a value on the channel.
+        ///
+        /// Acquires a [`Cx`](crate::cx::Cx) internally via
+        /// `Cx::current()` (falling back to `for_request()`) for the
+        /// asupersync two-phase reserve/commit send.
+        ///
+        /// Returns `Err(value)` if the receiver was dropped.
+        pub fn send(self, value: T) -> Result<(), T> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.inner
+                .send(&cx, value)
+                .map_err(|inner::SendError::Disconnected(v)| v)
+        }
+    }
+}
+
+/// Oneshot channel aliases for the active runtime (tokio fallback).
+#[cfg(not(feature = "asupersync-runtime"))]
 pub mod oneshot {
     pub use tokio::sync::oneshot::{Receiver, Sender, channel, error::RecvError};
 }
@@ -1933,8 +2011,8 @@ pub fn broadcast_len<T>(tx: &broadcast::Sender<T>) -> usize {
 /// Send a value on a oneshot channel using the active runtime backend.
 ///
 /// Returns `Err(message)` if the receiver was dropped.
-/// When the oneshot backend is migrated to asupersync, this helper will
-/// acquire `Cx::current()` for the two-phase reserve/commit send.
+/// Under `asupersync-runtime`, the wrapper `Sender` acquires a `Cx`
+/// internally, so this helper's signature is unchanged.
 pub fn oneshot_send<T>(tx: oneshot::Sender<T>, value: T) -> Result<(), String> {
     tx.send(value)
         .map_err(|_| "sending on a closed oneshot channel".to_string())
@@ -1942,10 +2020,21 @@ pub fn oneshot_send<T>(tx: oneshot::Sender<T>, value: T) -> Result<(), String> {
 
 /// Receive from a oneshot channel using the active runtime backend.
 ///
-/// Consumes the receiver. When the oneshot backend is migrated to asupersync,
-/// this helper will acquire `Cx::current()` for the async recv.
+/// Consumes the receiver. Under `asupersync-runtime`, acquires a `Cx`
+/// and calls the asupersync `.recv()` method. Under tokio, awaits the
+/// receiver directly (since tokio `Receiver` impls `Future`).
 pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
-    rx.await.map_err(|e| e.to_string())
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        let mut inner_rx = rx.inner;
+        inner_rx.recv(&cx).await.map_err(|e| e.to_string())
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        rx.await.map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

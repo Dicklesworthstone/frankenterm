@@ -7114,7 +7114,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish promptly");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("shutdown should await server-observed socket close");
             closed.expect("server close signal should complete");
@@ -7632,7 +7632,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish promptly");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
@@ -7767,7 +7767,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish after cancellation");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
@@ -7896,7 +7896,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish after cancellation");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
@@ -8036,7 +8036,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish after cancellation");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("server should observe connection close after cancellation");
             closed.expect("server close signal should complete");
@@ -8152,7 +8152,7 @@ mod tests {
                 .await
                 .expect("shutdown should finish after cancellation");
 
-            let closed = timeout(Duration::from_millis(500), closed_rx)
+            let closed = timeout(Duration::from_millis(500), crate::runtime_compat::oneshot_recv(closed_rx))
                 .await
                 .expect("shutdown should await server-observed socket close");
             closed.expect("server close signal should complete");
