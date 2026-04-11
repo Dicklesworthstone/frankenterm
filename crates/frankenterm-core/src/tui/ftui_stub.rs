@@ -9,8 +9,8 @@
 //! - Status footer with view name and refresh indicator
 //! - Periodic data refresh via background tasks
 //!
-//! Individual view rendering functions will be migrated in FTUI-05.2 through
-//! FTUI-05.7.  Until then, each view body shows a placeholder message.
+//! All view bodies (Home, Panes, Search, Help, Events, Triage, History,
+//! Timeline) are backed by live state — no placeholders remain.
 //!
 //! # Architecture
 //!
