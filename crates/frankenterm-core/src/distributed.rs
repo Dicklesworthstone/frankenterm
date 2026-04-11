@@ -3339,7 +3339,10 @@ KBAhs4snj5QspGFqkazmIw==
             });
 
             let mut client = connector
-                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
                 .await
                 .expect("tls connect");
             client.write_all(b"hello").await.expect("write");
@@ -3397,7 +3400,10 @@ KBAhs4snj5QspGFqkazmIw==
             });
 
             let mut client = connector
-                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
                 .await
                 .expect("mtls connect");
             client.write_all(b"mtls").await.expect("write");
@@ -3457,7 +3463,9 @@ KBAhs4snj5QspGFqkazmIw==
                 assert!(n > 0);
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                 stream.write_all(response).await.expect("write response");
-                stream.shutdown().await.expect("shutdown");
+                stream
+                    .shutdown(std::net::Shutdown::Both)
+                    .expect("shutdown");
             });
 
             let client = DistributedHttpClient::plaintext();
@@ -3507,7 +3515,10 @@ KBAhs4snj5QspGFqkazmIw==
             });
 
             let mut client = connector
-                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
                 .await
                 .expect("tls connect");
 
@@ -3564,7 +3575,10 @@ KBAhs4snj5QspGFqkazmIw==
             });
 
             let mut client = connector
-                .connect("localhost", TcpStream::connect(addr).await.expect("connect"))
+                .connect(
+                    "localhost",
+                    TcpStream::connect(addr).await.expect("connect"),
+                )
                 .await
                 .expect("tls connect");
             client.write_all(&payload).await.expect("write");
