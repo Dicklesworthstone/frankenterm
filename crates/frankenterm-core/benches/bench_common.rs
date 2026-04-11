@@ -170,6 +170,12 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 500_000,
         note: "bp scheduler: ceiling 500us",
     },
+    // TCP/TLS: coarse regression guard for loopback networking.
+    CiBudgetEntry {
+        group_prefix: "tcp_tls/",
+        max_median_ns: 500_000_000,
+        note: "tcp/tls benches should stay sub-0.5s median on CI",
+    },
     // Sizing insert: DB-bound, can be slow → ceiling 2s
     CiBudgetEntry {
         group_prefix: "sizing_insert",

@@ -3295,6 +3295,7 @@ dependencies = [
  "proptest",
  "rand 0.9.2",
  "ratatui",
+ "rcgen",
  "regex",
  "rmp-serde",
  "rusqlite",
