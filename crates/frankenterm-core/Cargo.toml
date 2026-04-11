@@ -10,6 +10,7 @@ repository.workspace = true
 readme = "../../README.md"
 keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
 categories = ["development-tools"]
+autobenches = false
 
 [lints]
 workspace = true
@@ -117,6 +118,7 @@ proptest = "1.8.0"
 tempfile = "3.23.0"
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 loom = "0.7"
+rcgen = { workspace = true }
 
 # Benchmarks
 [[bench]]
@@ -171,6 +173,11 @@ required-features = ["asupersync-runtime"]
 name = "task_spawn"
 harness = false
 required-features = ["asupersync-runtime"]
+
+[[bench]]
+name = "tcp_tls"
+harness = false
+required-features = ["asupersync-runtime", "distributed"]
 
 [[bench]]
 name = "sizing_benchmark"

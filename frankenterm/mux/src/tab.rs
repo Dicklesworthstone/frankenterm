@@ -3359,7 +3359,9 @@ impl TabInner {
             .detach();
         }
         for pane in &dead_panes {
-            self.constraint_overrides.remove(&pane.pane_id());
+            let pid = pane.pane_id();
+            self.constraint_overrides.remove(&pid);
+            self.collapsed_panes.remove(&pid);
         }
         dead_panes
     }

@@ -29,6 +29,10 @@ fn max_backlog_bytes_per_pane() -> usize {
 /// indicates protocol churn or a stalled consumer.
 const CMD_QUEUE_WARNING_DEPTH: usize = 10_000;
 
+/// Hard cap on tmux command queue size to prevent unbounded memory growth
+/// during event storms. Oldest commands are dropped when the cap is reached.
+const CMD_QUEUE_MAX_DEPTH: usize = 50_000;
+
 fn cap_backlog_payload(payload: &[u8]) -> Vec<u8> {
     if payload.len() <= max_backlog_bytes_per_pane() {
         payload.to_vec()
@@ -283,7 +287,16 @@ impl TmuxDomainState {
             return;
         }
         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-        if cmd_queue.len() > CMD_QUEUE_WARNING_DEPTH {
+        if cmd_queue.len() > CMD_QUEUE_MAX_DEPTH {
+            let excess = cmd_queue.len() - CMD_QUEUE_MAX_DEPTH;
+            log::error!(
+                "tmux command queue ({}) exceeds hard cap {}; dropping {} oldest commands",
+                cmd_queue.len(),
+                CMD_QUEUE_MAX_DEPTH,
+                excess,
+            );
+            cmd_queue.drain(..excess);
+        } else if cmd_queue.len() > CMD_QUEUE_WARNING_DEPTH {
             log::warn!(
                 "tmux command queue depth ({}) exceeds {} threshold; possible protocol churn",
                 cmd_queue.len(),
@@ -797,5 +810,42 @@ mod tests {
         let capped = cap_backlog_payload(&exact);
         assert_eq!(exact.len(), capped.len());
         assert_eq!(exact, capped);
+    }
+
+    #[test]
+    fn cmd_queue_hard_cap_drains_oldest_when_exceeded() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-queue-cap-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+
+        let launcher = RecordingPane::new(99, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+
+        let tmux_domain = TmuxDomain::new(99);
+        // Set state to Idle so send_next_command processes the queue
+        *tmux_domain.inner.state.lock() = State::Idle;
+
+        // Fill the queue beyond the hard cap
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            for _ in 0..CMD_QUEUE_MAX_DEPTH + 100 {
+                queue.push_back(Box::new(ListCommands));
+            }
+            assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH + 100);
+        }
+
+        // send_next_command should drain excess before processing
+        tmux_domain.inner.send_next_command();
+
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        // Queue should be at or below the cap (minus the one that was sent)
+        assert!(
+            queue.len() <= CMD_QUEUE_MAX_DEPTH,
+            "queue length {} should be at most {}",
+            queue.len(),
+            CMD_QUEUE_MAX_DEPTH,
+        );
     }
 }

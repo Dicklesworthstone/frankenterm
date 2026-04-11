@@ -841,8 +841,15 @@ impl Mux {
 
         let mut dead_subscribers = Vec::new();
         for (id, subscriber) in subscribers {
-            if !subscriber(notification.clone()) {
-                dead_subscribers.push(id);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                subscriber(notification.clone())
+            })) {
+                Ok(true) => {} // subscriber still alive
+                Ok(false) => dead_subscribers.push(id),
+                Err(_) => {
+                    log::error!("mux subscriber {id} panicked — removing");
+                    dead_subscribers.push(id);
+                }
             }
         }
 
@@ -2063,5 +2070,34 @@ mod tests {
         let pty_size = terminal_size_to_pty_size(size).unwrap();
         assert_eq!(pty_size.rows, 0);
         assert_eq!(pty_size.cols, 0);
+    }
+
+    #[test]
+    fn panicking_subscriber_is_removed_and_does_not_poison_others() {
+        let mux = Mux::new(None);
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&healthy_count);
+
+        // Panicking subscriber
+        mux.subscribe(move |_| {
+            panic!("intentional test panic in subscriber");
+        });
+
+        // Healthy subscriber registered after the panicker
+        mux.subscribe(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+
+        // First dispatch: panicker fires and is removed, healthy fires
+        mux.dispatch_notification(MuxNotification::Empty);
+        assert_eq!(healthy_count.load(Ordering::Relaxed), 1);
+
+        // Second dispatch: panicker is gone, only healthy fires
+        mux.dispatch_notification(MuxNotification::Empty);
+        assert_eq!(healthy_count.load(Ordering::Relaxed), 2);
+
+        // Only the healthy subscriber remains
+        assert_eq!(mux.subscribers.read().len(), 1);
     }
 }
