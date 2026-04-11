@@ -211,11 +211,7 @@ impl Pattern {
     pub fn add_charset(&mut self, charset: &CharSet) -> anyhow::Result<()> {
         unsafe {
             ensure!(
-                FcPatternAddCharSet(
-                    self.pat,
-                    c"charset".as_ptr(),
-                    charset.cset
-                ) != 0,
+                FcPatternAddCharSet(self.pat, c"charset".as_ptr(), charset.cset) != 0,
                 "failed to add charset property"
             );
             Ok(())

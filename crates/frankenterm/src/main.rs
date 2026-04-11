@@ -44155,8 +44155,7 @@ recorder_backend = "frankensqlite"
                     .filter(|pane| pane.domain.starts_with("distributed:"))
                     .count();
                 assert_eq!(
-                    distributed_pane_count,
-                    1,
+                    distributed_pane_count, 1,
                     "case-only sender variants should not fork remote panes"
                 );
 
@@ -46077,8 +46076,7 @@ recorder_backend = "frankensqlite"
                         .filter(|pane| pane.domain.starts_with("distributed:"))
                         .count();
                     assert_eq!(
-                        distributed_pane_count,
-                        1,
+                        distributed_pane_count, 1,
                         "listener should not fork sender state on case-only identity changes"
                     );
                 }
@@ -52489,7 +52487,10 @@ log_level = "debug"
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with(".cursorrules."));
-                name_match && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                name_match
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
             })
             .collect();
         assert_eq!(backups.len(), 1, "expected exactly one backup file");
