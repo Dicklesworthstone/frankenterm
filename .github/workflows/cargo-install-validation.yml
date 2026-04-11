@@ -1,6 +1,15 @@
 name: Cargo Install Validation
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm/**'
+      - 'crates/frankenterm-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/cargo-install-validation.yml'
   workflow_dispatch:
     inputs:
       git_url:
@@ -45,26 +54,28 @@ jobs:
         with:
           key: cargo-install-${{ matrix.os }}
 
-      - name: Run cargo install validation
-        env:
-          INPUT_GIT_URL: ${{ inputs.git_url }}
-          INPUT_GIT_REF: ${{ inputs.git_ref }}
-          DEFAULT_GIT_URL: https://github.com/${{ github.repository }}.git
-          E2E_ARTIFACTS_BASE: ${{ github.workspace }}/e2e-artifacts
+      # On macOS, ensure the system C compiler is used (not aliases).
+      # On Ubuntu, install system deps for native crate compilation.
+      - name: Platform-specific setup
+        shell: bash
         run: |
-          if [ -n "${INPUT_GIT_URL}" ]; then
-            export FT_INSTALL_GIT_URL="${INPUT_GIT_URL}"
-          else
-            export FT_INSTALL_GIT_URL="${DEFAULT_GIT_URL}"
-          fi
+          case "$(uname -s)" in
+            Darwin)
+              echo "CC=$(xcrun --find clang)" >> "$GITHUB_ENV"
+              echo "CXX=$(xcrun --find clang++)" >> "$GITHUB_ENV"
+              ;;
+            Linux)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq cmake pkg-config libssl-dev
+              ;;
+          esac
 
-          if [ -n "${INPUT_GIT_REF}" ]; then
-            export FT_INSTALL_GIT_REF="${INPUT_GIT_REF}"
-          else
-            export FT_INSTALL_GIT_REF="${GITHUB_SHA}"
-          fi
-
-          bash tests/e2e/test_ft_gofz5_1_cargo_install.sh
+      - name: Run cargo install validation (path mode)
+        env:
+          FT_INSTALL_SOURCE: path
+          FT_INSTALL_PATH: ${{ github.workspace }}/crates/frankenterm
+          E2E_ARTIFACTS_BASE: ${{ github.workspace }}/e2e-artifacts
+        run: bash tests/e2e/test_ft_gofz5_1_cargo_install.sh
 
       - name: Upload cargo install artifacts
         if: always()
