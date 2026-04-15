@@ -8339,12 +8339,13 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (_task_id, _handle) = runtime
+            let (task_id, _handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
                 })
                 .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
 
             let report = runtime.run_with_auto_advance();
             assert!(
@@ -8452,9 +8453,7 @@ mod tests {
                     "capacity freed by recv must accept try_send"
                 );
                 let second = rx.recv(&cx).await.expect("recv");
-                assert!(
-                    matches!(second, PaneDelta::Gap { reason, .. } if reason == "after-drain")
-                );
+                assert!(matches!(second, PaneDelta::Gap { reason, .. } if reason == "after-drain"));
             });
         }
 
