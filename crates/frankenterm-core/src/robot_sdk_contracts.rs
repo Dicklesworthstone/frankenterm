@@ -240,15 +240,23 @@ pub struct ErrorCodeSpec {
 // =============================================================================
 
 /// Language target for SDK generation.
+///
+/// Only [`SdkLanguage::Rust`] is a fully-supported finish-line SDK target:
+/// its generated client wires through [`RustSdkTransport`] end-to-end. The
+/// `Python`, `TypeScript`, and `Go` variants render *template skeletons*
+/// whose transport methods raise/throw/panic with `transport not wired` and
+/// must be implemented by the consumer before use. Use
+/// [`SdkLanguage::is_fully_supported`] to gate any code path that requires a
+/// real, wired transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SdkLanguage {
-    /// Python SDK.
+    /// Python SDK template. Transport stub: consumer must implement `_call`.
     Python,
-    /// TypeScript/JavaScript SDK.
+    /// TypeScript/JavaScript SDK template. Transport stub: consumer must implement `call`.
     TypeScript,
-    /// Rust SDK (client crate).
+    /// Rust SDK (client crate). Fully-supported finish-line target.
     Rust,
-    /// Go SDK.
+    /// Go SDK template. Transport stub: consumer must implement `call`.
     Go,
 }
 
@@ -273,6 +281,17 @@ impl SdkLanguage {
             Self::Rust => "Rust",
             Self::Go => "Go",
         }
+    }
+
+    /// Returns `true` only for SDK targets whose generated client has a
+    /// fully-wired transport. Non-Rust targets currently emit template
+    /// skeletons with `transport not wired` placeholders and must not be
+    /// advertised as finish-line supported capabilities. Tracked for the
+    /// `ft-xbnl0` finish-line program in the
+    /// `ft-xbnl0.1.2` capability inventory.
+    #[must_use]
+    pub fn is_fully_supported(&self) -> bool {
+        matches!(self, Self::Rust)
     }
 }
 
@@ -2297,6 +2316,38 @@ mod tests {
         assert!(source.contains("supported_commands"));
         assert!(!source.contains("transport not wired"));
         assert!(!source.contains("unimplemented!("));
+    }
+
+    #[test]
+    fn ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported() {
+        // Truth-sweep guard for ft-xbnl0.3.6: the inventory excludes
+        // non-Rust SDK templates from the finish-line supported matrix
+        // because their generated transports are stubs. Lock that
+        // contract into a test so future agents cannot quietly widen
+        // the supported matrix without updating the inventory.
+        assert!(SdkLanguage::Rust.is_fully_supported());
+        for lang in [
+            SdkLanguage::Python,
+            SdkLanguage::TypeScript,
+            SdkLanguage::Go,
+        ] {
+            assert!(
+                !lang.is_fully_supported(),
+                "{} SDK template still emits a `transport not wired` stub; \
+                 narrow it explicitly before claiming finish-line support",
+                lang.label()
+            );
+            let mut sdk = SdkSurface::new(lang, "frankenterm");
+            sdk.generate_from_specs(&core_endpoint_specs());
+            let source = sdk.render_client_source();
+            assert!(
+                source.contains("transport not wired"),
+                "{} template lost its `transport not wired` marker; \
+                 either wire the transport (and update is_fully_supported) \
+                 or restore the marker so the supported-path sweep stays honest",
+                lang.label()
+            );
+        }
     }
 
     // ---- E2E ----
