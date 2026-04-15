@@ -8357,6 +8357,17 @@ mod tests {
             );
         }
 
+        /// Direct reserve/commit send using the caller's LabRuntime Cx. The
+        /// mux_client production helpers (`pane_delta_send`,
+        /// `mpsc_reserve_send`) rely on `crate::cx::for_testing()` which
+        /// minted a *different* Cx than the LabRuntime task's Cx, so those
+        /// helpers deadlock the deterministic scheduler. These tests use the
+        /// raw asupersync API to exercise the same two-phase semantics the
+        /// production helpers wrap.
+        async fn lab_send(cx: &asupersync::Cx, tx: &compat_mpsc::Sender<PaneDelta>, v: PaneDelta) {
+            tx.reserve(cx).await.expect("reserve lab permit").send(v);
+        }
+
         /// 1. A single PaneDelta channel delivers a value end-to-end under
         ///    LabRuntime using the compat-routed mpsc primitives.
         #[test]
@@ -8365,7 +8376,8 @@ mod tests {
                 let (tx, mut rx) = compat_mpsc::channel::<PaneDelta>(4);
                 let cx = asupersync::Cx::current().expect("lab Cx");
 
-                pane_delta_send(
+                lab_send(
+                    &cx,
                     &tx,
                     PaneDelta::Output {
                         pane_id: 7,
@@ -8456,7 +8468,8 @@ mod tests {
                 let (tx_b, mut rx_b) = compat_mpsc::channel::<PaneDelta>(8);
                 let cx = asupersync::Cx::current().expect("lab Cx");
 
-                pane_delta_send(
+                lab_send(
+                    &cx,
                     &tx_a,
                     PaneDelta::Output {
                         pane_id: 11,
@@ -8468,7 +8481,8 @@ mod tests {
                     },
                 )
                 .await;
-                pane_delta_send(
+                lab_send(
+                    &cx,
                     &tx_b,
                     PaneDelta::Output {
                         pane_id: 22,
@@ -8535,7 +8549,8 @@ mod tests {
                 let cx = asupersync::Cx::current().expect("lab Cx");
 
                 for seqno in 0u64..6 {
-                    pane_delta_send(
+                    lab_send(
+                        &cx,
                         &tx,
                         PaneDelta::Output {
                             pane_id: 5,
@@ -8575,7 +8590,8 @@ mod tests {
 
                 let total = AtomicU64::new(0);
                 for seqno in 0u64..10 {
-                    pane_delta_send(
+                    lab_send(
+                        &cx,
                         &tx,
                         PaneDelta::Output {
                             pane_id: 9,
