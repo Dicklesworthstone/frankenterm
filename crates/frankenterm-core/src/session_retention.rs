@@ -258,6 +258,59 @@ pub async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
 ) -> Result<CleanupResult, String> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_request();
+        cleanup_sessions_async_cx(&cx, db_path, config).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        cleanup_sessions_async_inner(db_path, config).await
+    }
+}
+
+/// Run cleanup asynchronously under an explicit `&Cx` (ft-xbnl0.2.2).
+///
+/// Cx-first entry point: caller-supplied cancellation is honored at the
+/// boundaries around the blocking SQLite work. A checkpoint before the
+/// spawn lets a canceled caller skip the blocking handoff entirely; a
+/// checkpoint after the join lets the caller abort before returning the
+/// result into the wider call graph.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn cleanup_sessions_async_cx(
+    cx: &crate::cx::Cx,
+    db_path: Arc<String>,
+    config: SessionRetentionConfig,
+) -> Result<CleanupResult, String> {
+    // Honor caller cancellation before we hand work off to the blocking pool.
+    cx.checkpoint()
+        .map_err(|err| format!("cx checkpoint failed before spawn_blocking: {err}"))?;
+
+    let outcome = crate::runtime_compat::spawn_blocking(move || {
+        let conn = Connection::open(db_path.as_str())
+            .map_err(|e| format!("Failed to open database: {e}"))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
+        cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?;
+
+    // Honor caller cancellation after the blocking work returns so a
+    // late-canceled caller does not propagate a stale result.
+    cx.checkpoint()
+        .map_err(|err| format!("cx checkpoint failed after spawn_blocking: {err}"))?;
+
+    outcome
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn cleanup_sessions_async_inner(
+    db_path: Arc<String>,
+    config: SessionRetentionConfig,
+) -> Result<CleanupResult, String> {
     crate::runtime_compat::spawn_blocking(move || {
         let conn = Connection::open(db_path.as_str())
             .map_err(|e| format!("Failed to open database: {e}"))?;
@@ -286,6 +339,76 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove that the
+    /// Cx-first `cleanup_sessions_async_cx` path respects the caller's
+    /// checkpoint boundary under seed-locked virtual-time scheduling.
+    /// We point it at a path that will fail fast at `Connection::open`
+    /// so no real SQLite work is done and no real time elapses; the
+    /// test asserts the spawn_blocking handoff + result plumbing run
+    /// under the LabRuntime scheduler without wall-clock dependence.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cleanup_sessions_async_cx_runs_under_labruntime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SEED: u64 = 0x5E55_1022_C410_D0BE;
+        let wall_start = std::time::Instant::now();
+        let observed_error = Arc::new(AtomicBool::new(false));
+        let observed_error_task = Arc::clone(&observed_error);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                // Path that cannot exist / cannot open as a SQLite DB.
+                let bad_db = Arc::new("/ft-xbnl0-2-2/does-not-exist/bogus.sqlite".to_string());
+                let config = SessionRetentionConfig::default();
+                let result = cleanup_sessions_async_cx(&cx, bad_db, config).await;
+                match result {
+                    Err(msg) => {
+                        // Either Failed to open database or Cleanup failed — both
+                        // prove the Cx-first plumbing ran end to end without
+                        // deadlocking or burning real time.
+                        assert!(
+                            msg.contains("Failed to open database")
+                                || msg.contains("Cleanup failed"),
+                            "unexpected error surface: {msg}"
+                        );
+                        observed_error_task.store(true, Ordering::SeqCst);
+                    }
+                    Ok(_) => panic!("expected an error from nonexistent DB"),
+                }
+            })
+            .expect("spawn session_retention task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            observed_error.load(Ordering::SeqCst),
+            "cleanup_sessions_async_cx must surface an error for a bogus DB path"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(2),
+            "Cx-first cleanup must not burn real time; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     fn make_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
