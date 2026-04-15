@@ -1909,8 +1909,12 @@ where
 }
 
 /// Runs `future` with a timeout that respects the provided `Cx`.
+///
+/// Cx-first timeout seam for the ft-xbnl0.2.2 migration. Call sites that
+/// already thread `&Cx` should prefer this over the ambient [`timeout`]
+/// which falls back to `Cx::current()` thread-local lookup.
 #[cfg(feature = "asupersync-runtime")]
-pub(crate) async fn timeout_with_cx<F>(
+pub async fn timeout_with_cx<F>(
     cx: &crate::cx::Cx,
     duration: Duration,
     future: F,

@@ -278,8 +278,32 @@ impl CautClient {
 
     /// Fetch usage data via `caut usage`.
     pub async fn usage(&self, service: CautService) -> Result<CautUsage, CautError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.usage_cx(&cx, service).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = Self::build_args("usage", service);
+            let output = self.run_inner(&args).await?;
+            parse_usage_json(&output, service, self.max_error_bytes)
+        }
+    }
+
+    /// Fetch usage data via `caut usage` under an explicit `&Cx`.
+    ///
+    /// Cx-first entry point (ft-xbnl0.2.2): the subprocess timeout binds to
+    /// the provided `Cx` so cancellation, budget, and virtual time propagate
+    /// into the `caut` invocation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn usage_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: CautService,
+    ) -> Result<CautUsage, CautError> {
         let args = Self::build_args("usage", service);
-        let output = self.run(&args).await?;
+        let output = self.run_with_cx(cx, &args).await?;
         parse_usage_json(&output, service, self.max_error_bytes)
     }
 
@@ -289,8 +313,28 @@ impl CautClient {
     /// `usage` call performs the refresh/read in one step and returns the latest
     /// account snapshot.
     pub async fn refresh(&self, service: CautService) -> Result<CautRefresh, CautError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.refresh_cx(&cx, service).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = Self::build_args("usage", service);
+            let output = self.run_inner(&args).await?;
+            parse_refresh_json(&output, service, self.max_error_bytes)
+        }
+    }
+
+    /// Refresh usage data under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first API).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn refresh_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: CautService,
+    ) -> Result<CautRefresh, CautError> {
         let args = Self::build_args("usage", service);
-        let output = self.run(&args).await?;
+        let output = self.run_with_cx(cx, &args).await?;
         parse_refresh_json(&output, service, self.max_error_bytes)
     }
 
@@ -304,7 +348,35 @@ impl CautClient {
         ]
     }
 
-    async fn run(&self, args: &[String]) -> Result<String, CautError> {
+    /// Cx-first subprocess execution (ft-xbnl0.2.2). The subprocess timeout
+    /// is bound to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`].
+    #[cfg(feature = "asupersync-runtime")]
+    async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[String],
+    ) -> Result<String, CautError> {
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+
+        let output = match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output())
+            .await
+        {
+            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
+            Err(_) => {
+                return Err(CautError::Timeout {
+                    timeout_secs: self.timeout.as_secs(),
+                });
+            }
+        };
+
+        self.finalize_output(output)
+    }
+
+    /// Non-Cx subprocess execution used by the non-asupersync fallback path.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run_inner(&self, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
         cmd.kill_on_drop(true);
@@ -318,6 +390,13 @@ impl CautClient {
             }
         };
 
+        self.finalize_output(output)
+    }
+
+    fn finalize_output(
+        &self,
+        output: std::process::Output,
+    ) -> Result<String, CautError> {
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
             let stderr_bytes = if output.stderr.len() > self.max_error_bytes {
@@ -343,7 +422,6 @@ impl CautClient {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
         Ok(stdout)
     }
 }
