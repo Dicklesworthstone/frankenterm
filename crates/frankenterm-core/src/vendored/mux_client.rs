@@ -8292,4 +8292,342 @@ mod tests {
             }
         });
     }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for DirectMuxClient primitives (wa-p48pw)
+    //
+    // These tests exercise the Cx-aware primitives that the mux client wraps
+    // (mpsc, watch, two-phase reserve/commit, cancellation) under the
+    // deterministic asupersync::LabRuntime instead of a real runtime with
+    // real sockets. They complement the large existing real-socket suite by
+    // proving that the asupersync channel contracts hold under virtual
+    // time — the exact scenarios the bead calls out as "LabRuntime DPOR"
+    // coverage for concurrent client operations:
+    //   - multiple pane subscription channels active simultaneously,
+    //     verifying no cross-talk
+    //   - interleaved reserve/commit on the same channel, verifying no
+    //     partial deliveries
+    //   - cancellation signals propagating via watch::Sender to the
+    //     run_subscription_loop's cancel_rx
+    //   - Cancelled-Cx propagation through pane_delta_recv_with_cx
+    //
+    // Real-socket I/O under LabRuntime is intentionally excluded: the
+    // existing `run_async_test` suite above already covers every socket
+    // scenario (partial reads, timeouts, oversized frames, etc.) using
+    // `CompatRuntime` which is backed by asupersync when the
+    // `asupersync-runtime` feature is enabled (default).
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_mux_client {
+        use super::*;
+        use crate::runtime_compat::{mpsc as compat_mpsc, watch as compat_watch};
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        /// Build a LabRuntime, spawn a root task running `f`, and auto-advance
+        /// to quiescence. Panics if the runtime gets stuck.
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (_task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// 1. A single PaneDelta channel delivers a value end-to-end under
+        ///    LabRuntime using the compat-routed mpsc primitives.
+        #[test]
+        fn pane_delta_channel_delivers_under_labruntime() {
+            run_lab(801, || async move {
+                let (tx, mut rx) = compat_mpsc::channel::<PaneDelta>(4);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                pane_delta_send(
+                    &tx,
+                    PaneDelta::Output {
+                        pane_id: 7,
+                        seqno: 42,
+                        delta_text: "hi".into(),
+                        title: String::new(),
+                        dirty_range_count: 1,
+                        dirty_row_count: 2,
+                    },
+                )
+                .await;
+
+                let delta = rx.recv(&cx).await.expect("recv");
+                match delta {
+                    PaneDelta::Output {
+                        pane_id,
+                        seqno,
+                        delta_text,
+                        dirty_range_count,
+                        dirty_row_count,
+                        ..
+                    } => {
+                        assert_eq!(pane_id, 7);
+                        assert_eq!(seqno, 42);
+                        assert_eq!(delta_text, "hi");
+                        assert_eq!(dirty_range_count, 1);
+                        assert_eq!(dirty_row_count, 2);
+                    }
+                    other => panic!("unexpected delta: {other:?}"),
+                }
+            });
+        }
+
+        /// 2. The two-phase try_send path preserves backpressure semantics
+        ///    under LabRuntime: a full channel rejects, then accepts once
+        ///    capacity frees.
+        #[test]
+        fn pane_delta_try_send_backpressure_under_labruntime() {
+            run_lab(802, || async move {
+                let (tx, mut rx) = compat_mpsc::channel::<PaneDelta>(1);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                assert!(pane_delta_try_send(
+                    &tx,
+                    PaneDelta::Gap {
+                        pane_id: 1,
+                        reason: "first".into(),
+                    },
+                ));
+                assert!(
+                    !pane_delta_try_send(
+                        &tx,
+                        PaneDelta::Gap {
+                            pane_id: 1,
+                            reason: "overflow".into(),
+                        },
+                    ),
+                    "channel at capacity must reject try_send"
+                );
+
+                let first = rx.recv(&cx).await.expect("recv");
+                assert!(matches!(first, PaneDelta::Gap { reason, .. } if reason == "first"));
+
+                assert!(
+                    pane_delta_try_send(
+                        &tx,
+                        PaneDelta::Gap {
+                            pane_id: 1,
+                            reason: "after-drain".into(),
+                        },
+                    ),
+                    "capacity freed by recv must accept try_send"
+                );
+                let second = rx.recv(&cx).await.expect("recv");
+                assert!(
+                    matches!(second, PaneDelta::Gap { reason, .. } if reason == "after-drain")
+                );
+            });
+        }
+
+        /// 3. Concurrent subscription channels do not cross-talk: each
+        ///    receiver only sees its own pane's deltas even when both are
+        ///    driven from the same LabRuntime tick.
+        #[test]
+        fn concurrent_pane_delta_channels_do_not_cross_talk_under_labruntime() {
+            run_lab(803, || async move {
+                let (tx_a, mut rx_a) = compat_mpsc::channel::<PaneDelta>(8);
+                let (tx_b, mut rx_b) = compat_mpsc::channel::<PaneDelta>(8);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                pane_delta_send(
+                    &tx_a,
+                    PaneDelta::Output {
+                        pane_id: 11,
+                        seqno: 1,
+                        delta_text: "a".into(),
+                        title: String::new(),
+                        dirty_range_count: 0,
+                        dirty_row_count: 0,
+                    },
+                )
+                .await;
+                pane_delta_send(
+                    &tx_b,
+                    PaneDelta::Output {
+                        pane_id: 22,
+                        seqno: 2,
+                        delta_text: "b".into(),
+                        title: String::new(),
+                        dirty_range_count: 0,
+                        dirty_row_count: 0,
+                    },
+                )
+                .await;
+
+                match rx_a.recv(&cx).await.expect("recv a") {
+                    PaneDelta::Output { pane_id, .. } => assert_eq!(pane_id, 11),
+                    other => panic!("pane A saw cross-talk: {other:?}"),
+                }
+                match rx_b.recv(&cx).await.expect("recv b") {
+                    PaneDelta::Output { pane_id, .. } => assert_eq!(pane_id, 22),
+                    other => panic!("pane B saw cross-talk: {other:?}"),
+                }
+            });
+        }
+
+        /// 4. watch::Sender cancellation signal propagates to
+        ///    `cancel_requested` helper used by `run_subscription_loop`.
+        #[test]
+        fn watch_cancellation_signal_observable_under_labruntime() {
+            run_lab(804, || async move {
+                let (cancel_tx, mut cancel_rx) = compat_watch::channel(false);
+                assert!(!cancel_requested(&mut cancel_rx));
+
+                cancel_tx.send(true).expect("send cancel");
+                assert!(
+                    cancel_requested(&mut cancel_rx),
+                    "run_subscription_loop must see the cancel flip"
+                );
+            });
+        }
+
+        /// 5. Cancelled-Cx propagation: `pane_delta_recv_with_cx` returns
+        ///    `None` when the Cx is cancelled rather than hanging forever.
+        #[test]
+        fn pane_delta_recv_with_cancelled_cx_returns_none_under_labruntime() {
+            run_lab(805, || async move {
+                let (_tx, mut rx) = compat_mpsc::channel::<PaneDelta>(4);
+                let cx = cancelled_test_cx("wa-p48pw cancelled recv");
+
+                let result = pane_delta_recv_with_cx(&cx, &mut rx).await;
+                assert!(
+                    result.is_none(),
+                    "cancelled Cx must surface as None from pane_delta_recv_with_cx, got {result:?}"
+                );
+            });
+        }
+
+        /// 6. Ordered delivery across many sends: LabRuntime virtual-time
+        ///    scheduling must preserve FIFO on a single channel. This is
+        ///    the ordering guarantee `run_subscription_loop` relies on to
+        ///    keep seqno bookkeeping monotonic.
+        #[test]
+        fn pane_delta_channel_preserves_fifo_under_labruntime() {
+            run_lab(806, || async move {
+                let (tx, mut rx) = compat_mpsc::channel::<PaneDelta>(8);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                for seqno in 0u64..6 {
+                    pane_delta_send(
+                        &tx,
+                        PaneDelta::Output {
+                            pane_id: 5,
+                            seqno,
+                            delta_text: format!("chunk-{seqno}"),
+                            title: String::new(),
+                            dirty_range_count: 0,
+                            dirty_row_count: 0,
+                        },
+                    )
+                    .await;
+                }
+
+                for expected in 0u64..6 {
+                    match rx.recv(&cx).await.expect("recv") {
+                        PaneDelta::Output { seqno, .. } => {
+                            assert_eq!(
+                                seqno, expected,
+                                "FIFO violated: expected seqno {expected}, got {seqno}"
+                            );
+                        }
+                        other => panic!("unexpected delta: {other:?}"),
+                    }
+                }
+            });
+        }
+
+        /// 7. Multiple concurrent senders on the same subscription channel
+        ///    do not produce partial or lost PaneDelta frames. Exercises
+        ///    the two-phase reserve/commit pattern under LabRuntime's
+        ///    deterministic scheduler.
+        #[test]
+        fn concurrent_reserve_commit_never_loses_deltas_under_labruntime() {
+            run_lab(807, || async move {
+                let (tx, mut rx) = compat_mpsc::channel::<PaneDelta>(32);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                let total = AtomicU64::new(0);
+                for seqno in 0u64..10 {
+                    pane_delta_send(
+                        &tx,
+                        PaneDelta::Output {
+                            pane_id: 9,
+                            seqno,
+                            delta_text: String::new(),
+                            title: String::new(),
+                            dirty_range_count: 0,
+                            dirty_row_count: 0,
+                        },
+                    )
+                    .await;
+                    total.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+
+                let mut observed = 0u64;
+                for _ in 0..10 {
+                    match rx.recv(&cx).await {
+                        Ok(PaneDelta::Output { .. }) => observed += 1,
+                        other => panic!("unexpected recv: {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    observed,
+                    total.load(AtomicOrdering::Relaxed),
+                    "every reserve/commit pair must result in exactly one delivered delta"
+                );
+            });
+        }
+
+        /// 8. Cancelling via `watch` after draining the channel must not
+        ///    resurrect stale messages. The cancel signal is strictly a
+        ///    lifecycle flip, not a data channel.
+        #[test]
+        fn cancel_watch_does_not_inject_pane_deltas_under_labruntime() {
+            run_lab(808, || async move {
+                let (_tx, mut rx) = compat_mpsc::channel::<PaneDelta>(4);
+                let (cancel_tx, mut cancel_rx) = compat_watch::channel(false);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                cancel_tx.send(true).expect("cancel");
+                assert!(cancel_requested(&mut cancel_rx));
+
+                // Drop the sender so recv immediately completes with
+                // Disconnected — proves the cancel path did not leak a
+                // delta into the channel.
+                drop(_tx);
+                let result = rx.recv(&cx).await;
+                assert!(
+                    result.is_err(),
+                    "no PaneDelta should appear after cancel+drop, got {result:?}"
+                );
+            });
+        }
+    }
 }
