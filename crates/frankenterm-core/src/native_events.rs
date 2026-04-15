@@ -333,29 +333,17 @@ async fn dispatch_event_with_timeout(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let reserve_cx = crate::cx::for_request();
-        match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
-            Ok(Ok(permit)) => {
-                permit.send(event);
-                EventDispatchOutcome::Sent
-            }
-            Ok(Err(_)) => EventDispatchOutcome::Closed,
-            Err(_) => EventDispatchOutcome::Backpressure,
+    // Native asupersync reserve/commit path. The `native-wezterm` feature
+    // requires `asupersync-runtime` (wa-k0tk5); there is no longer a tokio
+    // fallback branch.
+    let reserve_cx = crate::cx::for_request();
+    match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
+        Ok(Ok(permit)) => {
+            permit.send(event);
+            EventDispatchOutcome::Sent
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        match crate::runtime_compat::timeout(send_timeout, event_tx.reserve()).await {
-            Ok(Ok(permit)) => {
-                permit.send(event);
-                EventDispatchOutcome::Sent
-            }
-            Ok(Err(_)) => EventDispatchOutcome::Closed,
-            Err(_) => EventDispatchOutcome::Backpressure,
-        }
+        Ok(Err(_)) => EventDispatchOutcome::Closed,
+        Err(_) => EventDispatchOutcome::Backpressure,
     }
 }
 
@@ -708,6 +696,76 @@ mod tests {
         assert!(err.to_string().contains("denied"));
     }
 
+    /// LabRuntime-based deterministic test (wa-k0tk5): prove that the
+    /// native-events dispatch path runs under seed-locked virtual-time
+    /// scheduling without wall clock dependence. This is the finish-line
+    /// evidence that the module is cleanly on asupersync — if the dispatch
+    /// ever re-acquires a tokio-shaped assumption, LabRuntime will either
+    /// deadlock or step-explode and fail the test.
+    #[test]
+    fn dispatch_event_runs_deterministically_under_labruntime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SEED: u64 = 0xF734_5E42_A11D_0515;
+        const EVENT_COUNT: usize = 8;
+
+        let wall_start = std::time::Instant::now();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_task = Arc::clone(&delivered);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let (tx, mut rx) = mpsc::channel::<NativeEvent>(EVENT_COUNT);
+                for i in 0..EVENT_COUNT {
+                    let event = NativeEvent::PaneDestroyed {
+                        pane_id: i as u64,
+                        timestamp_ms: i as i64,
+                    };
+                    match dispatch_event_with_timeout(&tx, event, Duration::from_millis(50)).await {
+                        EventDispatchOutcome::Sent => {}
+                        other => panic!("expected Sent, got {other:?}"),
+                    }
+                }
+                drop(tx);
+                let mut observed = 0usize;
+                while let Some(_evt) = recv_next(&mut rx).await {
+                    observed += 1;
+                }
+                delivered_task.store(observed, Ordering::SeqCst);
+            })
+            .expect("spawn native-events dispatch task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            EVENT_COUNT,
+            "all dispatched events must be observable under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(1),
+            "virtual-time scheduling must not consume a real second; took {:?}",
+            wall_start.elapsed()
+        );
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -732,29 +790,13 @@ mod tests {
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = crate::cx::for_testing();
-            rx.recv(&cx).await.ok()
-        }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            rx.recv().await
-        }
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
     }
 
     async fn send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = crate::cx::for_testing();
-            tx.send(&cx, value).await
-        }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            tx.send(value).await
-        }
+        let cx = crate::cx::for_testing();
+        tx.send(&cx, value).await
     }
 
     async fn recv_event(

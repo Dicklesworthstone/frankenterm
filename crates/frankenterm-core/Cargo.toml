@@ -539,7 +539,7 @@ tui-widgets = ["dep:ftui-render", "dep:ftui-layout", "dep:ftui-style", "dep:ftui
 tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-backend"]
 rollout = ["tui", "ftui"]
 metrics = []
-native-wezterm = []
+native-wezterm = ["asupersync-runtime"]
 distributed = [
     "dep:asupersync",
     "dep:rustls",
