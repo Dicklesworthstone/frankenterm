@@ -284,7 +284,7 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.2.9"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb#bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=6be1c989#6be1c989ea4b5026828aa2b74ed2d77db64e2f63"
 dependencies = [
  "asupersync-macros",
  "base64 0.22.1",
@@ -305,6 +305,7 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "polling",
+ "prost",
  "ring",
  "rmp-serde",
  "rustls",
@@ -332,7 +333,7 @@ dependencies = [
 [[package]]
 name = "asupersync-macros"
 version = "0.2.9"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb#bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=6be1c989#6be1c989ea4b5026828aa2b74ed2d77db64e2f63"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3019,7 +3020,7 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.2.9"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb#bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=6be1c989#6be1c989ea4b5026828aa2b74ed2d77db64e2f63"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -3029,7 +3030,7 @@ dependencies = [
 [[package]]
 name = "franken-evidence"
 version = "0.2.9"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb#bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=6be1c989#6be1c989ea4b5026828aa2b74ed2d77db64e2f63"
 dependencies = [
  "serde",
  "serde_json",
@@ -3038,7 +3039,7 @@ dependencies = [
 [[package]]
 name = "franken-kernel"
 version = "0.2.9"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb#bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=6be1c989#6be1c989ea4b5026828aa2b74ed2d77db64e2f63"
 dependencies = [
  "serde",
 ]
@@ -7739,6 +7740,29 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.10.5",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

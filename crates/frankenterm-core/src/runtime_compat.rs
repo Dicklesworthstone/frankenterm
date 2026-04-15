@@ -124,7 +124,7 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
     SurfaceContractEntry {
         api: "broadcast",
         disposition: SurfaceDisposition::Keep,
-        rationale: "Canonical fan-out channel seam that confines direct tokio broadcast usage to runtime_compat while backend migration continues.",
+        rationale: "Canonical fan-out channel seam — migrated to asupersync wrappers under asupersync-runtime feature.",
         replacement: None,
     },
     SurfaceContractEntry {
@@ -557,19 +557,178 @@ pub mod watch {
 
 /// Broadcast channel aliases for the active runtime.
 ///
-/// Broadcast remains tokio-backed under **all** feature paths.  Migrating
-/// to `asupersync::channel::broadcast` is blocked by three missing APIs in
-/// the asupersync broadcast primitive:
-///
-/// 1. `Receiver::try_recv()` — used by `broadcast_try_recv` /
-///    `EventSubscription::try_next()` in `events.rs`.
-/// 2. `Sender::receiver_count()` — used by `broadcast_receiver_count` for
-///    telemetry in `events.rs`.
-/// 3. `Sender::len()` — used by `broadcast_len` for queue-depth metrics
-///    in `events.rs`.
-///
-/// Once these are added to asupersync, the migration can follow the same
-/// wrapper pattern used for `oneshot` above.
+/// When `asupersync-runtime` is enabled, provides wrapper types around
+/// `asupersync::channel::broadcast` that acquire a `Cx` internally, keeping
+/// the tokio-compatible call-site signatures so that existing callers
+/// (event bus, telemetry, etc.) need no changes.
+#[cfg(feature = "asupersync-runtime")]
+pub mod broadcast {
+    use asupersync::channel::broadcast as inner;
+
+    /// Error returned when sending fails (no active receivers).
+    #[derive(Debug)]
+    pub struct SendError<T>(pub T);
+
+    impl<T> std::fmt::Display for SendError<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "sending on a closed broadcast channel")
+        }
+    }
+
+    impl<T: std::fmt::Debug> std::error::Error for SendError<T> {}
+
+    /// Error returned when receiving fails.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecvError {
+        /// The receiver fell behind and missed messages.
+        Lagged(u64),
+        /// All senders have been dropped.
+        Closed,
+    }
+
+    impl std::fmt::Display for RecvError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Lagged(n) => write!(f, "receiver lagged by {n} messages"),
+                Self::Closed => write!(f, "broadcast channel closed"),
+            }
+        }
+    }
+
+    impl std::error::Error for RecvError {}
+
+    /// Error returned by non-blocking try_recv.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TryRecvError {
+        /// No message available right now.
+        Empty,
+        /// All senders have been dropped.
+        Closed,
+        /// The receiver fell behind and missed messages.
+        Lagged(u64),
+    }
+
+    impl std::fmt::Display for TryRecvError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Empty => write!(f, "broadcast channel empty"),
+                Self::Closed => write!(f, "broadcast channel closed"),
+                Self::Lagged(n) => write!(f, "receiver lagged by {n} messages"),
+            }
+        }
+    }
+
+    impl std::error::Error for TryRecvError {}
+
+    /// Wrapper around [`asupersync::channel::broadcast::Sender`] that acquires
+    /// a `Cx` internally, preserving the tokio-compatible `.send(value)` API.
+    pub struct Sender<T> {
+        inner: inner::Sender<T>,
+    }
+
+    impl<T> std::fmt::Debug for Sender<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("broadcast::Sender").finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Clone for Sender<T> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl<T: Clone> Sender<T> {
+        /// Sends a message to all receivers.
+        ///
+        /// Acquires a `Cx` internally for the asupersync two-phase send.
+        /// Returns `Ok(receiver_count)` or `Err(SendError(value))` if no
+        /// receivers are alive.
+        pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.inner
+                .send(&cx, value)
+                .map_err(|inner::SendError::Closed(v)| SendError(v))
+        }
+
+        /// Creates a new receiver subscribed to this channel.
+        pub fn subscribe(&self) -> Receiver<T> {
+            Receiver {
+                inner: self.inner.subscribe(),
+            }
+        }
+
+        /// Returns the number of active receivers.
+        pub fn receiver_count(&self) -> usize {
+            self.inner.receiver_count()
+        }
+
+        /// Returns the number of messages currently buffered.
+        pub fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        /// Returns `true` if no messages are buffered.
+        pub fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+    }
+
+    /// Wrapper around [`asupersync::channel::broadcast::Receiver`] that
+    /// acquires a `Cx` internally for async recv.
+    pub struct Receiver<T> {
+        inner: inner::Receiver<T>,
+    }
+
+    impl<T> std::fmt::Debug for Receiver<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("broadcast::Receiver").finish_non_exhaustive()
+        }
+    }
+
+    impl<T> Clone for Receiver<T> {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
+    }
+
+    impl<T: Clone> Receiver<T> {
+        /// Receives the next message.
+        ///
+        /// Acquires a `Cx` internally for the asupersync async recv.
+        pub async fn recv(&mut self) -> Result<T, RecvError> {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.inner.recv(&cx).await.map_err(|e| match e {
+                inner::RecvError::Lagged(n) => RecvError::Lagged(n),
+                inner::RecvError::Closed => RecvError::Closed,
+                inner::RecvError::Cancelled => RecvError::Closed,
+                inner::RecvError::PolledAfterCompletion => RecvError::Closed,
+            })
+        }
+
+        /// Attempts to receive the next message without blocking.
+        pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+            self.inner.try_recv().map_err(|e| match e {
+                inner::TryRecvError::Empty => TryRecvError::Empty,
+                inner::TryRecvError::Closed => TryRecvError::Closed,
+                inner::TryRecvError::Lagged(n) => TryRecvError::Lagged(n),
+            })
+        }
+    }
+
+    /// Creates a new broadcast channel with the given capacity.
+    pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let (tx, rx) = inner::channel(capacity);
+        (Sender { inner: tx }, Receiver { inner: rx })
+    }
+}
+
+/// Broadcast channel aliases for the active runtime (tokio fallback).
+#[cfg(not(feature = "asupersync-runtime"))]
 pub mod broadcast {
     pub use tokio::sync::broadcast::{
         Receiver, Sender, channel,
@@ -998,31 +1157,14 @@ pub use tokio::join;
 
 /// Re-export `select!` macro for multiplexing futures.
 ///
-/// # SAFETY: cross-runtime `select!` under asupersync
+/// # Status: all channel types migrated
 ///
-/// Both cfg paths currently re-export `tokio::select!`. Under
-/// `asupersync-runtime` this means the select macro uses tokio's internal
-/// polling infrastructure while the rest of the runtime uses asupersync.
-///
-/// **Why this works today:** tokio is still a linked dependency because
-/// `broadcast` and `oneshot` channels have not yet been migrated to
-/// asupersync equivalents. Those channel types initialize tokio's internal
-/// driver context (cooperative budget, waker plumbing) as a side-effect,
-/// which `tokio::select!` relies on. As long as at least one of those
-/// tokio channel types is alive in the process, the tokio context is valid
-/// and `select!` behaves correctly.
-///
-/// **When this will break:** once `broadcast` and `oneshot` are migrated
-/// away from tokio, the tokio internal context will no longer be
-/// initialized, and `tokio::select!` may panic or busy-loop. At that
-/// point this must be replaced with `asupersync::select!` (or a
-/// runtime-agnostic implementation such as `futures::select!` with
-/// `pin_mut!`).
-///
-/// Do **not** change this to a non-tokio select without first migrating
-/// all tokio channel types — the two changes must be coordinated.
-// TODO(asupersync): replace with asupersync-native select when available
-// and tokio channel dependencies have been fully migrated.
+/// Under `asupersync-runtime`, all channel types (mpsc, watch, broadcast,
+/// oneshot, notify) now use asupersync primitives. `tokio::select!` is
+/// retained as the poll combinator because it operates on standard
+/// `Future::poll` and does not require a live tokio runtime.
+// TODO(asupersync): replace with `asupersync::select!` or
+// `futures::select!` once available to fully decouple from tokio.
 #[cfg(feature = "asupersync-runtime")]
 pub use tokio::select;
 #[cfg(not(feature = "asupersync-runtime"))]
@@ -1942,9 +2084,8 @@ pub async fn watch_changed<T: Send + Sync>(
 
 /// Send a value on a broadcast channel using the active runtime backend.
 ///
-/// When the broadcast backend is migrated to asupersync, this helper will
-/// acquire `Cx::current()` for the two-phase reserve/commit send. Currently
-/// delegates directly to tokio.
+/// Under `asupersync-runtime`, the wrapper `Sender` acquires a `Cx`
+/// internally for the two-phase reserve/commit send.
 pub fn broadcast_send<T: Clone>(
     tx: &broadcast::Sender<T>,
     value: T,
@@ -1954,8 +2095,8 @@ pub fn broadcast_send<T: Clone>(
 
 /// Receive a value from a broadcast channel using the active runtime backend.
 ///
-/// When the broadcast backend is migrated to asupersync, this helper will
-/// acquire `Cx::current()` for the async recv. Currently delegates to tokio.
+/// Under `asupersync-runtime`, the wrapper `Receiver` acquires a `Cx`
+/// internally for the async recv.
 pub async fn broadcast_recv<T: Clone>(
     rx: &mut broadcast::Receiver<T>,
 ) -> Result<T, broadcast::RecvError> {
@@ -1991,20 +2132,14 @@ pub fn broadcast_try_recv<T: Clone>(
 }
 
 /// Return the number of active broadcast receivers.
-///
-/// This helper keeps sender-side subscriber inspection off the concrete
-/// runtime backend surface.
 #[must_use]
-pub fn broadcast_receiver_count<T>(tx: &broadcast::Sender<T>) -> usize {
+pub fn broadcast_receiver_count<T: Clone>(tx: &broadcast::Sender<T>) -> usize {
     tx.receiver_count()
 }
 
 /// Return the current broadcast queue depth.
-///
-/// This helper exists so queue-depth metrics can migrate away from direct
-/// tokio broadcast APIs before the backend swap happens.
 #[must_use]
-pub fn broadcast_len<T>(tx: &broadcast::Sender<T>) -> usize {
+pub fn broadcast_len<T: Clone>(tx: &broadcast::Sender<T>) -> usize {
     tx.len()
 }
 

@@ -558,14 +558,14 @@ strip = true        # Remove debug symbols
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "bbfaa67fd5a4e266e27a1ca3af0acde5257a4feb" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
