@@ -83,9 +83,7 @@ fn bench_multi_channel_select(c: &mut Criterion) {
                         let mut channels: Vec<(
                             runtime_compat::mpsc::Sender<u32>,
                             runtime_compat::mpsc::Receiver<u32>,
-                        )> = (0..n)
-                            .map(|_| runtime_compat::mpsc::channel(16))
-                            .collect();
+                        )> = (0..n).map(|_| runtime_compat::mpsc::channel(16)).collect();
 
                         // Send one event on each channel
                         for (i, (tx, _)) in channels.iter().enumerate() {

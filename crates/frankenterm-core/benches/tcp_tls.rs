@@ -5,7 +5,7 @@
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use futures::future;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

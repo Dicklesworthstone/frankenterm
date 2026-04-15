@@ -7401,7 +7401,11 @@ mod tests {
                 }
 
                 // Channel should be full: capacity() reports remaining slots
-                assert_eq!(tx.capacity(), 0, "channel should report 0 remaining capacity");
+                assert_eq!(
+                    tx.capacity(),
+                    0,
+                    "channel should report 0 remaining capacity"
+                );
 
                 // Drain one, verify space opens
                 let v = rx.recv(&cx).await.expect("recv");
@@ -7440,10 +7444,8 @@ mod tests {
         fn relay_mpsc_to_spsc_under_labruntime() {
             run_lab(108, || async move {
                 let cx = asupersync::Cx::current().expect("lab Cx");
-                let (mpsc_tx, mut mpsc_rx) =
-                    crate::runtime_compat::mpsc::channel::<String>(16);
-                let (spsc_tx, spsc_rx) =
-                    crate::spsc_ring_buffer::channel::<String>(16);
+                let (mpsc_tx, mut mpsc_rx) = crate::runtime_compat::mpsc::channel::<String>(16);
+                let (spsc_tx, spsc_rx) = crate::spsc_ring_buffer::channel::<String>(16);
 
                 // Simulate producer sending events
                 mpsc_tx
@@ -7482,8 +7484,7 @@ mod tests {
                 heartbeats.record_discovery();
 
                 // Verify health check runs without panic
-                let report =
-                    heartbeats.check_health(&crate::watchdog::WatchdogConfig::default());
+                let report = heartbeats.check_health(&crate::watchdog::WatchdogConfig::default());
                 // The report should exist and not panic — unhealthy is expected
                 // since heartbeats just started. We just verify the API works.
                 let _unhealthy = report.unhealthy_components();

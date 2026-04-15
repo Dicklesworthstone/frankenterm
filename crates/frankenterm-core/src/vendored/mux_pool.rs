@@ -3412,12 +3412,8 @@ mod tests {
             let _ = pool
                 .get_lines_with_cx(&cx, 1, std::iter::once(0..5).collect())
                 .await;
-            let _ = pool
-                .write_to_pane_with_cx(&cx, 2, b"data\n".to_vec())
-                .await;
-            let _ = pool
-                .send_paste_with_cx(&cx, 3, "text\n".to_string())
-                .await;
+            let _ = pool.write_to_pane_with_cx(&cx, 2, b"data\n".to_vec()).await;
+            let _ = pool.send_paste_with_cx(&cx, 3, "text\n".to_string()).await;
 
             let stats = pool.stats().await;
             assert_eq!(stats.pool.total_acquired, 0, "no acquires across 3 ops");
@@ -3476,7 +3472,10 @@ mod tests {
 
             let stats = pool.stats().await;
             // Connection counters unchanged from the single successful op.
-            assert_eq!(stats.connections_created, 1, "still just the one connection");
+            assert_eq!(
+                stats.connections_created, 1,
+                "still just the one connection"
+            );
             assert_eq!(stats.connections_failed, 0, "no new failures");
             assert_eq!(stats.pool.idle_count, 1, "idle connection preserved");
             assert_eq!(stats.pool.active_count, 0, "no active checkouts");

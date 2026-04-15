@@ -3463,9 +3463,7 @@ KBAhs4snj5QspGFqkazmIw==
                 assert!(n > 0);
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                 stream.write_all(response).await.expect("write response");
-                stream
-                    .shutdown(std::net::Shutdown::Both)
-                    .expect("shutdown");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
             });
 
             let client = DistributedHttpClient::plaintext();
