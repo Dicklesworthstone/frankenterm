@@ -180,6 +180,11 @@ harness = false
 required-features = ["asupersync-runtime", "distributed"]
 
 [[bench]]
+name = "observation_loop"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "sizing_benchmark"
 harness = false
 

@@ -7119,4 +7119,457 @@ mod tests {
         assert_eq!(infos[0].warm_pages, 3);
         assert_eq!(infos[0].estimated_memory_bytes, 132_800);
     }
+
+    // -----------------------------------------------------------------------
+    // LabRuntime observation loop tests (wa-1m7nk)
+    //
+    // These tests exercise runtime channel dispatch, shutdown propagation,
+    // RwLock contention, and backpressure under deterministic virtual time
+    // provided by asupersync::LabRuntime.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_observation {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+        /// Helper: build a LabRuntime, create a root region and a task, run to
+        /// quiescence via auto-advance. Asserts termination is clean.
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (_task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime should not get stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// 1. Event loop channel dispatch: send events through mpsc,
+        ///    verify the receiver processes them in order.
+        #[test]
+        fn channel_dispatch_under_labruntime() {
+            run_lab(101, || async move {
+                let (tx, mut rx) = crate::runtime_compat::mpsc::channel::<u64>(16);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                tx.send(&cx, 42).await.expect("send");
+                tx.send(&cx, 99).await.expect("send");
+
+                let v1 = rx.recv(&cx).await.expect("recv");
+                let v2 = rx.recv(&cx).await.expect("recv");
+                assert_eq!(v1, 42);
+                assert_eq!(v2, 99);
+            });
+        }
+
+        /// 2. Multi-channel concurrent dispatch: events on multiple channels
+        ///    are all handled.
+        #[test]
+        fn multi_channel_dispatch_under_labruntime() {
+            run_lab(102, || async move {
+                let (tx_a, mut rx_a) = crate::runtime_compat::mpsc::channel::<&str>(8);
+                let (tx_b, mut rx_b) = crate::runtime_compat::mpsc::channel::<u32>(8);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                tx_a.send(&cx, "hello").await.expect("send a");
+                tx_b.send(&cx, 7).await.expect("send b");
+
+                let a = rx_a.recv(&cx).await.expect("recv a");
+                let b = rx_b.recv(&cx).await.expect("recv b");
+                assert_eq!(a, "hello");
+                assert_eq!(b, 7);
+            });
+        }
+
+        /// 3. Adaptive sleep interval: verify virtual time advances correctly
+        ///    during the discovery task's short-burst sleep pattern.
+        #[test]
+        fn adaptive_sleep_advances_virtual_time() {
+            let iterations = Arc::new(AtomicU64::new(0));
+            let iterations_task = Arc::clone(&iterations);
+
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(103)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(100_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (_task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = asupersync::Cx::current().expect("lab Cx");
+                    // Simulate the discovery loop's 100ms short-burst sleep pattern
+                    for _ in 0..5 {
+                        let _ = asupersync::time::budget_sleep(
+                            &cx,
+                            Duration::from_millis(100),
+                            asupersync::Time::ZERO,
+                        )
+                        .await;
+                        iterations_task.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .expect("spawn task");
+
+            let report = runtime.run_with_auto_advance();
+            assert_eq!(iterations.load(Ordering::SeqCst), 5);
+            // Virtual time should have advanced by at least 500ms
+            assert!(
+                runtime.now() >= asupersync::Time::from_millis(500),
+                "virtual time should advance to at least 500ms, got {:?}; termination: {:?}",
+                runtime.now(),
+                report.termination,
+            );
+        }
+
+        /// 4. Shutdown propagation: setting AtomicBool flag causes task to exit.
+        #[test]
+        fn shutdown_flag_propagation_under_labruntime() {
+            let exited = Arc::new(AtomicBool::new(false));
+            let exited_task = Arc::clone(&exited);
+
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(104)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(100_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag_loop = Arc::clone(&shutdown_flag);
+            let shutdown_flag_trigger = Arc::clone(&shutdown_flag);
+
+            // Task that loops until shutdown, simulating observation loop
+            let (_t1, _h1) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = asupersync::Cx::current().expect("lab Cx");
+                    let mut ticks = 0u32;
+                    loop {
+                        if shutdown_flag_loop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = asupersync::time::budget_sleep(
+                            &cx,
+                            Duration::from_millis(10),
+                            asupersync::Time::ZERO,
+                        )
+                        .await;
+                        ticks += 1;
+                        if ticks > 1000 {
+                            panic!("loop did not terminate via shutdown flag");
+                        }
+                    }
+                    exited_task.store(true, Ordering::SeqCst);
+                })
+                .expect("spawn loop task");
+
+            // Task that fires shutdown after 50ms
+            let (_t2, _h2) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = asupersync::Cx::current().expect("lab Cx");
+                    let _ = asupersync::time::budget_sleep(
+                        &cx,
+                        Duration::from_millis(50),
+                        asupersync::Time::ZERO,
+                    )
+                    .await;
+                    shutdown_flag_trigger.store(true, Ordering::SeqCst);
+                })
+                .expect("spawn trigger task");
+
+            let _report = runtime.run_with_auto_advance();
+            assert!(
+                exited.load(Ordering::SeqCst),
+                "observation loop should exit after shutdown flag set"
+            );
+        }
+
+        /// 5. RwLock concurrent readers + writer: verify no deadlocks under
+        ///    deterministic scheduling.
+        #[test]
+        fn rwlock_contention_no_deadlock_under_labruntime() {
+            let total_reads = Arc::new(AtomicUsize::new(0));
+            let total_writes = Arc::new(AtomicUsize::new(0));
+            let reads_clone = Arc::clone(&total_reads);
+            let writes_clone = Arc::clone(&total_writes);
+
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(105)
+                    .with_auto_advance()
+                    .worker_count(4)
+                    .max_steps(100_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+
+            let lock = Arc::new(crate::runtime_compat::RwLock::new(0u64));
+
+            // Spawn 3 reader tasks
+            for i in 0..3u32 {
+                let lock = Arc::clone(&lock);
+                let reads = Arc::clone(&reads_clone);
+                let (_tid, _h) = runtime
+                    .state
+                    .create_task(region, asupersync::Budget::INFINITE, async move {
+                        let cx = asupersync::Cx::current().expect("lab Cx");
+                        for _ in 0..5 {
+                            let val = *lock.read().await;
+                            let _ = val;
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            let _ = asupersync::time::budget_sleep(
+                                &cx,
+                                Duration::from_millis(5),
+                                asupersync::Time::ZERO,
+                            )
+                            .await;
+                        }
+                        let _ = i;
+                    })
+                    .expect("spawn reader");
+            }
+
+            // Spawn 1 writer task
+            {
+                let lock = Arc::clone(&lock);
+                let writes = Arc::clone(&writes_clone);
+                let (_tid, _h) = runtime
+                    .state
+                    .create_task(region, asupersync::Budget::INFINITE, async move {
+                        let cx = asupersync::Cx::current().expect("lab Cx");
+                        for _ in 0..5 {
+                            let mut guard = lock.write().await;
+                            *guard += 1;
+                            writes.fetch_add(1, Ordering::SeqCst);
+                            drop(guard);
+                            let _ = asupersync::time::budget_sleep(
+                                &cx,
+                                Duration::from_millis(10),
+                                asupersync::Time::ZERO,
+                            )
+                            .await;
+                        }
+                    })
+                    .expect("spawn writer");
+            }
+
+            let _report = runtime.run_with_auto_advance();
+            assert_eq!(total_reads.load(Ordering::SeqCst), 15); // 3 readers * 5 reads
+            assert_eq!(total_writes.load(Ordering::SeqCst), 5); // 1 writer * 5 writes
+        }
+
+        /// 6. Backpressure: bounded channel overflow behavior is correct.
+        #[test]
+        fn backpressure_bounded_channel_under_labruntime() {
+            run_lab(106, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = crate::runtime_compat::mpsc::channel::<u32>(4);
+
+                // Fill the channel to capacity
+                for i in 0..4 {
+                    tx.send(&cx, i).await.expect("send within capacity");
+                }
+
+                // Channel should be full: capacity() reports remaining slots
+                assert_eq!(tx.capacity(), 0, "channel should report 0 remaining capacity");
+
+                // Drain one, verify space opens
+                let v = rx.recv(&cx).await.expect("recv");
+                assert_eq!(v, 0);
+                assert_eq!(tx.capacity(), 1, "draining one should free one slot");
+
+                // Drain rest
+                for expected in 1..4 {
+                    let v = rx.recv(&cx).await.expect("recv");
+                    assert_eq!(v, expected);
+                }
+            });
+        }
+
+        /// 7. Watch channel under LabRuntime: verify send/recv/borrow work.
+        #[test]
+        fn watch_channel_under_labruntime() {
+            run_lab(107, || async move {
+                let (tx, rx) = crate::runtime_compat::watch::channel(0u64);
+
+                // Initial value visible
+                assert_eq!(*rx.borrow(), 0);
+
+                // Send updates
+                tx.send(42).expect("watch send");
+                assert_eq!(*rx.borrow(), 42);
+
+                tx.send(100).expect("watch send");
+                assert_eq!(*rx.borrow(), 100);
+            });
+        }
+
+        /// 8. SPSC ring buffer relay pattern: verify the mpsc→spsc relay
+        ///    pattern that the capture relay task uses.
+        #[test]
+        fn relay_mpsc_to_spsc_under_labruntime() {
+            run_lab(108, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (mpsc_tx, mut mpsc_rx) =
+                    crate::runtime_compat::mpsc::channel::<String>(16);
+                let (spsc_tx, spsc_rx) =
+                    crate::spsc_ring_buffer::channel::<String>(16);
+
+                // Simulate producer sending events
+                mpsc_tx
+                    .send(&cx, "event_a".to_string())
+                    .await
+                    .expect("send a");
+                mpsc_tx
+                    .send(&cx, "event_b".to_string())
+                    .await
+                    .expect("send b");
+
+                // Simulate relay: read from mpsc, write to spsc
+                let a = mpsc_rx.recv(&cx).await.expect("mpsc recv a");
+                spsc_tx.send(a).await.expect("spsc send a");
+
+                let b = mpsc_rx.recv(&cx).await.expect("mpsc recv b");
+                spsc_tx.send(b).await.expect("spsc send b");
+
+                // Consumer reads from spsc
+                let out_a = spsc_rx.recv().await.expect("spsc recv a");
+                let out_b = spsc_rx.recv().await.expect("spsc recv b");
+                assert_eq!(out_a, "event_a");
+                assert_eq!(out_b, "event_b");
+            });
+        }
+
+        /// 9. Heartbeat registry recording under virtual time.
+        #[test]
+        fn heartbeat_recording_under_labruntime() {
+            run_lab(109, || async move {
+                let heartbeats = HeartbeatRegistry::new();
+
+                // Record some heartbeats
+                heartbeats.record_discovery();
+                heartbeats.record_persistence();
+                heartbeats.record_discovery();
+
+                // Verify health check runs without panic
+                let report =
+                    heartbeats.check_health(&crate::watchdog::WatchdogConfig::default());
+                // The report should exist and not panic — unhealthy is expected
+                // since heartbeats just started. We just verify the API works.
+                let _unhealthy = report.unhealthy_components();
+            });
+        }
+
+        /// 10. Timeout wrapping recv: simulates the relay task's
+        ///     timeout(25ms, recv_event) pattern.
+        #[test]
+        fn timeout_recv_pattern_under_labruntime() {
+            let timed_out_count = Arc::new(AtomicU64::new(0));
+            let received_count = Arc::new(AtomicU64::new(0));
+            let timed_out_task = Arc::clone(&timed_out_count);
+            let received_task = Arc::clone(&received_count);
+
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(110)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(100_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+
+            let (tx, mut rx) = asupersync::channel::mpsc::channel::<u32>(16);
+            let tx_send = tx.clone();
+
+            // Consumer: timeout-based recv loop using budget_timeout
+            let (_t1, _h1) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = asupersync::Cx::current().expect("lab Cx");
+                    for _ in 0..4 {
+                        let recv_fut = Box::pin(rx.recv(&cx));
+                        match asupersync::time::budget_timeout(
+                            &cx,
+                            Duration::from_millis(25),
+                            recv_fut,
+                            asupersync::Time::ZERO,
+                        )
+                        .await
+                        {
+                            Ok(Ok(val)) => {
+                                let _ = val;
+                                received_task.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {
+                                timed_out_task.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                })
+                .expect("spawn consumer");
+
+            // Producer: send 2 events with delays, causing some timeouts
+            let (_t2, _h2) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    let cx = asupersync::Cx::current().expect("lab Cx");
+                    // Send immediately (consumer should receive)
+                    tx_send.send(&cx, 1).await.expect("send 1");
+                    // Wait longer than timeout (consumer should timeout once)
+                    let _ = asupersync::time::budget_sleep(
+                        &cx,
+                        Duration::from_millis(50),
+                        asupersync::Time::ZERO,
+                    )
+                    .await;
+                    tx_send.send(&cx, 2).await.expect("send 2");
+                })
+                .expect("spawn producer");
+
+            let _report = runtime.run_with_auto_advance();
+
+            let received = received_count.load(Ordering::SeqCst);
+            let timed_out = timed_out_count.load(Ordering::SeqCst);
+            assert!(
+                received >= 1,
+                "should receive at least 1 event, got {received}"
+            );
+            assert!(
+                timed_out >= 1,
+                "should timeout at least once, got {timed_out}"
+            );
+            assert_eq!(received + timed_out, 4, "total iterations should be 4");
+        }
+    }
 }
