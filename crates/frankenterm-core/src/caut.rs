@@ -10,6 +10,7 @@ use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
@@ -351,25 +352,20 @@ impl CautClient {
     /// Cx-first subprocess execution (ft-xbnl0.2.2). The subprocess timeout
     /// is bound to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`].
     #[cfg(feature = "asupersync-runtime")]
-    async fn run_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        args: &[String],
-    ) -> Result<String, CautError> {
+    async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
         cmd.kill_on_drop(true);
 
-        let output = match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output())
-            .await
-        {
-            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-            Err(_) => {
-                return Err(CautError::Timeout {
-                    timeout_secs: self.timeout.as_secs(),
-                });
-            }
-        };
+        let output =
+            match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output()).await {
+                Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
+                Err(_) => {
+                    return Err(CautError::Timeout {
+                        timeout_secs: self.timeout.as_secs(),
+                    });
+                }
+            };
 
         self.finalize_output(output)
     }
@@ -393,10 +389,7 @@ impl CautClient {
         self.finalize_output(output)
     }
 
-    fn finalize_output(
-        &self,
-        output: std::process::Output,
-    ) -> Result<String, CautError> {
+    fn finalize_output(&self, output: std::process::Output) -> Result<String, CautError> {
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
             let stderr_bytes = if output.stderr.len() > self.max_error_bytes {
@@ -772,6 +765,73 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::json;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove that the
+    /// Cx-first `CautClient::usage_cx` path binds its subprocess timeout to
+    /// the provided `Cx`. We use a binary that definitely does not exist so
+    /// the inner command fails fast with NotInstalled — no real process ever
+    /// starts, no real time elapses, and the LabRuntime scheduler remains in
+    /// control. If a wall-clock timeout or ambient runtime handle sneaks
+    /// back in, this test either step-explodes or burns real seconds.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn caut_client_usage_cx_runs_under_labruntime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SEED: u64 = 0x4C61_6231_C410_C0C0;
+        let wall_start = std::time::Instant::now();
+        let saw_expected_error = Arc::new(AtomicBool::new(false));
+        let saw_expected_error_task = Arc::clone(&saw_expected_error);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                // Use a binary name that provably does not exist so the
+                // subprocess path fails with NotInstalled before any real
+                // I/O or timeout window is consumed.
+                let client = CautClient::new()
+                    .with_binary("/ft-xbnl0-2-2/nonexistent-caut-binary")
+                    .with_timeout_secs(30);
+                let result = client.usage_cx(&cx, CautService::OpenAI).await;
+                match result {
+                    Err(CautError::NotInstalled) => {
+                        saw_expected_error_task.store(true, Ordering::SeqCst);
+                    }
+                    Err(other) => panic!("expected NotInstalled, got {other:?}"),
+                    Ok(_) => panic!("expected NotInstalled error, got Ok"),
+                }
+            })
+            .expect("spawn caut usage_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            saw_expected_error.load(Ordering::SeqCst),
+            "usage_cx must return NotInstalled for a missing binary"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(2),
+            "Cx-first caut client must not consume real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     #[test]
     fn build_args_includes_service_and_format() {
