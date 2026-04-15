@@ -1887,8 +1887,12 @@ pub async fn sleep(duration: Duration) {
 }
 
 /// Sleep for the requested duration while respecting the provided `Cx`.
+///
+/// This is the Cx-first sleep seam used by the ft-xbnl0.2.2 migration. Call
+/// sites that have a `Cx` in hand should prefer this over the ambient
+/// [`sleep`] which falls back to `Cx::current()` thread-local lookup.
 #[cfg(feature = "asupersync-runtime")]
-pub(crate) async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(), String> {
+pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(), String> {
     asupersync::time::budget_sleep(cx, duration, cx_timer_now(cx))
         .await
         .map_err(|err| err.to_string())

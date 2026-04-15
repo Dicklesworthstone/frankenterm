@@ -185,8 +185,50 @@ where
     with_retry_outcome(policy, operation).await.result
 }
 
+/// Execute an async operation with retry under an explicit `&Cx`.
+///
+/// Cx-first wrapper around [`with_retry_outcome_cx`] (ft-xbnl0.2.2).
+#[cfg(feature = "asupersync-runtime")]
+pub async fn with_retry_cx<T, F, Fut>(
+    cx: &crate::cx::Cx,
+    policy: &RetryPolicy,
+    operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    with_retry_outcome_cx(cx, policy, operation).await.result
+}
+
 /// Execute an async operation with retry, returning detailed outcome.
-pub async fn with_retry_outcome<T, F, Fut>(
+pub async fn with_retry_outcome<T, F, Fut>(policy: &RetryPolicy, operation: F) -> RetryOutcome<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_request();
+        with_retry_outcome_cx(&cx, policy, operation).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        with_retry_outcome_inner(policy, operation).await
+    }
+}
+
+/// Execute an async operation with retry under an explicit `&Cx`, returning
+/// detailed outcome.
+///
+/// This is the Cx-first entry point (ft-xbnl0.2.2): callers that already
+/// thread a capability context down their call graph should prefer this so
+/// that cancellation, budget, and virtual time propagate cleanly into the
+/// retry sleep. Inter-attempt sleeps use [`crate::runtime_compat::sleep_with_cx`]
+/// which binds the sleep to the provided `Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn with_retry_outcome_cx<T, F, Fut>(
+    cx: &crate::cx::Cx,
     policy: &RetryPolicy,
     mut operation: F,
 ) -> RetryOutcome<T>
@@ -216,7 +258,6 @@ where
             Err(e) => {
                 attempt += 1;
 
-                // Check if we've exhausted retries
                 if let Some(max) = policy.max_attempts {
                     if attempt >= max {
                         warn!(
@@ -233,7 +274,6 @@ where
                     }
                 }
 
-                // Calculate delay and wait
                 let delay = policy.delay_for_attempt(attempt - 1);
                 debug!(
                     attempt,
@@ -242,6 +282,45 @@ where
                     "Retrying operation after failure"
                 );
 
+                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn with_retry_outcome_inner<T, F, Fut>(
+    policy: &RetryPolicy,
+    mut operation: F,
+) -> RetryOutcome<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let start = std::time::Instant::now();
+    let mut attempt = 0u32;
+
+    loop {
+        match operation().await {
+            Ok(value) => {
+                return RetryOutcome {
+                    result: Ok(value),
+                    attempts: attempt + 1,
+                    elapsed: start.elapsed(),
+                };
+            }
+            Err(e) => {
+                attempt += 1;
+                if let Some(max) = policy.max_attempts {
+                    if attempt >= max {
+                        return RetryOutcome {
+                            result: Err(e),
+                            attempts: attempt,
+                            elapsed: start.elapsed(),
+                        };
+                    }
+                }
+                let delay = policy.delay_for_attempt(attempt - 1);
                 crate::runtime_compat::sleep(delay).await;
             }
         }
@@ -283,6 +362,34 @@ where
         Err(_) => circuit.record_failure(),
     }
 
+    outcome.result
+}
+
+/// Circuit-aware retry under an explicit `&Cx` (ft-xbnl0.2.2).
+#[cfg(feature = "asupersync-runtime")]
+pub async fn with_retry_and_circuit_cx<T, F, Fut>(
+    cx: &crate::cx::Cx,
+    policy: &RetryPolicy,
+    circuit: &mut CircuitBreaker,
+    operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    use crate::error::WeztermError;
+
+    if !circuit.allow() {
+        let status = circuit.status();
+        let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
+        return Err(Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms }));
+    }
+
+    let outcome = with_retry_outcome_cx(cx, policy, operation).await;
+    match &outcome.result {
+        Ok(_) => circuit.record_success(),
+        Err(_) => circuit.record_failure(),
+    }
     outcome.result
 }
 
@@ -342,7 +449,29 @@ pub fn is_retryable(error: &Error) -> bool {
 }
 
 /// Execute an operation with smart retry (only retries if error is retryable).
-pub async fn with_smart_retry<T, F, Fut>(policy: &RetryPolicy, mut operation: F) -> Result<T>
+pub async fn with_smart_retry<T, F, Fut>(policy: &RetryPolicy, operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_request();
+        with_smart_retry_cx(&cx, policy, operation).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        with_smart_retry_inner(policy, operation).await
+    }
+}
+
+/// Smart retry under an explicit `&Cx` (ft-xbnl0.2.2).
+#[cfg(feature = "asupersync-runtime")]
+pub async fn with_smart_retry_cx<T, F, Fut>(
+    cx: &crate::cx::Cx,
+    policy: &RetryPolicy,
+    mut operation: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
@@ -364,18 +493,10 @@ where
             }
             Err(e) => {
                 attempt += 1;
-
-                // Check if error is retryable
                 if !is_retryable(&e) {
-                    debug!(
-                        attempt,
-                        error = %e,
-                        "Non-retryable error, giving up"
-                    );
+                    debug!(attempt, error = %e, "Non-retryable error, giving up");
                     return Err(e);
                 }
-
-                // Check if we've exhausted retries
                 if let Some(max) = policy.max_attempts {
                     if attempt >= max {
                         warn!(
@@ -388,8 +509,6 @@ where
                         return Err(e);
                     }
                 }
-
-                // Calculate delay and wait
                 let delay = policy.delay_for_attempt(attempt - 1);
                 debug!(
                     attempt,
@@ -397,7 +516,33 @@ where
                     error = %e,
                     "Retrying operation after retryable failure"
                 );
+                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+            }
+        }
+    }
+}
 
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn with_smart_retry_inner<T, F, Fut>(policy: &RetryPolicy, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                attempt += 1;
+                if !is_retryable(&e) {
+                    return Err(e);
+                }
+                if let Some(max) = policy.max_attempts {
+                    if attempt >= max {
+                        return Err(e);
+                    }
+                }
+                let delay = policy.delay_for_attempt(attempt - 1);
                 crate::runtime_compat::sleep(delay).await;
             }
         }
@@ -409,6 +554,83 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove that Cx-first
+    /// retry runs under seed-locked virtual-time scheduling with no wall-clock
+    /// dependence. If inter-attempt sleeps ever re-acquire a tokio-shaped
+    /// (real-time) assumption, this test will either block the wall clock or
+    /// step-explode and fail.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn retry_runs_deterministically_under_labruntime_with_cx() {
+        const SEED: u64 = 0x2A2B_C5E1_0102_2000;
+        let wall_start = std::time::Instant::now();
+        let attempts_observed = Arc::new(AtomicU32::new(0));
+        let attempts_task = Arc::clone(&attempts_observed);
+        let final_attempts = Arc::new(AtomicU32::new(0));
+        let final_attempts_task = Arc::clone(&final_attempts);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                // Reuse the root region's Cx so sleeps bind to lab virtual time.
+                let cx = crate::cx::for_request();
+                let policy = RetryPolicy {
+                    initial_delay: Duration::from_millis(10),
+                    max_delay: Duration::from_millis(50),
+                    backoff_factor: 2.0,
+                    jitter_percent: 0.0,
+                    max_attempts: Some(4),
+                };
+                let outcome = with_retry_outcome_cx(&cx, &policy, || {
+                    let n = attempts_task.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < 3 {
+                            Err(Error::Runtime(format!("attempt {n} transient")))
+                        } else {
+                            Ok::<_, Error>(n)
+                        }
+                    }
+                })
+                .await;
+                final_attempts_task.store(outcome.attempts, Ordering::SeqCst);
+                assert!(outcome.result.is_ok(), "expected success on attempt 4");
+            })
+            .expect("spawn retry task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert_eq!(
+            final_attempts.load(Ordering::SeqCst),
+            4,
+            "retry must have issued exactly 4 attempts (3 failures + 1 success)"
+        );
+        assert_eq!(
+            attempts_observed.load(Ordering::SeqCst),
+            4,
+            "operation closure must be invoked once per attempt"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(1),
+            "virtual-time retry sleeps must not consume real time; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     fn run_async_test<F>(future: F)
     where
