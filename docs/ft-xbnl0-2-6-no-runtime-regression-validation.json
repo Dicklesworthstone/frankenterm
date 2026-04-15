@@ -1,0 +1,77 @@
+{
+  "checked_at": "2026-04-15T05:16:15Z",
+  "checks": [
+    {
+      "name": "contract_identity",
+      "status": "passed"
+    },
+    {
+      "name": "manifest_dependency_allowlist",
+      "observed": {
+        "async-io": [
+          "Cargo.toml",
+          "frankenterm/async_ossl/Cargo.toml",
+          "frankenterm/promise/Cargo.toml",
+          "frankenterm/uds/Cargo.toml"
+        ],
+        "smol": [
+          "Cargo.toml",
+          "frankenterm/codec/Cargo.toml",
+          "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
+          "frankenterm/ssh/Cargo.toml"
+        ],
+        "tokio": [
+          "Cargo.toml",
+          "crates/frankenterm-core/Cargo.toml"
+        ]
+      },
+      "status": "passed"
+    },
+    {
+      "name": "source_quarantine_enforcement",
+      "quarantined_files": 64,
+      "status": "passed"
+    },
+    {
+      "doc_hits": 18,
+      "name": "doc_narrative_enforcement",
+      "status": "passed"
+    },
+    {
+      "name": "stale_allowlist_check",
+      "status": "passed"
+    }
+  ],
+  "policy_path": "docs/ft-xbnl0-2-6-no-runtime-regression-gate.json",
+  "repo_root": "/Users/jemanuel/projects/frankenterm",
+  "status": "passed",
+  "summary": {
+    "doc_files_with_tokens": 18,
+    "manifest_dependency_hits": {
+      "async-io": [
+        "Cargo.toml",
+        "frankenterm/async_ossl/Cargo.toml",
+        "frankenterm/promise/Cargo.toml",
+        "frankenterm/uds/Cargo.toml"
+      ],
+      "smol": [
+        "Cargo.toml",
+        "frankenterm/codec/Cargo.toml",
+        "frankenterm/lua-api-crates/mux-lua/Cargo.toml",
+        "frankenterm/ssh/Cargo.toml"
+      ],
+      "tokio": [
+        "Cargo.toml",
+        "crates/frankenterm-core/Cargo.toml"
+      ]
+    },
+    "owner_inventory": [
+      "ft-22x4r",
+      "ft-xbnl0.2.5",
+      "ft-xbnl0.2.6",
+      "ft-xbnl0.4.6",
+      "wa-2h1ha"
+    ],
+    "source_files_quarantined": 64
+  }
+}

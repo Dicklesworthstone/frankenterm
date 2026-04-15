@@ -1,0 +1,268 @@
+{
+  "contract_id": "ft.xbnl0.2.6.no_runtime_regression_gate.v1",
+  "version": "1.0.0",
+  "bead_id": "ft-xbnl0.2.6",
+  "last_updated": "2026-04-15",
+  "description": "Strict per-file allowlist gate that prevents reintroduction of direct tokio, smol, or async-io usage in supported builds, tests, benches, and core docs. Each existing usage must be explicitly quarantined with a named owner and a removal bead. Any file that contains a forbidden token without an explicit allowlist entry fails the gate.",
+  "source_roots": [
+    "crates",
+    "frankenterm"
+  ],
+  "doc_roots": [
+    "docs",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "manifest_roots": [
+    "Cargo.toml"
+  ],
+  "forbidden_tokens": [
+    "tokio::",
+    "smol::",
+    "async_io::"
+  ],
+  "forbidden_dependencies": [
+    "tokio",
+    "smol",
+    "async-io"
+  ],
+  "manifest_dependency_allowlist": {
+    "tokio": {
+      "Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Workspace-level tokio dependency declaration; removed when wa-2h1ha (Phase 7) lands.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "crates/frankenterm-core/Cargo.toml": {
+        "owner": "ft-xbnl0.2.5",
+        "reason": "frankenterm-core retains tokio for runtime_compat shim; removed when runtime_compat collapses (ft-xbnl0.2.5).",
+        "removal_bead": "ft-xbnl0.2.5"
+      }
+    },
+    "smol": {
+      "Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Workspace-level smol declaration retained for vendored frankenterm subsystem crates that still use smol primitives.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/codec/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored frankenterm codec crate uses smol for upstream-shaped IO; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/lua-api-crates/mux-lua/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored mux-lua binding inherits smol from upstream; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/ssh/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored frankenterm ssh crate uses smol channels; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      }
+    },
+    "async-io": {
+      "Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Workspace-level async-io declaration retained for vendored async_ossl/promise/uds crates.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/async_ossl/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored async_ossl crate wraps OpenSSL on async-io reactor; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/promise/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored promise crate exposes async-io spawn primitives; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      },
+      "frankenterm/uds/Cargo.toml": {
+        "owner": "wa-2h1ha",
+        "reason": "Vendored uds crate wraps async-io UnixListener; migration tracked under wa-2h1ha.",
+        "removal_bead": "wa-2h1ha"
+      }
+    }
+  },
+  "source_quarantine": {
+    "crates/frankenterm-core/src/runtime_compat.rs": {
+      "owner": "ft-xbnl0.2.5",
+      "reason": "Sole intentional Tokio quarantine root during the asupersync migration (per ft-xbnl0.2.6 design notes). Collapsed by ft-xbnl0.2.5.",
+      "removal_bead": "ft-xbnl0.2.5",
+      "allowed_tokens": ["tokio::", "smol::", "async_io::"]
+    },
+    "crates/frankenterm-core/src/runtime_compat_surface_guard.rs": {
+      "owner": "ft-xbnl0.2.5",
+      "reason": "Compile-time guard module that names tokio types so its own surface contract test stays meaningful. Removed with runtime_compat under ft-xbnl0.2.5.",
+      "removal_bead": "ft-xbnl0.2.5",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/dependency_eradication.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Migration accounting module; tokens are referenced as string literals to track eradication progress, not as runtime calls.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::", "smol::", "async_io::"]
+    },
+    "crates/frankenterm-core/src/forbidden_dep_guards.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Guard module whose purpose is to mention forbidden tokens so its self-test catches their reintroduction.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/manifest_dep_eradication.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Manifest-eradication audit module; references tokens to encode the guarded set.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/vendored_async_contracts.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Contract-verification module for vendored crates; references tokens to encode the guarded set.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/src/vendored_migration_map.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored migration map; references smol token to track migration of vendored crates.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["smol::"]
+    },
+    "frankenterm/async_ossl/src/lib.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored upstream crate; migrates as part of the vendored crate cleanup phase.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["async_io::"]
+    },
+    "frankenterm/codec/src/lib.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored upstream codec; migrates as part of the vendored crate cleanup phase.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["smol::"]
+    },
+    "frankenterm/promise/src/spawn.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored upstream promise crate; migrates as part of the vendored crate cleanup phase.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["async_io::"]
+    },
+    "frankenterm/ssh/src/lib.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored upstream ssh crate; migrates as part of the vendored crate cleanup phase.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::", "smol::"]
+    },
+    "frankenterm/uds/src/lib.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Vendored upstream uds crate; migrates as part of the vendored crate cleanup phase.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["async_io::"]
+    }
+  },
+  "test_quarantine_pattern": {
+    "pattern": "_labruntime\\.rs$",
+    "applies_to_dirs": ["crates/frankenterm-core/tests"],
+    "owner": "ft-22x4r",
+    "reason": "Lab-runtime tests are explicit Tokio quarantine surface used to validate runtime_compat behavior; migrated en bloc by ft-22x4r.",
+    "removal_bead": "ft-22x4r",
+    "allowed_tokens": ["tokio::"]
+  },
+  "test_quarantine_explicit": {
+    "crates/frankenterm-core/tests/proptest_dependency_eradication.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Property tests for the dependency eradication module; references forbidden tokens by name.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/tests/proptest_forbidden_dep_guards.rs": {
+      "owner": "ft-xbnl0.2.6",
+      "reason": "Property tests for forbidden dependency guards; references forbidden tokens by name.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/tests/runtime_compat_surface_guard.rs": {
+      "owner": "ft-xbnl0.2.5",
+      "reason": "Surface contract test for runtime_compat; closes when runtime_compat collapses.",
+      "removal_bead": "ft-xbnl0.2.5",
+      "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/tests/vendored_async_contract_verification.rs": {
+      "owner": "wa-2h1ha",
+      "reason": "Verifies vendored crates expose expected async contracts; references forbidden tokens by name.",
+      "removal_bead": "wa-2h1ha",
+      "allowed_tokens": ["tokio::"]
+    }
+  },
+  "bench_quarantine_pattern": {
+    "pattern": ".*\\.rs$",
+    "applies_to_dirs": ["crates/frankenterm-core/benches"],
+    "owner": "ft-xbnl0.4.6",
+    "reason": "Benchmark harnesses still use #[tokio::test]/tokio::runtime; benchmark migration tracked under ft-xbnl0.4.6 (performance budgets).",
+    "removal_bead": "ft-xbnl0.4.6",
+    "allowed_tokens": ["tokio::"]
+  },
+  "doc_narrative_allowlist": [
+    "docs/asupersync-architecture-doctrine.md",
+    "docs/asupersync-cutover-runtime-guard-validation.json",
+    "docs/asupersync-cutover-runtime-guardrails.json",
+    "docs/asupersync-migration-baseline.md",
+    "docs/asupersync-migration-playbook.md",
+    "docs/asupersync-migration-scoreboard.json",
+    "docs/asupersync-migration-scoreboard.md",
+    "docs/asupersync-runtime-compat-surface-ft-e34d9.10.2.3.md",
+    "docs/asupersync-runtime-doctrine-v1.json",
+    "docs/asupersync-runtime-inventory.json",
+    "docs/asupersync-runtime-invariants.json",
+    "docs/asupersync-vendored-migration-map.json",
+    "docs/adr/0012-asupersync-runtime-doctrine.md",
+    "docs/ft-xbnl0-verification-contract.md",
+    "docs/ft-xbnl0-2-6-no-runtime-regression-gate.json",
+    "docs/ft-xbnl0-2-6-no-runtime-regression-validation.json",
+    "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md",
+    "docs/adr/0008-query-facade-contract.md",
+    "docs/ftui-pty-fixture-strategy.md",
+    "docs/ftui-subprocess-forwarding-contract.md",
+    "docs/replay-test-taxonomy.md",
+    "docs/timing-determinism.md"
+  ],
+  "doc_narrative_rewrite_owner": {
+    "docs/COMPREHENSIVE_ANALYSIS_OF_coding_agent_usage_tracker.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "Third-party tool architecture analysis; references the analyzed project's own tokio::main entry point.",
+      "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/adr/0008-query-facade-contract.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "ADR captures migration-era query facade runtime contract; rewritten to native asupersync narrative under ft-xbnl0.5.1 doc sweep.",
+      "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/ftui-pty-fixture-strategy.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "ftui PTY fixture spec contains migration-era code samples; replaced by asupersync samples under ft-xbnl0.5.1 doc sweep.",
+      "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/ftui-subprocess-forwarding-contract.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "ftui subprocess contract still references tokio::sync::watch as the shutdown signal type; replaced under ft-xbnl0.5.1 doc sweep.",
+      "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/replay-test-taxonomy.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "Replay-test taxonomy mentions #[tokio::test] as the legacy async test convention; replaced under ft-xbnl0.5.1 doc sweep.",
+      "removal_bead": "ft-xbnl0.5.1"
+    },
+    "docs/timing-determinism.md": {
+      "owner": "ft-xbnl0.5.1",
+      "reason": "Timing-determinism guidance references tokio::time::pause and tokio::time::sleep as both anti-pattern and recommended test primitives; replaced with native asupersync timing primitives under ft-xbnl0.5.1 doc sweep.",
+      "removal_bead": "ft-xbnl0.5.1"
+    }
+  },
+  "doc_narrative_rule": {
+    "description": "Documents under doc_roots may reference forbidden tokens only if they are listed in doc_narrative_allowlist or live under integration-research/ (third-party project analyses).",
+    "exempt_dirs": ["docs/integration-research", "docs/design"],
+    "exempt_extensions": [".log"]
+  },
+  "determinism_contract": {
+    "report_key_sorting_required": true,
+    "actual_must_match_allowlist_exactly": true
+  }
+}
