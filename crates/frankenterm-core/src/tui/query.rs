@@ -6,6 +6,23 @@
 //! - Testability: Mock implementations for unit tests
 //! - Consistency: Same data access patterns as robot mode
 //! - Decoupling: UI doesn't know about SQLite or storage internals
+//!
+//! # Cx-first migration (ft-xbnl0.2.2)
+//!
+//! This module is a sync → async bridge: the `QueryClient` trait methods are
+//! synchronous and own a dedicated `runtime_compat::Runtime` that executes the
+//! inner async blocks via `runtime.block_on(async { ... })`. There is no
+//! public `async fn` surface here to thread `&Cx` through explicitly — the
+//! Cx flows automatically inside each `block_on` because
+//! `runtime_compat::Runtime::block_on` registers a root Cx under the
+//! `asupersync-runtime` feature, and downstream async helpers
+//! (`runtime_compat::timeout`, `broadcast_recv`, etc.) acquire that Cx via
+//! `Cx::current()`.
+//!
+//! If the TUI ever exposes an `async fn` query entry point, that's when a
+//! `_cx` variant should be added, matching the pattern used in `retry.rs`,
+//! `caut.rs`, `session_retention.rs`, `telemetry.rs`, `watchdog.rs`,
+//! `restore_process.rs`, `survival.rs`, `events.rs`, and `wait.rs`.
 
 use std::path::PathBuf;
 
