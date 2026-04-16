@@ -98,6 +98,35 @@ impl WorkflowEngine {
         .await
     }
 
+    /// Cx-first variant of [`start`] (ft-xbnl0.2.2).
+    ///
+    /// Honors the caller's capability context at the entry and exit
+    /// boundaries of the persist operation so a canceled caller skips the
+    /// storage write entirely (pre-checkpoint) or abandons the returned
+    /// execution cleanly (post-checkpoint).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn start_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        workflow_name: &str,
+        pane_id: u64,
+        trigger_event_id: Option<i64>,
+        context: Option<serde_json::Value>,
+    ) -> crate::Result<WorkflowExecution> {
+        let execution_id = generate_workflow_id(workflow_name);
+        self.start_with_id_cx(
+            cx,
+            storage,
+            execution_id,
+            workflow_name,
+            pane_id,
+            trigger_event_id,
+            context,
+        )
+        .await
+    }
+
     /// Start a workflow execution using a caller-provided execution_id.
     ///
     /// This is used by `WorkflowRunner` so the lock execution_id matches the persisted DB id.
@@ -139,6 +168,51 @@ impl WorkflowEngine {
             started_at: now,
             updated_at: now,
         })
+    }
+
+    /// Cx-first variant of [`start_with_id`] (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn start_with_id_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        execution_id: String,
+        workflow_name: &str,
+        pane_id: u64,
+        trigger_event_id: Option<i64>,
+        context: Option<serde_json::Value>,
+    ) -> crate::Result<WorkflowExecution> {
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        let result = self
+            .start_with_id(
+                storage,
+                execution_id,
+                workflow_name,
+                pane_id,
+                trigger_event_id,
+                context,
+            )
+            .await;
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        result
+    }
+
+    /// Cx-first variant of [`resume`] (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn resume_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+    ) -> crate::Result<Option<(WorkflowExecution, usize)>> {
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        let result = self.resume(storage, execution_id).await;
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        result
     }
 
     /// Resume a workflow execution from storage
@@ -189,6 +263,50 @@ impl WorkflowEngine {
         storage.find_incomplete_workflows().await
     }
 
+    /// Cx-first variant of [`find_incomplete`] (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn find_incomplete_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+    ) -> crate::Result<Vec<crate::storage::WorkflowRecord>> {
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        let result = self.find_incomplete(storage).await;
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        result
+    }
+
+    /// Cx-first variant of [`update_status`] (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_status_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+        status: ExecutionStatus,
+        current_step: usize,
+        wait_condition: Option<&WaitCondition>,
+        error: Option<&str>,
+    ) -> crate::Result<()> {
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        let result = self
+            .update_status(
+                storage,
+                execution_id,
+                status,
+                current_step,
+                wait_condition,
+                error,
+            )
+            .await;
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        result
+    }
+
     /// Update workflow status
     pub async fn update_status(
         &self,
@@ -235,6 +353,35 @@ impl WorkflowEngine {
         };
 
         storage.upsert_workflow(record).await
+    }
+
+    /// Cx-first variant of [`log_step`] (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn log_step_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+        step_index: usize,
+        step_name: &str,
+        result: &StepResult,
+        started_at: i64,
+    ) -> crate::Result<()> {
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        let res = self
+            .log_step(
+                storage,
+                execution_id,
+                step_index,
+                step_name,
+                result,
+                started_at,
+            )
+            .await;
+        cx.checkpoint()
+            .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
+        res
     }
 
     /// Record a step log entry
@@ -919,6 +1066,42 @@ mod tests {
                 .next()
                 .unwrap_or_else(|| panic!("missing audit row for {action_kind}"))
         })
+    }
+
+    /// Cx-first plumbing smoke test (ft-xbnl0.2.2): exercise
+    /// [`WorkflowEngine::find_incomplete_cx`] end to end against a real
+    /// tempfile storage so the checkpoint-before / checkpoint-after
+    /// boundary logic runs its full error-mapping path. A canceled caller
+    /// would observe `Error::Runtime("cx checkpoint: ...")` without the
+    /// storage write being attempted; under a healthy Cx the call returns
+    /// the (empty) incomplete-workflow list.
+    ///
+    /// This is not a LabRuntime test because workflows/engine.rs has no
+    /// sleeps or timeouts to bind to virtual time — the Cx-first pattern
+    /// here is boundary checkpoints on storage-backed operations, which
+    /// are tested via the real storage path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn find_incomplete_cx_returns_empty_for_fresh_db_ft_xbnl0_2_2() {
+        let (_tmp, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let cx = crate::cx::for_request();
+            let storage = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let engine = WorkflowEngine::default();
+            let incomplete = engine
+                .find_incomplete_cx(&cx, &storage)
+                .await
+                .expect("find_incomplete_cx must succeed under healthy Cx");
+            assert!(
+                incomplete.is_empty(),
+                "fresh DB must have no incomplete workflows"
+            );
+        });
+        drop(runtime);
+        let _ = std::panic::catch_unwind(|| crate::runtime_compat::clear_runtime_handle());
     }
 
     // ========================================================================
