@@ -1,0 +1,121 @@
+name: Finish-Line Guards
+
+# Permanent regression guards for the ft-xbnl0 finish-line program (bead
+# ft-xbnl0.5.2). Runs on every PR + push to main so the no-tokio/smol/
+# async-io invariant, the forbidden-token ceiling invariant, the fake-SDK
+# capability contract, and the artifact-contract shape never silently
+# regress.
+#
+# Each guard is actionable: failure output names the exact guard,
+# reason_code, and log tail. Contributors can reproduce the full sweep
+# locally with:
+#     bash scripts/check_finish_line_guards.sh
+#
+# The composition manifest is docs/ft-xbnl0-5-2-finish-line-guards.json.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: finish-line-guards-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  shell-guards:
+    name: Shell guards (no cargo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq + python3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3
+
+      - name: Run ft-xbnl0.5.2 composition (skip cargo test guard)
+        env:
+          # cargo test runs in the cargo-guards job below, not here,
+          # so the composition's fake-SDK guard is explicitly skipped
+          # to keep this job fast and cargo-free.
+          FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
+        run: bash scripts/check_finish_line_guards.sh --output "$RUNNER_TEMP/finish-line-guards.json"
+
+      - name: Upload guard summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finish-line-guards-summary-shell
+          path: |
+            ${{ runner.temp }}/finish-line-guards.json
+            docs/ft-xbnl0-2-6-no-runtime-regression-validation.json
+            docs/asupersync-cutover-runtime-guard-validation.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  cargo-guards:
+    name: Cargo test guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: finish-line-guards-cargo
+
+      - name: Run ft-xbnl0.3.6 fake-SDK capability contract test
+        run: |
+          cargo test -p frankenterm-core --lib \
+            robot_sdk_contracts::tests::ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported \
+            -- --exact --nocapture
+
+      - name: Run ft-xbnl0.2.6 no-runtime regression gate (Rust wrapper)
+        run: |
+          cargo test -p frankenterm-core --test ft_xbnl0_2_6_no_runtime_regression_gate \
+            --no-default-features \
+            -- --nocapture
+
+      - name: Run ft-xbnl0.5.2 finish-line guard composition test
+        run: |
+          cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards \
+            --no-default-features \
+            -- --nocapture
+
+  e2e-composition:
+    name: E2E composition scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq + python3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3
+
+      - name: Run ft-xbnl0.5.2 composition E2E
+        env:
+          FT_XBNL0_5_2_SKIP_RCH: "1"
+          FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
+        run: bash tests/e2e/test_ft_xbnl0_5_2_finish_line_guards.sh
+
+      - name: Upload E2E artifact bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finish-line-guards-e2e-bundle
+          path: tests/e2e/logs/ft_xbnl0_5_2_finish_line_guards_*/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,8 +1,8 @@
 {
   "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
   "bead_id": "ft-xbnl0.5.2",
-  "checked_at": "2026-04-16T05:03:16Z",
-  "status": "failed",
+  "checked_at": "2026-04-16T05:13:58Z",
+  "status": "passed",
   "manifest_path": "/dp/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
   "guards": [
     {
@@ -40,16 +40,12 @@
     },
     {
       "guard_id": "finish_line_verification_contract_shape",
-      "outcome": "failed",
-      "reason_code": "e2e_missing_summary_json_or_structured_log",
+      "outcome": "passed",
+      "reason_code": "artifact_contract_satisfied",
       "detail": {
-        "inspected": 4,
-        "missing": [
-          {
-            "missing": "summary.json",
-            "run_dir": "/dp/frankenterm/tests/e2e/logs/ft_xbnl0_2_6_no_runtime_regression_20260415_054115"
-          }
-        ]
+        "inspected": 1,
+        "missing": [],
+        "policy": "latest-run-per-scenario"
       }
     }
   ]

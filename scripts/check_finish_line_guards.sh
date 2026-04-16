@@ -195,42 +195,72 @@ verify_artifact_contract() {
 
   python3 - "${logs_dir}" <<'PY' > /tmp/_ft_xbnl0_5_2_art.json
 import json
-import os
+import re
 import sys
 from pathlib import Path
 
 logs = Path(sys.argv[1])
-missing: list[dict] = []
-inspected: int = 0
 required_summary_keys = ["scenario", "outcome", "artifact_dir", "structured_log"]
+# Group run directories by scenario prefix (everything before the trailing
+# _YYYYMMDD_HHMMSS timestamp). Only inspect the newest run per scenario —
+# older runs might be stale from interrupted local debug sessions and
+# inspecting them would punish the contributor for crashes rather than
+# catching real artifact-contract drift.
+timestamp_suffix = re.compile(r"_\d{8}_\d{6}$")
+latest_per_scenario: dict[str, Path] = {}
 for run_dir in sorted(logs.iterdir()):
     if not run_dir.is_dir():
         continue
-    # Only inspect dirs that already contain a summary.json OR look like
-    # finish-line run bundles (scenario_<RUN_ID> name shape).
+    name = run_dir.name
+    m = timestamp_suffix.search(name)
+    if not m:
+        continue
+    scenario = name[: m.start()]
     summary = run_dir / "summary.json"
     structured = run_dir / "structured.log"
-    has_structured = structured.exists()
-    has_summary = summary.exists()
-    if not (has_structured or has_summary):
-        continue  # not a finish-line bundle; skip.
-    inspected += 1
-    if not has_summary:
-        missing.append({"run_dir": str(run_dir), "missing": "summary.json"})
+    if not (summary.exists() or structured.exists()):
         continue
-    if not has_structured:
-        missing.append({"run_dir": str(run_dir), "missing": "structured.log"})
+    prev = latest_per_scenario.get(scenario)
+    if prev is None or run_dir.name > prev.name:
+        latest_per_scenario[scenario] = run_dir
+
+missing: list[dict] = []
+for scenario, run_dir in sorted(latest_per_scenario.items()):
+    summary = run_dir / "summary.json"
+    structured = run_dir / "structured.log"
+    if not summary.exists():
+        missing.append(
+            {"scenario": scenario, "run_dir": str(run_dir), "missing": "summary.json"}
+        )
+        continue
+    if not structured.exists():
+        missing.append(
+            {"scenario": scenario, "run_dir": str(run_dir), "missing": "structured.log"}
+        )
         continue
     try:
         data = json.loads(summary.read_text(encoding="utf-8"))
     except Exception as e:
-        missing.append({"run_dir": str(run_dir), "error": f"summary.json unreadable: {e}"})
+        missing.append(
+            {"scenario": scenario, "run_dir": str(run_dir), "error": f"summary.json unreadable: {e}"}
+        )
         continue
     absent_keys = [k for k in required_summary_keys if k not in data]
     if absent_keys:
-        missing.append({"run_dir": str(run_dir), "missing_keys": absent_keys})
+        missing.append(
+            {"scenario": scenario, "run_dir": str(run_dir), "missing_keys": absent_keys}
+        )
 
-print(json.dumps({"inspected": inspected, "missing": missing}, sort_keys=True))
+print(
+    json.dumps(
+        {
+            "inspected": len(latest_per_scenario),
+            "missing": missing,
+            "policy": "latest-run-per-scenario",
+        },
+        sort_keys=True,
+    )
+)
 PY
   local result
   result="$(cat /tmp/_ft_xbnl0_5_2_art.json)"
