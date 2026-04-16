@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-15T04:26:21Z",
+  "checked_at": "2026-04-16T04:53:14Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -31,7 +31,7 @@
       "counts": {
         "async_io::": 6,
         "smol::": 35,
-        "tokio::": 254
+        "tokio::": 269
       },
       "files": {
         "async_io::": [
@@ -57,6 +57,7 @@
           "crates/frankenterm-core/benches/storage_regression.rs",
           "crates/frankenterm-core/benches/sync_primitives.rs",
           "crates/frankenterm-core/benches/task_spawn.rs",
+          "crates/frankenterm-core/benches/test_execution.rs",
           "crates/frankenterm-core/benches/timer_precision.rs",
           "crates/frankenterm-core/src/dependency_eradication.rs",
           "crates/frankenterm-core/src/forbidden_dep_guards.rs",
@@ -101,6 +102,7 @@
           "crates/frankenterm-core/tests/telemetry_labruntime.rs",
           "crates/frankenterm-core/tests/undo_labruntime.rs",
           "crates/frankenterm-core/tests/vendored_async_contract_verification.rs",
+          "crates/frankenterm-core/tests/wa_22x4r_no_tokio_test_in_supported_paths.rs",
           "crates/frankenterm-core/tests/watchdog_labruntime.rs",
           "crates/frankenterm-core/tests/webhook_labruntime.rs",
           "crates/frankenterm-core/tests/wezterm_labruntime.rs",
@@ -142,7 +144,7 @@
     "forbidden_token_counts": {
       "async_io::": 6,
       "smol::": 35,
-      "tokio::": 254
+      "tokio::": 269
     }
   }
 }
