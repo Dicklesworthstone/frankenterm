@@ -14,6 +14,27 @@
 //! - Persistent/resumable workflows
 //! - Deterministic step logic testing
 //! - Shared runner across agent-specific workflows
+//!
+//! # Cx-first migration (ft-xbnl0.2.2)
+//!
+//! `workflows/mod.rs` itself has zero public `async fn` — it is a re-export
+//! shim + trait definitions + large test module. The meaningful Cx-first
+//! entry points for the workflow system live in the submodules:
+//!
+//! - [`Workflow::execute_step_cx`] / [`Workflow::cleanup_cx`] (see
+//!   `workflows/traits.rs`) — Cx-threaded trait entry points with
+//!   default impls that delegate to the non-Cx variants. This keeps
+//!   existing `Workflow` implementations (including `MockWorkflow`,
+//!   `CodexExitWorkflow`, `SessionCompactionWorkflow`, and all
+//!   builtin_workflows entries) backward compatible while giving callers
+//!   a way to thread `&Cx` without modifying every implementor.
+//! - [`WorkflowEngine::start_cx`] / `start_with_id_cx` / `resume_cx` /
+//!   `find_incomplete_cx` / `update_status_cx` / `log_step_cx` (see
+//!   `workflows/engine.rs`) — Cx-threaded storage-boundary wrappers with
+//!   `cx.checkpoint()` before and after each underlying storage call.
+//!
+//! The `workflows/runner.rs` module is owned by CC-2 in the ft-xbnl0.2.2
+//! lane and will add its own `_cx` runner entry points.
 
 mod account_steps;
 mod builtin_workflows;

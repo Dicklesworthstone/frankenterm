@@ -108,11 +108,45 @@ pub trait Workflow: Send + Sync {
     fn execute_step(&self, ctx: &mut WorkflowContext, step_idx: usize)
     -> BoxFuture<'_, StepResult>;
 
+    /// Execute a single step under an explicit `&Cx` (ft-xbnl0.2.2
+    /// Cx-first entry point).
+    ///
+    /// This variant threads the caller's capability context through the
+    /// workflow execution boundary so cancellation, budget, and virtual
+    /// time can propagate into step bodies. The default implementation
+    /// delegates to [`execute_step`] unchanged for backward compatibility
+    /// with the many workflow implementations that do not yet thread
+    /// `&Cx` themselves; new workflows and workflows that need
+    /// fine-grained cancellation should override this to consume the
+    /// `Cx` explicitly.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        self.execute_step(ctx, step_idx)
+    }
+
     /// Optional cleanup when workflow is aborted or completes with error.
     ///
     /// Override to release resources, revert partial changes, etc.
     fn cleanup(&self, _ctx: &mut WorkflowContext) -> BoxFuture<'_, ()> {
         Box::pin(async {})
+    }
+
+    /// Cx-first variant of [`cleanup`] (ft-xbnl0.2.2).
+    ///
+    /// Delegates to [`cleanup`] by default; override to consume `&Cx`
+    /// when cleanup work needs explicit cancellation or budget control.
+    #[cfg(feature = "asupersync-runtime")]
+    fn cleanup_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+    ) -> BoxFuture<'a, ()> {
+        self.cleanup(ctx)
     }
 
     /// Get the number of steps in this workflow.
@@ -304,6 +338,36 @@ impl WorkflowInfo {
 mod tests {
     use super::*;
     use crate::patterns::{AgentType, Detection, Severity};
+
+    /// Compile-time signature check for `Workflow::execute_step_cx`
+    /// (ft-xbnl0.2.2). Never called at runtime; exists purely so the
+    /// compiler type-checks that every `Workflow` implementation
+    /// automatically gets a callable `execute_step_cx` via the default
+    /// impl, with the correct lifetime plumbing on `BoxFuture<'a, _>`.
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(dead_code)]
+    fn _execute_step_cx_signature_check<'a, W: Workflow>(
+        w: &'a W,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+    ) -> BoxFuture<'a, StepResult> {
+        w.execute_step_cx(cx, ctx, 0)
+    }
+
+    /// Compile-time signature check for `Workflow::cleanup_cx` (ft-xbnl0.2.2).
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(dead_code)]
+    fn _cleanup_cx_signature_check<'a, W: Workflow>(
+        w: &'a W,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+    ) -> BoxFuture<'a, ()> {
+        w.cleanup_cx(cx, ctx)
+    }
+
+    // ========================================================================
+    // Mock Workflow for testing trait default methods
+    // ========================================================================
 
     // ========================================================================
     // Mock Workflow for testing trait default methods
