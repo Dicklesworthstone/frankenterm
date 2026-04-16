@@ -382,6 +382,35 @@ impl WorkflowRunner {
         }
     }
 
+    /// Cx-first variant of [`WorkflowRunner::handle_detection`]
+    /// (ft-xbnl0.2.2).
+    ///
+    /// Honours the caller's asupersync capability context by
+    /// short-circuiting with `WorkflowStartResult::Error` when the Cx is
+    /// already cancelled on entry, before doing any pane-lock
+    /// acquisition or engine work. This prevents a detection dispatched
+    /// to a cancelled context from acquiring a lock that no workflow
+    /// will ever release on the inner path.
+    ///
+    /// When the Cx is healthy the call simply delegates to
+    /// [`WorkflowRunner::handle_detection`]; the inner engine already
+    /// installs a fresh per-execution Cx as needed.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn handle_detection_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &crate::patterns::Detection,
+        event_id: Option<i64>,
+    ) -> WorkflowStartResult {
+        if cx.is_cancel_requested() {
+            return WorkflowStartResult::Error {
+                error: "capability context already cancelled".to_owned(),
+            };
+        }
+        self.handle_detection(pane_id, detection, event_id).await
+    }
+
     /// Run a workflow execution to completion.
     ///
     /// This method executes all steps of a workflow, handling retries,
@@ -2048,6 +2077,31 @@ impl WorkflowRunner {
             error_reason: None,
         })
     }
+
+    /// Cx-first variant of [`WorkflowRunner::abort_execution`]
+    /// (ft-xbnl0.2.2).
+    ///
+    /// Short-circuits with a cancelled-error when the caller's
+    /// asupersync capability context is already cancelled on entry,
+    /// before issuing any storage reads or lock releases. This matches
+    /// the `handle_detection_with_cx` contract so a cancelled operator
+    /// request cannot accidentally mutate workflow state during
+    /// teardown.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn abort_execution_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        reason: Option<&str>,
+        force: bool,
+    ) -> crate::Result<AbortResult> {
+        if cx.is_cancel_requested() {
+            return Err(crate::Error::Runtime(
+                "capability context already cancelled; abort_execution refused".to_owned(),
+            ));
+        }
+        self.abort_execution(execution_id, reason, force).await
+    }
 }
 
 /// Result of an abort operation
@@ -2435,5 +2489,186 @@ mod tests {
         assert_eq!(config.step_timeout_ms, 60_000);
         assert!((config.retry_backoff_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(config.max_retries_per_step, 5);
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for workflows/runner.rs primitives
+    // (ft-xbnl0.2.2 slice).
+    //
+    // Full `WorkflowRunner` construction requires storage, engine,
+    // lock_manager, and injector — an integration-scale setup unsuited
+    // to LabRuntime's deterministic scheduler. These LabRuntime tests
+    // therefore pin the pure-data surface that backs
+    // `handle_detection_with_cx` and `abort_execution_with_cx` pre-cancel
+    // contracts: result predicates, serde shapes, config defaults.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_runner {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// 1. WorkflowRunnerConfig defaults are stable under LabRuntime.
+        #[test]
+        fn workflow_runner_config_defaults_under_labruntime() {
+            run_lab(5001, || async move {
+                let config = WorkflowRunnerConfig::default();
+                assert_eq!(config.max_concurrent, 3);
+                assert_eq!(config.step_timeout_ms, 30_000);
+                assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
+                assert_eq!(config.max_retries_per_step, 3);
+            });
+        }
+
+        /// 2. The "capability context already cancelled" Error variant
+        ///    produced by `handle_detection_with_cx` serializes stably:
+        ///    downstream telemetry that matches on the `type` tag + the
+        ///    error-message prefix must remain reliable.
+        #[test]
+        fn cancelled_error_variant_serde_roundtrip_under_labruntime() {
+            run_lab(5002, || async move {
+                let err = WorkflowStartResult::Error {
+                    error: "capability context already cancelled".to_owned(),
+                };
+                let json = serde_json::to_string(&err).expect("serialize");
+                assert!(
+                    json.contains("\"type\":\"error\""),
+                    "serde tag missing in {json}"
+                );
+                assert!(
+                    json.contains("capability context already cancelled"),
+                    "cancellation message must round-trip verbatim: {json}"
+                );
+                let restored: WorkflowStartResult =
+                    serde_json::from_str(&json).expect("deserialize");
+                match restored {
+                    WorkflowStartResult::Error { error } => {
+                        assert_eq!(error, "capability context already cancelled");
+                    }
+                    other => panic!("unexpected variant: {other:?}"),
+                }
+            });
+        }
+
+        /// 3. `WorkflowStartResult::Error` is classified correctly by
+        ///    the `is_started` / `is_locked` / `execution_id` helpers
+        ///    under LabRuntime virtual time.
+        #[test]
+        fn error_variant_predicates_under_labruntime() {
+            run_lab(5003, || async move {
+                let r = WorkflowStartResult::Error {
+                    error: "capability context already cancelled".to_owned(),
+                };
+                assert!(!r.is_started());
+                assert!(!r.is_locked());
+                assert!(r.execution_id().is_none());
+            });
+        }
+
+        /// 4. `WorkflowStartResult::Started` remains detectable by
+        ///    `is_started` and surfaces its execution_id, so the
+        ///    Cx-first pre-cancel path is observably distinct from a
+        ///    successful start.
+        #[test]
+        fn started_variant_predicates_under_labruntime() {
+            run_lab(5004, || async move {
+                let r = WorkflowStartResult::Started {
+                    execution_id: "exec-wa-runner".to_owned(),
+                    workflow_name: "wf-lab".to_owned(),
+                };
+                assert!(r.is_started());
+                assert!(!r.is_locked());
+                assert_eq!(r.execution_id(), Some("exec-wa-runner"));
+            });
+        }
+
+        /// 5. AbortResult serde shape: the Cx-first
+        ///    `abort_execution_with_cx` relies on the existing
+        ///    AbortResult surface staying stable.
+        #[test]
+        fn abort_result_serde_shape_under_labruntime() {
+            run_lab(5005, || async move {
+                let result = AbortResult {
+                    aborted: true,
+                    execution_id: "exec-abort-1".to_owned(),
+                    workflow_name: "wf-abort".to_owned(),
+                    pane_id: 42,
+                    previous_status: "running".to_owned(),
+                    aborted_at_step: 3,
+                    reason: Some("operator".to_owned()),
+                    aborted_at: Some(1_700_000_000_000),
+                    error_reason: None,
+                };
+                let json = serde_json::to_string(&result).expect("serialize");
+                assert!(json.contains("\"aborted\":true"));
+                assert!(json.contains("\"pane_id\":42"));
+                assert!(json.contains("\"aborted_at_step\":3"));
+                assert!(
+                    !json.contains("error_reason"),
+                    "skip_serializing_if must drop None error_reason"
+                );
+            });
+        }
+
+        /// 6. AbortResult with None reason and None aborted_at omits
+        ///    those fields (via skip_serializing_if). Pins the
+        ///    wire-format contract for already-terminal abort paths.
+        #[test]
+        fn abort_result_omits_none_fields_under_labruntime() {
+            run_lab(5006, || async move {
+                let result = AbortResult {
+                    aborted: false,
+                    execution_id: "exec-done".to_owned(),
+                    workflow_name: "wf-done".to_owned(),
+                    pane_id: 7,
+                    previous_status: "completed".to_owned(),
+                    aborted_at_step: 10,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_completed".to_owned()),
+                };
+                let json = serde_json::to_string(&result).expect("serialize");
+                assert!(
+                    !json.contains("\"reason\""),
+                    "None reason must be skipped: {json}"
+                );
+                assert!(
+                    !json.contains("\"aborted_at\""),
+                    "None aborted_at must be skipped: {json}"
+                );
+                assert!(json.contains("\"error_reason\":\"already_completed\""));
+            });
+        }
     }
 }
