@@ -561,11 +561,73 @@ impl MuxWatchdog {
 
     /// Run a single health check and return the sample.
     pub async fn check(&mut self) -> MuxHealthSample {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.check_cx(&cx).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.check_inner().await
+        }
+    }
+
+    /// Run a single health check under an explicit `&Cx` (ft-xbnl0.2.2
+    /// Cx-first API).
+    ///
+    /// Both the WezTerm pane-list ping and the watchdog-warnings probe use
+    /// [`crate::runtime_compat::timeout_with_cx`] so cancellation, budget,
+    /// and virtual time flow through the caller's capability context.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn check_cx(&mut self, cx: &crate::cx::Cx) -> MuxHealthSample {
         self.total_checks += 1;
         let now = epoch_ms();
         let start = std::time::Instant::now();
 
-        // Ping: try listing panes with timeout
+        let ping_ok = matches!(
+            crate::runtime_compat::timeout_with_cx(
+                cx,
+                self.config.ping_timeout,
+                self.wezterm.list_panes()
+            )
+            .await,
+            Ok(Ok(_))
+        );
+
+        let ping_latency_ms = if ping_ok {
+            Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+        } else {
+            None
+        };
+
+        let rss_bytes = get_mux_server_rss().await;
+
+        let warning_probe = match crate::runtime_compat::timeout_with_cx(
+            cx,
+            self.config.ping_timeout,
+            self.wezterm.watchdog_warnings(),
+        )
+        .await
+        {
+            Ok(Ok(lines)) => WarningProbeOutcome::Ok(lines),
+            Ok(Err(err)) => WarningProbeOutcome::Error(format!(
+                "failed to query backend watchdog warnings: {err}"
+            )),
+            Err(_) => WarningProbeOutcome::Error(format!(
+                "timed out querying backend watchdog warnings after {} ms",
+                self.config.ping_timeout.as_millis()
+            )),
+        };
+
+        self.finalize_sample(now, ping_ok, ping_latency_ms, rss_bytes, warning_probe)
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn check_inner(&mut self) -> MuxHealthSample {
+        self.total_checks += 1;
+        let now = epoch_ms();
+        let start = std::time::Instant::now();
+
         let ping_ok = matches!(
             crate::runtime_compat::timeout(self.config.ping_timeout, self.wezterm.list_panes())
                 .await,
@@ -578,10 +640,8 @@ impl MuxWatchdog {
             None
         };
 
-        // Memory check: get mux server RSS
         let rss_bytes = get_mux_server_rss().await;
 
-        // Query backend-specific warning lines (e.g., shard health warnings).
         let warning_probe = match crate::runtime_compat::timeout(
             self.config.ping_timeout,
             self.wezterm.watchdog_warnings(),
@@ -598,6 +658,17 @@ impl MuxWatchdog {
             )),
         };
 
+        self.finalize_sample(now, ping_ok, ping_latency_ms, rss_bytes, warning_probe)
+    }
+
+    fn finalize_sample(
+        &mut self,
+        now: u64,
+        ping_ok: bool,
+        ping_latency_ms: Option<u64>,
+        rss_bytes: Option<u64>,
+        warning_probe: WarningProbeOutcome,
+    ) -> MuxHealthSample {
         let mut watchdog_warnings = match warning_probe {
             WarningProbeOutcome::Ok(lines) => lines,
             WarningProbeOutcome::Error(err) => vec![err],
@@ -838,6 +909,62 @@ fn epoch_ms() -> u64 {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `MuxWatchdog::check_cx` path runs under seed-locked virtual-time
+    /// scheduling. The mock handle returns an empty pane list immediately
+    /// so the timeout path is not exercised (we only care that the
+    /// timeout_with_cx plumbing doesn't panic or block the scheduler).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn mux_watchdog_check_cx_runs_under_labruntime() {
+        const SEED: u64 = 0xD0C8_D06C_C410_00AF;
+        let wall_start = std::time::Instant::now();
+        let check_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check_ran_task = std::sync::Arc::clone(&check_ran);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                let config = MuxWatchdogConfig::default();
+                let wezterm = crate::wezterm::mock_wezterm_handle();
+                let mut watchdog = MuxWatchdog::new(config, wezterm);
+                let sample = watchdog.check_cx(&cx).await;
+                // The mock handle returns Ok so ping should succeed.
+                assert!(sample.ping_ok, "mock wezterm should report ping_ok");
+                assert_eq!(sample.status, HealthStatus::Healthy);
+                check_ran_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn watchdog check_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            check_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "check_cx must complete under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(2),
+            "Cx-first check must not burn real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     #[test]
     fn heartbeat_registry_defaults_to_zero() {
