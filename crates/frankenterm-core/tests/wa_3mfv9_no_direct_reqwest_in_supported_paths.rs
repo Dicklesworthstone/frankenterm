@@ -52,9 +52,10 @@ fn is_supported_rust_file(path: &Path) -> bool {
             if name == "codegen" {
                 // Only skip the char-props codegen; let other codegen/
                 // paths through if any appear later.
-                if path.ancestors().any(|a| {
-                    a.file_name().and_then(|s| s.to_str()) == Some("char-props")
-                }) {
+                if path
+                    .ancestors()
+                    .any(|a| a.file_name().and_then(|s| s.to_str()) == Some("char-props"))
+                {
                     return false;
                 }
             }
@@ -157,9 +158,9 @@ fn collect_workspace_cargo_manifests(root: &Path, out: &mut Vec<PathBuf>) {
                         continue;
                     }
                     if name == "codegen"
-                        && path.ancestors().any(|a| {
-                            a.file_name().and_then(|s| s.to_str()) == Some("char-props")
-                        })
+                        && path
+                            .ancestors()
+                            .any(|a| a.file_name().and_then(|s| s.to_str()) == Some("char-props"))
                     {
                         continue;
                     }
