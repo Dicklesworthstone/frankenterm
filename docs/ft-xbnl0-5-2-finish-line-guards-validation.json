@@ -1,0 +1,56 @@
+{
+  "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
+  "bead_id": "ft-xbnl0.5.2",
+  "checked_at": "2026-04-16T05:03:16Z",
+  "status": "failed",
+  "manifest_path": "/dp/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
+  "guards": [
+    {
+      "guard_id": "no_runtime_regression",
+      "outcome": "passed",
+      "reason_code": "guard_script_passed",
+      "detail": {
+        "script": "scripts/check_no_runtime_regression.sh",
+        "exit_code": 0,
+        "report_status": "passed",
+        "error_code": "",
+        "log_tail": ""
+      }
+    },
+    {
+      "guard_id": "asupersync_cutover_runtime_guards",
+      "outcome": "passed",
+      "reason_code": "guard_script_passed",
+      "detail": {
+        "script": "scripts/validate_asupersync_cutover_runtime_guards.sh",
+        "exit_code": 0,
+        "report_status": "passed",
+        "error_code": "",
+        "log_tail": ""
+      }
+    },
+    {
+      "guard_id": "fake_sdk_capability_contract",
+      "outcome": "skipped",
+      "reason_code": "skip_via_FT_XBNL0_5_2_SKIP_CARGO_TEST",
+      "detail": {
+        "test_name": "ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported",
+        "skip_reason": "FT_XBNL0_5_2_SKIP_CARGO_TEST=1 set — contributor must run cargo test manually or in a shell without the rch hook intercepting."
+      }
+    },
+    {
+      "guard_id": "finish_line_verification_contract_shape",
+      "outcome": "failed",
+      "reason_code": "e2e_missing_summary_json_or_structured_log",
+      "detail": {
+        "inspected": 4,
+        "missing": [
+          {
+            "missing": "summary.json",
+            "run_dir": "/dp/frankenterm/tests/e2e/logs/ft_xbnl0_2_6_no_runtime_regression_20260415_054115"
+          }
+        ]
+      }
+    }
+  ]
+}
