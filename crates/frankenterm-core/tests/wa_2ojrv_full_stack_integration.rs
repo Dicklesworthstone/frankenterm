@@ -29,12 +29,11 @@ use std::time::Duration;
 
 use asupersync::Budget;
 use common::fixtures::{
-    MockMuxClient, MockPool, RuntimeFixture, SimulatedNetwork, SimulatedNetworkConfig,
-    healthy_cx, mock_unix_stream_pair, timeout_cx, user_cancelled_cx,
+    MockMuxClient, MockPool, RuntimeFixture, SimulatedNetwork, SimulatedNetworkConfig, healthy_cx,
+    mock_unix_stream_pair, timeout_cx, user_cancelled_cx,
 };
 use common::lab::{
-    ChaosPreset, ChaosTestConfig, LabTestConfig, run_chaos_test, run_lab_test,
-    run_lab_test_simple,
+    ChaosPreset, ChaosTestConfig, LabTestConfig, run_chaos_test, run_lab_test, run_lab_test_simple,
 };
 
 /// Helper: build a `LabTestConfig` with the wa-2ojrv bead tag and
@@ -78,10 +77,7 @@ fn wa_2ojrv_s1_full_lifecycle() {
                 // Full lifecycle: acquire → command → release.
                 let conn = pool_c.acquire(&cx).await.expect("acquire");
                 assert!(conn.id < 4, "conn id within pool capacity");
-                let text = client_c
-                    .get_pane_text(&cx, 1)
-                    .await
-                    .expect("mux command");
+                let text = client_c.get_pane_text(&cx, 1).await.expect("mux command");
                 assert_eq!(text, "hello");
                 pool_c.release(&cx, conn).await.expect("release");
             })
@@ -140,10 +136,7 @@ fn wa_2ojrv_s2_concurrent_pool_operations() {
                         let now = in_flight_c.fetch_add(1, Ordering::SeqCst) + 1;
                         let _ = max_c.fetch_max(now, Ordering::SeqCst);
                         asupersync::runtime::yield_now().await;
-                        let _ = client_c
-                            .get_pane_text(&cx, i)
-                            .await
-                            .expect("mux command");
+                        let _ = client_c.get_pane_text(&cx, i).await.expect("mux command");
                         in_flight_c.fetch_sub(1, Ordering::SeqCst);
                         pool_c.release(&cx, conn).await.expect("release");
                         completed_c.fetch_add(1, Ordering::SeqCst);
@@ -320,61 +313,64 @@ fn wa_2ojrv_s4_event_streaming() {
 
 #[test]
 fn wa_2ojrv_s5_mid_operation_cancellation() {
-    let report = run_lab_test(lab_config(500, "s5_mid_operation_cancellation"), |runtime| {
-        let region = runtime.state.create_root_region(Budget::INFINITE);
-        let (tx, rx) = asupersync::channel::mpsc::channel::<u64>(4);
-        let (cancel_tx, cancel_rx) = asupersync::channel::watch::channel(false);
-        let received = Arc::new(AtomicU64::new(0));
+    let report = run_lab_test(
+        lab_config(500, "s5_mid_operation_cancellation"),
+        |runtime| {
+            let region = runtime.state.create_root_region(Budget::INFINITE);
+            let (tx, rx) = asupersync::channel::mpsc::channel::<u64>(4);
+            let (cancel_tx, cancel_rx) = asupersync::channel::watch::channel(false);
+            let received = Arc::new(AtomicU64::new(0));
 
-        // Producer: emits until cancelled.
-        let mut cancel_rx_prod = cancel_rx.clone();
-        let (prod_id, _ph) = runtime
-            .state
-            .create_task(region, Budget::INFINITE, async move {
-                let cx = healthy_cx();
-                let mut seq = 0u64;
-                loop {
-                    if cancel_rx_prod.borrow_and_clone() {
-                        break;
-                    }
-                    if tx.try_reserve().is_err() {
+            // Producer: emits until cancelled.
+            let mut cancel_rx_prod = cancel_rx.clone();
+            let (prod_id, _ph) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = healthy_cx();
+                    let mut seq = 0u64;
+                    loop {
+                        if cancel_rx_prod.borrow_and_clone() {
+                            break;
+                        }
+                        if tx.try_reserve().is_err() {
+                            asupersync::runtime::yield_now().await;
+                            continue;
+                        }
+                        tx.reserve(&cx).await.expect("reserve").send(seq);
+                        seq += 1;
                         asupersync::runtime::yield_now().await;
-                        continue;
                     }
-                    tx.reserve(&cx).await.expect("reserve").send(seq);
-                    seq += 1;
-                    asupersync::runtime::yield_now().await;
-                }
-            })
-            .expect("spawn producer");
-        runtime.scheduler.lock().schedule(prod_id, 0);
+                })
+                .expect("spawn producer");
+            runtime.scheduler.lock().schedule(prod_id, 0);
 
-        // Consumer: receives 3 events then signals cancel.
-        let received_c = Arc::clone(&received);
-        let (cons_id, _ch) = runtime
-            .state
-            .create_task(region, Budget::INFINITE, async move {
-                let cx = healthy_cx();
-                let mut rx = rx;
-                for _ in 0..3 {
-                    let _ = rx.recv(&cx).await.expect("recv");
-                    received_c.fetch_add(1, Ordering::SeqCst);
-                }
-                cancel_tx.send(true).expect("signal cancel");
-                // Drain any already-queued events then exit.
-                while rx.recv(&cx).await.is_ok() {}
-            })
-            .expect("spawn consumer");
-        runtime.scheduler.lock().schedule(cons_id, 0);
+            // Consumer: receives 3 events then signals cancel.
+            let received_c = Arc::clone(&received);
+            let (cons_id, _ch) = runtime
+                .state
+                .create_task(region, Budget::INFINITE, async move {
+                    let cx = healthy_cx();
+                    let mut rx = rx;
+                    for _ in 0..3 {
+                        let _ = rx.recv(&cx).await.expect("recv");
+                        received_c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    cancel_tx.send(true).expect("signal cancel");
+                    // Drain any already-queued events then exit.
+                    while rx.recv(&cx).await.is_ok() {}
+                })
+                .expect("spawn consumer");
+            runtime.scheduler.lock().schedule(cons_id, 0);
 
-        runtime.run_until_quiescent();
+            runtime.run_until_quiescent();
 
-        assert_eq!(
-            received.load(Ordering::SeqCst),
-            3,
-            "consumer received exactly 3 events before cancelling"
-        );
-    });
+            assert_eq!(
+                received.load(Ordering::SeqCst),
+                3,
+                "consumer received exactly 3 events before cancelling"
+            );
+        },
+    );
     assert!(report.passed(), "s5 did not pass oracle");
 }
 
@@ -555,11 +551,11 @@ fn wa_2ojrv_s8_full_system_chaos() {
             "all permits returned even under chaos"
         );
     });
+    assert!(report.passed(), "s8 chaos scenario did not pass oracle");
     assert!(
-        report.passed(),
-        "s8 chaos scenario did not pass oracle"
+        report.chaos_active,
+        "chaos injection must be reported active"
     );
-    assert!(report.chaos_active, "chaos injection must be reported active");
 }
 
 // ============================================================================
