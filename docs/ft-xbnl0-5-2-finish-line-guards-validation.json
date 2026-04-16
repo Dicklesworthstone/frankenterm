@@ -1,7 +1,7 @@
 {
   "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
   "bead_id": "ft-xbnl0.5.2",
-  "checked_at": "2026-04-16T05:13:58Z",
+  "checked_at": "2026-04-16T05:58:32Z",
   "status": "passed",
   "manifest_path": "/dp/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
   "guards": [
@@ -43,7 +43,7 @@
       "outcome": "passed",
       "reason_code": "artifact_contract_satisfied",
       "detail": {
-        "inspected": 1,
+        "inspected": 2,
         "missing": [],
         "policy": "latest-run-per-scenario"
       }

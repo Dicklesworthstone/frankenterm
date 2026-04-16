@@ -114,6 +114,13 @@ if [[ ! -f "${MANIFEST}" ]]; then
   exit 1
 fi
 
+# Write an "in-progress" summary.json up front so the composition's
+# artifact-contract check (which runs inside the nominal composition step
+# below) does not flag our own still-running scenario directory as a
+# malformed finish-line bundle. The real outcome is overwritten via
+# write_summary when each step resolves.
+write_summary "in_progress"
+
 emit_log "preflight" "startup" "scenario_start" "started" "none" "none" "$(basename "${LOG_FILE}")"
 
 # Step 1: nominal run (cargo-test guard skipped to keep this scenario
