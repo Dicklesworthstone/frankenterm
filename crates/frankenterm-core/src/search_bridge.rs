@@ -222,6 +222,69 @@ impl SearchBridge {
         }
     }
 
+    /// Run a search against a caller-provided asupersync capability context
+    /// (ft-xbnl0.2.2 Cx-first entry point).
+    ///
+    /// The caller's `asupersync::Cx` governs cooperative cancellation for
+    /// the outer bridge: if the Cx is already cancelled on entry this
+    /// method short-circuits with `SearchBridgeError::Cancelled` without
+    /// invoking the underlying `TwoTierSearcher`. While the search runs,
+    /// a background watcher propagates asupersync Cx cancellation into
+    /// the bridge's [`BridgeCancellationToken`], which in turn drives the
+    /// frankensearch-side cooperative cancel via the existing
+    /// `spawn_cancellation_thread` machinery.
+    ///
+    /// The frankensearch side still runs under a fresh `frankensearch::Cx`
+    /// because frankensearch's cooperative-cancel API is defined against
+    /// its own Cx type; the bridge token is the single source of truth
+    /// that ties the two together.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_with_asupersync_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: SearchBridgeRequest,
+        on_phase: impl FnMut(SearchPhase) + Send + 'static,
+    ) -> Result<SearchBridgeResult, SearchBridgeError> {
+        // Short-circuit: pre-cancelled asupersync Cx must not open a new
+        // searcher call at all — matches the existing contract used by
+        // pool.rs::acquire_with_cx and caut.rs::run_with_cx.
+        if cx.is_cancel_requested() {
+            return Err(SearchBridgeError::Cancelled {
+                reason: "capability context already cancelled".to_owned(),
+            });
+        }
+
+        // Ensure the request carries a bridge cancellation token so we can
+        // wire the caller's asupersync Cx to the token (and from there
+        // into the frankensearch-side cancellation).
+        let mut request = request;
+        let bridge_token = request.cancellation.clone().unwrap_or_default();
+        request.cancellation = Some(bridge_token.clone());
+
+        let (watcher_done, watcher_handle) =
+            spawn_asupersync_cancellation_watcher(cx.clone(), bridge_token.clone());
+
+        // `Cx` inside this file is re-exported from frankensearch, which
+        // in turn re-exports asupersync::Cx — so this is literally the
+        // same type family as the caller's `&crate::cx::Cx`. We still
+        // mint a fresh owned Cx here because the existing
+        // `search_with_cx` takes ownership; the caller's Cx is watched
+        // for cancellation via `spawn_asupersync_cancellation_watcher`
+        // above.
+        let search_cx = Cx::for_request();
+        let result = self.search_with_cx(search_cx, request, on_phase).await;
+
+        // Stop the asupersync-Cx watcher thread before returning so we do
+        // not leak it past the call.
+        watcher_done.store(true, Ordering::Release);
+        if let Some(handle) = watcher_handle {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+
+        result
+    }
+
     #[cfg(feature = "asupersync-runtime")]
     async fn search_direct(
         &self,
@@ -482,6 +545,55 @@ fn spawn_cancellation_thread(
                 break;
             }
             // Avoid busy-waiting: this loop is best-effort cancellation plumbing.
+            std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
+        }
+    });
+
+    (done, Some(handle))
+}
+
+/// Propagate asupersync capability-context cancellation into a
+/// [`BridgeCancellationToken`] (ft-xbnl0.2.2 Cx-first plumbing).
+///
+/// Symmetrical companion to [`spawn_cancellation_thread`]: that helper
+/// drives the frankensearch-side Cx from the bridge token, while this
+/// helper drives the bridge token from the caller's asupersync Cx.
+/// Together they give `search_with_asupersync_cx` a single coherent
+/// cancellation signal chain: asupersync::Cx → BridgeCancellationToken →
+/// frankensearch::Cx.
+///
+/// The returned `done` flag is set to `true` by the caller once the
+/// search finishes so the watcher thread exits without doing any more
+/// polling. The watcher is also unparked when the flag is flipped to
+/// shorten the worst-case teardown latency.
+#[cfg(feature = "asupersync-runtime")]
+fn spawn_asupersync_cancellation_watcher(
+    cx: crate::cx::Cx,
+    cancellation: BridgeCancellationToken,
+) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
+    let done = Arc::new(AtomicBool::new(false));
+    // If the asupersync Cx is already cancelled at entry, propagate once
+    // and skip the watcher thread entirely.
+    if cx.is_cancel_requested() {
+        cancellation.cancel();
+        return (done, None);
+    }
+    // If the bridge token is already cancelled, no further plumbing is
+    // required — the frankensearch-side machinery will observe it.
+    if cancellation.is_cancelled() {
+        return (done, None);
+    }
+
+    let done_for_thread = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        while !done_for_thread.load(Ordering::Acquire) {
+            if cx.is_cancel_requested() {
+                cancellation.cancel();
+                break;
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
             std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
         }
     });
@@ -1461,5 +1573,168 @@ mod tests {
             saw_initial.load(Ordering::Acquire),
             "should have seen Initial phase"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first entry point
+    // (ft-xbnl0.2.2 / search_bridge slice)
+    //
+    // These tests pin the pre-cancellation short-circuit and the
+    // cancellation-watcher plumbing added by
+    // `search_with_asupersync_cx` + `spawn_asupersync_cancellation_watcher`
+    // under deterministic scheduling. They deliberately don't run the
+    // underlying frankensearch searcher — that would require building a
+    // real TwoTierIndex inside LabRuntime which is orthogonal to the
+    // Cx-first cancellation contract this slice owns.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_search_bridge {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        fn cancelled_request_cx(msg: &'static str) -> crate::cx::Cx {
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(crate::outcome::CancelKind::User, Some(msg));
+            cx
+        }
+
+        /// 1. `search_with_asupersync_cx` short-circuits a pre-cancelled
+        ///    asupersync Cx with `SearchBridgeError::Cancelled` before
+        ///    touching the underlying searcher. Mirrors pool.rs and
+        ///    caut.rs Cx-first contracts.
+        #[test]
+        fn search_with_asupersync_cx_precancelled_short_circuits_under_labruntime() {
+            run_lab(4001, || async move {
+                let (bridge, text_provider) = build_test_bridge();
+                let request =
+                    SearchBridgeRequest::new("qwen", 3).with_text_provider_arc(text_provider);
+                let cx = cancelled_request_cx("wa-search-bridge cancel");
+                let err = bridge
+                    .search_with_asupersync_cx(&cx, request, |_phase| {})
+                    .await
+                    .expect_err("precancelled Cx must short-circuit");
+                assert!(
+                    matches!(err, SearchBridgeError::Cancelled { .. }),
+                    "expected Cancelled, got {err:?}"
+                );
+            });
+        }
+
+        /// 2. `spawn_asupersync_cancellation_watcher` propagates an
+        ///    already-cancelled asupersync Cx into the bridge token
+        ///    without ever spawning a watcher thread — the short path.
+        #[test]
+        fn watcher_propagates_precancelled_cx_under_labruntime() {
+            run_lab(4002, || async move {
+                let cx = cancelled_request_cx("pre-cancel watcher");
+                let token = BridgeCancellationToken::new();
+                assert!(!token.is_cancelled());
+                let (done, handle) = spawn_asupersync_cancellation_watcher(cx, token.clone());
+                assert!(token.is_cancelled(), "token must be cancelled immediately");
+                assert!(
+                    handle.is_none(),
+                    "no watcher thread should spawn for an already-cancelled Cx"
+                );
+                assert!(!done.load(Ordering::Acquire));
+            });
+        }
+
+        /// 3. `spawn_asupersync_cancellation_watcher` takes the short
+        ///    path when the bridge token is already cancelled — no new
+        ///    thread spawns and the asupersync Cx is left untouched.
+        #[test]
+        fn watcher_short_circuits_when_token_precancelled_under_labruntime() {
+            run_lab(4003, || async move {
+                let cx = crate::cx::Cx::for_testing_with_budget(crate::cx::Budget::new());
+                let token = BridgeCancellationToken::new();
+                token.cancel();
+                let (_done, handle) =
+                    spawn_asupersync_cancellation_watcher(cx.clone(), token.clone());
+                assert!(
+                    handle.is_none(),
+                    "no watcher thread should spawn for an already-cancelled token"
+                );
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "token cancellation must not retroactively cancel the asupersync Cx"
+                );
+            });
+        }
+
+        /// 4. `BridgeCancellationToken` defaults are not cancelled and
+        ///    `cancel()` flips the flag atomically.
+        #[test]
+        fn bridge_cancellation_token_defaults_under_labruntime() {
+            run_lab(4004, || async move {
+                let token = BridgeCancellationToken::new();
+                assert!(!token.is_cancelled());
+                token.cancel();
+                assert!(token.is_cancelled());
+                // Idempotent.
+                token.cancel();
+                assert!(token.is_cancelled());
+            });
+        }
+
+        /// 5. `SearchBridgeRequest` default field values are stable.
+        #[test]
+        fn search_bridge_request_defaults_under_labruntime() {
+            run_lab(4005, || async move {
+                let req = SearchBridgeRequest::new("query", 10);
+                assert_eq!(req.query, "query");
+                assert_eq!(req.limit, 10);
+                assert!(req.timeout.is_none());
+                assert!(req.cancellation.is_none());
+            });
+        }
+
+        /// 6. `SearchBridgeError::Cancelled` carries its reason through
+        ///    Display so operator-visible logs stay informative.
+        #[test]
+        fn search_bridge_error_display_under_labruntime() {
+            run_lab(4006, || async move {
+                let err = SearchBridgeError::Cancelled {
+                    reason: "wa-search-bridge display".into(),
+                };
+                let text = format!("{err}");
+                assert!(
+                    text.contains("wa-search-bridge display"),
+                    "reason should surface in Display: {text}"
+                );
+            });
+        }
     }
 }
