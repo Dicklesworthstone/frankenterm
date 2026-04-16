@@ -1,0 +1,94 @@
+{
+  "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
+  "version": "1.0.0",
+  "bead_id": "ft-xbnl0.5.2",
+  "last_updated": "2026-04-16",
+  "description": "Manifest of the permanent CI/doctor/audit guards that defend the ft-xbnl0 finish-line invariants. Each guard entry lists its script, policy artifacts (if any), upstream bead that established the invariant, and the failure signature contributors will see when the guard fires. The composition script scripts/check_finish_line_guards.sh runs every guard listed here and aggregates the results into a single summary.json artifact.",
+  "guards": [
+    {
+      "guard_id": "no_runtime_regression",
+      "invariant": "Zero direct tokio, smol, or async-io usage outside the explicit per-file quarantine allowlist.",
+      "script": "scripts/check_no_runtime_regression.sh",
+      "policy": "docs/ft-xbnl0-2-6-no-runtime-regression-gate.json",
+      "output_artifact": "docs/ft-xbnl0-2-6-no-runtime-regression-validation.json",
+      "upstream_bead": "ft-xbnl0.2.6",
+      "failure_signatures": [
+        "source_runtime_regression",
+        "manifest_dependency_regression",
+        "doc_narrative_regression",
+        "stale_quarantine_entry"
+      ]
+    },
+    {
+      "guard_id": "asupersync_cutover_runtime_guards",
+      "invariant": "Forbidden-token ceilings and strict-zero modules stay within the configured bounds.",
+      "script": "scripts/validate_asupersync_cutover_runtime_guards.sh",
+      "policy": "docs/asupersync-cutover-runtime-guardrails.json",
+      "output_artifact": "docs/asupersync-cutover-runtime-guard-validation.json",
+      "upstream_bead": "ft-e34d9.10.8.2",
+      "failure_signatures": [
+        "token_ceiling_exceeded",
+        "strict_module_forbidden_token",
+        "unexpected_dependency_manifest"
+      ]
+    },
+    {
+      "guard_id": "fake_sdk_capability_contract",
+      "invariant": "SdkLanguage::is_fully_supported returns true only for Rust; Python/TypeScript/Go SDK targets must not be advertised as finish-line-supported capabilities.",
+      "cargo_test": "ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported",
+      "test_target": "-p frankenterm-core --lib",
+      "upstream_bead": "ft-xbnl0.3.6",
+      "failure_signatures": [
+        "assertion_failed: Rust must be fully supported",
+        "assertion_failed: non-Rust SDK target claimed full support"
+      ]
+    },
+    {
+      "guard_id": "finish_line_verification_contract_shape",
+      "invariant": "Every finish-line E2E harness under tests/e2e/ that follows the artifact contract emits summary.json and structured.log into its per-run directory; deterministic scripts use the shared rch guard helper.",
+      "script_check": "scripts/check_finish_line_guards.sh (internal verify_artifact_contract step)",
+      "upstream_bead": "ft-xbnl0.1.4",
+      "failure_signatures": [
+        "e2e_missing_summary_json",
+        "e2e_missing_structured_log"
+      ]
+    }
+  ],
+  "ci_binding": {
+    "workflow_path": ".github/workflows/finish-line-guards.yml",
+    "triggers": ["pull_request", "push"],
+    "required_commands": [
+      "bash scripts/check_finish_line_guards.sh --output $RUNNER_TEMP/finish-line-guards.json"
+    ]
+  },
+  "local_contributor_path": {
+    "summary": "Contributors can run the full finish-line guard sweep locally before submitting a PR.",
+    "commands": [
+      "bash scripts/check_finish_line_guards.sh",
+      "cargo test -p frankenterm-core --lib ft_xbnl0_5_2_finish_line_guards"
+    ]
+  },
+  "artifact_contract": {
+    "summary_json_required_keys": [
+      "scenario",
+      "bead_id",
+      "run_id",
+      "correlation_id",
+      "outcome",
+      "artifact_dir",
+      "structured_log"
+    ],
+    "structured_log_required_fields": [
+      "timestamp",
+      "component",
+      "scenario_id",
+      "correlation_id",
+      "decision_path",
+      "outcome"
+    ]
+  },
+  "determinism_contract": {
+    "composition_must_be_order_stable": true,
+    "guard_report_keys_sorted": true
+  }
+}
