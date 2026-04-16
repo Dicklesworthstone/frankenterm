@@ -320,6 +320,11 @@ harness = false
 required-features = ["asupersync-runtime"]
 
 [[bench]]
+name = "integration_throughput"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
 name = "outcome_adapter"
 harness = false
 required-features = ["asupersync-runtime"]
