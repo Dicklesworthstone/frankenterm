@@ -2982,4 +2982,174 @@ mod tests {
         assert!(auth.authorize(Some("writer"), IpcScope::Write).is_ok());
         assert!(auth.authorize(Some("writer"), IpcScope::Read).is_ok());
     }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for IPC primitives (wa-16hou)
+    //
+    // Exercises the Cx-aware channel primitives (mpsc_recv_state_with_cx,
+    // shutdown_signal_pending_with_cx) and pure-data IPC types under
+    // LabRuntime virtual time. Real-socket IPC tests (accept loop,
+    // handler scope, multi-client concurrency) run through the existing
+    // CompatRuntime test suite above; these LabRuntime tests add the
+    // deterministic scheduling dimension for the three mpsc_recv_state
+    // outcomes (Value, Disconnected, Cancelled) and the two
+    // shutdown_signal_pending outcomes (true = shutdown, false = continue).
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_ipc {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// 1. mpsc_recv_state_with_cx returns Value when a message is
+        ///    available under LabRuntime scheduling.
+        #[test]
+        fn mpsc_recv_state_value_under_labruntime() {
+            run_lab(1001, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<()>(1);
+                tx.reserve(&cx).await.expect("reserve").send(());
+                let state = mpsc_recv_state_with_cx(&mut rx, &cx).await;
+                assert_eq!(state, MpscRecvState::Value(()));
+            });
+        }
+
+        /// 2. mpsc_recv_state_with_cx returns Disconnected when the sender
+        ///    is dropped before any message is sent.
+        #[test]
+        fn mpsc_recv_state_disconnected_under_labruntime() {
+            run_lab(1002, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<()>(1);
+                drop(tx);
+                let state = mpsc_recv_state_with_cx(&mut rx, &cx).await;
+                assert_eq!(state, MpscRecvState::Disconnected);
+            });
+        }
+
+        /// 3. mpsc_recv_state_with_cx returns Cancelled when the Cx is
+        ///    pre-cancelled, even if the sender is still alive.
+        #[test]
+        fn mpsc_recv_state_cancelled_under_labruntime() {
+            run_lab(1003, || async move {
+                let (_tx, mut rx) = mpsc::channel::<()>(1);
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("wa-16hou cancelled recv"),
+                );
+                let state = mpsc_recv_state_with_cx(&mut rx, &cx).await;
+                assert_eq!(state, MpscRecvState::Cancelled);
+            });
+        }
+
+        /// 4. shutdown_signal_pending_with_cx returns true when the
+        ///    shutdown channel is closed (sender dropped).
+        #[test]
+        fn shutdown_pending_on_closed_channel_under_labruntime() {
+            run_lab(1004, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+                drop(shutdown_tx);
+                assert!(shutdown_signal_pending_with_cx(&mut shutdown_rx, &cx).await);
+            });
+        }
+
+        /// 5. shutdown_signal_pending_with_cx returns false when the Cx is
+        ///    cancelled — the IPC server must NOT shut down just because
+        ///    the Cx was cancelled. ProudSalmon fixed this behavior in
+        ///    the 2026-04-01 support slice; this LabRuntime test pins it
+        ///    under deterministic scheduling.
+        #[test]
+        fn shutdown_not_pending_on_cancelled_cx_under_labruntime() {
+            run_lab(1005, || async move {
+                let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("wa-16hou shutdown cancel"),
+                );
+                assert!(!shutdown_signal_pending_with_cx(&mut shutdown_rx, &cx).await);
+            });
+        }
+
+        /// 6. IpcResponse JSON serde roundtrip is stable under LabRuntime.
+        #[test]
+        fn ipc_response_serde_roundtrip_under_labruntime() {
+            run_lab(1006, || async move {
+                let resp = IpcResponse::ok_with_data(serde_json::json!({"pane_id": 42}));
+                let json = serde_json::to_string(&resp).expect("serialize");
+                let restored: IpcResponse = serde_json::from_str(&json).expect("deserialize");
+                assert!(restored.ok);
+                assert_eq!(
+                    restored.data.as_ref().and_then(|d| d.get("pane_id")),
+                    Some(&serde_json::json!(42))
+                );
+            });
+        }
+
+        /// 7. IpcAuth token validation holds under LabRuntime: a valid
+        ///    token with Write scope can read and write; an unknown token
+        ///    is rejected.
+        #[test]
+        fn ipc_auth_token_validation_under_labruntime() {
+            run_lab(1007, || async move {
+                let auth = IpcAuth::new(vec![IpcAuthToken {
+                    token: "lab-token".into(),
+                    scopes: vec![IpcScope::Write],
+                    expires_at_ms: None,
+                }]);
+                assert!(auth.authorize(Some("lab-token"), IpcScope::Read).is_ok());
+                assert!(auth.authorize(Some("lab-token"), IpcScope::Write).is_ok());
+                assert!(auth.authorize(Some("bad-token"), IpcScope::Read).is_err());
+                assert!(auth.authorize(None, IpcScope::Read).is_err());
+            });
+        }
+
+        /// 8. IpcRequest serde roundtrip: the Status variant survives
+        ///    JSON encode/decode under LabRuntime. Pins the JSON-line
+        ///    protocol contract the bead calls "must be preserved."
+        #[test]
+        fn ipc_request_serde_roundtrip_under_labruntime() {
+            run_lab(1008, || async move {
+                let req = IpcRequest::Status;
+                let json = serde_json::to_string(&req).expect("serialize");
+                let restored: IpcRequest = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(format!("{restored:?}"), format!("{req:?}"));
+            });
+        }
+    }
 }
