@@ -3637,4 +3637,223 @@ mod tests {
         assert_eq!(sm.pane_byte_budget_exceeded, 0);
         assert_eq!(sm.throttle_events, 0);
     }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for tailer primitives (wa-124z4)
+    //
+    // Exercises the Cx-aware channel primitives and pure-data tailer types
+    // under LabRuntime virtual time. Real-capture tests (PaneTailer,
+    // TailerSupervisor with mock WezTerm backends) run through the
+    // existing CompatRuntime suite above. These LabRuntime tests add
+    // the deterministic scheduling dimension for:
+    //   - CaptureEvent channel delivery and backpressure
+    //   - Cancelled Cx propagation through channel recv
+    //   - CaptureScheduler budget enforcement logic
+    //   - TailerConfig / SchedulerSnapshot data contracts
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_tailer {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// 1. TailerConfig defaults are stable: the tailer supervisor's
+        ///    adaptive-polling and concurrency semantics depend on these
+        ///    exact defaults.
+        #[test]
+        fn tailer_config_defaults_under_labruntime() {
+            run_lab(2001, || async move {
+                let config = TailerConfig::default();
+                assert_eq!(config.min_interval, Duration::from_millis(50));
+                assert_eq!(config.max_interval, Duration::from_secs(1));
+                assert_eq!(config.max_concurrent, 10);
+                assert_eq!(config.overlap_size, 256);
+                assert_eq!(config.capture_timeout, Duration::from_secs(2));
+            });
+        }
+
+        /// 2. CaptureScheduler budget enforcement under LabRuntime:
+        ///    a finite captures-per-sec limit throttles after exhaustion.
+        #[test]
+        fn capture_scheduler_rate_limit_under_labruntime() {
+            run_lab(2002, || async move {
+                let budget = CaptureBudgetConfig {
+                    max_captures_per_sec: 3,
+                    max_bytes_per_sec: 0,
+                };
+                let mut sched = CaptureScheduler::new(budget);
+
+                // First 3 should pass.
+                for _ in 0..3 {
+                    assert!(sched.check_global_budget());
+                }
+                // Fourth should be throttled.
+                assert!(
+                    !sched.check_global_budget(),
+                    "budget exhausted; fourth capture should be throttled"
+                );
+                assert_eq!(sched.metrics().global_rate_limited, 1);
+                assert_eq!(sched.metrics().throttle_events, 1);
+            });
+        }
+
+        /// 3. CaptureScheduler byte budget tracking under LabRuntime:
+        ///    recording bytes deducts from the global budget.
+        #[test]
+        fn capture_scheduler_byte_budget_under_labruntime() {
+            run_lab(2003, || async move {
+                let budget = CaptureBudgetConfig {
+                    max_captures_per_sec: 0,
+                    max_bytes_per_sec: 100,
+                };
+                let mut sched = CaptureScheduler::new(budget);
+
+                assert!(!sched.is_byte_budget_exhausted());
+                sched.record_capture(1, 60);
+                assert!(!sched.is_byte_budget_exhausted());
+                sched.record_capture(2, 50);
+                assert!(
+                    sched.is_byte_budget_exhausted(),
+                    "110 bytes consumed against 100-byte budget"
+                );
+            });
+        }
+
+        /// 4. SchedulerSnapshot serde roundtrip under LabRuntime: pins
+        ///    the telemetry shape downstream health reporting depends on.
+        #[test]
+        fn scheduler_snapshot_serde_roundtrip_under_labruntime() {
+            run_lab(2004, || async move {
+                let snap = SchedulerSnapshot {
+                    budget_active: true,
+                    max_captures_per_sec: 10,
+                    max_bytes_per_sec: 1024,
+                    captures_remaining: 7,
+                    bytes_remaining: 512,
+                    total_rate_limited: 3,
+                    total_byte_budget_exceeded: 0,
+                    total_throttle_events: 3,
+                    tracked_panes: 4,
+                };
+                let json = serde_json::to_string(&snap).expect("serialize");
+                let restored: SchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(restored.captures_remaining, 7);
+                assert_eq!(restored.tracked_panes, 4);
+                assert_eq!(restored.total_rate_limited, 3);
+            });
+        }
+
+        /// 5. mpsc channel for CaptureEvent delivery under LabRuntime:
+        ///    messages arrive in order via two-phase reserve/commit.
+        #[test]
+        fn capture_event_channel_delivery_under_labruntime() {
+            run_lab(2005, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<u64>(4);
+
+                for seq in 0u64..3 {
+                    tx.reserve(&cx).await.expect("reserve").send(seq);
+                }
+
+                for expected in 0u64..3 {
+                    let got = rx.recv(&cx).await.expect("recv");
+                    assert_eq!(got, expected, "FIFO violated");
+                }
+            });
+        }
+
+        /// 6. mpsc backpressure under LabRuntime: a full channel rejects
+        ///    try_reserve, then accepts after a consumer drains.
+        #[test]
+        fn capture_event_channel_backpressure_under_labruntime() {
+            run_lab(2006, || async move {
+                let cx = asupersync::Cx::current().expect("lab Cx");
+                let (tx, mut rx) = mpsc::channel::<u64>(1);
+
+                tx.reserve(&cx).await.expect("reserve").send(1);
+                assert!(
+                    tx.try_reserve().is_err(),
+                    "channel at capacity must reject try_reserve"
+                );
+
+                let got = rx.recv(&cx).await.expect("recv");
+                assert_eq!(got, 1);
+
+                tx.reserve(&cx).await.expect("reserve after drain").send(2);
+                let got2 = rx.recv(&cx).await.expect("recv2");
+                assert_eq!(got2, 2);
+            });
+        }
+
+        /// 7. Cancelled Cx propagation through capture event recv under
+        ///    LabRuntime: mirrors the tailer supervisor's behavior when
+        ///    the runtime's Cx is cancelled during a capture batch.
+        #[test]
+        fn capture_recv_cancelled_cx_under_labruntime() {
+            run_lab(2007, || async move {
+                let (_tx, mut rx) = mpsc::channel::<u64>(4);
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("wa-124z4 tailer cancel"),
+                );
+                let result = rx.recv(&cx).await;
+                assert!(
+                    result.is_err(),
+                    "cancelled Cx must surface as recv error, got {result:?}"
+                );
+            });
+        }
+
+        /// 8. TailerMetrics defaults are all zero under LabRuntime: the
+        ///    supervisor's metric counters start clean.
+        #[test]
+        fn tailer_metrics_defaults_under_labruntime() {
+            run_lab(2008, || async move {
+                let m = TailerMetrics::default();
+                assert_eq!(m.events_sent, 0);
+                assert_eq!(m.send_timeouts, 0);
+                assert_eq!(m.capture_timeouts, 0);
+                assert_eq!(m.no_change_captures, 0);
+                assert_eq!(m.overflow_gaps_emitted, 0);
+
+                let sm = SupervisorMetrics::default();
+                assert_eq!(sm.tailers_started, 0);
+                assert_eq!(sm.tailers_stopped, 0);
+                assert_eq!(sm.sync_count, 0);
+            });
+        }
+    }
 }
