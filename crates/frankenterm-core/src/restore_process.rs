@@ -187,6 +187,89 @@ impl ProcessLauncher {
     /// Plans are executed sequentially with `launch_delay_ms` between each
     /// to prevent resource spikes.
     pub async fn execute(&self, plans: &[ProcessPlan]) -> LaunchReport {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.execute_cx(&cx, plans).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.execute_inner(plans).await
+        }
+    }
+
+    /// Execute process plans under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
+    /// API).
+    ///
+    /// Inter-launch sleeps and per-pane command delays bind to the provided
+    /// capability context so cancellation, budget, and virtual time propagate
+    /// cleanly through the launch sequence.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_cx(&self, cx: &crate::cx::Cx, plans: &[ProcessPlan]) -> LaunchReport {
+        let mut report = LaunchReport::default();
+        let delay = Duration::from_millis(self.config.launch_delay_ms);
+
+        for (i, plan) in plans.iter().enumerate() {
+            if i > 0 && !delay.is_zero() {
+                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+            }
+
+            let result = match &plan.action {
+                LaunchAction::LaunchShell { shell, cwd } => {
+                    self.launch_shell_cx(cx, plan.new_pane_id, shell, cwd).await
+                }
+                LaunchAction::LaunchAgent {
+                    command,
+                    cwd,
+                    agent_type,
+                } => {
+                    self.launch_agent_cx(cx, plan.new_pane_id, command, cwd, agent_type)
+                        .await
+                }
+                LaunchAction::Skip { reason } => {
+                    debug!(pane = plan.new_pane_id, reason = %reason, "skipping pane");
+                    report.skipped += 1;
+                    report.results.push(LaunchResult {
+                        old_pane_id: plan.old_pane_id,
+                        new_pane_id: plan.new_pane_id,
+                        action: plan.action.clone(),
+                        success: true,
+                        error: None,
+                    });
+                    continue;
+                }
+                LaunchAction::Manual { hint, .. } => {
+                    info!(pane = plan.new_pane_id, hint = %hint, "manual restart required");
+                    report.manual += 1;
+                    report.results.push(LaunchResult {
+                        old_pane_id: plan.old_pane_id,
+                        new_pane_id: plan.new_pane_id,
+                        action: plan.action.clone(),
+                        success: true,
+                        error: None,
+                    });
+                    continue;
+                }
+            };
+
+            self.record_result(&mut report, plan, result);
+        }
+
+        info!(
+            shells = report.shells_launched,
+            agents = report.agents_launched,
+            skipped = report.skipped,
+            manual = report.manual,
+            failed = report.failed,
+            "process re-launch complete"
+        );
+
+        report
+    }
+
+    /// Non-asupersync fallback for execute.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn execute_inner(&self, plans: &[ProcessPlan]) -> LaunchReport {
         let mut report = LaunchReport::default();
         let delay = Duration::from_millis(self.config.launch_delay_ms);
 
@@ -208,11 +291,7 @@ impl ProcessLauncher {
                         .await
                 }
                 LaunchAction::Skip { reason } => {
-                    debug!(
-                        pane = plan.new_pane_id,
-                        reason = %reason,
-                        "skipping pane"
-                    );
+                    debug!(pane = plan.new_pane_id, reason = %reason, "skipping pane");
                     report.skipped += 1;
                     report.results.push(LaunchResult {
                         old_pane_id: plan.old_pane_id,
@@ -224,11 +303,7 @@ impl ProcessLauncher {
                     continue;
                 }
                 LaunchAction::Manual { hint, .. } => {
-                    info!(
-                        pane = plan.new_pane_id,
-                        hint = %hint,
-                        "manual restart required"
-                    );
+                    info!(pane = plan.new_pane_id, hint = %hint, "manual restart required");
                     report.manual += 1;
                     report.results.push(LaunchResult {
                         old_pane_id: plan.old_pane_id,
@@ -241,37 +316,7 @@ impl ProcessLauncher {
                 }
             };
 
-            match result {
-                Ok(()) => {
-                    match &plan.action {
-                        LaunchAction::LaunchShell { .. } => report.shells_launched += 1,
-                        LaunchAction::LaunchAgent { .. } => report.agents_launched += 1,
-                        _ => {}
-                    }
-                    report.results.push(LaunchResult {
-                        old_pane_id: plan.old_pane_id,
-                        new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
-                        success: true,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    warn!(
-                        pane = plan.new_pane_id,
-                        error = %e,
-                        "process launch failed"
-                    );
-                    report.failed += 1;
-                    report.results.push(LaunchResult {
-                        old_pane_id: plan.old_pane_id,
-                        new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
-                        success: false,
-                        error: Some(e),
-                    });
-                }
-            }
+            self.record_result(&mut report, plan, result);
         }
 
         info!(
@@ -284,6 +329,43 @@ impl ProcessLauncher {
         );
 
         report
+    }
+
+    /// Shared result recording logic used by both execute_cx and execute_inner.
+    #[allow(clippy::unused_self)]
+    fn record_result(
+        &self,
+        report: &mut LaunchReport,
+        plan: &ProcessPlan,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                match &plan.action {
+                    LaunchAction::LaunchShell { .. } => report.shells_launched += 1,
+                    LaunchAction::LaunchAgent { .. } => report.agents_launched += 1,
+                    _ => {}
+                }
+                report.results.push(LaunchResult {
+                    old_pane_id: plan.old_pane_id,
+                    new_pane_id: plan.new_pane_id,
+                    action: plan.action.clone(),
+                    success: true,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                warn!(pane = plan.new_pane_id, error = %e, "process launch failed");
+                report.failed += 1;
+                report.results.push(LaunchResult {
+                    old_pane_id: plan.old_pane_id,
+                    new_pane_id: plan.new_pane_id,
+                    action: plan.action.clone(),
+                    success: false,
+                    error: Some(e),
+                });
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -482,18 +564,14 @@ impl ProcessLauncher {
     // -------------------------------------------------------------------------
 
     /// Send shell launch commands to a pane.
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn launch_shell(&self, pane_id: u64, shell: &str, cwd: &Path) -> Result<(), String> {
-        // cd to the working directory first
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
             .send_text(pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
-
-        // Small delay to let the cd complete
         crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-
-        // If the shell is different from default, exec it
         let current_shell = default_shell();
         if shell != current_shell && !shell.is_empty() {
             let exec_cmd = format!("exec {shell}\r");
@@ -502,12 +580,38 @@ impl ProcessLauncher {
                 .await
                 .map_err(|e| format!("send exec: {e}"))?;
         }
+        info!(pane = pane_id, shell = %shell, cwd = %cwd.display(), "shell launched");
+        Ok(())
+    }
 
+    #[cfg(feature = "asupersync-runtime")]
+    async fn launch_shell_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        shell: &str,
+        cwd: &Path,
+    ) -> Result<(), String> {
+        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
+        self.wezterm
+            .send_text(pane_id, &cd_cmd)
+            .await
+            .map_err(|e| format!("send cd: {e}"))?;
+        let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
+        let current_shell = default_shell();
+        if shell != current_shell && !shell.is_empty() {
+            let exec_cmd = format!("exec {shell}\r");
+            self.wezterm
+                .send_text(pane_id, &exec_cmd)
+                .await
+                .map_err(|e| format!("send exec: {e}"))?;
+        }
         info!(pane = pane_id, shell = %shell, cwd = %cwd.display(), "shell launched");
         Ok(())
     }
 
     /// Send agent launch command to a pane.
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn launch_agent(
         &self,
         pane_id: u64,
@@ -515,27 +619,42 @@ impl ProcessLauncher {
         cwd: &Path,
         agent_type: &str,
     ) -> Result<(), String> {
-        // Custom templates may omit cwd handling entirely, so anchor the pane first.
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
             .send_text(pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
-
         crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-
         let full_cmd = format!("{command}\r");
         self.wezterm
             .send_text(pane_id, &full_cmd)
             .await
             .map_err(|e| format!("send agent command: {e}"))?;
+        info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
+        Ok(())
+    }
 
-        info!(
-            pane = pane_id,
-            agent = %agent_type,
-            cwd = %cwd.display(),
-            "agent launched"
-        );
+    #[cfg(feature = "asupersync-runtime")]
+    async fn launch_agent_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        command: &str,
+        cwd: &Path,
+        agent_type: &str,
+    ) -> Result<(), String> {
+        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
+        self.wezterm
+            .send_text(pane_id, &cd_cmd)
+            .await
+            .map_err(|e| format!("send cd: {e}"))?;
+        let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
+        let full_cmd = format!("{command}\r");
+        self.wezterm
+            .send_text(pane_id, &full_cmd)
+            .await
+            .map_err(|e| format!("send agent command: {e}"))?;
+        info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
         Ok(())
     }
 }
@@ -694,6 +813,64 @@ fn default_agent_command(agent_type: AgentType, cwd: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::session_pane_state::TerminalState;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `execute_cx` path runs under seed-locked virtual-time scheduling.
+    /// We execute an empty plan list so no WezTerm interaction occurs; the
+    /// test verifies the execute_cx orchestration loop and its sleep_with_cx
+    /// plumbing run under the LabRuntime scheduler without wall-clock
+    /// dependence.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn execute_cx_runs_under_labruntime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SEED: u64 = 0x6E57_0EE0_C410_7E57;
+        let wall_start = std::time::Instant::now();
+        let completed = std::sync::Arc::new(AtomicBool::new(false));
+        let completed_task = std::sync::Arc::clone(&completed);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                let wezterm = crate::wezterm::mock_wezterm_handle();
+                let launcher = ProcessLauncher::new(wezterm, LaunchConfig::default());
+                let report = launcher.execute_cx(&cx, &[]).await;
+                assert_eq!(report.shells_launched, 0);
+                assert_eq!(report.agents_launched, 0);
+                assert_eq!(report.failed, 0);
+                completed_task.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn execute_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "execute_cx must complete under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(2),
+            "Cx-first execute must not burn real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     /// Create a minimal `PaneStateSnapshot` for testing.
     fn test_pane_state(pane_id: u64) -> PaneStateSnapshot {
