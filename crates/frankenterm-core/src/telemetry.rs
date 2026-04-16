@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::sleep;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -761,6 +762,67 @@ impl TelemetryCollector {
     ///
     /// Samples resource metrics at `config.sample_interval`.
     pub async fn run(&self) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.run_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.run_inner().await;
+        }
+    }
+
+    /// Run the collection loop under an explicit `&Cx` (ft-xbnl0.2.2
+    /// Cx-first API).
+    ///
+    /// Cancellation, budget, and virtual time all flow through the provided
+    /// capability context. The loop honors two cancellation boundaries: the
+    /// Cx-aware sleep between samples, and an explicit `cx.checkpoint()`
+    /// at the top of every iteration so a canceled caller exits the loop
+    /// even if the shutdown flag has not been set.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_cx(&self, cx: &crate::cx::Cx) {
+        let interval = self.config.sample_interval.max(Duration::from_secs(1));
+        let mut first_tick = true;
+
+        loop {
+            if !first_tick {
+                let _ = crate::runtime_compat::sleep_with_cx(cx, interval).await;
+            }
+            first_tick = false;
+
+            if self.shutdown.load(Ordering::SeqCst) {
+                debug!("Telemetry collector shutting down");
+                break;
+            }
+            if cx.checkpoint().is_err() {
+                debug!("Telemetry collector exiting via Cx cancellation");
+                break;
+            }
+
+            let pid = self.config.mux_server_pid;
+            let snap_opt =
+                crate::runtime_compat::spawn_blocking(move || ResourceSnapshot::collect(pid))
+                    .await
+                    .unwrap_or(None);
+
+            if let Some(snap) = snap_opt {
+                self.buffer.push(snap);
+                self.sample_count.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    pid,
+                    samples = self.sample_count.load(Ordering::Relaxed),
+                    "Telemetry sample collected"
+                );
+            } else {
+                warn!(pid, "Failed to collect telemetry sample");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run_inner(&self) {
         let interval = self.config.sample_interval.max(Duration::from_secs(1));
         let mut first_tick = true;
 
@@ -1229,6 +1291,70 @@ impl std::fmt::Debug for TelemetryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `TelemetryCollector::run_cx` path exits cleanly under seed-locked
+    /// virtual-time scheduling when shutdown is pre-signaled. The collector
+    /// enters the loop, skips the first sleep, observes the shutdown flag
+    /// on iteration 1, and returns — all without consuming real time. If
+    /// the sleep seam ever re-acquires a wall-clock assumption, this test
+    /// burns real seconds or step-explodes.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn telemetry_collector_run_cx_honors_shutdown_under_labruntime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SEED: u64 = 0x7E1E_7E7E_C410_3100;
+        let wall_start = std::time::Instant::now();
+        let exited_cleanly = Arc::new(AtomicBool::new(false));
+        let exited_cleanly_task = Arc::clone(&exited_cleanly);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                let collector = TelemetryCollector::new(TelemetryConfig {
+                    sample_interval: Duration::from_secs(60),
+                    buffer_capacity: 8,
+                    histogram_buckets: 64,
+                    per_process_metrics: false,
+                    mux_server_pid: 0,
+                });
+                // Pre-signal shutdown so iteration 1 breaks out of the loop
+                // without entering spawn_blocking or sleeping.
+                collector.shutdown();
+                collector.run_cx(&cx).await;
+                exited_cleanly_task.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn telemetry run_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            exited_cleanly.load(Ordering::SeqCst),
+            "run_cx must honor pre-signaled shutdown under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(2),
+            "Cx-first telemetry run must not consume real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     // Helper to create a minimal ResourceSnapshot for tests.
     fn make_snap(pid: u32, rss: u64, fd: u64, ts: u64) -> ResourceSnapshot {

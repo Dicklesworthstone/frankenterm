@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-15T23:58:39Z",
+  "checked_at": "2026-04-16T01:14:18Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -33,7 +33,7 @@
       "status": "passed"
     },
     {
-      "doc_hits": 18,
+      "doc_hits": 17,
       "name": "doc_narrative_enforcement",
       "status": "passed"
     },
@@ -46,7 +46,7 @@
   "repo_root": "/Users/jemanuel/projects/frankenterm",
   "status": "passed",
   "summary": {
-    "doc_files_with_tokens": 18,
+    "doc_files_with_tokens": 17,
     "manifest_dependency_hits": {
       "async-io": [
         "Cargo.toml",
