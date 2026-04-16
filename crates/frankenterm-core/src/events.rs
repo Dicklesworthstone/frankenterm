@@ -722,6 +722,31 @@ impl EventSubscriber {
         }
     }
 
+    /// Receive the next event under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
+    /// API).
+    ///
+    /// Cancellation, budget, and virtual time all flow through the provided
+    /// capability context, so a canceled caller abandons the broadcast wait
+    /// cleanly instead of blocking on thread-local state.
+    ///
+    /// # Errors
+    /// - `RecvError::Closed` if the event bus was dropped
+    /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn recv_cx(&mut self, cx: &crate::cx::Cx) -> Result<Event, RecvError> {
+        match crate::runtime_compat::broadcast_recv_with_cx(cx, &mut self.receiver).await {
+            Ok(event) => Ok(event),
+            Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
+            Err(broadcast::RecvError::Lagged(n)) => {
+                self.lagged_count += n;
+                self.metrics
+                    .subscriber_lag_events
+                    .fetch_add(n, Ordering::Relaxed);
+                Err(RecvError::Lagged { missed_count: n })
+            }
+        }
+    }
+
     /// Try to receive an event without blocking
     ///
     /// Returns `None` if no event is immediately available.
@@ -1358,6 +1383,74 @@ impl NotificationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `EventSubscriber::recv_cx` path runs under seed-locked virtual-time
+    /// scheduling. We publish a single event into the bus, drain it through
+    /// `recv_cx(&cx)`, and assert the round trip happens without consuming
+    /// real time. If the broadcast recv ever re-acquires a tokio-shaped
+    /// (real-time) assumption, this test either step-explodes or burns
+    /// real seconds.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn event_subscriber_recv_cx_runs_under_labruntime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SEED: u64 = 0xE5E7_57B5_4C41_2000;
+        let wall_start = std::time::Instant::now();
+        let event_observed = Arc::new(AtomicBool::new(false));
+        let event_observed_task = Arc::clone(&event_observed);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(50_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                let bus = EventBus::new(8);
+                let mut sub = bus.subscribe();
+                let _ = bus.publish(Event::SegmentCaptured {
+                    pane_id: 1,
+                    seq: 42,
+                    content_len: 100,
+                });
+                match sub.recv_cx(&cx).await {
+                    Ok(Event::SegmentCaptured { pane_id, seq, .. }) => {
+                        assert_eq!(pane_id, 1);
+                        assert_eq!(seq, 42);
+                        event_observed_task.store(true, Ordering::SeqCst);
+                    }
+                    Ok(other) => panic!("unexpected event variant: {other:?}"),
+                    Err(err) => panic!("recv_cx returned error: {err:?}"),
+                }
+            })
+            .expect("spawn events recv_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            event_observed.load(Ordering::SeqCst),
+            "recv_cx must deliver the published event under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(1),
+            "Cx-first broadcast recv must not burn real time; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     fn run_async_test<F>(future: F)
     where

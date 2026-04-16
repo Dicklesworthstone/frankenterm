@@ -190,6 +190,12 @@
       "reason": "Verifies vendored crates expose expected async contracts; references forbidden tokens by name.",
       "removal_bead": "wa-2h1ha",
       "allowed_tokens": ["tokio::"]
+    },
+    "crates/frankenterm-core/tests/wa_22x4r_no_tokio_test_in_supported_paths.rs": {
+      "owner": "wa-22x4r",
+      "reason": "Regression guard test for wa-22x4r: scans supported-path source trees and asserts no active `#[tokio::test]` attributes remain; references forbidden tokens in the guard logic itself.",
+      "removal_bead": "wa-22x4r",
+      "allowed_tokens": ["tokio::"]
     }
   },
   "bench_quarantine_pattern": {

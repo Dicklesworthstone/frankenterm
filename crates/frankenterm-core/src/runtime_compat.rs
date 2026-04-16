@@ -703,7 +703,15 @@ pub mod broadcast {
         /// Acquires a `Cx` internally for the asupersync async recv.
         pub async fn recv(&mut self) -> Result<T, RecvError> {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.inner.recv(&cx).await.map_err(|e| match e {
+            self.recv_with_cx(&cx).await
+        }
+
+        /// Receives the next message under an explicit `&Cx` (ft-xbnl0.2.2
+        /// Cx-first API). Cancellation, budget, and virtual time all flow
+        /// through the provided capability context instead of being pulled
+        /// from thread-local state.
+        pub async fn recv_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<T, RecvError> {
+            self.inner.recv(cx).await.map_err(|e| match e {
                 inner::RecvError::Lagged(n) => RecvError::Lagged(n),
                 inner::RecvError::Closed => RecvError::Closed,
                 inner::RecvError::Cancelled => RecvError::Closed,
@@ -2110,6 +2118,18 @@ pub async fn broadcast_recv<T: Clone>(
     rx: &mut broadcast::Receiver<T>,
 ) -> Result<T, broadcast::RecvError> {
     rx.recv().await
+}
+
+/// Receive a value from a broadcast channel under an explicit `&Cx`
+/// (ft-xbnl0.2.2 Cx-first helper). Prefer this over [`broadcast_recv`] in
+/// call graphs that already thread `&Cx` so cancellation flows cleanly
+/// through the broadcast boundary.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn broadcast_recv_with_cx<T: Clone>(
+    cx: &crate::cx::Cx,
+    rx: &mut broadcast::Receiver<T>,
+) -> Result<T, broadcast::RecvError> {
+    rx.recv_with_cx(cx).await
 }
 
 /// Error returned by [`broadcast_try_recv`] across runtime backends.
