@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::sleep;
 
 /// Backoff configuration for wait loops.
@@ -146,6 +147,33 @@ impl std::error::Error for WaitError {}
 
 /// Wait for a predicate to become true within a timeout using backoff.
 pub async fn wait_for<P>(
+    predicate: P,
+    timeout: Duration,
+    backoff: Backoff,
+) -> Result<P::Output, WaitError>
+where
+    P: WaitPredicate + Send,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        wait_for_cx(&cx, predicate, timeout, backoff).await
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        wait_for_inner(predicate, timeout, backoff).await
+    }
+}
+
+/// Wait for a predicate under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
+/// API).
+///
+/// All inter-poll sleeps bind to the provided capability context so
+/// cancellation, budget, and virtual time propagate cleanly into the
+/// backoff delay.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_cx<P>(
+    cx: &crate::cx::Cx,
     mut predicate: P,
     timeout: Duration,
     backoff: Backoff,
@@ -186,10 +214,90 @@ where
         let remaining = deadline.saturating_duration_since(now);
         let sleep_for = if delay > remaining { remaining } else { delay };
         if !sleep_for.is_zero() {
+            let _ = crate::runtime_compat::sleep_with_cx(cx, sleep_for).await;
+        }
+        delay = backoff.next_delay(delay);
+    }
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn wait_for_inner<P>(
+    mut predicate: P,
+    timeout: Duration,
+    backoff: Backoff,
+) -> Result<P::Output, WaitError>
+where
+    P: WaitPredicate + Send,
+{
+    let expected = predicate.describe();
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut retries = 0usize;
+    let mut delay = backoff.initial;
+    let mut last_observed = None;
+
+    loop {
+        retries = retries.saturating_add(1);
+        match predicate.check().await {
+            WaitFor::Ready(value) => return Ok(value),
+            WaitFor::NotReady { last_observed: obs } => {
+                if obs.is_some() {
+                    last_observed = obs;
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline || backoff.max_retries.is_some_and(|max| retries >= max) {
+            return Err(WaitError {
+                expected,
+                last_observed,
+                retries,
+                elapsed: now.saturating_duration_since(start),
+            });
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let sleep_for = if delay > remaining { remaining } else { delay };
+        if !sleep_for.is_zero() {
             sleep(sleep_for).await;
         }
         delay = backoff.next_delay(delay);
     }
+}
+
+/// Wait for a query to return the expected value under an explicit `&Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_value_cx<F, Fut, T>(
+    cx: &crate::cx::Cx,
+    query: F,
+    expected: T,
+    timeout: Duration,
+) -> Result<T, WaitError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = T> + Send + 'static,
+    T: PartialEq + fmt::Debug + Clone + Send + 'static,
+{
+    let expected_desc = format!("value == {expected:?}");
+    let condition = WaitCondition::new(expected_desc, {
+        let mut query = query;
+        move || {
+            let fut = query();
+            let expected = expected.clone();
+            async move {
+                let observed = fut.await;
+                if observed == expected {
+                    WaitFor::Ready(observed)
+                } else {
+                    WaitFor::NotReady {
+                        last_observed: Some(format!("{observed:?}")),
+                    }
+                }
+            }
+        }
+    });
+    wait_for_cx(cx, condition, timeout, Backoff::default()).await
 }
 
 /// Wait for a query to return the expected value within a timeout.
@@ -280,6 +388,46 @@ where
     S: QuiescenceSignals + Clone + Send + 'static,
 {
     wait_for_quiescence_with_backoff(signals, timeout, Backoff::default()).await
+}
+
+/// Wait for quiescence under an explicit `&Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_quiescence_cx<S>(
+    cx: &crate::cx::Cx,
+    signals: S,
+    timeout: Duration,
+) -> Result<(), WaitError>
+where
+    S: QuiescenceSignals + Clone + Send + 'static,
+{
+    wait_for_quiescence_with_backoff_cx(cx, signals, timeout, Backoff::default()).await
+}
+
+/// Wait for quiescence with custom backoff under an explicit `&Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_quiescence_with_backoff_cx<S>(
+    cx: &crate::cx::Cx,
+    signals: S,
+    timeout: Duration,
+    backoff: Backoff,
+) -> Result<(), WaitError>
+where
+    S: QuiescenceSignals + Clone + Send + 'static,
+{
+    let condition = WaitCondition::new("quiescence", move || {
+        let now = Instant::now();
+        let signals = signals.clone();
+        async move {
+            if signals.is_quiet(now) {
+                WaitFor::Ready(())
+            } else {
+                WaitFor::NotReady {
+                    last_observed: Some(signals.describe(now)),
+                }
+            }
+        }
+    });
+    wait_for_cx(cx, condition, timeout, backoff).await
 }
 
 /// Wait for quiescence using a custom backoff.
@@ -583,6 +731,59 @@ impl QuiescenceSignals for QuiescenceSnapshot {
     }
 }
 
+/// Wait for a boolean condition under an explicit `&Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_condition_cx<F, Fut>(
+    cx: &crate::cx::Cx,
+    description: impl Into<String>,
+    mut check: F,
+    timeout: Duration,
+) -> Result<(), WaitError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let desc = description.into();
+    let condition = WaitCondition::new(desc, move || {
+        let fut = check();
+        async move {
+            if fut.await {
+                WaitFor::Ready(())
+            } else {
+                WaitFor::not_ready(None::<String>)
+            }
+        }
+    });
+    wait_for_cx(cx, condition, timeout, Backoff::default()).await
+}
+
+/// Wait for a boolean condition with custom backoff under an explicit `&Cx`.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_condition_with_backoff_cx<F, Fut>(
+    cx: &crate::cx::Cx,
+    description: impl Into<String>,
+    mut check: F,
+    timeout: Duration,
+    backoff: Backoff,
+) -> Result<(), WaitError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    let desc = description.into();
+    let condition = WaitCondition::new(desc, move || {
+        let fut = check();
+        async move {
+            if fut.await {
+                WaitFor::Ready(())
+            } else {
+                WaitFor::not_ready(None::<String>)
+            }
+        }
+    });
+    wait_for_cx(cx, condition, timeout, backoff).await
+}
+
 /// Wait for a boolean condition to become true.
 ///
 /// Simpler alternative to [`wait_for`] for cases where you just need
@@ -639,7 +840,83 @@ where
 #[allow(clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::sleep;
     use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+
+    /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
+    /// `wait_for_cx` path runs under seed-locked virtual-time scheduling.
+    /// A predicate that succeeds on the 3rd poll verifies that the backoff
+    /// sleep uses virtual time (no wall seconds consumed).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn wait_for_cx_runs_under_labruntime() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const SEED: u64 = 0xAA17_F04C_C410_4040;
+        let wall_start = Instant::now();
+        let completed = std::sync::Arc::new(AtomicBool::new(false));
+        let completed_task = std::sync::Arc::clone(&completed);
+
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(SEED)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(100_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                let cx = crate::cx::for_request();
+                let poll_count = std::sync::Arc::new(AtomicUsize::new(0));
+                let poll_count_inner = std::sync::Arc::clone(&poll_count);
+
+                let condition = WaitCondition::new("poll_count >= 3", move || {
+                    let n = poll_count_inner.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if n >= 3 {
+                            WaitFor::Ready(())
+                        } else {
+                            WaitFor::not_ready(Some(format!("count={n}")))
+                        }
+                    }
+                });
+                let backoff = Backoff {
+                    initial: Duration::from_millis(10),
+                    max: Duration::from_millis(50),
+                    factor: 2,
+                    max_retries: Some(10),
+                };
+                let result = wait_for_cx(&cx, condition, Duration::from_secs(5), backoff).await;
+                assert!(result.is_ok(), "wait_for_cx must succeed: {result:?}");
+                assert!(
+                    poll_count.load(Ordering::SeqCst) >= 3,
+                    "predicate must have been polled at least 3 times"
+                );
+                completed_task.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn wait_for_cx task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "wait_for_cx must complete under LabRuntime"
+        );
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(2),
+            "Cx-first wait must not burn real seconds; elapsed {:?}",
+            wall_start.elapsed()
+        );
+    }
 
     fn run_async_test<F>(future: F)
     where
