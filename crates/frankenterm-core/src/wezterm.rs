@@ -63,8 +63,46 @@ pub trait WeztermInterface: Send + Sync {
     }
     /// Get a specific pane by ID.
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo>;
+
+    /// Get a specific pane by ID bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first trait extension).
+    ///
+    /// Default delegates to [`get_pane`](Self::get_pane). Concrete
+    /// impls with a Cx-aware path (e.g. `WeztermClient::get_pane_with_cx`
+    /// which delegates to `list_panes_with_cx`) SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneInfo> {
+        self.get_pane(pane_id)
+    }
     /// Get text content from a pane.
     fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String>;
+
+    /// Get text content from a pane bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first trait extension).
+    ///
+    /// Default delegates to [`get_text`](Self::get_text). Concrete
+    /// impls with a Cx-aware mux-pool path (e.g.
+    /// `WeztermClient::get_text_with_cx` routing through
+    /// `MuxPool::get_pane_render_changes_with_cx` +
+    /// `MuxPool::get_lines_with_cx`) SHOULD override.
+    ///
+    /// For long scrollback reads this is the main cancellation lever
+    /// — a caller-cancelled read terminates promptly after the
+    /// in-flight 2000-row chunk instead of consuming the full
+    /// scrollback-fetch budget.
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_text_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> WeztermFuture<'a, String> {
+        self.get_text(pane_id, escapes)
+    }
     /// Send text using paste mode.
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
     /// Send text without paste mode.
@@ -2021,8 +2059,27 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_pane(self, pane_id).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneInfo> {
+        Box::pin(async move { WeztermClient::get_pane_with_cx(self, cx, pane_id).await })
+    }
+
     fn get_text(&self, pane_id: u64, escapes: bool) -> WeztermFuture<'_, String> {
         Box::pin(async move { WeztermClient::get_text(self, pane_id, escapes).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> WeztermFuture<'a, String> {
+        Box::pin(async move { WeztermClient::get_text_with_cx(self, cx, pane_id, escapes).await })
     }
 
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
