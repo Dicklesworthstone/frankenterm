@@ -290,6 +290,28 @@ pub trait WebhookTransport: Send + Sync {
         headers: &'a HashMap<String, String>,
         body: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>>;
+
+    /// Send a JSON payload bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.3 Cx-first trait extension).
+    ///
+    /// Default implementation delegates to [`send`](Self::send) which
+    /// uses ambient Cx. Concrete implementations with a Cx-aware HTTP
+    /// client (e.g. asupersync::http) SHOULD override this method to
+    /// propagate caller Cx through to the underlying cancellable I/O.
+    ///
+    /// The `cx` parameter lifetime matches the returned future so
+    /// overrides can thread cx into async operations held by the
+    /// future.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        url: &'a str,
+        headers: &'a HashMap<String, String>,
+        body: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
+        self.send(url, headers, body)
+    }
 }
 
 // ============================================================================
@@ -390,6 +412,68 @@ impl WebhookDispatcher {
         records
     }
 
+    /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Threads caller cx
+    /// through each endpoint delivery via `transport.send_with_cx`.
+    /// When the transport is a Cx-aware HTTP client, caller
+    /// cancellation propagates through to the underlying request.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn dispatch_payload_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        payload: &NotificationPayload,
+    ) -> Vec<DeliveryRecord> {
+        let mut records = Vec::new();
+
+        for endpoint in &self.endpoints {
+            if !endpoint.enabled {
+                continue;
+            }
+
+            if !endpoint.matches_event_type(&payload.event_type) {
+                continue;
+            }
+
+            let body = render_template(endpoint.template, payload);
+
+            tracing::debug!(
+                endpoint = %endpoint.name,
+                url = %endpoint.url,
+                template = %endpoint.template,
+                rule_id = %payload.event_type,
+                "dispatching webhook (cx-first)"
+            );
+
+            let result = self
+                .transport
+                .send_with_cx(cx, &endpoint.url, &endpoint.headers, &body)
+                .await;
+
+            if result.accepted {
+                tracing::info!(
+                    endpoint = %endpoint.name,
+                    status = result.status_code,
+                    "webhook delivered"
+                );
+            } else {
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    status = result.status_code,
+                    error = ?result.error,
+                    "webhook delivery failed"
+                );
+            }
+
+            records.push(DeliveryRecord {
+                target: endpoint.name.clone(),
+                accepted: result.accepted,
+                status_code: result.status_code,
+                error: result.error,
+            });
+        }
+
+        records
+    }
+
     /// Number of configured endpoints (including disabled ones).
     #[must_use]
     pub fn endpoint_count(&self) -> usize {
@@ -406,6 +490,29 @@ impl WebhookDispatcher {
 impl NotificationSender for WebhookDispatcher {
     fn name(&self) -> &'static str {
         "webhook"
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        payload: &'a NotificationPayload,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            let records = self.dispatch_payload_with_cx(cx, payload).await;
+            let success = records.iter().all(|r| r.accepted);
+            NotificationDelivery {
+                sender: self.name().to_string(),
+                success,
+                rate_limited: false,
+                error: if success {
+                    None
+                } else {
+                    Some("one_or_more_deliveries_failed".to_string())
+                },
+                records,
+            }
+        })
     }
 
     fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
