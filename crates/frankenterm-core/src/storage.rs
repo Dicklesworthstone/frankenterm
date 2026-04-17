@@ -7016,6 +7016,36 @@ impl StorageHandle {
         Ok(deleted)
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`retention_cleanup`].
+    ///
+    /// Routes both the prune and the maintenance-log write through their
+    /// cx-first siblings so the full composite honours cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn retention_cleanup_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("retention_cleanup cancelled: {err}"))
+        })?;
+        let deleted = self.prune_segments_before_with_cx(cx, before_ts).await?;
+        let metadata = serde_json::json!({
+            "deleted_segments": deleted,
+            "before_ts": before_ts,
+        })
+        .to_string();
+        let record = MaintenanceRecord {
+            id: 0,
+            event_type: "retention_cleanup".to_string(),
+            message: Some(format!("Deleted {deleted} output segments")),
+            metadata: Some(metadata),
+            timestamp: now_ms(),
+        };
+        let _ = self.record_maintenance_with_cx(cx, record).await?;
+        Ok(deleted)
+    }
+
     /// Record a usage metric for analytics tracking.
     pub async fn record_usage_metric(&self, record: UsageMetricRecord) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
@@ -7139,6 +7169,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_daily_metrics`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn aggregate_daily_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        since_ts: i64,
+    ) -> Result<Vec<DailyMetricSummary>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("aggregate_daily_metrics cancelled: {err}"))
+        })?;
+        self.aggregate_daily_metrics(since_ts).await
+    }
+
     /// Get per-agent metric breakdown since a given timestamp.
     pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
         let db_path = Arc::clone(&self.db_path);
@@ -7149,6 +7192,19 @@ impl StorageHandle {
             aggregate_by_agent_sync(&conn, since_ts)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_by_agent`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn aggregate_by_agent_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        since_ts: i64,
+    ) -> Result<Vec<AgentMetricBreakdown>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("aggregate_by_agent cancelled: {err}"))
+        })?;
+        self.aggregate_by_agent(since_ts).await
     }
 
     // ---- Notification History ----
@@ -7621,6 +7677,14 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`vacuum`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn vacuum_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("vacuum cancelled: {err}")))?;
+        self.vacuum().await
+    }
+
     /// Lightweight WAL checkpoint (PASSIVE) + PRAGMA optimize.
     ///
     /// Prefer this over `vacuum()` for periodic maintenance — it is
@@ -7635,6 +7699,14 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`checkpoint`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn checkpoint_with_cx(&self, cx: &crate::cx::Cx) -> Result<CheckpointResult> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("checkpoint cancelled: {err}")))?;
+        self.checkpoint().await
+    }
+
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
     pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
         let db_path = Arc::clone(&self.db_path);
@@ -7645,6 +7717,18 @@ impl StorageHandle {
             database_page_stats_sync(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`database_page_stats`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn database_page_stats_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<DatabasePageStats> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("database_page_stats cancelled: {err}"))
+        })?;
+        self.database_page_stats().await
     }
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
@@ -21073,6 +21157,60 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 141 maintenance cluster —
+/// 6 new storage cx-first siblings exercised end-to-end:
+/// `retention_cleanup_with_cx` (composite),
+/// `aggregate_daily_metrics_with_cx`, `aggregate_by_agent_with_cx`,
+/// `vacuum_with_cx`, `checkpoint_with_cx`,
+/// `database_page_stats_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick141_maintenance_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick141_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. vacuum_with_cx on an empty DB — should succeed.
+        storage.vacuum_with_cx(&cx).await.unwrap();
+
+        // 2. checkpoint_with_cx — returns a CheckpointResult.
+        let _ckpt = storage.checkpoint_with_cx(&cx).await.unwrap();
+
+        // 3. database_page_stats_with_cx — returns stats for the fresh DB.
+        let _stats = storage.database_page_stats_with_cx(&cx).await.unwrap();
+
+        // 4. aggregate_daily_metrics_with_cx — empty result on fresh DB,
+        //    but the call must roundtrip cleanly.
+        let daily = storage
+            .aggregate_daily_metrics_with_cx(&cx, 0)
+            .await
+            .unwrap();
+        assert!(daily.is_empty());
+
+        // 5. aggregate_by_agent_with_cx — likewise empty on fresh DB.
+        let by_agent = storage.aggregate_by_agent_with_cx(&cx, 0).await.unwrap();
+        assert!(by_agent.is_empty());
+
+        // 6. retention_cleanup_with_cx — composite that cx-threads both
+        //    prune_segments_before_with_cx + record_maintenance_with_cx.
+        //    On an empty DB it should delete 0 segments but still log the
+        //    maintenance event.
+        let deleted = storage
+            .retention_cleanup_with_cx(&cx, 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "no segments to delete on fresh DB");
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
