@@ -47,19 +47,53 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`start_web_server`].
 ///
-/// Pre-flight checkpoint gates server startup before the bind
-/// address is validated or the listener is opened. Cx-driven
-/// CLI callers that have been cancelled can bail before taking
-/// a port. Delegates to [`start_web_server`] for the actual
-/// work so the legacy path remains authoritative.
+/// Threads the caller's cx through to
+/// `FrameworkWebRuntime::start_with_cx` so the accept loop
+/// inherits the caller's capability context (not a fresh
+/// per-request one). Cancellation/budget/virtual-time propagate
+/// into every accepted connection.
+///
+/// Tick 101 upgraded this from a simple pre-flight delegate to
+/// a true cx-threading entry point.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn start_web_server_with_cx(
     cx: &crate::cx::Cx,
     config: WebServerConfig,
 ) -> Result<WebServerHandle> {
+    use tracing::info;
+
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("start_web_server cancelled: {err}")))?;
-    start_web_server(config).await
+
+    if !config.is_localhost() && !config.allow_public_bind {
+        return Err(Error::Runtime(format!(
+            "refusing to bind on public address '{}' — \
+             use --dangerous-bind-any or with_dangerous_public_bind() to override",
+            config.host
+        )));
+    }
+    if !config.is_localhost() {
+        warn!(
+            target: "wa.web",
+            host = %config.host,
+            "binding web server on non-localhost address — endpoints may be remotely reachable"
+        );
+    }
+    let bind_addr = config.bind_addr();
+    let app = super::build_app(config.storage, config.event_bus);
+    let (local_addr, runtime) =
+        crate::web_framework::FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
+
+    info!(
+        target: "wa.web",
+        bound_addr = %local_addr,
+        "web server listening (cx-first)"
+    );
+
+    Ok(WebServerHandle {
+        bound_addr: local_addr,
+        runtime,
+    })
 }
 
 /// Run the web server until Ctrl+C, then shut down gracefully.

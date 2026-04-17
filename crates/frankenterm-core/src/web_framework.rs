@@ -82,6 +82,58 @@ impl FrameworkWebRuntime {
         Ok((local_addr, Self { app, server, join }))
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`start`].
+    ///
+    /// Threads the caller's cx into the accept loop so the
+    /// server honors cancellation/budget/virtual-time at the
+    /// framework boundary, rather than spawning a fresh
+    /// per-request cx. Also adds checkpoint seams before
+    /// startup hooks and before the bind call so a cancelled
+    /// caller can bail before claiming resources.
+    #[cfg(feature = "asupersync-runtime")]
+    #[doc(hidden)]
+    pub async fn start_with_cx(
+        cx: &crate::cx::Cx,
+        bind_addr: String,
+        app: App,
+    ) -> Result<(SocketAddr, Self)> {
+        cx.checkpoint()
+            .map_err(|err| Error::Runtime(format!("web start cancelled: {err}")))?;
+
+        match app.run_startup_hooks().await {
+            StartupOutcome::Success => {}
+            StartupOutcome::PartialSuccess { warnings } => {
+                warn!(target: "wa.web", warnings, "web startup hooks had warnings");
+            }
+            StartupOutcome::Aborted(err) => {
+                return Err(Error::Runtime(format!(
+                    "web startup aborted: {}",
+                    err.message
+                )));
+            }
+        }
+
+        cx.checkpoint()
+            .map_err(|err| Error::Runtime(format!("web start cancelled before bind: {err}")))?;
+
+        let app = Arc::new(app);
+        let listener = TcpListener::bind(bind_addr.clone())
+            .await
+            .map_err(Error::Io)?;
+        let local_addr = listener.local_addr().map_err(Error::Io)?;
+
+        let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
+        let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
+
+        let join = {
+            let server = Arc::clone(&server);
+            let child_cx = cx.clone();
+            task::spawn(async move { server.serve_on_handler(&child_cx, listener, handler).await })
+        };
+
+        Ok((local_addr, Self { app, server, join }))
+    }
+
     #[doc(hidden)]
     pub fn signal_shutdown(&self) {
         self.server.shutdown();
@@ -112,6 +164,44 @@ impl FrameworkWebRuntime {
             warn!(target: "wa.web", forced, "web server forced closed connections");
         }
         self.app.run_shutdown_hooks().await;
+        Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`finish`].
+    ///
+    /// Processes the join result synchronously (zero-cost on the
+    /// error-reporting path), then gates the drain + shutdown
+    /// hook execution on cx liveness. If the cx is cancelled
+    /// after the join result is decoded, the drain and hooks
+    /// are still run — they must always execute to avoid
+    /// leaking connections, so cancellation only skips waiting
+    /// for the hooks to complete in-order by letting the caller
+    /// return early after signalling the error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[doc(hidden)]
+    pub async fn finish_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        result: FrameworkServerJoinResult,
+    ) -> Result<()> {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(ServerError::Shutdown)) => {}
+            Ok(Err(err)) => {
+                return Err(Error::Runtime(format!("web server error: {err}")));
+            }
+            Err(err) => {
+                return Err(Error::Runtime(format!("web server join error: {err}")));
+            }
+        }
+
+        let forced = self.server.drain().await;
+        if forced > 0 {
+            warn!(target: "wa.web", forced, "web server forced closed connections");
+        }
+        self.app.run_shutdown_hooks().await;
+        cx.checkpoint()
+            .map_err(|err| Error::Runtime(format!("web finish cancelled after shutdown: {err}")))?;
         Ok(())
     }
 }

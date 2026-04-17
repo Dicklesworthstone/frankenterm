@@ -250,12 +250,15 @@ impl WebServerHandle {
     /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].
     ///
     /// Signals shutdown + pokes the listener unconditionally so
-    /// the accept loop always wakes up, then awaits
-    /// completion only if the cx is not already cancelled. If
-    /// the cx is cancelled at entry, returns a cancellation
-    /// error immediately after signalling — the background
-    /// runtime will still wind down on its own, but the caller
-    /// does not block.
+    /// the accept loop always wakes up, then routes through
+    /// `FrameworkWebRuntime::finish_with_cx` so the drain +
+    /// shutdown-hook phase is also cx-aware. A cancelled cx
+    /// allows the caller to return early after shutdown hooks
+    /// complete, instead of blocking further in the caller's
+    /// control flow.
+    ///
+    /// Tick 101 upgraded this from a pre-flight-only delegate to
+    /// a two-seam path that threads cx through finish.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
         let WebServerHandle {
@@ -267,7 +270,7 @@ impl WebServerHandle {
         cx.checkpoint()
             .map_err(|err| crate::Error::Runtime(format!("web shutdown cancelled: {err}")))?;
         let result = runtime.join_handle_mut().await;
-        runtime.finish(result).await
+        runtime.finish_with_cx(cx, result).await
     }
 }
 
