@@ -289,22 +289,109 @@ pub trait RecorderStorage: Send + Sync {
         req: AppendRequest,
     ) -> std::result::Result<AppendResponse, RecorderStorageError>;
 
+    /// Cx-first [`Self::append_batch`] (ft-xbnl0.2.3). Default
+    /// implementation checks caller cancellation via `cx.checkpoint()?`
+    /// before delegating to the non-cx `append_batch`. Concrete
+    /// backends with internal cancellation support (e.g. a
+    /// `timeout_with_cx`-aware write path) SHOULD override to
+    /// thread cx deeper.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn append_batch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        req: AppendRequest,
+    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+        cx.checkpoint().map_err(|err| {
+            RecorderStorageError::Io(std::io::Error::other(format!(
+                "append_batch cancelled pre-start: {err}"
+            )))
+        })?;
+        self.append_batch(req).await
+    }
+
     async fn flush(&self, mode: FlushMode)
     -> std::result::Result<FlushStats, RecorderStorageError>;
+
+    /// Cx-first [`Self::flush`] (ft-xbnl0.2.3). Default
+    /// implementation checks caller cancellation before
+    /// delegating to the non-cx `flush`.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn flush_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mode: FlushMode,
+    ) -> std::result::Result<FlushStats, RecorderStorageError> {
+        cx.checkpoint().map_err(|err| {
+            RecorderStorageError::Io(std::io::Error::other(format!(
+                "flush cancelled pre-start: {err}"
+            )))
+        })?;
+        self.flush(mode).await
+    }
 
     async fn read_checkpoint(
         &self,
         consumer: &CheckpointConsumerId,
     ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError>;
 
+    /// Cx-first [`Self::read_checkpoint`] (ft-xbnl0.2.3). Default
+    /// implementation checks caller cancellation before
+    /// delegating to the non-cx `read_checkpoint`.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn read_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        consumer: &CheckpointConsumerId,
+    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+        cx.checkpoint().map_err(|err| {
+            RecorderStorageError::Io(std::io::Error::other(format!(
+                "read_checkpoint cancelled pre-start: {err}"
+            )))
+        })?;
+        self.read_checkpoint(consumer).await
+    }
+
     async fn commit_checkpoint(
         &self,
         checkpoint: RecorderCheckpoint,
     ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError>;
 
+    /// Cx-first [`Self::commit_checkpoint`] (ft-xbnl0.2.3).
+    /// Default implementation checks caller cancellation before
+    /// delegating to the non-cx `commit_checkpoint`.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn commit_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        checkpoint: RecorderCheckpoint,
+    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+        cx.checkpoint().map_err(|err| {
+            RecorderStorageError::Io(std::io::Error::other(format!(
+                "commit_checkpoint cancelled pre-start: {err}"
+            )))
+        })?;
+        self.commit_checkpoint(checkpoint).await
+    }
+
     async fn health(&self) -> RecorderStorageHealth;
 
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError>;
+
+    /// Cx-first [`Self::lag_metrics`] (ft-xbnl0.2.3). Default
+    /// implementation checks caller cancellation before
+    /// delegating to the non-cx `lag_metrics`.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn lag_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+        cx.checkpoint().map_err(|err| {
+            RecorderStorageError::Io(std::io::Error::other(format!(
+                "lag_metrics cancelled pre-start: {err}"
+            )))
+        })?;
+        self.lag_metrics().await
+    }
 }
 
 /// Append-log backend configuration.
@@ -1298,6 +1385,111 @@ mod tests {
             assert_eq!(r2.first_offset.ordinal, 2);
             assert!(r2.first_offset.byte_offset > r1.first_offset.byte_offset);
             assert_eq!(r2.last_offset.ordinal, 2);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: default trait `append_batch_with_cx`
+    /// must match the legacy `append_batch` for an uncancelled
+    /// cx, producing identical AppendResponse fields (ordinals,
+    /// byte_offsets). The default delegates to `append_batch`
+    /// after a checkpoint, so for an uncancelled cx they are
+    /// observationally equivalent. This test pins the contract
+    /// so that overriding backends (when added) won't
+    /// accidentally regress the default-delegation parity.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn trait_append_batch_with_cx_matches_legacy() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+            let cx = crate::cx::for_request();
+
+            let cx_response = storage
+                .append_batch_with_cx(
+                    &cx,
+                    AppendRequest {
+                        batch_id: "cx-b1".to_string(),
+                        events: vec![sample_event("cx-e1", 1, 0, "first")],
+                        required_durability: DurabilityLevel::Appended,
+                        producer_ts_ms: 1,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let legacy_response = storage
+                .append_batch(AppendRequest {
+                    batch_id: "legacy-b1".to_string(),
+                    events: vec![sample_event("legacy-e1", 1, 1, "second")],
+                    required_durability: DurabilityLevel::Appended,
+                    producer_ts_ms: 2,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(cx_response.first_offset.ordinal, 0);
+            assert_eq!(cx_response.last_offset.ordinal, 0);
+            assert_eq!(legacy_response.first_offset.ordinal, 1);
+            assert_eq!(legacy_response.last_offset.ordinal, 1);
+            // Byte offsets are monotonically increasing across
+            // both cx and legacy append paths — proves the
+            // Cx-first default didn't accidentally re-order or
+            // skip the write.
+            assert!(
+                legacy_response.first_offset.byte_offset > cx_response.first_offset.byte_offset,
+                "legacy byte_offset must follow cx byte_offset in the same storage"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: default trait
+    /// `read_checkpoint_with_cx` and `commit_checkpoint_with_cx`
+    /// must round-trip correctly for uncancelled cx. Writes a
+    /// checkpoint via the Cx-first commit variant, reads it
+    /// back via the Cx-first read variant, asserts parity.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn trait_checkpoint_cx_variants_round_trip() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let storage = AppendLogRecorderStorage::open(test_config(dir.path())).unwrap();
+            let cx = crate::cx::for_request();
+
+            let consumer = CheckpointConsumerId("cx-test".to_string());
+            let checkpoint = RecorderCheckpoint {
+                consumer: consumer.clone(),
+                upto_offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset: 100,
+                    ordinal: 7,
+                },
+                schema_version: "ft.recorder.event.v1".to_string(),
+                committed_at_ms: 1_700_000_000,
+            };
+
+            let commit_outcome = storage
+                .commit_checkpoint_with_cx(&cx, checkpoint.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    commit_outcome,
+                    CheckpointCommitOutcome::Advanced
+                        | CheckpointCommitOutcome::NoopAlreadyAdvanced
+                ),
+                "commit_checkpoint_with_cx should advance: got {commit_outcome:?}"
+            );
+
+            let read_back = storage
+                .read_checkpoint_with_cx(&cx, &consumer)
+                .await
+                .unwrap()
+                .expect("read_checkpoint_with_cx must return the just-written checkpoint");
+
+            assert_eq!(read_back.consumer.0, "cx-test");
+            assert_eq!(read_back.upto_offset.ordinal, 7);
+            assert_eq!(read_back.upto_offset.byte_offset, 100);
+            assert_eq!(read_back.schema_version, "ft.recorder.event.v1");
         });
     }
 
