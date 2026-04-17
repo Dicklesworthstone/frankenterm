@@ -1605,6 +1605,20 @@ impl WeztermClient {
         Ok(())
     }
 
+    /// Cx-first [`activate_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
+    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// underlying `wezterm cli activate-pane` invocation honors
+    /// cancellation, budget, and virtual time from the caller's
+    /// context rather than the ambient thread-local one.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn activate_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
+        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
+        Ok(())
+    }
+
     /// Get the pane ID in a specific direction from the current pane
     ///
     /// # Arguments
@@ -1812,6 +1826,31 @@ impl WeztermClient {
         }
     }
 
+    /// Cx-first variant of [`run_cli_with_pane_check`] (ft-xbnl0.2.3).
+    /// Threads `cx` through [`Self::run_cli_with_cx`] and applies the
+    /// same pane-level error mapping so `PaneNotFound` is surfaced
+    /// consistently between the legacy and Cx paths.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn run_cli_with_pane_check_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        pane_id: u64,
+    ) -> Result<String> {
+        match self.run_cli_with_cx(cx, args).await {
+            Ok(output) => Ok(output),
+            Err(crate::Error::Wezterm(WeztermError::CommandFailed(ref stderr)))
+                if stderr.contains("pane")
+                    && (stderr.contains("not found")
+                        || stderr.contains("does not exist")
+                        || stderr.contains("no such")) =>
+            {
+                Err(WeztermError::PaneNotFound(pane_id).into())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Run a WezTerm CLI command with timeout
     ///
     /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
@@ -1843,6 +1882,58 @@ impl WeztermClient {
             Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
         };
 
+        Self::finalize_cli_output(output)
+    }
+
+    /// Cx-first [`run_cli`] variant (ft-xbnl0.2.3). Binds the subprocess
+    /// timeout to the provided `Cx` via
+    /// [`crate::runtime_compat::timeout_with_cx`] so caller cancellation,
+    /// budget, and virtual time propagate into `wezterm cli` invocations.
+    ///
+    /// Mirrors the pattern in [`crate::cass::CassClient::run_with_cx`] and
+    /// [`crate::caut::CautClient::run_with_cx`]. Pre-flight socket-path
+    /// check and post-execution error categorization are shared via
+    /// [`Self::finalize_cli_output`] so the legacy and Cx paths produce
+    /// bit-for-bit identical error surfaces for the same subprocess
+    /// output.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
+        use crate::runtime_compat::process::Command;
+
+        if let Some(ref socket) = self.socket_path {
+            if !std::path::Path::new(socket).exists() {
+                return Err(WeztermError::SocketNotFound(socket.clone()).into());
+            }
+        }
+
+        let mut cmd = Command::new(wezterm_binary());
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+
+        if let Some(ref socket) = self.socket_path {
+            cmd.env("WEZTERM_UNIX_SOCKET", socket);
+        }
+
+        let timeout_duration = Duration::from_secs(self.timeout_secs);
+        let output = match crate::runtime_compat::timeout_with_cx(
+            cx,
+            timeout_duration,
+            cmd.output(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| Self::categorize_io_error(&e))?,
+            Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
+        };
+
+        Self::finalize_cli_output(output)
+    }
+
+    /// Shared post-timeout validation: checks exit status, stderr
+    /// (truncated safely on char boundaries), and maps common error
+    /// strings to structured variants. Extracted so `run_cli` and
+    /// `run_cli_with_cx` share the exact same error surface.
+    fn finalize_cli_output(output: std::process::Output) -> Result<String> {
         if !output.status.success() {
             const MAX_ERROR_CHARS: usize = 8 * 1024;
             let stderr_full = String::from_utf8_lossy(&output.stderr);
@@ -3562,6 +3653,54 @@ mod tests {
         let client = WeztermClient::new().with_retries(5).with_retry_delay_ms(10);
         assert_eq!(client.retry_attempts, 5);
         assert_eq!(client.retry_delay_ms, 10);
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `activate_pane_with_cx` must honor the
+    /// socket-path pre-check before any async I/O is dispatched. With a
+    /// socket path pointing at a guaranteed-nonexistent location, the
+    /// Cx-first entry point short-circuits to `SocketNotFound` without
+    /// touching cx's timeout budget or spawning wezterm. Pins the
+    /// new `run_cli_with_cx` -> `run_cli_with_pane_check_with_cx` ->
+    /// `activate_pane_with_cx` call chain (regression guard: if a
+    /// future refactor accidentally bypassed the pre-check on the cx
+    /// path, this test would surface a different error variant —
+    /// CliNotFound, Timeout, or CommandFailed — instead of the
+    /// expected SocketNotFound).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn activate_pane_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            // Use a path under the temp dir that we guarantee doesn't
+            // exist by appending a fresh unique component.
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick40-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+
+            let cx = crate::cx::for_request();
+            let err = client
+                .activate_pane_with_cx(&cx, 42)
+                .await
+                .expect_err("missing socket should short-circuit");
+
+            match err {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!("expected Wezterm(SocketNotFound) from cx-first path, got {other:?}")
+                }
+            }
+        });
     }
 
     #[test]
