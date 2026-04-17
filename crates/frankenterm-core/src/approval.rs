@@ -249,6 +249,81 @@ impl<'a> ApprovalStore<'a> {
         })
     }
 
+    /// Cx-first [`Self::issue_for_plan`] (ft-xbnl0.2.3). Parallel
+    /// of tick-59's `issue_with_cx` for the plan-bound variant.
+    /// Threads cx through the same two storage calls
+    /// (count_active_approvals + insert_approval_token) via
+    /// checkpoint seams at the same two points: pre-flight and
+    /// between count and insert. The plan_hash/plan_version/
+    /// risk_summary semantics are identical to the legacy
+    /// `issue_for_plan`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn issue_for_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        input: &PolicyInput,
+        plan_hash: &str,
+        plan_version: Option<i32>,
+        risk_summary: Option<String>,
+    ) -> Result<ApprovalRequest> {
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "approval.issue_for_plan cancelled pre-start: {err}"
+            ))
+        })?;
+
+        let now = now_ms();
+        let active = self
+            .storage
+            .count_active_approvals(&self.workspace_id, now)
+            .await?;
+        if active >= self.config.max_active_tokens {
+            return Err(Error::Policy(format!(
+                "Approval token limit reached ({active}/{})",
+                self.config.max_active_tokens
+            )));
+        }
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "approval.issue_for_plan cancelled between count and insert (active={active}): {err}"
+            ))
+        })?;
+
+        let code = generate_allow_once_code(DEFAULT_CODE_LEN);
+        let code_hash = hash_allow_once_code(&code);
+        let fingerprint = fingerprint_for_input(input);
+        let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
+
+        let summary_text = risk_summary
+            .clone()
+            .unwrap_or_else(|| summary_for_input(input));
+
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: code_hash.clone(),
+            created_at: now,
+            expires_at,
+            used_at: None,
+            workspace_id: self.workspace_id.clone(),
+            action_kind: input.action.as_str().to_string(),
+            pane_id: input.pane_id,
+            action_fingerprint: fingerprint,
+            plan_hash: Some(plan_hash.to_string()),
+            plan_version,
+            risk_summary: risk_summary.clone(),
+        };
+        self.storage.insert_approval_token(token).await?;
+
+        Ok(ApprovalRequest {
+            allow_once_code: code.clone(),
+            allow_once_full_hash: code_hash,
+            expires_at,
+            summary: summary_text,
+            command: format!("ft approve {code}"),
+        })
+    }
+
     /// Consume a plan-bound approval, validating that the plan_hash matches.
     ///
     /// Returns `None` if the token doesn't exist, has expired, was already
@@ -1200,6 +1275,116 @@ mod tests {
     // -----------------------------------------------------------------------
     // Async integration tests (existing)
     // -----------------------------------------------------------------------
+
+    /// ft-xbnl0.2.3 Cx-first: `issue_for_plan_with_cx` must match
+    /// the legacy `issue_for_plan` for an uncancelled cx.
+    /// Parallel to tick-59's `issue_with_cx` test with the
+    /// additional plan_hash binding check: the Cx-first-issued
+    /// plan-bound token must be consumable via the legacy
+    /// `consume_for_plan` only when the SAME plan_hash is
+    /// presented (TOCTOU protection preserved), and a mismatched
+    /// plan_hash must still fail even though the token itself is
+    /// valid.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn issue_for_plan_with_cx_preserves_plan_binding() {
+        run_async_test(async {
+            let temp_dir = std::env::temp_dir();
+            let db_path = temp_dir.join(format!(
+                "wa_test_approval_issue_plan_cx_{}.db",
+                std::process::id()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path_str).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+            let cx = crate::cx::for_request();
+            let plan_hash = "sha256:plan-cx-binding-test";
+
+            // Token 1: test matching plan_hash consumes successfully.
+            let request_match = store
+                .issue_for_plan_with_cx(
+                    &cx,
+                    &input,
+                    plan_hash,
+                    Some(7),
+                    Some("Cx-first plan binding".to_string()),
+                )
+                .await
+                .unwrap();
+            assert!(request_match.allow_once_full_hash.starts_with("sha256:"));
+            assert_eq!(request_match.summary, "Cx-first plan binding");
+
+            let matched = store
+                .consume_for_plan(&request_match.allow_once_code, &input, plan_hash)
+                .await
+                .unwrap();
+            assert!(
+                matched.is_some(),
+                "matching plan_hash must consume Cx-issued plan-bound token"
+            );
+            let token = matched.unwrap();
+            assert_eq!(token.plan_hash.as_deref(), Some(plan_hash));
+            assert_eq!(token.plan_version, Some(7));
+            assert_eq!(token.risk_summary.as_deref(), Some("Cx-first plan binding"));
+
+            // Token 2: test mismatched plan_hash rejects.
+            // The legacy semantic is TOCTOU-safe — a mismatched
+            // plan_hash returns None but also consumes the token
+            // so it cannot be reused with the correct hash.
+            let request_mismatch = store
+                .issue_for_plan_with_cx(&cx, &input, plan_hash, Some(7), None)
+                .await
+                .unwrap();
+            let rejected = store
+                .consume_for_plan(
+                    &request_mismatch.allow_once_code,
+                    &input,
+                    "sha256:wrong-plan",
+                )
+                .await
+                .unwrap();
+            assert!(
+                rejected.is_none(),
+                "mismatched plan_hash must reject consumption"
+            );
+            // Double-check: even re-trying with the correct hash
+            // fails because the token was already consumed (TOCTOU
+            // protection — a mismatched presentation invalidates
+            // the token).
+            let retry = store
+                .consume_for_plan(&request_mismatch.allow_once_code, &input, plan_hash)
+                .await
+                .unwrap();
+            assert!(
+                retry.is_none(),
+                "TOCTOU protection: mismatched plan_hash must have consumed the token"
+            );
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        });
+    }
 
     /// ft-xbnl0.2.3 Cx-first: `issue_with_cx` must match the
     /// legacy `issue` for an uncancelled cx. Exercises the full
