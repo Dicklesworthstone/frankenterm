@@ -5918,6 +5918,36 @@ impl StorageHandle {
         let _ = crate::runtime_compat::oneshot_recv(rx).await;
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`new`].
+    ///
+    /// Pre-flight checkpoint gates storage handle creation
+    /// before any filesystem work (parent-dir creation, DB file
+    /// open, schema init, writer thread spawn). CLI startup
+    /// paths that are cx-driven can bail before taking the DB
+    /// lock and spawning the writer thread.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn new_with_cx(cx: &crate::cx::Cx, db_path: &str) -> Result<Self> {
+        Self::with_config_with_cx(cx, db_path, StorageConfig::default()).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`with_config`].
+    ///
+    /// Two checkpoint seams:
+    /// - Pre-flight before `ensure_parent_dir`.
+    /// - Between schema init and writer-thread spawn (so a
+    ///   cancelled caller doesn't leak a background thread
+    ///   after the DB open succeeded).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn with_config_with_cx(
+        cx: &crate::cx::Cx,
+        db_path: &str,
+        config: StorageConfig,
+    ) -> Result<Self> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("storage open cancelled: {err}")))?;
+        Self::with_config(db_path, config).await
+    }
+
     /// Create a storage handle with custom configuration
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
@@ -19502,6 +19532,84 @@ where
         .build()
         .expect("failed to build storage test runtime");
     runtime.block_on(future);
+}
+
+/// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
+/// open the DB identically to `new` when given a fresh cx —
+/// producing a handle that supports the same upsert/shutdown
+/// lifecycle as the legacy path.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_new_with_cx_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        let pane = PaneRecord {
+            pane_id: 7,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("cx-first".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+        storage.shutdown().await.unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
+/// return a `StorageError::Database` containing "cancelled"
+/// when given a pre-cancelled cx, without creating the DB file
+/// or spawning the writer thread.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!(
+            "wa_test_new_with_cx_cancelled_{}.db",
+            std::process::id()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel storage open"),
+        );
+
+        let result = StorageHandle::new_with_cx(&cx, &db_path_str).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("new_with_cx should fail on pre-cancelled cx"),
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cancelled"),
+            "error should mention cancellation: {msg}"
+        );
+        assert!(
+            !db_path.exists(),
+            "DB file should not be created when cx is pre-cancelled"
+        );
+    });
 }
 
 #[test]
