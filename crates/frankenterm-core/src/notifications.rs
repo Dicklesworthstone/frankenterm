@@ -310,6 +310,72 @@ impl NotificationPipeline {
         }
     }
 
+    /// Gate and dispatch a detection event, bound to the caller's
+    /// asupersync capability context (ft-xbnl0.2.3 Cx-first entry
+    /// point).
+    ///
+    /// The internal `mute_store` RwLock acquire uses `read_with_cx(cx)`
+    /// (the primitive from tick 9) so a caller-cancelled mute-check
+    /// propagates cleanly through the lock wait. The
+    /// `storage_guard.is_event_muted` and `sender.send` calls still
+    /// use ambient Cx since `StorageHandle` and the `NotificationSender`
+    /// trait are not yet Cx-first at the trait level.
+    ///
+    /// The legacy [`handle_detection`](Self::handle_detection) entry
+    /// point is preserved for non-migrated callers; this is strictly
+    /// additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn handle_detection_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        detection: &Detection,
+        pane_id: u64,
+        pane_uuid: Option<&str>,
+        event_id: Option<i64>,
+    ) -> NotificationOutcome {
+        if let Some(storage) = &self.mute_store {
+            let identity_key = event_identity_key(detection, pane_id, pane_uuid);
+            let now_ms = now_epoch_ms();
+            let muted = {
+                let storage_guard = storage.read_with_cx(cx).await;
+                storage_guard
+                    .is_event_muted(&identity_key, now_ms)
+                    .await
+                    .unwrap_or(false)
+            };
+            if muted {
+                return NotificationOutcome {
+                    decision: NotifyDecision::Filtered,
+                    deliveries: Vec::new(),
+                };
+            }
+        }
+
+        let decision = self.gate.should_notify(detection, pane_id, pane_uuid);
+        match decision {
+            NotifyDecision::Send {
+                suppressed_since_last,
+            } => {
+                let rendered = render_detection(detection, pane_id, event_id);
+                let payload = NotificationPayload::from_detection(
+                    detection,
+                    pane_id,
+                    &rendered,
+                    suppressed_since_last,
+                );
+                let deliveries = self.dispatch_payload(&payload).await;
+                NotificationOutcome {
+                    decision,
+                    deliveries,
+                }
+            }
+            _ => NotificationOutcome {
+                decision,
+                deliveries: Vec::new(),
+            },
+        }
+    }
+
     async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<NotificationDelivery> {
         let mut deliveries = Vec::with_capacity(self.senders.len());
         for sender in &self.senders {
@@ -884,6 +950,72 @@ mod tests {
             assert!(
                 sent.lock().unwrap().is_empty(),
                 "muted event should not be sent"
+            );
+
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: handle_detection_with_cx with a fresh Cx
+    /// behaves identically to handle_detection for the mute-filter path.
+    /// Pins no-regression on the Cx-first variant.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pipeline_with_cx_mute_store_blocks_muted_events() {
+        run_async_test(async {
+            use crate::events::event_identity_key;
+            use crate::storage::{EventMuteRecord, StorageHandle};
+
+            let db_path = std::env::temp_dir()
+                .join(format!("wa_notif_cx_test_mute_{}.db", std::process::id()));
+            let db_str = db_path.to_string_lossy().to_string();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+            let storage = StorageHandle::new(&db_str).await.expect("open test db");
+
+            let detection = test_detection();
+            let identity_key = event_identity_key(&detection, 7, None);
+            let now_ms = crate::storage::now_ms();
+            storage
+                .add_event_mute(EventMuteRecord {
+                    identity_key,
+                    scope: "workspace".to_string(),
+                    created_at: now_ms,
+                    expires_at: None,
+                    created_by: Some("test".to_string()),
+                    reason: Some("too noisy".to_string()),
+                })
+                .await
+                .unwrap();
+
+            let filter = EventFilter::allow_all();
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let sender = MockSender::new("mock", Arc::clone(&sent));
+            let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
+            let mut pipeline =
+                NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
+
+            let cx = crate::cx::for_request();
+            let outcome = pipeline
+                .handle_detection_with_cx(&cx, &detection, 7, None, None)
+                .await;
+
+            assert!(
+                matches!(outcome.decision, NotifyDecision::Filtered),
+                "muted event should be filtered under Cx-first path"
+            );
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "muted event should not be sent under Cx-first path"
             );
 
             let _ = std::fs::remove_file(&db_path);
