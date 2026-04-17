@@ -137,7 +137,8 @@ pub async fn cleanup_preview_with_cx(
         ..Default::default()
     };
 
-    let events_summaries = preview_events_by_tier(storage, config, now).await?;
+    // ft-xbnl0.2.3 tick 132: route through cx-first helpers + storage.
+    let events_summaries = preview_events_by_tier_with_cx(cx, storage, config, now).await?;
     for summary in &events_summaries {
         plan.total_eligible += summary.eligible_rows;
     }
@@ -149,7 +150,9 @@ pub async fn cleanup_preview_with_cx(
                 "cleanup_preview cancelled before output_segments: {err}"
             ))
         })?;
-        let count = storage.count_segments_before(global_cutoff_ms).await?;
+        let count = storage
+            .count_segments_before_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "output_segments".to_string(),
             eligible_rows: count,
@@ -165,7 +168,9 @@ pub async fn cleanup_preview_with_cx(
                 "cleanup_preview cancelled before audit_actions: {err}"
             ))
         })?;
-        let count = storage.count_audit_actions_before(global_cutoff_ms).await?;
+        let count = storage
+            .count_audit_actions_before_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "audit_actions".to_string(),
             eligible_rows: count,
@@ -181,7 +186,9 @@ pub async fn cleanup_preview_with_cx(
                 "cleanup_preview cancelled before usage_metrics: {err}"
             ))
         })?;
-        let count = storage.count_usage_metrics_before(global_cutoff_ms).await?;
+        let count = storage
+            .count_usage_metrics_before_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "usage_metrics".to_string(),
             eligible_rows: count,
@@ -198,7 +205,7 @@ pub async fn cleanup_preview_with_cx(
             ))
         })?;
         let count = storage
-            .count_notification_history_before(global_cutoff_ms)
+            .count_notification_history_before_with_cx(cx, global_cutoff_ms)
             .await?;
         plan.tables.push(CleanupTableSummary {
             table: "notification_history".to_string(),
@@ -351,7 +358,8 @@ pub async fn cleanup_apply_with_cx(
         ..Default::default()
     };
 
-    let events_summaries = apply_events_by_tier(storage, config, now).await?;
+    // ft-xbnl0.2.3 tick 132: route through cx-first helpers + storage.
+    let events_summaries = apply_events_by_tier_with_cx(cx, storage, config, now).await?;
     for summary in &events_summaries {
         plan.total_eligible += summary.eligible_rows;
         plan.total_deleted += summary.deleted_rows;
@@ -364,8 +372,12 @@ pub async fn cleanup_apply_with_cx(
                 "cleanup_apply cancelled before output_segments: {err}"
             ))
         })?;
-        let count = storage.count_segments_before(global_cutoff_ms).await?;
-        let deleted = storage.prune_segments_before(global_cutoff_ms).await?;
+        let count = storage
+            .count_segments_before_with_cx(cx, global_cutoff_ms)
+            .await?;
+        let deleted = storage
+            .prune_segments_before_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "output_segments".to_string(),
             eligible_rows: count,
@@ -382,8 +394,12 @@ pub async fn cleanup_apply_with_cx(
                 "cleanup_apply cancelled before audit_actions: {err}"
             ))
         })?;
-        let count = storage.count_audit_actions_before(global_cutoff_ms).await?;
-        let deleted = storage.purge_audit_actions_before(global_cutoff_ms).await?;
+        let count = storage
+            .count_audit_actions_before_with_cx(cx, global_cutoff_ms)
+            .await?;
+        let deleted = storage
+            .purge_audit_actions_before_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "audit_actions".to_string(),
             eligible_rows: count,
@@ -400,8 +416,12 @@ pub async fn cleanup_apply_with_cx(
                 "cleanup_apply cancelled before usage_metrics: {err}"
             ))
         })?;
-        let count = storage.count_usage_metrics_before(global_cutoff_ms).await?;
-        let deleted = storage.purge_usage_metrics(global_cutoff_ms).await?;
+        let count = storage
+            .count_usage_metrics_before_with_cx(cx, global_cutoff_ms)
+            .await?;
+        let deleted = storage
+            .purge_usage_metrics_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "usage_metrics".to_string(),
             eligible_rows: count,
@@ -419,9 +439,11 @@ pub async fn cleanup_apply_with_cx(
             ))
         })?;
         let count = storage
-            .count_notification_history_before(global_cutoff_ms)
+            .count_notification_history_before_with_cx(cx, global_cutoff_ms)
             .await?;
-        let deleted = storage.purge_notification_history(global_cutoff_ms).await?;
+        let deleted = storage
+            .purge_notification_history_with_cx(cx, global_cutoff_ms)
+            .await?;
         plan.tables.push(CleanupTableSummary {
             table: "notification_history".to_string(),
             eligible_rows: count,
@@ -434,23 +456,26 @@ pub async fn cleanup_apply_with_cx(
 
     // Log the maintenance event (best-effort — do NOT propagate cx
     // cancellation so late-cancelled callers still record what was
-    // actually deleted).
+    // actually deleted). tick 132: route through cx-first.
     let metadata = serde_json::json!({
         "plan": plan,
     })
     .to_string();
     let _ = storage
-        .record_maintenance(crate::storage::MaintenanceRecord {
-            id: 0,
-            event_type: "tiered_cleanup".to_string(),
-            message: Some(format!(
-                "Cleanup complete: {} rows deleted across {} tables",
-                plan.total_deleted,
-                plan.tables.len()
-            )),
-            metadata: Some(metadata),
-            timestamp: now,
-        })
+        .record_maintenance_with_cx(
+            cx,
+            crate::storage::MaintenanceRecord {
+                id: 0,
+                event_type: "tiered_cleanup".to_string(),
+                message: Some(format!(
+                    "Cleanup complete: {} rows deleted across {} tables",
+                    plan.total_deleted,
+                    plan.tables.len()
+                )),
+                metadata: Some(metadata),
+                timestamp: now,
+            },
+        )
         .await;
 
     Ok(plan)
@@ -496,6 +521,53 @@ async fn preview_events_by_tier(
     Ok(summaries)
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`preview_events_by_tier`].
+#[cfg(feature = "asupersync-runtime")]
+async fn preview_events_by_tier_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    config: &StorageConfig,
+    now: i64,
+) -> crate::Result<Vec<CleanupTableSummary>> {
+    if config.retention_tiers.is_empty() {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
+        if config.retention_days == 0 {
+            return Ok(vec![]);
+        }
+        let count = storage.count_events_before_with_cx(cx, cutoff).await?;
+        return Ok(vec![CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        }]);
+    }
+
+    let mut summaries = Vec::new();
+    for tier in &config.retention_tiers {
+        if tier.retention_days == 0 {
+            continue;
+        }
+        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        let count = storage
+            .count_events_by_tier_with_cx(
+                cx,
+                cutoff,
+                &tier.severities,
+                &tier.event_types,
+                tier.handled,
+            )
+            .await?;
+        summaries.push(CleanupTableSummary {
+            table: format!("events (tier: {})", tier.name),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: tier.retention_days,
+        });
+    }
+    Ok(summaries)
+}
+
 /// Apply tier-based event cleanup.
 async fn apply_events_by_tier(
     storage: &StorageHandle,
@@ -530,6 +602,66 @@ async fn apply_events_by_tier(
             .await?;
         let deleted = storage
             .delete_events_by_tier(
+                cutoff,
+                &tier.severities,
+                &tier.event_types,
+                tier.handled,
+                DELETE_BATCH_SIZE,
+            )
+            .await?;
+        summaries.push(CleanupTableSummary {
+            table: format!("events (tier: {})", tier.name),
+            eligible_rows: count,
+            deleted_rows: deleted,
+            retention_days: tier.retention_days,
+        });
+    }
+    Ok(summaries)
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`apply_events_by_tier`].
+#[cfg(feature = "asupersync-runtime")]
+async fn apply_events_by_tier_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    config: &StorageConfig,
+    now: i64,
+) -> crate::Result<Vec<CleanupTableSummary>> {
+    if config.retention_tiers.is_empty() {
+        let cutoff = retention_cutoff_ms(now, config.retention_days);
+        if config.retention_days == 0 {
+            return Ok(vec![]);
+        }
+        let count = storage.count_events_before_with_cx(cx, cutoff).await?;
+        let deleted = storage
+            .delete_events_before_with_cx(cx, cutoff, DELETE_BATCH_SIZE)
+            .await?;
+        return Ok(vec![CleanupTableSummary {
+            table: "events".to_string(),
+            eligible_rows: count,
+            deleted_rows: deleted,
+            retention_days: config.retention_days,
+        }]);
+    }
+
+    let mut summaries = Vec::new();
+    for tier in &config.retention_tiers {
+        if tier.retention_days == 0 {
+            continue;
+        }
+        let cutoff = retention_cutoff_ms(now, tier.retention_days);
+        let count = storage
+            .count_events_by_tier_with_cx(
+                cx,
+                cutoff,
+                &tier.severities,
+                &tier.event_types,
+                tier.handled,
+            )
+            .await?;
+        let deleted = storage
+            .delete_events_by_tier_with_cx(
+                cx,
                 cutoff,
                 &tier.severities,
                 &tier.event_types,

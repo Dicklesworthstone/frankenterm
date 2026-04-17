@@ -6518,6 +6518,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_maintenance`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_maintenance_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: MaintenanceRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_maintenance cancelled: {err}"))
+        })?;
+        self.record_maintenance(record).await
+    }
+
     /// Record a secret scan report (checkpoint + payload).
     pub async fn record_secret_scan_report(&self, record: SecretScanReportRecord) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
@@ -7049,6 +7062,23 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_by_tier`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_events_by_tier_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        severities: &[String],
+        event_types: &[String],
+        handled: Option<bool>,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_events_by_tier cancelled: {err}"))
+        })?;
+        self.count_events_by_tier(before_ts, severities, event_types, handled)
+            .await
+    }
+
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
@@ -7111,6 +7141,21 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_notification_history_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_notification_history_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!(
+                "count_notification_history_before cancelled: {err}"
+            ))
+        })?;
+        self.count_notification_history_before(before_ts).await
+    }
+
     /// Delete events older than a cutoff (flat, no tier; write-path).
     pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -7124,6 +7169,20 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn delete_events_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        batch_size: usize,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("delete_events_before cancelled: {err}"))
+        })?;
+        self.delete_events_before(before_ts, batch_size).await
     }
 
     /// Delete events matching tier criteria older than a cutoff (write-path).
@@ -7149,6 +7208,24 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_by_tier`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn delete_events_by_tier_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+        severities: &[String],
+        event_types: &[String],
+        handled: Option<bool>,
+        batch_size: usize,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("delete_events_by_tier cancelled: {err}"))
+        })?;
+        self.delete_events_by_tier(before_ts, severities, event_types, handled, batch_size)
+            .await
     }
 
     /// Query notification history with filters.
