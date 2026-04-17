@@ -8577,6 +8577,24 @@ impl StorageHandle {
         Ok(results.into_iter().map(|r| r.segment).collect())
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`search`].
+    ///
+    /// Routes through `search_with_results_with_cx` so the inner call
+    /// honours cancellation as well.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: &str,
+    ) -> Result<Vec<Segment>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("search cancelled: {err}")))?;
+        let results = self
+            .search_with_results_with_cx(cx, query, SearchOptions::default())
+            .await?;
+        Ok(results.into_iter().map(|r| r.segment).collect())
+    }
+
     /// Search segments with options (legacy, returns segments only)
     pub async fn search_with_options(
         &self,
@@ -8584,6 +8602,24 @@ impl StorageHandle {
         options: SearchOptions,
     ) -> Result<Vec<Segment>> {
         let results = self.search_with_results(query, options).await?;
+        Ok(results.into_iter().map(|r| r.segment).collect())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_options`].
+    ///
+    /// Routes through `search_with_results_with_cx` so the inner call
+    /// honours cancellation as well.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_with_options_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<Segment>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("search_with_options cancelled: {err}"))
+        })?;
+        let results = self.search_with_results_with_cx(cx, query, options).await?;
         Ok(results.into_iter().map(|r| r.segment).collect())
     }
 
@@ -8622,6 +8658,20 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_results`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_with_results_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("search_with_results cancelled: {err}"))
+        })?;
+        self.search_with_results(query, options).await
+    }
+
     // =========================================================================
     // Embedding storage (semantic search)
     // =========================================================================
@@ -8656,6 +8706,22 @@ impl StorageHandle {
 
         self.invalidate_semantic_cache();
         Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`store_embedding`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn store_embedding_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        segment_id: i64,
+        embedder_id: &str,
+        dimension: i32,
+        vector: &[u8],
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("store_embedding cancelled: {err}")))?;
+        self.store_embedding(segment_id, embedder_id, dimension, vector)
+            .await
     }
 
     /// Get segment IDs that have no embedding for the given embedder.
@@ -8694,6 +8760,20 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_unembedded_segments`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_unembedded_segments_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        embedder_id: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_unembedded_segments cancelled: {err}"))
+        })?;
+        self.get_unembedded_segments(embedder_id, limit).await
+    }
+
     /// Get the embedding for a specific segment.
     pub async fn get_embedding(
         &self,
@@ -8720,6 +8800,19 @@ impl StorageHandle {
             Ok(result)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_embedding`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_embedding_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        segment_id: i64,
+        embedder_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_embedding cancelled: {err}")))?;
+        self.get_embedding(segment_id, embedder_id).await
     }
 
     /// Get embedding statistics per embedder.
@@ -8758,6 +8851,17 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn embedding_stats_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<EmbeddingStats>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
+        self.embedding_stats().await
+    }
+
     /// Store an f32 embedding vector (little-endian packed) for a segment.
     pub async fn store_embedding_f32(
         &self,
@@ -8775,6 +8879,34 @@ impl StorageHandle {
             StorageError::Database("store_embedding_f32: vector dimension exceeds i32".to_string())
         })?;
         self.store_embedding(segment_id, embedder_id, dimension, &bytes)
+            .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`store_embedding_f32`].
+    ///
+    /// Composite: packs f32 → bytes, then routes through
+    /// `store_embedding_with_cx` so the inner write honours cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn store_embedding_f32_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        segment_id: i64,
+        embedder_id: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("store_embedding_f32 cancelled: {err}"))
+        })?;
+        if vector.is_empty() {
+            return Err(
+                StorageError::Database("store_embedding_f32: vector is empty".to_string()).into(),
+            );
+        }
+        let bytes = encode_f32_embedding_blob(vector)?;
+        let dimension = i32::try_from(vector.len()).map_err(|_| {
+            StorageError::Database("store_embedding_f32: vector dimension exceeds i32".to_string())
+        })?;
+        self.store_embedding_with_cx(cx, segment_id, embedder_id, dimension, &bytes)
             .await
     }
 
@@ -8798,6 +8930,21 @@ impl StorageHandle {
             search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`semantic_search`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn semantic_search_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        embedder_id: &str,
+        query_vector: &[f32],
+        options: SearchOptions,
+    ) -> Result<Vec<SemanticSearchHit>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("semantic_search cancelled: {err}")))?;
+        self.semantic_search(embedder_id, query_vector, options)
+            .await
     }
 
     /// Hybrid lexical+semantic retrieval using deterministic fusion.
@@ -8840,6 +8987,39 @@ impl StorageHandle {
                 &semantic_budget_state,
             )
         })
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`hybrid_search_with_results`].
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_with_results_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: &str,
+        options: SearchOptions,
+        embedder_id: &str,
+        query_vector: &[f32],
+        mode: SearchMode,
+        rrf_k: u32,
+        lexical_weight: f32,
+        semantic_weight: f32,
+        fusion_backend: Option<FusionBackend>,
+    ) -> Result<HybridSearchBundle> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("hybrid_search_with_results cancelled: {err}"))
+        })?;
+        self.hybrid_search_with_results(
+            query,
+            options,
+            embedder_id,
+            query_vector,
+            mode,
+            rrf_k,
+            lexical_weight,
+            semantic_weight,
+            fusion_backend,
+        )
         .await
     }
 
@@ -21649,6 +21829,153 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 149 search/semantic cluster — the
+/// final 10 siblings needed to complete storage cx-first coverage
+/// (140/140 pub async fns).
+///
+/// Siblings exercised:
+/// `search_with_cx`, `search_with_options_with_cx`,
+/// `search_with_results_with_cx`, `store_embedding_with_cx`,
+/// `get_unembedded_segments_with_cx`, `get_embedding_with_cx`,
+/// `embedding_stats_with_cx`, `store_embedding_f32_with_cx`,
+/// `semantic_search_with_cx`, `hybrid_search_with_results_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick149_search_semantic_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick149_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // FTS lexical: an empty DB just exercises the call surface and
+        // must roundtrip cleanly. The underlying search_fts_with_snippets
+        // returns `Ok(vec![])` on a fresh index.
+        let empty_search = storage.search_with_cx(&cx, "tick149").await.unwrap();
+        assert!(empty_search.is_empty());
+        let empty_opts = storage
+            .search_with_options_with_cx(&cx, "tick149", SearchOptions::default())
+            .await
+            .unwrap();
+        assert!(empty_opts.is_empty());
+        let empty_results = storage
+            .search_with_results_with_cx(&cx, "tick149", SearchOptions::default())
+            .await
+            .unwrap();
+        assert!(empty_results.is_empty());
+
+        // Seed pane + two segments for FK on segment_embeddings.
+        let pane = PaneRecord {
+            pane_id: 73,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick149".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+        let seg_a = storage
+            .append_segment_with_cx(&cx, 73, "hello world tick149", None)
+            .await
+            .unwrap();
+        let seg_b = storage
+            .append_segment_with_cx(&cx, 73, "second segment tick149", None)
+            .await
+            .unwrap();
+
+        // Semantic: seed a synthetic embedding via store_embedding_f32_with_cx
+        // (composite), then exercise get / get_unembedded / stats / semantic /
+        // hybrid.
+        let vec_f32 = [0.1_f32, 0.2, 0.3, 0.4];
+        storage
+            .store_embedding_f32_with_cx(&cx, seg_a.id, "embedder-tick149", &vec_f32)
+            .await
+            .unwrap();
+
+        // Also exercise store_embedding_with_cx (bytes path) on seg_b.
+        let raw_bytes = encode_f32_embedding_blob(&vec_f32).unwrap();
+        storage
+            .store_embedding_with_cx(&cx, seg_b.id, "embedder-tick149", 4, &raw_bytes)
+            .await
+            .unwrap();
+
+        // get_embedding_with_cx — retrieves the bytes we stored for seg_a.
+        let retrieved = storage
+            .get_embedding_with_cx(&cx, seg_a.id, "embedder-tick149")
+            .await
+            .unwrap();
+        assert!(retrieved.is_some());
+        let retrieved_bytes = retrieved.unwrap();
+        assert_eq!(retrieved_bytes, raw_bytes);
+
+        // get_unembedded_segments_with_cx — both seg_a and seg_b have
+        // embeddings now, so the set under "embedder-tick149" is empty.
+        // A different embedder still sees both as unembedded.
+        let unembedded_same = storage
+            .get_unembedded_segments_with_cx(&cx, "embedder-tick149", 10)
+            .await
+            .unwrap();
+        assert!(unembedded_same.is_empty());
+        let unembedded_other = storage
+            .get_unembedded_segments_with_cx(&cx, "embedder-other", 10)
+            .await
+            .unwrap();
+        assert_eq!(unembedded_other.len(), 2);
+
+        // embedding_stats_with_cx — one embedder, two rows.
+        let stats = storage.embedding_stats_with_cx(&cx).await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].embedder_id, "embedder-tick149");
+        assert_eq!(stats[0].count, 2);
+
+        // semantic_search_with_cx — semantic hit list against our seeded
+        // vectors. Exact order is a function of cosine similarity; we just
+        // assert the call roundtrips and returns at most 2 hits.
+        let hits = storage
+            .semantic_search_with_cx(
+                &cx,
+                "embedder-tick149",
+                &vec_f32,
+                SearchOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(hits.len() <= 2);
+
+        // hybrid_search_with_results_with_cx — empty FTS corpus so bundle
+        // will be empty-ish, but call must roundtrip cleanly.
+        let bundle = storage
+            .hybrid_search_with_results_with_cx(
+                &cx,
+                "tick149",
+                SearchOptions::default(),
+                "embedder-tick149",
+                &vec_f32,
+                SearchMode::Hybrid,
+                60,
+                0.5,
+                0.5,
+                Some(FusionBackend::FrankenSearchRrf),
+            )
+            .await
+            .unwrap();
+        let _ = bundle;
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
