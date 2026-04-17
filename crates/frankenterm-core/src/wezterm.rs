@@ -1510,6 +1510,20 @@ impl WeztermClient {
             .await
     }
 
+    /// Cx-first [`spawn`] (ft-xbnl0.2.3). Delegates to
+    /// [`Self::spawn_targeted_with_cx`] so caller `&Cx` propagates
+    /// into the underlying `wezterm cli spawn` invocation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn spawn_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+    ) -> Result<u64> {
+        self.spawn_targeted_with_cx(cx, cwd, domain_name, SpawnTarget::default())
+            .await
+    }
+
     /// Spawn a new root pane/tab into a specific window or into a new window.
     pub async fn spawn_targeted(
         &self,
@@ -1543,6 +1557,47 @@ impl WeztermClient {
         }
 
         let output = self.run_cli(&args).await?;
+        Self::parse_pane_id(&output)
+    }
+
+    /// Cx-first [`spawn_targeted`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through [`Self::run_cli_with_cx`] so `wezterm cli spawn`
+    /// honors caller cancellation, budget, and virtual time. The argv
+    /// construction (window targeting, domain, cwd) is identical to
+    /// the legacy path so both variants produce the exact same
+    /// command line for the same inputs.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn spawn_targeted_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        target: SpawnTarget,
+    ) -> Result<u64> {
+        let mut args = vec!["cli", "spawn"];
+
+        let window_id_arg;
+        if target.new_window {
+            args.push("--new-window");
+        } else if let Some(window_id) = target.window_id {
+            window_id_arg = window_id.to_string();
+            args.push("--window-id");
+            args.push(&window_id_arg);
+        }
+
+        let domain_arg;
+        if let Some(domain) = domain_name {
+            domain_arg = format!("--domain-name={domain}");
+            args.push(&domain_arg);
+        }
+
+        let cwd_arg;
+        if let Some(dir) = cwd {
+            cwd_arg = format!("--cwd={dir}");
+            args.push(&cwd_arg);
+        }
+
+        let output = self.run_cli_with_cx(cx, &args).await?;
         Self::parse_pane_id(&output)
     }
 
@@ -3829,6 +3884,118 @@ mod tests {
                     panic!(
                         "expected Wezterm(SocketNotFound) on zoom=false (unzoom) path, got {other:?}"
                     )
+                }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `spawn_with_cx` must honor the
+    /// socket-path pre-check. Since `spawn_with_cx` delegates to
+    /// `spawn_targeted_with_cx`, this test also transitively covers
+    /// the delegation chain (if a future refactor broke the delegate,
+    /// a different error variant would surface).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick42-spawn-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+
+            let cx = crate::cx::for_request();
+            let err = client
+                .spawn_with_cx(&cx, Some("/tmp"), Some("local"))
+                .await
+                .expect_err("missing socket should short-circuit spawn");
+
+            match err {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!(
+                        "expected Wezterm(SocketNotFound) from spawn cx-first path, got {other:?}"
+                    )
+                }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `spawn_targeted_with_cx` must honor the
+    /// socket-path pre-check across both target variants (existing
+    /// window and new window). Exercises the full `SpawnTarget`
+    /// parameter surface to catch regressions in argv construction on
+    /// the Cx path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_targeted_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick42-spawn-targeted-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let cx = crate::cx::for_request();
+
+            // new_window = true branch (adds --new-window).
+            let err_new = client
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        new_window: true,
+                        window_id: None,
+                    },
+                )
+                .await
+                .expect_err("missing socket should short-circuit spawn_targeted(new_window)");
+            match err_new {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!("expected Wezterm(SocketNotFound) on new_window path, got {other:?}")
+                }
+            }
+
+            // window_id branch (adds --window-id <id>).
+            let err_wid = client
+                .spawn_targeted_with_cx(
+                    &cx,
+                    Some("/tmp"),
+                    Some("local"),
+                    SpawnTarget {
+                        new_window: false,
+                        window_id: Some(7),
+                    },
+                )
+                .await
+                .expect_err("missing socket should short-circuit spawn_targeted(window_id)");
+            match err_wid {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!("expected Wezterm(SocketNotFound) on window_id path, got {other:?}")
                 }
             }
         });
