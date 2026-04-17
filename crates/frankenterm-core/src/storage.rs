@@ -9351,6 +9351,18 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_account`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_account_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        account: crate::accounts::AccountRecord,
+    ) -> Result<i64> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("upsert_account cancelled: {err}")))?;
+        self.upsert_account(account).await
+    }
+
     /// Update an account's last_used_at timestamp
     ///
     /// Call this when an account is selected for use to maintain LRU ordering.
@@ -9374,6 +9386,22 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_account_last_used`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_account_last_used_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: &str,
+        account_id: &str,
+        last_used_at: i64,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("update_account_last_used cancelled: {err}"))
+        })?;
+        self.update_account_last_used(service, account_id, last_used_at)
+            .await
+    }
+
     /// Delete an account by service and account_id
     ///
     /// Returns true if an account was deleted, false if not found.
@@ -9389,6 +9417,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`delete_account`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn delete_account_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: &str,
+        account_id: &str,
+    ) -> Result<bool> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("delete_account cancelled: {err}")))?;
+        self.delete_account(service, account_id).await
     }
 
     /// Get all accounts for a service
@@ -9438,6 +9479,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_account`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_account_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: &str,
+        account_id: &str,
+    ) -> Result<Option<crate::accounts::AccountRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_account cancelled: {err}")))?;
+        self.get_account(service, account_id).await
+    }
+
     /// Select the best account for a service according to selection policy
     ///
     /// This combines fetching accounts with the selection algorithm from the
@@ -9448,6 +9502,23 @@ impl StorageHandle {
         config: &crate::accounts::AccountSelectionConfig,
     ) -> Result<crate::accounts::AccountSelectionResult> {
         let accounts = self.get_accounts_by_service(service).await?;
+        Ok(crate::accounts::select_account(&accounts, config))
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`select_account`].
+    ///
+    /// Composite that routes through `get_accounts_by_service_with_cx` so
+    /// the full selection flow honours cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn select_account_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: &str,
+        config: &crate::accounts::AccountSelectionConfig,
+    ) -> Result<crate::accounts::AccountSelectionResult> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("select_account cancelled: {err}")))?;
+        let accounts = self.get_accounts_by_service_with_cx(cx, service).await?;
         Ok(crate::accounts::select_account(&accounts, config))
     }
 
@@ -21312,6 +21383,129 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 144 account cluster —
+/// 5 new storage cx-first siblings exercised end-to-end:
+/// `upsert_account_with_cx`, `update_account_last_used_with_cx`,
+/// `delete_account_with_cx`, `get_account_with_cx`,
+/// `select_account_with_cx` (composite routing via
+/// `get_accounts_by_service_with_cx`).
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick144_account_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick144_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. upsert_account_with_cx — two accounts so select_account has
+        //    real material to pick from.
+        let acct_hi = crate::accounts::AccountRecord {
+            id: 0,
+            account_id: "acct-hi".to_string(),
+            service: "openai".to_string(),
+            name: Some("primary".to_string()),
+            percent_remaining: 80.0,
+            reset_at: None,
+            tokens_used: None,
+            tokens_remaining: None,
+            tokens_limit: None,
+            last_refreshed_at: 1_700_000_000_000,
+            last_used_at: None,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+        let id_hi = storage
+            .upsert_account_with_cx(&cx, acct_hi)
+            .await
+            .unwrap();
+        assert!(id_hi > 0);
+
+        let acct_lo = crate::accounts::AccountRecord {
+            id: 0,
+            account_id: "acct-lo".to_string(),
+            service: "openai".to_string(),
+            name: Some("secondary".to_string()),
+            percent_remaining: 20.0,
+            reset_at: None,
+            tokens_used: None,
+            tokens_remaining: None,
+            tokens_limit: None,
+            last_refreshed_at: 1_700_000_000_000,
+            last_used_at: None,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+        let id_lo = storage
+            .upsert_account_with_cx(&cx, acct_lo)
+            .await
+            .unwrap();
+        assert!(id_lo > 0 && id_lo != id_hi);
+
+        // 2. get_account_with_cx
+        let fetched = storage
+            .get_account_with_cx(&cx, "openai", "acct-hi")
+            .await
+            .unwrap()
+            .expect("acct-hi should exist");
+        assert!((fetched.percent_remaining - 80.0).abs() < 1e-9);
+
+        // 3. select_account_with_cx — composite; with the default 5% threshold
+        //    and quota-ranked ordering, acct-hi (80%) should win over
+        //    acct-lo (20%).
+        let selection = storage
+            .select_account_with_cx(
+                &cx,
+                "openai",
+                &crate::accounts::AccountSelectionConfig::default(),
+            )
+            .await
+            .unwrap();
+        let selected = selection
+            .selected
+            .expect("select_account_with_cx should pick an eligible account");
+        assert_eq!(selected.account_id, "acct-hi");
+
+        // 4. update_account_last_used_with_cx
+        storage
+            .update_account_last_used_with_cx(&cx, "openai", "acct-hi", 1_700_000_001_000)
+            .await
+            .unwrap();
+        let after_use = storage
+            .get_account_with_cx(&cx, "openai", "acct-hi")
+            .await
+            .unwrap()
+            .expect("acct-hi should still exist");
+        assert_eq!(after_use.last_used_at, Some(1_700_000_001_000));
+
+        // 5. delete_account_with_cx
+        let deleted = storage
+            .delete_account_with_cx(&cx, "openai", "acct-lo")
+            .await
+            .unwrap();
+        assert!(deleted, "delete_account_with_cx should remove acct-lo");
+        let missing = storage
+            .get_account_with_cx(&cx, "openai", "acct-lo")
+            .await
+            .unwrap();
+        assert!(missing.is_none(), "acct-lo should be gone after delete");
+        let not_there = storage
+            .delete_account_with_cx(&cx, "openai", "acct-lo")
+            .await
+            .unwrap();
+        assert!(
+            !not_there,
+            "second delete should return false (no row affected)"
+        );
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
