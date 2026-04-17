@@ -395,6 +395,81 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         Ok(progress)
     }
 
+    /// Cx-first [`Self::full_reindex`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the two pre-loop storage reads (via
+    /// `cx.checkpoint()` seams) and through the index loop via
+    /// [`Self::index_loop_with_cx`] (per-iteration cancellation).
+    ///
+    /// Cancellation-safety contract: the `writer.clear_all()` call
+    /// fires BEFORE the first cx.checkpoint inside the index loop,
+    /// so a cx cancelled after clear-before-start still lets the
+    /// caller observe what was cleared in `progress.docs_cleared`
+    /// — no silent data loss.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn full_reindex_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        config: &ReindexConfig,
+    ) -> Result<ReindexProgress, IndexerError> {
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!("full_reindex cancelled pre-start: {err}"))
+        })?;
+
+        if config.batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        let event_reader = create_event_reader(&config.source)?;
+
+        let mut progress = ReindexProgress::new();
+        let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
+
+        if config.clear_before_start {
+            let existing_checkpoint = storage.read_checkpoint(&consumer_id).await?;
+            if existing_checkpoint.is_none() {
+                let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
+                progress.docs_cleared = cleared;
+            }
+        }
+
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!(
+                "full_reindex cancelled after clear_all (docs_cleared={}): {err}",
+                progress.docs_cleared
+            ))
+        })?;
+
+        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+
+        let mut cursor = match &checkpoint {
+            Some(cp) => {
+                let mut c = event_reader
+                    .open_cursor(cp.upto_offset.clone())
+                    .map_err(cursor_err)?;
+                let _ = c.next_batch(1).map_err(cursor_err)?;
+                progress.current_ordinal = Some(cp.upto_offset.ordinal);
+                c
+            }
+            None => event_reader.open_cursor_from_start().map_err(cursor_err)?,
+        };
+
+        self.index_loop_with_cx(
+            cx,
+            storage,
+            &mut *cursor,
+            &consumer_id,
+            &BackfillRange::All,
+            config.batch_size,
+            config.dedup_on_replay,
+            &config.expected_event_schema,
+            config.max_batches,
+            &mut progress,
+        )
+        .await?;
+
+        Ok(progress)
+    }
+
     /// Access the underlying writer.
     pub fn writer(&self) -> &W {
         &self.writer
@@ -846,6 +921,122 @@ impl<W: IndexWriter> ReindexPipeline<W> {
             // Only commit if we indexed or filtered something
             if let Some(offset) = last_offset {
                 // Checkpoint advancement must be coupled to committed index mutations.
+                if index_mutations_in_batch > 0 {
+                    self.writer.commit().map_err(IndexerError::IndexWrite)?;
+                }
+
+                progress.current_ordinal = Some(offset.ordinal);
+
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset,
+                    schema_version: expected_schema.to_string(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+                progress.batches_committed += 1;
+            }
+
+            if is_final_batch || progress.caught_up {
+                if !progress.caught_up {
+                    progress.caught_up = true;
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cx-first [`Self::index_loop`] (ft-xbnl0.2.3). Mirrors the
+    /// legacy index_loop exactly; adds `cx.checkpoint()?` at the
+    /// top of each batch iteration so caller cancellation is
+    /// honored between batches. Mid-batch cancellation is not
+    /// offered here — the per-record loop body is CPU-only
+    /// document mapping + writer operations, no await points.
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    async fn index_loop_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        cursor: &mut dyn RecorderEventCursor,
+        consumer_id: &CheckpointConsumerId,
+        range: &BackfillRange,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+        max_batches: usize,
+        progress: &mut ReindexProgress,
+    ) -> Result<(), IndexerError> {
+        loop {
+            if max_batches > 0 && progress.batches_committed >= max_batches as u64 {
+                break;
+            }
+
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "index_loop cancelled between batches (current_ordinal={:?}, batches={}): {err}",
+                    progress.current_ordinal, progress.batches_committed
+                ))
+            })?;
+
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
+            if batch.is_empty() {
+                progress.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+            let mut index_mutations_in_batch = 0u64;
+
+            for record in &batch {
+                progress.events_read += 1;
+                let ordinal = record.offset.ordinal;
+
+                if range.past_end(ordinal) {
+                    progress.caught_up = true;
+                    last_offset = Some(record.offset.clone());
+                    break;
+                }
+
+                if !range.includes(ordinal, record.event.occurred_at_ms) {
+                    progress.events_filtered += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                if record.event.schema_version != expected_schema {
+                    progress.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, record.offset.ordinal);
+
+                if dedup_on_replay {
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => {
+                        progress.events_indexed += 1;
+                        index_mutations_in_batch += 1;
+                    }
+                    Err(IndexWriteError::Rejected { .. }) => {
+                        progress.events_skipped += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            if let Some(offset) = last_offset {
                 if index_mutations_in_batch > 0 {
                     self.writer.commit().map_err(IndexerError::IndexWrite)?;
                 }
@@ -1613,6 +1804,86 @@ mod tests {
             assert_eq!(progress.events_indexed, 1);
             assert_eq!(progress.docs_cleared, 0);
             assert!(!pipeline.writer().cleared);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `full_reindex_with_cx` must match
+    /// the legacy `full_reindex` for an uncancelled cx. Exercises
+    /// the cold-start path (5 events, clear_before_start=true) and
+    /// asserts ReindexProgress parity across all counter fields.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn full_reindex_with_cx_matches_legacy_cold_start() {
+        run_async_test(async {
+            let dir_legacy = tempdir().unwrap();
+            let scfg_legacy = test_storage_config(dir_legacy.path());
+            let storage_legacy = AppendLogRecorderStorage::open(scfg_legacy.clone()).unwrap();
+
+            let events: Vec<_> = (0..5)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+                .collect();
+            populate_log(&storage_legacy, events.clone()).await;
+
+            let config_legacy = ReindexConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir_legacy.path().join("events.log"),
+                },
+                consumer_id: "legacy-full".to_string(),
+                batch_size: 10,
+                dedup_on_replay: true,
+                clear_before_start: true,
+                max_batches: 0,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
+
+            let mut pipeline_legacy = ReindexPipeline::new(MockReindexWriter::new());
+            let p_legacy = pipeline_legacy
+                .full_reindex(&storage_legacy, &config_legacy)
+                .await
+                .unwrap();
+
+            // Separate dir + storage + consumer_id for the Cx-first run
+            // so their checkpoints don't collide.
+            let dir_cx = tempdir().unwrap();
+            let scfg_cx = test_storage_config(dir_cx.path());
+            let storage_cx = AppendLogRecorderStorage::open(scfg_cx.clone()).unwrap();
+            populate_log(&storage_cx, events).await;
+
+            let config_cx = ReindexConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir_cx.path().join("events.log"),
+                },
+                consumer_id: "cx-full".to_string(),
+                batch_size: 10,
+                dedup_on_replay: true,
+                clear_before_start: true,
+                max_batches: 0,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
+
+            let mut pipeline_cx = ReindexPipeline::new(MockReindexWriter::new());
+            let cx = crate::cx::for_request();
+            let p_cx = pipeline_cx
+                .full_reindex_with_cx(&cx, &storage_cx, &config_cx)
+                .await
+                .unwrap();
+
+            assert_eq!(p_legacy.events_read, p_cx.events_read);
+            assert_eq!(p_legacy.events_indexed, p_cx.events_indexed);
+            assert_eq!(p_legacy.events_skipped, p_cx.events_skipped);
+            assert_eq!(p_legacy.events_filtered, p_cx.events_filtered);
+            assert_eq!(p_legacy.caught_up, p_cx.caught_up);
+            assert_eq!(p_legacy.current_ordinal, p_cx.current_ordinal);
+            assert_eq!(p_legacy.batches_committed, p_cx.batches_committed);
+            assert_eq!(p_legacy.docs_cleared, p_cx.docs_cleared);
+            assert!(
+                p_cx.events_indexed > 0,
+                "Cx-first full_reindex must index events"
+            );
+            assert!(
+                pipeline_cx.writer().cleared,
+                "clear_before_start=true must trigger clear on Cx-first path"
+            );
         });
     }
 
