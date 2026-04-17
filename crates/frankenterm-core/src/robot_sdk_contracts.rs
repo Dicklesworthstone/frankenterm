@@ -570,6 +570,41 @@ impl RustSdkTransport {
     ) -> Result<serde_json::Value, RustSdkTransportError> {
         self.call(command, payload).await
     }
+
+    /// Cx-first [`Self::call`] (ft-xbnl0.2.3). Routes the IPC
+    /// RPC call through [`crate::ipc::IpcClient::call_rpc_with_cx`]
+    /// (tick 78) so caller cancellation propagates into the
+    /// socket round-trip — the 4 await points inside
+    /// `send_request_with_id_with_cx` (connect, write, flush,
+    /// read) all honor cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn call_with_cx<T: DeserializeOwned>(
+        &self,
+        cx: &crate::cx::Cx,
+        command: &str,
+        payload: serde_json::Value,
+    ) -> Result<T, RustSdkTransportError> {
+        let args = build_rust_sdk_ipc_args(command, &payload)?;
+        let response = self
+            .ipc
+            .call_rpc_with_cx(cx, args, None)
+            .await
+            .map_err(RustSdkTransportError::Transport)?;
+        decode_rust_sdk_response(response)
+    }
+
+    /// Cx-first [`Self::call_value`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::call_with_cx`] with
+    /// `T = serde_json::Value`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn call_value_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        command: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, RustSdkTransportError> {
+        self.call_with_cx(cx, command, payload).await
+    }
 }
 
 /// Errors surfaced by the Rust SDK IPC transport.
@@ -1930,6 +1965,58 @@ mod tests {
     use super::*;
 
     // ---- FieldType ----
+
+    /// ft-xbnl0.2.3 Cx-first: `call_with_cx` must surface
+    /// `WatcherNotRunning` on a missing-socket — same as legacy
+    /// `call` — proving the IPC cx-first path reaches the
+    /// socket check. Only exercises the error-path semantics;
+    /// full round-trip testing requires a running watcher
+    /// daemon which is out of scope for unit tests.
+    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[test]
+    fn call_with_cx_surfaces_watcher_not_running() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let bogus = std::env::temp_dir().join(format!(
+                    "ft-rusticmaple-tick87-robot-sdk-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                ));
+                assert!(!bogus.exists());
+                let transport = RustSdkTransport::new(&bogus);
+                let cx = crate::cx::for_request();
+
+                let err: RustSdkTransportError = transport
+                    .call_value_with_cx(&cx, "get-text", serde_json::json!({"pane_id": 1}))
+                    .await
+                    .expect_err("cx-first call on missing socket should error");
+
+                match err {
+                    RustSdkTransportError::Transport(UserVarError::WatcherNotRunning {
+                        ..
+                    }) => {}
+                    other => panic!(
+                        "expected Transport(WatcherNotRunning) on cx-first missing socket, got {other}"
+                    ),
+                }
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn field_type_labels() {
