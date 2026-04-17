@@ -668,21 +668,64 @@ impl ShardedWeztermClient {
         Ok(panes)
     }
 
+    /// Cx-first `collect_panes` (ft-xbnl0.2.3). Uses each backend's
+    /// `list_panes_with_cx(cx)` (added to `WeztermInterface` trait in
+    /// tick 27 with a default impl that delegates to `list_panes` for
+    /// backends without a Cx-aware path, and overridden by
+    /// `WeztermClient` to propagate Cx through to
+    /// `MuxPool::list_panes_with_cx`).
+    #[cfg(feature = "asupersync-runtime")]
+    async fn collect_panes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<(Vec<PaneInfo>, HashMap<u64, PaneRoute>)> {
+        let mut all = Vec::new();
+        let mut routes = HashMap::new();
+
+        for backend in &self.backends {
+            let panes = backend
+                .handle
+                .list_panes_with_cx(cx)
+                .await
+                .map_err(|err| self.backend_error(backend.id, "list_panes", None, err))?;
+
+            for mut pane in panes {
+                let local_pane_id = pane.pane_id;
+                let global_pane_id = encode_sharded_pane_id(backend.id, local_pane_id);
+                pane.pane_id = global_pane_id;
+                pane.extra
+                    .insert("shard_id".to_string(), Value::from(backend.id.0 as u64));
+                pane.extra
+                    .insert("local_pane_id".to_string(), Value::from(local_pane_id));
+
+                routes.insert(
+                    global_pane_id,
+                    PaneRoute {
+                        shard_id: backend.id,
+                        local_pane_id,
+                    },
+                );
+                all.push(pane);
+            }
+        }
+
+        Ok((all, routes))
+    }
+
     /// Aggregate panes across all shards, bound to the caller's
     /// asupersync capability context (ft-xbnl0.2.3 Cx-first entry
     /// point).
     ///
-    /// The internal `pane_routes` RwLock acquire uses `write_with_cx(cx)`
-    /// (the primitive from tick 9) so a caller-cancelled route-index
-    /// refresh propagates cleanly through the lock wait. The per-backend
-    /// `backend.handle.list_panes()` call remains ambient since
-    /// `WeztermInterface` trait does not yet expose `list_panes_with_cx`
-    /// (trait-level refactor scope; see wezterm.rs tick 19 which added
-    /// list_panes_with_cx on the concrete `WeztermClient` impl).
+    /// Uses `collect_panes_with_cx(cx)` so per-backend `list_panes`
+    /// calls flow through `WeztermInterface::list_panes_with_cx`
+    /// (tick 27 trait extension); the concrete `WeztermClient` impl
+    /// routes to `MuxPool::list_panes_with_cx` on the fast path.
+    /// The internal `pane_routes` RwLock acquire uses
+    /// `write_with_cx(cx)` (the primitive from tick 9).
     #[cfg(feature = "asupersync-runtime")]
     pub async fn list_all_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
-        let (panes, routes) = self.collect_panes().await?;
+        let (panes, routes) = self.collect_panes_with_cx(cx).await?;
         let mut guard = self.pane_routes.write_with_cx(cx).await;
         *guard = routes;
         Ok(panes)

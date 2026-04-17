@@ -40,6 +40,27 @@ pub type WeztermHandle = Arc<dyn WeztermInterface>;
 pub trait WeztermInterface: Send + Sync {
     /// List all panes across all windows and tabs.
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>>;
+
+    /// List all panes bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.3 Cx-first trait extension).
+    ///
+    /// Default implementation delegates to [`list_panes`](Self::list_panes),
+    /// which uses ambient Cx. Concrete implementations that have a
+    /// Cx-aware path (e.g. `WeztermClient::list_panes_with_cx` routing
+    /// through `MuxPool::list_panes_with_cx`) SHOULD override this
+    /// method to propagate caller Cx through to the underlying
+    /// cancellable operation.
+    ///
+    /// The `cx` parameter is `&'a crate::cx::Cx` where `'a` matches the
+    /// returned future's lifetime, allowing overrides to thread the
+    /// caller's Cx into async operations held by the future.
+    #[cfg(feature = "asupersync-runtime")]
+    fn list_panes_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneInfo>> {
+        self.list_panes()
+    }
     /// Get a specific pane by ID.
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo>;
     /// Get text content from a pane.
@@ -1989,6 +2010,14 @@ fn find_neighbor_pane(
 impl WeztermInterface for WeztermClient {
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>> {
         Box::pin(async move { WeztermClient::list_panes(self).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn list_panes_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<PaneInfo>> {
+        Box::pin(async move { WeztermClient::list_panes_with_cx(self, cx).await })
     }
 
     fn get_pane(&self, pane_id: u64) -> WeztermFuture<'_, PaneInfo> {
