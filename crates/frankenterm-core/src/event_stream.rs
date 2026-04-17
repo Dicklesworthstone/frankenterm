@@ -1816,7 +1816,7 @@ mod tests {
         fn wait_with_cx_precancelled_short_circuits_under_labruntime() {
             run_lab(6001, || async move {
                 let bus = EventBus::new(16);
-                let waiter = EventWaiter::new(WaitCondition::Any);
+                let waiter = EventWaiter::new(WaitCondition::AnyEvent);
                 let cx = pre_cancelled_cx("wa-event-stream precancel");
                 let result = waiter.wait_with_cx(&cx, &bus).await;
                 match result {
@@ -1865,8 +1865,7 @@ mod tests {
                     "serde tag missing: {json}"
                 );
                 assert!(json.contains("capability context already cancelled"));
-                let restored: WaitResult =
-                    serde_json::from_str(&json).expect("deserialize");
+                let restored: WaitResult = serde_json::from_str(&json).expect("deserialize");
                 match restored {
                     WaitResult::Cancelled { reason } => {
                         assert_eq!(reason, "capability context already cancelled");
@@ -1881,12 +1880,13 @@ mod tests {
         #[test]
         fn wait_result_timeout_serde_roundtrip_under_labruntime() {
             run_lab(6004, || async move {
-                let wr = WaitResult::Timeout { elapsed_ms: 3_600_000 };
+                let wr = WaitResult::Timeout {
+                    elapsed_ms: 3_600_000,
+                };
                 let json = serde_json::to_string(&wr).expect("serialize");
                 assert!(json.contains("\"outcome\":\"timeout\""));
                 assert!(json.contains("\"elapsed_ms\":3600000"));
-                let restored: WaitResult =
-                    serde_json::from_str(&json).expect("deserialize");
+                let restored: WaitResult = serde_json::from_str(&json).expect("deserialize");
                 match restored {
                     WaitResult::Timeout { elapsed_ms } => {
                         assert_eq!(elapsed_ms, 3_600_000);
@@ -1902,7 +1902,7 @@ mod tests {
         #[test]
         fn event_waiter_default_timeout_under_labruntime() {
             run_lab(6005, || async move {
-                let waiter = EventWaiter::new(WaitCondition::Any);
+                let waiter = EventWaiter::new(WaitCondition::AnyEvent);
                 // timeout field is private; exercise via fluent builder.
                 let waiter = waiter.with_timeout(Duration::from_secs(60));
                 // Drop without waiting — just asserts the builder works.

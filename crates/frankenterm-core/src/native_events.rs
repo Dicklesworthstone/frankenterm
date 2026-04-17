@@ -205,6 +205,83 @@ impl NativeEventListener {
             }
         }
     }
+
+    /// Run the accept loop against the caller's asupersync capability
+    /// context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Short-circuits before entering the loop if `cx` is already
+    /// cancelled — an operator who has abandoned the watch should not
+    /// bind subscribers or spawn per-connection tasks. While the loop
+    /// runs each accept poll is bound to the caller's `Cx` via
+    /// [`crate::runtime_compat::timeout_with_cx`], so budget-driven
+    /// cancellation from the outer scope cuts the poll wait
+    /// deterministically under `LabRuntime` virtual time. Matches the
+    /// Cx-first pattern landed by `EventWaiter::wait_with_cx`
+    /// (event_stream.rs), `WorkflowRunner::handle_detection_with_cx`,
+    /// and `SurvivalModel::run_cx`.
+    ///
+    /// The legacy [`run`](Self::run) entry point is preserved for
+    /// non-migrated callers; this is strictly additive.
+    pub async fn run_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_tx: mpsc::Sender<NativeEvent>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        if cx.is_cancel_requested() {
+            debug!(
+                path = %self.socket_path.display(),
+                "native event run aborted: capability context already cancelled"
+            );
+            return;
+        }
+
+        let mut connection_tasks = JoinSet::new();
+
+        loop {
+            if shutdown_flag.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+                break;
+            }
+
+            match crate::runtime_compat::timeout_with_cx(
+                cx,
+                ACCEPT_POLL_INTERVAL,
+                self.listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _addr))) => {
+                    let tx = event_tx.clone();
+                    connection_tasks.spawn(async move {
+                        if let Err(err) = handle_connection(stream, tx).await {
+                            debug!(error = %err, "native event connection closed with error");
+                        }
+                    });
+                }
+                Ok(Err(err)) => {
+                    warn!(error = %err, path = %self.socket_path.display(), "native event accept failed");
+                }
+                // `timeout_with_cx` returns Err on either the poll
+                // interval elapsing OR the Cx being cancelled. Either
+                // way we want to loop and re-evaluate shutdown /
+                // cancellation on the next iteration — no need to
+                // disambiguate here.
+                Err(_) => {}
+            }
+
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(err) = join_result {
+                    debug!(error = %err, "native event connection task failed");
+                }
+            }
+        }
+
+        while let Some(join_result) = connection_tasks.join_next().await {
+            if let Err(err) = join_result {
+                debug!(error = %err, "native event connection task failed during shutdown");
+            }
+        }
+    }
 }
 
 impl Drop for NativeEventListener {
@@ -914,6 +991,53 @@ mod tests {
             let socket_path = dir.path().join("sub").join("dir").join("deep.sock");
             let result = NativeEventListener::bind(socket_path).await;
             assert!(result.is_ok());
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `run_with_cx` must return promptly when the
+    /// caller's capability context is already cancelled on entry. A
+    /// pre-cancelled wait should not enter the accept loop, spawn any
+    /// connection tasks, or consume a real `ACCEPT_POLL_INTERVAL` tick.
+    ///
+    /// This mirrors the short-circuit contract landed for
+    /// `EventWaiter::wait_with_cx` (event_stream.rs) — operators who have
+    /// abandoned the watch should not pay the subscribe / accept cost.
+    #[test]
+    fn run_with_cx_pre_cancelled_exits_immediately() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("precancel.sock");
+            let listener = NativeEventListener::bind(socket_path)
+                .await
+                .expect("bind listener");
+            let (event_tx, _event_rx) = mpsc::channel::<NativeEvent>(4);
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+            // Pre-cancel the Cx. No shutdown flag will ever be set, so a
+            // Cx-unaware run loop would block forever on the accept poll.
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.3 pre-cancel native_events"),
+            );
+
+            let wall_start = std::time::Instant::now();
+            listener
+                .run_with_cx(&cx, event_tx, Arc::clone(&shutdown_flag))
+                .await;
+
+            assert!(
+                wall_start.elapsed() < Duration::from_secs(1),
+                "pre-cancelled run_with_cx must not consume a full accept \
+                 poll tick; took {:?}",
+                wall_start.elapsed()
+            );
+            assert!(
+                !shutdown_flag.load(Ordering::SeqCst),
+                "run_with_cx must return via Cx cancellation path, not \
+                 shutdown flag"
+            );
         });
     }
 
