@@ -6628,6 +6628,104 @@ where
         .await
     }
 
+    /// Cx-first [`Self::send_ctrl_c`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::inject_with_cx`] with
+    /// `ActionKind::SendCtrlC`, mirroring the legacy send_ctrl_c
+    /// → inject delegation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_c_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject_with_cx(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_C,
+            ActionKind::SendCtrlC,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Cx-first [`Self::send_ctrl_d`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::inject_with_cx`] with
+    /// `ActionKind::SendCtrlD`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_d_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject_with_cx(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_D,
+            ActionKind::SendCtrlD,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Cx-first [`Self::send_ctrl_z`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::inject_with_cx`] with
+    /// `ActionKind::SendCtrlZ`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_z_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject_with_cx(
+            cx,
+            pane_id,
+            crate::wezterm::control::CTRL_Z,
+            ActionKind::SendCtrlZ,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Cx-first [`Self::send_control`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::inject_with_cx`] with
+    /// `ActionKind::SendControl`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_control_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject_with_cx(
+            cx,
+            pane_id,
+            control_char,
+            ActionKind::SendControl,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
     /// Shared wezterm-send dispatch used by the policy-gated inject
     /// flow. Extracted so the Cx-first dispatch path
     /// ([`Self::dispatch_wezterm_send_with_cx`]) can use the same
@@ -7437,6 +7535,96 @@ mod tests {
                     assert_eq!(details["rule_id"], "policy.alt_screen");
                 }
                 other => panic!("expected control marker, got {other:?}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: remaining `send_ctrl_*_with_cx` +
+    /// `send_control_with_cx` must match their legacy siblings
+    /// on the deny branch. Same alt_screen=true topology as
+    /// `send_text_with_cx_matches_legacy_deny_path`. Consolidated
+    /// test covers all 4 remaining entry points with one
+    /// fixture.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_and_control_with_cx_match_legacy_deny_path() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+
+            // Ctrl-C
+            {
+                let mut injector = PolicyGatedInjector::new(
+                    PolicyEngine::strict(),
+                    crate::wezterm::default_wezterm_handle(),
+                );
+                let mut caps = PaneCapabilities::prompt();
+                caps.alt_screen = Some(true);
+                let result = injector
+                    .send_ctrl_c_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
+                    .await;
+                match result {
+                    InjectionResult::Denied { action, .. } => {
+                        assert_eq!(action, ActionKind::SendCtrlC);
+                    }
+                    other => panic!("send_ctrl_c_with_cx expected Denied, got {other:?}"),
+                }
+            }
+
+            // Ctrl-D
+            {
+                let mut injector = PolicyGatedInjector::new(
+                    PolicyEngine::strict(),
+                    crate::wezterm::default_wezterm_handle(),
+                );
+                let mut caps = PaneCapabilities::prompt();
+                caps.alt_screen = Some(true);
+                let result = injector
+                    .send_ctrl_d_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
+                    .await;
+                match result {
+                    InjectionResult::Denied { action, .. } => {
+                        assert_eq!(action, ActionKind::SendCtrlD);
+                    }
+                    other => panic!("send_ctrl_d_with_cx expected Denied, got {other:?}"),
+                }
+            }
+
+            // Ctrl-Z
+            {
+                let mut injector = PolicyGatedInjector::new(
+                    PolicyEngine::strict(),
+                    crate::wezterm::default_wezterm_handle(),
+                );
+                let mut caps = PaneCapabilities::prompt();
+                caps.alt_screen = Some(true);
+                let result = injector
+                    .send_ctrl_z_with_cx(&cx, 1, ActorKind::Robot, &caps, None)
+                    .await;
+                match result {
+                    InjectionResult::Denied { action, .. } => {
+                        assert_eq!(action, ActionKind::SendCtrlZ);
+                    }
+                    other => panic!("send_ctrl_z_with_cx expected Denied, got {other:?}"),
+                }
+            }
+
+            // send_control with arbitrary control char
+            {
+                let mut injector = PolicyGatedInjector::new(
+                    PolicyEngine::strict(),
+                    crate::wezterm::default_wezterm_handle(),
+                );
+                let mut caps = PaneCapabilities::prompt();
+                caps.alt_screen = Some(true);
+                let result = injector
+                    .send_control_with_cx(&cx, 1, "\x07", ActorKind::Robot, &caps, None)
+                    .await;
+                match result {
+                    InjectionResult::Denied { action, .. } => {
+                        assert_eq!(action, ActionKind::SendControl);
+                    }
+                    other => panic!("send_control_with_cx expected Denied, got {other:?}"),
+                }
             }
         });
     }
