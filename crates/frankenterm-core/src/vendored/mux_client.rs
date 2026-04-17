@@ -1722,7 +1722,7 @@ impl DirectMuxClient {
             let mut temp = vec![0u8; 4096];
             let read = match timeout(
                 self.config.read_timeout,
-                unix_stream_read(&mut self.stream, &mut temp),
+                unix_stream_read_with_cx(cx, &mut self.stream, &mut temp),
             )
             .await
             {
@@ -1881,6 +1881,27 @@ fn should_auto_fallback_to_always(
 }
 
 async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    io::read(stream, buf).await
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`unix_stream_read`].
+///
+/// Pre-flight `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`
+/// so a cancelled caller surfaces as an IO error rather than panicking
+/// or blocking on the underlying poll_read. Used from
+/// `read_next_pdu_with_cx` where the parent Cx is already in scope.
+#[cfg(feature = "asupersync-runtime")]
+async fn unix_stream_read_with_cx(
+    cx: &Cx,
+    stream: &mut UnixStream,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    cx.checkpoint().map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("unix_stream_read cancelled: {err}"),
+        )
+    })?;
     io::read(stream, buf).await
 }
 
