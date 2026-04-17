@@ -1254,11 +1254,17 @@ impl SessionRestorer {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`restore`].
     ///
-    /// Pre-flight checkpoint gates the entire multi-step restore
-    /// pipeline (topology parse → layout restore → scrollback
-    /// inject → banner send → bookkeeping → process relaunch).
-    /// Delegates to [`restore`] for the actual work so the legacy
-    /// path remains authoritative.
+    /// Tick 129 upgraded this from a pre-flight delegate to a
+    /// fully cx-threaded multi-step pipeline. Caller cancellation
+    /// now propagates into every subsystem:
+    /// - `LayoutRestorer::restore_with_cx` (tick 93)
+    /// - `ScrollbackInjector::inject_with_cx` (tick 94)
+    /// - per-pane `wezterm.send_text_with_cx` for banner delivery
+    /// - `ProcessLauncher::execute_cx` for process relaunch
+    ///
+    /// Per-step `cx.checkpoint()` seams also gate each stage so a
+    /// cancelled caller can bail between topology parse, layout,
+    /// scrollback, banners, bookkeeping, and relaunch.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn restore_with_cx(
         &self,
@@ -1269,7 +1275,237 @@ impl SessionRestorer {
     ) -> Result<RestoreSummary, RestoreError> {
         cx.checkpoint()
             .map_err(|err| RestoreError::Wezterm(format!("restore cancelled: {err}")))?;
-        self.restore(session, checkpoint, wezterm).await
+
+        let start = std::time::Instant::now();
+
+        let topology = TopologySnapshot::from_json(&session.topology_json)
+            .map_err(|e| RestoreError::TopologyParse(e.to_string()))?;
+
+        let total_panes = topology.pane_count();
+
+        info!(
+            session_id = %session.session_id,
+            windows = topology.windows.len(),
+            panes = total_panes,
+            "Restoring session topology (cx-first)"
+        );
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!("restore cancelled before layout: {err}"))
+        })?;
+
+        let restore_config = RestoreConfig {
+            restore_working_dirs: true,
+            restore_split_ratios: true,
+            continue_on_error: true,
+        };
+        let restorer = LayoutRestorer::new(wezterm.clone(), restore_config);
+        let layout_result = restorer
+            .restore_with_cx(cx, &topology)
+            .await
+            .map_err(|e| RestoreError::LayoutRestore(e.to_string()))?;
+
+        info!(
+            panes_created = layout_result.panes_created,
+            windows_created = layout_result.windows_created,
+            tabs_created = layout_result.tabs_created,
+            failed = layout_result.failed_panes.len(),
+            "Layout restoration complete"
+        );
+
+        for (old_id, error) in &layout_result.failed_panes {
+            warn!(old_pane_id = old_id, error = %error, "Failed to restore pane");
+        }
+
+        let pane_state_map: HashMap<u64, &RestoredPaneState> = checkpoint
+            .pane_states
+            .iter()
+            .map(|ps| (ps.pane_id, ps))
+            .collect();
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!("restore cancelled before scrollback: {err}"))
+        })?;
+
+        let (scrollback_result, scrollback_error) = if self.config.restore_scrollback {
+            match load_scrollback_data(
+                &self.db_path,
+                &checkpoint.pane_states,
+                self.config.restore_max_lines,
+            ) {
+                Ok(scrollback_data) => {
+                    let injector = ScrollbackInjector::new(
+                        wezterm.clone(),
+                        InjectionConfig {
+                            max_lines: self.config.restore_max_lines,
+                            ..InjectionConfig::default()
+                        },
+                    );
+                    match injector
+                        .inject_with_cx(cx, &layout_result.pane_id_map, &scrollback_data)
+                        .await
+                    {
+                        Ok(report) => {
+                            if report.failure_count() > 0 || !report.skipped.is_empty() {
+                                warn!(
+                                    restored = report.success_count(),
+                                    failed = report.failure_count(),
+                                    skipped = report.skipped.len(),
+                                    "Scrollback replay completed with warnings"
+                                );
+                            } else {
+                                info!(
+                                    restored = report.success_count(),
+                                    bytes = report.total_bytes(),
+                                    "Scrollback replay complete"
+                                );
+                            }
+                            (Some(report), None)
+                        }
+                        Err(error) => {
+                            warn!(
+                                session_id = %session.session_id,
+                                checkpoint_id = checkpoint.checkpoint_id,
+                                error = %error,
+                                "Scrollback injection returned error"
+                            );
+                            (None, Some(error.to_string()))
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %session.session_id,
+                        checkpoint_id = checkpoint.checkpoint_id,
+                        error = %error,
+                        "Skipping scrollback replay because persisted output could not be loaded"
+                    );
+                    (None, Some(error.to_string()))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!("restore cancelled before banner send: {err}"))
+        })?;
+
+        for (&old_id, &new_id) in &layout_result.pane_id_map {
+            let pane_state = pane_state_map.get(&old_id).copied();
+            let banner = restore_banner(
+                old_id,
+                &session.session_id,
+                checkpoint.checkpoint_at,
+                pane_state,
+            );
+
+            if let Err(e) = wezterm.send_text_with_cx(cx, new_id, &banner).await {
+                warn!(
+                    old_pane_id = old_id,
+                    new_pane_id = new_id,
+                    error = %e,
+                    "Failed to send restore banner"
+                );
+            } else {
+                debug!(
+                    old_pane_id = old_id,
+                    new_pane_id = new_id,
+                    agent = ?pane_state.and_then(|ps| ps.agent_metadata.as_ref().map(|a| &a.agent_type)),
+                    "Restore banner sent"
+                );
+            }
+        }
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!("restore cancelled before bookkeeping: {err}"))
+        })?;
+
+        let mark_clean = layout_result.failed_panes.is_empty();
+        let bookkeeping_checkpoint = finalize_restore(
+            &self.db_path,
+            &session.session_id,
+            &layout_result.pane_id_map,
+            mark_clean,
+        )
+        .map_err(|error| {
+            RestoreError::Bookkeeping(format!(
+                "failed to persist restore bookkeeping for session {}: {error}",
+                session.session_id
+            ))
+        })?;
+        debug!(
+            checkpoint_id = bookkeeping_checkpoint,
+            mark_clean, "Persisted restore bookkeeping"
+        );
+
+        if !mark_clean {
+            warn!(
+                session_id = %session.session_id,
+                restored_panes = layout_result.pane_id_map.len(),
+                failed_panes = layout_result.failed_panes.len(),
+                "Session restore incomplete; leaving source session unclean for retry"
+            );
+        } else {
+            let launch_snapshots: Vec<_> = checkpoint
+                .pane_states
+                .iter()
+                .map(|state| launch_snapshot_from_restored_state(state, checkpoint.checkpoint_at))
+                .collect();
+            let launcher =
+                ProcessLauncher::new(wezterm.clone(), self.config.process_relaunch.clone());
+            let plans = launcher.plan(&layout_result.pane_id_map, &launch_snapshots);
+            if !plans.is_empty() {
+                let report = launcher.execute_cx(cx, &plans).await;
+                if report.failed > 0 || report.manual > 0 {
+                    warn!(
+                        session_id = %session.session_id,
+                        shells_launched = report.shells_launched,
+                        agents_launched = report.agents_launched,
+                        manual = report.manual,
+                        skipped = report.skipped,
+                        failed = report.failed,
+                        "Process relaunch completed with follow-up required"
+                    );
+                } else {
+                    info!(
+                        session_id = %session.session_id,
+                        shells_launched = report.shells_launched,
+                        agents_launched = report.agents_launched,
+                        skipped = report.skipped,
+                        "Process relaunch complete"
+                    );
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        let failed_panes = layout_result.failed_panes.len();
+        let restore_status = if failed_panes == 0 {
+            "complete"
+        } else {
+            "partial"
+        };
+
+        info!(
+            session_id = %session.session_id,
+            restored = layout_result.pane_id_map.len(),
+            failed = failed_panes,
+            total = total_panes,
+            status = restore_status,
+            elapsed_ms = elapsed,
+            "Session restore finished (cx-first)"
+        );
+
+        Ok(RestoreSummary {
+            session_id: session.session_id.clone(),
+            checkpoint_id: checkpoint.checkpoint_id,
+            layout_result,
+            pane_states: checkpoint.pane_states.clone(),
+            scrollback_result,
+            scrollback_error,
+            elapsed_ms: elapsed,
+        })
     }
 
     /// Run the full detection + restore flow.
@@ -1364,7 +1600,8 @@ impl SessionRestorer {
             ))
         })?;
 
-        match wezterm.list_panes().await {
+        // ft-xbnl0.2.3 tick 129: route list_panes through cx-first.
+        match wezterm.list_panes_with_cx(cx).await {
             Ok(panes) if !panes.is_empty() => {
                 info!(
                     existing_panes = panes.len(),
