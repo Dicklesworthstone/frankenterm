@@ -7685,6 +7685,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_indexing_health`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_indexing_health_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<IndexingHealthReport> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_indexing_health cancelled: {err}"))
+        })?;
+        self.get_indexing_health().await
+    }
+
     /// Perform incremental FTS sync on startup.
     ///
     /// This checks the FTS index state and either:
@@ -7704,6 +7716,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`sync_fts`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn sync_fts_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        config: FtsSyncConfig,
+    ) -> Result<FtsSyncResult> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
+        self.sync_fts(config).await
+    }
+
     /// Perform a full FTS rebuild regardless of current state.
     ///
     /// This drops the FTS index and reindexes all segments with batched progress.
@@ -7719,6 +7743,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`rebuild_fts`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn rebuild_fts_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        config: FtsSyncConfig,
+    ) -> Result<FtsSyncResult> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
+        self.rebuild_fts(config).await
+    }
+
     /// Get the current FTS index state (version, last rebuild time).
     pub async fn get_fts_index_state(&self) -> Result<Option<FtsIndexState>> {
         let db_path = Arc::clone(&self.db_path);
@@ -7729,6 +7765,18 @@ impl StorageHandle {
             get_fts_index_state_sync(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_fts_index_state`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_fts_index_state_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Option<FtsIndexState>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_fts_index_state cancelled: {err}"))
+        })?;
+        self.get_fts_index_state().await
     }
 
     /// Insert an approval token
@@ -21025,6 +21073,47 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 140 FTS cluster —
+/// 4 new storage cx-first siblings exercised end-to-end:
+/// `get_indexing_health_with_cx`, `sync_fts_with_cx`,
+/// `rebuild_fts_with_cx`, `get_fts_index_state_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick140_fts_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick140_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. sync_fts_with_cx on a fresh DB — drives initial FTS state creation.
+        let cfg = FtsSyncConfig::default();
+        let sync_result = storage.sync_fts_with_cx(&cx, cfg.clone()).await.unwrap();
+        let _ = sync_result; // contents depend on current index state; just asserting the call roundtrips is enough here.
+
+        // 2. get_fts_index_state_with_cx — should be Some after sync_fts.
+        let state = storage.get_fts_index_state_with_cx(&cx).await.unwrap();
+        assert!(
+            state.is_some(),
+            "FTS index state should be populated after sync_fts_with_cx"
+        );
+
+        // 3. rebuild_fts_with_cx
+        let rebuild_result = storage.rebuild_fts_with_cx(&cx, cfg).await.unwrap();
+        let _ = rebuild_result;
+
+        // 4. get_indexing_health_with_cx — returns a report even with no indexed data.
+        let health = storage.get_indexing_health_with_cx(&cx).await.unwrap();
+        let _ = health;
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
