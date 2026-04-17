@@ -8201,6 +8201,46 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_step_log`].
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_step_log_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+        audit_action_id: Option<i64>,
+        step_index: usize,
+        step_name: &str,
+        step_id: Option<String>,
+        step_kind: Option<String>,
+        result_type: &str,
+        result_data: Option<String>,
+        policy_summary: Option<String>,
+        verification_refs: Option<String>,
+        error_code: Option<String>,
+        started_at: i64,
+        completed_at: i64,
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("insert_step_log cancelled: {err}")))?;
+        self.insert_step_log(
+            workflow_id,
+            audit_action_id,
+            step_index,
+            step_name,
+            step_id,
+            step_kind,
+            result_type,
+            result_data,
+            policy_summary,
+            verification_refs,
+            error_code,
+            started_at,
+            completed_at,
+        )
+        .await
+    }
+
     // Upsert an agent session record
     //
     // Creates a new session or updates an existing one.
@@ -8990,6 +9030,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions_stream`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_audit_actions_stream_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: AuditStreamQuery,
+    ) -> Result<AuditStreamPage> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_audit_actions_stream cancelled: {err}"))
+        })?;
+        self.get_audit_actions_stream(query).await
+    }
+
     /// Query action history view with filters
     pub async fn get_action_history(
         &self,
@@ -9065,6 +9118,19 @@ impl StorageHandle {
             query_approval_token_by_hash(&conn, &code_hash)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_approval_token_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        code_hash: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_approval_token cancelled: {err}"))
+        })?;
+        self.get_approval_token(code_hash).await
     }
 
     /// Get the maximum sequence number for a pane (to resume capture).
@@ -9183,6 +9249,19 @@ impl StorageHandle {
             query_segments(&conn, pane_id, limit)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_segments`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_segments_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        limit: usize,
+    ) -> Result<Vec<Segment>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_segments cancelled: {err}")))?;
+        self.get_segments(pane_id, limit).await
     }
 
     /// Scan segments in ascending id order with incremental paging.
@@ -9321,6 +9400,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_step_log`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_latest_step_log_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowStepLogRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_latest_step_log cancelled: {err}"))
+        })?;
+        self.get_latest_step_log(workflow_id).await
+    }
+
     /// Get the persisted action plan for a workflow execution, if available
     pub async fn get_action_plan(
         &self,
@@ -9339,6 +9431,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_plan`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_action_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowActionPlanRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_action_plan cancelled: {err}")))?;
+        self.get_action_plan(workflow_id).await
+    }
+
     /// Get a prepared plan preview by plan_id
     pub async fn get_prepared_plan(&self, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -9352,6 +9456,18 @@ impl StorageHandle {
             query_prepared_plan(&conn, &plan_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_prepared_plan`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_prepared_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        plan_id: &str,
+    ) -> Result<Option<PreparedPlanRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_prepared_plan cancelled: {err}")))?;
+        self.get_prepared_plan(plan_id).await
     }
 
     /// Find incomplete workflows for resume on restart
@@ -9391,6 +9507,19 @@ impl StorageHandle {
         // We can't easily send a ping without adding a new WriteCommand variant,
         // so we check if the channel has capacity (indicates writer is processing)
         !self.write_tx.is_closed()
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`is_writable`].
+    ///
+    /// Health probe routed through a cx seam so a cancelled context
+    /// surfaces before the channel state is inspected. Note the underlying
+    /// check is infallible, so we return `Ok(bool)` and fold cancellation
+    /// into the error path.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn is_writable_with_cx(&self, cx: &crate::cx::Cx) -> Result<bool> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("is_writable cancelled: {err}")))?;
+        Ok(self.is_writable().await)
     }
 
     // =========================================================================
@@ -21488,6 +21617,135 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 147 misc step-log/plan/audit cluster —
+/// 8 new storage cx-first siblings exercised end-to-end:
+/// `insert_step_log_with_cx`, `get_latest_step_log_with_cx`,
+/// `get_audit_actions_stream_with_cx`, `get_approval_token_with_cx`,
+/// `get_segments_with_cx`, `get_action_plan_with_cx`,
+/// `get_prepared_plan_with_cx`, `is_writable_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick147_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed pane for FK.
+        let pane = PaneRecord {
+            pane_id: 57,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick147".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // Seed workflow for step_log FK.
+        let workflow = WorkflowRecord {
+            id: "wf-tick147".to_string(),
+            workflow_name: "demo".to_string(),
+            pane_id: 57,
+            trigger_event_id: None,
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+            completed_at: None,
+        };
+        storage
+            .upsert_workflow_with_cx(&cx, workflow)
+            .await
+            .unwrap();
+
+        // 1. insert_step_log_with_cx
+        storage
+            .insert_step_log_with_cx(
+                &cx,
+                "wf-tick147",
+                None,
+                0,
+                "step-zero",
+                Some("step0".to_string()),
+                Some("send_text".to_string()),
+                "continue",
+                None,
+                None,
+                None,
+                None,
+                1_700_000_000_000,
+                1_700_000_000_100,
+            )
+            .await
+            .unwrap();
+
+        // 2. get_latest_step_log_with_cx — should match what we just wrote.
+        let latest = storage
+            .get_latest_step_log_with_cx(&cx, "wf-tick147")
+            .await
+            .unwrap()
+            .expect("step log just inserted");
+        assert_eq!(latest.step_name, "step-zero");
+        assert_eq!(latest.step_index, 0);
+
+        // 3. get_audit_actions_stream_with_cx — empty DB: default query
+        //    roundtrips to an empty page.
+        let stream = storage
+            .get_audit_actions_stream_with_cx(&cx, AuditStreamQuery::default())
+            .await
+            .unwrap();
+        assert!(stream.records.is_empty());
+
+        // 4. get_approval_token_with_cx — no tokens, returns None.
+        let token = storage
+            .get_approval_token_with_cx(&cx, "nonexistent-hash")
+            .await
+            .unwrap();
+        assert!(token.is_none());
+
+        // 5. get_segments_with_cx — no segments captured, empty list.
+        let segments = storage.get_segments_with_cx(&cx, 57, 10).await.unwrap();
+        assert!(segments.is_empty());
+
+        // 6. get_action_plan_with_cx — no plan upserted, returns None.
+        let plan = storage
+            .get_action_plan_with_cx(&cx, "wf-tick147")
+            .await
+            .unwrap();
+        assert!(plan.is_none());
+
+        // 7. get_prepared_plan_with_cx — likewise None.
+        let prepared = storage
+            .get_prepared_plan_with_cx(&cx, "plan-nonexistent")
+            .await
+            .unwrap();
+        assert!(prepared.is_none());
+
+        // 8. is_writable_with_cx — writer thread up, expect true.
+        let writable = storage.is_writable_with_cx(&cx).await.unwrap();
+        assert!(writable, "fresh storage should be writable");
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
