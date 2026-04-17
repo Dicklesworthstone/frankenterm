@@ -422,6 +422,67 @@ impl MemoryBudgetManager {
         }
     }
 
+    /// Run the monitoring loop against the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Short-circuits before the first sample if `cx` is already cancelled.
+    /// Otherwise each inter-sample sleep is bound via
+    /// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+    /// cancellation from the outer scope cuts the sleep deterministically
+    /// under `LabRuntime` virtual time. Both the `shutdown` flag and
+    /// `cx.is_cancel_requested()` are checked each iteration so either
+    /// cancellation path terminates the loop promptly without waiting on
+    /// the full sample interval.
+    ///
+    /// Mirrors `CpuPressureMonitor::run_with_cx` (cpu_pressure.rs) — these
+    /// two sampling loops share the same lifecycle shape.
+    ///
+    /// The legacy [`run`](Self::run) entry point is preserved for
+    /// non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if cx.is_cancel_requested() {
+            return;
+        }
+
+        let interval = std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
+        let mut first_tick = true;
+
+        loop {
+            if !first_tick {
+                // `sleep_with_cx` returns Err on cancellation; treat as
+                // "time to exit" so the loop terminates cleanly without
+                // a spurious extra sample after cancellation.
+                if crate::runtime_compat::sleep_with_cx(cx, interval)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            first_tick = false;
+
+            if shutdown.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+                break;
+            }
+
+            let summary = self.sample_all();
+            if summary.throttled_count > 0 || summary.over_budget_count > 0 {
+                tracing::warn!(
+                    throttled = summary.throttled_count,
+                    over_budget = summary.over_budget_count,
+                    worst_pane = ?summary.worst_pane_id,
+                    worst_ratio = format!("{:.2}", summary.worst_usage_ratio),
+                    "Memory budget pressure detected"
+                );
+            }
+        }
+    }
+
     /// Protect the mux server process from OOM kill (Linux only).
     ///
     /// Writes to `/proc/self/oom_score_adj` to lower our OOM priority.
@@ -1305,6 +1366,101 @@ mod tests {
 
             mgr.unregister_pane(1);
             assert!(!std::path::Path::new(&format!("{base}/pane-1")).exists());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first run entry point
+    // (ft-xbnl0.2.x slice). Pin that `run_with_cx` responds to Cx-driven
+    // cancellation without consuming the sample interval. Mirrors the
+    // cpu_pressure.rs labruntime_cpu_pressure tests.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_memory_budget {
+        use super::*;
+        use std::sync::Arc;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// `run_with_cx` must return before entering the loop if the
+        /// caller's Cx is already cancelled. No samples should be taken.
+        #[test]
+        fn run_with_cx_pre_cancelled_exits_without_sampling() {
+            run_lab(0x3E30_10CE_BED5_0101, || async move {
+                let mgr = MemoryBudgetManager::new(test_config());
+                let samples_before = mgr.telemetry().snapshot().samples;
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x memory_budget precancel"),
+                );
+
+                mgr.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                assert_eq!(
+                    mgr.telemetry().snapshot().samples,
+                    samples_before,
+                    "pre-cancelled run_with_cx must not take a sample"
+                );
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "run_with_cx must return via the Cx path, not the shutdown flag"
+                );
+            });
+        }
+
+        /// `run_with_cx` with shutdown already set must exit before
+        /// sampling (matches the pattern in cpu_pressure.rs: shutdown
+        /// check runs before sample_all() on the first tick).
+        #[test]
+        fn run_with_cx_shutdown_set_exits_without_sampling() {
+            run_lab(0x3E30_10CE_BED5_0202, || async move {
+                let mgr = MemoryBudgetManager::new(test_config());
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let cx = crate::cx::for_request();
+
+                mgr.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                assert_eq!(
+                    mgr.telemetry().snapshot().samples,
+                    0,
+                    "shutdown flag set before any tick must exit before sampling"
+                );
+            });
         }
     }
 }
