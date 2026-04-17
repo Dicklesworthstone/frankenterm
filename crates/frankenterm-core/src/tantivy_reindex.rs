@@ -425,7 +425,8 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
         if config.clear_before_start {
-            let existing_checkpoint = storage.read_checkpoint(&consumer_id).await?;
+            // Tick 75/76 refactor: Cx-first trait sibling.
+            let existing_checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
             if existing_checkpoint.is_none() {
                 let cleared = self.writer.clear_all().map_err(IndexerError::IndexWrite)?;
                 progress.docs_cleared = cleared;
@@ -439,7 +440,8 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
             ))
         })?;
 
-        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        // Tick 75/76 refactor: Cx-first trait sibling.
+        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -1020,7 +1022,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                     schema_version: expected_schema.to_string(),
                     committed_at_ms: epoch_ms_now(),
                 };
-                storage.commit_checkpoint(cp).await?;
+                // Tick 75/76 refactor: Cx-first trait sibling.
+                storage.commit_checkpoint_with_cx(cx, cp).await?;
                 progress.batches_committed += 1;
 
                 let now_ms = epoch_ms_now();
@@ -1164,7 +1167,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         let mut progress = ReindexProgress::new();
         let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
 
-        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        // Tick 75/76 refactor: Cx-first trait sibling.
+        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -1422,7 +1426,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                     schema_version: expected_schema.to_string(),
                     committed_at_ms: epoch_ms_now(),
                 };
-                storage.commit_checkpoint(cp).await?;
+                // Tick 75/76 refactor: Cx-first trait sibling.
+                storage.commit_checkpoint_with_cx(cx, cp).await?;
                 progress.batches_committed += 1;
             }
 
@@ -1647,7 +1652,8 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                     schema_version: expected_schema.to_string(),
                     committed_at_ms: epoch_ms_now(),
                 };
-                storage.commit_checkpoint(cp).await?;
+                // Tick 75/76 refactor: Cx-first trait sibling.
+                storage.commit_checkpoint_with_cx(cx, cp).await?;
                 progress.batches_committed += 1;
             }
 

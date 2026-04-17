@@ -1079,7 +1079,10 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
         let consumer_id = CheckpointConsumerId(self.config.consumer_id.clone());
 
-        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        // Tick 75/76 refactor: route through the RecorderStorage
+        // Cx-first trait sibling (tick 74) so cancellation
+        // propagates into the storage read path itself.
+        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
 
         let data_path = self.config.data_path().ok_or_else(|| {
             IndexerError::Config(
@@ -1168,7 +1171,9 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                     schema_version: self.config.expected_event_schema.clone(),
                     committed_at_ms: epoch_ms_now(),
                 };
-                storage.commit_checkpoint(cp).await?;
+                // Tick 75/76 refactor: Cx-first commit via trait
+                // sibling (tick 74).
+                storage.commit_checkpoint_with_cx(cx, cp).await?;
             }
 
             result.batches_committed += 1;
@@ -1338,7 +1343,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
 
         let consumer_id = CheckpointConsumerId(self.config.consumer_id.clone());
 
-        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+        // Tick 75/76 refactor: Cx-first trait sibling.
+        let checkpoint = storage.read_checkpoint_with_cx(cx, &consumer_id).await?;
 
         let mut cursor = match &checkpoint {
             Some(cp) => {
@@ -1431,7 +1437,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
                     schema_version: self.config.expected_event_schema.clone(),
                     committed_at_ms: epoch_ms_now(),
                 };
-                storage.commit_checkpoint(cp).await?;
+                // Tick 75/76 refactor: Cx-first trait sibling.
+                storage.commit_checkpoint_with_cx(cx, cp).await?;
             }
 
             result.batches_committed += 1;
