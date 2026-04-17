@@ -976,6 +976,36 @@ impl SnapshotEngine {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_periodic`].
+    ///
+    /// Pre-flight checkpoint gates the scheduler-loop entry
+    /// before any shutdown receiver setup or startup capture
+    /// fires. Delegates to [`run_periodic`] for the actual
+    /// scheduler body — the internal scheduler still uses a
+    /// fresh-per-request cx for its own shutdown/trigger polls
+    /// (deep cx threading through both scheduling modes would
+    /// duplicate ~150 lines; a future tick may lift that).
+    /// This pre-flight seam is still valuable because
+    /// `run_periodic` is the supervisor-spawned entry for the
+    /// snapshot engine and a cancelled supervisor cx should
+    /// bail before the scheduler arms itself.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_periodic_with_cx<F, Fut>(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: watch::Receiver<bool>,
+        pane_provider: F,
+    ) where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
+    {
+        if cx.checkpoint().is_err() {
+            tracing::info!("snapshot engine run_periodic cancelled at entry");
+            return;
+        }
+        self.run_periodic(shutdown, pane_provider).await;
+    }
+
     /// Get or create the session ID.
     async fn ensure_session(
         &self,
@@ -1172,6 +1202,29 @@ impl SnapshotEngine {
             let db_path = Arc::clone(&self.db_path);
             Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
         }
+        Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
+    ///
+    /// Two checkpoint seams: (1) pre-flight before acquiring the
+    /// session-id read lock, (2) after the spawn_blocking DB
+    /// update returns (so a late-cancelled caller gets the
+    /// cancel surface without dropping the DB work in-flight).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn mark_shutdown_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> std::result::Result<(), SnapshotError> {
+        cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
+
+        let session_id = { self.session_id.read().await.clone() };
+        if let Some(id) = session_id {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
+        }
+
+        cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
         Ok(())
     }
 }
@@ -1996,6 +2049,61 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(clean, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `mark_shutdown_with_cx` must set
+    /// the shutdown_clean flag identically to the legacy path
+    /// when given a fresh, uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn mark_shutdown_with_cx_sets_flag() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            let r = engine
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .unwrap();
+
+            let cx = crate::cx::for_testing();
+            engine.mark_shutdown_with_cx(&cx).await.unwrap();
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let clean: i64 = conn
+                .query_row(
+                    "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                    [&r.session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(clean, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `mark_shutdown_with_cx` must
+    /// return `SnapshotError::Cancelled` when given a
+    /// pre-cancelled cx, without touching the DB.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn mark_shutdown_with_precancelled_cx_returns_cancelled() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel mark_shutdown test"),
+            );
+
+            let err = match engine.mark_shutdown_with_cx(&cx).await {
+                Err(e) => e,
+                Ok(()) => panic!("mark_shutdown_with_cx should fail on cancelled cx"),
+            };
+            assert!(matches!(err, SnapshotError::Cancelled));
         });
     }
 
