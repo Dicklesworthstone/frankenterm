@@ -1529,7 +1529,10 @@ pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
         )))
     })?;
 
-    let health = storage.health().await;
+    // ft-xbnl0.2.3 tick 134: route through cx-first trait siblings
+    // so caller cancellation propagates into storage's pre-flight
+    // checkpoints on both the health probe and the checkpoint read.
+    let health = storage.health_with_cx(cx).await;
 
     cx.checkpoint().map_err(|err| {
         RecorderStorageError::Io(std::io::Error::other(format!(
@@ -1538,7 +1541,7 @@ pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
     })?;
 
     let checkpoint = storage
-        .read_checkpoint(&CheckpointConsumerId(consumer_id.to_string()))
+        .read_checkpoint_with_cx(cx, &CheckpointConsumerId(consumer_id.to_string()))
         .await?;
 
     Ok(build_indexer_lag_snapshot(&health, checkpoint))
