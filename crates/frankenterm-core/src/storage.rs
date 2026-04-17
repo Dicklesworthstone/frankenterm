@@ -6545,6 +6545,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_secret_scan_report`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_secret_scan_report_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: SecretScanReportRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_secret_scan_report cancelled: {err}"))
+        })?;
+        self.record_secret_scan_report(record).await
+    }
+
     /// Insert a saved search definition.
     pub async fn insert_saved_search(&self, record: SavedSearchRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -8536,6 +8549,19 @@ impl StorageHandle {
             query_latest_secret_scan_report(&conn, &scope_hash)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`latest_secret_scan_report`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn latest_secret_scan_report_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        scope_hash: &str,
+    ) -> Result<Option<SecretScanReportRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("latest_secret_scan_report cancelled: {err}"))
+        })?;
+        self.latest_secret_scan_report(scope_hash).await
     }
 
     /// Get workflow by ID

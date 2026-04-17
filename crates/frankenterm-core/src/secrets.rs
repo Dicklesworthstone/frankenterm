@@ -220,9 +220,11 @@ impl SecretScanEngine {
 
     /// Cx-first [`scan_storage_incremental`] (ft-xbnl0.2.3).
     /// Mirrors the legacy incremental-resume path but routes the
-    /// batch scan through [`Self::scan_storage_from_with_cx`]. The
-    /// preamble checkpoint captures
-    /// pre-cancelled cx before touching storage.
+    /// batch scan through [`Self::scan_storage_from_with_cx`]. Tick
+    /// 133 deepened the storage calls too: both
+    /// `latest_secret_scan_report` (checkpoint read) and
+    /// `record_secret_scan_report` (checkpoint write) now route
+    /// through their cx-first siblings.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn scan_storage_incremental_with_cx(
         &self,
@@ -237,7 +239,9 @@ impl SecretScanEngine {
         let scope = SecretScanScope::from_options(&options);
         let scope_json = serde_json::to_string(&scope)?;
         let scope_hash = hash_bytes(scope_json.as_bytes());
-        let checkpoint = storage.latest_secret_scan_report(&scope_hash).await?;
+        let checkpoint = storage
+            .latest_secret_scan_report_with_cx(cx, &scope_hash)
+            .await?;
         let resume_after_id = checkpoint.and_then(|report| report.last_segment_id);
 
         let report = self
@@ -253,7 +257,7 @@ impl SecretScanEngine {
             report_json: serde_json::to_string(&report)?,
             created_at: report.completed_at,
         };
-        let _ = storage.record_secret_scan_report(record).await?;
+        let _ = storage.record_secret_scan_report_with_cx(cx, record).await?;
 
         Ok(report)
     }
@@ -306,7 +310,8 @@ impl SecretScanEngine {
                 limit,
             };
 
-            let batch = storage.scan_segments(query).await?;
+            // tick 133: cx-first segment scan.
+            let batch = storage.scan_segments_with_cx(cx, query).await?;
             if batch.is_empty() {
                 break;
             }
