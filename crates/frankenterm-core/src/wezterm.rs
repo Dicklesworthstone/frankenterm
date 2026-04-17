@@ -2329,9 +2329,46 @@ impl WeztermClient {
         result
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of
+    /// [`WeztermClient::run_cli_with_pane_check_retry`].
+    ///
+    /// Routes the inner CLI invocation through
+    /// `run_cli_with_pane_check_with_cx` and calls
+    /// `retry_with_with_cx` so each attempt honours cancellation.
+    async fn run_cli_with_pane_check_retry_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+        pane_id: u64,
+    ) -> Result<String> {
+        self.circuit_guard()?;
+        let result = self
+            .retry_with_with_cx(cx, || self.run_cli_with_pane_check_with_cx(cx, args, pane_id))
+            .await;
+        self.circuit_record_result(&result);
+        result
+    }
+
     async fn run_cli_with_retry(&self, args: &[&str]) -> Result<String> {
         self.circuit_guard()?;
         let result = self.retry_with(|| self.run_cli(args)).await;
+        self.circuit_record_result(&result);
+        result
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`WeztermClient::run_cli_with_retry`].
+    ///
+    /// Routes the inner CLI invocation through `run_cli_with_cx` and
+    /// calls `retry_with_with_cx` so each attempt honours cancellation.
+    async fn run_cli_with_retry_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: &[&str],
+    ) -> Result<String> {
+        self.circuit_guard()?;
+        let result = self
+            .retry_with_with_cx(cx, || self.run_cli_with_cx(cx, args))
+            .await;
         self.circuit_record_result(&result);
         result
     }
@@ -2343,6 +2380,45 @@ impl WeztermClient {
     {
         let mut attempt = 0;
         loop {
+            attempt += 1;
+            match runner().await {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    if attempt >= self.retry_attempts || !is_retryable_error(&err) {
+                        return Err(err);
+                    }
+                    if self.retry_delay_ms > 0 {
+                        sleep(Duration::from_millis(self.retry_delay_ms)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`WeztermClient::retry_with`].
+    ///
+    /// Pre-flight `cx.checkpoint()` on each iteration so a cancelled
+    /// context interrupts the retry loop at the earliest boundary,
+    /// before the next inner call and before the inter-attempt
+    /// sleep. The inner `runner` closure is expected to route through
+    /// a cx-first path itself; this helper only owns cancellation of
+    /// the retry schedule, not of the underlying IO.
+    async fn retry_with_with_cx<F, Fut>(
+        &self,
+        cx: &crate::cx::Cx,
+        mut runner: F,
+    ) -> Result<String>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<String>>,
+    {
+        let mut attempt = 0;
+        loop {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Wezterm(WeztermError::CommandFailed(format!(
+                    "retry_with cancelled: {err}"
+                )))
+            })?;
             attempt += 1;
             match runner().await {
                 Ok(output) => return Ok(output),
@@ -4168,6 +4244,57 @@ mod tests {
                         "expected Wezterm(SocketNotFound) on zoom=false (unzoom) path, got {other:?}"
                     )
                 }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `retry_with_with_cx` must honor a
+    /// pre-cancelled context on the very first iteration — before
+    /// `runner` is invoked, before any inter-attempt sleep. This pins
+    /// the cancellation-seam contract for the retry loop and proves
+    /// tick 150's sibling trio (`retry_with_with_cx`,
+    /// `run_cli_with_retry_with_cx`,
+    /// `run_cli_with_pane_check_retry_with_cx`) is wired correctly.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn retry_with_with_cx_short_circuits_on_precancelled_cx() {
+        run_async_test(async {
+            let client = WeztermClient::new();
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel retry loop"),
+            );
+
+            let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let invocations_closure = Arc::clone(&invocations);
+
+            let err = client
+                .retry_with_with_cx(&cx, move || {
+                    let invocations = Arc::clone(&invocations_closure);
+                    async move {
+                        invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, crate::Error>("unreachable".to_string())
+                    }
+                })
+                .await
+                .expect_err("pre-cancelled cx must short-circuit retry loop");
+
+            assert_eq!(
+                invocations.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "runner must NOT be invoked when cx is pre-cancelled"
+            );
+            match err {
+                crate::Error::Wezterm(WeztermError::CommandFailed(msg)) => {
+                    assert!(
+                        msg.contains("cancelled"),
+                        "error should mention cancellation: {msg}"
+                    );
+                }
+                other => panic!(
+                    "expected Wezterm(CommandFailed) on pre-cancel, got {other:?}"
+                ),
             }
         });
     }
