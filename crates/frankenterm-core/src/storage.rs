@@ -6019,6 +6019,26 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`append_segment`].
+    ///
+    /// Pre-flight checkpoint gates the segment-write hot path
+    /// before the command is enqueued on the writer channel.
+    /// The ingest pipeline lives downstream of this method, so
+    /// threading cx here lets a cx-cancelled observation loop
+    /// bail before enqueuing the write.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn append_segment_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+    ) -> Result<Segment> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
+        self.append_segment(pane_id, content, content_hash).await
+    }
+
     /// Record a gap event
     ///
     /// Indicates a discontinuity in capture for the given pane.
@@ -6035,6 +6055,23 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_gap`].
+    ///
+    /// Pre-flight checkpoint gates gap recording. Called from
+    /// ingest detector paths where caller cx propagation is
+    /// common.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_gap_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        reason: &str,
+    ) -> Result<Option<Gap>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("record_gap cancelled: {err}")))?;
+        self.record_gap(pane_id, reason).await
     }
 
     /// Record an event (pattern detection)
@@ -7982,6 +8019,14 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_panes`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_panes cancelled: {err}")))?;
+        self.get_panes().await
+    }
+
     /// Get a specific pane
     pub async fn get_pane(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8099,6 +8144,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_workflow`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_workflow cancelled: {err}")))?;
+        self.get_workflow(workflow_id).await
+    }
+
     /// Get step logs for a workflow
     ///
     /// Returns all step logs for the given workflow, ordered by step index.
@@ -8199,6 +8256,18 @@ impl StorageHandle {
             query_incomplete_workflows(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`find_incomplete_workflows`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn find_incomplete_workflows_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<WorkflowRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("find_incomplete_workflows cancelled: {err}"))
+        })?;
+        self.find_incomplete_workflows().await
     }
 
     /// Check if the storage is writable (writer thread is alive and responsive).
@@ -8532,6 +8601,18 @@ impl StorageHandle {
             query_export_workflows(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`export_workflows`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn export_workflows_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ExportQuery,
+    ) -> Result<Vec<WorkflowRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("export_workflows cancelled: {err}")))?;
+        self.export_workflows(query).await
     }
 
     /// Export agent sessions with optional pane/time/limit filters
@@ -19929,6 +20010,121 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 118 hot-path batch smoke test —
+/// 6 more storage cx-first siblings exercised end-to-end:
+/// `append_segment_with_cx`, `record_gap_with_cx`,
+/// `get_panes_with_cx`, `get_workflow_with_cx`,
+/// `find_incomplete_workflows_with_cx`, `export_workflows_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick118_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick118_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed two panes — verify get_panes_with_cx returns both.
+        for id in [11_u64, 22_u64] {
+            storage
+                .upsert_pane_with_cx(
+                    &cx,
+                    PaneRecord {
+                        pane_id: id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some(format!("tick118-{id}")),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // 1. get_panes_with_cx
+        let panes = storage.get_panes_with_cx(&cx).await.unwrap();
+        assert_eq!(panes.len(), 2);
+
+        // 2. append_segment_with_cx (hot write path)
+        let segment = storage
+            .append_segment_with_cx(&cx, 11, "tick118-content", None)
+            .await
+            .unwrap();
+        assert_eq!(segment.pane_id, 11);
+
+        // 3. record_gap_with_cx
+        let gap = storage
+            .record_gap_with_cx(&cx, 11, "tick118-gap-reason")
+            .await
+            .unwrap();
+        // gap may be None if no prior segment sequence anomaly; just
+        // asserting the call roundtrips cleanly is sufficient here.
+        let _ = gap;
+
+        // 4. upsert_workflow_with_cx + get_workflow_with_cx roundtrip
+        let workflow = WorkflowRecord {
+            id: "wf-tick118".to_string(),
+            workflow_name: "demo".to_string(),
+            pane_id: 11,
+            trigger_event_id: None,
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+            completed_at: None,
+        };
+        storage
+            .upsert_workflow_with_cx(&cx, workflow)
+            .await
+            .unwrap();
+        let fetched = storage
+            .get_workflow_with_cx(&cx, "wf-tick118")
+            .await
+            .unwrap()
+            .expect("workflow should exist");
+        assert_eq!(fetched.id, "wf-tick118");
+
+        // 5. find_incomplete_workflows_with_cx — our running workflow
+        // above is incomplete.
+        let incomplete = storage
+            .find_incomplete_workflows_with_cx(&cx)
+            .await
+            .unwrap();
+        assert!(
+            incomplete.iter().any(|w| w.id == "wf-tick118"),
+            "find_incomplete_workflows_with_cx should include wf-tick118"
+        );
+
+        // 6. export_workflows_with_cx
+        let exported = storage
+            .export_workflows_with_cx(&cx, ExportQuery::default())
+            .await
+            .unwrap();
+        assert!(
+            exported.iter().any(|w| w.id == "wf-tick118"),
+            "export_workflows_with_cx should include wf-tick118"
+        );
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
