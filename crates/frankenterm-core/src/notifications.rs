@@ -886,6 +886,49 @@ mod tests {
         assert_eq!(limited.inner().name, "test_inner");
     }
 
+    /// ft-xbnl0.2.3 Cx-first: RateLimitedSender::send_with_cx must
+    /// forward cx to the wrapped sender. Pins the tick 35 fix — the
+    /// wrapper's Cx-first path reaches the inner sender's Cx-aware
+    /// surface instead of falling back to the ambient `send()`.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn rate_limited_sender_with_cx_forwards_to_inner() {
+        run_async_test(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let inner = MockSender::new("inner", Arc::clone(&sent));
+            let limited = RateLimitedSender::new(inner, Duration::from_millis(10));
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
+
+            let cx = crate::cx::for_request();
+            let d1 = limited.send_with_cx(&cx, &payload).await;
+            assert!(
+                d1.success,
+                "first send_with_cx should succeed when within rate limit"
+            );
+            assert!(
+                !d1.rate_limited,
+                "first send_with_cx must not be rate-limited"
+            );
+
+            // Immediate second send should hit the rate limit (the
+            // within_window check runs before forwarding to inner).
+            let d2 = limited.send_with_cx(&cx, &payload).await;
+            assert!(
+                d2.rate_limited,
+                "immediate second send_with_cx should be rate-limited"
+            );
+            assert!(!d2.success);
+
+            // Only one message actually reached the inner MockSender.
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                1,
+                "rate-limited send_with_cx must not forward to inner"
+            );
+        });
+    }
+
     #[test]
     fn rate_limited_sender_name_delegates() {
         let sent = Arc::new(Mutex::new(Vec::new()));
