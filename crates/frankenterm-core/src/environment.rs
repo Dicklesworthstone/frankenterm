@@ -178,6 +178,74 @@ impl WeztermInfo {
 
         (info, panes)
     }
+
+    /// Cx-first [`Self::detect`] (ft-xbnl0.2.3). Routes the
+    /// `wezterm cli list-panes` call through
+    /// [`crate::wezterm::WeztermInterface::list_panes_with_cx`]
+    /// (tick 27 trait extension) so caller cancellation
+    /// propagates into the subprocess.
+    ///
+    /// The synchronous detection steps (version probe, socket
+    /// discovery) fire regardless of cx state — they're
+    /// subprocess spawns via `std::process::Command` that
+    /// don't use the async runtime. A pre-flight checkpoint
+    /// could skip them, but the detection fast path is short
+    /// enough (~100ms typical) that a checkpoint there adds
+    /// ceremony without much value. The cx-aware seam is the
+    /// `list_panes` call which can be slow on a loaded
+    /// wezterm instance.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn detect_with_cx(
+        cx: &crate::cx::Cx,
+        wezterm: Option<&WeztermHandle>,
+        shell: &ShellInfo,
+    ) -> (Self, Vec<PaneInfo>) {
+        let version = detect_wezterm_version();
+        let cli_available = version.is_some();
+        let socket_path = detect_wezterm_socket();
+
+        let mut panes = Vec::new();
+        let mut list_ok = false;
+
+        if cli_available {
+            let handle = wezterm.cloned().unwrap_or_else(default_wezterm_handle);
+            match handle.list_panes_with_cx(cx).await {
+                Ok(found) => {
+                    panes = found;
+                    list_ok = true;
+                }
+                Err(_) => {
+                    list_ok = false;
+                }
+            }
+        }
+
+        let osc_7 = list_ok
+            && panes.iter().any(|pane| {
+                pane.cwd
+                    .as_ref()
+                    .map(|cwd| !cwd.trim().is_empty())
+                    .unwrap_or(false)
+            });
+
+        let capabilities = WeztermCapabilities {
+            cli_available,
+            json_output: list_ok,
+            multiplexing: list_ok,
+            osc_133: shell.osc_133_enabled,
+            osc_7,
+            image_protocol: cli_available,
+        };
+
+        let info = Self {
+            version,
+            socket_path,
+            is_running: list_ok,
+            capabilities,
+        };
+
+        (info, panes)
+    }
 }
 
 impl SystemInfo {
@@ -210,6 +278,29 @@ impl DetectedEnvironment {
     pub async fn detect(wezterm: Option<&WeztermHandle>) -> Self {
         let shell = ShellInfo::detect();
         let (wezterm_info, panes) = WeztermInfo::detect(wezterm, &shell).await;
+        let agents = detect_agents_from_panes(&panes);
+        let remotes = detect_remotes_from_panes(&panes);
+        let system = SystemInfo::detect();
+
+        Self {
+            wezterm: wezterm_info,
+            shell,
+            agents,
+            remotes,
+            system,
+            detected_at: Utc::now(),
+        }
+    }
+
+    /// Cx-first [`Self::detect`] (ft-xbnl0.2.3). Routes the
+    /// wezterm detection through [`WeztermInfo::detect_with_cx`]
+    /// so the `list_panes` call honors caller cancellation. All
+    /// other detection steps (shell, agents, remotes, system)
+    /// are pure-sync and don't need cx threading.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn detect_with_cx(cx: &crate::cx::Cx, wezterm: Option<&WeztermHandle>) -> Self {
+        let shell = ShellInfo::detect();
+        let (wezterm_info, panes) = WeztermInfo::detect_with_cx(cx, wezterm, &shell).await;
         let agents = detect_agents_from_panes(&panes);
         let remotes = detect_remotes_from_panes(&panes);
         let system = SystemInfo::detect();
@@ -663,6 +754,64 @@ mod tests {
             is_active: false,
             is_zoomed: false,
             extra: std::collections::HashMap::new(),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `DetectedEnvironment::detect_with_cx`
+    /// must produce a detection result with the same shape as
+    /// the legacy `detect` for an uncancelled cx. Uses a mock
+    /// wezterm handle with 2 panes to verify agent detection
+    /// runs through the Cx-first path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn detect_with_cx_matches_legacy_with_mock_wezterm() {
+        use crate::runtime_compat::CompatRuntime;
+        use crate::wezterm::{MockWezterm, WeztermHandle};
+        use std::sync::Arc;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let mock = Arc::new(MockWezterm::new());
+                mock.add_pane(crate::wezterm::MockPane {
+                    pane_id: 1,
+                    window_id: 0,
+                    tab_id: 0,
+                    title: "codex".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    is_active: true,
+                    is_zoomed: false,
+                    cols: 80,
+                    rows: 24,
+                    content: String::new(),
+                })
+                .await;
+                let handle: WeztermHandle = mock.clone();
+                let cx = crate::cx::for_request();
+
+                let legacy = DetectedEnvironment::detect(Some(&handle)).await;
+                let cx_first = DetectedEnvironment::detect_with_cx(&cx, Some(&handle)).await;
+
+                // Detection counts must match (same backend, same pane).
+                assert_eq!(legacy.agents.len(), cx_first.agents.len());
+                assert_eq!(legacy.remotes.len(), cx_first.remotes.len());
+                // System + shell are pure-sync detection and
+                // should produce identical results on the same
+                // host.
+                assert_eq!(legacy.system.os, cx_first.system.os);
+                assert_eq!(legacy.system.arch, cx_first.system.arch);
+                assert_eq!(legacy.shell.shell_type, cx_first.shell.shell_type);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 
