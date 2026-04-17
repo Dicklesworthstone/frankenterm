@@ -1560,6 +1560,35 @@ pub async fn persist_captured_segment(
     })
 }
 
+/// Cx-first [`persist_captured_segment`] (ft-xbnl0.2.3).
+/// Threads caller `&Cx` through the storage operations via a
+/// pre-flight checkpoint plus one before the main
+/// `append_segment` write. The record_gap calls that may
+/// precede or follow the append are left uncheckpointed —
+/// they're cheap and skipping them to break out early would
+/// leave the cursor in a half-recorded state.
+///
+/// Cancellation-safety: pre-flight cancel returns before any
+/// storage write happens. A late cancel (between the
+/// pre-flight check and the append) is out of the narrow
+/// window this variant covers; callers depending on this
+/// would require a deeper refactor with per-step checkpoints.
+/// The pre-flight checkpoint alone is valuable because
+/// tailer code paths frequently call persist in a loop and
+/// may want to bail out when shutdown arrives.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn persist_captured_segment_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+) -> Result<PersistedCapture> {
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!("persist_captured_segment cancelled: {err}"))
+    })?;
+    persist_captured_segment(storage, captured, max_segment_bytes).await
+}
+
 fn hash_text(text: &str) -> u64 {
     stable_hash(text.as_bytes())
 }
@@ -2835,6 +2864,43 @@ mod tests {
             assert_eq!(segments.len(), 2);
             assert!(segments.iter().any(|seg| seg.content == "hello\n"));
             assert!(segments.iter().any(|seg| seg.content == "world\n"));
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first:
+    /// `persist_captured_segment_with_cx` must match
+    /// `persist_captured_segment` on the basic append flow.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn persist_captured_segment_with_cx_matches_legacy() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let mut cursor = PaneCursor::new(1);
+            let seg0 = cursor
+                .capture_snapshot("cx-hello\n", 1024, None)
+                .expect("first capture");
+
+            let cx = crate::cx::for_request();
+            let stored = persist_captured_segment_with_cx(
+                &cx,
+                &handle,
+                &seg0,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(stored.segment.seq, seg0.seq);
+
+            let segments = handle.get_segments(1, 10).await.unwrap();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].content, "cx-hello\n");
 
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
