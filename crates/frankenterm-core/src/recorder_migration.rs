@@ -997,6 +997,111 @@ impl MigrationEngine {
         Ok(result)
     }
 
+    /// Cx-first [`Self::m5_cutover`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the cutover sequence via checkpoint
+    /// seams: pre-flight (short-circuits before building the
+    /// lifecycle marker), between the marker append and the
+    /// post-activation health check.
+    ///
+    /// Cancellation-safety contract: the pre-flight checkpoint
+    /// fires BEFORE constructing the marker event, so a
+    /// pre-cancelled cx leaves the target completely untouched
+    /// (no marker written). A cancel between the marker append
+    /// and the health check leaves the marker on the target (it
+    /// was fsync'd) but the caller doesn't see the `target_healthy`
+    /// field — a subsequent re-attempt of m5 would write a second
+    /// marker with a different epoch_ms (the `batch_id` includes
+    /// it, so idempotency is epoch-scoped). Operators should
+    /// treat a mid-cutover cancellation as "cutover started, re-run
+    /// to confirm".
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn m5_cutover_with_cx<T: RecorderStorage>(
+        &self,
+        cx: &crate::cx::Cx,
+        target: &T,
+        manifest: &MigrationManifest,
+        epoch_ms: u64,
+        source_path: Option<String>,
+    ) -> Result<CutoverResult, MigrationError> {
+        cx.checkpoint().map_err(|err| {
+            MigrationError::TargetWriteError(format!("m5_cutover cancelled pre-start: {err}"))
+        })?;
+
+        let marker_event = RecorderEvent {
+            schema_version: "ft.recorder.event.v1".to_string(),
+            event_id: format!("migration-cutover-{epoch_ms}"),
+            pane_id: 0,
+            session_id: None,
+            workflow_id: None,
+            correlation_id: None,
+            source: RecorderEventSource::RecoveryFlow,
+            occurred_at_ms: epoch_ms,
+            recorded_at_ms: epoch_ms,
+            sequence: manifest.last_ordinal + 1,
+            causality: RecorderEventCausality {
+                parent_event_id: None,
+                trigger_event_id: None,
+                root_event_id: None,
+            },
+            payload: RecorderEventPayload::LifecycleMarker {
+                lifecycle_phase: RecorderLifecyclePhase::CaptureStarted,
+                reason: Some("migration_complete".to_string()),
+                details: serde_json::json!({
+                    "migration_type": "append_log_to_frankensqlite",
+                    "event_count": manifest.event_count,
+                    "export_digest": format!("{:#x}", manifest.export_digest),
+                    "epoch_ms": epoch_ms,
+                }),
+            },
+        };
+
+        let req = AppendRequest {
+            batch_id: format!("{}-cutover-{epoch_ms}", self.config.consumer_id),
+            events: vec![marker_event],
+            required_durability: DurabilityLevel::Fsync,
+            producer_ts_ms: epoch_ms,
+        };
+
+        target
+            .append_batch(req)
+            .await
+            .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
+
+        cx.checkpoint().map_err(|err| {
+            MigrationError::TargetWriteError(format!(
+                "m5_cutover cancelled after marker append (epoch_ms={epoch_ms}): {err}"
+            ))
+        })?;
+
+        let health = target.health().await;
+
+        if source_path.is_some() {
+            info!(
+                source_retention = true,
+                path = %source_path.as_deref().unwrap_or(""),
+                "source files retained for rollback window (cx)"
+            );
+        }
+
+        let result = CutoverResult {
+            activated_backend: RecorderBackendKind::FrankenSqlite,
+            migration_epoch_ms: epoch_ms,
+            target_healthy: !health.degraded,
+            source_retained_path: source_path,
+        };
+
+        info!(
+            migration_stage = "M5",
+            activated = true,
+            backend = "frankensqlite",
+            epoch = %epoch_ms,
+            healthy = result.target_healthy,
+            "cutover complete (cx)"
+        );
+
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // Full M0→M2 pipeline
     // -----------------------------------------------------------------------
@@ -2511,6 +2616,65 @@ mod tests {
             let marker = &appended[0].events[0];
             assert!(marker.event_id.contains("cutover"));
             assert_eq!(marker.sequence, 100); // last_ordinal + 1
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m5_cutover_with_cx` must emit an
+    /// identical lifecycle marker and produce an identical
+    /// CutoverResult for the same inputs as the legacy
+    /// `m5_cutover`. Parallel of `test_m5_emits_lifecycle_marker`
+    /// under the Cx-first path, plus cross-path parity
+    /// assertions.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m5_cutover_with_cx_matches_legacy() {
+        run_async_test(async {
+            let target_legacy = MockMigrationStorage::healthy();
+            let target_cx = MockMigrationStorage::healthy();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let manifest = MigrationManifest {
+                event_count: 100,
+                first_ordinal: 0,
+                last_ordinal: 99,
+                export_digest: 0xCAFE,
+                ..Default::default()
+            };
+            let epoch_ms = 1_708_000_000_u64;
+
+            let legacy = engine
+                .m5_cutover(&target_legacy, &manifest, epoch_ms, None)
+                .await
+                .unwrap();
+
+            let cx = crate::cx::for_request();
+            let cx_first = engine
+                .m5_cutover_with_cx(&cx, &target_cx, &manifest, epoch_ms, None)
+                .await
+                .unwrap();
+
+            // Result parity.
+            assert_eq!(legacy.activated_backend, cx_first.activated_backend);
+            assert_eq!(legacy.migration_epoch_ms, cx_first.migration_epoch_ms);
+            assert_eq!(legacy.target_healthy, cx_first.target_healthy);
+            assert_eq!(legacy.source_retained_path, cx_first.source_retained_path);
+
+            // Both targets must have received exactly one batch with
+            // exactly one event (the cutover marker).
+            let legacy_appended = target_legacy.appended.lock().unwrap();
+            let cx_appended = target_cx.appended.lock().unwrap();
+            assert_eq!(legacy_appended.len(), cx_appended.len());
+            assert_eq!(legacy_appended.len(), 1);
+            assert_eq!(legacy_appended[0].events.len(), cx_appended[0].events.len());
+
+            // The marker event_id must be identical (epoch_ms-based).
+            let legacy_marker = &legacy_appended[0].events[0];
+            let cx_marker = &cx_appended[0].events[0];
+            assert_eq!(legacy_marker.event_id, cx_marker.event_id);
+            assert_eq!(legacy_marker.sequence, cx_marker.sequence);
+            assert_eq!(legacy_marker.sequence, 100);
+
+            // batch_id must match too (contains consumer_id + epoch).
+            assert_eq!(legacy_appended[0].batch_id, cx_appended[0].batch_id);
         });
     }
 
