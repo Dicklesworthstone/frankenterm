@@ -128,6 +128,40 @@ impl<T> SpscProducer<T> {
         }
     }
 
+    /// Cx-first [`Self::send`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the notify-wait loop via `cx.checkpoint()?`
+    /// at the top of each iteration. A pre-cancelled cx returns
+    /// `Err(value)` before touching the queue; a cancel during
+    /// a blocked `notified.await` breaks the caller out of the
+    /// loop and surfaces as `Err(value)` — value is returned so
+    /// the caller can retry with a different channel or drop.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_with_cx(&self, cx: &crate::cx::Cx, mut value: T) -> Result<(), T> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(value);
+            }
+
+            if self.is_closed() {
+                return Err(value);
+            }
+
+            match self.shared.queue.push(value) {
+                Ok(()) => {
+                    self.shared.not_empty.notify_one();
+                    return Ok(());
+                }
+                Err(v) => {
+                    value = v;
+                    let notified = self.shared.not_full.notified();
+                    if self.shared.queue.is_full() && !self.is_closed() {
+                        notified.await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Try to send a value without waiting.
     pub fn try_send(&self, value: T) -> Result<(), T> {
         if self.is_closed() {
@@ -202,6 +236,36 @@ impl<T> SpscConsumer<T> {
         }
     }
 
+    /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the notify-wait loop. A pre-cancelled cx
+    /// returns `None`; a cancel during a blocked wait breaks
+    /// the caller out and returns `None`. Note: returning
+    /// `None` on cancellation matches the closed-and-drained
+    /// return shape, so callers already handle it correctly —
+    /// they just see "channel ended" rather than blocking
+    /// forever.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<T> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return None;
+            }
+
+            if let Some(value) = self.try_recv() {
+                return Some(value);
+            }
+
+            if self.is_closed() {
+                return None;
+            }
+
+            let notified = self.shared.not_empty.notified();
+            if self.shared.queue.is_empty() && !self.is_closed() {
+                notified.await;
+            }
+        }
+    }
+
     /// Try to receive one value without waiting.
     pub fn try_recv(&self) -> Option<T> {
         let value = self.shared.queue.pop();
@@ -248,6 +312,34 @@ impl<T: Clone> SpmcProducer<T> {
     /// Send a value to all consumers, waiting asynchronously if any consumer queue is full.
     pub async fn send(&self, value: T) -> Result<(), T> {
         loop {
+            if self.is_closed() {
+                return Err(value);
+            }
+
+            if let Some(full_idx) = self.first_full_queue() {
+                let notified = self.shared.not_full[full_idx].notified();
+                if self.shared.queues[full_idx].is_full() && !self.is_closed() {
+                    notified.await;
+                }
+                continue;
+            }
+
+            self.push_to_all(value);
+            return Ok(());
+        }
+    }
+
+    /// Cx-first [`Self::send`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the notify-wait loop. A pre-cancelled cx
+    /// or cancel during a blocked `notified.await` returns
+    /// `Err(value)`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_with_cx(&self, cx: &crate::cx::Cx, value: T) -> Result<(), T> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(value);
+            }
+
             if self.is_closed() {
                 return Err(value);
             }
@@ -379,6 +471,33 @@ impl<T> SpmcConsumer<T> {
         }
     }
 
+    /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the notify-wait loop. Returns `None` on
+    /// pre-cancel or mid-wait cancel — matches the
+    /// closed-and-drained return shape so existing callers
+    /// that check for `None` need no changes.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<T> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return None;
+            }
+
+            if let Some(value) = self.try_recv() {
+                return Some(value);
+            }
+
+            if self.is_closed() {
+                return None;
+            }
+
+            let notified = self.shared.not_empty[self.consumer_idx].notified();
+            if self.shared.queues[self.consumer_idx].is_empty() && !self.is_closed() {
+                notified.await;
+            }
+        }
+    }
+
     /// Try to receive one value without waiting.
     pub fn try_recv(&self) -> Option<T> {
         let value = self.shared.queues[self.consumer_idx].pop();
@@ -455,6 +574,50 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `send_with_cx` + `recv_with_cx`
+    /// must match their legacy siblings for an uncancelled cx.
+    /// Exercises the full send-then-recv round-trip on an SPSC
+    /// channel with 3 values.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spsc_with_cx_preserves_fifo_order() {
+        run_async_test(async {
+            let (tx, rx) = channel(8);
+            let cx = crate::cx::for_request();
+
+            tx.send_with_cx(&cx, 1).await.unwrap();
+            tx.send_with_cx(&cx, 2).await.unwrap();
+            tx.send_with_cx(&cx, 3).await.unwrap();
+
+            assert_eq!(rx.recv_with_cx(&cx).await, Some(1));
+            assert_eq!(rx.recv_with_cx(&cx).await, Some(2));
+            assert_eq!(rx.recv_with_cx(&cx).await, Some(3));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: SPMC `send_with_cx` +
+    /// `recv_with_cx` must match their legacy siblings —
+    /// broadcast semantics preserved, each consumer gets every
+    /// value.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spmc_with_cx_broadcasts_to_all_consumers() {
+        run_async_test(async {
+            let (tx, rxs) = spmc_channel::<u32>(4, 2);
+            let rx1 = &rxs[0];
+            let rx2 = &rxs[1];
+            let cx = crate::cx::for_request();
+
+            tx.send_with_cx(&cx, 10).await.unwrap();
+            tx.send_with_cx(&cx, 20).await.unwrap();
+
+            assert_eq!(rx1.recv_with_cx(&cx).await, Some(10));
+            assert_eq!(rx1.recv_with_cx(&cx).await, Some(20));
+            assert_eq!(rx2.recv_with_cx(&cx).await, Some(10));
+            assert_eq!(rx2.recv_with_cx(&cx).await, Some(20));
+        });
     }
 
     #[test]
