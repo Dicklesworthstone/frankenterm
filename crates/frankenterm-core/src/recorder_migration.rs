@@ -552,6 +552,109 @@ impl MigrationEngine {
         Ok(())
     }
 
+    /// Cx-first [`Self::m2_import`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the chunk-import loop via
+    /// `cx.checkpoint()?` before each `target.append_batch` call.
+    /// A pre-cancelled cx returns before any writes; a mid-import
+    /// cancel leaves the target with all successfully-committed
+    /// chunks intact (batch_id idempotency means a resume after
+    /// cancellation will skip already-written chunks cleanly).
+    ///
+    /// Digest + count verification runs AFTER the loop completes
+    /// (no checkpoint there — the verification is pure CPU, and
+    /// a cancellation at that point would lose the import
+    /// context). If the caller cancels and the partial import
+    /// exits early, the count/digest checks do NOT run, which is
+    /// the right behavior: a partial import's digest won't match
+    /// the full-export digest, so we'd get a spurious
+    /// DigestMismatch on top of a cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn m2_import_with_cx<T: RecorderStorage>(
+        &self,
+        cx: &crate::cx::Cx,
+        target: &T,
+        records: &[CursorRecord],
+        manifest: &mut MigrationManifest,
+    ) -> Result<(), MigrationError> {
+        cx.checkpoint().map_err(|err| {
+            MigrationError::TargetWriteError(format!("m2_import cancelled pre-start: {err}"))
+        })?;
+
+        let mut import_digest = FNV1A_OFFSET_BASIS;
+        let mut import_count: u64 = 0;
+
+        for chunk in records.chunks(self.config.import_batch_size) {
+            cx.checkpoint().map_err(|err| {
+                MigrationError::TargetWriteError(format!(
+                    "m2_import cancelled mid-import (import_count={import_count}): {err}"
+                ))
+            })?;
+
+            let first_ord = chunk.first().map(|r| r.offset.ordinal).unwrap_or(0);
+            let last_ord = chunk.last().map(|r| r.offset.ordinal).unwrap_or(0);
+            let batch_id = format!("{}-{first_ord}-{last_ord}", self.config.consumer_id);
+
+            let events: Vec<_> = chunk.iter().map(|r| r.event.clone()).collect();
+
+            let req = AppendRequest {
+                batch_id,
+                events,
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 0,
+            };
+
+            target
+                .append_batch(req)
+                .await
+                .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
+
+            for record in chunk {
+                import_digest = fnv1a_feed(import_digest, record.offset.ordinal);
+                import_count += 1;
+            }
+        }
+
+        if import_count != manifest.export_count {
+            error!(
+                migration_abort = true,
+                stage = "M2",
+                expected_count = manifest.export_count,
+                actual_count = import_count,
+                "count mismatch (cx)"
+            );
+            return Err(MigrationError::CountMismatch {
+                expected: manifest.export_count,
+                actual: import_count,
+            });
+        }
+
+        if import_digest != manifest.export_digest {
+            error!(
+                migration_abort = true,
+                stage = "M2",
+                expected_digest = %format!("{:#x}", manifest.export_digest),
+                actual_digest = %format!("{import_digest:#x}"),
+                "digest mismatch (cx)"
+            );
+            return Err(MigrationError::DigestMismatch {
+                expected: manifest.export_digest,
+                actual: import_digest,
+            });
+        }
+
+        manifest.import_digest = import_digest;
+        manifest.import_count = import_count;
+
+        info!(
+            migration_stage = "M2",
+            events_imported = import_count,
+            digest = %format!("{import_digest:#x}"),
+            "import complete (cx)"
+        );
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // M3 — Checkpoint synchronization
     // -----------------------------------------------------------------------
@@ -1313,6 +1416,79 @@ mod tests {
             assert_eq!(target.total_events_appended(), 3);
             assert_eq!(manifest.import_count, 3);
             assert_eq!(manifest.import_digest, manifest.export_digest);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m2_import_with_cx` must match the
+    /// legacy `m2_import` for an uncancelled cx. Exercises the
+    /// chunk-import loop with import_batch_size=2 (forces
+    /// multiple chunks from 3 records) and asserts:
+    ///   * same total events written to target
+    ///   * same import_count and import_digest in the manifest
+    ///   * import_digest matches export_digest (the full
+    ///     round-trip parity check the legacy test already makes)
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m2_import_with_cx_matches_legacy() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+            ];
+            let engine = MigrationEngine::new(MigrationConfig {
+                import_batch_size: 2,
+                ..Default::default()
+            });
+            let mut manifest = MigrationManifest::default();
+
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+
+            let target = MockMigrationStorage::healthy();
+            let cx = crate::cx::for_request();
+            engine
+                .m2_import_with_cx(&cx, &target, &exported, &mut manifest)
+                .await
+                .unwrap();
+
+            assert_eq!(target.total_events_appended(), 3);
+            assert_eq!(manifest.import_count, 3);
+            assert_eq!(
+                manifest.import_digest, manifest.export_digest,
+                "Cx-first m2_import must produce digest matching the export"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m2_import_with_cx` must detect
+    /// digest mismatches the same as the legacy path. Proves the
+    /// verification branches still run on the Cx-first path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m2_import_with_cx_digest_mismatch_aborts() {
+        run_async_test(async {
+            let records = vec![make_cursor_record(1, 0), make_cursor_record(1, 1)];
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let mut manifest = MigrationManifest::default();
+
+            let reader = TestEventReader::new(records);
+            let exported = engine.m1_export(&reader, &mut manifest).unwrap();
+
+            // Tamper with the digest so the Cx-first path surfaces the mismatch.
+            manifest.export_digest = 0xDEADBEEF;
+
+            let target = MockMigrationStorage::healthy();
+            let cx = crate::cx::for_request();
+            let result = engine
+                .m2_import_with_cx(&cx, &target, &exported, &mut manifest)
+                .await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("digest mismatch"),
+                "Cx-first error should mention digest mismatch: {msg}"
+            );
         });
     }
 
