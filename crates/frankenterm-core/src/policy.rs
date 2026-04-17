@@ -6298,6 +6298,232 @@ where
         }
     }
 
+    /// Cx-first [`Self::send_text`] (ft-xbnl0.2.3). Routes the
+    /// policy-gated send through [`Self::dispatch_wezterm_send_with_cx`]
+    /// so the underlying wezterm subprocess honors caller
+    /// cancellation. Policy evaluation, audit emission, ingress
+    /// tap, and trauma-feedback hooks stay on the ambient path
+    /// (they're short and CPU-bound; threading cx there would be
+    /// noise). The single cx-aware await is the wezterm send,
+    /// which is where long-running subprocess latency actually
+    /// lives.
+    ///
+    /// Returns the same `InjectionResult` shape as the legacy
+    /// `send_text` for easy drop-in replacement.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_text_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        self.inject_with_cx(
+            cx,
+            pane_id,
+            text,
+            ActionKind::SendText,
+            actor,
+            capabilities,
+            workflow_id,
+        )
+        .await
+    }
+
+    /// Cx-first internal inject (ft-xbnl0.2.3). Mirrors
+    /// [`Self::inject`] but routes the wezterm send through
+    /// [`Self::dispatch_wezterm_send_with_cx`]. All other stages
+    /// (policy eval, decision capture, trauma feedback, ingress
+    /// tap, audit emission) are identical to the legacy
+    /// `inject` — no cx propagation there because they're either
+    /// synchronous (policy eval, decision capture) or already
+    /// bounded by their own timeouts (audit storage writes).
+    #[cfg(feature = "asupersync-runtime")]
+    async fn inject_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        action: ActionKind,
+        actor: ActorKind,
+        capabilities: &PaneCapabilities,
+        workflow_id: Option<&str>,
+    ) -> InjectionResult {
+        let summary = self.engine.redact_secrets(text);
+        let tap_summary = if self.ingress_tap.is_some() {
+            Some(summary.clone())
+        } else {
+            None
+        };
+
+        let mut input = PolicyInput::new(action, actor)
+            .with_surface(PolicySurface::Mux)
+            .with_pane(pane_id)
+            .with_capabilities(capabilities.clone())
+            .with_text_summary(&summary);
+
+        if let Some(wf_id) = workflow_id {
+            input = input.with_workflow(wf_id);
+        }
+
+        if action == ActionKind::SendText {
+            input = input.with_command_text(text);
+        }
+
+        let decision = self.engine.authorize(&input);
+
+        if let Some(adapter) = self.decision_capture.as_ref() {
+            let input_text = serde_json::to_string(&input).unwrap_or_else(|_| {
+                format!(
+                    "action={};pane_id={};actor={}",
+                    action.as_str(),
+                    pane_id,
+                    actor.as_str()
+                )
+            });
+            let output = serde_json::to_value(&decision).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "decision": decision.as_str(),
+                    "rule_id": decision.rule_id(),
+                })
+            });
+            let decision_event = crate::replay_capture::DecisionEvent::new(
+                crate::replay_capture::DecisionType::PolicyEvaluation,
+                pane_id,
+                decision.rule_id().unwrap_or("policy.default_allow"),
+                &decision_definition_text(&decision),
+                &input_text,
+                output,
+                workflow_id.map(|id| format!("workflow_execution:{id}")),
+                None,
+                crate::recording::epoch_ms_now(),
+            );
+            adapter.capture_decision(
+                crate::recording::actor_to_source(actor),
+                workflow_id.map(String::from),
+                decision_event,
+            );
+        }
+
+        let mut result = match &decision {
+            PolicyDecision::Allow { .. } => {
+                let text_owned = text.to_string();
+
+                // Cx-first dispatch — the single cx-aware seam.
+                let send_result = self
+                    .dispatch_wezterm_send_with_cx(cx, action, pane_id, &text_owned)
+                    .await;
+
+                match send_result {
+                    Ok(()) => InjectionResult::Allowed {
+                        decision,
+                        summary,
+                        pane_id,
+                        action,
+                        audit_action_id: None,
+                    },
+                    Err(e) => InjectionResult::Error {
+                        decision,
+                        error: e.to_string(),
+                        pane_id,
+                        action,
+                        audit_action_id: None,
+                    },
+                }
+            }
+            PolicyDecision::Deny { .. } => {
+                self.maybe_inject_trauma_feedback(pane_id, &decision).await;
+                InjectionResult::Denied {
+                    decision,
+                    summary,
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                }
+            }
+            PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
+                decision,
+                summary,
+                pane_id,
+                action,
+                audit_action_id: None,
+            },
+        };
+
+        if let Some(ref tap) = self.ingress_tap {
+            use crate::recording::{
+                IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source, epoch_ms_now,
+            };
+            let outcome = match &result {
+                InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
+                InjectionResult::Denied { decision, .. } => IngressOutcome::Denied {
+                    reason: format!("{decision:?}"),
+                },
+                InjectionResult::RequiresApproval { .. } => IngressOutcome::RequiresApproval,
+                InjectionResult::Error { error, .. } => IngressOutcome::Error {
+                    error: error.clone(),
+                },
+            };
+            if let Some(text) = tap_summary {
+                tap.on_ingress(IngressEvent {
+                    pane_id,
+                    text,
+                    source: actor_to_source(actor),
+                    ingress_kind: action_to_ingress_kind(action, actor),
+                    redaction: crate::recording::RecorderRedactionLevel::Partial,
+                    occurred_at_ms: epoch_ms_now(),
+                    outcome,
+                    workflow_id: workflow_id.map(String::from),
+                });
+            }
+        }
+
+        let storage_for_summary = self.storage.clone();
+        let mut audit_summary = None;
+        if action == ActionKind::SendText {
+            if let Some(storage) = storage_for_summary.as_ref() {
+                let parent_action_id = if actor == ActorKind::Workflow {
+                    if let Some(id) = workflow_id {
+                        find_workflow_start_action_id(storage, id).await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                audit_summary = Some(build_send_text_audit_summary(
+                    text,
+                    workflow_id,
+                    parent_action_id,
+                ));
+            }
+        }
+
+        if let Some(ref storage) = self.storage {
+            let mut audit_record =
+                result.to_audit_record(actor, workflow_id.map(String::from), None);
+            if let Some(summary) = audit_summary {
+                audit_record.input_summary = Some(summary);
+            }
+            match storage.record_audit_action_redacted(audit_record).await {
+                Ok(audit_id) => {
+                    result.set_audit_action_id(audit_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id,
+                        action = action.as_str(),
+                        "Failed to emit audit record: {e}"
+                    );
+                }
+            }
+        }
+
+        result
+    }
+
     /// Send text to a pane with policy gating
     ///
     /// This is the primary method for sending text. It:
@@ -6402,6 +6628,67 @@ where
         .await
     }
 
+    /// Shared wezterm-send dispatch used by the policy-gated inject
+    /// flow. Extracted so the Cx-first dispatch path
+    /// ([`Self::dispatch_wezterm_send_with_cx`]) can use the same
+    /// ActionKind → WeztermInterface method mapping without
+    /// duplicating the match.
+    async fn dispatch_wezterm_send(
+        &self,
+        action: ActionKind,
+        pane_id: u64,
+        text: &str,
+    ) -> Result<(), crate::Error> {
+        let client = &self.client;
+        match action {
+            ActionKind::SendText => client.send_text(pane_id, text).await,
+            ActionKind::SendCtrlC => client.send_ctrl_c(pane_id).await,
+            ActionKind::SendCtrlD => client.send_ctrl_d(pane_id).await,
+            ActionKind::SendCtrlZ => {
+                client
+                    .send_control(pane_id, crate::wezterm::control::CTRL_Z)
+                    .await
+            }
+            ActionKind::SendControl => client.send_control(pane_id, text).await,
+            other => Err(crate::Error::Runtime(format!(
+                "dispatch_wezterm_send called with non-injection action: {other:?}"
+            ))),
+        }
+    }
+
+    /// Cx-first parallel of [`Self::dispatch_wezterm_send`]
+    /// (ft-xbnl0.2.3). Routes each ActionKind to its `_with_cx`
+    /// WeztermInterface method (tick 44/45 trait extensions), so
+    /// caller cancellation, budget, and virtual time propagate
+    /// into the underlying `wezterm cli` subprocess call. Future
+    /// Cx-first `inject_with_cx` variants will call this helper
+    /// to get cancellation-aware dispatch without duplicating the
+    /// ActionKind match.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn dispatch_wezterm_send_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        action: ActionKind,
+        pane_id: u64,
+        text: &str,
+    ) -> Result<(), crate::Error> {
+        let client = &self.client;
+        match action {
+            ActionKind::SendText => client.send_text_with_cx(cx, pane_id, text).await,
+            ActionKind::SendCtrlC => client.send_ctrl_c_with_cx(cx, pane_id).await,
+            ActionKind::SendCtrlD => client.send_ctrl_d_with_cx(cx, pane_id).await,
+            ActionKind::SendCtrlZ => {
+                client
+                    .send_control_with_cx(cx, pane_id, crate::wezterm::control::CTRL_Z)
+                    .await
+            }
+            ActionKind::SendControl => client.send_control_with_cx(cx, pane_id, text).await,
+            other => Err(crate::Error::Runtime(format!(
+                "dispatch_wezterm_send_with_cx called with non-injection action: {other:?}"
+            ))),
+        }
+    }
+
     /// Internal injection method with policy gating
     ///
     /// This method:
@@ -6488,29 +6775,13 @@ where
                 // after policy approval. The text reference lifetime is handled
                 // by copying to a String for the actual send.
                 let text_owned = text.to_string();
-                let client = &self.client;
 
-                // We need to call the send function with owned data
-                let send_result = match action {
-                    ActionKind::SendText => client.send_text(pane_id, &text_owned).await,
-                    ActionKind::SendCtrlC => client.send_ctrl_c(pane_id).await,
-                    ActionKind::SendCtrlD => client.send_ctrl_d(pane_id).await,
-                    ActionKind::SendCtrlZ => {
-                        client
-                            .send_control(pane_id, crate::wezterm::control::CTRL_Z)
-                            .await
-                    }
-                    ActionKind::SendControl => client.send_control(pane_id, &text_owned).await,
-                    other => {
-                        return InjectionResult::Error {
-                            decision: decision.clone(),
-                            error: format!("inject called with non-injection action: {other:?}"),
-                            pane_id,
-                            action,
-                            audit_action_id: None,
-                        };
-                    }
-                };
+                // Dispatch via the shared helper so the legacy and
+                // Cx-first inject paths route through the same
+                // ActionKind match (see [`Self::dispatch_wezterm_send_with_cx`]).
+                let send_result = self
+                    .dispatch_wezterm_send(action, pane_id, &text_owned)
+                    .await;
 
                 match send_result {
                     Ok(()) => InjectionResult::Allowed {
@@ -7166,6 +7437,60 @@ mod tests {
                     assert_eq!(details["rule_id"], "policy.alt_screen");
                 }
                 other => panic!("expected control marker, got {other:?}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `send_text_with_cx` must match
+    /// `send_text` on the deny branch. Alt-screen capability
+    /// triggers the strict engine's policy.alt_screen rule on
+    /// both paths. Asserts the Cx-first entry point:
+    ///   * runs the same policy evaluation (emits
+    ///     InjectionResult::Denied with rule_id == "policy.alt_screen")
+    ///   * produces a decision with the mux surface, same as
+    ///     legacy `send_text`
+    ///   * never dispatches to the wezterm send (dispatch_with_cx
+    ///     is only called on the Allow branch, which doesn't fire
+    ///     here)
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_text_with_cx_matches_legacy_deny_path() {
+        run_async_test(async {
+            let mut injector = PolicyGatedInjector::new(
+                PolicyEngine::strict(),
+                crate::wezterm::default_wezterm_handle(),
+            );
+
+            let mut caps = PaneCapabilities::prompt();
+            caps.alt_screen = Some(true);
+
+            let cx = crate::cx::for_request();
+            let result = injector
+                .send_text_with_cx(&cx, 1, "echo hi", ActorKind::Robot, &caps, None)
+                .await;
+
+            match result {
+                InjectionResult::Denied {
+                    decision, action, ..
+                } => {
+                    assert_eq!(action, ActionKind::SendText);
+                    let context = decision
+                        .context()
+                        .expect("deny decision should include context");
+                    assert_eq!(
+                        context.surface,
+                        PolicySurface::Mux,
+                        "Cx-first send_text_with_cx must set mux surface"
+                    );
+                    assert_eq!(
+                        decision.rule_id(),
+                        Some("policy.alt_screen"),
+                        "Cx-first deny on alt_screen capability must surface the alt_screen rule"
+                    );
+                }
+                other => panic!(
+                    "Cx-first send_text_with_cx expected Denied on alt_screen cap, got {other:?}"
+                ),
             }
         });
     }
