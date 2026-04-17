@@ -579,6 +579,10 @@ mod tests {
     struct MockTransport {
         /// Captured requests for assertions.
         requests: Arc<Mutex<Vec<MockRequest>>>,
+        /// Captured cx-path requests (separate bucket to prove the
+        /// Cx-first transport surface was exercised vs. the ambient
+        /// `send` fallback).
+        cx_requests: Arc<Mutex<Vec<MockRequest>>>,
         /// Response to return.
         response: DeliveryResult,
     }
@@ -595,6 +599,7 @@ mod tests {
         fn success() -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                cx_requests: Arc::new(Mutex::new(Vec::new())),
                 response: DeliveryResult::ok(200),
             }
         }
@@ -602,12 +607,18 @@ mod tests {
         fn failure(status: u16, error: &str) -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                cx_requests: Arc::new(Mutex::new(Vec::new())),
                 response: DeliveryResult::err(status, error),
             }
         }
 
         fn requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        #[cfg(feature = "asupersync-runtime")]
+        fn cx_requests(&self) -> Vec<MockRequest> {
+            self.cx_requests.lock().unwrap().clone()
         }
     }
 
@@ -624,6 +635,28 @@ mod tests {
                 body: body.clone(),
             };
             self.requests.lock().unwrap().push(req);
+            let resp = self.response.clone();
+            Box::pin(async move { resp })
+        }
+
+        /// Override the Cx-first transport entry point so the test
+        /// suite can observe which path was used. Concrete transports
+        /// (e.g. asupersync::http) override this to propagate caller
+        /// cx; the default trait impl would delegate to `send`.
+        #[cfg(feature = "asupersync-runtime")]
+        fn send_with_cx<'a>(
+            &'a self,
+            _cx: &'a crate::cx::Cx,
+            url: &'a str,
+            headers: &'a HashMap<String, String>,
+            body: &'a serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = DeliveryResult> + Send + 'a>> {
+            let req = MockRequest {
+                url: url.to_string(),
+                headers: headers.clone(),
+                body: body.clone(),
+            };
+            self.cx_requests.lock().unwrap().push(req);
             let resp = self.response.clone();
             Box::pin(async move { resp })
         }
@@ -814,6 +847,57 @@ mod tests {
             assert_eq!(records.len(), 2);
             assert!(records.iter().all(|r| r.accepted));
             assert_eq!(transport.requests().len(), 2);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `WebhookDispatcher::dispatch_payload_with_cx`
+    /// must invoke `transport.send_with_cx` rather than falling back to
+    /// the ambient `send` path. This pins the Cx-forward contract at the
+    /// dispatcher → transport boundary so a Cx-aware transport has the
+    /// opportunity to thread caller cancellation into its underlying
+    /// HTTP call. Regression guard: if the dispatcher regressed to
+    /// calling `send` directly, `cx_requests` would stay empty while
+    /// `requests` would populate — this test would fail loudly.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn dispatch_payload_with_cx_invokes_transport_cx_path() {
+        run_async_test(async {
+            let transport = MockTransport::success();
+            let endpoints = vec![
+                test_endpoint(
+                    "slack",
+                    "https://hooks.slack.com/test",
+                    WebhookTemplate::Slack,
+                ),
+                test_endpoint(
+                    "discord",
+                    "https://discord.com/api/webhooks/test",
+                    WebhookTemplate::Discord,
+                ),
+            ];
+            let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+
+            let payload =
+                NotificationPayload::from_detection(&test_detection(), 3, &test_rendered(), 0);
+            let cx = crate::cx::for_request();
+            let records = dispatcher.dispatch_payload_with_cx(&cx, &payload).await;
+
+            assert_eq!(records.len(), 2, "both endpoints should be attempted");
+            assert!(
+                records.iter().all(|r| r.accepted),
+                "mock transport reports success for both endpoints"
+            );
+
+            // Cx-first path populated, ambient path untouched.
+            assert_eq!(
+                transport.cx_requests().len(),
+                2,
+                "dispatch_payload_with_cx must invoke transport.send_with_cx for each endpoint"
+            );
+            assert!(
+                transport.requests().is_empty(),
+                "dispatch_payload_with_cx must NOT fall back to transport.send"
+            );
         });
     }
 
