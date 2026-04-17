@@ -705,6 +705,31 @@ impl<S> InstrumentedStorage<S> {
         result
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`append_batch_instrumented`].
+    ///
+    /// Pre-flight checkpoint gates the telemetry recording so
+    /// cx-driven callers can propagate cancellation consistently
+    /// even though the recording itself is cheap in-memory work.
+    /// On cancellation, returns the original append result
+    /// unchanged (telemetry simply is not recorded for this call)
+    /// so the caller's error semantics are preserved.
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::future_not_send)]
+    pub async fn append_batch_instrumented_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        req: AppendRequest,
+        result: Result<AppendResponse, RecorderStorageError>,
+        start: Instant,
+        backend: RecorderBackendKind,
+    ) -> Result<AppendResponse, RecorderStorageError> {
+        if cx.checkpoint().is_err() {
+            return result;
+        }
+        self.append_batch_instrumented(req, result, start, backend)
+            .await
+    }
+
     /// Time a flush call and record telemetry.
     pub fn flush_instrumented(
         &self,
@@ -1385,6 +1410,78 @@ mod tests {
         let (inner, t) = instrumented.into_parts();
         assert_eq!(inner, 42);
         assert!(Arc::ptr_eq(&t, &telem));
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `append_batch_instrumented_with_cx`
+    /// must record the same telemetry as
+    /// `append_batch_instrumented` for an uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn append_batch_instrumented_with_cx_matches_legacy() {
+        use crate::recorder_storage::{
+            AppendRequest, AppendResponse, DurabilityLevel, RecorderOffset,
+        };
+        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let telem = Arc::new(StorageTelemetry::with_defaults());
+                let instrumented = InstrumentedStorage::new((), telem.clone());
+
+                let req = AppendRequest {
+                    batch_id: "cx-test".to_string(),
+                    events: vec![],
+                    required_durability: DurabilityLevel::Enqueued,
+                    producer_ts_ms: 0,
+                };
+                let resp = AppendResponse {
+                    backend: RecorderBackendKind::AppendLog,
+                    accepted_count: 3,
+                    first_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: 0,
+                    },
+                    last_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 128,
+                        ordinal: 2,
+                    },
+                    committed_durability: DurabilityLevel::Enqueued,
+                    committed_at_ms: 0,
+                };
+
+                let start = Instant::now();
+                let cx = crate::cx::for_request();
+                let out = instrumented
+                    .append_batch_instrumented_with_cx(
+                        &cx,
+                        req,
+                        Ok(resp.clone()),
+                        start,
+                        RecorderBackendKind::AppendLog,
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(out.accepted_count, 3);
+                assert_eq!(telem.registry().counter_value(COUNTER_BATCHES_PROCESSED), 1);
+                assert_eq!(telem.registry().counter_value(COUNTER_EVENTS_APPENDED), 3);
+                let backend_batches =
+                    backend_metric_name(COUNTER_BATCHES_PROCESSED, RecorderBackendKind::AppendLog);
+                assert_eq!(telem.registry().counter_value(&backend_batches), 1);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     // Batch: DarkBadger wa-1u90p.7.1
