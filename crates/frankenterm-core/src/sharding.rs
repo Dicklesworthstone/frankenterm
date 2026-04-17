@@ -1147,6 +1147,186 @@ impl WeztermInterface for ShardedWeztermClient {
                 })
         })
     }
+
+    // --- ft-xbnl0.2.3: Cx-first overrides for ShardedWeztermClient ---
+    //
+    // Same rationale as tick 30 (Arc<dyn>) and tick 31 (UnifiedClient):
+    // without explicit _with_cx overrides, calls fall through to the
+    // trait default which loses cx at the ShardedWezterm hop. Each
+    // override routes the pane_id through `route_for_global_pane_id`
+    // and forwards cx through `backend.handle.METHOD_with_cx(cx, ...)`
+    // so the concrete inner impl's Cx-first path (e.g.
+    // WeztermClient → MuxPool → DirectMuxClient) runs cx-aware.
+    //
+    // Route lookups (`route_for_global_pane_id`) still use ambient Cx
+    // — they hit the `pane_routes` RwLock which has its own cx-first
+    // `read_with_cx`/`write_with_cx` primitives but no current caller
+    // has cx in hand at this dispatch point. Follow-up: thread cx
+    // through route_for_global_pane_id too.
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
+        Box::pin(async move { self.list_all_panes_with_cx(cx).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneInfo> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            let mut pane = backend
+                .handle
+                .get_pane_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "get_pane", Some(pane_id), err)
+                })?;
+            pane.pane_id = encode_sharded_pane_id(route.shard_id, route.local_pane_id);
+            pane.extra
+                .insert("shard_id".to_string(), Value::from(route.shard_id.0 as u64));
+            pane.extra.insert(
+                "local_pane_id".to_string(),
+                Value::from(route.local_pane_id),
+            );
+            Ok(pane)
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> WeztermFuture<'a, String> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .get_text_with_cx(cx, route.local_pane_id, escapes)
+                .await
+                .map_err(|err| self.backend_error(route.shard_id, "get_text", Some(pane_id), err))
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .send_text_with_cx(cx, route.local_pane_id, &text)
+                .await
+                .map_err(|err| self.backend_error(route.shard_id, "send_text", Some(pane_id), err))
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_no_paste_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .send_text_no_paste_with_cx(cx, route.local_pane_id, &text)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "send_text_no_paste", Some(pane_id), err)
+                })
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_options_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .send_text_with_options_with_cx(
+                    cx,
+                    route.local_pane_id,
+                    &text,
+                    no_paste,
+                    no_newline,
+                )
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "send_text_with_options", Some(pane_id), err)
+                })
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_control_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let control_char = control_char.to_string();
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .send_control_with_cx(cx, route.local_pane_id, &control_char)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "send_control", Some(pane_id), err)
+                })
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn pane_tiered_scrollback_summary_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id(pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .pane_tiered_scrollback_summary_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    self.backend_error(
+                        route.shard_id,
+                        "pane_tiered_scrollback_summary",
+                        Some(pane_id),
+                        err,
+                    )
+                })
+        })
+    }
 }
 
 fn circuit_state_rank(state: CircuitStateKind) -> u8 {
