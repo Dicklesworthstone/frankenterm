@@ -689,8 +689,18 @@ pub mod broadcast {
         /// receivers are alive.
         pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.send_with_cx(&cx, value)
+        }
+
+        /// Sends a message to all receivers under an explicit `&Cx`
+        /// (ft-xbnl0.2.x Cx-first primitive). Preferred over
+        /// [`send`](Self::send) when the caller already threads `&Cx`
+        /// through its public API — the Cx flows into the asupersync
+        /// two-phase reserve/commit send instead of being pulled from
+        /// thread-local state.
+        pub fn send_with_cx(&self, cx: &crate::cx::Cx, value: T) -> Result<usize, SendError<T>> {
             self.inner
-                .send(&cx, value)
+                .send(cx, value)
                 .map_err(|inner::SendError::Closed(v)| SendError(v))
         }
 
@@ -854,8 +864,18 @@ pub mod oneshot {
         /// Returns `Err(value)` if the receiver was dropped.
         pub fn send(self, value: T) -> Result<(), T> {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.send_with_cx(&cx, value)
+        }
+
+        /// Sends a value on the channel under an explicit `&Cx`
+        /// (ft-xbnl0.2.x Cx-first primitive). Preferred over
+        /// [`send`](Self::send) when the caller already threads `&Cx`.
+        ///
+        /// Consumes `self` because oneshot senders fire at most once.
+        /// Returns `Err(value)` if the receiver was dropped.
+        pub fn send_with_cx(self, cx: &crate::cx::Cx, value: T) -> Result<(), T> {
             self.inner
-                .send(&cx, value)
+                .send(cx, value)
                 .map_err(|inner::SendError::Disconnected(v)| v)
         }
     }
@@ -2232,14 +2252,31 @@ pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
     #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        let mut inner_rx = rx.inner;
-        inner_rx.recv(&cx).await.map_err(|e| e.to_string())
+        oneshot_recv_with_cx(&cx, rx).await
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         rx.await.map_err(|e| e.to_string())
     }
+}
+
+/// Receive from a oneshot channel under an explicit `&Cx` (ft-xbnl0.2.x
+/// Cx-first primitive).
+///
+/// Preferred over [`oneshot_recv`] when the caller already threads
+/// `&Cx` through its public API. Consumes the receiver (oneshot
+/// channels fire at most once). The Cx flows into the asupersync
+/// `.recv()` method instead of being pulled from thread-local state so
+/// cancellation, budget, and virtual time all propagate through the
+/// caller's capability context.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn oneshot_recv_with_cx<T>(
+    cx: &crate::cx::Cx,
+    rx: oneshot::Receiver<T>,
+) -> Result<T, String> {
+    let mut inner_rx = rx.inner;
+    inner_rx.recv(cx).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -5219,6 +5256,74 @@ mod tests {
                 let m = Mutex::new(99u32);
                 let guard = m.lock().await;
                 assert_eq!(*guard, 99);
+            });
+        }
+
+        /// `broadcast::Sender::send_with_cx` delivers to an active
+        /// receiver under a live Cx. Pin the happy-path contract.
+        #[test]
+        fn broadcast_send_with_cx_delivers_under_live_cx() {
+            run_lab(0x10C5_10C5_C410_4005, || async move {
+                let (tx, mut rx) = broadcast::channel::<u32>(4);
+                let cx = crate::cx::for_request();
+
+                let receivers = tx
+                    .send_with_cx(&cx, 99)
+                    .expect("send_with_cx should succeed");
+                assert_eq!(receivers, 1, "one active receiver");
+
+                let v = rx.recv_with_cx(&cx).await.expect("recv");
+                assert_eq!(v, 99);
+            });
+        }
+
+        /// `broadcast::Sender::send_with_cx` returns SendError(value)
+        /// when no receivers are alive — matches send() behavior.
+        #[test]
+        fn broadcast_send_with_cx_surfaces_send_error_when_no_receivers() {
+            run_lab(0x10C5_10C5_C410_4006, || async move {
+                let (tx, rx) = broadcast::channel::<u32>(4);
+                drop(rx);
+                let cx = crate::cx::for_request();
+                let err = tx
+                    .send_with_cx(&cx, 7)
+                    .expect_err("no receivers -> SendError");
+                assert_eq!(err.0, 7, "SendError must carry the value");
+            });
+        }
+
+        /// `oneshot::Sender::send_with_cx` delivers and
+        /// `oneshot_recv_with_cx` receives — end-to-end Cx-first oneshot
+        /// roundtrip.
+        #[test]
+        fn oneshot_send_with_cx_roundtrip_under_live_cx() {
+            run_lab(0x10C5_10C5_C410_4007, || async move {
+                let (tx, rx) = oneshot::channel::<String>();
+                let cx = crate::cx::for_request();
+
+                tx.send_with_cx(&cx, "hello".to_string())
+                    .expect("oneshot send_with_cx should succeed");
+
+                let recv_cx = crate::cx::for_request();
+                let v = oneshot_recv_with_cx(&recv_cx, rx)
+                    .await
+                    .expect("oneshot_recv_with_cx should succeed");
+                assert_eq!(v, "hello");
+            });
+        }
+
+        /// `oneshot::Sender::send_with_cx` returns Err(value) when the
+        /// receiver was dropped before the send — matches send() behavior.
+        #[test]
+        fn oneshot_send_with_cx_returns_value_when_receiver_dropped() {
+            run_lab(0x10C5_10C5_C410_4008, || async move {
+                let (tx, rx) = oneshot::channel::<u32>();
+                drop(rx);
+                let cx = crate::cx::for_request();
+                let err = tx
+                    .send_with_cx(&cx, 42)
+                    .expect_err("receiver dropped -> Err(value)");
+                assert_eq!(err, 42, "Err must carry the undelivered value");
             });
         }
     }
