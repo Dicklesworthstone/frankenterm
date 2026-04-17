@@ -770,6 +770,62 @@ impl WeztermClient {
         Ok(panes)
     }
 
+    /// List all panes bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Same semantics as [`list_panes`](Self::list_panes) with the
+    /// mux-pool call rebound via `MuxPool::list_panes_with_cx(cx)`
+    /// (already Cx-first from prior ticks). The CLI fallback and
+    /// time-windowed cache are preserved — the cache is a std Mutex
+    /// (sync, no Cx needed), and `run_cli_with_retry` internal retry
+    /// sleeps remain ambient since threading Cx through the retry
+    /// helper is a larger structural refactor that would affect every
+    /// WeztermHandle async method.
+    ///
+    /// Most callers (snapshot engine, watchdog, native-events,
+    /// discovery loop) go through the mux-pool fast path, so the
+    /// Cx-first variant here delivers meaningful cancellation
+    /// propagation for the common case.
+    ///
+    /// The legacy [`list_panes`](Self::list_panes) entry point is
+    /// preserved for non-migrated callers; this is strictly additive.
+    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                match pool.list_panes_with_cx(cx).await {
+                    Ok(response) => {
+                        self.mux_circuit_record_success();
+                        return Ok(pane_info_from_mux_response(&response));
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool list_panes_with_cx failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+
+        // CLI fallback: the retry helper's internal sleeps still use
+        // ambient Cx, but the CLI path is the slow recovery route and
+        // threading Cx through the whole retry/circuit-breaker stack
+        // is out of scope for this slice. The mux-pool fast path above
+        // IS Cx-first via pool.list_panes_with_cx.
+        self.list_panes().await
+    }
+
+    /// Cx-first `list_panes` fallback stub for configurations that do
+    /// NOT have the `vendored` + unix + asupersync combination. The
+    /// legacy `list_panes` is invoked so existing callers behave
+    /// identically.
+    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        self.list_panes().await
+    }
+
     /// Get a specific pane by ID
     ///
     /// Returns the pane info if found, or `WeztermError::PaneNotFound` if not.
