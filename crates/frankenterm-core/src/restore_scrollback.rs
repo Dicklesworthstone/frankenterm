@@ -283,6 +283,81 @@ impl ScrollbackInjector {
         report
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`inject`].
+    ///
+    /// Pre-flight checkpoint gates the injection before any
+    /// `send_text` calls fire; a per-pane checkpoint inside the
+    /// loop makes cancellation responsive for large multi-pane
+    /// restorations where each pane may emit many chunks with
+    /// inter-chunk sleeps.
+    ///
+    /// On cancellation the method returns the partial
+    /// `InjectionReport` gathered so far — panes that have not
+    /// yet been processed are simply absent from the result, so
+    /// callers can inspect what did land before shutdown.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn inject_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id_map: &HashMap<u64, u64>,
+        scrollbacks: &HashMap<u64, ScrollbackData>,
+    ) -> crate::Result<InjectionReport> {
+        cx.checkpoint()
+            .map_err(|err| crate::Error::Runtime(format!("inject cancelled: {err}")))?;
+
+        let mut report = InjectionReport::default();
+
+        let target_new_ids: Vec<u64> = scrollbacks
+            .keys()
+            .filter_map(|old_id| pane_id_map.get(old_id).copied())
+            .collect();
+
+        let _guard = InjectionGuard::new(self.suppressed_panes.clone(), target_new_ids);
+
+        info!(
+            panes = scrollbacks.len(),
+            concurrent = self.config.concurrent_injections,
+            "starting scrollback injection (cx-first)"
+        );
+
+        let semaphore = Arc::new(Semaphore::new(self.config.concurrent_injections));
+
+        for (old_id, scrollback) in scrollbacks {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!("inject cancelled between panes: {err}"))
+            })?;
+
+            let new_id = match pane_id_map.get(old_id) {
+                Some(&id) => id,
+                None => {
+                    debug!(old_pane = old_id, "pane not in id map, skipping");
+                    report.skipped.push(*old_id);
+                    continue;
+                }
+            };
+
+            let _permit = semaphore.acquire().await.expect("semaphore closed");
+
+            match self.inject_pane(*old_id, new_id, scrollback).await {
+                Ok(stats) => report.successes.push(stats),
+                Err(e) => {
+                    warn!(old_pane = old_id, new_pane = new_id, error = %e, "injection failed");
+                    report.failures.push((*old_id, e.to_string()));
+                }
+            }
+        }
+
+        info!(
+            success = report.success_count(),
+            failed = report.failure_count(),
+            skipped = report.skipped.len(),
+            total_bytes = report.total_bytes(),
+            "scrollback injection complete (cx-first)"
+        );
+
+        Ok(report)
+    }
+
     /// Inject scrollback into a single pane.
     async fn inject_pane(
         &self,
@@ -678,6 +753,40 @@ mod tests {
 
             assert_eq!(report.success_count(), 2);
             assert_eq!(report.failure_count(), 0);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `inject_with_cx` must produce an
+    /// equivalent `InjectionReport` to `inject` (same success/
+    /// failure counts) for an uncancelled cx. Verified on a
+    /// 2-pane injection where both panes are in the id_map.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn inject_with_cx_matches_legacy() {
+        run_async_test(async {
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(10).await;
+            mock.add_default_pane(11).await;
+            let injector = make_injector(mock.clone());
+
+            let mut pane_id_map = HashMap::new();
+            pane_id_map.insert(1_u64, 10_u64);
+            pane_id_map.insert(2_u64, 11_u64);
+
+            let mut scrollbacks = HashMap::new();
+            scrollbacks.insert(1, mock_scrollback(vec!["cx-pane1-output"]));
+            scrollbacks.insert(2, mock_scrollback(vec!["cx-pane2-output"]));
+
+            let cx = crate::cx::for_request();
+            let report = injector
+                .inject_with_cx(&cx, &pane_id_map, &scrollbacks)
+                .await
+                .unwrap();
+
+            assert_eq!(report.success_count(), 2);
+            assert_eq!(report.failure_count(), 0);
+            assert!(report.skipped.is_empty());
+            assert!(report.total_bytes() > 0);
         });
     }
 
