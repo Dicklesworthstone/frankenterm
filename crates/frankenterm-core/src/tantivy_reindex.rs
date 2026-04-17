@@ -573,6 +573,96 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         Ok(progress)
     }
 
+    /// Cx-first [`Self::reindex_range`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the exclusive-range index loop via
+    /// `index_loop_exclusive_with_cx`. Pre-flight checkpoint gates
+    /// the empty-range short-circuit and the event reader
+    /// construction. Empty ranges (`to <= from`) still return
+    /// `Ok(ReindexProgress::new())` without calling storage — the
+    /// Cx-first path preserves the fast-path optimization.
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reindex_range_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        source: &RecorderSourceDescriptor,
+        from: RecorderOffset,
+        to: RecorderOffset,
+        consumer_id_str: &str,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+    ) -> Result<ReindexProgress, IndexerError> {
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!("reindex_range cancelled pre-start: {err}"))
+        })?;
+
+        if batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        if to.ordinal <= from.ordinal {
+            tracing::debug!(
+                reindex_range = true,
+                from = %from.ordinal,
+                to = %to.ordinal,
+                backend = %source,
+                "reindex range is empty (to <= from) (cx)"
+            );
+            return Ok(ReindexProgress::new());
+        }
+
+        tracing::debug!(
+            reindex_range = true,
+            from = %from.ordinal,
+            to = %to.ordinal,
+            backend = %source,
+            "starting deterministic range reindex [from, to) (cx)"
+        );
+
+        let event_reader = create_event_reader(source)?;
+        let consumer_id = CheckpointConsumerId(consumer_id_str.to_string());
+        let mut progress = ReindexProgress::new();
+
+        let mut cursor = if from.ordinal > 0 {
+            event_reader
+                .open_cursor_at_ordinal(from.ordinal)
+                .map_err(cursor_err)?
+        } else {
+            event_reader.open_cursor_from_start().map_err(cursor_err)?
+        };
+
+        let exclusive_range = ExclusiveOrdinalRange {
+            from_ordinal: from.ordinal,
+            to_ordinal: to.ordinal,
+        };
+
+        self.index_loop_exclusive_with_cx(
+            cx,
+            storage,
+            &mut *cursor,
+            &consumer_id,
+            &exclusive_range,
+            batch_size,
+            dedup_on_replay,
+            expected_schema,
+            0,
+            &mut progress,
+        )
+        .await?;
+
+        tracing::debug!(
+            reindex_range = true,
+            from = %from.ordinal,
+            to = %to.ordinal,
+            events_indexed = progress.events_indexed,
+            events_read = progress.events_read,
+            "deterministic range reindex complete (cx)"
+        );
+
+        Ok(progress)
+    }
+
     /// Reindex `[from, to)` with operator observability callbacks.
     ///
     /// Same semantics as `reindex_range` but calls `observer.on_progress()`
@@ -1125,6 +1215,121 @@ impl<W: IndexWriter> ReindexPipeline<W> {
                 let doc = map_event_to_document(&record.event, record.offset.ordinal);
 
                 // Dedup
+                if dedup_on_replay {
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => {
+                        progress.events_indexed += 1;
+                        index_mutations_in_batch += 1;
+                    }
+                    Err(IndexWriteError::Rejected { .. }) => {
+                        progress.events_skipped += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            if let Some(offset) = last_offset {
+                if index_mutations_in_batch > 0 {
+                    self.writer.commit().map_err(IndexerError::IndexWrite)?;
+                }
+
+                progress.current_ordinal = Some(offset.ordinal);
+
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset,
+                    schema_version: expected_schema.to_string(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+                progress.batches_committed += 1;
+            }
+
+            if is_final_batch || progress.caught_up {
+                if !progress.caught_up {
+                    progress.caught_up = true;
+                }
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cx-first [`Self::index_loop_exclusive`] (ft-xbnl0.2.3).
+    /// Adds `cx.checkpoint()?` at the top of each batch iteration,
+    /// embedding the current_ordinal in the error message. Per-record
+    /// body is CPU-only, so cancellation granularity is per-batch
+    /// (matches ticks 52/53/55).
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    async fn index_loop_exclusive_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        cursor: &mut dyn RecorderEventCursor,
+        consumer_id: &CheckpointConsumerId,
+        range: &ExclusiveOrdinalRange,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+        max_batches: usize,
+        progress: &mut ReindexProgress,
+    ) -> Result<(), IndexerError> {
+        loop {
+            if max_batches > 0 && progress.batches_committed >= max_batches as u64 {
+                break;
+            }
+
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "index_loop_exclusive cancelled between batches (current_ordinal={:?}, batches={}): {err}",
+                    progress.current_ordinal, progress.batches_committed
+                ))
+            })?;
+
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
+            if batch.is_empty() {
+                progress.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+            let mut index_mutations_in_batch = 0u64;
+
+            for record in &batch {
+                progress.events_read += 1;
+                let ordinal = record.offset.ordinal;
+
+                if ordinal >= range.to_ordinal {
+                    progress.caught_up = true;
+                    last_offset = Some(record.offset.clone());
+                    break;
+                }
+
+                if ordinal < range.from_ordinal {
+                    progress.events_filtered += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                if record.event.schema_version != expected_schema {
+                    progress.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, record.offset.ordinal);
+
                 if dedup_on_replay {
                     self.writer
                         .delete_by_event_id(&doc.event_id)
@@ -3440,6 +3645,110 @@ mod tests {
                 .map(|d| d.event_id.as_str())
                 .collect();
             assert_eq!(ids, vec!["e5", "e6", "e7"]);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `reindex_range_with_cx` must produce
+    /// the same ReindexProgress and the same doc event_ids as the
+    /// legacy `reindex_range` for an uncancelled cx. Exercises the
+    /// exclusive [from, to) range semantics (events e5/e6/e7
+    /// indexed from [5, 8)).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn reindex_range_with_cx_matches_legacy_exclusive_bounds() {
+        run_async_test(async {
+            let dir_legacy = tempdir().unwrap();
+            let scfg_legacy = test_storage_config(dir_legacy.path());
+            let storage_legacy = AppendLogRecorderStorage::open(scfg_legacy.clone()).unwrap();
+
+            let events: Vec<_> = (0..10)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect();
+            populate_log(&storage_legacy, events.clone()).await;
+
+            let source_legacy = RecorderSourceDescriptor::AppendLog {
+                data_path: dir_legacy.path().join("events.log"),
+            };
+
+            let from = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 5,
+            };
+            let to = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 8,
+            };
+
+            let mut pipeline_legacy = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let p_legacy = pipeline_legacy
+                .reindex_range(
+                    &storage_legacy,
+                    &source_legacy,
+                    from.clone(),
+                    to.clone(),
+                    "legacy-range-parity",
+                    20,
+                    false,
+                    RECORDER_EVENT_SCHEMA_VERSION_V1,
+                )
+                .await
+                .unwrap();
+
+            // Separate dir/storage for cx so consumer checkpoints don't collide.
+            let dir_cx = tempdir().unwrap();
+            let scfg_cx = test_storage_config(dir_cx.path());
+            let storage_cx = AppendLogRecorderStorage::open(scfg_cx.clone()).unwrap();
+            populate_log(&storage_cx, events).await;
+
+            let source_cx = RecorderSourceDescriptor::AppendLog {
+                data_path: dir_cx.path().join("events.log"),
+            };
+
+            let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let cx = crate::cx::for_request();
+            let p_cx = pipeline_cx
+                .reindex_range_with_cx(
+                    &cx,
+                    &storage_cx,
+                    &source_cx,
+                    from,
+                    to,
+                    "cx-range-parity",
+                    20,
+                    false,
+                    RECORDER_EVENT_SCHEMA_VERSION_V1,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(p_legacy.events_read, p_cx.events_read);
+            assert_eq!(p_legacy.events_indexed, p_cx.events_indexed);
+            assert_eq!(p_legacy.events_skipped, p_cx.events_skipped);
+            assert_eq!(p_legacy.events_filtered, p_cx.events_filtered);
+            assert_eq!(p_legacy.caught_up, p_cx.caught_up);
+            assert_eq!(p_legacy.current_ordinal, p_cx.current_ordinal);
+            assert_eq!(p_legacy.batches_committed, p_cx.batches_committed);
+            assert_eq!(p_cx.events_indexed, 3, "range [5,8) has 3 events");
+
+            let ids_legacy: Vec<&str> = pipeline_legacy
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            let ids_cx: Vec<&str> = pipeline_cx
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            assert_eq!(
+                ids_legacy, ids_cx,
+                "indexed event_ids must match across legacy and cx paths"
+            );
+            assert_eq!(ids_cx, vec!["e5", "e6", "e7"]);
         });
     }
 
