@@ -5286,6 +5286,123 @@ impl WeztermInterface for UnifiedClient {
     ) -> WeztermFuture<'_, PaneTieredScrollbackSummary> {
         self.inner.pane_tiered_scrollback_summary(pane_id)
     }
+
+    // --- ft-xbnl0.2.3: Cx-first overrides for UnifiedClient ---
+    //
+    // Same rationale as the Arc<dyn WeztermInterface> overrides in
+    // tick 30. Without explicit _with_cx overrides here, calls would
+    // fall through to the trait default which calls non-cx via
+    // `self.list_panes()` etc. — losing cx at the UnifiedClient hop.
+    // Forward cx through `self.inner._with_cx(cx, ...)` so the
+    // underlying Arc<dyn WeztermInterface> (which now also forwards
+    // correctly per tick 30) reaches the concrete WeztermClient
+    // Cx-first override.
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
+        self.inner.list_panes_with_cx(cx)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneInfo> {
+        self.inner.get_pane_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> WeztermFuture<'a, String> {
+        self.inner.get_text_with_cx(cx, pane_id, escapes)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.send_text_with_cx(cx, pane_id, text)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_no_paste_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.send_text_no_paste_with_cx(cx, pane_id, text)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_options_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner
+            .send_text_with_options_with_cx(cx, pane_id, text, no_paste, no_newline)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_control_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.send_control_with_cx(cx, pane_id, control_char)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_c_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.send_ctrl_c_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_d_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.send_ctrl_d_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_direction_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'a, Option<u64>> {
+        self.inner
+            .get_pane_direction_with_cx(cx, pane_id, direction)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn pane_tiered_scrollback_summary_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
+        self.inner
+            .pane_tiered_scrollback_summary_with_cx(cx, pane_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
