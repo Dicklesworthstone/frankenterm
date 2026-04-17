@@ -6507,7 +6507,10 @@ where
             if let Some(summary) = audit_summary {
                 audit_record.input_summary = Some(summary);
             }
-            match storage.record_audit_action_redacted(audit_record).await {
+            match storage
+                .record_audit_action_redacted_with_cx(cx, audit_record)
+                .await
+            {
                 Ok(audit_id) => {
                     result.set_audit_action_id(audit_id);
                 }
