@@ -313,7 +313,33 @@ impl<C: Send + 'static> Pool<C> {
     /// If the pool's idle queue is already at capacity, the connection is
     /// dropped instead.
     pub async fn put(&self, conn: C) {
-        let mut idle = self.idle.lock().await;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_request();
+            return self.put_with_cx(&cx, conn).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut idle = self.idle.lock().await;
+            self.evict_expired(&mut idle);
+            if idle.len() < self.config.max_size {
+                idle.push_back(PooledEntry {
+                    conn,
+                    returned_at: Instant::now(),
+                });
+                self.stats_returned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Return a connection to the pool under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point). The internal idle-pool
+    /// mutex acquire is bound to the caller's `Cx` via
+    /// `Mutex::lock_with_cx` so a caller-cancelled wait propagates
+    /// cleanly through the return path.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn put_with_cx(&self, cx: &Cx, conn: C) {
+        let mut idle = self.idle.lock_with_cx(cx).await;
         self.evict_expired(&mut idle);
         if idle.len() < self.config.max_size {
             idle.push_back(PooledEntry {
@@ -327,13 +353,55 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Evict idle connections that have exceeded the idle timeout.
     pub async fn evict_idle(&self) -> usize {
-        let mut idle = self.idle.lock().await;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_request();
+            return self.evict_idle_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut idle = self.idle.lock().await;
+            self.evict_expired(&mut idle)
+        }
+    }
+
+    /// Evict expired idle connections under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn evict_idle_with_cx(&self, cx: &Cx) -> usize {
+        let mut idle = self.idle.lock_with_cx(cx).await;
         self.evict_expired(&mut idle)
     }
 
     /// Get current pool statistics.
     pub async fn stats(&self) -> PoolStats {
-        let idle_count = self.idle.lock().await.len();
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_request();
+            return self.stats_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let idle_count = self.idle.lock().await.len();
+            let acquired = self.stats_acquired.load(Ordering::Relaxed);
+            let returned = self.stats_returned.load(Ordering::Relaxed);
+            PoolStats {
+                max_size: self.config.max_size,
+                idle_count,
+                active_count: self.config.max_size - self.semaphore.available_permits(),
+                total_acquired: acquired,
+                total_returned: returned,
+                total_evicted: self.stats_evicted.load(Ordering::Relaxed),
+                total_timeouts: self.stats_timeouts.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// Get current pool statistics under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn stats_with_cx(&self, cx: &Cx) -> PoolStats {
+        let idle_count = self.idle.lock_with_cx(cx).await.len();
         let acquired = self.stats_acquired.load(Ordering::Relaxed);
         let returned = self.stats_returned.load(Ordering::Relaxed);
         PoolStats {
@@ -349,7 +417,25 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Drain all idle connections from the pool.
     pub async fn clear(&self) {
-        let mut idle = self.idle.lock().await;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = cx::for_request();
+            return self.clear_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut idle = self.idle.lock().await;
+            let count = idle.len() as u64;
+            idle.clear();
+            self.stats_evicted.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain all idle connections under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn clear_with_cx(&self, cx: &Cx) {
+        let mut idle = self.idle.lock_with_cx(cx).await;
         let count = idle.len() as u64;
         idle.clear();
         self.stats_evicted.fetch_add(count, Ordering::Relaxed);
@@ -1772,6 +1858,53 @@ mod tests {
             assert_eq!(
                 stats.total_acquired, 1,
                 "only the held permit should be in total_acquired"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: put_with_cx / evict_idle_with_cx /
+    /// stats_with_cx / clear_with_cx all round-trip a connection
+    /// through the idle queue under an explicit caller `&Cx`. Pins
+    /// no-regression on the Cx-first variants of the remaining four
+    /// pool methods.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_non_acquire_methods_with_cx_full_roundtrip() {
+        run_async_test(async {
+            let pool: Pool<String> = Pool::new(test_config(4));
+            let cx = Cx::for_testing();
+
+            // Acquire to get a permit.
+            let result = pool
+                .acquire_with_cx(&cx)
+                .await
+                .expect("acquire_with_cx should succeed");
+            let (_, guard) = result.into_parts();
+
+            // Return a connection via put_with_cx.
+            pool.put_with_cx(&cx, "conn-a".to_string()).await;
+            drop(guard);
+
+            // stats_with_cx should reflect the put.
+            let stats = pool.stats_with_cx(&cx).await;
+            assert_eq!(stats.idle_count, 1, "put_with_cx should leave 1 idle");
+            assert_eq!(stats.total_returned, 1);
+
+            // evict_idle_with_cx with a fresh entry shouldn't evict (not
+            // yet expired under the test config's idle_timeout).
+            let evicted = pool.evict_idle_with_cx(&cx).await;
+            assert_eq!(evicted, 0, "fresh idle entry must not be evicted");
+
+            // clear_with_cx drains the idle queue.
+            pool.clear_with_cx(&cx).await;
+            let stats_after_clear = pool.stats_with_cx(&cx).await;
+            assert_eq!(
+                stats_after_clear.idle_count, 0,
+                "clear_with_cx must drain all idle entries"
+            );
+            assert!(
+                stats_after_clear.total_evicted >= 1,
+                "clear_with_cx must increment the evicted counter"
             );
         });
     }
