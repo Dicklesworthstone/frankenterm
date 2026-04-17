@@ -164,7 +164,9 @@ pub async fn run_orphan_reaper_with_cx(
             return;
         }
 
-        let report = reap_orphans(max_age).await;
+        // ft-xbnl0.2.3 tick 107: route through the Cx-first reap so
+        // mid-cycle cancellation bails before killing every stale pid.
+        let report = reap_orphans_with_cx(cx, max_age).await;
         if report.killed > 0 {
             info!(
                 scanned = report.scanned,
