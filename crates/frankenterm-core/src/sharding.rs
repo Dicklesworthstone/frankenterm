@@ -872,8 +872,40 @@ impl ShardedWeztermClient {
         }
 
         let panes = self.list_all_panes().await?;
+        Self::resolve_window_shard(window_id, &panes)
+    }
+
+    /// Resolve a `window_id` to its owning shard bound to the
+    /// caller's asupersync capability context (ft-xbnl0.2.3 Cx-first
+    /// internal helper).
+    ///
+    /// Uses [`Self::list_all_panes_with_cx`] so the underlying
+    /// per-backend `list_panes_with_cx` calls (and the
+    /// `pane_routes.write_with_cx` refresh) all honor caller
+    /// cancellation/budget/virtual time. Shares the pure
+    /// `resolve_window_shard` matcher with the legacy
+    /// `route_for_window_id` so both variants produce bit-for-bit
+    /// identical decisions for the same shard state.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn route_for_window_id_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        window_id: u64,
+    ) -> Result<ShardId> {
+        if self.backends.len() == 1 {
+            return Ok(self.backends[0].id);
+        }
+
+        let panes = self.list_all_panes_with_cx(cx).await?;
+        Self::resolve_window_shard(window_id, &panes)
+    }
+
+    /// Pure window-to-shard matcher extracted from
+    /// [`Self::route_for_window_id`] so legacy and Cx-first lookups
+    /// share the same ambiguity + not-found semantics.
+    fn resolve_window_shard(window_id: u64, panes: &[PaneInfo]) -> Result<ShardId> {
         let matching_shards: HashSet<_> = panes
-            .into_iter()
+            .iter()
             .filter(|pane| pane.window_id == window_id)
             .filter_map(|pane| {
                 pane.extra
@@ -1464,7 +1496,7 @@ impl WeztermInterface for ShardedWeztermClient {
                 self.choose_spawn_shard(domain_name, None)
             } else {
                 match target.window_id {
-                    Some(window_id) => self.route_for_window_id(window_id).await?,
+                    Some(window_id) => self.route_for_window_id_with_cx(cx, window_id).await?,
                     None => self.choose_spawn_shard(domain_name, None),
                 }
             };
@@ -1843,6 +1875,82 @@ mod tests {
             assert_eq!(decode_sharded_pane_id(spawned).0, ShardId(0));
             assert_eq!(shard0.pane_count().await, 2);
             assert_eq!(shard1.pane_count().await, 0);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `spawn_targeted_with_cx` with a
+    /// `window_id` hint must route through
+    /// `route_for_window_id_with_cx` (tick 48 helper) so the
+    /// underlying `list_panes_with_cx` + `pane_routes.write_with_cx`
+    /// calls propagate cx end-to-end. Mirrors the legacy
+    /// `spawn_targeted_routes_existing_window_to_matching_shard`
+    /// topology exactly — if tick 48's Cx-first window-routing
+    /// regressed the matcher semantics (matching_shards set
+    /// construction, 0/1/many branches), this test would diverge
+    /// from the legacy one.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_targeted_with_cx_routes_existing_window_to_matching_shard() {
+        run_async_test(async {
+            let shard0 = Arc::new(MockWezterm::new());
+            let shard1 = Arc::new(MockWezterm::new());
+            shard0
+                .add_pane(crate::wezterm::MockPane {
+                    pane_id: 10,
+                    window_id: 41,
+                    tab_id: 0,
+                    title: "existing".to_string(),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    is_active: false,
+                    is_zoomed: false,
+                    cols: 80,
+                    rows: 24,
+                    content: String::new(),
+                })
+                .await;
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), "zero", shard0.clone() as WeztermHandle),
+                    ShardBackend::new(ShardId(1), "one", shard1.clone() as WeztermHandle),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let cx = crate::cx::for_request();
+            let spawned = client
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        window_id: Some(41),
+                        new_window: false,
+                    },
+                )
+                .await
+                .unwrap();
+
+            // window_id=41 exists only on shard 0 → new pane must
+            // land there. Note: the local pane_id is whatever Mock
+            // assigned (starts from 0), so we only check the shard
+            // matches. shard_count assertions below pin the full
+            // routing behavior.
+            assert_eq!(decode_sharded_pane_id(spawned).0, ShardId(0));
+            assert_eq!(shard0.pane_count().await, 2);
+            assert_eq!(shard1.pane_count().await, 0);
+
+            // Cx-first path also recorded the new pane in
+            // pane_routes (route_for_window_id_with_cx was called,
+            // followed by pane_routes.write_with_cx). Using the cx
+            // reader to prove the recording happened under the
+            // Cx-first path.
+            let routes = client.pane_routes.read_with_cx(&cx).await;
+            assert!(
+                routes.contains_key(&spawned),
+                "Cx-first spawn_targeted must record new pane in pane_routes"
+            );
         });
     }
 
