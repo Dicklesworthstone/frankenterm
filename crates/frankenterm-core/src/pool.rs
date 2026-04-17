@@ -149,14 +149,38 @@ impl<C: Send + 'static> Pool<C> {
     /// Try to acquire a connection using an explicit capability context.
     ///
     /// This is the migration-safe entry point for call paths that already
-    /// thread `Cx` explicitly.
+    /// thread `Cx` explicitly. The internal idle-pool mutex acquire is
+    /// bound to the caller's `Cx` via `Mutex::lock_with_cx` so a
+    /// caller-cancelled wait propagates through the full acquire path
+    /// (ft-xbnl0.2.3). Without this, a cancelled caller could be
+    /// blocked on the ambient mutex acquire for the full `lock` budget
+    /// even though the caller had already abandoned the operation.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn try_acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
-        self.try_acquire_inner().await
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let conn = {
+                    let mut idle = self.idle.lock_with_cx(cx).await;
+                    self.evict_expired(&mut idle);
+                    idle.pop_front().map(|e| e.conn)
+                };
+                self.stats_acquired.fetch_add(1, Ordering::Relaxed);
+                Ok(PoolAcquireResult {
+                    conn,
+                    permit: Some(permit),
+                })
+            }
+            Err(TryAcquireError::NoPermits) => Err(PoolError::AcquireTimeout),
+            Err(TryAcquireError::Closed) => Err(PoolError::Closed),
+        }
     }
 
-    /// Inner implementation shared by both cx and non-cx paths.
+    /// Inner implementation used by the non-asupersync (tokio) path. Under
+    /// `asupersync-runtime` the Cx-first `try_acquire_with_cx` inlines the
+    /// semaphore + idle-lock dance directly so the caller's Cx can be
+    /// threaded into the idle mutex acquire.
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn try_acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => {
@@ -240,7 +264,10 @@ impl<C: Send + 'static> Pool<C> {
         };
 
         let conn = {
-            let mut idle = self.idle.lock().await;
+            // Use lock_with_cx for the idle-pool mutex so a caller-
+            // cancelled wait propagates through the full acquire path
+            // (ft-xbnl0.2.3). Matches the fix in try_acquire_with_cx.
+            let mut idle = self.idle.lock_with_cx(cx).await;
             self.evict_expired(&mut idle);
             idle.pop_front().map(|e| e.conn)
         };
