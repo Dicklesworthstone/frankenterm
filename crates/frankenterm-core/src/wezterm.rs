@@ -1649,6 +1649,52 @@ impl WeztermClient {
         Self::parse_pane_id(&output)
     }
 
+    /// Cx-first [`split_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
+    /// through [`Self::run_cli_with_pane_check_with_cx`] so
+    /// `wezterm cli split-pane` honors caller cancellation, budget,
+    /// and virtual time. The argv construction (direction flag, cwd,
+    /// percent clamp to 10-90) is identical to the legacy path so
+    /// both variants produce the exact same command line for the
+    /// same inputs.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn split_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        percent: Option<u8>,
+    ) -> Result<u64> {
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "split-pane", "--pane-id", &pane_id_str];
+
+        let dir_flag = match direction {
+            SplitDirection::Left => "--left",
+            SplitDirection::Right => "--right",
+            SplitDirection::Top => "--top",
+            SplitDirection::Bottom => "--bottom",
+        };
+        args.push(dir_flag);
+
+        let cwd_arg;
+        if let Some(dir) = cwd {
+            cwd_arg = format!("--cwd={dir}");
+            args.push(&cwd_arg);
+        }
+
+        let percent_arg;
+        if let Some(pct) = percent {
+            let clamped = pct.clamp(10, 90);
+            percent_arg = format!("--percent={clamped}");
+            args.push(&percent_arg);
+        }
+
+        let output = self
+            .run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
+        Self::parse_pane_id(&output)
+    }
+
     /// Activate (focus) a specific pane
     ///
     /// # Arguments
@@ -3997,6 +4043,57 @@ mod tests {
                 other => {
                     panic!("expected Wezterm(SocketNotFound) on window_id path, got {other:?}")
                 }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `split_pane_with_cx` must honor the
+    /// socket-path pre-check. Exercises the `SplitDirection` enum
+    /// variants along with cwd/percent options so a regression in
+    /// argv construction on the Cx path surfaces as an error-variant
+    /// mismatch rather than silently succeeding the wrong command.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn split_pane_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick43-split-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let cx = crate::cx::for_request();
+
+            // Exercise Left direction with no cwd/percent.
+            let err_left = client
+                .split_pane_with_cx(&cx, 11, SplitDirection::Left, None, None)
+                .await
+                .expect_err("missing socket should short-circuit split_pane(Left)");
+            match err_left {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("expected SocketNotFound on Left, got {other:?}"),
+            }
+
+            // Exercise Bottom direction with cwd + percent (exercises
+            // the two Option<_> append branches on the Cx path).
+            let err_bottom = client
+                .split_pane_with_cx(&cx, 11, SplitDirection::Bottom, Some("/tmp"), Some(30))
+                .await
+                .expect_err("missing socket should short-circuit split_pane(Bottom,cwd,pct)");
+            match err_bottom {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("expected SocketNotFound on Bottom+cwd+pct, got {other:?}"),
             }
         });
     }
