@@ -587,6 +587,99 @@ impl Player {
         let (_tx, rx) = watch::channel(PlayerControl::Play);
         self.play(sink, rx).await
     }
+
+    /// Cx-first [`Self::play`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the per-frame loop via `cx.checkpoint()`
+    /// before the inter-frame sleep and through
+    /// [`crate::runtime_compat::sleep_with_cx`] for the sleep
+    /// itself. A pre-cancelled cx returns before emitting any
+    /// frames; a mid-playback cancel exits between frames,
+    /// leaving the player's `position` at the last-emitted
+    /// frame index so the caller can resume replay on a fresh
+    /// cx.
+    ///
+    /// The external control channel (`control_rx`) continues to
+    /// work — cx cancellation takes precedence over control
+    /// signals (a Stop/Pause control that arrives during a
+    /// sleep is still respected because both `check_control`
+    /// and the cx checkpoint fire on every loop iteration).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn play_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        sink: &mut dyn OutputSink,
+        mut control_rx: watch::Receiver<PlayerControl>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!("replay.play cancelled pre-start: {err}"))
+        })?;
+
+        self.state = PlayerState::Playing;
+
+        while self.position.frame_index < self.recording.frames.len() {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "replay.play cancelled at frame_index={} (timestamp_ms={}): {err}",
+                    self.position.frame_index, self.position.timestamp_ms
+                ))
+            })?;
+
+            if let Some(ctrl) = check_control(&mut control_rx) {
+                if self.handle_control(ctrl, &mut control_rx).await? {
+                    return Ok(());
+                }
+            }
+
+            let frame_ts = self.recording.frames[self.position.frame_index]
+                .header
+                .timestamp_ms;
+
+            if frame_ts > self.position.timestamp_ms {
+                let raw_delay_ms = frame_ts - self.position.timestamp_ms;
+                let scaled_delay = (raw_delay_ms as f64) / (self.speed.as_f32() as f64);
+                if scaled_delay > 0.5 {
+                    // Cx-first sleep: cancellation unblocks this
+                    // await immediately rather than waiting for
+                    // the full scaled_delay.
+                    let _ = crate::runtime_compat::sleep_with_cx(
+                        cx,
+                        Duration::from_micros((scaled_delay * 1000.0).round() as u64),
+                    )
+                    .await;
+                }
+
+                if let Some(ctrl) = check_control(&mut control_rx) {
+                    if self.handle_control(ctrl, &mut control_rx).await? {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let decoded = decode_frame(&self.recording.frames[self.position.frame_index])?;
+            output_decoded(sink, &decoded)?;
+
+            self.position = PlaybackPosition {
+                frame_index: self.position.frame_index + 1,
+                timestamp_ms: frame_ts,
+            };
+        }
+
+        self.state = PlayerState::Finished;
+        Ok(())
+    }
+
+    /// Cx-first [`Self::play_simple`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::play_with_cx`] with an
+    /// unsubscribed-sender control channel.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn play_simple_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        sink: &mut dyn OutputSink,
+    ) -> Result<()> {
+        let (_tx, rx) = watch::channel(PlayerControl::Play);
+        self.play_with_cx(cx, sink, rx).await
+    }
 }
 
 /// Poll the control channel for the latest signal (non-blocking).
@@ -1315,6 +1408,32 @@ mod tests {
             let mut sink = CollectorSink::new();
 
             player.play_simple(&mut sink).await.unwrap();
+
+            assert_eq!(player.state(), PlayerState::Finished);
+            assert_eq!(sink.output, b"AB");
+            assert_eq!(sink.markers, vec!["done"]);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `play_simple_with_cx` must match
+    /// the legacy `play_simple` — same final state, same emitted
+    /// output, same markers.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn play_simple_with_cx_matches_legacy() {
+        run_async_test(async {
+            let data = build_recording(&[
+                (0, FrameType::Output, b"A".to_vec()),
+                (10, FrameType::Output, b"B".to_vec()),
+                (20, FrameType::Marker, b"done".to_vec()),
+            ]);
+            let recording = Recording::from_bytes(&data).unwrap();
+            let mut player = Player::new(recording);
+            player.set_speed(PlaybackSpeed::QUAD);
+            let mut sink = CollectorSink::new();
+            let cx = crate::cx::for_request();
+
+            player.play_simple_with_cx(&cx, &mut sink).await.unwrap();
 
             assert_eq!(player.state(), PlayerState::Finished);
             assert_eq!(sink.output, b"AB");
