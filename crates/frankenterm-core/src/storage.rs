@@ -8231,6 +8231,23 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_mux_session`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn insert_mux_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: String,
+        topology_json: String,
+        ft_version: String,
+        host_id: Option<String>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_mux_session cancelled: {err}"))
+        })?;
+        self.insert_mux_session(session_id, topology_json, ft_version, host_id)
+            .await
+    }
+
     /// Insert a session checkpoint with per-pane state rows.
     /// Returns the checkpoint ID.
     pub async fn insert_session_checkpoint(
@@ -8260,6 +8277,35 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_session_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: String,
+        checkpoint_type: String,
+        state_hash: String,
+        pane_count: usize,
+        total_bytes: usize,
+        metadata_json: Option<String>,
+        pane_states: Vec<SessionPaneStateRow>,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_session_checkpoint cancelled: {err}"))
+        })?;
+        self.insert_session_checkpoint(
+            session_id,
+            checkpoint_type,
+            state_hash,
+            pane_count,
+            total_bytes,
+            metadata_json,
+            pane_states,
+        )
+        .await
+    }
+
     /// Prune old checkpoints beyond the retention limit.
     /// Returns the number of pruned checkpoints.
     pub async fn prune_session_checkpoints(
@@ -8279,6 +8325,20 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`prune_session_checkpoints`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn prune_session_checkpoints_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: String,
+        retention: usize,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("prune_session_checkpoints cancelled: {err}"))
+        })?;
+        self.prune_session_checkpoints(session_id, retention).await
+    }
+
     /// Mark a session as cleanly shut down.
     pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -8292,6 +8352,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn mark_session_shutdown_clean_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: String,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("mark_session_shutdown_clean cancelled: {err}"))
+        })?;
+        self.mark_session_shutdown_clean(session_id).await
+    }
+
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8302,6 +8375,19 @@ impl StorageHandle {
             get_latest_checkpoint_hash(&conn, &session_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_checkpoint_hash`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_latest_checkpoint_hash_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: String,
+    ) -> Result<Option<String>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_latest_checkpoint_hash cancelled: {err}"))
+        })?;
+        self.get_latest_checkpoint_hash(session_id).await
     }
 
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
@@ -8368,6 +8454,18 @@ impl StorageHandle {
             query_active_sessions(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_sessions`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_active_sessions_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<AgentSessionRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_active_sessions cancelled: {err}"))
+        })?;
+        self.get_active_sessions().await
     }
 
     /// Get agent sessions for a specific pane
@@ -21214,6 +21312,97 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 143 mux-session/checkpoint cluster —
+/// 6 new storage cx-first siblings exercised end-to-end:
+/// `insert_mux_session_with_cx`,
+/// `insert_session_checkpoint_with_cx`,
+/// `prune_session_checkpoints_with_cx`,
+/// `mark_session_shutdown_clean_with_cx`,
+/// `get_latest_checkpoint_hash_with_cx`,
+/// `get_active_sessions_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick143_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. insert_mux_session_with_cx
+        let session_id = "sess-tick143".to_string();
+        storage
+            .insert_mux_session_with_cx(
+                &cx,
+                session_id.clone(),
+                "{\"panes\":[]}".to_string(),
+                "test-ft-version".to_string(),
+                Some("host-tick143".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // 2. insert_session_checkpoint_with_cx — three checkpoints so prune
+        //    below has something to remove.
+        for i in 0..3 {
+            let checkpoint_id = storage
+                .insert_session_checkpoint_with_cx(
+                    &cx,
+                    session_id.clone(),
+                    "periodic".to_string(),
+                    format!("state-hash-{i}"),
+                    0,
+                    0,
+                    None,
+                    Vec::<SessionPaneStateRow>::new(),
+                )
+                .await
+                .unwrap();
+            assert!(checkpoint_id > 0);
+        }
+
+        // 3. get_latest_checkpoint_hash_with_cx — should match the last one.
+        let latest = storage
+            .get_latest_checkpoint_hash_with_cx(&cx, session_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(latest.as_deref(), Some("state-hash-2"));
+
+        // 4. prune_session_checkpoints_with_cx — retain 1, should remove 2.
+        let pruned = storage
+            .prune_session_checkpoints_with_cx(&cx, session_id.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 2, "retention=1 should prune the two older checkpoints");
+
+        // Latest should still be state-hash-2 after pruning.
+        let after_prune = storage
+            .get_latest_checkpoint_hash_with_cx(&cx, session_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(after_prune.as_deref(), Some("state-hash-2"));
+
+        // 5. mark_session_shutdown_clean_with_cx — doesn't return state,
+        //    just has to succeed.
+        storage
+            .mark_session_shutdown_clean_with_cx(&cx, session_id.clone())
+            .await
+            .unwrap();
+
+        // 6. get_active_sessions_with_cx — AgentSession table is distinct
+        //    from mux_sessions; on a fresh DB with no agent sessions it
+        //    should be empty. The call just needs to roundtrip.
+        let active = storage.get_active_sessions_with_cx(&cx).await.unwrap();
+        assert!(active.is_empty());
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
