@@ -6298,6 +6298,38 @@ where
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of
+    /// [`Self::maybe_inject_trauma_feedback`].
+    ///
+    /// Routes the wezterm send through
+    /// `send_text_with_options_with_cx` so a cancelled parent (e.g.
+    /// a shutting-down policy engine) bails before pumping the
+    /// trauma-feedback text into the pane.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn maybe_inject_trauma_feedback_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        decision: &PolicyDecision,
+    ) {
+        let Some(feedback) = trauma_feedback_comment(decision) else {
+            return;
+        };
+
+        if let Err(error) = self
+            .client
+            .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
+            .await
+        {
+            tracing::warn!(
+                pane_id,
+                rule_id = ?decision.rule_id(),
+                error = %error,
+                "Failed to inject synthetic trauma guard feedback (cx path)"
+            );
+        }
+    }
+
     /// Cx-first [`Self::send_text`] (ft-xbnl0.2.3). Routes the
     /// policy-gated send through [`Self::dispatch_wezterm_send_with_cx`]
     /// so the underlying wezterm subprocess honors caller
@@ -6434,7 +6466,8 @@ where
                 }
             }
             PolicyDecision::Deny { .. } => {
-                self.maybe_inject_trauma_feedback(pane_id, &decision).await;
+                self.maybe_inject_trauma_feedback_with_cx(cx, pane_id, &decision)
+                    .await;
                 InjectionResult::Denied {
                     decision,
                     summary,
@@ -6486,7 +6519,7 @@ where
             if let Some(storage) = storage_for_summary.as_ref() {
                 let parent_action_id = if actor == ActorKind::Workflow {
                     if let Some(id) = workflow_id {
-                        find_workflow_start_action_id(storage, id).await
+                        find_workflow_start_action_id_with_cx(cx, storage, id).await
                     } else {
                         None
                     }
@@ -7043,6 +7076,31 @@ async fn find_workflow_start_action_id(
     };
     storage
         .get_audit_actions(query)
+        .await
+        .ok()
+        .and_then(|mut rows| rows.pop().map(|row| row.id))
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`find_workflow_start_action_id`].
+///
+/// Routes through `get_audit_actions_with_cx` so the lookup
+/// honours cancellation. Returns `None` on cancellation (matching
+/// the legacy "swallow errors → None" contract), so callers in the
+/// decision-context capture path degrade gracefully.
+#[cfg(feature = "asupersync-runtime")]
+async fn find_workflow_start_action_id_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    execution_id: &str,
+) -> Option<i64> {
+    let query = crate::storage::AuditQuery {
+        limit: Some(1),
+        actor_id: Some(execution_id.to_string()),
+        action_kind: Some("workflow_start".to_string()),
+        ..Default::default()
+    };
+    storage
+        .get_audit_actions_with_cx(cx, query)
         .await
         .ok()
         .and_then(|mut rows| rows.pop().map(|row| row.id))
