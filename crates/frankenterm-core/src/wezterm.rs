@@ -259,8 +259,39 @@ pub trait WeztermInterface: Send + Sync {
     }
     /// Kill (close) a pane.
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+
+    /// Kill a pane bound to the caller's Cx (ft-xbnl0.2.3). Default
+    /// delegates to [`kill_pane`](Self::kill_pane); concrete impls
+    /// with a Cx-aware `wezterm cli kill-pane` path (e.g.
+    /// `WeztermClient::kill_pane_with_cx`) SHOULD override so caller
+    /// cancellation/budget/virtual time propagate into the subprocess
+    /// invocation.
+    #[cfg(feature = "asupersync-runtime")]
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.kill_pane(pane_id)
+    }
+
     /// Zoom or unzoom a pane.
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()>;
+
+    /// Zoom or unzoom a pane bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates to
+    /// [`zoom_pane`](Self::zoom_pane); concrete impls with a Cx-aware
+    /// `wezterm cli zoom-pane` path (e.g.
+    /// `WeztermClient::zoom_pane_with_cx`) SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.zoom_pane(pane_id, zoom)
+    }
     /// Get current circuit breaker status.
     fn circuit_status(&self) -> CircuitBreakerStatus;
     /// Emit health warnings suitable for watchdog snapshots.
@@ -2612,8 +2643,27 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::kill_pane(self, pane_id).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move { WeztermClient::kill_pane_with_cx(self, cx, pane_id).await })
+    }
+
     fn zoom_pane(&self, pane_id: u64, zoom: bool) -> WeztermFuture<'_, ()> {
         Box::pin(async move { WeztermClient::zoom_pane(self, pane_id, zoom).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move { WeztermClient::zoom_pane_with_cx(self, cx, pane_id, zoom).await })
     }
 
     fn circuit_status(&self) -> CircuitBreakerStatus {
@@ -2878,6 +2928,25 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         pane_id: u64,
     ) -> WeztermFuture<'a, ()> {
         self.as_ref().activate_pane_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.as_ref().kill_pane_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.as_ref().zoom_pane_with_cx(cx, pane_id, zoom)
     }
 
     #[cfg(feature = "asupersync-runtime")]
@@ -4160,6 +4229,140 @@ mod tests {
                     assert_eq!(path, bogus.to_string_lossy());
                 }
                 other => panic!("UnifiedClient expected SocketNotFound, got {other:?}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `kill_pane_with_cx` trait extension
+    /// must route through Arc<dyn> and UnifiedClient wrappers to the
+    /// concrete `WeztermClient::kill_pane_with_cx` short-circuit.
+    /// Parallel to tick 44's activate_pane_with_cx trait-path test.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn kill_pane_with_cx_forwards_through_arc_and_unified() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick45-arc-kill-no-such-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+
+            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let cx = crate::cx::for_request();
+            let err_arc = arc
+                .kill_pane_with_cx(&cx, 42)
+                .await
+                .expect_err("Arc<dyn> kill_pane_with_cx should short-circuit");
+            match err_arc {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound (kill), got {other:?}"),
+            }
+
+            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let unified = UnifiedClient::from_handle(
+                inner_handle,
+                BackendSelection {
+                    kind: BackendKind::Cli,
+                    reason: "tick 45 kill regression guard".to_string(),
+                    compatibility: None,
+                },
+            );
+            let err_unified = unified
+                .kill_pane_with_cx(&cx, 42)
+                .await
+                .expect_err("UnifiedClient kill_pane_with_cx should short-circuit");
+            match err_unified {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("UnifiedClient expected SocketNotFound (kill), got {other:?}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `zoom_pane_with_cx` trait extension
+    /// must route through Arc<dyn> and UnifiedClient wrappers for
+    /// both `zoom=true` and `zoom=false` (--unzoom) branches.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn zoom_pane_with_cx_forwards_through_arc_and_unified() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick45-arc-zoom-no-such-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+
+            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let cx = crate::cx::for_request();
+
+            // zoom=true branch
+            let err_arc_zoom = arc
+                .zoom_pane_with_cx(&cx, 13, true)
+                .await
+                .expect_err("Arc<dyn> zoom_pane_with_cx(true) should short-circuit");
+            match err_arc_zoom {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound (zoom=true), got {other:?}"),
+            }
+
+            // zoom=false branch (unzoom)
+            let err_arc_unzoom = arc
+                .zoom_pane_with_cx(&cx, 13, false)
+                .await
+                .expect_err("Arc<dyn> zoom_pane_with_cx(false) should short-circuit");
+            match err_arc_unzoom {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound (zoom=false), got {other:?}"),
+            }
+
+            // UnifiedClient zoom=true
+            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let unified = UnifiedClient::from_handle(
+                inner_handle,
+                BackendSelection {
+                    kind: BackendKind::Cli,
+                    reason: "tick 45 zoom regression guard".to_string(),
+                    compatibility: None,
+                },
+            );
+            let err_unified = unified
+                .zoom_pane_with_cx(&cx, 13, true)
+                .await
+                .expect_err("UnifiedClient zoom_pane_with_cx should short-circuit");
+            match err_unified {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("UnifiedClient expected SocketNotFound (zoom), got {other:?}"),
             }
         });
     }
@@ -6052,6 +6255,25 @@ impl WeztermInterface for UnifiedClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, ()> {
         self.inner.activate_pane_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.kill_pane_with_cx(cx, pane_id)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.zoom_pane_with_cx(cx, pane_id, zoom)
     }
 
     #[cfg(feature = "asupersync-runtime")]

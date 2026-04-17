@@ -1400,6 +1400,41 @@ impl WeztermInterface for ShardedWeztermClient {
                 })
         })
     }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn kill_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .kill_pane_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| self.backend_error(route.shard_id, "kill_pane", Some(pane_id), err))
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn zoom_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .zoom_pane_with_cx(cx, route.local_pane_id, zoom)
+                .await
+                .map_err(|err| self.backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
+        })
+    }
 }
 
 fn circuit_state_rank(state: CircuitStateKind) -> u8 {
