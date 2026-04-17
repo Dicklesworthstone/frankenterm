@@ -6851,6 +6851,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_pane_bookmark`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn insert_pane_bookmark_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: PaneBookmarkRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_pane_bookmark cancelled: {err}"))
+        })?;
+        self.insert_pane_bookmark(record).await
+    }
+
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
     pub async fn delete_pane_bookmark(&self, alias: &str) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -6863,6 +6876,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`delete_pane_bookmark`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn delete_pane_bookmark_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        alias: &str,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("delete_pane_bookmark cancelled: {err}"))
+        })?;
+        self.delete_pane_bookmark(alias).await
     }
 
     /// Get a pane bookmark by alias.
@@ -6881,6 +6907,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_bookmark_by_alias`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_bookmark_by_alias_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        alias: &str,
+    ) -> Result<Option<PaneBookmarkRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_pane_bookmark_by_alias cancelled: {err}"))
+        })?;
+        self.get_pane_bookmark_by_alias(alias).await
+    }
+
     /// List all pane bookmarks in alias order.
     pub async fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -6891,6 +6930,18 @@ impl StorageHandle {
             list_pane_bookmarks_sync(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_pane_bookmarks_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneBookmarkRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_pane_bookmarks cancelled: {err}"))
+        })?;
+        self.list_pane_bookmarks().await
     }
 
     /// List pane bookmarks filtered by tag.
@@ -6904,6 +6955,19 @@ impl StorageHandle {
             list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks_by_tag`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_pane_bookmarks_by_tag_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        tag: &str,
+    ) -> Result<Vec<PaneBookmarkRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_pane_bookmarks_by_tag cancelled: {err}"))
+        })?;
+        self.list_pane_bookmarks_by_tag(tag).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_segments_before`].
@@ -20878,6 +20942,102 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 138 pane-bookmark cluster —
+/// 5 new storage cx-first siblings exercised end-to-end:
+/// `insert_pane_bookmark_with_cx`, `delete_pane_bookmark_with_cx`,
+/// `get_pane_bookmark_by_alias_with_cx`,
+/// `list_pane_bookmarks_with_cx`,
+/// `list_pane_bookmarks_by_tag_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick138_pane_bookmark_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick138_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. insert_pane_bookmark_with_cx — two bookmarks so list/tag filter
+        //    can prove ordering and selectivity.
+        let rec_alpha = PaneBookmarkRecord {
+            id: 0,
+            pane_id: 21,
+            alias: "alpha".to_string(),
+            tags: Some(vec!["primary".to_string(), "tick138".to_string()]),
+            description: Some("first bookmark".to_string()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+        let id_alpha = storage
+            .insert_pane_bookmark_with_cx(&cx, rec_alpha)
+            .await
+            .unwrap();
+        assert!(id_alpha > 0);
+
+        let rec_beta = PaneBookmarkRecord {
+            id: 0,
+            pane_id: 22,
+            alias: "beta".to_string(),
+            tags: Some(vec!["secondary".to_string(), "tick138".to_string()]),
+            description: None,
+            created_at: 1_700_000_000_100,
+            updated_at: 1_700_000_000_100,
+        };
+        let id_beta = storage
+            .insert_pane_bookmark_with_cx(&cx, rec_beta)
+            .await
+            .unwrap();
+        assert!(id_beta > 0 && id_beta != id_alpha);
+
+        // 2. get_pane_bookmark_by_alias_with_cx
+        let fetched = storage
+            .get_pane_bookmark_by_alias_with_cx(&cx, "alpha")
+            .await
+            .unwrap()
+            .expect("alpha bookmark should exist");
+        assert_eq!(fetched.pane_id, 21);
+        assert_eq!(fetched.description.as_deref(), Some("first bookmark"));
+
+        // 3. list_pane_bookmarks_with_cx — both bookmarks
+        let all = storage.list_pane_bookmarks_with_cx(&cx).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|b| b.alias == "alpha"));
+        assert!(all.iter().any(|b| b.alias == "beta"));
+
+        // 4. list_pane_bookmarks_by_tag_with_cx
+        let primary_only = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "primary")
+            .await
+            .unwrap();
+        assert_eq!(primary_only.len(), 1);
+        assert_eq!(primary_only[0].alias, "alpha");
+
+        let tick138_both = storage
+            .list_pane_bookmarks_by_tag_with_cx(&cx, "tick138")
+            .await
+            .unwrap();
+        assert_eq!(tick138_both.len(), 2);
+
+        // 5. delete_pane_bookmark_with_cx
+        let deleted = storage
+            .delete_pane_bookmark_with_cx(&cx, "alpha")
+            .await
+            .unwrap();
+        assert!(deleted, "delete_pane_bookmark_with_cx should remove alpha");
+        let after = storage
+            .get_pane_bookmark_by_alias_with_cx(&cx, "alpha")
+            .await
+            .unwrap();
+        assert!(after.is_none(), "alpha should be gone after delete");
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
