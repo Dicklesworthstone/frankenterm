@@ -13,6 +13,8 @@ mod web_tests {
     };
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
 
+    #[cfg(feature = "asupersync-runtime")]
+    use frankenterm_core::web::start_web_server_with_cx;
     use frankenterm_core::web::{WebServerConfig, start_web_server};
 
     fn run_async_test<F>(future: F)
@@ -173,6 +175,33 @@ mod web_tests {
 
             let response = fetch_health(addr).await;
             let shutdown = server.shutdown().await;
+
+            let response = response.unwrap();
+            shutdown.unwrap();
+
+            assert!(response.contains("200"));
+            assert!(response.contains("\"ok\":true"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: verify
+    /// `start_web_server_with_cx` + `shutdown_with_cx` roundtrip
+    /// on an ephemeral port, identically to the legacy pair. An
+    /// uncancelled cx must not affect the happy path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_health_with_cx_ephemeral_port() {
+        run_async_test(async {
+            let cx = frankenterm_core::cx::for_request();
+            let server = start_web_server_with_cx(&cx, WebServerConfig::default().with_port(0))
+                .await
+                .unwrap();
+            let addr = server.bound_addr();
+
+            assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+            let response = fetch_health(addr).await;
+            let shutdown = server.shutdown_with_cx(&cx).await;
 
             let response = response.unwrap();
             shutdown.unwrap();

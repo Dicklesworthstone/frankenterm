@@ -45,6 +45,23 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
     })
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`start_web_server`].
+///
+/// Pre-flight checkpoint gates server startup before the bind
+/// address is validated or the listener is opened. Cx-driven
+/// CLI callers that have been cancelled can bail before taking
+/// a port. Delegates to [`start_web_server`] for the actual
+/// work so the legacy path remains authoritative.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn start_web_server_with_cx(
+    cx: &crate::cx::Cx,
+    config: WebServerConfig,
+) -> Result<WebServerHandle> {
+    cx.checkpoint()
+        .map_err(|err| Error::Runtime(format!("start_web_server cancelled: {err}")))?;
+    start_web_server(config).await
+}
+
 /// Run the web server until Ctrl+C, then shut down gracefully.
 pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
