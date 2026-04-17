@@ -336,6 +336,92 @@ impl MigrationEngine {
         Ok(manifest)
     }
 
+    /// Cx-first [`Self::m0_preflight`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the preflight sequence via checkpoint
+    /// seams: pre-flight (before `storage.health()` touches the
+    /// source), between the health check and the head offset
+    /// read, and per-iteration during the cursor-scan loop that
+    /// builds the manifest.
+    ///
+    /// The scan loop can be long on large ledgers (hundreds of
+    /// thousands of events). Without per-batch cancellation the
+    /// caller can't abort a scan — M0 is a no-op blocker but can
+    /// still take minutes in practice. The checkpoint per batch
+    /// keeps the loop responsive to operator cancel signals.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn m0_preflight_with_cx<S: RecorderStorage>(
+        &self,
+        cx: &crate::cx::Cx,
+        source_storage: &S,
+        source_reader: &dyn RecorderEventReader,
+    ) -> Result<MigrationManifest, MigrationError> {
+        cx.checkpoint()
+            .map_err(|err| MigrationError::SourceDegraded {
+                last_error: Some(format!("m0_preflight cancelled pre-start: {err}")),
+            })?;
+
+        let health: RecorderStorageHealth = source_storage.health().await;
+        if health.degraded {
+            return Err(MigrationError::SourceDegraded {
+                last_error: health.last_error,
+            });
+        }
+
+        cx.checkpoint()
+            .map_err(|err| MigrationError::SourceDegraded {
+                last_error: Some(format!("m0_preflight cancelled after health check: {err}")),
+            })?;
+
+        let head = source_reader.head_offset()?;
+
+        let mut cursor = source_reader.open_cursor_from_start()?;
+        let mut event_count: u64 = 0;
+        let mut first_ordinal: Option<u64> = None;
+        let mut last_ordinal: u64 = 0;
+        let mut per_pane_counts: HashMap<u64, u64> = HashMap::new();
+
+        loop {
+            cx.checkpoint().map_err(|err| {
+                MigrationError::SourceDegraded {
+                    last_error: Some(format!(
+                        "m0_preflight cancelled mid-scan (event_count={event_count}, last_ordinal={last_ordinal}): {err}"
+                    )),
+                }
+            })?;
+
+            let batch = cursor.next_batch(self.config.export_batch_size)?;
+            if batch.is_empty() {
+                break;
+            }
+            for record in &batch {
+                event_count += 1;
+                if first_ordinal.is_none() {
+                    first_ordinal = Some(record.offset.ordinal);
+                }
+                last_ordinal = record.offset.ordinal;
+                *per_pane_counts.entry(record.event.pane_id).or_insert(0) += 1;
+            }
+        }
+
+        let manifest = MigrationManifest {
+            event_count,
+            first_ordinal: first_ordinal.unwrap_or(0),
+            last_ordinal,
+            per_pane_counts,
+            last_offset: Some(head),
+            ..Default::default()
+        };
+
+        info!(
+            migration_stage = "M0",
+            event_count = event_count,
+            last_ordinal = %last_ordinal,
+            "preflight complete (cx)"
+        );
+
+        Ok(manifest)
+    }
+
     // -----------------------------------------------------------------------
     // M1 — Export
     // -----------------------------------------------------------------------
@@ -1036,6 +1122,73 @@ mod tests {
             assert!(
                 msg.contains("degraded"),
                 "error should mention degraded: {msg}"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m0_preflight_with_cx` must match
+    /// the legacy `m0_preflight` for an uncancelled cx. Uses the
+    /// same 5-record fixture as `test_m0_captures_manifest_with_correct_counts`
+    /// to prove the manifest counts are bit-for-bit identical.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m0_preflight_with_cx_matches_legacy() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+                make_cursor_record(1, 3),
+                make_cursor_record(3, 4),
+            ];
+
+            // Legacy path
+            let reader_legacy = TestEventReader::new(records.clone());
+            let storage_legacy = MockMigrationStorage::healthy();
+            let engine_legacy = MigrationEngine::new(MigrationConfig::default());
+            let legacy = engine_legacy
+                .m0_preflight(&storage_legacy, &reader_legacy)
+                .await
+                .unwrap();
+
+            // Cx-first path
+            let reader_cx = TestEventReader::new(records);
+            let storage_cx = MockMigrationStorage::healthy();
+            let engine_cx = MigrationEngine::new(MigrationConfig::default());
+            let cx = crate::cx::for_request();
+            let cx_first = engine_cx
+                .m0_preflight_with_cx(&cx, &storage_cx, &reader_cx)
+                .await
+                .unwrap();
+
+            assert_eq!(legacy.event_count, cx_first.event_count);
+            assert_eq!(legacy.first_ordinal, cx_first.first_ordinal);
+            assert_eq!(legacy.last_ordinal, cx_first.last_ordinal);
+            assert_eq!(legacy.per_pane_counts, cx_first.per_pane_counts);
+            assert_eq!(legacy.last_offset, cx_first.last_offset);
+            assert_eq!(cx_first.event_count, 5);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m0_preflight_with_cx` must reject
+    /// a degraded source with SourceDegraded, same as the legacy
+    /// path. Proves the health-check branch short-circuits on
+    /// the Cx path too.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m0_preflight_with_cx_rejects_degraded_source() {
+        run_async_test(async {
+            let reader = TestEventReader::new(vec![]);
+            let storage = MockMigrationStorage::degraded();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let cx = crate::cx::for_request();
+
+            let result = engine.m0_preflight_with_cx(&cx, &storage, &reader).await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("degraded"),
+                "Cx-first error should mention degraded: {msg}"
             );
         });
     }
