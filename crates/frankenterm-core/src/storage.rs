@@ -6463,6 +6463,20 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`mark_action_undone`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn mark_action_undone_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        audit_action_id: i64,
+        undone_by: &str,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("mark_action_undone cancelled: {err}"))
+        })?;
+        self.mark_action_undone(audit_action_id, undone_by).await
+    }
+
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -6776,6 +6790,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metrics_batch`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_usage_metrics_batch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        records: Vec<UsageMetricRecord>,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_usage_metrics_batch cancelled: {err}"))
+        })?;
+        self.record_usage_metrics_batch(records).await
+    }
+
     /// Purge usage metrics older than a cutoff timestamp.
     pub async fn purge_usage_metrics(&self, before_ts: i64) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -6788,6 +6815,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`purge_usage_metrics`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn purge_usage_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("purge_usage_metrics cancelled: {err}"))
+        })?;
+        self.purge_usage_metrics(before_ts).await
     }
 
     /// Query usage metrics with filters (read-only, uses read connection).
@@ -6920,6 +6960,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`purge_notification_history`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn purge_notification_history_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("purge_notification_history cancelled: {err}"))
+        })?;
+        self.purge_notification_history(before_ts).await
     }
 
     // =========================================================================
@@ -7415,6 +7468,20 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_plan`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_action_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+        plan: &crate::plan::ActionPlan,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("upsert_action_plan cancelled: {err}"))
+        })?;
+        self.upsert_action_plan(workflow_id, plan).await
+    }
+
     /// Insert a prepared plan preview for later commit
     pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -7659,6 +7726,19 @@ impl StorageHandle {
             query_sessions_for_pane(&conn, pane_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_sessions_for_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_sessions_for_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Vec<AgentSessionRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_sessions_for_pane cancelled: {err}"))
+        })?;
+        self.get_sessions_for_pane(pane_id).await
     }
 
     /// Search segments using FTS5
@@ -8158,6 +8238,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_max_seq`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_max_seq_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<u64>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_max_seq cancelled: {err}")))?;
+        self.get_max_seq(pane_id).await
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8624,6 +8716,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_reservation`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_active_reservation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<PaneReservation>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_active_reservation cancelled: {err}"))
+        })?;
+        self.get_active_reservation(pane_id).await
+    }
+
     /// Get the active reservation for a pane using a synchronous read path.
     pub fn get_active_reservation_blocking(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
         let conn = Connection::open(self.db_path.as_str())
@@ -8640,6 +8745,18 @@ impl StorageHandle {
             list_active_reservations_sync(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_reservations`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_active_reservations_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneReservation>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_active_reservations cancelled: {err}"))
+        })?;
+        self.list_active_reservations().await
     }
 
     /// Check whether there is an active approval token for the exact scope on a
@@ -8827,6 +8944,19 @@ impl StorageHandle {
             query_export_reservations(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`export_reservations`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn export_reservations_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ExportQuery,
+    ) -> Result<Vec<PaneReservation>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("export_reservations cancelled: {err}"))
+        })?;
+        self.export_reservations(query).await
     }
 
     /// Expire all stale reservations (past their TTL).
@@ -20200,6 +20330,136 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 121 hot-path batch smoke test —
+/// 10 more storage cx-first siblings exercised end-to-end on a
+/// fresh DB with pane 1 seeded for FK constraints.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick121_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick121_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed pane 1 for FK constraints.
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("tick121".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ts = 1_700_000_000_000_i64;
+        let future_ts = 1_800_000_000_000_i64;
+
+        // 1. mark_action_undone_with_cx — false (no such audit action).
+        let undone = storage
+            .mark_action_undone_with_cx(&cx, 999_999, "test")
+            .await
+            .unwrap();
+        assert!(!undone);
+
+        // 2. record_usage_metrics_batch_with_cx — empty batch, returns 0.
+        let batch_count = storage
+            .record_usage_metrics_batch_with_cx(&cx, vec![])
+            .await
+            .unwrap();
+        assert_eq!(batch_count, 0);
+
+        // 3. purge_usage_metrics_with_cx — 0 on empty DB.
+        let purged = storage
+            .purge_usage_metrics_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(purged, 0);
+
+        // 4. purge_notification_history_with_cx — 0 on empty DB.
+        let nh_purged = storage
+            .purge_notification_history_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(nh_purged, 0);
+
+        // 5. upsert_action_plan_with_cx — seed workflow first (FK).
+        storage
+            .upsert_workflow_with_cx(
+                &cx,
+                WorkflowRecord {
+                    id: "wf-tick121".to_string(),
+                    workflow_name: "demo".to_string(),
+                    pane_id: 1,
+                    trigger_event_id: None,
+                    current_step: 0,
+                    status: "running".to_string(),
+                    wait_condition: None,
+                    context: None,
+                    result: None,
+                    error: None,
+                    started_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_000_000,
+                    completed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let plan = crate::plan::ActionPlan::builder("tick121", "ws-tick121").build();
+        storage
+            .upsert_action_plan_with_cx(&cx, "wf-tick121", &plan)
+            .await
+            .unwrap();
+
+        // 6. get_sessions_for_pane_with_cx — empty on fresh DB.
+        let sessions = storage.get_sessions_for_pane_with_cx(&cx, 1).await.unwrap();
+        assert!(sessions.is_empty());
+
+        // 7. get_max_seq_with_cx — None on fresh DB (no segments).
+        let max_seq = storage.get_max_seq_with_cx(&cx, 1).await.unwrap();
+        assert!(max_seq.is_none());
+
+        // 8. get_active_reservation_with_cx — None on fresh DB.
+        let rsv = storage
+            .get_active_reservation_with_cx(&cx, 1)
+            .await
+            .unwrap();
+        assert!(rsv.is_none());
+
+        // 9. list_active_reservations_with_cx — empty on fresh DB.
+        let rsvs = storage.list_active_reservations_with_cx(&cx).await.unwrap();
+        assert!(rsvs.is_empty());
+
+        // 10. export_reservations_with_cx — empty on fresh DB.
+        let exp_rsvs = storage
+            .export_reservations_with_cx(&cx, ExportQuery::default())
+            .await
+            .unwrap();
+        assert!(exp_rsvs.is_empty());
+
+        let _ = ts;
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
