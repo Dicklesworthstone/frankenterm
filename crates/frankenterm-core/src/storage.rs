@@ -7167,6 +7167,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_notification`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_notification_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: NotificationHistoryRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_notification cancelled: {err}"))
+        })?;
+        self.record_notification(record).await
+    }
+
     /// Update the delivery status of a notification.
     pub async fn update_notification_status(
         &self,
@@ -7186,6 +7199,22 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_notification_status`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_notification_status_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: i64,
+        status: NotificationStatus,
+        error_message: Option<String>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("update_notification_status cancelled: {err}"))
+        })?;
+        self.update_notification_status(id, status, error_message)
+            .await
     }
 
     /// Acknowledge a notification (marks when and by whom).
@@ -7209,6 +7238,22 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`acknowledge_notification`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn acknowledge_notification_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: i64,
+        acknowledged_by: String,
+        action_taken: Option<String>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("acknowledge_notification cancelled: {err}"))
+        })?;
+        self.acknowledge_notification(id, acknowledged_by, action_taken)
+            .await
+    }
+
     /// Increment the retry count for a notification and reset its status to pending.
     pub async fn increment_notification_retry(&self, id: i64) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -7218,6 +7263,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`increment_notification_retry`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn increment_notification_retry_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: i64,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("increment_notification_retry cancelled: {err}"))
+        })?;
+        self.increment_notification_retry(id).await
     }
 
     /// Purge notification history older than the given timestamp.
@@ -7502,6 +7560,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`query_notification_history`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn query_notification_history_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: NotificationHistoryQuery,
+    ) -> Result<Vec<NotificationHistoryRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("query_notification_history cancelled: {err}"))
+        })?;
+        self.query_notification_history(query).await
+    }
+
     /// Get a single notification by ID.
     pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
         let db_path = Arc::clone(&self.db_path);
@@ -7512,6 +7583,18 @@ impl StorageHandle {
             get_notification_sync(&conn, id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_notification`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_notification_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: i64,
+    ) -> Result<NotificationHistoryRecord> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
+        self.get_notification(id).await
     }
 
     /// Current write queue depth (pending commands waiting for the writer thread).
@@ -20942,6 +21025,99 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 139 notification cluster —
+/// 6 new storage cx-first siblings exercised end-to-end:
+/// `record_notification_with_cx`,
+/// `update_notification_status_with_cx`,
+/// `acknowledge_notification_with_cx`,
+/// `increment_notification_retry_with_cx`,
+/// `query_notification_history_with_cx`,
+/// `get_notification_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick139_notification_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick139_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. record_notification_with_cx
+        let rec = NotificationHistoryRecord {
+            id: 0,
+            timestamp: 1_700_000_000_000,
+            event_id: None,
+            channel: "desktop".to_string(),
+            title: "tick139 ping".to_string(),
+            body: "hello".to_string(),
+            severity: "info".to_string(),
+            status: NotificationStatus::Pending,
+            error_message: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            action_taken: None,
+            retry_count: 0,
+            metadata: None,
+            created_at: 1_700_000_000_000,
+        };
+        let id = storage.record_notification_with_cx(&cx, rec).await.unwrap();
+        assert!(id > 0);
+
+        // 2. get_notification_with_cx — freshly recorded notification
+        let fetched = storage.get_notification_with_cx(&cx, id).await.unwrap();
+        assert_eq!(fetched.title, "tick139 ping");
+        assert!(matches!(fetched.status, NotificationStatus::Pending));
+
+        // 3. update_notification_status_with_cx — promote to Sent
+        storage
+            .update_notification_status_with_cx(&cx, id, NotificationStatus::Sent, None)
+            .await
+            .unwrap();
+        let after_sent = storage.get_notification_with_cx(&cx, id).await.unwrap();
+        assert!(matches!(after_sent.status, NotificationStatus::Sent));
+
+        // 4. acknowledge_notification_with_cx
+        storage
+            .acknowledge_notification_with_cx(
+                &cx,
+                id,
+                "operator-tick139".to_string(),
+                Some("dismissed".to_string()),
+            )
+            .await
+            .unwrap();
+        let after_ack = storage.get_notification_with_cx(&cx, id).await.unwrap();
+        assert_eq!(after_ack.acknowledged_by.as_deref(), Some("operator-tick139"));
+        assert_eq!(after_ack.action_taken.as_deref(), Some("dismissed"));
+        assert!(after_ack.acknowledged_at.is_some());
+
+        // 5. increment_notification_retry_with_cx
+        let before_retry = after_ack.retry_count;
+        storage
+            .increment_notification_retry_with_cx(&cx, id)
+            .await
+            .unwrap();
+        let after_retry = storage.get_notification_with_cx(&cx, id).await.unwrap();
+        assert_eq!(after_retry.retry_count, before_retry + 1);
+        // increment_notification_retry resets status to Pending per the
+        // method contract.
+        assert!(matches!(after_retry.status, NotificationStatus::Pending));
+
+        // 6. query_notification_history_with_cx — no filters, should include our row.
+        let listed = storage
+            .query_notification_history_with_cx(&cx, NotificationHistoryQuery::default())
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|n| n.id == id));
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
