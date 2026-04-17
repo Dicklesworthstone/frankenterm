@@ -514,6 +514,90 @@ pub async fn refresh_cass_summary_for_session(
     Ok(summary)
 }
 
+/// Cx-first [`refresh_cass_summary_for_session`] (ft-xbnl0.2.3).
+/// Routes the cass subprocess call through
+/// [`CassClient::query_session_with_cx`] so caller cancellation
+/// propagates into the `cass` invocation. TTL-gated refresh
+/// semantics preserved — a recently-refreshed session returns
+/// its cached summary without touching cass (and without
+/// firing any checkpoints beyond the pre-flight one).
+///
+/// Pre-flight checkpoint gates the initial storage read; a
+/// checkpoint between the cass call and the persist step lets
+/// a late-cancelled caller abort before updating the session
+/// record.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn refresh_cass_summary_for_session_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    session_id: i64,
+    options: &CassSummaryRefreshOptions,
+) -> Result<CassSessionSummary, String> {
+    cx.checkpoint()
+        .map_err(|err| format!("refresh_cass_summary_for_session cancelled pre-start: {err}"))?;
+
+    let mut record = storage
+        .get_agent_session(session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("agent session not found: {session_id}"))?;
+
+    let Some(external_id) = record.external_id.clone() else {
+        return Err("cass external_id missing on agent session".to_string());
+    };
+
+    let now = now_ms();
+    if !options.force {
+        if let Some(last_refresh) = record.external_meta.as_ref().and_then(extract_refresh_ms) {
+            let elapsed = now.saturating_sub(last_refresh);
+            if elapsed < options.min_refresh_interval_ms {
+                if let Some(summary) = record
+                    .external_meta
+                    .as_ref()
+                    .and_then(extract_summary_from_meta)
+                {
+                    return Ok(summary);
+                }
+            }
+        }
+    }
+
+    let session = cass
+        .query_session_with_cx(cx, &external_id)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    cx.checkpoint().map_err(|err| {
+        format!(
+            "refresh_cass_summary_for_session cancelled between cass and persist (session_id={session_id}): {err}"
+        )
+    })?;
+
+    let summary = CassSessionSummary::from_session(&session);
+    record.total_tokens = summary.total_tokens;
+    record.input_tokens = summary.input_tokens;
+    record.output_tokens = summary.output_tokens;
+
+    if record.ended_at.is_none() {
+        record.ended_at = summary.session_ended_at_ms;
+    }
+
+    record.external_meta = Some(merge_external_meta(
+        record.external_meta.take(),
+        &summary,
+        now,
+        &external_id,
+    ));
+
+    storage
+        .upsert_agent_session(record)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(summary)
+}
+
 fn window_start(session_started_at_ms: i64, options: &CassCorrelationOptions) -> i64 {
     session_started_at_ms.saturating_sub(options.window_before_ms.max(0))
 }
@@ -1226,6 +1310,46 @@ mod tests {
             assert_eq!(updated.external_id.as_deref(), Some("cass-override"));
             assert!(updated.external_meta.is_some());
             assert_eq!(correlation.status, CorrelationStatus::Linked);
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `refresh_cass_summary_for_session_with_cx`
+    /// must match the legacy `refresh_cass_summary_for_session`
+    /// on the missing-session error branch. Both variants
+    /// surface `"agent session not found: <id>"`. Proves the
+    /// pre-flight checkpoint on the Cx-first path doesn't
+    /// short-circuit uncancelled cx — the storage read still
+    /// fires and the same error surfaces.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn refresh_cass_summary_with_cx_missing_session_matches_legacy() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft-refresh-cx.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
+
+            let cass = CassClient::new();
+            let options = CassSummaryRefreshOptions::default();
+            let cx = crate::cx::for_request();
+
+            // No session with id=999 exists — both paths must
+            // return "agent session not found: 999".
+            let legacy_err = refresh_cass_summary_for_session(&handle, &cass, 999, &options)
+                .await
+                .expect_err("legacy must error on missing session");
+            let cx_err =
+                refresh_cass_summary_for_session_with_cx(&cx, &handle, &cass, 999, &options)
+                    .await
+                    .expect_err("cx-first must error on missing session");
+
+            assert_eq!(legacy_err, cx_err);
+            assert!(
+                cx_err.contains("agent session not found: 999"),
+                "expected 'agent session not found: 999', got: {cx_err}"
+            );
 
             handle.shutdown().await.unwrap();
         });
