@@ -564,11 +564,36 @@ mod tests {
     struct MockSender {
         name: &'static str,
         sent: Arc<Mutex<Vec<NotificationPayload>>>,
+        /// Separate bucket populated only by `send_with_cx`. Lets tests
+        /// distinguish the Cx-first delivery path from the ambient
+        /// `send` fallback — without this, the default trait impl
+        /// `send_with_cx → send` would be indistinguishable from a
+        /// Cx-aware override at the MockSender level.
+        #[cfg(feature = "asupersync-runtime")]
+        cx_sent: Arc<Mutex<Vec<NotificationPayload>>>,
     }
 
     impl MockSender {
         fn new(name: &'static str, sent: Arc<Mutex<Vec<NotificationPayload>>>) -> Self {
-            Self { name, sent }
+            Self {
+                name,
+                sent,
+                #[cfg(feature = "asupersync-runtime")]
+                cx_sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        #[cfg(feature = "asupersync-runtime")]
+        fn with_cx_sent(
+            name: &'static str,
+            sent: Arc<Mutex<Vec<NotificationPayload>>>,
+            cx_sent: Arc<Mutex<Vec<NotificationPayload>>>,
+        ) -> Self {
+            Self {
+                name,
+                sent,
+                cx_sent,
+            }
         }
     }
 
@@ -582,6 +607,32 @@ mod tests {
             let payload = payload.clone();
             Box::pin(async move {
                 let mut guard = sent.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push(payload);
+                NotificationDelivery {
+                    sender: "mock".to_string(),
+                    success: true,
+                    rate_limited: false,
+                    error: None,
+                    records: Vec::new(),
+                }
+            })
+        }
+
+        /// Cx-first override. Records into a separate bucket so tests
+        /// can assert which path (`send` vs `send_with_cx`) the caller
+        /// took. Without this override, the `NotificationSender` trait
+        /// default would delegate to `send`, making the two paths
+        /// indistinguishable at the MockSender boundary.
+        #[cfg(feature = "asupersync-runtime")]
+        fn send_with_cx<'a>(
+            &'a self,
+            _cx: &'a crate::cx::Cx,
+            payload: &'a NotificationPayload,
+        ) -> NotificationFuture<'a> {
+            let cx_sent = Arc::clone(&self.cx_sent);
+            let payload = payload.clone();
+            Box::pin(async move {
+                let mut guard = cx_sent.lock().unwrap_or_else(|e| e.into_inner());
                 guard.push(payload);
                 NotificationDelivery {
                     sender: "mock".to_string(),
@@ -895,7 +946,8 @@ mod tests {
     fn rate_limited_sender_with_cx_forwards_to_inner() {
         run_async_test(async {
             let sent = Arc::new(Mutex::new(Vec::new()));
-            let inner = MockSender::new("inner", Arc::clone(&sent));
+            let cx_sent = Arc::new(Mutex::new(Vec::new()));
+            let inner = MockSender::with_cx_sent("inner", Arc::clone(&sent), Arc::clone(&cx_sent));
             let limited = RateLimitedSender::new(inner, Duration::from_millis(10));
             let payload =
                 NotificationPayload::from_detection(&test_detection(), 1, &test_rendered(), 0);
@@ -920,11 +972,19 @@ mod tests {
             );
             assert!(!d2.success);
 
-            // Only one message actually reached the inner MockSender.
+            // Exactly one delivery reached the inner's Cx-aware surface —
+            // proving the wrapper forwarded through `send_with_cx`
+            // rather than falling back to `send`. Both the rate-limited
+            // second attempt (short-circuit in the wrapper) and the
+            // ambient `send` path must not populate the inner at all.
             assert_eq!(
-                sent.lock().unwrap().len(),
+                cx_sent.lock().unwrap().len(),
                 1,
-                "rate-limited send_with_cx must not forward to inner"
+                "first send_with_cx should have reached inner.send_with_cx"
+            );
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "wrapper must not fall back to inner.send (ambient path)"
             );
         });
     }
@@ -1137,6 +1197,82 @@ mod tests {
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_file(format!("{db_str}-wal"));
             let _ = std::fs::remove_file(format!("{db_str}-shm"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `NotificationPipeline::dispatch_payload_with_cx`
+    /// must route through each sender's `send_with_cx` entry point
+    /// rather than falling back to the ambient `send`. This regression
+    /// guard pairs with the webhook tick 38 test — it pins the
+    /// pipeline→sender Cx-forward contract. Without this, a future
+    /// refactor of the pipeline that regressed to `sender.send(...)`
+    /// would be silent because MockSender's default-trait delegation
+    /// would hide the difference.
+    ///
+    /// Uses `MockSender::with_cx_sent` so the two paths populate
+    /// separate buckets. Fans out across two senders to additionally
+    /// verify that cx reaches every sender in the vec (not just the
+    /// first).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pipeline_handle_detection_with_cx_invokes_sender_cx_path() {
+        run_async_test(async {
+            let filter = EventFilter::allow_all();
+            let gate = NotificationGate::from_config(
+                filter,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
+
+            let sent_a = Arc::new(Mutex::new(Vec::new()));
+            let cx_sent_a = Arc::new(Mutex::new(Vec::new()));
+            let sender_a =
+                MockSender::with_cx_sent("mock_a", Arc::clone(&sent_a), Arc::clone(&cx_sent_a));
+
+            let sent_b = Arc::new(Mutex::new(Vec::new()));
+            let cx_sent_b = Arc::new(Mutex::new(Vec::new()));
+            let sender_b =
+                MockSender::with_cx_sent("mock_b", Arc::clone(&sent_b), Arc::clone(&cx_sent_b));
+
+            let mut pipeline =
+                NotificationPipeline::new(gate, vec![Box::new(sender_a), Box::new(sender_b)]);
+
+            let cx = crate::cx::for_request();
+            let outcome = pipeline
+                .handle_detection_with_cx(&cx, &test_detection(), 7, None, Some(42))
+                .await;
+
+            assert!(
+                matches!(outcome.decision, NotifyDecision::Send { .. }),
+                "gate should allow send on fresh test detection"
+            );
+            assert_eq!(
+                outcome.deliveries.len(),
+                2,
+                "both senders should be attempted under Cx-first path"
+            );
+
+            // Each sender's cx-aware surface was invoked exactly once.
+            assert_eq!(
+                cx_sent_a.lock().unwrap().len(),
+                1,
+                "sender_a.send_with_cx must be invoked by pipeline Cx-first path"
+            );
+            assert_eq!(
+                cx_sent_b.lock().unwrap().len(),
+                1,
+                "sender_b.send_with_cx must be invoked by pipeline Cx-first path"
+            );
+
+            // Ambient `send` path was not touched at all.
+            assert!(
+                sent_a.lock().unwrap().is_empty(),
+                "pipeline Cx-first path must NOT fall back to sender_a.send"
+            );
+            assert!(
+                sent_b.lock().unwrap().is_empty(),
+                "pipeline Cx-first path must NOT fall back to sender_b.send"
+            );
         });
     }
 
