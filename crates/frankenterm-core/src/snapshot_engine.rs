@@ -809,6 +809,59 @@ impl SnapshotEngine {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`capture_from_provider`].
+    ///
+    /// Routes both the `capture` and post-capture `cleanup` writes
+    /// through their cx-first siblings so the scheduler's main work
+    /// loop honours caller cancellation across every write seam.
+    /// The pane provider is awaited directly — it's a caller-supplied
+    /// future that doesn't inherently know about cx; if a caller
+    /// needs cx threaded there they can capture one in the closure.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn capture_from_provider_with_cx<F, Fut>(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_provider: &F,
+        trigger: SnapshotTrigger,
+    ) -> bool
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
+    {
+        if let Some(panes) = pane_provider().await {
+            match self.capture_with_cx(cx, &panes, trigger).await {
+                Ok(result) => {
+                    tracing::info!(
+                        trigger = ?trigger,
+                        pane_count = result.pane_count,
+                        total_bytes = result.total_bytes,
+                        checkpoint_id = result.checkpoint_id,
+                        "snapshot captured (cx path)"
+                    );
+                    if let Err(e) = self.cleanup_with_cx(cx).await {
+                        tracing::warn!(error = %e, "snapshot retention cleanup failed (cx path)");
+                    }
+                    true
+                }
+                Err(SnapshotError::NoChanges) => {
+                    tracing::debug!(trigger = ?trigger, "snapshot skipped: no changes");
+                    false
+                }
+                Err(SnapshotError::InProgress) => {
+                    tracing::debug!(trigger = ?trigger, "snapshot skipped: capture in progress");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(trigger = ?trigger, error = %e, "snapshot capture failed");
+                    false
+                }
+            }
+        } else {
+            tracing::debug!(trigger = ?trigger, "snapshot skipped: no panes available");
+            false
+        }
+    }
+
     /// Run the snapshot scheduling loop.
     ///
     /// In `Periodic` mode: captures at fixed intervals.
@@ -904,7 +957,7 @@ impl SnapshotEngine {
                     } else {
                         SnapshotTrigger::Periodic
                     };
-                    let _ = self.capture_from_provider(&pane_provider, trigger).await;
+                    let _ = self.capture_from_provider_with_cx(cx, &pane_provider, trigger).await;
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
@@ -922,7 +975,7 @@ impl SnapshotEngine {
                 };
 
                 let _ = self
-                    .capture_from_provider(&pane_provider, SnapshotTrigger::Startup)
+                    .capture_from_provider_with_cx(cx, &pane_provider, SnapshotTrigger::Startup)
                     .await;
 
                 let fallback_secs = self
@@ -988,7 +1041,7 @@ impl SnapshotEngine {
 
                             if should_capture {
                                 let captured =
-                                    self.capture_from_provider(&pane_provider, trigger).await;
+                                    self.capture_from_provider_with_cx(cx, &pane_provider, trigger).await;
                                 if captured || immediate || snapshot_threshold <= 0.0 {
                                     accumulated_value = 0.0;
                                 }
@@ -1005,7 +1058,8 @@ impl SnapshotEngine {
                                 continue;
                             }
                             let captured = self
-                                .capture_from_provider(
+                                .capture_from_provider_with_cx(
+                                    cx,
                                     &pane_provider,
                                     SnapshotTrigger::PeriodicFallback,
                                 )
