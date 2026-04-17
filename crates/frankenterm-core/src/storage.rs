@@ -8797,6 +8797,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`export_segments`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn export_segments_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ExportQuery,
+    ) -> Result<Vec<Segment>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("export_segments cancelled: {err}")))?;
+        self.export_segments(query).await
+    }
+
     /// Export output gaps with optional pane/time/limit filters
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8932,6 +8944,18 @@ impl StorageHandle {
             query_export_sessions(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn export_sessions_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ExportQuery,
+    ) -> Result<Vec<AgentSessionRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
+        self.export_sessions(query).await
     }
 
     /// Export pane reservations (active + historical) with optional pane/time/limit filters

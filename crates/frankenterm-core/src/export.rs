@@ -229,10 +229,11 @@ pub async fn export_jsonl<W: Write>(
 }
 
 /// Cx-first [`export_jsonl`] (ft-xbnl0.2.3). Pre-flight
-/// cx checkpoint gates the expensive storage query — a
-/// pre-cancelled cx returns `Err(Error::Runtime(...))` without
-/// touching storage or writing a header to the output. For
-/// uncancelled cx the behavior is identical to `export_jsonl`.
+/// cx checkpoint gates the expensive storage query, and each
+/// storage call is routed through its cx-first sibling so
+/// caller cancellation propagates into storage's pre-flight
+/// checkpoints (tick 123 upgrade — previously this was a
+/// simple delegate that used legacy storage methods).
 ///
 /// Per-record cancellation is out of scope: once the storage
 /// query returns a `Vec<Record>`, the write loop is CPU-only
@@ -248,7 +249,131 @@ pub async fn export_jsonl_with_cx<W: Write>(
 ) -> crate::Result<usize> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("export_jsonl cancelled: {err}")))?;
-    export_jsonl(storage, opts, writer).await
+
+    let redactor = if opts.redact {
+        Some(Redactor::new())
+    } else {
+        None
+    };
+
+    let count = match opts.kind {
+        ExportKind::Segments => {
+            let records = storage
+                .export_segments_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                let record = if let Some(ref r) = redactor {
+                    redact_segment(record, r)
+                } else {
+                    record
+                };
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Gaps => {
+            let records = storage.export_gaps_with_cx(cx, opts.query.clone()).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Events => {
+            let query = EventQuery {
+                limit: opts.query.limit,
+                pane_id: opts.query.pane_id,
+                since: opts.query.since,
+                until: opts.query.until,
+                ..Default::default()
+            };
+            let records = storage.get_events_with_cx(cx, query).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in records {
+                let record = if let Some(ref r) = redactor {
+                    redact_event(record, r)
+                } else {
+                    record
+                };
+                write_record(writer, &record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Workflows => {
+            let records = storage
+                .export_workflows_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for wf in &records {
+                write_record(writer, wf, opts.pretty)?;
+                if let Ok(steps) = storage.get_step_logs_with_cx(cx, &wf.id).await {
+                    for step in &steps {
+                        let step = if let Some(ref r) = redactor {
+                            redact_step_log(step.clone(), r)
+                        } else {
+                            step.clone()
+                        };
+                        write_record(writer, &step, opts.pretty)?;
+                    }
+                }
+            }
+            count
+        }
+        ExportKind::Sessions => {
+            let records = storage
+                .export_sessions_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &records {
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Audit => {
+            let query = AuditQuery {
+                limit: opts.query.limit,
+                pane_id: opts.query.pane_id,
+                since: opts.query.since,
+                until: opts.query.until,
+                actor_kind: opts.audit_actor.clone(),
+                action_kind: opts.audit_action.clone(),
+                ..Default::default()
+            };
+            let mut records = storage.get_audit_actions_with_cx(cx, query).await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &mut records {
+                if let Some(ref r) = redactor {
+                    record.redact_fields(r);
+                }
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+        ExportKind::Reservations => {
+            let records = storage
+                .export_reservations_with_cx(cx, opts.query.clone())
+                .await?;
+            let count = records.len();
+            write_header(writer, opts, count)?;
+            for record in &records {
+                write_record(writer, record, opts.pretty)?;
+            }
+            count
+        }
+    };
+
+    writer.flush().map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!("Flush failed: {e}")))
+    })?;
+
+    Ok(count)
 }
 
 fn write_header<W: Write>(
