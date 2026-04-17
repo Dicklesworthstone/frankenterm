@@ -1669,6 +1669,19 @@ impl WeztermClient {
         Ok(())
     }
 
+    /// Cx-first [`kill_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
+    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// `wezterm cli kill-pane` subprocess honors caller cancellation,
+    /// budget, and virtual time.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn kill_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
+        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
+        Ok(())
+    }
+
     /// Zoom or unzoom a pane
     ///
     /// # Arguments
@@ -1681,6 +1694,28 @@ impl WeztermClient {
             args.push("--unzoom");
         }
         self.run_cli_with_pane_check(&args, pane_id).await?;
+        Ok(())
+    }
+
+    /// Cx-first [`zoom_pane`] (ft-xbnl0.2.3). Threads caller `&Cx`
+    /// through [`Self::run_cli_with_pane_check_with_cx`] so the
+    /// `wezterm cli zoom-pane` subprocess honors caller cancellation,
+    /// budget, and virtual time. The `--unzoom` arg selection logic is
+    /// identical to the legacy path.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn zoom_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        zoom: bool,
+    ) -> Result<()> {
+        let pane_id_str = pane_id.to_string();
+        let mut args = vec!["cli", "zoom-pane", "--pane-id", &pane_id_str];
+        if !zoom {
+            args.push("--unzoom");
+        }
+        self.run_cli_with_pane_check_with_cx(cx, &args, pane_id)
+            .await?;
         Ok(())
     }
 
@@ -3698,6 +3733,102 @@ mod tests {
                 }
                 other => {
                     panic!("expected Wezterm(SocketNotFound) from cx-first path, got {other:?}")
+                }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `kill_pane_with_cx` follows the same
+    /// short-circuit contract as `activate_pane_with_cx` — a missing
+    /// socket must surface as `SocketNotFound` via
+    /// `run_cli_with_pane_check_with_cx`, not as a subprocess error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn kill_pane_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick41-kill-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+
+            let cx = crate::cx::for_request();
+            let err = client
+                .kill_pane_with_cx(&cx, 7)
+                .await
+                .expect_err("missing socket should short-circuit");
+
+            match err {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!(
+                        "expected Wezterm(SocketNotFound) from kill_pane cx-first path, got {other:?}"
+                    )
+                }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `zoom_pane_with_cx` follows the same
+    /// short-circuit contract, and exercises both `zoom=true` and
+    /// `zoom=false` (the `--unzoom` branch) so a regression in arg
+    /// construction on the Cx path would be caught.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn zoom_pane_with_cx_short_circuits_on_missing_socket() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick41-zoom-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+            let client = WeztermClient::with_socket(bogus.to_string_lossy().into_owned());
+            let cx = crate::cx::for_request();
+
+            // Zoom path (no --unzoom arg).
+            let err_zoom = client
+                .zoom_pane_with_cx(&cx, 11, true)
+                .await
+                .expect_err("missing socket should short-circuit zoom");
+            match err_zoom {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!("expected Wezterm(SocketNotFound) on zoom=true path, got {other:?}")
+                }
+            }
+
+            // Unzoom path (appends --unzoom arg).
+            let err_unzoom = client
+                .zoom_pane_with_cx(&cx, 11, false)
+                .await
+                .expect_err("missing socket should short-circuit unzoom");
+            match err_unzoom {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!(
+                        "expected Wezterm(SocketNotFound) on zoom=false (unzoom) path, got {other:?}"
+                    )
                 }
             }
         });
