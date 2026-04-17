@@ -6670,6 +6670,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_saved_search`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn insert_saved_search_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: SavedSearchRecord,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_saved_search cancelled: {err}"))
+        })?;
+        self.insert_saved_search(record).await
+    }
+
     /// Update last-run metadata for a saved search.
     pub async fn update_saved_search_run(
         &self,
@@ -6693,6 +6706,23 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_run`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_saved_search_run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: &str,
+        last_run_at: i64,
+        last_result_count: Option<i64>,
+        last_error: Option<String>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("update_saved_search_run cancelled: {err}"))
+        })?;
+        self.update_saved_search_run(id, last_run_at, last_result_count, last_error)
+            .await
+    }
+
     /// Update scheduling settings for a saved search.
     pub async fn update_saved_search_schedule(
         &self,
@@ -6714,6 +6744,22 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_schedule`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_saved_search_schedule_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        id: &str,
+        enabled: bool,
+        schedule_interval_ms: Option<i64>,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("update_saved_search_schedule cancelled: {err}"))
+        })?;
+        self.update_saved_search_schedule(id, enabled, schedule_interval_ms)
+            .await
+    }
+
     /// Delete a saved search by name. Returns number of rows deleted.
     pub async fn delete_saved_search(&self, name: &str) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -6726,6 +6772,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`delete_saved_search`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn delete_saved_search_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        name: &str,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("delete_saved_search cancelled: {err}"))
+        })?;
+        self.delete_saved_search(name).await
     }
 
     /// Fetch a saved search by name.
@@ -6741,6 +6800,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_saved_search_by_name`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_saved_search_by_name_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        name: &str,
+    ) -> Result<Option<SavedSearchRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_saved_search_by_name cancelled: {err}"))
+        })?;
+        self.get_saved_search_by_name(name).await
+    }
+
     /// List saved searches in deterministic order.
     pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -6751,6 +6823,18 @@ impl StorageHandle {
             list_saved_searches_sync(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`list_saved_searches`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_saved_searches_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<SavedSearchRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_saved_searches cancelled: {err}"))
+        })?;
+        self.list_saved_searches().await
     }
 
     /// Insert a pane bookmark. Returns the row ID.
@@ -20794,6 +20878,114 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 137 saved-search cluster —
+/// 6 new storage cx-first siblings exercised end-to-end:
+/// `insert_saved_search_with_cx`, `update_saved_search_run_with_cx`,
+/// `update_saved_search_schedule_with_cx`,
+/// `delete_saved_search_with_cx`, `get_saved_search_by_name_with_cx`,
+/// `list_saved_searches_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick137_saved_search_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick137_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // 1. insert_saved_search_with_cx
+        let record = SavedSearchRecord {
+            id: "ss-tick137".to_string(),
+            name: "tick137-errors".to_string(),
+            query: "error OR panic".to_string(),
+            pane_id: None,
+            limit: 50,
+            since_mode: SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
+            since_ms: None,
+            schedule_interval_ms: None,
+            enabled: false,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+        storage
+            .insert_saved_search_with_cx(&cx, record)
+            .await
+            .unwrap();
+
+        // 2. get_saved_search_by_name_with_cx
+        let fetched = storage
+            .get_saved_search_by_name_with_cx(&cx, "tick137-errors")
+            .await
+            .unwrap()
+            .expect("saved search should exist");
+        assert_eq!(fetched.id, "ss-tick137");
+        assert_eq!(fetched.query, "error OR panic");
+
+        // 3. list_saved_searches_with_cx
+        let listed = storage.list_saved_searches_with_cx(&cx).await.unwrap();
+        assert!(
+            listed.iter().any(|s| s.id == "ss-tick137"),
+            "list_saved_searches_with_cx should include ss-tick137"
+        );
+
+        // 4. update_saved_search_run_with_cx
+        storage
+            .update_saved_search_run_with_cx(
+                &cx,
+                "ss-tick137",
+                1_700_000_001_000,
+                Some(12),
+                None,
+            )
+            .await
+            .unwrap();
+        let after_run = storage
+            .get_saved_search_by_name_with_cx(&cx, "tick137-errors")
+            .await
+            .unwrap()
+            .expect("saved search should still exist after run update");
+        assert_eq!(after_run.last_run_at, Some(1_700_000_001_000));
+        assert_eq!(after_run.last_result_count, Some(12));
+
+        // 5. update_saved_search_schedule_with_cx
+        storage
+            .update_saved_search_schedule_with_cx(&cx, "ss-tick137", true, Some(60_000))
+            .await
+            .unwrap();
+        let after_sched = storage
+            .get_saved_search_by_name_with_cx(&cx, "tick137-errors")
+            .await
+            .unwrap()
+            .expect("saved search should still exist after schedule update");
+        assert!(after_sched.enabled);
+        assert_eq!(after_sched.schedule_interval_ms, Some(60_000));
+
+        // 6. delete_saved_search_with_cx
+        let deleted = storage
+            .delete_saved_search_with_cx(&cx, "tick137-errors")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1, "delete_saved_search_with_cx should remove one row");
+        let after_delete = storage
+            .get_saved_search_by_name_with_cx(&cx, "tick137-errors")
+            .await
+            .unwrap();
+        assert!(
+            after_delete.is_none(),
+            "saved search should be gone after delete_saved_search_with_cx"
+        );
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
