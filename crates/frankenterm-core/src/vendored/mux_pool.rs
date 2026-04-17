@@ -294,6 +294,24 @@ impl MuxPool {
         self.pool.put(client).await;
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::return_client`].
+    ///
+    /// Routes through `ConnectionPool::put_with_cx` so a cancelled
+    /// caller interrupts the idle-pool mutex acquire rather than
+    /// waiting. Callers inside cx-aware execute paths (e.g.
+    /// `execute_with_recovery_with_cx`) should prefer this sibling
+    /// so release honors cancellation end-to-end.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn return_client_with_cx(&self, cx: &Cx, client: DirectMuxClient) {
+        tracing::trace!(
+            subsystem = "mux_pool",
+            event = "release",
+            explicit_cx = true,
+            "returned mux connection to pool (cx path)"
+        );
+        self.pool.put_with_cx(cx, client).await;
+    }
+
     async fn execute_with_recovery<T, Op>(
         &self,
         op_name: &'static str,
@@ -337,7 +355,7 @@ impl MuxPool {
             let result = op(&mut client).await;
             match result {
                 Ok(value) => {
-                    self.return_client(client).await;
+                    self.return_client_with_cx(cx, client).await;
                     if attempt > 1 {
                         self.recovery_successes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -788,6 +806,26 @@ impl MuxPool {
         evicted
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::evict_idle`].
+    ///
+    /// Routes through `ConnectionPool::evict_idle_with_cx` so
+    /// periodic-eviction tasks can be interrupted by a pool
+    /// shutdown-cancel without hanging on the idle mutex.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn evict_idle_with_cx(&self, cx: &Cx) -> usize {
+        let evicted = self.pool.evict_idle_with_cx(cx).await;
+        if evicted > 0 {
+            tracing::debug!(
+                subsystem = "mux_pool",
+                event = "evict_idle",
+                explicit_cx = true,
+                evicted,
+                "evicted idle mux connections (cx path)"
+            );
+        }
+        evicted
+    }
+
     /// Clear all idle connections from the pool.
     pub async fn clear(&self) {
         tracing::debug!(
@@ -798,10 +836,46 @@ impl MuxPool {
         self.pool.clear().await;
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::clear`].
+    ///
+    /// Routes through `ConnectionPool::clear_with_cx` so shutdown
+    /// paths that invoke a pool-wide flush can bail under a
+    /// cancelled parent cx instead of deadlocking on the idle
+    /// mutex (which itself cx-threads its acquire).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn clear_with_cx(&self, cx: &Cx) {
+        tracing::debug!(
+            subsystem = "mux_pool",
+            event = "clear",
+            explicit_cx = true,
+            "clearing all idle mux connections (cx path)"
+        );
+        self.pool.clear_with_cx(cx).await;
+    }
+
     /// Get pool statistics.
     pub async fn stats(&self) -> MuxPoolStats {
         MuxPoolStats {
             pool: self.pool.stats().await,
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_failed: self.connections_failed.load(Ordering::Relaxed),
+            health_checks: self.health_checks.load(Ordering::Relaxed),
+            health_check_failures: self.health_check_failures.load(Ordering::Relaxed),
+            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
+            recovery_successes: self.recovery_successes.load(Ordering::Relaxed),
+            permanent_failures: self.permanent_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::stats`].
+    ///
+    /// Routes through `ConnectionPool::stats_with_cx` so a
+    /// telemetry exporter running under a cancelled parent cx
+    /// doesn't stall waiting for the idle mutex snapshot.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn stats_with_cx(&self, cx: &Cx) -> MuxPoolStats {
+        MuxPoolStats {
+            pool: self.pool.stats_with_cx(cx).await,
             connections_created: self.connections_created.load(Ordering::Relaxed),
             connections_failed: self.connections_failed.load(Ordering::Relaxed),
             health_checks: self.health_checks.load(Ordering::Relaxed),
