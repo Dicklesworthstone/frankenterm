@@ -1381,6 +1381,25 @@ impl WeztermInterface for ShardedWeztermClient {
                 })
         })
     }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            backend
+                .handle
+                .activate_pane_with_cx(cx, route.local_pane_id)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "activate_pane", Some(pane_id), err)
+                })
+        })
+    }
 }
 
 fn circuit_state_rank(state: CircuitStateKind) -> u8 {

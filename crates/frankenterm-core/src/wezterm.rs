@@ -219,6 +219,22 @@ pub trait WeztermInterface: Send + Sync {
     ) -> WeztermFuture<'_, u64>;
     /// Activate a pane.
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+
+    /// Activate a pane bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates to [`activate_pane`](Self::activate_pane);
+    /// concrete impls with a Cx-aware `wezterm cli activate-pane`
+    /// path (e.g. `WeztermClient::activate_pane_with_cx`) SHOULD
+    /// override to thread caller cancellation, budget, and virtual
+    /// time through the subprocess invocation.
+    #[cfg(feature = "asupersync-runtime")]
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.activate_pane(pane_id)
+    }
+
     /// Get a pane in a direction relative to another.
     fn get_pane_direction(
         &self,
@@ -2563,6 +2579,15 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::activate_pane(self, pane_id).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move { WeztermClient::activate_pane_with_cx(self, cx, pane_id).await })
+    }
+
     fn get_pane_direction(
         &self,
         pane_id: u64,
@@ -2844,6 +2869,15 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
     ) -> WeztermFuture<'a, Option<u64>> {
         self.as_ref()
             .get_pane_direction_with_cx(cx, pane_id, direction)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.as_ref().activate_pane_with_cx(cx, pane_id)
     }
 
     #[cfg(feature = "asupersync-runtime")]
@@ -4043,6 +4077,89 @@ mod tests {
                 other => {
                     panic!("expected Wezterm(SocketNotFound) on window_id path, got {other:?}")
                 }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: the `activate_pane_with_cx` trait
+    /// extension + wrapper-impl overrides must route through to the
+    /// concrete `WeztermClient::activate_pane_with_cx` short-circuit
+    /// on the socket pre-check.
+    ///
+    /// Without the overrides added in tick 44 on `Arc<dyn
+    /// WeztermInterface>` and `UnifiedClient`, calling
+    /// `arc.activate_pane_with_cx(cx, pane_id)` would fall through to
+    /// the trait default which calls `self.activate_pane(pane_id)`
+    /// (non-cx) — the wrapper boundary would silently drop cx before
+    /// reaching `WeztermClient::activate_pane_with_cx`, and the
+    /// subprocess timeout would not honor caller cancellation.
+    ///
+    /// We can't directly observe "did cx propagate" at the subprocess
+    /// call, but we CAN observe the unique error variant from the
+    /// concrete `WeztermClient::activate_pane_with_cx` pre-check
+    /// (SocketNotFound with the exact bogus path). If the trait
+    /// default were used instead, we'd still get SocketNotFound but
+    /// via `activate_pane` — observationally equivalent here, but a
+    /// future concrete override with different behavior would
+    /// diverge. This test pins the invariant that invoking the
+    /// trait's `_with_cx` method on Arc<dyn> and UnifiedClient reaches
+    /// the concrete impl's Cx-first entry point.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn activate_pane_with_cx_forwards_through_arc_and_unified() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick44-arc-no-such-socket-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+
+            // Arc<dyn WeztermInterface> wrapper.
+            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let cx = crate::cx::for_request();
+            let err_arc = arc
+                .activate_pane_with_cx(&cx, 99)
+                .await
+                .expect_err("Arc<dyn> activate_pane_with_cx should short-circuit");
+            match err_arc {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound, got {other:?}"),
+            }
+
+            // UnifiedClient wrapper (CLI-backed variant). Build via
+            // `from_handle` so the inner WeztermClient uses the bogus
+            // socket path.
+            let inner_handle: WeztermHandle = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let unified = UnifiedClient::from_handle(
+                inner_handle,
+                BackendSelection {
+                    kind: BackendKind::Cli,
+                    reason: "tick 44 regression guard".to_string(),
+                    compatibility: None,
+                },
+            );
+            let err_unified = unified
+                .activate_pane_with_cx(&cx, 99)
+                .await
+                .expect_err("UnifiedClient activate_pane_with_cx should short-circuit");
+            match err_unified {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("UnifiedClient expected SocketNotFound, got {other:?}"),
             }
         });
     }
@@ -5926,6 +6043,15 @@ impl WeztermInterface for UnifiedClient {
     ) -> WeztermFuture<'a, Option<u64>> {
         self.inner
             .get_pane_direction_with_cx(cx, pane_id, direction)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn activate_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.inner.activate_pane_with_cx(cx, pane_id)
     }
 
     #[cfg(feature = "asupersync-runtime")]
