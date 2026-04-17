@@ -2725,6 +2725,156 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
     }
 }
 
+/// Cx-first `wait_for_codex_session_summary` (ft-xbnl0.2.3).
+///
+/// Mirrors the legacy function with three Cx-aware changes:
+///
+///   * Pre-flight `cx.checkpoint()` before the first poll. A
+///     caller-cancelled wait returns the pre-cancellation empty
+///     snapshot (`matched: false`, `polls: 0`, `elapsed_ms: 0`)
+///     without touching the source.
+///
+///   * Mid-loop `cx.checkpoint()` after each poll, before the
+///     exponential-backoff sleep.
+///
+///   * `sleep_with_cx(cx, duration)` bounds the between-poll
+///     backoff. Mid-sleep cancellation collapses to the
+///     timeout-shaped result (`matched: false`) for a stable
+///     surface — callers can distinguish cancelled from true
+///     timeout via the caller's own Cx state if needed.
+///
+/// The `PaneTextSource::get_text` call still uses ambient Cx
+/// (trait is not Cx-aware yet); the Cx-first wait here delivers
+/// meaningful cancellation for the between-poll sleep portion.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?Sized>(
+    cx: &crate::cx::Cx,
+    source: &S,
+    pane_id: u64,
+    timeout: Duration,
+    options: WaitOptions,
+) -> Result<CodexSummaryWaitResult> {
+    if cx.checkpoint().is_err() {
+        return Ok(CodexSummaryWaitResult {
+            matched: false,
+            elapsed_ms: 0,
+            polls: 0,
+            last_tail_hash: None,
+            last_markers: CodexSummaryMarkers {
+                token_usage: false,
+                resume_hint: false,
+            },
+        });
+    }
+
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut polls = 0usize;
+    let mut interval = options.poll_initial;
+
+    tracing::info!(
+        pane_id,
+        timeout_ms = ms_u64(timeout),
+        "codex_summary_wait_with_cx start"
+    );
+
+    loop {
+        polls += 1;
+        let text = source.get_text(pane_id, options.escapes).await?;
+        let tail = tail_text(&text, options.tail_lines);
+        let last_tail_hash = Some(stable_hash(tail.as_bytes()));
+
+        let last_markers = CodexSummaryMarkers {
+            token_usage: tail.contains("Token usage:"),
+            resume_hint: tail.contains("codex resume"),
+        };
+
+        if last_markers.complete() {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(
+                pane_id,
+                elapsed_ms,
+                polls,
+                "codex_summary_wait_with_cx matched"
+            );
+            return Ok(CodexSummaryWaitResult {
+                matched: true,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        let now = Instant::now();
+        if now >= deadline || polls >= options.max_polls {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(
+                pane_id,
+                elapsed_ms,
+                polls,
+                "codex_summary_wait_with_cx timeout"
+            );
+            return Ok(CodexSummaryWaitResult {
+                matched: false,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        if cx.checkpoint().is_err() {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(
+                pane_id,
+                elapsed_ms,
+                polls,
+                "codex_summary_wait_with_cx cancelled mid-loop"
+            );
+            return Ok(CodexSummaryWaitResult {
+                matched: false,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let sleep_duration = if interval > remaining {
+            remaining
+        } else {
+            interval
+        };
+        if !sleep_duration.is_zero()
+            && crate::runtime_compat::sleep_with_cx(cx, sleep_duration)
+                .await
+                .is_err()
+        {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(
+                pane_id,
+                elapsed_ms,
+                polls,
+                "codex_summary_wait_with_cx cancelled during sleep"
+            );
+            return Ok(CodexSummaryWaitResult {
+                matched: false,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        interval = interval.saturating_mul(2);
+        if interval > options.poll_max {
+            interval = options.poll_max;
+        }
+    }
+}
+
 pub(crate) fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
