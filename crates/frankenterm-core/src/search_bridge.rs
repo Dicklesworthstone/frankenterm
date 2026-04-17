@@ -128,6 +128,53 @@ impl BridgeCancellationToken {
         }
         self.state.notify.notified().await;
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`cancelled`].
+    ///
+    /// Returns `BridgeWaitOutcome::BridgeCancelled` when the bridge
+    /// cancellation is observed, or `BridgeWaitOutcome::CxCancelled`
+    /// when the caller's cx is cancelled first. This lets the
+    /// caller short-circuit the bridge-cancellation wait when an
+    /// outer cx is cancelled — useful for supervisor futures that
+    /// race the bridge token against a shutdown scope.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn cancelled_with_cx(&self, cx: &crate::cx::Cx) -> BridgeWaitOutcome {
+        if self.is_cancelled() {
+            return BridgeWaitOutcome::BridgeCancelled;
+        }
+        if cx.checkpoint().is_err() {
+            return BridgeWaitOutcome::CxCancelled;
+        }
+
+        // Race the bridge-notify wait against cx-aware polling.
+        // The cx-aware yield branch polls the cx at tick boundaries
+        // so a cancelled cx wakes this future without depending on
+        // the bridge's own notify path.
+        let notified = self.state.notify.notified();
+        let cx_wait = async {
+            loop {
+                if cx.checkpoint().is_err() {
+                    return;
+                }
+                asupersync::runtime::yield_now().await;
+            }
+        };
+
+        crate::runtime_compat::select! {
+            () = notified => BridgeWaitOutcome::BridgeCancelled,
+            () = cx_wait => BridgeWaitOutcome::CxCancelled,
+        }
+    }
+}
+
+/// Outcome of [`BridgeCancellationToken::cancelled_with_cx`].
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeWaitOutcome {
+    /// The bridge cancellation token was observed.
+    BridgeCancelled,
+    /// The caller's cx was cancelled before the bridge token.
+    CxCancelled,
 }
 
 /// Bridge result containing final results and two-tier metrics.
@@ -1395,6 +1442,41 @@ mod tests {
         );
         assert!(token.is_cancelled());
         log_test_event("test_bridge_cancellation_forward", "done", started_at, "ok");
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `cancelled_with_cx` returns
+    /// `BridgeCancelled` when the bridge token is cancelled
+    /// first (fast path via is_cancelled() check).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cancelled_with_cx_observes_bridge_cancel_fast_path() {
+        let token = BridgeCancellationToken::new();
+        token.cancel();
+        let cx = crate::cx::for_testing();
+
+        let outcome = run_async(token.cancelled_with_cx(&cx));
+        assert_eq!(outcome, BridgeWaitOutcome::BridgeCancelled);
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `cancelled_with_cx` returns
+    /// `CxCancelled` when the cx is pre-cancelled and the
+    /// bridge is NOT cancelled.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cancelled_with_cx_observes_cx_cancel_when_bridge_live() {
+        let token = BridgeCancellationToken::new();
+        let cx = crate::cx::for_testing();
+        cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel cx for bridge wait"),
+        );
+
+        let outcome = run_async(token.cancelled_with_cx(&cx));
+        assert_eq!(outcome, BridgeWaitOutcome::CxCancelled);
+        assert!(
+            !token.is_cancelled(),
+            "bridge token should still be live — cx-cancel must not signal the bridge"
+        );
     }
 
     #[test]
