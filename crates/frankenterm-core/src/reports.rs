@@ -298,7 +298,9 @@ pub async fn generate_session_report_with_cx(
         limit: opts.limit,
         ..Default::default()
     };
-    let events = storage.get_events(event_query).await?;
+    // ft-xbnl0.2.3 tick 122: route through cx-first storage
+    // siblings so caller cancellation propagates into storage.
+    let events = storage.get_events_with_cx(cx, event_query).await?;
 
     md.push_str("## Events\n\n");
     if events.is_empty() {
@@ -330,7 +332,7 @@ pub async fn generate_session_report_with_cx(
         ))
     })?;
 
-    let workflows = storage.export_workflows(query.clone()).await?;
+    let workflows = storage.export_workflows_with_cx(cx, query.clone()).await?;
 
     md.push_str("## Workflows\n\n");
     if workflows.is_empty() {
@@ -366,7 +368,7 @@ pub async fn generate_session_report_with_cx(
                 md.push_str(&format!("- **Error:** {err_text}\n"));
             }
 
-            if let Ok(steps) = storage.get_step_logs(&wf.id).await {
+            if let Ok(steps) = storage.get_step_logs_with_cx(cx, &wf.id).await {
                 if !steps.is_empty() {
                     md.push_str("\n**Steps:**\n\n");
                     md.push_str("| # | Step | Result | Duration |\n");
@@ -392,7 +394,7 @@ pub async fn generate_session_report_with_cx(
         ))
     })?;
 
-    let gaps = storage.export_gaps(query.clone()).await?;
+    let gaps = storage.export_gaps_with_cx(cx, query.clone()).await?;
 
     md.push_str("## Gaps\n\n");
     if gaps.is_empty() {
@@ -426,7 +428,7 @@ pub async fn generate_session_report_with_cx(
         limit: opts.limit,
         ..Default::default()
     };
-    let audits = storage.get_audit_actions(audit_query).await?;
+    let audits = storage.get_audit_actions_with_cx(cx, audit_query).await?;
     let denials: Vec<_> = audits
         .iter()
         .filter(|a| a.policy_decision != "allow")
