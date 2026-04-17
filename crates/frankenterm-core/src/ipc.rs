@@ -921,6 +921,173 @@ impl IpcServer {
         // Clean up socket file
         let _ = std::fs::remove_file(&self.socket_path);
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_context`].
+    ///
+    /// Threads the caller's cx into the accept loop:
+    /// - `shutdown_signal_pending_with_cx(&cx)` replaces the
+    ///   fresh-per-iteration cx with the caller's cx, so
+    ///   cancellation propagates into the shutdown-poll path.
+    /// - Socket-cleanup is always run (safety invariant) so a
+    ///   cancelled cx cannot leak the socket file.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn run_with_context_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        ctx: Arc<IpcHandlerContext>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) {
+        let mut connection_tasks = crate::runtime_compat::task::JoinSet::new();
+
+        loop {
+            if shutdown_signal_pending_with_cx(shutdown_rx, cx).await {
+                tracing::info!("IPC server shutting down (cx-first)");
+                break;
+            }
+
+            if cx.checkpoint().is_err() {
+                tracing::info!("IPC server shutting down on cx cancellation");
+                break;
+            }
+
+            match crate::runtime_compat::timeout(IPC_ACCEPT_POLL_INTERVAL, self.listener.accept())
+                .await
+            {
+                Ok(Ok((stream, _addr))) => {
+                    let ctx = ctx.clone();
+                    connection_tasks.spawn(async move {
+                        if let Err(e) = handle_client_with_context(stream, ctx).await {
+                            tracing::warn!(error = %e, "IPC client error");
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "Failed to accept IPC connection");
+                }
+                Err(_elapsed) => {}
+            }
+
+            while let Some(join_result) = connection_tasks.try_join_next() {
+                if let Err(join_err) = join_result {
+                    tracing::debug!(error = %join_err, "IPC client task failed");
+                }
+            }
+        }
+
+        connection_tasks.abort_all();
+        while let Some(join_result) = connection_tasks.join_next().await {
+            if let Err(join_err) = join_result {
+                tracing::debug!(error = %join_err, "IPC client task failed during shutdown");
+            }
+        }
+
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_auth_with_cx(cx, event_bus, None, shutdown_rx)
+            .await;
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_registry_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_registry_and_auth_with_cx(cx, event_bus, registry, None, shutdown_rx)
+            .await;
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_auth`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_auth_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth(event_bus, None, auth));
+        self.run_with_context_with_cx(cx, ctx, &mut shutdown_rx)
+            .await;
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry_and_auth`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_registry_and_auth_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth(
+            event_bus,
+            Some(registry),
+            auth,
+        ));
+        self.run_with_context_with_cx(cx, ctx, &mut shutdown_rx)
+            .await;
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry_auth_and_rpc`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_registry_auth_and_rpc_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        self.run_with_registry_auth_rpc_and_search_config_with_cx(
+            cx,
+            event_bus,
+            registry,
+            auth,
+            rpc_handler,
+            None,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of
+    /// [`run_with_registry_auth_rpc_and_search_config`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_registry_auth_rpc_and_search_config_with_cx(
+        self,
+        cx: &crate::cx::Cx,
+        event_bus: Arc<EventBus>,
+        registry: Arc<RwLock<PaneRegistry>>,
+        auth: Option<IpcAuth>,
+        rpc_handler: Option<IpcRpcHandler>,
+        search_config: Option<SearchConfig>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_and_search_config(
+            event_bus,
+            Some(registry),
+            auth,
+            rpc_handler,
+            search_config,
+        ));
+        self.run_with_context_with_cx(cx, ctx, &mut shutdown_rx)
+            .await;
+    }
 }
 
 #[cfg(unix)]
@@ -2136,6 +2303,43 @@ mod tests {
             drop(shutdown_tx);
 
             assert!(shutdown_signal_pending(&mut shutdown_rx).await);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `run_with_cx` must exit cleanly
+    /// when the shutdown channel fires. Verifies that the
+    /// cx-first run path reaches completion, removes the socket
+    /// file, and releases the bound path (a follow-up bind must
+    /// succeed).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn ipc_server_run_with_cx_exits_cleanly_on_shutdown() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("run-cx-test.sock");
+            let cx = crate::cx::for_testing();
+
+            let server = IpcServer::bind_with_cx(&cx, &socket_path)
+                .await
+                .expect("bind_with_cx");
+
+            let event_bus = Arc::new(EventBus::new(16));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let run_cx = cx.clone();
+            let handle = crate::runtime_compat::task::spawn(async move {
+                server.run_with_cx(&run_cx, event_bus, shutdown_rx).await;
+            });
+
+            // Let the accept loop start, then shut it down.
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(20)).await;
+            send_shutdown(&shutdown_tx).await;
+            let _ = handle.await;
+
+            assert!(
+                !socket_path.exists(),
+                "socket file should be removed after clean shutdown"
+            );
         });
     }
 
