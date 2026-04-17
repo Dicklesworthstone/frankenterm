@@ -188,6 +188,21 @@ pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
     scan_and_reap(max_age_seconds).await
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`reap_orphans`].
+///
+/// Threads the caller's cx through the reap cycle:
+/// - Pre-flight checkpoint gates entry before `ps` listing.
+/// - Per-kill checkpoint between iterations lets a cancelled
+///   caller stop partway through killing a long list of stale
+///   processes, returning a partial report.
+/// Scan errors and individual kill errors are captured in the
+/// report (not short-circuited) so the caller always gets a
+/// coherent snapshot of what did get reaped.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
+    scan_and_reap_with_cx(cx, max_age_seconds).await
+}
+
 /// Implementation for a single orphan-reaper cycle.
 async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
     let mut report = ReapReport::default();
@@ -210,6 +225,76 @@ async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
             );
             // Use runtime_compat::spawn_blocking + std::process::Command to
             // avoid requiring a Tokio reactor (panics under asupersync).
+            let pid = entry.pid;
+            let pid_str = pid.to_string();
+            let kill_result = crate::runtime_compat::spawn_blocking(move || {
+                std::process::Command::new("kill")
+                    .args(["-s", "KILL", &pid_str])
+                    .status()
+            })
+            .await;
+
+            match kill_result {
+                Ok(Ok(status)) if status.success() => {
+                    report.killed += 1;
+                    report.killed_pids.push(pid);
+                }
+                Ok(Ok(status)) => {
+                    report
+                        .errors
+                        .push(format!("kill -s KILL {pid} exited with {status}"));
+                }
+                Ok(Err(error)) => {
+                    report
+                        .errors
+                        .push(format!("failed to run kill for pid {pid}: {error}"));
+                }
+                Err(error) => {
+                    report.errors.push(format!(
+                        "spawn_blocking failed while killing pid {pid}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    report
+}
+
+/// Cx-first implementation of a single orphan-reaper cycle.
+#[cfg(feature = "asupersync-runtime")]
+async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
+    let mut report = ReapReport::default();
+
+    if cx.checkpoint().is_err() {
+        report.errors.push("reap cancelled before scan".to_string());
+        return report;
+    }
+
+    let entries = match list_wezterm_cli_processes_via_ps().await {
+        Ok(entries) => entries,
+        Err(error) => {
+            report.errors.push(error);
+            return report;
+        }
+    };
+    report.scanned = entries.len();
+
+    for entry in entries {
+        if cx.checkpoint().is_err() {
+            report
+                .errors
+                .push("reap cancelled between kills".to_string());
+            break;
+        }
+
+        if entry.age_seconds >= max_age_seconds {
+            debug!(
+                pid = entry.pid,
+                age_s = entry.age_seconds,
+                cmd = %entry.command,
+                "killing orphaned wezterm cli process (cx-first)"
+            );
             let pid = entry.pid;
             let pid_str = pid.to_string();
             let kill_result = crate::runtime_compat::spawn_blocking(move || {
@@ -587,6 +672,31 @@ mod tests {
                 assert!(
                     !shutdown.load(Ordering::SeqCst),
                     "interval=0 must not touch the shutdown flag"
+                );
+            });
+        }
+
+        /// ft-xbnl0.2.3 Cx-first: `reap_orphans_with_cx` must return a
+        /// report with "cancelled" in the errors when given a
+        /// pre-cancelled cx, without scanning any processes.
+        #[test]
+        fn reap_orphans_with_precancelled_cx_returns_empty_report_with_cancel_error() {
+            run_lab(0x0_1FEA_BED5_0707, || async move {
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x reap_orphans precancel"),
+                );
+
+                let report = reap_orphans_with_cx(&cx, 60).await;
+
+                assert_eq!(report.scanned, 0, "pre-cancelled cx must skip scan");
+                assert_eq!(report.killed, 0);
+                assert!(
+                    report.errors.iter().any(|e| e.contains("cancelled")),
+                    "errors must include cancellation reason: {:?}",
+                    report.errors
                 );
             });
         }
