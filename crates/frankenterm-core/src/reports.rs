@@ -227,6 +227,242 @@ pub async fn generate_session_report(
     Ok(md)
 }
 
+/// Cx-first [`generate_session_report`] (ft-xbnl0.2.3). Threads
+/// caller `&Cx` through the 5 storage reads via `cx.checkpoint()`
+/// seams between each section:
+///
+///   1. pre-flight before `get_events`.
+///   2. between events and workflows.
+///   3. between workflows and step-logs loop.
+///   4. between workflows and gaps.
+///   5. between gaps and audit denials.
+///
+/// A pre-cancelled cx returns `Err(Error::Runtime("cancelled"))`
+/// before any storage call. A mid-generation cancel returns with
+/// the failed stage named in the error message — operators can
+/// see how far the report got before cancellation. Partial output
+/// is discarded (the String is abandoned) because a partial
+/// Markdown report would be misleading.
+///
+/// Each section's storage query is the slow part; the Markdown
+/// formatting between them is CPU-only and doesn't need a
+/// checkpoint.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn generate_session_report_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    opts: &ReportOptions,
+) -> crate::Result<String> {
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!("generate_session_report cancelled: {err}"))
+    })?;
+
+    let redactor = if opts.redact {
+        Some(Redactor::new())
+    } else {
+        None
+    };
+
+    let mut md = String::new();
+
+    md.push_str("# Session Report\n\n");
+
+    if let Some(pane_id) = opts.pane_id {
+        md.push_str(&format!("**Pane:** {pane_id}\n"));
+    } else {
+        md.push_str("**Pane:** all\n");
+    }
+
+    if let Some(since) = opts.since {
+        md.push_str(&format!("**Since:** {}\n", format_ts(since)));
+    }
+    if let Some(until) = opts.until {
+        md.push_str(&format!("**Until:** {}\n", format_ts(until)));
+    }
+    if opts.redact {
+        md.push_str("**Redacted:** yes\n");
+    }
+    md.push('\n');
+
+    let query = ExportQuery {
+        pane_id: opts.pane_id,
+        since: opts.since,
+        until: opts.until,
+        limit: opts.limit,
+    };
+
+    let event_query = EventQuery {
+        pane_id: opts.pane_id,
+        since: opts.since,
+        until: opts.until,
+        limit: opts.limit,
+        ..Default::default()
+    };
+    let events = storage.get_events(event_query).await?;
+
+    md.push_str("## Events\n\n");
+    if events.is_empty() {
+        md.push_str("No events detected.\n\n");
+    } else {
+        md.push_str("| Severity | Type | Pane | Detected | Detail |\n");
+        md.push_str("|----------|------|------|----------|--------|\n");
+        for event in &events {
+            let detail = match (&event.matched_text, &redactor) {
+                (Some(text), Some(r)) => r.redact(text),
+                (Some(text), None) => truncate(text, 60),
+                (None, _) => "—".to_string(),
+            };
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                event.severity,
+                event.event_type,
+                event.pane_id,
+                format_ts(event.detected_at),
+                detail.replace('|', "\\|"),
+            ));
+        }
+        md.push('\n');
+    }
+
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!(
+            "generate_session_report cancelled before workflows section: {err}"
+        ))
+    })?;
+
+    let workflows = storage.export_workflows(query.clone()).await?;
+
+    md.push_str("## Workflows\n\n");
+    if workflows.is_empty() {
+        md.push_str("No workflow executions.\n\n");
+    } else {
+        for wf in &workflows {
+            let status_icon = match wf.status.as_str() {
+                "completed" => "✅",
+                "failed" | "aborted" => "❌",
+                "running" => "🔄",
+                _ => "⏳",
+            };
+            md.push_str(&format!(
+                "### {status_icon} {} (`{}`)\n\n",
+                wf.workflow_name, wf.id
+            ));
+            md.push_str(&format!("- **Status:** {}\n", wf.status));
+            md.push_str(&format!("- **Pane:** {}\n", wf.pane_id));
+            md.push_str(&format!("- **Started:** {}\n", format_ts(wf.started_at)));
+            if let Some(completed_at) = wf.completed_at {
+                md.push_str(&format!("- **Completed:** {}\n", format_ts(completed_at)));
+                let duration_ms = completed_at - wf.started_at;
+                md.push_str(&format!(
+                    "- **Duration:** {}\n",
+                    format_duration(duration_ms)
+                ));
+            }
+            if let Some(ref error) = wf.error {
+                let err_text = match &redactor {
+                    Some(r) => r.redact(error),
+                    None => error.clone(),
+                };
+                md.push_str(&format!("- **Error:** {err_text}\n"));
+            }
+
+            if let Ok(steps) = storage.get_step_logs(&wf.id).await {
+                if !steps.is_empty() {
+                    md.push_str("\n**Steps:**\n\n");
+                    md.push_str("| # | Step | Result | Duration |\n");
+                    md.push_str("|---|------|--------|----------|\n");
+                    for step in &steps {
+                        md.push_str(&format!(
+                            "| {} | {} | {} | {} |\n",
+                            step.step_index,
+                            step.step_name,
+                            step.result_type,
+                            format_duration(step.duration_ms),
+                        ));
+                    }
+                }
+            }
+            md.push('\n');
+        }
+    }
+
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!(
+            "generate_session_report cancelled before gaps section: {err}"
+        ))
+    })?;
+
+    let gaps = storage.export_gaps(query.clone()).await?;
+
+    md.push_str("## Gaps\n\n");
+    if gaps.is_empty() {
+        md.push_str("No output gaps detected.\n\n");
+    } else {
+        md.push_str("| Pane | Seq Range | Reason | Detected |\n");
+        md.push_str("|------|-----------|--------|----------|\n");
+        for gap in &gaps {
+            md.push_str(&format!(
+                "| {} | {}→{} | {} | {} |\n",
+                gap.pane_id,
+                gap.seq_before,
+                gap.seq_after,
+                gap.reason,
+                format_ts(gap.detected_at),
+            ));
+        }
+        md.push('\n');
+    }
+
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!(
+            "generate_session_report cancelled before audit section: {err}"
+        ))
+    })?;
+
+    let audit_query = AuditQuery {
+        pane_id: opts.pane_id,
+        since: opts.since,
+        until: opts.until,
+        limit: opts.limit,
+        ..Default::default()
+    };
+    let audits = storage.get_audit_actions(audit_query).await?;
+    let denials: Vec<_> = audits
+        .iter()
+        .filter(|a| a.policy_decision != "allow")
+        .collect();
+
+    if !denials.is_empty() {
+        md.push_str("## Policy Denials\n\n");
+        md.push_str("| Time | Actor | Action | Surface | Decision | Rule | Reason |\n");
+        md.push_str("|------|-------|--------|---------|----------|------|--------|\n");
+        for d in &denials {
+            let reason = match (&d.decision_reason, &redactor) {
+                (Some(r), Some(red)) => red.redact(r),
+                (Some(r), None) => truncate(r, 60),
+                (None, _) => "—".to_string(),
+            };
+            let surface = policy_surface_from_decision_context(d.decision_context.as_deref());
+            let rule = d.rule_id.as_deref().unwrap_or("—");
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                format_ts(d.ts),
+                d.actor_kind,
+                d.action_kind,
+                surface.replace('|', "\\|"),
+                d.policy_decision,
+                rule.replace('|', "\\|"),
+                reason.replace('|', "\\|"),
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str(&format!("---\n*Generated by ft v{}*\n", crate::VERSION));
+
+    Ok(md)
+}
+
 /// Format epoch-ms timestamp as a human-readable string.
 pub fn format_ts(epoch_ms: i64) -> String {
     // Simple UTC formatting without external deps
@@ -650,6 +886,45 @@ mod tests {
             assert!(report.contains(&format!("ft v{}", crate::VERSION)));
             // No Policy Denials section when there are none
             assert!(!report.contains("## Policy Denials"));
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `generate_session_report_with_cx`
+    /// must match `generate_session_report` for an uncancelled
+    /// cx on an empty DB. Both should produce identical Markdown
+    /// (same sections, same "No X detected" placeholder text,
+    /// same footer).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn report_empty_db_with_cx_matches_legacy() {
+        run_async_test(async {
+            let (storage, tmp) = test_db("empty_cx").await;
+
+            let opts = ReportOptions {
+                pane_id: None,
+                since: None,
+                until: None,
+                limit: None,
+                redact: false,
+            };
+
+            let cx = crate::cx::for_request();
+            let legacy = generate_session_report(&storage, &opts).await.unwrap();
+            let cx_first = generate_session_report_with_cx(&cx, &storage, &opts)
+                .await
+                .unwrap();
+
+            // The footer has a nanosecond-free static `ft v{VERSION}`
+            // line, and all section bodies are identical on an
+            // empty DB, so the reports must match exactly.
+            assert_eq!(legacy, cx_first);
+            assert!(cx_first.contains("# Session Report"));
+            assert!(cx_first.contains("No events detected."));
+            assert!(cx_first.contains("No workflow executions."));
+            assert!(cx_first.contains("No output gaps detected."));
 
             storage.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&tmp);
