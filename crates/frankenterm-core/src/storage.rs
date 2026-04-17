@@ -6271,6 +6271,23 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action`].
+    ///
+    /// Pre-flight checkpoint gates audit writes. Audit-trail
+    /// emitters are on a hot path (14+ call sites) — a cx-driven
+    /// caller bails before enqueuing the write if cancelled.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_audit_action_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        action: AuditActionRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_audit_action cancelled: {err}"))
+        })?;
+        self.record_audit_action(action).await
+    }
+
     /// Record an audit action after applying redaction
     pub async fn record_audit_action_redacted(&self, mut action: AuditActionRecord) -> Result<i64> {
         let redactor = Redactor::new();
@@ -7132,6 +7149,22 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_workflow`].
+    ///
+    /// Pre-flight checkpoint gates workflow state writes
+    /// (18+ call sites) — second most-called business mutation
+    /// after upsert_pane.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow: WorkflowRecord,
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("upsert_workflow cancelled: {err}")))?;
+        self.upsert_workflow(workflow).await
+    }
+
     /// Upsert a workflow action plan (canonical JSON + hash)
     pub async fn upsert_action_plan(
         &self,
@@ -7770,6 +7803,22 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions`].
+    ///
+    /// Pre-flight checkpoint gates the audit query before
+    /// spawn_blocking. 14+ call sites on the operator-facing
+    /// audit-history read path.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_audit_actions_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: AuditQuery,
+    ) -> Result<Vec<AuditActionRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_audit_actions cancelled: {err}")))?;
+        self.get_audit_actions(query).await
+    }
+
     /// Stream audit actions using a cursor and stable ordering.
     ///
     /// Records are ordered by monotonically increasing ID for deterministic paging.
@@ -7987,6 +8036,23 @@ impl StorageHandle {
             query_step_logs(&conn, &workflow_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_step_logs`].
+    ///
+    /// Pre-flight checkpoint gates the step-log query before
+    /// spawn_blocking. 16+ call sites on the workflow
+    /// observability read path (diagnostic bundles, CLI step
+    /// history, etc.).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_step_logs_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowStepLogRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_step_logs cancelled: {err}")))?;
+        self.get_step_logs(workflow_id).await
     }
 
     /// Get the latest step log for a workflow (highest step_index).
@@ -19785,6 +19851,107 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 116 hot-path batch smoke test —
+/// `upsert_workflow_with_cx`, `record_audit_action_with_cx`,
+/// `get_audit_actions_with_cx`, and `get_step_logs_with_cx`
+/// must each round-trip cleanly with a fresh cx.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick116_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick116_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed a pane for FK constraints.
+        let pane = PaneRecord {
+            pane_id: 42,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick116".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // 1. upsert_workflow_with_cx
+        let workflow = WorkflowRecord {
+            id: "wf-tick116".to_string(),
+            workflow_name: "demo".to_string(),
+            pane_id: 42,
+            trigger_event_id: None,
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context: None,
+            result: None,
+            error: None,
+            started_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+            completed_at: None,
+        };
+        storage
+            .upsert_workflow_with_cx(&cx, workflow)
+            .await
+            .unwrap();
+
+        // 2. record_audit_action_with_cx
+        let action = AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "human".to_string(),
+            actor_id: Some("tick116".to_string()),
+            correlation_id: None,
+            pane_id: Some(42),
+            domain: None,
+            action_kind: "test_action".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        let audit_id = storage
+            .record_audit_action_with_cx(&cx, action)
+            .await
+            .unwrap();
+        assert!(audit_id > 0);
+
+        // 3. get_audit_actions_with_cx
+        let audits = storage
+            .get_audit_actions_with_cx(&cx, AuditQuery::default())
+            .await
+            .unwrap();
+        assert!(
+            audits.iter().any(|a| a.id == audit_id),
+            "audit action should be queryable via cx-first path"
+        );
+
+        // 4. get_step_logs_with_cx (empty result is fine — just exercise the path)
+        let steps = storage
+            .get_step_logs_with_cx(&cx, "wf-tick116")
+            .await
+            .unwrap();
+        assert!(steps.is_empty(), "fresh workflow has no step logs");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
