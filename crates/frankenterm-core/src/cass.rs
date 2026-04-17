@@ -732,20 +732,36 @@ impl CassClient {
         path: &Path,
         agent: Option<CassAgent>,
     ) -> Result<Vec<CassSession>, CassError> {
-        let mut args = vec![
-            "search".to_string(),
-            "--path".to_string(),
-            path.to_string_lossy().to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ];
-
-        if let Some(agent) = agent {
-            args.push("--agent".to_string());
-            args.push(agent.as_str().to_string());
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            return self.search_sessions_with_cx(&cx, path, agent).await;
         }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = build_search_sessions_args(path, agent);
+            let output = self.run(&args).await?;
+            let sessions = parse_sessions(&output, self.max_error_bytes)?;
+            if sessions.is_empty() {
+                return Err(CassError::NoResults {
+                    query: format!("path={}", path.display()),
+                });
+            }
+            Ok(sessions)
+        }
+    }
 
-        let output = self.run(&args).await?;
+    /// Search sessions under a given path + agent under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_sessions_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        path: &Path,
+        agent: Option<CassAgent>,
+    ) -> Result<Vec<CassSession>, CassError> {
+        let args = build_search_sessions_args(path, agent);
+        let output = self.run_with_cx(cx, &args).await?;
         let sessions = parse_sessions(&output, self.max_error_bytes)?;
         if sessions.is_empty() {
             return Err(CassError::NoResults {
@@ -757,15 +773,35 @@ impl CassClient {
 
     /// Query a specific session by session id.
     pub async fn query_session(&self, session_id: &str) -> Result<CassSession, CassError> {
-        let args = vec![
-            "query".to_string(),
-            "--session-id".to_string(),
-            session_id.to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ];
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            return self.query_session_with_cx(&cx, session_id).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = build_query_session_args(session_id);
+            let output = self.run(&args).await?;
+            let mut sessions = parse_sessions(&output, self.max_error_bytes)?;
+            if let Some(session) = sessions.pop() {
+                return Ok(session);
+            }
+            Err(CassError::NoResults {
+                query: format!("session_id={session_id}"),
+            })
+        }
+    }
 
-        let output = self.run(&args).await?;
+    /// Query a specific session by session id under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn query_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: &str,
+    ) -> Result<CassSession, CassError> {
+        let args = build_query_session_args(session_id);
+        let output = self.run_with_cx(cx, &args).await?;
         let mut sessions = parse_sessions(&output, self.max_error_bytes)?;
         if let Some(session) = sessions.pop() {
             return Ok(session);
@@ -782,27 +818,57 @@ impl CassClient {
         line_number: usize,
         options: &ViewOptions,
     ) -> Result<CassViewResult, CassError> {
-        let mut args = vec![
-            "view".to_string(),
-            session_path.to_string_lossy().to_string(),
-            "-n".to_string(),
-            line_number.to_string(),
-            "--json".to_string(),
-        ];
-
-        if let Some(context) = options.context_lines {
-            args.push("-C".to_string());
-            args.push(context.to_string());
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            return self
+                .query_with_cx(&cx, session_path, line_number, options)
+                .await;
         }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = build_query_args(session_path, line_number, options);
+            let output = self.run(&args).await?;
+            parse_json(&output, self.max_error_bytes)
+        }
+    }
 
-        let output = self.run(&args).await?;
+    /// Query a specific session via `cass view` under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn query_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_path: &Path,
+        line_number: usize,
+        options: &ViewOptions,
+    ) -> Result<CassViewResult, CassError> {
+        let args = build_query_args(session_path, line_number, options);
+        let output = self.run_with_cx(cx, &args).await?;
         parse_json(&output, self.max_error_bytes)
     }
 
     /// Check cass health via `cass status`.
     pub async fn status(&self) -> Result<CassStatus, CassError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            return self.status_with_cx(&cx).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = vec!["status".to_string(), "--json".to_string()];
+            let output = self.run(&args).await?;
+            parse_json(&output, self.max_error_bytes)
+        }
+    }
+
+    /// Check cass health via `cass status` under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn status_with_cx(&self, cx: &crate::cx::Cx) -> Result<CassStatus, CassError> {
         let args = vec!["status".to_string(), "--json".to_string()];
-        let output = self.run(&args).await?;
+        let output = self.run_with_cx(cx, &args).await?;
         parse_json(&output, self.max_error_bytes)
     }
 
@@ -817,38 +883,48 @@ impl CassClient {
         &self,
         workspace: Option<&str>,
     ) -> Result<CassIndexResult, CassError> {
-        let mut args = vec!["index".to_string(), "--json".to_string()];
-        if let Some(ws) = workspace {
-            args.push("--path".to_string());
-            args.push(ws.to_string());
-        }
-        let output = self.run(&args).await?;
-        parse_json(&output, self.max_error_bytes)
-    }
-
-    async fn run(&self, args: &[String]) -> Result<String, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_request();
-            return self.run_with_cx(&cx, args).await;
+            return self.trigger_index_with_cx(&cx, workspace).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            let mut cmd = Command::new(&self.binary);
-            cmd.args(args);
-            cmd.kill_on_drop(true);
-
-            let output = match timeout(self.timeout, cmd.output()).await {
-                Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-                Err(_) => {
-                    return Err(CassError::Timeout {
-                        timeout_secs: self.timeout.as_secs(),
-                    });
-                }
-            };
-
-            self.finalize_output(output)
+            let args = build_trigger_index_args(workspace);
+            let output = self.run(&args).await?;
+            parse_json(&output, self.max_error_bytes)
         }
+    }
+
+    /// Trigger a cass index refresh under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn trigger_index_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workspace: Option<&str>,
+    ) -> Result<CassIndexResult, CassError> {
+        let args = build_trigger_index_args(workspace);
+        let output = self.run_with_cx(cx, &args).await?;
+        parse_json(&output, self.max_error_bytes)
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run(&self, args: &[String]) -> Result<String, CassError> {
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+
+        let output = match timeout(self.timeout, cmd.output()).await {
+            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
+            Err(_) => {
+                return Err(CassError::Timeout {
+                    timeout_secs: self.timeout.as_secs(),
+                });
+            }
+        };
+
+        self.finalize_output(output)
     }
 
     /// Cx-first subprocess execution (ft-xbnl0.2.3). The subprocess
@@ -945,6 +1021,67 @@ fn build_search_args(query: &str, options: &SearchOptions) -> Vec<String> {
         args.push(max_tokens.to_string());
     }
 
+    args
+}
+
+/// Build cass search-by-path args. Extracted so `search_sessions` and
+/// `search_sessions_with_cx` share the argv construction bit-for-bit.
+fn build_search_sessions_args(path: &Path, agent: Option<CassAgent>) -> Vec<String> {
+    let mut args = vec![
+        "search".to_string(),
+        "--path".to_string(),
+        path.to_string_lossy().to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+
+    if let Some(agent) = agent {
+        args.push("--agent".to_string());
+        args.push(agent.as_str().to_string());
+    }
+
+    args
+}
+
+/// Build cass query-by-session-id args. Extracted so `query_session` and
+/// `query_session_with_cx` share the argv construction bit-for-bit.
+fn build_query_session_args(session_id: &str) -> Vec<String> {
+    vec![
+        "query".to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]
+}
+
+/// Build cass view args. Extracted so `query` and `query_with_cx` share
+/// the argv construction bit-for-bit.
+fn build_query_args(session_path: &Path, line_number: usize, options: &ViewOptions) -> Vec<String> {
+    let mut args = vec![
+        "view".to_string(),
+        session_path.to_string_lossy().to_string(),
+        "-n".to_string(),
+        line_number.to_string(),
+        "--json".to_string(),
+    ];
+
+    if let Some(context) = options.context_lines {
+        args.push("-C".to_string());
+        args.push(context.to_string());
+    }
+
+    args
+}
+
+/// Build cass index-refresh args. Extracted so `trigger_index` and
+/// `trigger_index_with_cx` share the argv construction bit-for-bit.
+fn build_trigger_index_args(workspace: Option<&str>) -> Vec<String> {
+    let mut args = vec!["index".to_string(), "--json".to_string()];
+    if let Some(ws) = workspace {
+        args.push("--path".to_string());
+        args.push(ws.to_string());
+    }
     args
 }
 
@@ -1955,6 +2092,93 @@ mod tests {
                 "--robot".to_string(),
                 "--limit".to_string(),
                 "50".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_search_sessions_args_without_agent() {
+        let args = build_search_sessions_args(Path::new("/tmp/workspace"), None);
+        assert_eq!(
+            args,
+            vec![
+                "search".to_string(),
+                "--path".to_string(),
+                "/tmp/workspace".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_search_sessions_args_with_agent() {
+        let args = build_search_sessions_args(Path::new("/ws"), Some(CassAgent::Codex));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("codex"),
+            "last arg must be the codex agent slug"
+        );
+        assert!(args.iter().any(|a| a == "--agent"));
+        assert!(args.iter().any(|a| a == "--path"));
+    }
+
+    #[test]
+    fn build_query_session_args_shape() {
+        let args = build_query_session_args("session-abc-123");
+        assert_eq!(
+            args,
+            vec![
+                "query".to_string(),
+                "--session-id".to_string(),
+                "session-abc-123".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_query_args_minimal() {
+        let opts = ViewOptions::default();
+        let args = build_query_args(Path::new("/tmp/s.jsonl"), 42, &opts);
+        assert_eq!(
+            args,
+            vec![
+                "view".to_string(),
+                "/tmp/s.jsonl".to_string(),
+                "-n".to_string(),
+                "42".to_string(),
+                "--json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_query_args_with_context() {
+        let opts = ViewOptions {
+            context_lines: Some(3),
+        };
+        let args = build_query_args(Path::new("/tmp/s.jsonl"), 10, &opts);
+        assert!(args.ends_with(&["-C".to_string(), "3".to_string()]));
+    }
+
+    #[test]
+    fn build_trigger_index_args_without_workspace() {
+        let args = build_trigger_index_args(None);
+        assert_eq!(args, vec!["index".to_string(), "--json".to_string()]);
+    }
+
+    #[test]
+    fn build_trigger_index_args_with_workspace() {
+        let args = build_trigger_index_args(Some("/custom/path"));
+        assert_eq!(
+            args,
+            vec![
+                "index".to_string(),
+                "--json".to_string(),
+                "--path".to_string(),
+                "/custom/path".to_string(),
             ]
         );
     }
