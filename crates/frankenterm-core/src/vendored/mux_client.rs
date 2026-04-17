@@ -771,6 +771,211 @@ impl DirectMuxClient {
         }
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    async fn expect_unit_response_with_cx(
+        &mut self,
+        cx: &Cx,
+        request: Pdu,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        match self.send_request_with_cx(cx, request).await? {
+            Pdu::UnitResponse(payload) => Ok(payload),
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "UnitResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`create_floating_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn create_floating_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        tab_id: usize,
+        pane_id: u64,
+        rect: FloatingPaneRect,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::CreateFloatingPane(CreateFloatingPane {
+                tab_id,
+                pane_id: pane_id as usize,
+                rect,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`move_floating_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn move_floating_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        rect: FloatingPaneRect,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::MoveFloatingPane(MoveFloatingPane {
+                pane_id: pane_id as usize,
+                rect,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`set_floating_pane_z`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_floating_pane_z_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        z_order: u32,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+                pane_id: pane_id as usize,
+                z_order,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`toggle_floating_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn toggle_floating_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        visible: bool,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::ToggleFloatingPane(ToggleFloatingPane {
+                pane_id: pane_id as usize,
+                visible,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`remove_floating_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn remove_floating_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::RemoveFloatingPane(RemoveFloatingPane {
+                pane_id: pane_id as usize,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`swap_to_layout`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn swap_to_layout_with_cx(
+        &mut self,
+        cx: &Cx,
+        tab_id: usize,
+        layout_index: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::SwapToLayout(SwapToLayout {
+                tab_id,
+                layout_index,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`set_layout_cycle`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_layout_cycle_with_cx(
+        &mut self,
+        cx: &Cx,
+        tab_id: usize,
+        layout_names: Vec<String>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::SetLayoutCycle(SetLayoutCycle {
+                tab_id,
+                layout_names,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`cycle_stack`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn cycle_stack_with_cx(
+        &mut self,
+        cx: &Cx,
+        tab_id: usize,
+        slot_index: usize,
+        forward: bool,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::CycleStack(CycleStack {
+                tab_id,
+                slot_index,
+                forward,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`select_stack_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn select_stack_pane_with_cx(
+        &mut self,
+        cx: &Cx,
+        tab_id: usize,
+        slot_index: usize,
+        pane_index: usize,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::SelectStackPane(SelectStackPane {
+                tab_id,
+                slot_index,
+                pane_index,
+            }),
+        )
+        .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_pane_constraints`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn update_pane_constraints_with_cx(
+        &mut self,
+        cx: &Cx,
+        pane_id: u64,
+        min_width: Option<usize>,
+        max_width: Option<usize>,
+        min_height: Option<usize>,
+        max_height: Option<usize>,
+    ) -> Result<UnitResponse, DirectMuxError> {
+        self.expect_unit_response_with_cx(
+            cx,
+            Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                pane_id: pane_id as usize,
+                min_width,
+                max_width,
+                min_height,
+                max_height,
+            }),
+        )
+        .await
+    }
+
     async fn verify_codec_version(&mut self) -> Result<GetCodecVersionResponse, DirectMuxError> {
         let response = self
             .send_request(Pdu::GetCodecVersion(GetCodecVersion {}))
@@ -2588,6 +2793,95 @@ mod tests {
             assert_eq!(saw_write.1, b"hello".to_vec());
             assert_eq!(saw_paste.0, 78);
             assert_eq!(saw_paste.1, "paste me");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: verify `create_floating_pane_with_cx`
+    /// (and by extension the `expect_unit_response_with_cx`
+    /// helper + the 9 sibling pane/layout ops that share it)
+    /// roundtrips through the mux codec correctly when given a
+    /// fresh, uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn create_floating_pane_with_cx_roundtrip() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("create-floating-pane-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut saw_create: Option<(usize, usize, FloatingPaneRect)> = None;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        let response = match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                    codec_vers: CODEC_VERSION,
+                                    version_string: "wezterm-test".to_string(),
+                                    executable_path: PathBuf::from("/bin/wezterm"),
+                                    config_file_path: None,
+                                })
+                            }
+                            Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
+                            Pdu::CreateFloatingPane(req) => {
+                                saw_create = Some((req.tab_id, req.pane_id, req.rect));
+                                Pdu::UnitResponse(UnitResponse {})
+                            }
+                            _ => continue,
+                        };
+                        let mut out = Vec::new();
+                        response
+                            .encode(&mut out, decoded.serial)
+                            .expect("encode response");
+                        stream.write_all(&out).await.expect("write response");
+
+                        if saw_create.is_some() {
+                            break;
+                        }
+                    }
+                    if saw_create.is_some() {
+                        break;
+                    }
+                }
+
+                saw_create.expect("saw create_floating_pane request")
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let rect = FloatingPaneRect {
+                left: 10,
+                top: 20,
+                width: 40,
+                height: 15,
+            };
+            client
+                .create_floating_pane_with_cx(&cx, 3, 99, rect)
+                .await
+                .expect("create_floating_pane_with_cx");
+
+            drop(client);
+            let (tab_id, pane_id, seen_rect) = server.await.expect("server task");
+            assert_eq!(tab_id, 3);
+            assert_eq!(pane_id, 99);
+            assert_eq!(seen_rect, rect);
         });
     }
 
