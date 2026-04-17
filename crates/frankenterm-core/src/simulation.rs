@@ -674,9 +674,59 @@ impl Scenario {
         Ok(count)
     }
 
+    /// Cx-first [`Self::execute_until`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the event injection loop via
+    /// `cx.checkpoint()` before each mock.inject call. A
+    /// pre-cancelled cx returns `Ok(0)` immediately; a
+    /// mid-iteration cancel returns an `Err` via Error::Runtime
+    /// with the event index embedded so the caller knows how far
+    /// the scenario progressed before cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_until_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mock: &MockWezterm,
+        elapsed: Duration,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "simulation.execute_until cancelled pre-start: {err}"
+            ))
+        })?;
+
+        let mut count = 0;
+        for (index, event) in self.events.iter().enumerate() {
+            if event.at > elapsed {
+                break;
+            }
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "simulation.execute_until cancelled at event index {index}: {err}"
+                ))
+            })?;
+            let mock_event = Self::to_mock_event(event)?;
+            mock.inject(event.pane, mock_event).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Execute all events in the scenario.
     pub async fn execute_all(&self, mock: &MockWezterm) -> Result<usize> {
         self.execute_until(mock, self.duration).await
+    }
+
+    /// Cx-first [`Self::execute_all`] (ft-xbnl0.2.3). Delegates
+    /// to [`Self::execute_until_with_cx`] with the scenario's
+    /// full duration, mirroring the legacy `execute_all` →
+    /// `execute_until` delegation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_all_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mock: &MockWezterm,
+    ) -> Result<usize> {
+        self.execute_until_with_cx(cx, mock, self.duration).await
     }
 
     /// Execute events up to `elapsed` and capture stage-level resize timeline probes.
@@ -1717,6 +1767,43 @@ events:
             let text = mock.get_text(0, false).await.unwrap();
             assert!(text.contains("hello world"));
             assert!(text.contains("done"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `execute_all_with_cx` must match
+    /// the legacy `execute_all` — same event count, same pane
+    /// text output (proving the injection went through cleanly
+    /// under the Cx-first path).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn execute_all_with_cx_matches_legacy() {
+        run_async_test(async {
+            let scenario = Scenario::from_yaml(BASIC_SCENARIO).unwrap();
+            let mock_legacy = MockWezterm::new();
+            scenario.setup(&mock_legacy).await.unwrap();
+
+            let mock_cx = MockWezterm::new();
+            scenario.setup(&mock_cx).await.unwrap();
+
+            let cx = crate::cx::for_request();
+
+            let count_legacy = scenario.execute_all(&mock_legacy).await.unwrap();
+            let count_cx = scenario.execute_all_with_cx(&cx, &mock_cx).await.unwrap();
+
+            assert_eq!(
+                count_legacy, count_cx,
+                "execute_all_with_cx must inject same event count as legacy"
+            );
+            assert_eq!(count_cx, 2);
+
+            let text_legacy = mock_legacy.get_text(0, false).await.unwrap();
+            let text_cx = mock_cx.get_text(0, false).await.unwrap();
+            assert_eq!(
+                text_legacy, text_cx,
+                "Cx-first and legacy must produce identical injected pane text"
+            );
+            assert!(text_cx.contains("hello world"));
+            assert!(text_cx.contains("done"));
         });
     }
 
