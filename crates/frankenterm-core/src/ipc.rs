@@ -1734,6 +1734,71 @@ impl IpcClient {
     ) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
     }
+
+    // ft-xbnl0.2.3 Cx-first: non-unix stubs so the Cx-first
+    // API surface is available on all platforms for
+    // cross-platform call sites. Each always returns
+    // `unsupported()` just like the legacy counterparts.
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_user_var_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
+        _name: String,
+        _value: String,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn ping_with_cx(&self, _cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn status_with_cx(&self, _cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn pane_state_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_pane_priority_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
+        _priority: u32,
+        _ttl_ms: Option<u64>,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn clear_pane_priority_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _pane_id: u64,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn call_rpc_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        _args: Vec<String>,
+        _request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        Err(Self::unsupported())
+    }
 }
 
 #[cfg(all(test, unix))]
