@@ -170,6 +170,26 @@ pub async fn build_explain_context(
     })
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`build_explain_context`].
+///
+/// Pre-flight checkpoint gates the context-build before any
+/// storage queries fire. Delegates to [`build_explain_context`]
+/// for the actual work so the legacy path remains authoritative.
+/// Used by `ft search --explain` on the CLI — a single pre-flight
+/// checkpoint is sufficient because the operation is read-only
+/// and completes quickly on typical DBs.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn build_explain_context_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    query: &str,
+    pane_filter: Option<u64>,
+) -> crate::Result<SearchExplainContext> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("build_explain_context cancelled: {err}")))?;
+    build_explain_context(storage, query, pane_filter).await
+}
+
 /// Analyze the search context and produce a ranked explanation.
 pub fn explain_search(ctx: &SearchExplainContext) -> SearchExplainResult {
     let mut reasons = Vec::new();
@@ -2002,5 +2022,60 @@ mod tests {
         let result = explain_search(&ctx);
         assert!(result.reasons.iter().any(|r| r.code == "PANE_NOT_FOUND"));
         assert_eq!(result.total_panes, 0);
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `build_explain_context_with_cx`
+    /// must produce a context equivalent to
+    /// `build_explain_context` on an empty DB (same pane count,
+    /// same indexing stats, same gaps, same retention cleanup).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn build_explain_context_with_cx_matches_legacy() {
+        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let tmp = std::env::temp_dir().join(format!(
+                    "wa_test_search_explain_cx_{}.db",
+                    std::process::id()
+                ));
+                let db_path = tmp.to_string_lossy().to_string();
+                let storage = crate::storage::StorageHandle::new(&db_path).await.unwrap();
+
+                let legacy = build_explain_context(&storage, "hello world", None)
+                    .await
+                    .unwrap();
+
+                let cx = crate::cx::for_request();
+                let cx_first = build_explain_context_with_cx(&cx, &storage, "hello world", None)
+                    .await
+                    .unwrap();
+
+                assert_eq!(legacy.query, cx_first.query);
+                assert_eq!(legacy.pane_filter, cx_first.pane_filter);
+                assert_eq!(legacy.panes.len(), cx_first.panes.len());
+                assert_eq!(legacy.indexing_stats.len(), cx_first.indexing_stats.len());
+                assert_eq!(legacy.gaps.len(), cx_first.gaps.len());
+                assert_eq!(
+                    legacy.retention_cleanup_count,
+                    cx_first.retention_cleanup_count
+                );
+                assert_eq!(legacy.earliest_segment_at, cx_first.earliest_segment_at);
+                assert_eq!(legacy.latest_segment_at, cx_first.latest_segment_at);
+
+                storage.shutdown().await.unwrap();
+                let _ = std::fs::remove_file(&tmp);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
