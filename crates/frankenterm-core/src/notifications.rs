@@ -228,6 +228,38 @@ where
         drop(guard);
         self.inner.send(payload)
     }
+
+    /// ft-xbnl0.2.3: Cx-first send forwards through the wrapped
+    /// sender's `send_with_cx`. Without this override the trait
+    /// default would delegate to our `send()` which loses cx at the
+    /// wrapper boundary.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        payload: &'a NotificationPayload,
+    ) -> NotificationFuture<'a> {
+        let now = Instant::now();
+        let mut guard = self.last_sent.lock().unwrap_or_else(|e| e.into_inner());
+        let within_window = guard
+            .as_ref()
+            .is_some_and(|last| now.duration_since(*last) < self.min_interval);
+
+        if within_window {
+            let delivery = NotificationDelivery {
+                sender: self.name().to_string(),
+                success: false,
+                rate_limited: true,
+                error: Some("rate_limited".to_string()),
+                records: Vec::new(),
+            };
+            return Box::pin(async move { delivery });
+        }
+
+        *guard = Some(now);
+        drop(guard);
+        self.inner.send_with_cx(cx, payload)
+    }
 }
 
 /// Outcome of attempting to notify about a detection.
