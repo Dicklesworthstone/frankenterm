@@ -9554,6 +9554,24 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`create_reservation`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn create_reservation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        owner_kind: &str,
+        owner_id: &str,
+        reason: Option<&str>,
+        ttl_ms: i64,
+    ) -> Result<PaneReservation> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("create_reservation cancelled: {err}"))
+        })?;
+        self.create_reservation(pane_id, owner_kind, owner_id, reason, ttl_ms)
+            .await
+    }
+
     /// Release a pane reservation by ID.
     ///
     /// Returns true if released, false if not found or already released.
@@ -9568,6 +9586,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`release_reservation`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn release_reservation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        reservation_id: i64,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("release_reservation cancelled: {err}"))
+        })?;
+        self.release_reservation(reservation_id).await
     }
 
     /// Get the active reservation for a pane (read-only).
@@ -9888,6 +9919,18 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn expire_stale_reservations_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("expire_stale_reservations cancelled: {err}"))
+        })?;
+        self.expire_stale_reservations().await
     }
 
     /// Shutdown the storage handle
@@ -21383,6 +21426,81 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 145 reservation cluster —
+/// 3 new storage cx-first siblings exercised end-to-end:
+/// `create_reservation_with_cx`, `release_reservation_with_cx`,
+/// `expire_stale_reservations_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick145_reservation_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick145_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed a pane for FK.
+        let pane = PaneRecord {
+            pane_id: 31,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick145".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // 1. create_reservation_with_cx — 60s TTL, well above the 1s floor.
+        let reservation = storage
+            .create_reservation_with_cx(
+                &cx,
+                31,
+                "agent",
+                "owner-tick145",
+                Some("running tick145"),
+                60_000,
+            )
+            .await
+            .unwrap();
+        assert!(reservation.id > 0);
+        assert_eq!(reservation.pane_id, 31);
+
+        // 2. expire_stale_reservations_with_cx — our reservation is fresh,
+        //    so the call should return 0 but still roundtrip.
+        let expired = storage.expire_stale_reservations_with_cx(&cx).await.unwrap();
+        assert_eq!(expired, 0, "fresh reservation should not be expired");
+
+        // 3. release_reservation_with_cx — first call removes the row,
+        //    second call returns false.
+        let released = storage
+            .release_reservation_with_cx(&cx, reservation.id)
+            .await
+            .unwrap();
+        assert!(released);
+        let second = storage
+            .release_reservation_with_cx(&cx, reservation.id)
+            .await
+            .unwrap();
+        assert!(
+            !second,
+            "second release should return false (reservation already gone)"
+        );
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
