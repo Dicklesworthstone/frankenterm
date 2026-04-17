@@ -7362,6 +7362,30 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_approval_token_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        code_hash: &str,
+        workspace_id: &str,
+        action_kind: &str,
+        pane_id: Option<u64>,
+        action_fingerprint: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("consume_approval_token cancelled: {err}"))
+        })?;
+        self.consume_approval_token(
+            code_hash,
+            workspace_id,
+            action_kind,
+            pane_id,
+            action_fingerprint,
+        )
+        .await
+    }
+
     /// Get an approval token by code hash (without consuming)
     pub async fn get_approval_token_by_code(
         &self,
@@ -8228,6 +8252,20 @@ impl StorageHandle {
             query_active_approvals_count(&conn, &workspace_id, now_ms)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_active_approvals`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_active_approvals_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workspace_id: &str,
+        now_ms: i64,
+    ) -> Result<u32> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_active_approvals cancelled: {err}"))
+        })?;
+        self.count_active_approvals(workspace_id, now_ms).await
     }
 
     /// Look up an approval token by code hash (without consuming it)

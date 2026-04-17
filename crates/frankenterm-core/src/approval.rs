@@ -119,17 +119,14 @@ impl<'a> ApprovalStore<'a> {
     }
 
     /// Cx-first [`Self::issue`] (ft-xbnl0.2.3). Threads caller
-    /// `&Cx` through the two storage calls via `cx.checkpoint()`
-    /// boundaries: pre-flight (short-circuits before
-    /// `count_active_approvals` on pre-cancelled cx) and between
-    /// the count and the insert (a late-cancelled caller can abort
-    /// before writing a new token record).
+    /// `&Cx` through BOTH storage calls via their cx-first
+    /// siblings (tick 127 deepened this from pre-flight-only
+    /// checkpoints to full cx-aware storage).
     ///
-    /// Cancellation-safety contract: the token is inserted into
-    /// storage AFTER both checkpoints, so a cancel during the
-    /// checkpoint window leaves no token on disk. A cancel during
-    /// the insert itself is out of scope (StorageHandle has no
-    /// `_with_cx` surface yet — 147 async fns without cx).
+    /// Cancellation-safety contract: the token is inserted
+    /// AFTER both explicit checkpoints, AND both underlying
+    /// storage calls now honor caller cancellation at their own
+    /// pre-flight boundaries.
     ///
     /// Semantics identical to [`Self::issue`] for uncancelled cx.
     #[cfg(feature = "asupersync-runtime")]
@@ -145,7 +142,7 @@ impl<'a> ApprovalStore<'a> {
         let now = now_ms();
         let active = self
             .storage
-            .count_active_approvals(&self.workspace_id, now)
+            .count_active_approvals_with_cx(cx, &self.workspace_id, now)
             .await?;
         if active >= self.config.max_active_tokens {
             return Err(Error::Policy(format!(
@@ -179,7 +176,9 @@ impl<'a> ApprovalStore<'a> {
             plan_version: None,
             risk_summary: None,
         };
-        self.storage.insert_approval_token(token).await?;
+        self.storage
+            .insert_approval_token_with_cx(cx, token)
+            .await?;
 
         let summary = summary.unwrap_or_else(|| summary_for_input(input));
         Ok(ApprovalRequest {
@@ -251,10 +250,9 @@ impl<'a> ApprovalStore<'a> {
 
     /// Cx-first [`Self::issue_for_plan`] (ft-xbnl0.2.3). Parallel
     /// of tick-59's `issue_with_cx` for the plan-bound variant.
-    /// Threads cx through the same two storage calls
-    /// (count_active_approvals + insert_approval_token) via
-    /// checkpoint seams at the same two points: pre-flight and
-    /// between count and insert. The plan_hash/plan_version/
+    /// Tick 127 deepened this to route both storage calls
+    /// (count_active_approvals + insert_approval_token) through
+    /// their cx-first siblings. The plan_hash/plan_version/
     /// risk_summary semantics are identical to the legacy
     /// `issue_for_plan`.
     #[cfg(feature = "asupersync-runtime")]
@@ -275,7 +273,7 @@ impl<'a> ApprovalStore<'a> {
         let now = now_ms();
         let active = self
             .storage
-            .count_active_approvals(&self.workspace_id, now)
+            .count_active_approvals_with_cx(cx, &self.workspace_id, now)
             .await?;
         if active >= self.config.max_active_tokens {
             return Err(Error::Policy(format!(
@@ -313,7 +311,9 @@ impl<'a> ApprovalStore<'a> {
             plan_version,
             risk_summary: risk_summary.clone(),
         };
-        self.storage.insert_approval_token(token).await?;
+        self.storage
+            .insert_approval_token_with_cx(cx, token)
+            .await?;
 
         Ok(ApprovalRequest {
             allow_once_code: code.clone(),
@@ -433,7 +433,8 @@ impl<'a> ApprovalStore<'a> {
         let fingerprint = fingerprint_for_input(input);
         let record = self
             .storage
-            .consume_approval_token(
+            .consume_approval_token_with_cx(
+                cx,
                 &code_hash,
                 &self.workspace_id,
                 input.action.as_str(),
@@ -458,8 +459,14 @@ impl<'a> ApprovalStore<'a> {
                     ))
                 })?;
 
-                self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
-                    .await?;
+                self.audit_approval_grant_with_cx(
+                    cx,
+                    input,
+                    &code_hash,
+                    &fingerprint,
+                    audit_context.as_ref(),
+                )
+                .await?;
                 Ok(Some(token))
             }
             None => Ok(None),
@@ -593,7 +600,8 @@ impl<'a> ApprovalStore<'a> {
         let fingerprint = fingerprint_for_input(input);
         let record = self
             .storage
-            .consume_approval_token(
+            .consume_approval_token_with_cx(
+                cx,
                 &code_hash,
                 &self.workspace_id,
                 input.action.as_str(),
@@ -609,8 +617,14 @@ impl<'a> ApprovalStore<'a> {
                 ))
             })?;
 
-            self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
-                .await?;
+            self.audit_approval_grant_with_cx(
+                cx,
+                input,
+                &code_hash,
+                &fingerprint,
+                audit_context.as_ref(),
+            )
+            .await?;
         }
 
         Ok(record)
@@ -651,6 +665,50 @@ impl<'a> ApprovalStore<'a> {
         };
 
         self.storage.record_audit_action_redacted(audit).await?;
+        Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::audit_approval_grant`].
+    /// Routes the audit write through the cx-first storage sibling.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn audit_approval_grant_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        input: &PolicyInput,
+        code_hash: &str,
+        fingerprint: &str,
+        audit_context: Option<&ApprovalAuditContext>,
+    ) -> Result<()> {
+        let ts = now_ms();
+        let verification = format!(
+            "workspace={}, fingerprint={}, hash={}",
+            self.workspace_id, fingerprint, code_hash
+        );
+        let decision_context = audit_context
+            .and_then(|ctx| ctx.decision_context.clone())
+            .or_else(|| build_approval_grant_decision_context(&self.workspace_id, input, ts));
+
+        let audit = AuditActionRecord {
+            id: 0,
+            ts,
+            actor_kind: input.actor.as_str().to_string(),
+            actor_id: None,
+            correlation_id: audit_context.and_then(|ctx| ctx.correlation_id.clone()),
+            pane_id: input.pane_id,
+            domain: input.domain.clone(),
+            action_kind: "approve_allow_once".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("allow_once approval granted".to_string()),
+            rule_id: None,
+            input_summary: Some(format!("allow_once approval for {}", input.action.as_str())),
+            verification_summary: Some(verification),
+            decision_context,
+            result: "success".to_string(),
+        };
+
+        self.storage
+            .record_audit_action_redacted_with_cx(cx, audit)
+            .await?;
         Ok(())
     }
 }
