@@ -1259,114 +1259,30 @@ impl WeztermClient {
         pane_id: u64,
         direction: MoveDirection,
     ) -> Result<Option<u64>> {
-        // Get the source pane info
         let source_pane = self.get_pane(pane_id).await?;
-        let tab_id = source_pane.tab_id;
-        let window_id = source_pane.window_id;
-
-        // List all panes to find neighbors
         let all_panes = self.list_panes().await?;
+        Ok(find_neighbor_pane(&source_pane, &all_panes, direction))
+    }
 
-        // Filter for panes in the same tab/window
-        let tab_panes: Vec<&PaneInfo> = all_panes
-            .iter()
-            .filter(|p| p.tab_id == tab_id && p.window_id == window_id && p.pane_id != pane_id)
-            .collect();
-
-        if tab_panes.is_empty() {
-            return Ok(None);
-        }
-
-        // Geometry-based neighbor detection
-        // WezTerm coordinates: (left_col, top_row) + (cols, rows)
-        // Note: left_col/top_row might be viewport-relative or absolute depending on version
-        // Assuming left_col/top_row are reliable spatial coordinates.
-        // Fallback: use cursor_x/y if viewport coords are missing (less reliable)
-
-        let src_left = i64::from(source_pane.left_col.unwrap_or(0));
-        let src_top = source_pane.top_row.unwrap_or(0);
-        let src_width = source_pane
-            .size
-            .as_ref()
-            .map(|s| s.cols)
-            .or(source_pane.cols)
-            .unwrap_or(0);
-        let src_width = i64::from(src_width);
-        let src_height = source_pane
-            .size
-            .as_ref()
-            .map(|s| s.rows)
-            .or(source_pane.rows)
-            .unwrap_or(0);
-        let src_height = i64::from(src_height);
-
-        let src_right = src_left + src_width;
-        let src_bottom = src_top + src_height;
-
-        let mut best_candidate: Option<u64> = None;
-        let mut min_distance = i64::MAX;
-
-        for candidate in tab_panes {
-            let cand_left = i64::from(candidate.left_col.unwrap_or(0));
-            let cand_top = candidate.top_row.unwrap_or(0);
-            let cand_width = candidate
-                .size
-                .as_ref()
-                .map(|s| s.cols)
-                .or(candidate.cols)
-                .unwrap_or(0);
-            let cand_width = i64::from(cand_width);
-            let cand_height = candidate
-                .size
-                .as_ref()
-                .map(|s| s.rows)
-                .or(candidate.rows)
-                .unwrap_or(0);
-            let cand_height = i64::from(cand_height);
-
-            let cand_right = cand_left + cand_width;
-            let cand_bottom = cand_top + cand_height;
-
-            let is_candidate = match direction {
-                MoveDirection::Left => {
-                    // Candidate is to the left if its right edge aligns with source left edge
-                    // and they overlap vertically
-                    cand_right <= src_left && (cand_top < src_bottom && cand_bottom > src_top)
-                }
-                MoveDirection::Right => {
-                    // Candidate is to the right if its left edge aligns with source right edge
-                    // and they overlap vertically
-                    cand_left >= src_right && (cand_top < src_bottom && cand_bottom > src_top)
-                }
-                MoveDirection::Up => {
-                    // Candidate is above if its bottom edge aligns with source top edge
-                    // and they overlap horizontally
-                    cand_bottom <= src_top && (cand_left < src_right && cand_right > src_left)
-                }
-                MoveDirection::Down => {
-                    // Candidate is below if its top edge aligns with source bottom edge
-                    // and they overlap horizontally
-                    cand_top >= src_bottom && (cand_left < src_right && cand_right > src_left)
-                }
-            };
-
-            if is_candidate {
-                // Calculate distance to edge (should be 0 or small for adjacent)
-                let distance = match direction {
-                    MoveDirection::Left => (src_left - cand_right).abs(),
-                    MoveDirection::Right => (cand_left - src_right).abs(),
-                    MoveDirection::Up => (src_top - cand_bottom).abs(),
-                    MoveDirection::Down => (cand_top - src_bottom).abs(),
-                };
-
-                if distance < min_distance {
-                    min_distance = distance;
-                    best_candidate = Some(candidate.pane_id);
-                }
-            }
-        }
-
-        Ok(best_candidate)
+    /// Get the pane ID in a specific direction under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Uses [`get_pane_with_cx`](Self::get_pane_with_cx) and
+    /// [`list_panes_with_cx`](Self::list_panes_with_cx) so the source
+    /// pane lookup and full pane enumeration both respect caller Cx.
+    /// The neighbor-selection geometry is a pure function
+    /// ([`find_neighbor_pane`]) so the legacy and Cx paths produce
+    /// bit-for-bit identical neighbor decisions.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_direction_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> Result<Option<u64>> {
+        let source_pane = self.get_pane_with_cx(cx, pane_id).await?;
+        let all_panes = self.list_panes_with_cx(cx).await?;
+        Ok(find_neighbor_pane(&source_pane, &all_panes, direction))
     }
 
     /// Kill (close) a pane
@@ -1770,6 +1686,113 @@ fn is_retryable_error(err: &crate::Error) -> bool {
             WeztermError::NotRunning | WeztermError::Timeout(_) | WeztermError::CommandFailed(_)
         )
     )
+}
+
+/// Find the best-matching neighbor pane in the given direction.
+///
+/// Pure geometry-based neighbor detection extracted so the legacy
+/// [`WeztermClient::get_pane_direction`] and the Cx-first
+/// [`WeztermClient::get_pane_direction_with_cx`] share bit-for-bit
+/// identical selection logic.
+///
+/// WezTerm coordinates: `(left_col, top_row)` + `(cols, rows)`.
+/// Returns the pane_id of the closest neighbor whose edge aligns with
+/// the source pane's corresponding edge and overlaps on the
+/// perpendicular axis.
+#[must_use]
+fn find_neighbor_pane(
+    source_pane: &PaneInfo,
+    all_panes: &[PaneInfo],
+    direction: MoveDirection,
+) -> Option<u64> {
+    let tab_id = source_pane.tab_id;
+    let window_id = source_pane.window_id;
+    let tab_panes: Vec<&PaneInfo> = all_panes
+        .iter()
+        .filter(|p| {
+            p.tab_id == tab_id && p.window_id == window_id && p.pane_id != source_pane.pane_id
+        })
+        .collect();
+
+    if tab_panes.is_empty() {
+        return None;
+    }
+
+    let src_left = i64::from(source_pane.left_col.unwrap_or(0));
+    let src_top = source_pane.top_row.unwrap_or(0);
+    let src_width = source_pane
+        .size
+        .as_ref()
+        .map(|s| s.cols)
+        .or(source_pane.cols)
+        .unwrap_or(0);
+    let src_width = i64::from(src_width);
+    let src_height = source_pane
+        .size
+        .as_ref()
+        .map(|s| s.rows)
+        .or(source_pane.rows)
+        .unwrap_or(0);
+    let src_height = i64::from(src_height);
+
+    let src_right = src_left + src_width;
+    let src_bottom = src_top + src_height;
+
+    let mut best_candidate: Option<u64> = None;
+    let mut min_distance = i64::MAX;
+
+    for candidate in tab_panes {
+        let cand_left = i64::from(candidate.left_col.unwrap_or(0));
+        let cand_top = candidate.top_row.unwrap_or(0);
+        let cand_width = candidate
+            .size
+            .as_ref()
+            .map(|s| s.cols)
+            .or(candidate.cols)
+            .unwrap_or(0);
+        let cand_width = i64::from(cand_width);
+        let cand_height = candidate
+            .size
+            .as_ref()
+            .map(|s| s.rows)
+            .or(candidate.rows)
+            .unwrap_or(0);
+        let cand_height = i64::from(cand_height);
+
+        let cand_right = cand_left + cand_width;
+        let cand_bottom = cand_top + cand_height;
+
+        let is_candidate = match direction {
+            MoveDirection::Left => {
+                cand_right <= src_left && (cand_top < src_bottom && cand_bottom > src_top)
+            }
+            MoveDirection::Right => {
+                cand_left >= src_right && (cand_top < src_bottom && cand_bottom > src_top)
+            }
+            MoveDirection::Up => {
+                cand_bottom <= src_top && (cand_left < src_right && cand_right > src_left)
+            }
+            MoveDirection::Down => {
+                cand_top >= src_bottom && (cand_left < src_right && cand_right > src_left)
+            }
+        };
+
+        if is_candidate {
+            let distance = match direction {
+                MoveDirection::Left => (src_left - cand_right).abs(),
+                MoveDirection::Right => (cand_left - src_right).abs(),
+                MoveDirection::Up => (src_top - cand_bottom).abs(),
+                MoveDirection::Down => (cand_top - src_bottom).abs(),
+            };
+
+            if distance < min_distance {
+                min_distance = distance;
+                best_candidate = Some(candidate.pane_id);
+            }
+        }
+    }
+
+    best_candidate
 }
 
 impl WeztermInterface for WeztermClient {
