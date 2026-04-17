@@ -2093,14 +2093,127 @@ impl WorkflowRunner {
         cx: &crate::cx::Cx,
         execution_id: &str,
         reason: Option<&str>,
-        force: bool,
+        _force: bool,
     ) -> crate::Result<AbortResult> {
         if cx.is_cancel_requested() {
             return Err(crate::Error::Runtime(
                 "capability context already cancelled; abort_execution refused".to_owned(),
             ));
         }
-        self.abort_execution(execution_id, reason, force).await
+
+        // ft-xbnl0.2.3 tick 131: deepened from pre-flight delegate
+        // to fully cx-threaded body. Routes both internal storage
+        // calls through cx-first siblings so caller cancellation
+        // propagates into storage's pre-flight checkpoints.
+
+        let record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        // Check if already in terminal state
+        match record.status.as_str() {
+            "completed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_completed".to_string()),
+                });
+            }
+            "aborted" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_aborted".to_string()),
+                });
+            }
+            "failed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_failed".to_string()),
+                });
+            }
+            _ => {}
+        }
+
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "abort_execution cancelled between get_workflow and upsert_workflow (exec_id={execution_id}): {err}"
+            ))
+        })?;
+
+        let previous_status = record.status.clone();
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let aborted_at_step = record.current_step;
+        let now = now_ms();
+
+        let mut updated_record = record;
+        updated_record.status = "aborted".to_string();
+        updated_record.error = reason.map(|r| format!("Aborted: {r}"));
+        updated_record.updated_at = now;
+        updated_record.completed_at = Some(now);
+
+        self.storage
+            .upsert_workflow_with_cx(cx, updated_record)
+            .await?;
+
+        self.lock_manager.release(pane_id, execution_id);
+
+        if let Err(e) = self
+            .mark_trigger_event_handled(execution_id, "aborted")
+            .await
+        {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to mark trigger event as handled during abort (cx-first)"
+            );
+        }
+
+        tracing::info!(
+            execution_id,
+            workflow_name,
+            pane_id,
+            reason = reason.unwrap_or("no reason provided"),
+            "Workflow aborted (cx-first)"
+        );
+
+        Ok(AbortResult {
+            aborted: true,
+            execution_id: execution_id.to_string(),
+            workflow_name,
+            pane_id,
+            previous_status,
+            aborted_at_step,
+            reason: reason.map(std::string::ToString::to_string),
+            aborted_at: Some(now as u64),
+            error_reason: None,
+        })
     }
 }
 
