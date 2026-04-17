@@ -529,6 +529,18 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 polls,
                 last_observed: Some(format!("timeout {}", matcher.description())),
             }),
+            WaitResult::Cancelled { reason, polls } => {
+                // ft-xbnl0.2.3: the legacy wait_for never returns
+                // Cancelled, but exhaustiveness requires this arm.
+                // Map cancellation to TimedOut with the reason as the
+                // last-observed context so downstream surfaces still
+                // see a timeout-shaped outcome.
+                Ok(WaitConditionResult::TimedOut {
+                    elapsed_ms: 0,
+                    polls,
+                    last_observed: Some(format!("cancelled: {reason}")),
+                })
+            }
         }
     }
 }

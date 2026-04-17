@@ -1190,6 +1190,15 @@ impl ToolHandler for WaWaitForTool {
                 );
                 envelope_to_content(envelope)
             }
+            Ok(WaitResult::Cancelled { reason, polls }) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_TIMEOUT,
+                    format!("Wait cancelled: {reason} ({polls} polls)"),
+                    Some("Retry with a fresh request. Cancellation is not a timeout.".to_string()),
+                    elapsed_ms(start),
+                );
+                envelope_to_content(envelope)
+            }
             Err(err) => {
                 let (code, hint) = map_mcp_error(&err);
                 let envelope =
@@ -1890,6 +1899,17 @@ impl ToolHandler for WaSendTool {
                             });
                             verification_error =
                                 Some(format!("Timeout waiting for pattern '{pattern}'"));
+                        }
+                        Ok(WaitResult::Cancelled { reason, polls }) => {
+                            wait_for_data = Some(McpWaitForData {
+                                pane_id: params.pane_id,
+                                pattern: pattern.clone(),
+                                matched: false,
+                                elapsed_ms: 0,
+                                polls,
+                                is_regex: params.wait_for_regex,
+                            });
+                            verification_error = Some(format!("Wait cancelled: {reason}"));
                         }
                         Err(e) => {
                             verification_error = Some(format!("wait-for failed: {e}"));

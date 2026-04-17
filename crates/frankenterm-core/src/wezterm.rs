@@ -2373,6 +2373,18 @@ pub enum WaitResult {
         polls: usize,
         last_tail_hash: Option<u64>,
     },
+    /// The caller's capability context (`Cx`) was cancelled before or
+    /// during the wait (ft-xbnl0.2.3). Surfaced only by
+    /// [`PaneWaiter::wait_for_with_cx`] when the outer scope abandons
+    /// the wait.
+    Cancelled {
+        /// Human-readable reason for cancellation (matches
+        /// `event_stream::WaitResult::Cancelled` shape).
+        reason: String,
+        /// Number of polls completed before cancellation (0 if
+        /// pre-cancelled).
+        polls: usize,
+    },
 }
 
 /// Marker presence snapshot for Codex session summary detection.
@@ -2491,6 +2503,144 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             };
 
             sleep(sleep_duration).await;
+            interval = interval.saturating_mul(2);
+            if interval > self.options.poll_max {
+                interval = self.options.poll_max;
+            }
+        }
+    }
+
+    /// Wait for a matcher to appear in the pane, bound to the caller's
+    /// asupersync capability context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Semantics mirror [`wait_for`](Self::wait_for) with three
+    /// Cx-aware changes:
+    ///
+    ///   * Pre-flight `cx.checkpoint()` before the first poll. A
+    ///     caller-cancelled wait returns `WaitResult::Cancelled`
+    ///     immediately without touching the source.
+    ///
+    ///   * Mid-loop `cx.checkpoint()` after each poll, before the
+    ///     exponential-backoff sleep. An operator who cancels a
+    ///     long-running wait exits promptly even before the sleep
+    ///     fires.
+    ///
+    ///   * `sleep_with_cx(cx, duration)` bounds the between-poll
+    ///     backoff sleep. If the Cx is cancelled mid-sleep, the
+    ///     sleep returns Err and the loop surfaces
+    ///     `WaitResult::Cancelled` rather than burning the remaining
+    ///     sleep budget.
+    ///
+    /// The `PaneTextSource::get_text` call still uses ambient Cx via
+    /// the source trait (get_text is not yet Cx-aware at the trait
+    /// level); the Cx-first wait here delivers meaningful cancellation
+    /// for the common case where the source responds quickly and the
+    /// loop spends most of its time in the backoff sleep.
+    ///
+    /// The legacy [`wait_for`](Self::wait_for) entry point is
+    /// preserved for non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn wait_for_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        matcher: &WaitMatcher,
+        timeout: Duration,
+    ) -> Result<WaitResult> {
+        if cx.checkpoint().is_err() {
+            return Ok(WaitResult::Cancelled {
+                reason: "capability context already cancelled".to_string(),
+                polls: 0,
+            });
+        }
+
+        let matcher_desc = matcher.description();
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut polls = 0usize;
+        let mut interval = self.options.poll_initial;
+        tracing::info!(
+            pane_id,
+            timeout_ms = ms_u64(timeout),
+            matcher = %matcher_desc,
+            "wait_for_with_cx start"
+        );
+
+        loop {
+            polls += 1;
+            let text = self.source.get_text(pane_id, self.options.escapes).await?;
+            let tail = tail_text(&text, self.options.tail_lines);
+            let tail_hash = stable_hash(tail.as_bytes());
+
+            if matcher.matches(&tail)? {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for_with_cx matched"
+                );
+                return Ok(WaitResult::Matched { elapsed_ms, polls });
+            }
+
+            let now = Instant::now();
+            if now >= deadline || polls >= self.options.max_polls {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for_with_cx timeout"
+                );
+                return Ok(WaitResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_tail_hash: Some(tail_hash),
+                });
+            }
+
+            if cx.checkpoint().is_err() {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for_with_cx cancelled mid-loop"
+                );
+                return Ok(WaitResult::Cancelled {
+                    reason: "capability context cancelled during wait".to_string(),
+                    polls,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_duration = if interval > remaining {
+                remaining
+            } else {
+                interval
+            };
+
+            if crate::runtime_compat::sleep_with_cx(cx, sleep_duration)
+                .await
+                .is_err()
+            {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for_with_cx cancelled during sleep"
+                );
+                return Ok(WaitResult::Cancelled {
+                    reason: "capability context cancelled during backoff sleep".to_string(),
+                    polls,
+                });
+            }
+
             interval = interval.saturating_mul(2);
             if interval > self.options.poll_max {
                 interval = self.options.poll_max;
