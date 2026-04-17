@@ -817,8 +817,64 @@ impl SnapshotEngine {
     ///
     /// `pane_provider` is called each time to fetch the current pane list.
     /// This decouples the engine from `WeztermClient` for testability.
-    pub async fn run_periodic<F, Fut>(&self, mut shutdown: watch::Receiver<bool>, pane_provider: F)
+    pub async fn run_periodic<F, Fut>(&self, shutdown: watch::Receiver<bool>, pane_provider: F)
     where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
+    {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.scheduler_body(&cx, shutdown, pane_provider).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.scheduler_body_legacy(shutdown, pane_provider).await;
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_periodic`].
+    ///
+    /// Tick 112 upgrade: threads the caller's cx through the
+    /// scheduler body so shutdown-watcher polls
+    /// (`shutdown.changed(&cx)`) and intelligent-scheduler
+    /// trigger polls (`trigger_rx.recv(&cx)`) honor caller
+    /// cancellation. A cancelled caller cx cuts BOTH poll sites
+    /// at their next waker boundary, replacing tick 106's
+    /// pre-flight-only gating.
+    ///
+    /// Both entry points now share a single
+    /// `scheduler_body(&cx, ...)` helper (via internal
+    /// refactor); the legacy path passes `cx::for_request()` to
+    /// preserve its prior semantics.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_periodic_with_cx<F, Fut>(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: watch::Receiver<bool>,
+        pane_provider: F,
+    ) where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
+    {
+        if cx.checkpoint().is_err() {
+            tracing::info!("snapshot engine run_periodic cancelled at entry");
+            return;
+        }
+        self.scheduler_body(cx, shutdown, pane_provider).await;
+    }
+
+    /// Cx-aware scheduler body shared by `run_periodic` and
+    /// `run_periodic_with_cx`. The caller's cx is threaded into
+    /// both `shutdown.changed(&cx)` and `trigger_rx.recv(&cx)`
+    /// so cancellation propagates into both poll sites.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn scheduler_body<F, Fut>(
+        &self,
+        cx: &crate::cx::Cx,
+        mut shutdown: watch::Receiver<bool>,
+        pane_provider: F,
+    ) where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
@@ -827,20 +883,19 @@ impl SnapshotEngine {
                 let interval_secs = self.config.interval_seconds.max(30);
                 let interval = Duration::from_secs(interval_secs);
                 let mut is_first = true;
-                #[cfg(feature = "asupersync-runtime")]
-                let shutdown_cx = crate::cx::for_request();
 
                 loop {
                     if !is_first {
-                        #[cfg(feature = "asupersync-runtime")]
-                        let shutdown_fut = shutdown.changed(&shutdown_cx);
-                        #[cfg(not(feature = "asupersync-runtime"))]
-                        let shutdown_fut = shutdown.changed();
-
+                        let shutdown_fut = shutdown.changed(cx);
                         if timeout(interval, shutdown_fut).await.is_ok() {
                             tracing::info!("snapshot engine shutting down");
                             break;
                         }
+                    }
+
+                    if cx.checkpoint().is_err() {
+                        tracing::info!("snapshot engine run_periodic: cx cancelled, exiting");
+                        break;
                     }
 
                     let trigger = if is_first {
@@ -853,7 +908,6 @@ impl SnapshotEngine {
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
-                #[cfg_attr(feature = "asupersync-runtime", allow(unused_mut))]
                 let mut trigger_rx = {
                     let mut guard = self.trigger_rx.lock().await;
                     match guard.take() {
@@ -867,12 +921,10 @@ impl SnapshotEngine {
                     }
                 };
 
-                // Startup capture (immediate).
                 let _ = self
                     .capture_from_provider(&pane_provider, SnapshotTrigger::Startup)
                     .await;
 
-                // Periodic fallback: capture even without triggers for liveness.
                 let fallback_secs = self
                     .config
                     .scheduling
@@ -884,8 +936,6 @@ impl SnapshotEngine {
 
                 let mut accumulated_value = 0.0_f64;
                 let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
-                #[cfg(feature = "asupersync-runtime")]
-                let scheduler_cx = crate::cx::for_request();
 
                 enum TriggerPoll {
                     Ready(SnapshotTrigger),
@@ -894,11 +944,14 @@ impl SnapshotEngine {
                 }
 
                 loop {
-                    #[cfg(feature = "asupersync-runtime")]
-                    let shutdown_check_fut = shutdown.changed(&scheduler_cx);
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    let shutdown_check_fut = shutdown.changed();
+                    if cx.checkpoint().is_err() {
+                        tracing::info!(
+                            "snapshot engine intelligent scheduler: cx cancelled, exiting"
+                        );
+                        break;
+                    }
 
+                    let shutdown_check_fut = shutdown.changed(cx);
                     if timeout(Duration::ZERO, shutdown_check_fut).await.is_ok() {
                         tracing::info!("snapshot engine shutting down");
                         break;
@@ -910,17 +963,9 @@ impl SnapshotEngine {
                         TriggerPoll::TimedOut
                     } else {
                         let wait_step = fallback_wait.min(Duration::from_millis(250));
-
-                        #[cfg(feature = "asupersync-runtime")]
-                        let recv_result = {
-                            let recv_fut = trigger_rx.recv(&scheduler_cx);
-                            timeout(wait_step, recv_fut).await.map(|result| result.ok())
-                        };
-                        #[cfg(not(feature = "asupersync-runtime"))]
-                        let recv_result = {
-                            let recv_fut = trigger_rx.recv();
-                            timeout(wait_step, recv_fut).await
-                        };
+                        let recv_fut = trigger_rx.recv(cx);
+                        let recv_result =
+                            timeout(wait_step, recv_fut).await.map(|result| result.ok());
 
                         match recv_result {
                             Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
@@ -976,34 +1021,146 @@ impl SnapshotEngine {
         }
     }
 
-    /// ft-xbnl0.2.3 Cx-first sibling of [`run_periodic`].
-    ///
-    /// Pre-flight checkpoint gates the scheduler-loop entry
-    /// before any shutdown receiver setup or startup capture
-    /// fires. Delegates to [`run_periodic`] for the actual
-    /// scheduler body — the internal scheduler still uses a
-    /// fresh-per-request cx for its own shutdown/trigger polls
-    /// (deep cx threading through both scheduling modes would
-    /// duplicate ~150 lines; a future tick may lift that).
-    /// This pre-flight seam is still valuable because
-    /// `run_periodic` is the supervisor-spawned entry for the
-    /// snapshot engine and a cancelled supervisor cx should
-    /// bail before the scheduler arms itself.
-    #[cfg(feature = "asupersync-runtime")]
-    pub async fn run_periodic_with_cx<F, Fut>(
+    /// Legacy non-cx scheduler body for builds without
+    /// `asupersync-runtime`. Preserves the exact prior behavior
+    /// — shutdown.changed() and trigger_rx.recv() without cx.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn scheduler_body_legacy<F, Fut>(
         &self,
-        cx: &crate::cx::Cx,
-        shutdown: watch::Receiver<bool>,
+        mut shutdown: watch::Receiver<bool>,
         pane_provider: F,
     ) where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
-        if cx.checkpoint().is_err() {
-            tracing::info!("snapshot engine run_periodic cancelled at entry");
-            return;
+        match self.config.scheduling.mode {
+            SnapshotSchedulingMode::Periodic => {
+                let interval_secs = self.config.interval_seconds.max(30);
+                let interval = Duration::from_secs(interval_secs);
+                let mut is_first = true;
+
+                loop {
+                    if !is_first {
+                        let shutdown_fut = shutdown.changed();
+                        if timeout(interval, shutdown_fut).await.is_ok() {
+                            tracing::info!("snapshot engine shutting down");
+                            break;
+                        }
+                    }
+
+                    let trigger = if is_first {
+                        is_first = false;
+                        SnapshotTrigger::Startup
+                    } else {
+                        SnapshotTrigger::Periodic
+                    };
+                    let _ = self.capture_from_provider(&pane_provider, trigger).await;
+                }
+            }
+            SnapshotSchedulingMode::Intelligent => {
+                let mut trigger_rx = {
+                    let mut guard = self.trigger_rx.lock().await;
+                    match guard.take() {
+                        Some(rx) => rx,
+                        None => {
+                            tracing::warn!(
+                                "snapshot intelligent scheduler: receiver already taken"
+                            );
+                            return;
+                        }
+                    }
+                };
+
+                let _ = self
+                    .capture_from_provider(&pane_provider, SnapshotTrigger::Startup)
+                    .await;
+
+                let fallback_secs = self
+                    .config
+                    .scheduling
+                    .periodic_fallback_minutes
+                    .max(1)
+                    .saturating_mul(60);
+                let fallback_interval = Duration::from_secs(fallback_secs);
+                let mut next_fallback_at = Instant::now() + fallback_interval;
+
+                let mut accumulated_value = 0.0_f64;
+                let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
+
+                enum TriggerPoll {
+                    Ready(SnapshotTrigger),
+                    Closed,
+                    TimedOut,
+                }
+
+                loop {
+                    let shutdown_check_fut = shutdown.changed();
+                    if timeout(Duration::ZERO, shutdown_check_fut).await.is_ok() {
+                        tracing::info!("snapshot engine shutting down");
+                        break;
+                    }
+
+                    let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
+
+                    let trigger_poll = if fallback_wait.is_zero() {
+                        TriggerPoll::TimedOut
+                    } else {
+                        let wait_step = fallback_wait.min(Duration::from_millis(250));
+                        let recv_fut = trigger_rx.recv();
+                        let recv_result = timeout(wait_step, recv_fut).await;
+
+                        match recv_result {
+                            Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
+                            Ok(None) => TriggerPoll::Closed,
+                            Err(_) => TriggerPoll::TimedOut,
+                        }
+                    };
+
+                    match trigger_poll {
+                        TriggerPoll::Ready(trigger) => {
+                            let tv = self.trigger_value(trigger);
+                            if tv > 0.0 {
+                                accumulated_value += tv;
+                            }
+
+                            let immediate = self.is_immediate_trigger(trigger);
+                            let should_capture = immediate
+                                || snapshot_threshold <= 0.0
+                                || accumulated_value >= snapshot_threshold;
+
+                            if should_capture {
+                                let captured =
+                                    self.capture_from_provider(&pane_provider, trigger).await;
+                                if captured || immediate || snapshot_threshold <= 0.0 {
+                                    accumulated_value = 0.0;
+                                }
+                            }
+                        }
+                        TriggerPoll::Closed => {
+                            tracing::info!(
+                                "trigger channel closed; intelligent scheduler stopping"
+                            );
+                            break;
+                        }
+                        TriggerPoll::TimedOut => {
+                            if Instant::now() < next_fallback_at {
+                                continue;
+                            }
+                            let captured = self
+                                .capture_from_provider(
+                                    &pane_provider,
+                                    SnapshotTrigger::PeriodicFallback,
+                                )
+                                .await;
+                            if captured {
+                                accumulated_value = 0.0;
+                            }
+                            next_fallback_at = Instant::now() + fallback_interval;
+                        }
+                    }
+                }
+            }
         }
-        self.run_periodic(shutdown, pane_provider).await;
     }
 
     /// Get or create the session ID.
@@ -2080,6 +2237,63 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(clean, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first tick 112: `run_periodic_with_cx`
+    /// must exit promptly when the caller's cx is cancelled
+    /// mid-flight — not just at the entry checkpoint. This
+    /// exercises the deep-threading upgrade from tick 106 (which
+    /// only gated entry). With `config.interval_seconds = 30`,
+    /// the periodic scheduler would normally block for 30s
+    /// between iterations; a mid-flight cx-cancel must cut the
+    /// shutdown-watcher `shutdown.changed(&cx)` poll so the task
+    /// exits in <500ms.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn run_periodic_with_cx_mid_flight_cancel_exits_quickly() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                interval_seconds: 30,
+                ..SnapshotConfig::default()
+            };
+            let engine = Arc::new(SnapshotEngine::new(db_path, config));
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let cx = crate::cx::for_testing();
+
+            // Move cx + engine into the task so the task is the sole owner.
+            let task_cx = cx.clone();
+            let task_engine = Arc::clone(&engine);
+            let handle = crate::runtime_compat::task::spawn(async move {
+                task_engine
+                    .run_periodic_with_cx(&task_cx, shutdown_rx, || async {
+                        Some(vec![make_test_pane(1, 24, 80)])
+                    })
+                    .await;
+            });
+
+            // Let the scheduler complete its startup capture and settle
+            // into the shutdown-watcher poll.
+            crate::runtime_compat::sleep(Duration::from_millis(100)).await;
+
+            // Cancel the caller's cx mid-flight; the scheduler should
+            // notice at its next checkpoint / shutdown.changed(&cx) poll.
+            let started = Instant::now();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("mid-flight cancel snapshot scheduler"),
+            );
+
+            let _ = crate::runtime_compat::timeout(Duration::from_secs(5), handle).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(2_000),
+                "mid-flight cx-cancel should cut the scheduler within 2s \
+                 (cx threading upgrade should avoid the 30s interval wait), took {elapsed:?}"
+            );
         });
     }
 
