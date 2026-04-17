@@ -104,10 +104,41 @@ pub async fn list_pane_bookmarks(storage: &StorageHandle) -> crate::Result<Vec<P
     Ok(records.into_iter().map(PaneBookmarkView::from).collect())
 }
 
+/// Cx-first [`list_pane_bookmarks`] (ft-xbnl0.2.3). Pre-flight
+/// cx checkpoint gates the storage query — a pre-cancelled cx
+/// returns `Err(crate::Error::Runtime(..))` without touching
+/// storage. Caller-cancellation during the storage call itself
+/// is out of scope — `StorageHandle` has no `_with_cx` siblings
+/// yet (147 async fns without cx surface). The pre-flight
+/// checkpoint is still valuable for UI surfaces that want to
+/// short-circuit cheaply when the operator has already
+/// cancelled (e.g. closed the bookmark picker).
+#[cfg(feature = "asupersync-runtime")]
+pub async fn list_pane_bookmarks_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+) -> crate::Result<Vec<PaneBookmarkView>> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("list_pane_bookmarks cancelled: {err}")))?;
+    list_pane_bookmarks(storage).await
+}
+
 /// List saved searches for UI surfaces.
 pub async fn list_saved_searches(storage: &StorageHandle) -> crate::Result<Vec<SavedSearchView>> {
     let records = storage.list_saved_searches().await?;
     Ok(records.into_iter().map(SavedSearchView::from).collect())
+}
+
+/// Cx-first [`list_saved_searches`] (ft-xbnl0.2.3). Pre-flight
+/// cx checkpoint gates the storage query.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn list_saved_searches_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+) -> crate::Result<Vec<SavedSearchView>> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("list_saved_searches cancelled: {err}")))?;
+    list_saved_searches(storage).await
 }
 
 /// Resolve ruleset profile status, including the currently active profile.
@@ -164,6 +195,62 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("wa_ui_query_{label}_{now}"))
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `list_pane_bookmarks_with_cx`
+    /// must match `list_pane_bookmarks` on an empty storage.
+    /// Proves the pre-flight checkpoint doesn't short-circuit
+    /// uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn list_pane_bookmarks_with_cx_matches_legacy_on_empty_db() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let db_path = std::env::temp_dir().join(format!(
+                    "wa_ui_query_bookmarks_cx_{}.db",
+                    std::process::id()
+                ));
+                let db_str = db_path.to_string_lossy().to_string();
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_str}-wal"));
+                let _ = std::fs::remove_file(format!("{db_str}-shm"));
+
+                let storage = StorageHandle::new(&db_str).await.expect("open storage");
+                let cx = crate::cx::for_request();
+
+                let legacy = list_pane_bookmarks(&storage).await.expect("legacy");
+                let cx_first = list_pane_bookmarks_with_cx(&cx, &storage)
+                    .await
+                    .expect("cx-first");
+
+                assert_eq!(legacy.len(), cx_first.len());
+                assert_eq!(cx_first.len(), 0);
+
+                let legacy_ss = list_saved_searches(&storage).await.expect("legacy ss");
+                let cx_first_ss = list_saved_searches_with_cx(&cx, &storage)
+                    .await
+                    .expect("cx-first ss");
+                assert_eq!(legacy_ss.len(), cx_first_ss.len());
+                assert_eq!(cx_first_ss.len(), 0);
+
+                storage.shutdown().await.expect("shutdown");
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_str}-wal"));
+                let _ = std::fs::remove_file(format!("{db_str}-shm"));
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]
