@@ -1363,6 +1363,34 @@ impl IpcClient {
         self.send_request(IpcRequest::Ping).await
     }
 
+    /// Cx-first [`Self::ping`] (ft-xbnl0.2.3). Routes the IPC
+    /// ping through [`Self::send_request_with_cx`] so caller
+    /// cancellation can abort the round-trip at any of the 4
+    /// await points (connect, write, flush, read).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn ping_with_cx(&self, cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_cx(cx, IpcRequest::Ping).await
+    }
+
+    /// Cx-first [`Self::send_user_var`] (ft-xbnl0.2.3). Routes
+    /// the user-var update through [`Self::send_request_with_cx`]
+    /// so the IPC round-trip honors caller cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_user_var_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        name: String,
+        value: String,
+    ) -> Result<IpcResponse, UserVarError> {
+        let request = IpcRequest::UserVar {
+            pane_id,
+            name,
+            value,
+        };
+        self.send_request_with_cx(cx, request).await
+    }
+
     /// Get watcher status.
     ///
     /// # Errors
@@ -1418,6 +1446,119 @@ impl IpcClient {
     /// Send a request and receive a response.
     async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse, UserVarError> {
         self.send_request_with_id(request, None).await
+    }
+
+    /// Cx-first [`Self::send_request`] (ft-xbnl0.2.3). Delegates
+    /// to [`Self::send_request_with_id_with_cx`] with `None`
+    /// request_id, mirroring the legacy `send_request` →
+    /// `send_request_with_id` chain.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn send_request_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: IpcRequest,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_id_with_cx(cx, request, None).await
+    }
+
+    /// Cx-first [`Self::send_request_with_id`] (ft-xbnl0.2.3).
+    /// Threads caller `&Cx` through the 4 await points in the
+    /// IPC round-trip via checkpoint seams:
+    ///
+    ///   1. pre-flight: pre-cancelled cx returns before
+    ///      `socket_path.exists()` check (saves the syscall).
+    ///   2. before `compat_unix::connect`: a cancel here avoids
+    ///      creating the socket connection at all.
+    ///   3. before write: a cancel here avoids sending a request
+    ///      that will immediately be abandoned.
+    ///   4. before read: a cancel here skips waiting on the
+    ///      response — caller sees cancellation rather than
+    ///      blocking on a server that may or may not reply.
+    ///
+    /// All cancellation errors wrap into `UserVarError::IpcSendFailed`
+    /// with "cancelled" prefix for pattern-matching.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn send_request_with_id_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: IpcRequest,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled pre-start: {err}"),
+        })?;
+
+        if !self.socket_path.exists() {
+            return Err(UserVarError::WatcherNotRunning {
+                socket_path: self.socket_path.display().to_string(),
+            });
+        }
+
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled before connect: {err}"),
+        })?;
+
+        let stream = compat_unix::connect(&self.socket_path).await.map_err(|e| {
+            UserVarError::IpcSendFailed {
+                message: format!("failed to connect: {e}"),
+            }
+        })?;
+
+        let (reader, mut writer) = stream.into_split();
+
+        let envelope = IpcEnvelope {
+            token: self.auth_token.clone(),
+            request_id,
+            request,
+        };
+        let request_json =
+            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to serialize request: {e}"),
+            })?;
+
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled before write: {err}"),
+        })?;
+
+        writer
+            .write_all(request_json.as_bytes())
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to send: {e}"),
+            })?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to send newline: {e}"),
+            })?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to flush: {e}"),
+            })?;
+
+        cx.checkpoint().map_err(|err| UserVarError::IpcSendFailed {
+            message: format!("cancelled before read: {err}"),
+        })?;
+
+        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+        let line = compat_unix::next_line(&mut lines)
+            .await
+            .map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("failed to read response: {e}"),
+            })?
+            .ok_or_else(|| UserVarError::IpcSendFailed {
+                message: "failed to read response: server closed connection".to_string(),
+            })?;
+
+        let response: IpcResponse =
+            serde_json::from_str(&line).map_err(|e| UserVarError::IpcSendFailed {
+                message: format!("invalid response: {e}"),
+            })?;
+
+        Ok(response)
     }
 
     async fn send_request_with_id(
@@ -1613,6 +1754,68 @@ mod tests {
     fn ipc_client_detects_missing_socket() {
         let client = IpcClient::new("/nonexistent/path/ipc.sock");
         assert!(!client.socket_exists());
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `ping_with_cx` must match the
+    /// legacy `ping` on the missing-socket path. Both variants
+    /// return `WatcherNotRunning` with the same socket_path
+    /// string. The Cx-first path's pre-flight checkpoint doesn't
+    /// short-circuit an uncancelled cx, so the socket check
+    /// still fires as the next step after the checkpoint.
+    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[test]
+    fn ping_with_cx_returns_watcher_not_running_on_missing_socket() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let bogus = std::env::temp_dir().join(format!(
+                    "ft-rusticmaple-tick77-ipc-no-such-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                ));
+                assert!(!bogus.exists(), "precondition: test socket must not exist");
+                let client = IpcClient::new(&bogus);
+                let cx = crate::cx::for_request();
+
+                let legacy_err = client
+                    .ping()
+                    .await
+                    .expect_err("legacy ping must error on missing socket");
+                let cx_err = client
+                    .ping_with_cx(&cx)
+                    .await
+                    .expect_err("Cx-first ping must error on missing socket");
+
+                match (&legacy_err, &cx_err) {
+                    (
+                        UserVarError::WatcherNotRunning {
+                            socket_path: legacy_path,
+                        },
+                        UserVarError::WatcherNotRunning {
+                            socket_path: cx_path,
+                        },
+                    ) => {
+                        assert_eq!(legacy_path, cx_path);
+                        assert!(cx_path.contains("tick77-ipc-no-such"));
+                    }
+                    other => panic!("expected WatcherNotRunning on both paths, got {other:?}"),
+                }
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     fn build_auth(token: &str, scopes: Vec<IpcScope>, expires_at_ms: Option<u64>) -> IpcAuth {
