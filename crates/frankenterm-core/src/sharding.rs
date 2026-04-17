@@ -1435,6 +1435,87 @@ impl WeztermInterface for ShardedWeztermClient {
                 .map_err(|err| self.backend_error(route.shard_id, "zoom_pane", Some(pane_id), err))
         })
     }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        Box::pin(async move {
+            self.spawn_with_hints_with_cx(cx, cwd, domain_name, None)
+                .await
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        Box::pin(async move {
+            self.telemetry.spawns.fetch_add(1, Ordering::Relaxed);
+            let shard = if target.new_window || target.window_id.is_none() {
+                self.choose_spawn_shard(domain_name, None)
+            } else {
+                match target.window_id {
+                    Some(window_id) => self.route_for_window_id(window_id).await?,
+                    None => self.choose_spawn_shard(domain_name, None),
+                }
+            };
+            let backend = self.backend_for_id(shard)?;
+            let local_id = backend
+                .handle
+                .spawn_targeted_with_cx(cx, cwd, domain_name, target)
+                .await
+                .map_err(|err| self.backend_error(shard, "spawn_targeted", None, err))?;
+            let global_id = encode_sharded_pane_id(shard, local_id);
+            self.pane_routes.write_with_cx(cx).await.insert(
+                global_id,
+                PaneRoute {
+                    shard_id: shard,
+                    local_pane_id: local_id,
+                },
+            );
+            Ok(global_id)
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&'a str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        Box::pin(async move {
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
+            let backend = self.backend_for_id(route.shard_id)?;
+            let local_new = backend
+                .handle
+                .split_pane_with_cx(cx, route.local_pane_id, direction, cwd, percent)
+                .await
+                .map_err(|err| {
+                    self.backend_error(route.shard_id, "split_pane", Some(pane_id), err)
+                })?;
+
+            let global_new = encode_sharded_pane_id(route.shard_id, local_new);
+            self.pane_routes.write_with_cx(cx).await.insert(
+                global_new,
+                PaneRoute {
+                    shard_id: route.shard_id,
+                    local_pane_id: local_new,
+                },
+            );
+            Ok(global_new)
+        })
+    }
 }
 
 fn circuit_state_rank(state: CircuitStateKind) -> u8 {

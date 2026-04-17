@@ -202,6 +202,22 @@ pub trait WeztermInterface: Send + Sync {
     }
     /// Spawn a new root pane/tab using the backend default target.
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64>;
+
+    /// Spawn a new root pane/tab bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates to [`spawn`](Self::spawn);
+    /// concrete impls SHOULD override so caller
+    /// cancellation/budget/virtual time propagate into the
+    /// `wezterm cli spawn` subprocess.
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        self.spawn(cwd, domain_name)
+    }
+
     /// Spawn a new root pane/tab into a specific window or a new window.
     fn spawn_targeted(
         &self,
@@ -209,6 +225,22 @@ pub trait WeztermInterface: Send + Sync {
         domain_name: Option<&str>,
         target: SpawnTarget,
     ) -> WeztermFuture<'_, u64>;
+
+    /// Spawn into a specific target bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates to
+    /// [`spawn_targeted`](Self::spawn_targeted); concrete impls with a
+    /// Cx-aware path SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        self.spawn_targeted(cwd, domain_name, target)
+    }
+
     /// Split an existing pane.
     fn split_pane(
         &self,
@@ -217,6 +249,21 @@ pub trait WeztermInterface: Send + Sync {
         cwd: Option<&str>,
         percent: Option<u8>,
     ) -> WeztermFuture<'_, u64>;
+
+    /// Split a pane bound to the caller's Cx (ft-xbnl0.2.3). Default
+    /// delegates to [`split_pane`](Self::split_pane); concrete impls
+    /// with a Cx-aware path SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&'a str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        self.split_pane(pane_id, direction, cwd, percent)
+    }
     /// Activate a pane.
     fn activate_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
 
@@ -2580,6 +2627,20 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::spawn(self, cwd.as_deref(), domain.as_deref()).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        let cwd = cwd.map(str::to_string);
+        let domain = domain_name.map(str::to_string);
+        Box::pin(async move {
+            WeztermClient::spawn_with_cx(self, cx, cwd.as_deref(), domain.as_deref()).await
+        })
+    }
+
     fn spawn_targeted(
         &self,
         cwd: Option<&str>,
@@ -2593,6 +2654,28 @@ impl WeztermInterface for WeztermClient {
         })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        let cwd = cwd.map(str::to_string);
+        let domain = domain_name.map(str::to_string);
+        Box::pin(async move {
+            WeztermClient::spawn_targeted_with_cx(
+                self,
+                cx,
+                cwd.as_deref(),
+                domain.as_deref(),
+                target,
+            )
+            .await
+        })
+    }
+
     fn split_pane(
         &self,
         pane_id: u64,
@@ -2603,6 +2686,22 @@ impl WeztermInterface for WeztermClient {
         let cwd = cwd.map(str::to_string);
         Box::pin(async move {
             WeztermClient::split_pane(self, pane_id, direction, cwd.as_deref(), percent).await
+        })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&'a str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        let cwd = cwd.map(str::to_string);
+        Box::pin(async move {
+            WeztermClient::split_pane_with_cx(self, cx, pane_id, direction, cwd.as_deref(), percent)
+                .await
         })
     }
 
@@ -2947,6 +3046,41 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         zoom: bool,
     ) -> WeztermFuture<'a, ()> {
         self.as_ref().zoom_pane_with_cx(cx, pane_id, zoom)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        self.as_ref().spawn_with_cx(cx, cwd, domain_name)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        self.as_ref()
+            .spawn_targeted_with_cx(cx, cwd, domain_name, target)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&'a str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        self.as_ref()
+            .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
     #[cfg(feature = "asupersync-runtime")]
@@ -4363,6 +4497,81 @@ mod tests {
                     assert_eq!(path, bogus.to_string_lossy());
                 }
                 other => panic!("UnifiedClient expected SocketNotFound (zoom), got {other:?}"),
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `spawn_with_cx`, `spawn_targeted_with_cx`,
+    /// `split_pane_with_cx` trait extensions must route through the
+    /// Arc<dyn> wrapper to the concrete `WeztermClient` short-circuit.
+    /// Covers the final 3 pane-lifecycle methods on the trait surface
+    /// (parallel to tick 44's activate and tick 45's kill/zoom).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_split_with_cx_forward_through_arc() {
+        run_async_test(async {
+            let bogus = std::env::temp_dir().join(format!(
+                "ft-rusticmaple-tick46-spawn-split-no-such-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            assert!(
+                !bogus.exists(),
+                "precondition: test socket path must not exist"
+            );
+
+            let arc: Arc<dyn WeztermInterface> = Arc::new(WeztermClient::with_socket(
+                bogus.to_string_lossy().into_owned(),
+            ));
+            let cx = crate::cx::for_request();
+
+            // spawn_with_cx
+            let err_spawn = arc
+                .spawn_with_cx(&cx, Some("/tmp"), Some("local"))
+                .await
+                .expect_err("Arc<dyn> spawn_with_cx should short-circuit");
+            match err_spawn {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound (spawn), got {other:?}"),
+            }
+
+            // spawn_targeted_with_cx (new_window branch)
+            let err_target = arc
+                .spawn_targeted_with_cx(
+                    &cx,
+                    None,
+                    None,
+                    SpawnTarget {
+                        new_window: true,
+                        window_id: None,
+                    },
+                )
+                .await
+                .expect_err("Arc<dyn> spawn_targeted_with_cx should short-circuit");
+            match err_target {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => {
+                    panic!("Arc<dyn> expected SocketNotFound (spawn_targeted), got {other:?}")
+                }
+            }
+
+            // split_pane_with_cx (Top direction, no cwd/percent)
+            let err_split = arc
+                .split_pane_with_cx(&cx, 21, SplitDirection::Top, None, None)
+                .await
+                .expect_err("Arc<dyn> split_pane_with_cx should short-circuit");
+            match err_split {
+                crate::Error::Wezterm(WeztermError::SocketNotFound(path)) => {
+                    assert_eq!(path, bogus.to_string_lossy());
+                }
+                other => panic!("Arc<dyn> expected SocketNotFound (split), got {other:?}"),
             }
         });
     }
@@ -6274,6 +6483,41 @@ impl WeztermInterface for UnifiedClient {
         zoom: bool,
     ) -> WeztermFuture<'a, ()> {
         self.inner.zoom_pane_with_cx(cx, pane_id, zoom)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+    ) -> WeztermFuture<'a, u64> {
+        self.inner.spawn_with_cx(cx, cwd, domain_name)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn spawn_targeted_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        cwd: Option<&'a str>,
+        domain_name: Option<&'a str>,
+        target: SpawnTarget,
+    ) -> WeztermFuture<'a, u64> {
+        self.inner
+            .spawn_targeted_with_cx(cx, cwd, domain_name, target)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn split_pane_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: SplitDirection,
+        cwd: Option<&'a str>,
+        percent: Option<u8>,
+    ) -> WeztermFuture<'a, u64> {
+        self.inner
+            .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
     #[cfg(feature = "asupersync-runtime")]
