@@ -108,6 +108,80 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
     }
 }
 
+/// Run the orphan reaper loop against the caller's asupersync capability
+/// context (ft-xbnl0.2.x Cx-first entry point).
+///
+/// Short-circuits before the first reap if `cx` is already cancelled
+/// — an operator who has abandoned the watch daemon should not trigger
+/// a final orphan scan. Otherwise each inter-cycle sleep is bound via
+/// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+/// cancellation from the outer scope cuts the sleep deterministically
+/// under `LabRuntime` virtual time. Both the `shutdown_flag` and
+/// `cx.is_cancel_requested()` are checked each iteration so either
+/// cancellation path terminates the loop promptly without waiting on
+/// the full reap interval.
+///
+/// The legacy [`run_orphan_reaper`] entry point is preserved for
+/// non-migrated callers; this is strictly additive.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn run_orphan_reaper_with_cx(
+    cx: &crate::cx::Cx,
+    config: CliConfig,
+    shutdown_flag: Arc<AtomicBool>,
+) {
+    if cx.is_cancel_requested() {
+        debug!("orphan reaper aborted before first cycle: capability context already cancelled");
+        return;
+    }
+
+    let interval = config.orphan_reap_interval_seconds;
+    if interval == 0 {
+        info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
+        return;
+    }
+
+    let max_age = config.orphan_max_age_seconds;
+    info!(
+        interval_s = interval,
+        max_age_s = max_age,
+        "orphan reaper started (Cx-aware)"
+    );
+
+    loop {
+        // `sleep_with_cx` returns Err on cancellation; treat as
+        // "time to exit" so the loop terminates cleanly without a
+        // spurious extra reap cycle after cancellation.
+        if crate::runtime_compat::sleep_with_cx(cx, Duration::from_secs(interval))
+            .await
+            .is_err()
+        {
+            debug!("orphan reaper shutting down: Cx cancelled during sleep");
+            return;
+        }
+
+        if shutdown_flag.load(Ordering::Relaxed) || cx.is_cancel_requested() {
+            debug!("orphan reaper shutting down");
+            return;
+        }
+
+        let report = reap_orphans(max_age).await;
+        if report.killed > 0 {
+            info!(
+                scanned = report.scanned,
+                killed = report.killed,
+                pids = ?report.killed_pids,
+                "orphan reaper cycle complete"
+            );
+        } else {
+            debug!(scanned = report.scanned, "orphan reaper cycle — no orphans");
+        }
+
+        for err in &report.errors {
+            warn!(error = %err, "orphan reaper error during scan");
+        }
+    }
+}
+
 /// Scan for orphaned `wezterm cli` processes and kill those exceeding
 /// `max_age_seconds`, returning a serializable cycle report.
 pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
@@ -424,5 +498,97 @@ mod tests {
     fn rejects_wezterm_cli_with_only_flags() {
         let line = "  6001   40 wezterm cli --prefer-mux";
         assert!(parse_ps_line_if_reapable(line).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first reaper loop
+    // (ft-xbnl0.2.x slice). Exercise only the short-circuit paths that do
+    // NOT spawn `ps`; the actual reap cycle requires a real
+    // OS process table which is outside the scope of a deterministic test.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_orphan_reaper {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// Pre-flight cancellation: if the Cx is already cancelled on
+        /// entry, the reaper returns before the `interval == 0` check
+        /// and before any `sleep_with_cx` await. A Cx-unaware loop
+        /// would either never start or block on the first sleep; the
+        /// Cx-first entry point must exit immediately.
+        #[test]
+        fn run_orphan_reaper_with_cx_pre_cancelled_exits_immediately() {
+            run_lab(0x0_1FEA_BED5_0505, || async move {
+                let config = CliConfig::default();
+                let shutdown = Arc::new(AtomicBool::new(false));
+
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x orphan_reaper precancel"),
+                );
+
+                run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;
+
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "run_with_cx must return via the Cx path, not the shutdown flag"
+                );
+            });
+        }
+
+        /// Interval=0 disables the reaper: it must return immediately
+        /// even under a live Cx. This matches the legacy `run_orphan_reaper`
+        /// contract and avoids a permanent sleep loop when the operator
+        /// has explicitly opted out.
+        #[test]
+        fn run_orphan_reaper_with_cx_interval_zero_disables() {
+            run_lab(0x0_1FEA_BED5_0606, || async move {
+                let mut config = CliConfig::default();
+                config.orphan_reap_interval_seconds = 0;
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let cx = crate::cx::for_request();
+
+                run_orphan_reaper_with_cx(&cx, config, Arc::clone(&shutdown)).await;
+
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "interval=0 must not touch the shutdown flag"
+                );
+            });
+        }
     }
 }
