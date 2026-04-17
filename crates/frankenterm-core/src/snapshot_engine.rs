@@ -254,6 +254,12 @@ pub enum SnapshotError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    /// The caller's capability context (`Cx`) was cancelled before or
+    /// during the capture. Surfaced only by `capture_with_cx` /
+    /// `shutdown_checkpoint_with_cx` when the outer scope abandons
+    /// the capture race.
+    #[error("snapshot capture cancelled via capability context")]
+    Cancelled,
 }
 
 // =============================================================================
@@ -463,6 +469,178 @@ impl SnapshotEngine {
 
         // 8. Update last hash
         *self.last_state_hash.write().await = Some(state_hash);
+
+        // 9. Record success telemetry
+        self.telemetry
+            .captures_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .panes_captured
+            .fetch_add(pane_count as u64, Ordering::Relaxed);
+        self.telemetry
+            .bytes_persisted
+            .fetch_add(result.2 as u64, Ordering::Relaxed);
+
+        Ok(SnapshotResult {
+            session_id: result.0,
+            checkpoint_id: result.1,
+            pane_count,
+            total_bytes: result.2,
+            trigger,
+        })
+    }
+
+    /// Capture a full mux state snapshot bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Mirrors [`capture`](Self::capture) with two Cx-first changes:
+    ///
+    ///   * The internal `last_state_hash` RwLock uses `read_with_cx(cx)` /
+    ///     `write_with_cx(cx)` so caller cancellation propagates through
+    ///     the dedup cache lookups.
+    ///
+    ///   * `ensure_session` is replaced with `ensure_session_with_cx`
+    ///     which threads `cx` through the inner `session_id` RwLock
+    ///     acquire.
+    ///
+    /// Pre-flight: if `cx` is already cancelled on entry, the
+    /// `captures_attempted` counter is still incremented (parity with
+    /// the legacy observability surface), but the in-progress guard is
+    /// never taken and the method returns `SnapshotError::Cancelled`
+    /// without touching panes, topology, or storage.
+    ///
+    /// The legacy [`capture`](Self::capture) entry point is preserved
+    /// for non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn capture_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        panes: &[PaneInfo],
+        trigger: SnapshotTrigger,
+    ) -> std::result::Result<SnapshotResult, SnapshotError> {
+        self.telemetry
+            .captures_attempted
+            .fetch_add(1, Ordering::Relaxed);
+
+        if cx.checkpoint().is_err() {
+            self.telemetry
+                .capture_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SnapshotError::Cancelled);
+        }
+
+        // 1. Guard: prevent concurrent captures
+        if self.in_progress.swap(true, Ordering::SeqCst) {
+            self.telemetry
+                .capture_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SnapshotError::InProgress);
+        }
+        struct InProgressGuard<'a>(&'a AtomicBool);
+        impl Drop for InProgressGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = InProgressGuard(&self.in_progress);
+
+        if panes.is_empty() {
+            self.telemetry
+                .capture_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SnapshotError::NoPanes);
+        }
+
+        let now_ms = epoch_ms();
+
+        // 2. Build topology snapshot (sync)
+        let (topology, _report) = TopologySnapshot::from_panes(panes, now_ms);
+        let topology_json = topology
+            .to_json()
+            .map_err(|e: serde_json::Error| SnapshotError::Serialization(e.to_string()))?;
+
+        // 3. Correlate agent identity/state + build per-pane snapshots
+        let mut correlator = AgentCorrelator::new();
+        let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
+        let db_path_for_detections = Arc::clone(&self.db_path);
+        let cutoff_ms: i64 =
+            i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
+                .unwrap_or(i64::MAX);
+
+        let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
+            load_latest_detections_by_pane_sync(
+                db_path_for_detections.as_str(),
+                &pane_ids,
+                cutoff_ms,
+            )
+        })
+        .await;
+
+        for (pane_id, detections) in detections_by_pane {
+            correlator.ingest_detections(pane_id, &detections);
+        }
+        for pane in panes {
+            correlator.update_from_pane_info(pane);
+        }
+
+        let pane_states: Vec<PaneStateSnapshot> = panes
+            .iter()
+            .map(|p| {
+                let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
+                if let Some(agent) = correlator.get_metadata(p.pane_id) {
+                    snapshot = snapshot.with_agent(agent);
+                }
+                snapshot
+            })
+            .collect();
+
+        // 4. Compute state hash for dedup (sync)
+        let state_hash = compute_state_hash(panes);
+
+        // 5. Skip if periodic-like and unchanged — Cx-bound read
+        if matches!(
+            trigger,
+            SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
+        ) {
+            let last = self.last_state_hash.read_with_cx(cx).await;
+            if last.as_deref() == Some(&state_hash) {
+                self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
+                return Err(SnapshotError::NoChanges);
+            }
+        }
+
+        // 6. Ensure session exists (Cx-bound)
+        let session_id = self
+            .ensure_session_with_cx(cx, &topology_json, now_ms)
+            .await?;
+
+        // 7. Persist checkpoint + pane states in a transaction
+        let checkpoint_type = trigger.as_db_str().to_string();
+        let pane_count = pane_states.len();
+
+        let db_path = Arc::clone(&self.db_path);
+        let state_hash_clone = state_hash.clone();
+
+        // Checkpoint before the blocking handoff so a canceled caller
+        // skips the DB write entirely.
+        if cx.checkpoint().is_err() {
+            return Err(SnapshotError::Cancelled);
+        }
+        let result = Self::spawn_blocking_db(move || {
+            save_checkpoint_sync(
+                &db_path,
+                &session_id,
+                now_ms,
+                &checkpoint_type,
+                &state_hash_clone,
+                &topology_json,
+                &pane_states,
+            )
+        })
+        .await?;
+
+        // 8. Update last hash — Cx-bound write
+        *self.last_state_hash.write_with_cx(cx).await = Some(state_hash);
 
         // 9. Record success telemetry
         self.telemetry
@@ -824,6 +1002,43 @@ impl SnapshotEngine {
         Ok(session_id)
     }
 
+    /// Get or create the session ID, bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first internal helper).
+    ///
+    /// Threads `cx` through the `session_id` RwLock acquires via
+    /// `read_with_cx` / `write_with_cx` and checkpoints before the
+    /// blocking DB handoff so a canceled caller skips session
+    /// creation cleanly.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn ensure_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        topology_json: &str,
+        now_ms: u64,
+    ) -> std::result::Result<String, SnapshotError> {
+        let existing_session_id = { self.session_id.read_with_cx(cx).await.clone() };
+        if let Some(id) = existing_session_id {
+            return Ok(id);
+        }
+
+        if cx.checkpoint().is_err() {
+            return Err(SnapshotError::Cancelled);
+        }
+
+        let session_id = generate_session_id();
+        let db_path = Arc::clone(&self.db_path);
+        let id = session_id.clone();
+        let topo = topology_json.to_string();
+        let version = crate::VERSION.to_string();
+        Self::spawn_blocking_db(move || {
+            create_session_sync(&db_path, &id, now_ms, &topo, &version)
+        })
+        .await?;
+
+        *self.session_id.write_with_cx(cx).await = Some(session_id.clone());
+        Ok(session_id)
+    }
+
     /// Capture a final shutdown checkpoint and mark the session as cleanly shut down.
     ///
     /// Returns `None` if the capture was skipped (dedup, timeout).
@@ -896,7 +1111,12 @@ impl SnapshotEngine {
         }
 
         let result = crate::runtime_compat::timeout_with_cx(cx, timeout, async {
-            let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
+            // Use the Cx-first capture variant so the inner RwLock
+            // acquires (last_state_hash dedup + session_id) bind to
+            // the caller's Cx rather than an ambient one.
+            let capture_result = self
+                .capture_with_cx(cx, panes, SnapshotTrigger::Shutdown)
+                .await;
             if let Err(e) = self.mark_shutdown().await {
                 tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
             }
@@ -907,6 +1127,14 @@ impl SnapshotEngine {
         match result {
             Ok(Ok(snap)) => Ok(Some(snap)),
             Ok(Err(SnapshotError::NoChanges)) => {
+                let _ = self.mark_shutdown().await;
+                Ok(None)
+            }
+            Ok(Err(SnapshotError::Cancelled)) => {
+                // Caller Cx was cancelled mid-capture. Best-effort mark
+                // shutdown (mark_shutdown uses ambient Cx for its own
+                // DB write, which is acceptable since we're in a
+                // shutdown path and do not want a cancellation storm).
                 let _ = self.mark_shutdown().await;
                 Ok(None)
             }
@@ -3030,6 +3258,96 @@ mod tests {
             assert!(
                 engine.telemetry().snapshot().cleanup_removed >= 2,
                 "cleanup_removed must reflect the actual deletion"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: capture_with_cx with a pre-cancelled Cx
+    /// must surface `SnapshotError::Cancelled` without entering the
+    /// in-progress guard or touching panes/storage. The
+    /// `captures_attempted` counter still increments (parity with the
+    /// legacy observability surface).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn capture_with_cx_pre_cancelled_returns_cancelled() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            let attempts_before = engine.telemetry().snapshot().captures_attempted;
+            let successes_before = engine.telemetry().snapshot().captures_succeeded;
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.3 capture_with_cx precancel"),
+            );
+
+            let result = engine
+                .capture_with_cx(&cx, &panes, SnapshotTrigger::Manual)
+                .await;
+
+            assert!(
+                matches!(result, Err(SnapshotError::Cancelled)),
+                "pre-cancelled capture_with_cx must surface Cancelled, got: {:?}",
+                result
+            );
+
+            // Observability parity
+            assert_eq!(
+                engine.telemetry().snapshot().captures_attempted,
+                attempts_before + 1,
+                "captures_attempted must still increment on pre-cancelled attempts"
+            );
+            assert_eq!(
+                engine.telemetry().snapshot().captures_succeeded,
+                successes_before,
+                "captures_succeeded must NOT change when capture was cancelled"
+            );
+
+            // The in-progress guard must NOT be stuck — a subsequent
+            // uncancelled capture() must still succeed.
+            engine
+                .capture(&panes, SnapshotTrigger::Manual)
+                .await
+                .expect("subsequent capture after pre-cancel must succeed");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: capture_with_cx happy path with a live Cx
+    /// produces the same snapshot shape as legacy capture(). No
+    /// regression on the success path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn capture_with_cx_happy_path_matches_legacy_capture() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            let cx = crate::cx::for_request();
+            let snap = engine
+                .capture_with_cx(&cx, &panes, SnapshotTrigger::Manual)
+                .await
+                .expect("capture_with_cx happy path");
+
+            assert_eq!(snap.trigger, SnapshotTrigger::Manual);
+            assert_eq!(snap.pane_count, 1);
+            assert!(
+                snap.total_bytes > 0,
+                "captured snapshot must record nonzero bytes"
+            );
+
+            let tel = engine.telemetry().snapshot();
+            assert!(
+                tel.captures_succeeded >= 1,
+                "captures_succeeded must increment on happy path"
+            );
+            assert!(
+                tel.panes_captured >= 1,
+                "panes_captured must increment on happy path"
             );
         });
     }
