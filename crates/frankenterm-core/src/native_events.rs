@@ -168,6 +168,51 @@ impl NativeEventListener {
         })
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
+    ///
+    /// Multi-seam checkpoint structure before each filesystem /
+    /// syscall boundary: entry, stale-socket cleanup, parent-dir
+    /// creation, listener bind. Gives responsive cancellation
+    /// during socket setup — a cx-driven caller cancelled
+    /// mid-startup won't touch files it doesn't need to.
+    /// Cancellation surfaces as `NativeEventError::Io(Interrupted)`
+    /// so the caller's existing error-match arms continue to hold.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn bind_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: PathBuf,
+    ) -> Result<Self, NativeEventError> {
+        let check = |stage: &str| -> Result<(), NativeEventError> {
+            cx.checkpoint().map_err(|err| {
+                NativeEventError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("native_events bind cancelled {stage}: {err}"),
+                ))
+            })
+        };
+
+        check("at entry")?;
+
+        if socket_path.as_os_str().is_empty() {
+            return Err(NativeEventError::EmptySocketPath);
+        }
+
+        check("before stale-socket cleanup")?;
+        maybe_cleanup_stale_socket(&socket_path)?;
+
+        if let Some(parent) = socket_path.parent() {
+            check("before parent-dir creation")?;
+            std::fs::create_dir_all(parent)?;
+        }
+
+        check("before listener bind")?;
+        let listener = compat_unix::bind(&socket_path).await?;
+        Ok(Self {
+            socket_path,
+            listener,
+        })
+    }
+
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
         let mut connection_tasks = JoinSet::new();
 
@@ -899,6 +944,60 @@ mod tests {
                 Err(other) => panic!("expected EmptySocketPath, got: {other}"),
                 Ok(_) => panic!("expected error"),
             }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must successfully
+    /// bind when given a fresh, uncancelled cx — producing a
+    /// listener on the same socket path as the legacy `bind`.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn bind_with_cx_succeeds_on_fresh_cx() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("bind-cx-fresh.sock");
+            let cx = crate::cx::for_testing();
+
+            let result = NativeEventListener::bind_with_cx(&cx, socket_path.clone()).await;
+            match &result {
+                Ok(_) => {}
+                Err(e) => panic!("bind_with_cx should succeed on fresh cx: {e}"),
+            }
+            assert!(socket_path.exists(), "socket should exist after bind");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must return an
+    /// `Io(Interrupted)` error on a pre-cancelled cx, without
+    /// creating the socket file.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn bind_with_precancelled_cx_returns_interrupted() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = dir.path().join("bind-cx-cancelled.sock");
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel native_events bind"),
+            );
+
+            let result = NativeEventListener::bind_with_cx(&cx, socket_path.clone()).await;
+            match result {
+                Err(NativeEventError::Io(err)) => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+                    assert!(
+                        err.to_string().contains("cancelled"),
+                        "error should mention cancellation: {err}"
+                    );
+                }
+                Err(other) => panic!("expected Io(Interrupted), got: {other}"),
+                Ok(_) => panic!("bind_with_cx should fail on cancelled cx"),
+            }
+            assert!(
+                !socket_path.exists(),
+                "socket must not exist after cancelled bind"
+            );
         });
     }
 
