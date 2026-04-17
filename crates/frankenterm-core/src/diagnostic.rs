@@ -714,11 +714,15 @@ pub async fn generate_bundle(
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`generate_bundle`].
 ///
-/// Pre-flight checkpoint gates the (potentially expensive)
-/// bundle generation — the CLI `ft diag bundle` command can
-/// be cancelled at entry before any storage work is done.
-/// Delegates to [`generate_bundle`] for the actual work so
-/// the legacy path remains authoritative.
+/// Pre-flight checkpoint gates bundle generation — the CLI
+/// `ft diag bundle` command can be cancelled at entry before
+/// any storage work is done. Tick 124 deepened this from a
+/// pure delegate to a fully cx-threaded body: the 6 internal
+/// storage calls are now routed through their cx-first
+/// siblings so caller cancellation propagates into storage's
+/// pre-flight checkpoints. Per-section cx.checkpoint() seams
+/// also give mid-bundle cancellation before each storage
+/// query.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn generate_bundle_with_cx(
     cx: &crate::cx::Cx,
@@ -729,7 +733,215 @@ pub async fn generate_bundle_with_cx(
 ) -> crate::Result<DiagnosticResult> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("generate_bundle cancelled: {err}")))?;
-    generate_bundle(config, layout, storage, opts).await
+
+    let redactor = Redactor::new();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let bundle_name = format!("diag_{now_ms}");
+    let output_dir = match &opts.output {
+        Some(p) => p.clone(),
+        None => layout.diag_dir.join(&bundle_name),
+    };
+
+    fs::create_dir_all(&output_dir).map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!(
+            "Failed to create diagnostic bundle directory {}: {e}",
+            output_dir.display()
+        )))
+    })?;
+
+    let mut file_count = 0usize;
+
+    let env_info = gather_environment();
+    write_json_file(&output_dir, "environment.json", &env_info)?;
+    file_count += 1;
+
+    let config_summary = summarize_config(config);
+    write_json_file(&output_dir, "config_summary.json", &config_summary)?;
+    file_count += 1;
+
+    let db_path = Path::new(storage.db_path());
+    match gather_db_health(db_path) {
+        Ok(health) => {
+            write_json_file(&output_dir, "db_health.json", &health)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to gather DB health: {e}"),
+            });
+            write_json_file(&output_dir, "db_health.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    let event_query = EventQuery {
+        limit: Some(opts.event_limit),
+        ..Default::default()
+    };
+    match storage.get_events_with_cx(cx, event_query).await {
+        Ok(events) => {
+            let traces = generate_rule_traces(&events, &redactor);
+            if !traces.is_empty() {
+                let traces_dir = output_dir.join("traces");
+                fs::create_dir_all(&traces_dir).map_err(|e| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Failed to create traces directory: {e}"
+                    )))
+                })?;
+                write_json_file(&traces_dir, "rule_traces.json", &traces)?;
+                file_count += 1;
+            }
+
+            let redacted = redact_events(events, &redactor);
+            write_json_file(&output_dir, "recent_events.json", &redacted)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to query events: {e}"),
+            });
+            write_json_file(&output_dir, "recent_events.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    let wf_query = ExportQuery {
+        limit: Some(opts.workflow_limit),
+        ..Default::default()
+    };
+    match storage.export_workflows_with_cx(cx, wf_query).await {
+        Ok(workflows) => {
+            let mut redacted_workflows = Vec::with_capacity(workflows.len());
+            for wf in workflows {
+                let steps = match storage.get_step_logs_with_cx(cx, &wf.id).await {
+                    Ok(steps) => steps
+                        .into_iter()
+                        .map(|s| redact_step(s, &redactor))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                redacted_workflows.push(RedactedWorkflow {
+                    id: wf.id.clone(),
+                    workflow_name: wf.workflow_name.clone(),
+                    pane_id: wf.pane_id,
+                    status: wf.status.clone(),
+                    started_at: wf.started_at,
+                    completed_at: wf.completed_at,
+                    step_count: steps.len(),
+                    steps,
+                });
+            }
+            write_json_file(&output_dir, "recent_workflows.json", &redacted_workflows)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to query workflows: {e}"),
+            });
+            write_json_file(&output_dir, "recent_workflows.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    match storage.list_active_reservations_with_cx(cx).await {
+        Ok(reservations) => {
+            let redacted: Vec<_> = reservations
+                .into_iter()
+                .map(|r| redact_reservation(r, &redactor))
+                .collect();
+            write_json_file(&output_dir, "active_reservations.json", &redacted)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to query reservations: {e}"),
+            });
+            write_json_file(&output_dir, "active_reservations.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    let res_query = ExportQuery {
+        limit: Some(50),
+        ..Default::default()
+    };
+    match storage.export_reservations_with_cx(cx, res_query).await {
+        Ok(all_res) => {
+            let redacted: Vec<_> = all_res
+                .into_iter()
+                .map(|r| redact_reservation(r, &redactor))
+                .collect();
+            write_json_file(&output_dir, "reservation_history.json", &redacted)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to query reservation history: {e}"),
+            });
+            write_json_file(&output_dir, "reservation_history.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    let audit_query = AuditQuery {
+        limit: Some(opts.audit_limit),
+        ..Default::default()
+    };
+    match storage.get_audit_actions_with_cx(cx, audit_query).await {
+        Ok(actions) => {
+            let redacted: Vec<_> = actions
+                .into_iter()
+                .map(|a| redact_audit(a, &redactor))
+                .collect();
+            write_json_file(&output_dir, "recent_audit.json", &redacted)?;
+            file_count += 1;
+        }
+        Err(e) => {
+            let error_info = serde_json::json!({
+                "error": format!("Failed to query audit actions: {e}"),
+            });
+            write_json_file(&output_dir, "recent_audit.json", &error_info)?;
+            file_count += 1;
+        }
+    }
+
+    let mut files = vec![
+        "environment.json".to_string(),
+        "config_summary.json".to_string(),
+        "db_health.json".to_string(),
+        "recent_events.json".to_string(),
+        "recent_workflows.json".to_string(),
+        "active_reservations.json".to_string(),
+        "reservation_history.json".to_string(),
+        "recent_audit.json".to_string(),
+    ];
+
+    let traces_dir = output_dir.join("traces");
+    if traces_dir.exists() && traces_dir.join("rule_traces.json").exists() {
+        files.push("traces/rule_traces.json".to_string());
+    }
+
+    let manifest = BundleManifest {
+        wa_version: crate::VERSION.to_string(),
+        generated_at_ms: now_ms,
+        file_count,
+        files,
+        redacted: true,
+    };
+    write_json_file(&output_dir, "manifest.json", &manifest)?;
+    file_count += 1;
+
+    let total_size = dir_size(&output_dir);
+
+    Ok(DiagnosticResult {
+        output_path: output_dir.display().to_string(),
+        file_count,
+        total_size_bytes: total_size,
+    })
 }
 
 // =============================================================================
