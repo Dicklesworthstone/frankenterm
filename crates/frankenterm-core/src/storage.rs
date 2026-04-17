@@ -6229,6 +6229,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`is_event_muted`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn is_event_muted_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        identity_key: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("is_event_muted cancelled: {err}")))?;
+        self.is_event_muted(identity_key, now_ms).await
+    }
+
     /// List all active (non-expired) mutes.
     pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -6293,6 +6306,21 @@ impl StorageHandle {
         let redactor = Redactor::new();
         action.redact_fields(&redactor);
         self.record_audit_action(action).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
+    ///
+    /// Redacts in-process (synchronous), then routes through the
+    /// cx-first record_audit_action path. 11+ callsites.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_audit_action_redacted_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mut action: AuditActionRecord,
+    ) -> Result<i64> {
+        let redactor = Redactor::new();
+        action.redact_fields(&redactor);
+        self.record_audit_action_with_cx(cx, action).await
     }
 
     /// Upsert undo metadata for an audit action
@@ -6784,6 +6812,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_events_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_events_before cancelled: {err}"))
+        })?;
+        self.count_events_before(before_ts).await
+    }
+
     /// Count events matching tier criteria older than a cutoff (read-path).
     pub async fn count_events_by_tier(
         &self,
@@ -7038,6 +7079,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_approval_token`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn insert_approval_token_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        token: ApprovalTokenRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_approval_token cancelled: {err}"))
+        })?;
+        self.insert_approval_token(token).await
     }
 
     /// Consume an approval token if it matches scope and is valid
@@ -7721,6 +7775,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_events`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_events_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: EventQuery,
+    ) -> Result<Vec<StoredEvent>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_events cancelled: {err}")))?;
+        self.get_events(query).await
+    }
+
     /// Query events using an ID cursor for deterministic replay/resume.
     ///
     /// Results are ordered by ascending event ID so callers can checkpoint using
@@ -7928,6 +7994,18 @@ impl StorageHandle {
             query_pane(&conn, pane_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<PaneRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_pane cancelled: {err}")))?;
+        self.get_pane(pane_id).await
     }
 
     /// Get a specific pane using a synchronous read path.
@@ -19851,6 +19929,121 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 117 hot-path batch smoke test —
+/// 6 more storage cx-first siblings exercised end-to-end:
+/// `count_events_before_with_cx`, `get_pane_with_cx`,
+/// `insert_approval_token_with_cx`,
+/// `record_audit_action_redacted_with_cx`,
+/// `is_event_muted_with_cx`, `get_events_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick117_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick117_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed a pane (for get_pane + FK constraints).
+        let pane = PaneRecord {
+            pane_id: 7,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick117".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // 1. get_pane_with_cx
+        let fetched = storage
+            .get_pane_with_cx(&cx, 7)
+            .await
+            .unwrap()
+            .expect("pane 7 should exist");
+        assert_eq!(fetched.pane_id, 7);
+
+        // 2. get_events_with_cx (empty on fresh DB)
+        let events = storage
+            .get_events_with_cx(&cx, EventQuery::default())
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+
+        // 3. count_events_before_with_cx
+        let count = storage
+            .count_events_before_with_cx(&cx, 1_800_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // 4. is_event_muted_with_cx
+        let muted = storage
+            .is_event_muted_with_cx(&cx, "no-such-key", 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert!(!muted);
+
+        // 5. record_audit_action_redacted_with_cx
+        let action = AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "human".to_string(),
+            actor_id: Some("tick117".to_string()),
+            correlation_id: None,
+            pane_id: Some(7),
+            domain: None,
+            action_kind: "test_action".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("raw reason".to_string()),
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+        let audit_id = storage
+            .record_audit_action_redacted_with_cx(&cx, action)
+            .await
+            .unwrap();
+        assert!(audit_id > 0);
+
+        // 6. insert_approval_token_with_cx
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: "tok-tick117-hash".to_string(),
+            created_at: 1_700_000_000_000,
+            expires_at: 1_800_000_000_000,
+            used_at: None,
+            workspace_id: "ws-tick117".to_string(),
+            action_kind: "test_action".to_string(),
+            pane_id: Some(7),
+            action_fingerprint: "fp-tick117".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        let approval_id = storage
+            .insert_approval_token_with_cx(&cx, token)
+            .await
+            .unwrap();
+        assert!(approval_id > 0);
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
