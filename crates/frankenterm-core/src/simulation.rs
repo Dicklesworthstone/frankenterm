@@ -616,6 +616,43 @@ impl Scenario {
         Ok(())
     }
 
+    /// Cx-first [`Self::setup`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the pane-add loop via `cx.checkpoint()`
+    /// before each `mock.add_pane` call. A pre-cancelled cx
+    /// returns `Err` before any panes are added. A mid-run cancel
+    /// returns with the pane index embedded in the error; panes
+    /// added before the cancellation remain on the mock (no
+    /// rollback — MockWezterm has no transactional bulk-add).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn setup_with_cx(&self, cx: &crate::cx::Cx, mock: &MockWezterm) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!("simulation.setup cancelled pre-start: {err}"))
+        })?;
+
+        for (index, pane_def) in self.panes.iter().enumerate() {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "simulation.setup cancelled at pane index {index}: {err}"
+                ))
+            })?;
+            let pane = MockPane {
+                pane_id: pane_def.id,
+                window_id: pane_def.window_id,
+                tab_id: pane_def.tab_id,
+                title: pane_def.title.clone(),
+                domain: pane_def.domain.clone(),
+                cwd: pane_def.cwd.clone(),
+                is_active: pane_def.id == 0,
+                is_zoomed: false,
+                cols: pane_def.cols,
+                rows: pane_def.rows,
+                content: pane_def.initial_content.clone(),
+            };
+            mock.add_pane(pane).await;
+        }
+        Ok(())
+    }
+
     /// Convert a scenario event to a MockEvent for injection.
     pub fn to_mock_event(event: &ScenarioEvent) -> Result<MockEvent> {
         match event.action {
@@ -1025,6 +1062,21 @@ impl TutorialSandbox {
         }
     }
 
+    /// Cx-first [`Self::trigger_exercise_events`] (ft-xbnl0.2.3).
+    /// Routes the scenario replay through
+    /// [`Scenario::execute_all_with_cx`] (tick 65) so caller
+    /// cancellation propagates through each event injection. No
+    /// additional checkpoint is needed at the sandbox wrapper
+    /// boundary — the inner `execute_all_with_cx` already gates
+    /// at pre-flight and per-event.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn trigger_exercise_events_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
+        match &self.scenario {
+            Some(s) => s.execute_all_with_cx(cx, &self.mock).await,
+            None => Ok(0),
+        }
+    }
+
     /// Check an expectation against the current sandbox state.
     pub async fn check_expectation(&self, kind: &ExpectationKind) -> bool {
         use crate::wezterm::WeztermInterface;
@@ -1055,6 +1107,52 @@ impl TutorialSandbox {
         let mut skip = 0;
 
         for exp in expectations {
+            match &exp.kind {
+                ExpectationKind::Contains { .. } => {
+                    if self.check_expectation(&exp.kind).await {
+                        pass += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+                _ => skip += 1,
+            }
+        }
+
+        (pass, fail, skip)
+    }
+
+    /// Cx-first [`Self::check_all_expectations`] (ft-xbnl0.2.3).
+    /// Threads caller `&Cx` through the expectation-check loop
+    /// via `cx.checkpoint()` at each iteration. A pre-cancelled
+    /// cx short-circuits to `(0, 0, 0)` without running any
+    /// expectation checks. A mid-run cancel returns the partial
+    /// counts accumulated so far (pass/fail/skip up to the
+    /// cancellation point). This matches the expected operator
+    /// UX: if a test run is aborted, the caller can still see
+    /// which expectations were evaluated before the abort.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn check_all_expectations_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> (usize, usize, usize) {
+        if cx.checkpoint().is_err() {
+            return (0, 0, 0);
+        }
+
+        let expectations = match &self.scenario {
+            Some(s) => &s.expectations,
+            None => return (0, 0, 0),
+        };
+
+        let mut pass = 0;
+        let mut fail = 0;
+        let mut skip = 0;
+
+        for exp in expectations {
+            if cx.checkpoint().is_err() {
+                break;
+            }
             match &exp.kind {
                 ExpectationKind::Contains { .. } => {
                     if self.check_expectation(&exp.kind).await {
@@ -2539,6 +2637,93 @@ events: []
             assert_eq!(pass, 2);
             assert_eq!(fail, 0);
             assert_eq!(skip, 0);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: end-to-end parity across all three
+    /// tick-66 additions — `setup_with_cx`,
+    /// `trigger_exercise_events_with_cx`, and
+    /// `check_all_expectations_with_cx`. Uses the default
+    /// tutorial sandbox (which `TutorialSandbox::new()` wires up
+    /// with 2 panes + 2 events + 2 contains expectations) as the
+    /// fixture.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sandbox_cx_first_trail_matches_legacy() {
+        run_async_test(async {
+            let cx = crate::cx::for_request();
+
+            // Both sandboxes: TutorialSandbox::new() calls the
+            // legacy `setup` internally. Tests the non-setup
+            // entry points (trigger/check) via their cx variants.
+            let sandbox_legacy = TutorialSandbox::new().await;
+            let legacy_count = sandbox_legacy.trigger_exercise_events().await.unwrap();
+            let (lp, lf, ls) = sandbox_legacy.check_all_expectations().await;
+
+            let sandbox_cx = TutorialSandbox::new().await;
+            let cx_count = sandbox_cx
+                .trigger_exercise_events_with_cx(&cx)
+                .await
+                .unwrap();
+            let (cp, cf, cs) = sandbox_cx.check_all_expectations_with_cx(&cx).await;
+
+            assert_eq!(legacy_count, cx_count, "trigger event counts must match");
+            assert_eq!(
+                (lp, lf, ls),
+                (cp, cf, cs),
+                "expectation (pass, fail, skip) counts must match across legacy and cx"
+            );
+            assert_eq!(cp, 2, "tutorial sandbox should pass both expectations");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `Scenario::setup_with_cx` must
+    /// match the legacy `setup` — same pane count, same pane
+    /// fields. Separate test from the sandbox trail because
+    /// setup is called from inside TutorialSandbox::new() which
+    /// uses the legacy setup. This test exercises setup_with_cx
+    /// directly on a bare MockWezterm.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn scenario_setup_with_cx_matches_legacy() {
+        run_async_test(async {
+            let yaml = r#"
+name: setup_parity
+duration: "1s"
+panes:
+  - id: 0
+    title: "pane0"
+    initial_content: "p0"
+  - id: 1
+    title: "pane1"
+    initial_content: "p1"
+events: []
+"#;
+            let scenario = Scenario::from_yaml(yaml).unwrap();
+
+            let mock_legacy = MockWezterm::new();
+            scenario.setup(&mock_legacy).await.unwrap();
+
+            let mock_cx = MockWezterm::new();
+            let cx = crate::cx::for_request();
+            scenario.setup_with_cx(&cx, &mock_cx).await.unwrap();
+
+            assert_eq!(
+                mock_legacy.pane_count().await,
+                mock_cx.pane_count().await,
+                "pane counts must match"
+            );
+            assert_eq!(mock_cx.pane_count().await, 2);
+
+            // Each pane's text must match.
+            for pane_id in [0_u64, 1] {
+                let text_legacy = mock_legacy.get_text(pane_id, false).await.unwrap();
+                let text_cx = mock_cx.get_text(pane_id, false).await.unwrap();
+                assert_eq!(
+                    text_legacy, text_cx,
+                    "pane {pane_id} text must match across legacy and cx setup"
+                );
+            }
         });
     }
 
