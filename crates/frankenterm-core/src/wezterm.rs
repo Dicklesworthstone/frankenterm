@@ -960,6 +960,136 @@ impl WeztermClient {
         self.run_cli_with_pane_check_retry(&args, pane_id).await
     }
 
+    /// Get text content from a pane, bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Mux-pool fast path uses `pool.get_pane_render_changes_with_cx(cx)`
+    /// plus `pool.get_lines_with_cx(cx)` for each scrollback chunk, so
+    /// a caller-cancelled long scrollback read terminates promptly
+    /// instead of consuming the full scrollback-fetch budget.
+    ///
+    /// When `escapes == true` the mux path is not used (vendored mux
+    /// does not support escape-sequence extraction) and the call
+    /// delegates to the legacy CLI path.
+    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    pub async fn get_text_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Result<String> {
+        if let Some(ref pool) = self.mux_pool {
+            if escapes {
+                tracing::debug!(
+                    "mux pool get_text_with_cx does not support escapes; falling back to CLI"
+                );
+            } else if self.mux_circuit_guard() {
+                let mut pool_text: Option<String> = None;
+                'mux_text: {
+                    let changes = match pool.get_pane_render_changes_with_cx(cx, pane_id).await {
+                        Ok(changes) => changes,
+                        Err(e) => {
+                            self.mux_circuit_record_failure(&e);
+                            tracing::debug!(
+                                error = %e,
+                                "mux pool get_text_with_cx: render_changes failed; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+
+                    let scrollback_top = changes.dimensions.scrollback_top;
+                    let scrollback_rows: isize = match changes.dimensions.scrollback_rows.try_into()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::debug!(
+                                rows = changes.dimensions.scrollback_rows,
+                                "mux pool get_text_with_cx: scrollback_rows overflow; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+                    let scrollback_end = match scrollback_top.checked_add(scrollback_rows) {
+                        Some(v) => v,
+                        None => {
+                            tracing::debug!(
+                                top = scrollback_top,
+                                rows = scrollback_rows,
+                                "mux pool get_text_with_cx: scrollback range overflow; falling back to CLI"
+                            );
+                            break 'mux_text;
+                        }
+                    };
+
+                    if scrollback_rows <= 0 || scrollback_end <= scrollback_top {
+                        pool_text = Some(String::new());
+                        break 'mux_text;
+                    }
+
+                    const CHUNK_ROWS: isize = 2_000;
+                    let mut out = String::new();
+                    let mut start = scrollback_top;
+
+                    while start < scrollback_end {
+                        let chunk_end = start
+                            .checked_add(CHUNK_ROWS)
+                            .unwrap_or(scrollback_end)
+                            .min(scrollback_end);
+
+                        #[allow(clippy::single_range_in_vec_init)]
+                        match pool
+                            .get_lines_with_cx(cx, pane_id, vec![start..chunk_end])
+                            .await
+                        {
+                            Ok(resp) => {
+                                let (mut lines, _images) = resp.lines.extract_data();
+                                lines.sort_by_key(|(idx, _)| *idx);
+                                for (_, line) in lines {
+                                    out.push_str(line.as_str().as_ref());
+                                    out.push('\n');
+                                }
+                            }
+                            Err(e) => {
+                                self.mux_circuit_record_failure(&e);
+                                tracing::debug!(
+                                    error = %e,
+                                    "mux pool get_text_with_cx: get_lines failed; falling back to CLI"
+                                );
+                                break 'mux_text;
+                            }
+                        }
+
+                        start = chunk_end;
+                    }
+
+                    pool_text = Some(out);
+                }
+
+                if let Some(text) = pool_text {
+                    self.mux_circuit_record_success();
+                    return Ok(text);
+                }
+            }
+        }
+
+        // CLI fallback delegates to the legacy get_text path. Matches
+        // the pattern used by list_panes_with_cx / send_text_impl_with_cx.
+        self.get_text(pane_id, escapes).await
+    }
+
+    /// Stub `get_text_with_cx` for configurations without
+    /// vendored+unix+asupersync — delegates to the legacy get_text.
+    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    pub async fn get_text_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Result<String> {
+        self.get_text(pane_id, escapes).await
+    }
+
     /// Read the mux-side tiered scrollback summary for a pane when available.
     ///
     /// This is a best-effort telemetry path used by runtime maintenance. It
@@ -999,6 +1129,67 @@ impl WeztermClient {
             "tiered scrollback telemetry unavailable for pane {pane_id}: CLI-only backend does not expose tiered scrollback status"
         ))
         .into())
+    }
+
+    /// Get tiered-scrollback telemetry for a pane under an explicit `&Cx`
+    /// (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Uses `pool.get_pane_render_changes_with_cx(cx)` so a caller-
+    /// cancelled render-changes lookup propagates through to the
+    /// underlying `DirectMuxClient::get_pane_render_changes_with_cx`.
+    /// Mux circuit-breaker accounting preserved identically.
+    ///
+    /// Tiered scrollback is a vendored-mux-only capability; the CLI
+    /// fallback path surfaces a `CommandFailed` error matching the
+    /// legacy [`pane_tiered_scrollback_summary`](Self::pane_tiered_scrollback_summary)
+    /// contract.
+    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    pub async fn pane_tiered_scrollback_summary_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<PaneTieredScrollbackSummary> {
+        if let Some(ref pool) = self.mux_pool {
+            if self.mux_circuit_guard() {
+                match pool.get_pane_render_changes_with_cx(cx, pane_id).await {
+                    Ok(changes) => {
+                        return self.map_mux_tiered_scrollback_summary(
+                            pane_id,
+                            changes.tiered_scrollback_status,
+                        );
+                    }
+                    Err(err) => {
+                        self.mux_circuit_record_failure(&err);
+                        return Err(WeztermError::CommandFailed(format!(
+                            "failed to read tiered scrollback status for pane {pane_id}: {err}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+
+            return Err(WeztermError::CommandFailed(format!(
+                "tiered scrollback telemetry unavailable for pane {pane_id}: vendored mux circuit breaker open and CLI fallback has no tiered scrollback surface"
+            ))
+            .into());
+        }
+
+        Err(WeztermError::CommandFailed(format!(
+            "tiered scrollback telemetry unavailable for pane {pane_id}: no mux pool configured"
+        ))
+        .into())
+    }
+
+    /// Stub `pane_tiered_scrollback_summary_with_cx` for configurations
+    /// without vendored+unix+asupersync — delegates to the legacy
+    /// method which returns the CLI-unavailable error path.
+    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    pub async fn pane_tiered_scrollback_summary_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<PaneTieredScrollbackSummary> {
+        self.pane_tiered_scrollback_summary(pane_id).await
     }
 
     /// Send text to a pane using paste mode (default, faster for multi-char input)
