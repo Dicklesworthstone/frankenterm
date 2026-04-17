@@ -1399,12 +1399,30 @@ impl IpcClient {
         self.send_request(IpcRequest::Status).await
     }
 
+    /// Cx-first [`Self::status`] (ft-xbnl0.2.3). Routes the IPC
+    /// status round-trip through [`Self::send_request_with_cx`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn status_with_cx(&self, cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_cx(cx, IpcRequest::Status).await
+    }
+
     /// Request pane state from watcher registry.
     ///
     /// # Errors
     /// Returns error if connection fails.
     pub async fn pane_state(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
         self.send_request(IpcRequest::PaneState { pane_id }).await
+    }
+
+    /// Cx-first [`Self::pane_state`] (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn pane_state_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_cx(cx, IpcRequest::PaneState { pane_id })
+            .await
     }
 
     /// Set a runtime pane capture priority override.
@@ -1422,9 +1440,40 @@ impl IpcClient {
         .await
     }
 
+    /// Cx-first [`Self::set_pane_priority`] (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_pane_priority_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        priority: u32,
+        ttl_ms: Option<u64>,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_cx(
+            cx,
+            IpcRequest::SetPanePriority {
+                pane_id,
+                priority,
+                ttl_ms,
+            },
+        )
+        .await
+    }
+
     /// Clear any runtime pane capture priority override.
     pub async fn clear_pane_priority(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
         self.send_request(IpcRequest::ClearPanePriority { pane_id })
+            .await
+    }
+
+    /// Cx-first [`Self::clear_pane_priority`] (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn clear_pane_priority_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_cx(cx, IpcRequest::ClearPanePriority { pane_id })
             .await
     }
 
@@ -1438,6 +1487,21 @@ impl IpcClient {
         request_id: Option<String>,
     ) -> Result<IpcResponse, UserVarError> {
         self.send_request_with_id(IpcRequest::Rpc { args }, request_id)
+            .await
+    }
+
+    /// Cx-first [`Self::call_rpc`] (ft-xbnl0.2.3). Uses
+    /// [`Self::send_request_with_id_with_cx`] directly (not
+    /// [`Self::send_request_with_cx`]) because RPC calls carry a
+    /// caller-supplied `request_id` for response correlation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn call_rpc_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        args: Vec<String>,
+        request_id: Option<String>,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request_with_id_with_cx(cx, IpcRequest::Rpc { args }, request_id)
             .await
     }
 
@@ -1754,6 +1818,78 @@ mod tests {
     fn ipc_client_detects_missing_socket() {
         let client = IpcClient::new("/nonexistent/path/ipc.sock");
         assert!(!client.socket_exists());
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: remaining 5 IpcClient `_with_cx`
+    /// entries (status, pane_state, set_pane_priority,
+    /// clear_pane_priority, call_rpc) must match their legacy
+    /// siblings on the missing-socket path. Consolidated test
+    /// covers all 5 with one fixture.
+    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[test]
+    fn remaining_ipc_with_cx_entries_match_legacy_on_missing_socket() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let bogus = std::env::temp_dir().join(format!(
+                    "ft-rusticmaple-tick78-ipc-trail-complete-{}-{}.sock",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                ));
+                assert!(!bogus.exists());
+                let client = IpcClient::new(&bogus);
+                let cx = crate::cx::for_request();
+
+                // status_with_cx
+                let err = client
+                    .status_with_cx(&cx)
+                    .await
+                    .expect_err("status_with_cx on missing socket");
+                assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+
+                // pane_state_with_cx
+                let err = client
+                    .pane_state_with_cx(&cx, 42)
+                    .await
+                    .expect_err("pane_state_with_cx on missing socket");
+                assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+
+                // set_pane_priority_with_cx
+                let err = client
+                    .set_pane_priority_with_cx(&cx, 42, 7, None)
+                    .await
+                    .expect_err("set_pane_priority_with_cx on missing socket");
+                assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+
+                // clear_pane_priority_with_cx
+                let err = client
+                    .clear_pane_priority_with_cx(&cx, 42)
+                    .await
+                    .expect_err("clear_pane_priority_with_cx on missing socket");
+                assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+
+                // call_rpc_with_cx (takes request_id)
+                let err = client
+                    .call_rpc_with_cx(&cx, vec!["test".to_string()], Some("corr-78".to_string()))
+                    .await
+                    .expect_err("call_rpc_with_cx on missing socket");
+                assert!(matches!(err, UserVarError::WatcherNotRunning { .. }));
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first: `ping_with_cx` must match the
