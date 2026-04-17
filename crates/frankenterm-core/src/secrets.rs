@@ -257,7 +257,9 @@ impl SecretScanEngine {
             report_json: serde_json::to_string(&report)?,
             created_at: report.completed_at,
         };
-        let _ = storage.record_secret_scan_report_with_cx(cx, record).await?;
+        let _ = storage
+            .record_secret_scan_report_with_cx(cx, record)
+            .await?;
 
         Ok(report)
     }
