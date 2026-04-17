@@ -267,6 +267,34 @@ impl<T> TxProducer<T> {
         }
     }
 
+    /// Cx-first [`Self::reserve`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the wait loop via `cx.checkpoint()?` at the
+    /// top of each iteration. A pre-cancelled cx returns
+    /// `Err(Closed)` without touching the queue; a mid-wait
+    /// cancel breaks the caller out of the blocking
+    /// `capacity_freed.notified().await` and surfaces as
+    /// `Err(Closed)` too — matches the close-while-waiting
+    /// return shape so existing callers that handle `Closed`
+    /// don't need to special-case cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn reserve_with_cx(&self, cx: &crate::cx::Cx) -> Result<Reservation, TxChannelError> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return Err(TxChannelError::Closed);
+            }
+            match self.try_reserve() {
+                Ok(r) => return Ok(r),
+                Err(TxChannelError::Full) => {
+                    self.shared.rollback_state.capacity_freed.notified().await;
+                    if self.shared.closed.load(Ordering::Acquire) {
+                        return Err(TxChannelError::Closed);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Commit a value through a reservation, delivering it to consumers.
     ///
     /// The reservation is consumed and marked as committed. The value is
@@ -431,6 +459,27 @@ impl<T> TxConsumer<T> {
     /// Returns `None` if the channel is closed and all values have been consumed.
     pub async fn recv(&self) -> Option<ReceivedValue<T>> {
         loop {
+            if let Some(rv) = self.try_recv() {
+                return Some(rv);
+            }
+            if self.shared.closed.load(Ordering::Acquire) && self.shared.queue.is_empty() {
+                return None;
+            }
+            self.shared.not_empty.notified().await;
+        }
+    }
+
+    /// Cx-first [`Self::recv`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the wait loop. Returns `None` on
+    /// pre-cancel or mid-wait cancel — matches the
+    /// closed-and-drained return shape so existing callers
+    /// that check `None` need no changes.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<ReceivedValue<T>> {
+        loop {
+            if cx.checkpoint().is_err() {
+                return None;
+            }
             if let Some(rv) = self.try_recv() {
                 return Some(rv);
             }
@@ -671,6 +720,52 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::thread;
+
+    /// ft-xbnl0.2.3 Cx-first: `reserve_with_cx` + `recv_with_cx`
+    /// must match their legacy siblings on a round-trip
+    /// (reserve, commit, recv). Uses run_async_test-equivalent
+    /// raw block_on because cancellation_safe_channel tests
+    /// use sync fixtures.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn tx_channel_with_cx_round_trip() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let (tx, rx) = tx_channel::<String>(4);
+                let cx = crate::cx::for_request();
+
+                // Reserve via Cx-first path.
+                let r = tx.reserve_with_cx(&cx).await.expect("reserve_with_cx");
+                assert_eq!(r.seq(), 1);
+                assert_eq!(tx.active_reservations(), 1);
+
+                // Commit is sync — unchanged.
+                tx.commit(&r, "cx-hello".into()).expect("commit");
+                assert!(r.is_committed());
+                assert_eq!(tx.queued(), 1);
+
+                // Receive via Cx-first path.
+                let rv = rx
+                    .recv_with_cx(&cx)
+                    .await
+                    .expect("recv_with_cx must return value");
+                assert_eq!(rv.seq, 1);
+                assert_eq!(rv.value, "cx-hello");
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn basic_reserve_commit() {
