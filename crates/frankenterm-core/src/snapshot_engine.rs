@@ -804,6 +804,76 @@ impl SnapshotEngine {
         }
     }
 
+    /// Capture a final shutdown checkpoint, bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Identical semantics to [`shutdown_checkpoint`](Self::shutdown_checkpoint)
+    /// with the inner timeout rebound via
+    /// [`crate::runtime_compat::timeout_with_cx`] so outer-scope cancellation
+    /// (operator abort, deadline collapse) cuts the capture race
+    /// deterministically under `LabRuntime` virtual time rather than only
+    /// responding to the explicit `timeout` argument.
+    ///
+    /// Pre-flight: if `cx` is already cancelled, skip the capture attempt
+    /// entirely, best-effort mark the session as cleanly shut down, and
+    /// return `Ok(None)`. An operator who has abandoned the shutdown race
+    /// should not trigger a full capture just to immediately time out.
+    ///
+    /// The legacy [`shutdown_checkpoint`](Self::shutdown_checkpoint) entry
+    /// point is preserved for non-migrated callers; this is strictly
+    /// additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn shutdown_checkpoint_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        panes: &[PaneInfo],
+        timeout: Duration,
+    ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
+        if cx.is_cancel_requested() {
+            tracing::debug!(
+                "shutdown_checkpoint_with_cx: Cx pre-cancelled; skipping capture and marking \
+                 shutdown"
+            );
+            let _ = self.mark_shutdown().await;
+            return Ok(None);
+        }
+
+        let result = crate::runtime_compat::timeout_with_cx(cx, timeout, async {
+            let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
+            if let Err(e) = self.mark_shutdown().await {
+                tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
+            }
+            capture_result
+        })
+        .await;
+
+        match result {
+            Ok(Ok(snap)) => Ok(Some(snap)),
+            Ok(Err(SnapshotError::NoChanges)) => {
+                let _ = self.mark_shutdown().await;
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                let _ = self.mark_shutdown().await;
+                Err(e)
+            }
+            Err(_) => {
+                // `timeout_with_cx` returns Err on either the timeout
+                // elapsing OR the Cx being cancelled. Either way, best
+                // effort mark shutdown and surface None.
+                if cx.is_cancel_requested() {
+                    tracing::warn!(
+                        "Shutdown checkpoint cancelled via Cx before completing within {timeout:?}"
+                    );
+                } else {
+                    tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
+                }
+                let _ = self.mark_shutdown().await;
+                Ok(None)
+            }
+        }
+    }
+
     /// Access the operational telemetry counters.
     #[must_use]
     pub fn telemetry(&self) -> &SnapshotEngineTelemetry {
@@ -2664,6 +2734,120 @@ mod tests {
             assert_eq!(snap.trigger, SnapshotTrigger::Shutdown);
 
             // Verify shutdown flag is set
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let clean: i64 = conn
+                .query_row(
+                    "SELECT shutdown_clean FROM mux_sessions WHERE session_id = ?1",
+                    [&snap.session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(clean, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.x Cx-first: `shutdown_checkpoint_with_cx` must short-circuit
+    /// when the caller's Cx is already cancelled on entry. The shutdown
+    /// flag must still be recorded (best effort) and the result must be
+    /// `Ok(None)` — an operator who has abandoned the shutdown race
+    /// should not trigger a full capture just to immediately time out,
+    /// but the session must still be marked as cleanly shut down so a
+    /// subsequent restart does not offer an unclean-shutdown recovery
+    /// prompt for a session the operator intentionally ended.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn shutdown_checkpoint_with_cx_pre_cancelled_marks_shutdown_without_capture() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            // Establish a session first so there's something to mark shutdown on.
+            engine
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .expect("startup capture");
+            let captures_before = engine.telemetry().snapshot().captures_attempted;
+
+            // Pre-cancel the Cx. Use a different pane state so a normal
+            // shutdown_checkpoint would NOT hit the NoChanges dedup path.
+            let panes2 = vec![make_test_pane(1, 30, 100)];
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.x pre-cancel shutdown"),
+            );
+
+            let wall_start = std::time::Instant::now();
+            let result = engine
+                .shutdown_checkpoint_with_cx(&cx, &panes2, Duration::from_secs(5))
+                .await
+                .expect("pre-cancelled shutdown returns Ok(None)");
+
+            // Must not have triggered a capture.
+            assert!(
+                result.is_none(),
+                "pre-cancelled shutdown must skip capture and return None"
+            );
+            assert_eq!(
+                engine.telemetry().snapshot().captures_attempted,
+                captures_before,
+                "pre-cancelled shutdown must not record a capture attempt"
+            );
+            assert!(
+                wall_start.elapsed() < Duration::from_secs(1),
+                "pre-cancelled shutdown must not consume the timeout budget; took {:?}",
+                wall_start.elapsed()
+            );
+
+            // Session must still be marked as cleanly shut down so the
+            // operator does not get an unclean-shutdown prompt on restart.
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let clean: i64 = conn
+                .query_row(
+                    "SELECT shutdown_clean FROM mux_sessions ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                clean, 1,
+                "pre-cancelled shutdown must still mark the session as cleanly shut down"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.x Cx-first: happy path — `shutdown_checkpoint_with_cx`
+    /// with a fresh Cx behaves identically to `shutdown_checkpoint`, i.e.
+    /// captures a Shutdown-triggered snapshot and marks the session
+    /// clean. Pins the contract that the Cx entry point doesn't regress
+    /// the existing operational behavior.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn shutdown_checkpoint_with_cx_happy_path_captures_and_marks() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let panes = vec![make_test_pane(1, 24, 80)];
+
+            engine
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .expect("startup capture");
+
+            // Fresh, non-cancelled Cx.
+            let cx = crate::cx::for_request();
+            let panes2 = vec![make_test_pane(1, 30, 100)];
+            let result = engine
+                .shutdown_checkpoint_with_cx(&cx, &panes2, Duration::from_secs(5))
+                .await
+                .expect("shutdown capture");
+            assert!(result.is_some(), "fresh-cx shutdown must capture a snapshot");
+
+            let snap = result.unwrap();
+            assert_eq!(snap.trigger, SnapshotTrigger::Shutdown);
+
             let conn = Connection::open(db_path.as_str()).unwrap();
             let clean: i64 = conn
                 .query_row(
