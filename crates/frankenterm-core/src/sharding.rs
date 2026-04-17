@@ -593,11 +593,12 @@ impl ShardedWeztermClient {
     /// caller's asupersync capability context (ft-xbnl0.2.3 Cx-first
     /// entry point).
     ///
-    /// The internal `pane_routes` RwLock acquire uses `write_with_cx(cx)`
-    /// so a caller-cancelled wait propagates cleanly. The
-    /// `backend.handle.spawn()` call remains ambient (WeztermHandle
-    /// spawn is CLI-only and out of scope; see ft-xbnl0.2.3 bead
-    /// for the retry-helper refactor seam).
+    /// Routes `cx` through both the subprocess I/O via
+    /// [`WeztermInterface::spawn_with_cx`] (landed in tick 46) AND
+    /// the internal `pane_routes` RwLock acquire via
+    /// [`crate::runtime_compat::RwLock::write_with_cx`], so caller
+    /// cancellation/budget/virtual time propagate end-to-end through
+    /// the entire spawn pipeline.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn spawn_with_hints_with_cx(
         &self,
@@ -611,7 +612,7 @@ impl ShardedWeztermClient {
         let backend = self.backend_for_id(shard)?;
         let local_id = backend
             .handle
-            .spawn(cwd, domain_name)
+            .spawn_with_cx(cx, cwd, domain_name)
             .await
             .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
         let global_id = encode_sharded_pane_id(shard, local_id);
@@ -1738,6 +1739,63 @@ mod tests {
             assert_eq!(decode_sharded_pane_id(pane), (ShardId(1), 0));
             assert_eq!(shard0.pane_count().await, 0);
             assert_eq!(shard1.pane_count().await, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `spawn_with_hints_with_cx` must route
+    /// through `backend.handle.spawn_with_cx` (tick 47 upgrade — the
+    /// trait gained spawn_with_cx in tick 46, so the internal call
+    /// previously left as ambient `backend.handle.spawn()` is now
+    /// cx-aware). Mirrors `spawn_with_agent_hint_uses_agent_assignment`
+    /// but drives the Cx-first entry point with a fresh `Cx`,
+    /// asserting the agent-hint routing logic + pane route insertion
+    /// work end-to-end when cx is threaded through both the
+    /// subprocess hop AND the `pane_routes.write_with_cx` RwLock
+    /// acquire.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn spawn_with_hints_with_cx_routes_and_records() {
+        run_async_test(async {
+            let shard0 = Arc::new(MockWezterm::new());
+            let shard1 = Arc::new(MockWezterm::new());
+            let handle0: WeztermHandle = shard0.clone();
+            let handle1: WeztermHandle = shard1.clone();
+
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), "zero", handle0),
+                    ShardBackend::new(ShardId(1), "one", handle1),
+                ],
+                AssignmentStrategy::ByAgentType {
+                    agent_to_shard: HashMap::from([
+                        (AgentType::Codex, ShardId(1)),
+                        (AgentType::ClaudeCode, ShardId(0)),
+                    ]),
+                    default_shard: Some(ShardId(0)),
+                },
+            )
+            .unwrap();
+
+            let cx = crate::cx::for_request();
+            let pane = client
+                .spawn_with_hints_with_cx(&cx, None, None, Some(AgentType::Codex))
+                .await
+                .unwrap();
+
+            // Agent-hint routed to shard 1 (Codex assignment).
+            assert_eq!(
+                decode_sharded_pane_id(pane),
+                (ShardId(1), 0),
+                "Codex agent hint should route to shard 1"
+            );
+            assert_eq!(shard0.pane_count().await, 0);
+            assert_eq!(shard1.pane_count().await, 1);
+
+            // Pane route recorded for subsequent lookups.
+            let routes = client.pane_routes.read_with_cx(&cx).await;
+            let recorded = routes.get(&pane).expect("pane route must be recorded");
+            assert_eq!(recorded.shard_id, ShardId(1));
+            assert_eq!(recorded.local_pane_id, 0);
         });
     }
 
