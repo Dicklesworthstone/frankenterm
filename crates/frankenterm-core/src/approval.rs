@@ -118,6 +118,79 @@ impl<'a> ApprovalStore<'a> {
         })
     }
 
+    /// Cx-first [`Self::issue`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the two storage calls via `cx.checkpoint()`
+    /// boundaries: pre-flight (short-circuits before
+    /// `count_active_approvals` on pre-cancelled cx) and between
+    /// the count and the insert (a late-cancelled caller can abort
+    /// before writing a new token record).
+    ///
+    /// Cancellation-safety contract: the token is inserted into
+    /// storage AFTER both checkpoints, so a cancel during the
+    /// checkpoint window leaves no token on disk. A cancel during
+    /// the insert itself is out of scope (StorageHandle has no
+    /// `_with_cx` surface yet — 147 async fns without cx).
+    ///
+    /// Semantics identical to [`Self::issue`] for uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn issue_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        input: &PolicyInput,
+        summary: Option<String>,
+    ) -> Result<ApprovalRequest> {
+        cx.checkpoint()
+            .map_err(|err| Error::Runtime(format!("approval.issue cancelled pre-start: {err}")))?;
+
+        let now = now_ms();
+        let active = self
+            .storage
+            .count_active_approvals(&self.workspace_id, now)
+            .await?;
+        if active >= self.config.max_active_tokens {
+            return Err(Error::Policy(format!(
+                "Approval token limit reached ({active}/{})",
+                self.config.max_active_tokens
+            )));
+        }
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "approval.issue cancelled between count and insert (active={active}): {err}"
+            ))
+        })?;
+
+        let code = generate_allow_once_code(DEFAULT_CODE_LEN);
+        let code_hash = hash_allow_once_code(&code);
+        let fingerprint = fingerprint_for_input(input);
+        let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
+
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: code_hash.clone(),
+            created_at: now,
+            expires_at,
+            used_at: None,
+            workspace_id: self.workspace_id.clone(),
+            action_kind: input.action.as_str().to_string(),
+            pane_id: input.pane_id,
+            action_fingerprint: fingerprint,
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        self.storage.insert_approval_token(token).await?;
+
+        let summary = summary.unwrap_or_else(|| summary_for_input(input));
+        Ok(ApprovalRequest {
+            allow_once_code: code.clone(),
+            allow_once_full_hash: code_hash,
+            expires_at,
+            summary,
+            command: format!("ft approve {code}"),
+        })
+    }
+
     /// Issue a plan-bound allow-once approval for a specific ActionPlan.
     ///
     /// The token will only be consumable when the caller presents the same
@@ -1127,6 +1200,85 @@ mod tests {
     // -----------------------------------------------------------------------
     // Async integration tests (existing)
     // -----------------------------------------------------------------------
+
+    /// ft-xbnl0.2.3 Cx-first: `issue_with_cx` must match the
+    /// legacy `issue` for an uncancelled cx. Exercises the full
+    /// token-issue flow (count_active_approvals + insert_approval_token)
+    /// and asserts the returned ApprovalRequest has the same
+    /// structural shape as the legacy path. Also verifies the
+    /// Cx-first-issued token is consumable by the legacy
+    /// `consume` — proving the checkpoint seams don't corrupt any
+    /// token state.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn issue_with_cx_matches_legacy_and_is_consumable() {
+        run_async_test(async {
+            let temp_dir = std::env::temp_dir();
+            let db_path = temp_dir.join(format!(
+                "wa_test_approval_issue_cx_{}.db",
+                std::process::id()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path_str).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+            let cx = crate::cx::for_request();
+
+            // Cx-first issue
+            let request = store.issue_with_cx(&cx, &input, None).await.unwrap();
+
+            // Structural checks mirror the legacy `issue_and_consume_allow_once` test.
+            assert!(request.allow_once_full_hash.starts_with("sha256:"));
+            assert_eq!(
+                request.command,
+                format!("ft approve {}", request.allow_once_code)
+            );
+
+            // The Cx-first-issued token must be consumable by the
+            // legacy consume path. This proves the token was
+            // written to storage with the same schema/fingerprint
+            // the legacy consumer expects.
+            let consumed = store
+                .consume(&request.allow_once_code, &input)
+                .await
+                .unwrap();
+            assert!(
+                consumed.is_some(),
+                "Cx-first-issued token must be consumable by legacy consume"
+            );
+
+            // Double-consume should fail (token exhausted) —
+            // same invariant as legacy.
+            let second = store
+                .consume(&request.allow_once_code, &input)
+                .await
+                .unwrap();
+            assert!(second.is_none(), "token should be exhausted after consume");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        });
+    }
 
     #[test]
     fn issue_and_consume_allow_once() {
