@@ -197,6 +197,143 @@ impl SecretScanEngine {
         Ok(report)
     }
 
+    /// Cx-first [`scan_storage`] (ft-xbnl0.2.3). Threads caller `&Cx`
+    /// through the batch loop via `cx.checkpoint()` before each
+    /// `storage.scan_segments` call. A pre-cancelled cx returns
+    /// early with an empty report (resume_after_id preserved); a
+    /// mid-scan cancel returns a partial report with the most recent
+    /// `after_id` so a subsequent resume picks up where cancellation
+    /// occurred. Underlying scan_segment per-row work is
+    /// synchronous + CPU-only, so per-row cancellation would require
+    /// storage._with_cx which does not yet exist (147 storage async
+    /// fns without cx). The between-batches seam is the value-add.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn scan_storage_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        options: SecretScanOptions,
+    ) -> Result<SecretScanReport> {
+        self.scan_storage_from_with_cx(cx, storage, options, None)
+            .await
+    }
+
+    /// Cx-first [`scan_storage_incremental`] (ft-xbnl0.2.3).
+    /// Mirrors the legacy incremental-resume path but routes the
+    /// batch scan through [`Self::scan_storage_from_with_cx`]. The
+    /// preamble checkpoint captures
+    /// pre-cancelled cx before touching storage.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn scan_storage_incremental_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        options: SecretScanOptions,
+    ) -> Result<SecretScanReport> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!("scan_storage_incremental cancelled: {err}"))
+        })?;
+
+        let scope = SecretScanScope::from_options(&options);
+        let scope_json = serde_json::to_string(&scope)?;
+        let scope_hash = hash_bytes(scope_json.as_bytes());
+        let checkpoint = storage.latest_secret_scan_report(&scope_hash).await?;
+        let resume_after_id = checkpoint.and_then(|report| report.last_segment_id);
+
+        let report = self
+            .scan_storage_from_with_cx(cx, storage, options, resume_after_id)
+            .await?;
+
+        let record = SecretScanReportRecord {
+            id: 0,
+            scope_hash,
+            scope_json,
+            report_version: i64::from(report.report_version),
+            last_segment_id: report.last_segment_id,
+            report_json: serde_json::to_string(&report)?,
+            created_at: report.completed_at,
+        };
+        let _ = storage.record_secret_scan_report(record).await?;
+
+        Ok(report)
+    }
+
+    /// Cx-first [`Self::scan_storage_from`] (ft-xbnl0.2.3). Identical
+    /// batch-loop semantics with a per-iteration `cx.checkpoint()?`
+    /// gating the next `scan_segments` call.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn scan_storage_from_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        mut options: SecretScanOptions,
+        resume_after_id: Option<i64>,
+    ) -> Result<SecretScanReport> {
+        cx.checkpoint()
+            .map_err(|err| crate::Error::Runtime(format!("scan_storage cancelled: {err}")))?;
+
+        if options.batch_size == 0 {
+            options.batch_size = 1_000;
+        }
+
+        let scope = SecretScanScope::from_options(&options);
+        let mut report = SecretScanReport::new(scope, resume_after_id);
+        let mut after_id = resume_after_id;
+
+        loop {
+            let remaining = options
+                .max_segments
+                .map(|max| max.saturating_sub(report.scanned_segments as usize));
+            if matches!(remaining, Some(0)) {
+                break;
+            }
+
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "scan_storage cancelled mid-batch (after_id={after_id:?}): {err}"
+                ))
+            })?;
+
+            let limit = remaining
+                .map(|remain| remain.min(options.batch_size))
+                .unwrap_or(options.batch_size);
+
+            let query = SegmentScanQuery {
+                after_id,
+                pane_id: options.pane_id,
+                since: options.since,
+                until: options.until,
+                limit,
+            };
+
+            let batch = storage.scan_segments(query).await?;
+            if batch.is_empty() {
+                break;
+            }
+
+            for segment in &batch {
+                self.scan_segment(segment, &options, &mut report);
+                report.scanned_segments += 1;
+                report.scanned_bytes += segment.content_len as u64;
+
+                if let Some(max) = options.max_segments {
+                    if report.scanned_segments as usize >= max {
+                        break;
+                    }
+                }
+            }
+
+            after_id = batch.last().map(|seg| seg.id);
+            if batch.len() < limit {
+                break;
+            }
+        }
+
+        report.last_segment_id = after_id;
+        report.completed_at = now_ms();
+        Ok(report)
+    }
+
     async fn scan_storage_from(
         &self,
         storage: &StorageHandle,
@@ -967,6 +1104,81 @@ mod tests {
             assert_eq!(report.matches_total, 0);
             assert!(report.samples.is_empty());
             assert_eq!(report.report_version, SECRET_SCAN_REPORT_VERSION);
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `scan_storage_with_cx` must match the
+    /// legacy `scan_storage` for an uncancelled cx. Exercises the
+    /// batch loop with real segments (some matching, some not) so
+    /// the Cx-first variant's per-batch checkpoint gating doesn't
+    /// accidentally perturb the report's match counts, samples, or
+    /// bytes-scanned totals.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn scan_storage_with_cx_matches_legacy_with_matches() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("cx_matches").await;
+
+            // Insert identical segments: some with secrets, some without.
+            storage
+                .append_segment(
+                    1,
+                    "export OPENAI_API_KEY=sk-abc1234567890abcdef1234567890abcdef12345678",
+                    None,
+                )
+                .await
+                .expect("seg1");
+            storage
+                .append_segment(1, "Hello, no secrets here.", None)
+                .await
+                .expect("seg2");
+            storage
+                .append_segment(1, "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", None)
+                .await
+                .expect("seg3");
+
+            let engine = SecretScanEngine::new();
+            let cx = crate::cx::for_request();
+
+            let legacy = engine
+                .scan_storage(&storage, SecretScanOptions::default())
+                .await
+                .expect("legacy scan");
+            let cx_first = engine
+                .scan_storage_with_cx(&cx, &storage, SecretScanOptions::default())
+                .await
+                .expect("cx-first scan");
+
+            // Cx-first must match legacy bit-for-bit on all the scan
+            // statistics that don't depend on completed_at (which is
+            // now_ms() and will differ by a few ms between calls).
+            assert_eq!(
+                legacy.scanned_segments, cx_first.scanned_segments,
+                "scanned_segments must match"
+            );
+            assert_eq!(
+                legacy.scanned_bytes, cx_first.scanned_bytes,
+                "scanned_bytes must match"
+            );
+            assert_eq!(
+                legacy.matches_total, cx_first.matches_total,
+                "matches_total must match"
+            );
+            assert_eq!(
+                legacy.samples.len(),
+                cx_first.samples.len(),
+                "samples count must match"
+            );
+            assert_eq!(legacy.report_version, cx_first.report_version);
+            assert_eq!(legacy.last_segment_id, cx_first.last_segment_id);
+            // Should have found BOTH matches (OPENAI + GH_TOKEN).
+            assert!(
+                cx_first.matches_total >= 2,
+                "expected at least 2 matches on Cx-first scan, got {}",
+                cx_first.matches_total
+            );
 
             teardown(storage, &db_path).await;
         });
