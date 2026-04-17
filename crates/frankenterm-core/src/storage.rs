@@ -6125,6 +6125,21 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`mark_event_handled`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn mark_event_handled_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        workflow_id: Option<String>,
+        status: &str,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("mark_event_handled cancelled: {err}"))
+        })?;
+        self.mark_event_handled(event_id, workflow_id, status).await
+    }
+
     /// Set or clear an event's triage state.
     ///
     /// Returns true if an event row was updated.
@@ -6146,6 +6161,22 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_triage_state`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_event_triage_state_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        triage_state: Option<String>,
+        updated_by: Option<String>,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("set_event_triage_state cancelled: {err}"))
+        })?;
+        self.set_event_triage_state(event_id, triage_state, updated_by)
+            .await
     }
 
     /// Set or clear an event's note.
@@ -6171,6 +6202,20 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_note`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn set_event_note_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        note: Option<String>,
+        updated_by: Option<String>,
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("set_event_note cancelled: {err}")))?;
+        self.set_event_note(event_id, note, updated_by).await
+    }
+
     /// Add a label to an event.
     ///
     /// Returns true if a new label row was inserted.
@@ -6194,6 +6239,20 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_label`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn add_event_label_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        label: String,
+        created_by: Option<String>,
+    ) -> Result<bool> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("add_event_label cancelled: {err}")))?;
+        self.add_event_label(event_id, label, created_by).await
+    }
+
     /// Remove a label from an event.
     ///
     /// Returns true if a label row was deleted.
@@ -6209,6 +6268,20 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_label`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn remove_event_label_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+        label: String,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("remove_event_label cancelled: {err}"))
+        })?;
+        self.remove_event_label(event_id, label).await
     }
 
     /// Fetch triage state, note, and labels for an event.
@@ -6248,6 +6321,18 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_mute`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn add_event_mute_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: EventMuteRecord,
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("add_event_mute cancelled: {err}")))?;
+        self.add_event_mute(record).await
     }
 
     /// Remove a persistent event mute by identity key.
@@ -6342,6 +6427,19 @@ impl StorageHandle {
             query_event_identity_key(&conn, event_id)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_identity_key`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_event_identity_key_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+    ) -> Result<Option<String>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_event_identity_key cancelled: {err}"))
+        })?;
+        self.get_event_identity_key(event_id).await
     }
 
     /// Record an audit action
@@ -20561,6 +20659,143 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 136 event-annotation cluster —
+/// 7 new storage cx-first siblings exercised end-to-end:
+/// `mark_event_handled_with_cx`, `set_event_triage_state_with_cx`,
+/// `set_event_note_with_cx`, `add_event_label_with_cx`,
+/// `remove_event_label_with_cx`, `add_event_mute_with_cx`,
+/// `get_event_identity_key_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick136_event_annotation_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick136_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed a pane (FK constraints for events).
+        let pane = PaneRecord {
+            pane_id: 17,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick136".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // Seed an event.
+        let event = StoredEvent {
+            id: 0,
+            pane_id: 17,
+            rule_id: "rule-tick136".to_string(),
+            agent_type: "unknown".to_string(),
+            event_type: "pattern".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some("hello".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: Some("ident-tick136".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let event_id = storage.record_event_with_cx(&cx, event).await.unwrap();
+        assert!(event_id > 0);
+
+        // 1. get_event_identity_key_with_cx
+        let ident = storage
+            .get_event_identity_key_with_cx(&cx, event_id)
+            .await
+            .unwrap();
+        let ident_key = ident.expect("event should have an identity key");
+        assert!(
+            !ident_key.is_empty(),
+            "identity key should be populated for a recorded event"
+        );
+
+        // 2. mark_event_handled_with_cx
+        storage
+            .mark_event_handled_with_cx(&cx, event_id, Some("wf-136".to_string()), "handled")
+            .await
+            .unwrap();
+
+        // 3. set_event_triage_state_with_cx
+        let updated = storage
+            .set_event_triage_state_with_cx(
+                &cx,
+                event_id,
+                Some("triaged".to_string()),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(updated, "triage state update should have touched a row");
+
+        // 4. set_event_note_with_cx
+        storage
+            .set_event_note_with_cx(
+                &cx,
+                event_id,
+                Some("note-tick136".to_string()),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // 5. add_event_label_with_cx
+        let inserted = storage
+            .add_event_label_with_cx(
+                &cx,
+                event_id,
+                "label-a".to_string(),
+                Some("tester".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(inserted, "label add should insert a new row");
+
+        // 6. remove_event_label_with_cx
+        let removed = storage
+            .remove_event_label_with_cx(&cx, event_id, "label-a".to_string())
+            .await
+            .unwrap();
+        assert!(removed, "label remove should delete the row we just added");
+
+        // 7. add_event_mute_with_cx
+        let mute = EventMuteRecord {
+            identity_key: "ident-tick136".to_string(),
+            scope: "workspace".to_string(),
+            created_at: 1_700_000_000_000,
+            expires_at: None,
+            created_by: Some("tester".to_string()),
+            reason: Some("test-mute".to_string()),
+        };
+        storage.add_event_mute_with_cx(&cx, mute).await.unwrap();
+        let muted = storage
+            .is_event_muted_with_cx(&cx, "ident-tick136", 1_700_000_000_001)
+            .await
+            .unwrap();
+        assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
