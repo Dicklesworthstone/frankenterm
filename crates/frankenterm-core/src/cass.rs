@@ -602,10 +602,13 @@ pub async fn export_sessions(
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
 ///
-/// Pre-flight checkpoint gates the cass session export before
-/// any storage queries fire. The cass connector can have many
-/// concurrent export batches in flight; a cancelled parent cx
-/// bails immediately at the boundary.
+/// Tick 151: rewritten from a pre-flight delegate into a fully
+/// cx-threaded body — every storage call is routed through its
+/// `_with_cx` sibling, including the per-session token estimate
+/// in the inner loop. The cass connector can have many concurrent
+/// export batches in flight; a cancelled parent cx now bails at
+/// the earliest boundary *and* at every storage seam inside the
+/// export loop.
 #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
 pub async fn export_sessions_with_cx(
     cx: &crate::cx::Cx,
@@ -614,7 +617,53 @@ pub async fn export_sessions_with_cx(
 ) -> crate::Result<Vec<CassExportSessionRecord>> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("cass export_sessions cancelled: {err}")))?;
-    export_sessions(storage, query).await
+
+    let pane_workspaces: HashMap<u64, String> = storage
+        .get_panes_with_cx(cx)
+        .await?
+        .into_iter()
+        .filter_map(|pane| pane.cwd.map(|cwd| (pane.pane_id, cwd)))
+        .collect();
+
+    let mut sessions = storage
+        .export_sessions_with_cx(
+            cx,
+            ExportQuery {
+                pane_id: query.pane_id,
+                since: query.since,
+                until: query.until,
+                limit: None,
+            },
+        )
+        .await?;
+    sessions.sort_unstable_by_key(|session| session.id);
+
+    let mut exported = Vec::new();
+    for session in sessions
+        .into_iter()
+        .filter(|session| query.after_id.is_none_or(|after_id| session.id > after_id))
+        .take(query.effective_limit())
+    {
+        let content_tokens = match session_recorded_tokens(&session) {
+            Some(tokens) => tokens,
+            None => estimate_session_content_tokens_with_cx(cx, storage, &session).await?,
+        };
+        exported.push(CassExportSessionRecord {
+            session_row_id: session.id,
+            session_id: export_session_identifier(&session),
+            agent_type: session.agent_type.clone(),
+            workspace: pane_workspaces.get(&session.pane_id).cloned(),
+            pane_ids: vec![session.pane_id],
+            started_at_ms: session.started_at,
+            ended_at_ms: session.ended_at,
+            model_name: session.model_name.clone(),
+            content_tokens,
+            external_id: session.external_id.clone(),
+            external_meta: session.external_meta.clone(),
+        });
+    }
+
+    Ok(exported)
 }
 
 /// Export recorder content chunks for a specific session.
@@ -653,9 +702,11 @@ pub async fn export_content(
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`export_content`].
 ///
-/// Pre-flight checkpoint gates the cass content export before
-/// the session lookup + segment scan. Used by the cass
-/// connector's per-session chunk-fetch loop.
+/// Tick 151: rewritten from a pre-flight delegate into a fully
+/// cx-threaded body — session resolution routes through
+/// `resolve_export_session_with_cx` and the segment scan uses
+/// `scan_segments_with_cx`. Used by the cass connector's
+/// per-session chunk-fetch loop.
 #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
 pub async fn export_content_with_cx(
     cx: &crate::cx::Cx,
@@ -665,7 +716,35 @@ pub async fn export_content_with_cx(
 ) -> crate::Result<Vec<CassExportContentChunk>> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("cass export_content cancelled: {err}")))?;
-    export_content(storage, session_id, query).await
+
+    let session = resolve_export_session_with_cx(cx, storage, session_id).await?;
+    let exported_session_id = export_session_identifier(&session);
+    let segments = storage
+        .scan_segments_with_cx(
+            cx,
+            SegmentScanQuery {
+                after_id: query.after_id,
+                pane_id: Some(session.pane_id),
+                since: Some(session.started_at),
+                until: session.ended_at,
+                limit: query.effective_limit(),
+            },
+        )
+        .await?;
+
+    Ok(segments
+        .into_iter()
+        .map(|segment| CassExportContentChunk {
+            session_row_id: session.id,
+            session_id: exported_session_id.clone(),
+            segment_id: segment.id,
+            pane_id: segment.pane_id,
+            seq: segment.seq,
+            timestamp_ms: segment.captured_at,
+            content: segment.content,
+            content_type: "output".to_string(),
+        })
+        .collect())
 }
 
 /// Thin wrapper around the cass CLI.
@@ -1261,6 +1340,35 @@ async fn estimate_session_content_tokens(
     Ok(segments.iter().map(estimate_segment_tokens).sum())
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`estimate_session_content_tokens`].
+///
+/// Routes through `export_segments_with_cx` so the session-token
+/// estimate honours cancellation of the parent export loop.
+#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+async fn estimate_session_content_tokens_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    session: &AgentSessionRecord,
+) -> crate::Result<u64> {
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!(
+            "cass estimate_session_content_tokens cancelled: {err}"
+        ))
+    })?;
+    let segments = storage
+        .export_segments_with_cx(
+            cx,
+            ExportQuery {
+                pane_id: Some(session.pane_id),
+                since: Some(session.started_at),
+                until: session.ended_at,
+                limit: None,
+            },
+        )
+        .await?;
+    Ok(segments.iter().map(estimate_segment_tokens).sum())
+}
+
 #[cfg(feature = "cass-export")]
 fn estimate_segment_tokens(segment: &Segment) -> u64 {
     estimate_text_tokens(&segment.content)
@@ -1307,6 +1415,50 @@ async fn resolve_export_session(
             limit: Some(RESOLVE_SESSION_FALLBACK_LIMIT),
             ..ExportQuery::default()
         })
+        .await?;
+
+    sessions
+        .into_iter()
+        .find(|candidate| export_session_identifier(candidate) == requested_id)
+        .ok_or_else(|| {
+            crate::Error::Storage(crate::StorageError::NotFound(format!(
+                "cass export session '{requested_id}'"
+            )))
+        })
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`resolve_export_session`].
+///
+/// Routes both the direct `get_agent_session_with_cx` probe and the
+/// bounded `export_sessions_with_cx` fallback through cx-first
+/// storage siblings so a cancelled parent interrupts the scan.
+#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+async fn resolve_export_session_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    session_id: &str,
+) -> crate::Result<AgentSessionRecord> {
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!("cass resolve_export_session cancelled: {err}"))
+    })?;
+    let requested_id = session_id.trim();
+
+    if let Some(row_id) = parse_export_session_row_id(session_id) {
+        if let Some(session) = storage.get_agent_session_with_cx(cx, row_id).await? {
+            if export_session_identifier(&session) == requested_id {
+                return Ok(session);
+            }
+        }
+    }
+
+    let sessions = storage
+        .export_sessions_with_cx(
+            cx,
+            ExportQuery {
+                limit: Some(RESOLVE_SESSION_FALLBACK_LIMIT),
+                ..ExportQuery::default()
+            },
+        )
         .await?;
 
     sessions
@@ -2257,6 +2409,72 @@ mod tests {
                 );
             }
             Ok(_) => panic!("search_with_cx must fail for a nonexistent binary"),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: tick 151 pins that
+    /// `export_content_with_cx` routes through the new
+    /// `resolve_export_session_with_cx` helper. On an empty DB the
+    /// session lookup must return `Storage(NotFound)` from *both*
+    /// the legacy and cx-first paths — byte-parity on the error type.
+    #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+    #[test]
+    fn cass_export_content_with_cx_missing_session_matches_legacy() {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let tmp = std::env::temp_dir().join(format!(
+                    "wa_test_cass_export_content_cx_{}.db",
+                    std::process::id()
+                ));
+                let db_path = tmp.to_string_lossy().to_string();
+                let storage = StorageHandle::new(&db_path).await.unwrap();
+
+                let query = CassContentExportQuery {
+                    after_id: None,
+                    limit: 100,
+                };
+
+                let cx = crate::cx::for_request();
+                let legacy_err = export_content(&storage, "session-tick151-none", &query)
+                    .await
+                    .expect_err("missing session must surface an error");
+                let cx_err = export_content_with_cx(
+                    &cx,
+                    &storage,
+                    "session-tick151-none",
+                    &query,
+                )
+                .await
+                .expect_err("missing session must surface an error via cx-first path");
+
+                match (&legacy_err, &cx_err) {
+                    (
+                        crate::Error::Storage(crate::StorageError::NotFound(a)),
+                        crate::Error::Storage(crate::StorageError::NotFound(b)),
+                    ) => {
+                        assert_eq!(a, b, "NotFound messages should match on both paths");
+                    }
+                    other => panic!(
+                        "expected Storage(NotFound) on both paths, got {other:?}"
+                    ),
+                }
+
+                storage.shutdown().await.unwrap();
+                let _ = std::fs::remove_file(&tmp);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 
