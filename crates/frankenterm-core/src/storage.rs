@@ -6223,6 +6223,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_annotations`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_event_annotations_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_id: i64,
+    ) -> Result<Option<EventAnnotations>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_event_annotations cancelled: {err}"))
+        })?;
+        self.get_event_annotations(event_id).await
+    }
+
     /// Add or update a persistent event mute by identity key.
     pub async fn add_event_mute(&self, record: EventMuteRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -6249,6 +6262,18 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_mute`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn remove_event_mute_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        identity_key: &str,
+    ) -> Result<bool> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("remove_event_mute cancelled: {err}")))?;
+        self.remove_event_mute(identity_key).await
     }
 
     /// Check whether an identity key is muted (and not expired).
@@ -6659,6 +6684,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`prune_segments_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn prune_segments_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("prune_segments_before cancelled: {err}"))
+        })?;
+        self.prune_segments_before(before_ts).await
+    }
+
     /// Prune output segments older than a cutoff timestamp
     pub async fn prune_segments_before(&self, before_ts: i64) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -6762,6 +6800,19 @@ impl StorageHandle {
             query_usage_metrics_sync(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`query_usage_metrics`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn query_usage_metrics_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: MetricQuery,
+    ) -> Result<Vec<UsageMetricRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("query_usage_metrics cancelled: {err}"))
+        })?;
+        self.query_usage_metrics(query).await
     }
 
     /// Get daily aggregated metric summaries since a given timestamp.
@@ -7555,6 +7606,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_agent_session`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_agent_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session: AgentSessionRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("upsert_agent_session cancelled: {err}"))
+        })?;
+        self.upsert_agent_session(session).await
+    }
+
     /// Get an agent session by ID
     pub async fn get_agent_session(&self, session_id: i64) -> Result<Option<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8200,6 +8264,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`scan_segments`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn scan_segments_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: SegmentScanQuery,
+    ) -> Result<Vec<Segment>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("scan_segments cancelled: {err}")))?;
+        self.scan_segments(query).await
+    }
+
     /// Fetch the most recent secret scan report for a scope hash.
     pub async fn latest_secret_scan_report(
         &self,
@@ -8446,6 +8522,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_accounts_by_service`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_accounts_by_service_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        service: &str,
+    ) -> Result<Vec<crate::accounts::AccountRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_accounts_by_service cancelled: {err}"))
+        })?;
+        self.get_accounts_by_service(service).await
+    }
+
     /// Get a single account by service and account_id
     pub async fn get_account(
         &self,
@@ -8601,6 +8690,18 @@ impl StorageHandle {
             query_export_gaps(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`export_gaps`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn export_gaps_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ExportQuery,
+    ) -> Result<Vec<Gap>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
+        self.export_gaps(query).await
     }
 
     /// Get all output gaps (for search explain diagnostics)
@@ -20099,6 +20200,122 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 120 hot-path batch smoke test —
+/// 8 more storage cx-first siblings exercised end-to-end.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick120_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick120_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed pane 1 for FK constraints on agent_session.
+        storage
+            .upsert_pane_with_cx(
+                &cx,
+                PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("tick120".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 1. get_event_annotations_with_cx — None on fresh DB.
+        let ann = storage
+            .get_event_annotations_with_cx(&cx, 9999)
+            .await
+            .unwrap();
+        assert!(ann.is_none());
+
+        // 2. remove_event_mute_with_cx — false (no such mute).
+        let removed = storage
+            .remove_event_mute_with_cx(&cx, "no-such-key")
+            .await
+            .unwrap();
+        assert!(!removed);
+
+        // 3. prune_segments_before_with_cx — 0 on empty DB.
+        let pruned = storage
+            .prune_segments_before_with_cx(&cx, 1_800_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 0);
+
+        // 4. query_usage_metrics_with_cx — empty on fresh DB.
+        let metrics = storage
+            .query_usage_metrics_with_cx(&cx, MetricQuery::default())
+            .await
+            .unwrap();
+        assert!(metrics.is_empty());
+
+        // 5. scan_segments_with_cx — empty on fresh DB.
+        let segments = storage
+            .scan_segments_with_cx(&cx, SegmentScanQuery::default())
+            .await
+            .unwrap();
+        assert!(segments.is_empty());
+
+        // 6. get_accounts_by_service_with_cx — empty on fresh DB.
+        let accts = storage
+            .get_accounts_by_service_with_cx(&cx, "codex")
+            .await
+            .unwrap();
+        assert!(accts.is_empty());
+
+        // 7. export_gaps_with_cx — empty on fresh DB.
+        let gaps = storage
+            .export_gaps_with_cx(&cx, ExportQuery::default())
+            .await
+            .unwrap();
+        assert!(gaps.is_empty());
+
+        // 8. upsert_agent_session_with_cx — verify id > 0.
+        let session = AgentSessionRecord {
+            id: 0,
+            pane_id: 1,
+            agent_type: "codex".to_string(),
+            session_id: Some("sess-tick120".to_string()),
+            external_id: None,
+            external_meta: None,
+            started_at: 1_700_000_000_000,
+            ended_at: None,
+            end_reason: None,
+            total_tokens: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            reasoning_tokens: None,
+            model_name: None,
+            estimated_cost_usd: None,
+        };
+        let session_id = storage
+            .upsert_agent_session_with_cx(&cx, session)
+            .await
+            .unwrap();
+        assert!(session_id > 0);
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
