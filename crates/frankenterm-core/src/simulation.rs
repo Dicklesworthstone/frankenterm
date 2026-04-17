@@ -992,10 +992,52 @@ impl TutorialSandbox {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`TutorialSandbox::new`].
+    ///
+    /// Routes the scenario setup through `Scenario::setup_with_cx`
+    /// (tick 65) so caller cancellation during a slow mock-setup
+    /// (e.g. many pane injections) surfaces cleanly rather than
+    /// swallowing cancel as a setup-failure tracing::warn.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn new_with_cx(cx: &crate::cx::Cx) -> Self {
+        let mock = MockWezterm::new();
+        let scenario = Self::default_scenario();
+
+        if let Err(e) = scenario.setup_with_cx(cx, &mock).await {
+            tracing::warn!("Failed to set up tutorial sandbox scenario (cx path): {e}");
+        }
+
+        Self {
+            mock,
+            scenario: Some(scenario),
+            command_log: Vec::new(),
+            show_indicator: true,
+        }
+    }
+
     /// Create a sandbox with a custom scenario.
     pub async fn with_scenario(scenario: Scenario) -> Result<Self> {
         let mock = MockWezterm::new();
         scenario.setup(&mock).await?;
+
+        Ok(Self {
+            mock,
+            scenario: Some(scenario),
+            command_log: Vec::new(),
+            show_indicator: true,
+        })
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`TutorialSandbox::with_scenario`].
+    ///
+    /// Routes the scenario setup through `Scenario::setup_with_cx`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn with_scenario_with_cx(
+        cx: &crate::cx::Cx,
+        scenario: Scenario,
+    ) -> Result<Self> {
+        let mock = MockWezterm::new();
+        scenario.setup_with_cx(cx, &mock).await?;
 
         Ok(Self {
             mock,
@@ -1090,6 +1132,33 @@ impl TutorialSandbox {
                 }
             }
             // Event/Workflow expectations need runtime integration
+            _ => false,
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::check_expectation`].
+    ///
+    /// Routes the mock `get_text` through `get_text_with_cx` so a
+    /// cancelled parent cx interrupts the read rather than silently
+    /// returning `false` on timeout/cancellation. Cancellation is
+    /// folded into the `false` return path to preserve the existing
+    /// "expectation failed or unknown → false" contract.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn check_expectation_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        kind: &ExpectationKind,
+    ) -> bool {
+        use crate::wezterm::WeztermInterface;
+
+        match kind {
+            ExpectationKind::Contains { pane, text } => {
+                if let Ok(content) = self.mock.get_text_with_cx(cx, *pane, false).await {
+                    content.contains(text)
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
