@@ -603,8 +603,16 @@ impl MigrationEngine {
                 producer_ts_ms: 0,
             };
 
+            // Tick 75 refactor: route through the Cx-first trait
+            // sibling (tick 74) so cancellation propagates into the
+            // storage write path itself, not just the between-chunk
+            // seam. Backends that override
+            // `append_batch_with_cx` with `timeout_with_cx`-aware
+            // code will benefit; the default impl is
+            // observationally equivalent to the prior
+            // `append_batch` call.
             target
-                .append_batch(req)
+                .append_batch_with_cx(cx, req)
                 .await
                 .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
 
@@ -798,12 +806,11 @@ impl MigrationEngine {
         target: &T,
         manifest: &MigrationManifest,
     ) -> Result<CheckpointSyncResult, MigrationError> {
-        cx.checkpoint().map_err(|err| {
-            MigrationError::StorageError(format!("m3_checkpoint_sync cancelled pre-start: {err}"))
-        })?;
-
+        // Tick 75 refactor: use the Cx-first trait sibling (tick
+        // 74) — absorbs the pre-flight checkpoint into the trait
+        // default's cancellation seam.
         let lag = source
-            .lag_metrics()
+            .lag_metrics_with_cx(cx)
             .await
             .map_err(|e| MigrationError::StorageError(e.to_string()))?;
 
@@ -828,15 +835,21 @@ impl MigrationEngine {
         }
 
         for consumer_id in &consumer_ids {
-            cx.checkpoint().map_err(|err| {
-                MigrationError::StorageError(format!(
-                    "m3_checkpoint_sync cancelled before consumer {} (migrated={}, reset={}): {err}",
-                    consumer_id.0, result.checkpoints_migrated, result.checkpoints_reset
-                ))
-            })?;
-
+            // Tick 75 refactor: use the Cx-first trait sibling
+            // for the per-consumer read. The iteration-context
+            // error message from the previous explicit
+            // `cx.checkpoint()?` is still preserved on the
+            // surrounding pane — if `read_checkpoint_with_cx`
+            // surfaces a cancellation, the default trait's error
+            // message ("read_checkpoint cancelled pre-start")
+            // combined with the `map_err` string gives enough
+            // context (`StorageError(...)` wraps the cancellation
+            // reason). Running counters are lost from the error
+            // message but that's acceptable — operators can
+            // inspect `result` state before the error for
+            // progress.
             let checkpoint_opt = source
-                .read_checkpoint(consumer_id)
+                .read_checkpoint_with_cx(cx, consumer_id)
                 .await
                 .map_err(|e| MigrationError::StorageError(e.to_string()))?;
 
@@ -880,8 +893,9 @@ impl MigrationEngine {
                 }
             };
 
+            // Tick 75 refactor: Cx-first commit via trait sibling.
             let outcome = target
-                .commit_checkpoint(target_checkpoint)
+                .commit_checkpoint_with_cx(cx, target_checkpoint)
                 .await
                 .map_err(|e| MigrationError::StorageError(e.to_string()))?;
 
@@ -1062,8 +1076,12 @@ impl MigrationEngine {
             producer_ts_ms: epoch_ms,
         };
 
+        // Tick 75 refactor: Cx-first marker append via trait
+        // sibling. A backend with internal cancellation support
+        // (via `timeout_with_cx`) can short-circuit the fsync'd
+        // write rather than waiting for a timeout.
         target
-            .append_batch(req)
+            .append_batch_with_cx(cx, req)
             .await
             .map_err(|e| MigrationError::TargetWriteError(e.to_string()))?;
 
