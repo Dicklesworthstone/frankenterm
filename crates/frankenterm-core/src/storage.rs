@@ -7956,6 +7956,21 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token_by_code`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_approval_token_by_code_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        code_hash: &str,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_approval_token_by_code cancelled: {err}"))
+        })?;
+        self.get_approval_token_by_code(code_hash, workspace_id)
+            .await
+    }
+
     /// Consume an approval token by code hash only (without fingerprint validation).
     ///
     /// **Warning**: This does NOT validate `action_kind`, `pane_id`, or
@@ -7978,6 +7993,21 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token_by_code`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_approval_token_by_code_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        code_hash: &str,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("consume_approval_token_by_code cancelled: {err}"))
+        })?;
+        self.consume_approval_token_by_code(code_hash, workspace_id)
+            .await
     }
 
     /// Upsert a pane record
@@ -8083,6 +8113,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`insert_prepared_plan`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn insert_prepared_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: PreparedPlanRecord,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_prepared_plan cancelled: {err}"))
+        })?;
+        self.insert_prepared_plan(record).await
+    }
+
     /// Consume a prepared plan by plan_id (marks as used if valid)
     pub async fn consume_prepared_plan(
         &self,
@@ -8100,6 +8143,20 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`consume_prepared_plan`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_prepared_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        plan_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<PreparedPlanRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("consume_prepared_plan cancelled: {err}"))
+        })?;
+        self.consume_prepared_plan(plan_id, now_ms).await
     }
 
     /// Insert a workflow step log entry
@@ -21157,6 +21214,132 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 142 token-lifecycle clusters —
+/// 4 new storage cx-first siblings across two related clusters:
+/// approval-token-code lookup/consume, and prepared-plan insert/consume.
+/// `get_approval_token_by_code_with_cx`,
+/// `consume_approval_token_by_code_with_cx`,
+/// `insert_prepared_plan_with_cx`, `consume_prepared_plan_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick142_token_lifecycle_clusters_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick142_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed pane for FK constraints on both approval_tokens and
+        // prepared_plans (both reference pane_id).
+        let pane = PaneRecord {
+            pane_id: 9,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick142".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // ---- approval-token-code cluster ----
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: "code-hash-tick142".to_string(),
+            created_at: 1_700_000_000_000,
+            expires_at: 4_100_000_000_000,
+            used_at: None,
+            workspace_id: "ws-tick142".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(9),
+            action_fingerprint: "fp-tick142".to_string(),
+            plan_hash: None,
+            plan_version: None,
+            risk_summary: None,
+        };
+        let token_id = storage
+            .insert_approval_token_with_cx(&cx, token)
+            .await
+            .unwrap();
+        assert!(token_id > 0);
+
+        // 1. get_approval_token_by_code_with_cx — unused, should return Some.
+        let fetched = storage
+            .get_approval_token_by_code_with_cx(&cx, "code-hash-tick142", "ws-tick142")
+            .await
+            .unwrap()
+            .expect("approval token should exist before consume");
+        assert_eq!(fetched.workspace_id, "ws-tick142");
+        assert!(fetched.used_at.is_none());
+
+        // 2. consume_approval_token_by_code_with_cx — should return the token
+        //    and mark it used. Repeat consume should now return None.
+        let consumed = storage
+            .consume_approval_token_by_code_with_cx(&cx, "code-hash-tick142", "ws-tick142")
+            .await
+            .unwrap()
+            .expect("approval token should be consumable once");
+        assert_eq!(consumed.code_hash, "code-hash-tick142");
+        let after_consume = storage
+            .consume_approval_token_by_code_with_cx(&cx, "code-hash-tick142", "ws-tick142")
+            .await
+            .unwrap();
+        assert!(
+            after_consume.is_none(),
+            "approval token can only be consumed once"
+        );
+
+        // ---- prepared-plan cluster ----
+        let plan = PreparedPlanRecord {
+            plan_id: "plan-tick142".to_string(),
+            plan_hash: "hash-tick142".to_string(),
+            workspace_id: "ws-tick142".to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id: Some(9),
+            pane_uuid: None,
+            params_json: None,
+            plan_json: "{}".to_string(),
+            requires_approval: false,
+            created_at: 1_700_000_000_000,
+            expires_at: 4_100_000_000_000,
+            consumed_at: None,
+        };
+        storage
+            .insert_prepared_plan_with_cx(&cx, plan)
+            .await
+            .unwrap();
+
+        // 3. consume_prepared_plan_with_cx — first call returns the record,
+        //    second returns None since the plan is now consumed.
+        let plan_consumed = storage
+            .consume_prepared_plan_with_cx(&cx, "plan-tick142", 1_700_000_000_500)
+            .await
+            .unwrap()
+            .expect("prepared plan should be consumable once");
+        assert_eq!(plan_consumed.plan_id, "plan-tick142");
+        let plan_after = storage
+            .consume_prepared_plan_with_cx(&cx, "plan-tick142", 1_700_000_000_600)
+            .await
+            .unwrap();
+        assert!(
+            plan_after.is_none(),
+            "prepared plan should only be consumed once"
+        );
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
