@@ -147,6 +147,27 @@ pub trait NotificationSender: Send + Sync {
 
     /// Send the notification payload.
     fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a>;
+
+    /// Send the notification payload bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first trait extension).
+    ///
+    /// Default implementation delegates to [`send`](Self::send) which
+    /// uses ambient Cx. Concrete implementations with a Cx-aware
+    /// transport (e.g. webhook HTTP clients, SMTP senders) SHOULD
+    /// override this method to propagate caller Cx through to the
+    /// underlying cancellable I/O.
+    ///
+    /// The `cx` parameter lifetime matches the returned future so
+    /// overrides can thread cx into async operations held by the
+    /// future.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        payload: &'a NotificationPayload,
+    ) -> NotificationFuture<'a> {
+        self.send(payload)
+    }
 }
 
 /// Notification future type.
@@ -363,7 +384,10 @@ impl NotificationPipeline {
                     &rendered,
                     suppressed_since_last,
                 );
-                let deliveries = self.dispatch_payload(&payload).await;
+                // ft-xbnl0.2.3: thread caller cx through each sender so
+                // Cx-aware transports (webhooks, SMTP, etc.) respect
+                // outer-scope cancellation.
+                let deliveries = self.dispatch_payload_with_cx(cx, &payload).await;
                 NotificationOutcome {
                     decision,
                     deliveries,
@@ -380,6 +404,23 @@ impl NotificationPipeline {
         let mut deliveries = Vec::with_capacity(self.senders.len());
         for sender in &self.senders {
             deliveries.push(sender.send(payload).await);
+        }
+        deliveries
+    }
+
+    /// Cx-first `dispatch_payload` (ft-xbnl0.2.3). Threads caller cx
+    /// through `NotificationSender::send_with_cx` so each sender's
+    /// cancellable I/O honors caller cancellation. The
+    /// `handle_detection_with_cx` path uses this helper.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn dispatch_payload_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        payload: &NotificationPayload,
+    ) -> Vec<NotificationDelivery> {
+        let mut deliveries = Vec::with_capacity(self.senders.len());
+        for sender in &self.senders {
+            deliveries.push(sender.send_with_cx(cx, payload).await);
         }
         deliveries
     }
