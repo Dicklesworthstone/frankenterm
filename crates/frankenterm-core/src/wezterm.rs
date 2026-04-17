@@ -837,6 +837,20 @@ impl WeztermClient {
             .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
     }
 
+    /// Get a specific pane by ID, bound to the caller's asupersync
+    /// capability context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Delegates to [`list_panes_with_cx`](Self::list_panes_with_cx)
+    /// so the underlying pane listing respects caller Cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
+        let panes = self.list_panes_with_cx(cx).await?;
+        panes
+            .into_iter()
+            .find(|p| p.pane_id == pane_id)
+            .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
+    }
+
     /// Get text content from a pane
     ///
     /// # Arguments
@@ -1050,6 +1064,74 @@ impl WeztermClient {
     /// Convenience method for `send_control(pane_id, control::CTRL_D)`.
     pub async fn send_ctrl_d(&self, pane_id: u64) -> Result<()> {
         self.send_control(pane_id, control::CTRL_D).await
+    }
+
+    /// Cx-first send_text (ft-xbnl0.2.3). Defaults to paste mode + newline.
+    /// The mux-pool fast path uses `pool.send_paste_with_cx(cx)` /
+    /// `pool.write_to_pane_with_cx(cx)`; CLI fallback delegates to the
+    /// legacy [`send_text`](Self::send_text) path.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_text_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> Result<()> {
+        self.send_text_impl_with_cx(cx, pane_id, text, false, false)
+            .await
+    }
+
+    /// Cx-first send_text_no_paste (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_text_no_paste_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> Result<()> {
+        self.send_text_impl_with_cx(cx, pane_id, text, true, false)
+            .await
+    }
+
+    /// Cx-first send_text_with_options (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_text_with_options_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> Result<()> {
+        self.send_text_impl_with_cx(cx, pane_id, text, no_paste, no_newline)
+            .await
+    }
+
+    /// Cx-first send_control (ft-xbnl0.2.3). Control characters always
+    /// use no-paste + no-newline mode.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_control_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+    ) -> Result<()> {
+        self.send_text_impl_with_cx(cx, pane_id, control_char, true, true)
+            .await
+    }
+
+    /// Cx-first send_ctrl_c (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_c_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        self.send_control_with_cx(cx, pane_id, control::CTRL_C)
+            .await
+    }
+
+    /// Cx-first send_ctrl_d (ft-xbnl0.2.3).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_d_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
+        self.send_control_with_cx(cx, pane_id, control::CTRL_D)
+            .await
     }
 
     // =========================================================================
@@ -1373,6 +1455,70 @@ impl WeztermClient {
         args.push(text);
         self.run_cli_with_pane_check(&args, pane_id).await?;
         Ok(())
+    }
+
+    /// Cx-first `send_text_impl` (ft-xbnl0.2.3). The mux-pool fast
+    /// path uses `pool.write_to_pane_with_cx(cx)` /
+    /// `pool.send_paste_with_cx(cx)`. CLI fallback delegates to the
+    /// legacy `send_text_impl` since threading Cx through
+    /// `run_cli_with_pane_check` + `retry_with` would require a
+    /// wider refactor (same rationale as `list_panes_with_cx`).
+    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    async fn send_text_impl_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> Result<()> {
+        if let Some(ref pool) = self.mux_pool {
+            if !self.mux_circuit_guard() {
+                tracing::debug!("mux connection circuit open; falling back to CLI send");
+            } else {
+                let data = if no_newline {
+                    text.to_string()
+                } else {
+                    format!("{text}\n")
+                };
+                let pool_result = if no_paste {
+                    pool.write_to_pane_with_cx(cx, pane_id, data.into_bytes())
+                        .await
+                } else {
+                    pool.send_paste_with_cx(cx, pane_id, data).await
+                };
+                match pool_result {
+                    Ok(_) => {
+                        self.mux_circuit_record_success();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.mux_circuit_record_failure(&e);
+                        tracing::debug!(
+                            error = %e,
+                            "mux pool send_with_cx failed, falling back to CLI"
+                        );
+                    }
+                }
+            }
+        }
+        self.send_text_impl(pane_id, text, no_paste, no_newline)
+            .await
+    }
+
+    /// Stub `send_text_impl_with_cx` for configurations without
+    /// vendored+unix+asupersync — delegates to the legacy impl.
+    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    async fn send_text_impl_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> Result<()> {
+        self.send_text_impl(pane_id, text, no_paste, no_newline)
+            .await
     }
 
     /// Run a CLI command with pane-specific error handling
