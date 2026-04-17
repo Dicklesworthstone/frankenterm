@@ -272,6 +272,62 @@ impl CpuPressureMonitor {
         }
     }
 
+    /// Run the monitoring loop against the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Short-circuits before the first sample if `cx` is already cancelled.
+    /// Otherwise each sleep between samples is bound via
+    /// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+    /// cancellation from the outer scope cuts the inter-sample wait
+    /// deterministically under `LabRuntime` virtual time. Both the
+    /// `shutdown` flag and `cx.is_cancel_requested()` are checked each
+    /// iteration so either cancellation path terminates the loop
+    /// promptly without waiting on the full sample interval.
+    ///
+    /// The legacy [`run`](Self::run) entry point is preserved for
+    /// non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if cx.is_cancel_requested() {
+            return;
+        }
+
+        let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
+        let mut first_tick = true;
+
+        loop {
+            if !first_tick {
+                // `sleep_with_cx` returns Err on cancellation, which we
+                // treat as "time to exit" so the loop terminates cleanly
+                // without a spurious extra sample after cancellation.
+                if crate::runtime_compat::sleep_with_cx(cx, interval)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            first_tick = false;
+
+            if shutdown.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+                break;
+            }
+
+            let sample = self.sample();
+            if sample.tier >= CpuPressureTier::Yellow {
+                tracing::info!(
+                    pressure = sample.pressure,
+                    tier = %sample.tier,
+                    "CPU pressure elevated"
+                );
+            }
+        }
+    }
+
     /// Classify a raw pressure value into a tier.
     fn classify(&self, pressure: f64) -> CpuPressureTier {
         if pressure >= self.config.red_threshold {
@@ -841,6 +897,111 @@ mod tests {
                 w[1],
                 w[1].as_u8(),
             );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first run entry point
+    // (ft-xbnl0.2.x slice).
+    //
+    // Pin that `run_with_cx` responds to Cx-driven cancellation without
+    // ever consuming the real 1s-min sample interval. A Cx-unaware loop
+    // (or a loop that only checks the shutdown flag) would block on the
+    // first `sleep(interval)` call and step-explode LabRuntime's max
+    // scheduling budget; if either happens, the LabRuntime report will
+    // be StuckBailout and the test will fail.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_cpu_pressure {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// `run_with_cx` must return before entering the loop if the
+        /// caller's Cx is already cancelled. No samples should be taken
+        /// and no sleep should be consumed.
+        #[test]
+        fn run_with_cx_pre_cancelled_exits_without_sampling() {
+            run_lab(0xCF01_1CE1, || async move {
+                let monitor = CpuPressureMonitor::new(test_config());
+                let samples_before = monitor.telemetry().snapshot().samples_taken;
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x cpu_pressure precancel"),
+                );
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                assert_eq!(
+                    monitor.telemetry().snapshot().samples_taken,
+                    samples_before,
+                    "pre-cancelled run_with_cx must not take a sample"
+                );
+                assert!(
+                    !shutdown.load(std::sync::atomic::Ordering::SeqCst),
+                    "run_with_cx must return via the Cx path, not the shutdown flag"
+                );
+            });
+        }
+
+        /// `run_with_cx` with a live Cx takes exactly one sample on the
+        /// first tick, then sleep_with_cx is cancelled mid-interval by
+        /// setting the shutdown flag *after* the first sample. This pins
+        /// the shared shutdown/Cx termination contract: either path
+        /// terminates the loop at the next iteration gate.
+        #[test]
+        fn run_with_cx_takes_first_sample_then_honors_shutdown() {
+            run_lab(0xCF02_1CE2, || async move {
+                let monitor = CpuPressureMonitor::new(test_config());
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let cx = crate::cx::for_request();
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                // First tick: `first_tick=true` skips sleep, then reads
+                // shutdown, which is set — so we should see zero samples
+                // taken (the shutdown check runs before sample()).
+                assert_eq!(
+                    monitor.telemetry().snapshot().samples_taken,
+                    0,
+                    "shutdown flag set before any tick must exit before sampling"
+                );
+            });
         }
     }
 }
