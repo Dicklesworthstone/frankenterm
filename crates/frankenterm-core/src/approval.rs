@@ -433,6 +433,80 @@ impl<'a> ApprovalStore<'a> {
         Ok(record)
     }
 
+    /// Cx-first [`Self::consume`] (ft-xbnl0.2.3). Pure delegate
+    /// to [`Self::consume_with_context_with_cx`] with `None`
+    /// audit context, mirroring the legacy `consume` → `consume_with_context`
+    /// delegation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        allow_once_code: &str,
+        input: &PolicyInput,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        self.consume_with_context_with_cx(cx, allow_once_code, input, None)
+            .await
+    }
+
+    /// Cx-first [`Self::consume_with_context`] (ft-xbnl0.2.3).
+    /// Threads caller `&Cx` through the two storage calls
+    /// (`consume_approval_token` + optional `audit_approval_grant`
+    /// → `insert_audit_action`) via checkpoint seams: pre-flight
+    /// (short-circuits before touching storage), and between the
+    /// consume and the audit write (a late-cancelled caller can
+    /// abort before the audit trail is recorded). The audit write
+    /// only fires when the consume returned `Some` (the token was
+    /// valid), matching legacy semantics.
+    ///
+    /// Cancellation-safety contract: a cancel between the consume
+    /// and the audit checkpoint still leaves the token consumed
+    /// (storage `consume_approval_token` returns Some with the
+    /// used_at timestamp set), but the audit trail is not
+    /// recorded. This is DIFFERENT from the legacy where the
+    /// audit always fires after a successful consume. Callers
+    /// that need audit-guaranteed consumption should not cancel
+    /// mid-flight — the checkpoint window here is narrow (between
+    /// two storage calls). The error wraps the reason so the
+    /// caller can distinguish cancellation from other failures.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_with_context_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        allow_once_code: &str,
+        input: &PolicyInput,
+        audit_context: Option<ApprovalAuditContext>,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!("approval.consume cancelled pre-start: {err}"))
+        })?;
+
+        let code_hash = hash_allow_once_code(allow_once_code);
+        let fingerprint = fingerprint_for_input(input);
+        let record = self
+            .storage
+            .consume_approval_token(
+                &code_hash,
+                &self.workspace_id,
+                input.action.as_str(),
+                input.pane_id,
+                &fingerprint,
+            )
+            .await?;
+
+        if record.is_some() {
+            cx.checkpoint().map_err(|err| {
+                Error::Runtime(format!(
+                    "approval.consume cancelled after token consumed, before audit: {err}"
+                ))
+            })?;
+
+            self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
+                .await?;
+        }
+
+        Ok(record)
+    }
+
     async fn audit_approval_grant(
         &self,
         input: &PolicyInput,
@@ -1275,6 +1349,97 @@ mod tests {
     // -----------------------------------------------------------------------
     // Async integration tests (existing)
     // -----------------------------------------------------------------------
+
+    /// ft-xbnl0.2.3 Cx-first: `consume_with_cx` must match the
+    /// legacy `consume` for an uncancelled cx. Issues a token
+    /// via the legacy path, then consumes via the Cx-first path,
+    /// verifying:
+    ///   * first consume returns Some (token valid + consumed).
+    ///   * second consume returns None (token exhausted).
+    ///   * same consumed-token fields as the legacy consume would
+    ///     produce (proven indirectly by the round-trip working).
+    ///
+    /// Also exercises `consume_with_context_with_cx` by passing
+    /// an explicit audit_context to verify the delegation hop
+    /// (`consume_with_cx` → `consume_with_context_with_cx`) works.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn consume_with_cx_matches_legacy_and_exhausts_token() {
+        run_async_test(async {
+            let temp_dir = std::env::temp_dir();
+            let db_path = temp_dir.join(format!(
+                "wa_test_approval_consume_cx_{}.db",
+                std::process::id()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path_str).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+            let cx = crate::cx::for_request();
+
+            // Path 1: legacy issue, Cx-first consume.
+            let req = store.issue(&input, None).await.unwrap();
+            let consumed = store
+                .consume_with_cx(&cx, &req.allow_once_code, &input)
+                .await
+                .unwrap();
+            assert!(
+                consumed.is_some(),
+                "Cx-first consume must succeed on legacy-issued token"
+            );
+            let retry = store
+                .consume_with_cx(&cx, &req.allow_once_code, &input)
+                .await
+                .unwrap();
+            assert!(
+                retry.is_none(),
+                "second consume_with_cx must find exhausted token"
+            );
+
+            // Path 2: Cx-first issue, Cx-first consume_with_context
+            // with an explicit audit_context. Exercises the
+            // audit-fire path (record.is_some() branch).
+            let req2 = store
+                .issue_with_cx(&cx, &input, Some("second token".to_string()))
+                .await
+                .unwrap();
+            let audit_ctx = ApprovalAuditContext {
+                correlation_id: Some("corr-cx-61".to_string()),
+                decision_context: None,
+            };
+            let consumed2 = store
+                .consume_with_context_with_cx(&cx, &req2.allow_once_code, &input, Some(audit_ctx))
+                .await
+                .unwrap();
+            assert!(
+                consumed2.is_some(),
+                "consume_with_context_with_cx must succeed on Cx-issued token"
+            );
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        });
+    }
 
     /// ft-xbnl0.2.3 Cx-first: `issue_for_plan_with_cx` must match
     /// the legacy `issue_for_plan` for an uncancelled cx.
