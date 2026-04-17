@@ -776,6 +776,140 @@ impl MigrationEngine {
         Ok(result)
     }
 
+    /// Cx-first [`Self::m3_checkpoint_sync`] (ft-xbnl0.2.3).
+    /// Threads caller `&Cx` through the per-consumer loop via
+    /// checkpoint seams: pre-flight (before `source.lag_metrics`),
+    /// per-iteration (before each consumer's read+commit pair),
+    /// so caller cancellation aborts between consumers.
+    ///
+    /// Cancellation-safety contract: the per-iteration checkpoint
+    /// fires BEFORE the `source.read_checkpoint` call for that
+    /// consumer, so a mid-sync cancel leaves the target with a
+    /// consistent set of fully-migrated consumers up to the abort
+    /// point. Already-migrated consumers are NOT rolled back —
+    /// the `commit_checkpoint` idempotency (Advanced /
+    /// NoopAlreadyAdvanced outcomes) means a subsequent resume
+    /// replays safely.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn m3_checkpoint_sync_with_cx<S: RecorderStorage, T: RecorderStorage>(
+        &self,
+        cx: &crate::cx::Cx,
+        source: &S,
+        target: &T,
+        manifest: &MigrationManifest,
+    ) -> Result<CheckpointSyncResult, MigrationError> {
+        cx.checkpoint().map_err(|err| {
+            MigrationError::StorageError(format!("m3_checkpoint_sync cancelled pre-start: {err}"))
+        })?;
+
+        let lag = source
+            .lag_metrics()
+            .await
+            .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+        let consumer_ids: Vec<CheckpointConsumerId> =
+            lag.consumers.iter().map(|c| c.consumer.clone()).collect();
+
+        info!(
+            migration_stage = "M3",
+            consumers = consumer_ids.len(),
+            "checkpoint sync starting (cx)"
+        );
+
+        let mut result = CheckpointSyncResult {
+            consumers_found: consumer_ids.len(),
+            checkpoints_migrated: 0,
+            checkpoints_reset: 0,
+            reset_consumers: Vec::new(),
+        };
+
+        if consumer_ids.is_empty() {
+            return Ok(result);
+        }
+
+        for consumer_id in &consumer_ids {
+            cx.checkpoint().map_err(|err| {
+                MigrationError::StorageError(format!(
+                    "m3_checkpoint_sync cancelled before consumer {} (migrated={}, reset={}): {err}",
+                    consumer_id.0, result.checkpoints_migrated, result.checkpoints_reset
+                ))
+            })?;
+
+            let checkpoint_opt = source
+                .read_checkpoint(consumer_id)
+                .await
+                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+            let checkpoint = match checkpoint_opt {
+                Some(cp) => cp,
+                None => continue,
+            };
+
+            let ordinal = checkpoint.upto_offset.ordinal;
+            let in_range = ordinal >= manifest.first_ordinal && ordinal <= manifest.last_ordinal;
+
+            let target_checkpoint = if in_range {
+                debug!(
+                    checkpoint_migrated = true,
+                    consumer = %consumer_id.0,
+                    ordinal = ordinal,
+                    "migrating checkpoint as-is (cx)"
+                );
+                checkpoint
+            } else {
+                warn!(
+                    checkpoint_reset = true,
+                    consumer = %consumer_id.0,
+                    original_ordinal = ordinal,
+                    reset_ordinal = manifest.first_ordinal,
+                    reason = "ordinal_gap",
+                    "resetting checkpoint to safe replay point (cx)"
+                );
+                result.checkpoints_reset += 1;
+                result.reset_consumers.push(consumer_id.0.clone());
+
+                RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: RecorderOffset {
+                        segment_id: 0,
+                        byte_offset: 0,
+                        ordinal: manifest.first_ordinal,
+                    },
+                    schema_version: checkpoint.schema_version,
+                    committed_at_ms: checkpoint.committed_at_ms,
+                }
+            };
+
+            let outcome = target
+                .commit_checkpoint(target_checkpoint)
+                .await
+                .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+
+            use crate::recorder_storage::CheckpointCommitOutcome;
+            match outcome {
+                CheckpointCommitOutcome::Advanced
+                | CheckpointCommitOutcome::NoopAlreadyAdvanced => {
+                    result.checkpoints_migrated += 1;
+                }
+                CheckpointCommitOutcome::RejectedOutOfOrder => {
+                    return Err(MigrationError::CheckpointCommitRejected {
+                        consumer: consumer_id.0.clone(),
+                        reason: "rejected out of order".to_string(),
+                    });
+                }
+            }
+        }
+
+        info!(
+            migration_stage = "M3",
+            migrated = result.checkpoints_migrated,
+            reset = result.checkpoints_reset,
+            "checkpoint sync complete (cx)"
+        );
+
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // M5 — Cutover
     // -----------------------------------------------------------------------
@@ -2039,6 +2173,83 @@ mod tests {
             assert_eq!(result.checkpoints_migrated, 2);
             assert_eq!(result.checkpoints_reset, 0);
             assert_eq!(target.committed.lock().unwrap().len(), 2);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m3_checkpoint_sync_with_cx` must
+    /// match the legacy `m3_checkpoint_sync` for an uncancelled cx.
+    /// Mirrors the two-consumer topology from
+    /// `test_m3_migrates_all_consumer_checkpoints` and asserts
+    /// CheckpointSyncResult parity across all fields.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m3_checkpoint_sync_with_cx_matches_legacy() {
+        run_async_test(async {
+            let consumers = vec![
+                make_consumer_lag("indexer", 5),
+                make_consumer_lag("auditor", 10),
+            ];
+            let mut checkpoints = HashMap::new();
+            checkpoints.insert("indexer".to_string(), make_checkpoint("indexer", 3));
+            checkpoints.insert("auditor".to_string(), make_checkpoint("auditor", 2));
+
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+
+            let manifest = MigrationManifest {
+                first_ordinal: 0,
+                last_ordinal: 10,
+                ..Default::default()
+            };
+
+            let cx = crate::cx::for_request();
+            let result = engine
+                .m3_checkpoint_sync_with_cx(&cx, &source, &target, &manifest)
+                .await
+                .unwrap();
+
+            assert_eq!(result.consumers_found, 2);
+            assert_eq!(result.checkpoints_migrated, 2);
+            assert_eq!(result.checkpoints_reset, 0);
+            assert!(result.reset_consumers.is_empty());
+            assert_eq!(target.committed.lock().unwrap().len(), 2);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `m3_checkpoint_sync_with_cx` must
+    /// reset an out-of-range checkpoint the same as the legacy
+    /// path (same branch as `test_m3_rejects_checkpoint_referencing_missing_ordinal`).
+    /// Proves the reset branch fires on the Cx path too.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn m3_checkpoint_sync_with_cx_resets_out_of_range() {
+        run_async_test(async {
+            let consumers = vec![make_consumer_lag("idx", 0)];
+            let mut checkpoints = HashMap::new();
+            // Checkpoint ordinal 100 is WAY past the manifest range
+            // [5, 20], so it must be reset to first_ordinal=5.
+            checkpoints.insert("idx".to_string(), make_checkpoint("idx", 100));
+
+            let source = MockCheckpointStorage::new(consumers, checkpoints);
+            let target = MockCheckpointStorage::empty_target();
+            let engine = MigrationEngine::new(MigrationConfig::default());
+            let cx = crate::cx::for_request();
+
+            let manifest = MigrationManifest {
+                first_ordinal: 5,
+                last_ordinal: 20,
+                ..Default::default()
+            };
+
+            let result = engine
+                .m3_checkpoint_sync_with_cx(&cx, &source, &target, &manifest)
+                .await
+                .unwrap();
+
+            assert_eq!(result.checkpoints_reset, 1);
+            assert_eq!(result.reset_consumers, vec!["idx".to_string()]);
+            assert_eq!(result.checkpoints_migrated, 1);
         });
     }
 
