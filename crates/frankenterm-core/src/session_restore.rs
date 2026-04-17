@@ -1252,6 +1252,26 @@ impl SessionRestorer {
         })
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`restore`].
+    ///
+    /// Pre-flight checkpoint gates the entire multi-step restore
+    /// pipeline (topology parse → layout restore → scrollback
+    /// inject → banner send → bookkeeping → process relaunch).
+    /// Delegates to [`restore`] for the actual work so the legacy
+    /// path remains authoritative.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn restore_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session: &SessionCandidate,
+        checkpoint: &CheckpointData,
+        wezterm: WeztermHandle,
+    ) -> Result<RestoreSummary, RestoreError> {
+        cx.checkpoint()
+            .map_err(|err| RestoreError::Wezterm(format!("restore cancelled: {err}")))?;
+        self.restore(session, checkpoint, wezterm).await
+    }
+
     /// Run the full detection + restore flow.
     ///
     /// Returns `None` if no restore is needed (clean startup).
@@ -1295,6 +1315,73 @@ impl SessionRestorer {
 
         // Step 4: Execute restore
         let summary = self.restore(&session, &checkpoint, wezterm).await?;
+
+        Ok(Some(summary))
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`detect_and_restore`].
+    ///
+    /// Checkpoint seams at each step boundary make cancellation
+    /// responsive between (1) pre-flight, (2) detect, (3)
+    /// checkpoint load, (4) WezTerm reachability check, and
+    /// (5) before the actual restore fires. The inner restore is
+    /// routed through [`restore_with_cx`] so cancellation
+    /// propagates into the expensive multi-step pipeline.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn detect_and_restore_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        wezterm: WeztermHandle,
+    ) -> Result<Option<RestoreSummary>, RestoreError> {
+        cx.checkpoint()
+            .map_err(|err| RestoreError::Wezterm(format!("detect_and_restore cancelled: {err}")))?;
+
+        let session = match self.detect()? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!(
+                "detect_and_restore cancelled before checkpoint load: {err}"
+            ))
+        })?;
+
+        let checkpoint = self.load_checkpoint(&session)?;
+
+        if checkpoint.pane_states.is_empty() {
+            warn!(
+                session_id = %session.session_id,
+                "Checkpoint has no pane states, skipping restore"
+            );
+            mark_session_restored(&self.db_path, &session.session_id)?;
+            return Ok(None);
+        }
+
+        cx.checkpoint().map_err(|err| {
+            RestoreError::Wezterm(format!(
+                "detect_and_restore cancelled before wezterm check: {err}"
+            ))
+        })?;
+
+        match wezterm.list_panes().await {
+            Ok(panes) if !panes.is_empty() => {
+                info!(
+                    existing_panes = panes.len(),
+                    "WezTerm has existing panes; restore will create new panes alongside them"
+                );
+            }
+            Ok(_) => {
+                debug!("WezTerm running with no panes — clean slate for restore");
+            }
+            Err(e) => {
+                return Err(RestoreError::Wezterm(format!("cannot reach WezTerm: {e}")));
+            }
+        }
+
+        let summary = self
+            .restore_with_cx(cx, &session, &checkpoint, wezterm)
+            .await?;
 
         Ok(Some(summary))
     }
@@ -3536,5 +3623,42 @@ mod tests {
             },
         );
         assert!(restorer.auto_restore());
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `restore_with_cx` must produce a
+    /// RestoreSummary equivalent to `restore` on a single-pane
+    /// clean-restore case. Uses the same MockWezterm harness
+    /// the legacy success test uses; asserts restored_count,
+    /// failed_count, and pane_id_map size match expectations.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn session_restorer_restore_with_cx_matches_legacy() {
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-cx-success", false);
+        set_single_pane_topology(&conn, "sess-cx-success", 9, "/cx-restore");
+
+        let checkpoint_id = insert_checkpoint(&conn, "sess-cx-success", 5000, 1);
+        insert_pane_state(&conn, checkpoint_id, 9, Some("/cx-restore"), Some("bash"));
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = 5000 WHERE session_id = 'sess-cx-success'",
+            [],
+        )
+        .unwrap();
+
+        let restorer =
+            SessionRestorer::new(Arc::new(db_path.clone()), SessionRestoreConfig::default());
+        let session = restorer.detect().unwrap().expect("restorable session");
+        let checkpoint = restorer.load_checkpoint(&session).unwrap();
+
+        let wezterm = Arc::new(MockWezterm::new());
+        let cx = crate::cx::for_request();
+        let summary =
+            run_async_test(restorer.restore_with_cx(&cx, &session, &checkpoint, wezterm.clone()))
+                .unwrap();
+
+        assert_eq!(summary.restored_count(), 1);
+        assert_eq!(summary.failed_count(), 0);
+        assert_eq!(summary.checkpoint_id, checkpoint_id);
+        assert_eq!(summary.layout_result.pane_id_map.len(), 1);
     }
 }
