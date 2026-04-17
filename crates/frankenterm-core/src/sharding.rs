@@ -811,6 +811,60 @@ impl ShardedWeztermClient {
         Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
     }
 
+    /// Resolve a global pane_id to a `PaneRoute` bound to the caller's
+    /// asupersync capability context (ft-xbnl0.2.3 Cx-first internal
+    /// helper).
+    ///
+    /// Uses `pane_routes.read_with_cx(cx)` / `write_with_cx(cx)` (the
+    /// primitives from tick 9) and `collect_panes_with_cx(cx)` so the
+    /// full route-discovery path threads cx end-to-end. Callers that
+    /// have already-Cx-first `_with_cx` handle methods should use this
+    /// internal helper to avoid breaking the Cx-first chain at the
+    /// route-lookup boundary.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn route_for_global_pane_id_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<PaneRoute> {
+        self.telemetry.route_lookups.fetch_add(1, Ordering::Relaxed);
+        if let Some(route) = self
+            .pane_routes
+            .read_with_cx(cx)
+            .await
+            .get(&pane_id)
+            .copied()
+        {
+            return Ok(route);
+        }
+
+        let (_panes, routes) = self.collect_panes_with_cx(cx).await?;
+        {
+            let mut guard = self.pane_routes.write_with_cx(cx).await;
+            *guard = routes;
+            if let Some(route) = guard.get(&pane_id).copied() {
+                return Ok(route);
+            }
+        }
+
+        if self.backends.len() == 1 {
+            return Ok(PaneRoute {
+                shard_id: self.backends[0].id,
+                local_pane_id: pane_id,
+            });
+        }
+
+        let (decoded_shard, decoded_local) = decode_sharded_pane_id(pane_id);
+        if self.backend_index.contains_key(&decoded_shard) {
+            return Ok(PaneRoute {
+                shard_id: decoded_shard,
+                local_pane_id: decoded_local,
+            });
+        }
+
+        Err(crate::Error::Wezterm(WeztermError::PaneNotFound(pane_id)))
+    }
+
     async fn route_for_window_id(&self, window_id: u64) -> Result<ShardId> {
         if self.backends.len() == 1 {
             return Ok(self.backends[0].id);
@@ -1176,7 +1230,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, PaneInfo> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             let mut pane = backend
                 .handle
@@ -1204,7 +1258,7 @@ impl WeztermInterface for ShardedWeztermClient {
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1223,7 +1277,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1242,7 +1296,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1265,7 +1319,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let text = text.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1292,7 +1346,7 @@ impl WeztermInterface for ShardedWeztermClient {
     ) -> WeztermFuture<'a, ()> {
         let control_char = control_char.to_string();
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
@@ -1311,7 +1365,7 @@ impl WeztermInterface for ShardedWeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
         Box::pin(async move {
-            let route = self.route_for_global_pane_id(pane_id).await?;
+            let route = self.route_for_global_pane_id_with_cx(cx, pane_id).await?;
             let backend = self.backend_for_id(route.shard_id)?;
             backend
                 .handle
