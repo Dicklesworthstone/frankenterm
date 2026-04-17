@@ -863,6 +863,216 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         Ok((progress, stats))
     }
 
+    /// Cx-first [`Self::reindex_range_observed`] (ft-xbnl0.2.3).
+    /// Same semantics as [`Self::reindex_range_observed`] plus
+    /// per-batch caller cancellation. Pre-flight checkpoint gates
+    /// the empty-range short-circuit and preserves the
+    /// `observer.on_complete(&stats_zero)` call for empty ranges
+    /// (semantic: the observer always hears about completion for
+    /// an uncancelled call, including trivial empty-range calls).
+    ///
+    /// Cancellation semantics: a mid-run cancel propagates as
+    /// `Err(IndexerError::Config(...))` WITHOUT calling
+    /// `observer.on_complete`. The observer only hears about
+    /// completion when the indexing run actually completed (either
+    /// naturally or was already empty). This matches the error
+    /// path on non-cx IO errors where on_complete is also not
+    /// called. Callers that need a cancellation-aware completion
+    /// signal should inspect the returned `Err` variant.
+    #[cfg(feature = "asupersync-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reindex_range_observed_with_cx<S: RecorderStorage, O: ReindexObserver + Sync>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        source: &RecorderSourceDescriptor,
+        from: RecorderOffset,
+        to: RecorderOffset,
+        consumer_id_str: &str,
+        batch_size: usize,
+        dedup_on_replay: bool,
+        expected_schema: &str,
+        observer: &O,
+    ) -> Result<(ReindexProgress, ReindexStats), IndexerError> {
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!("reindex_range_observed cancelled pre-start: {err}"))
+        })?;
+
+        let start_ms = epoch_ms_now();
+
+        if batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        if to.ordinal <= from.ordinal {
+            let progress = ReindexProgress::new();
+            let stats = ReindexStats::from_progress(&progress, start_ms);
+            observer.on_complete(&stats);
+            tracing::info!(
+                reindex_complete = true,
+                duration_ms = %stats.duration_ms,
+                events = 0u64,
+                errors = 0u64,
+                "reindex range empty (to <= from) (cx)"
+            );
+            return Ok((progress, stats));
+        }
+
+        let total_estimate = to.ordinal.saturating_sub(from.ordinal);
+        tracing::info!(
+            reindex_progress = "starting",
+            from = %from.ordinal,
+            to = %to.ordinal,
+            estimated_events = total_estimate,
+            backend = %source,
+            "starting observed reindex [from, to) (cx)"
+        );
+
+        let event_reader = create_event_reader(source)?;
+        let consumer_id = CheckpointConsumerId(consumer_id_str.to_string());
+        let mut progress = ReindexProgress::new();
+
+        let mut cursor = if from.ordinal > 0 {
+            event_reader
+                .open_cursor_at_ordinal(from.ordinal)
+                .map_err(cursor_err)?
+        } else {
+            event_reader.open_cursor_from_start().map_err(cursor_err)?
+        };
+
+        let exclusive_range = ExclusiveOrdinalRange {
+            from_ordinal: from.ordinal,
+            to_ordinal: to.ordinal,
+        };
+
+        let mut last_progress_ms = start_ms;
+        loop {
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "reindex_range_observed cancelled between batches (current_ordinal={:?}, batches={}): {err}",
+                    progress.current_ordinal, progress.batches_committed
+                ))
+            })?;
+
+            let batch = cursor.next_batch(batch_size).map_err(cursor_err)?;
+            if batch.is_empty() {
+                progress.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+            let mut index_mutations_in_batch = 0u64;
+
+            for record in &batch {
+                progress.events_read += 1;
+                let ordinal = record.offset.ordinal;
+
+                if ordinal >= exclusive_range.to_ordinal {
+                    progress.caught_up = true;
+                    last_offset = Some(record.offset.clone());
+                    break;
+                }
+
+                if ordinal < exclusive_range.from_ordinal {
+                    progress.events_filtered += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                if record.event.schema_version != expected_schema {
+                    progress.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, ordinal);
+
+                if dedup_on_replay {
+                    self.writer
+                        .delete_by_event_id(&doc.event_id)
+                        .map_err(IndexerError::IndexWrite)?;
+                    index_mutations_in_batch += 1;
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => {
+                        progress.events_indexed += 1;
+                        index_mutations_in_batch += 1;
+                    }
+                    Err(IndexWriteError::Rejected { .. }) => {
+                        progress.events_skipped += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            if let Some(offset) = last_offset {
+                if index_mutations_in_batch > 0 {
+                    self.writer.commit().map_err(IndexerError::IndexWrite)?;
+                }
+                progress.current_ordinal = Some(offset.ordinal);
+
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset.clone(),
+                    schema_version: expected_schema.to_string(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+                progress.batches_committed += 1;
+
+                let now_ms = epoch_ms_now();
+                let elapsed = now_ms.saturating_sub(start_ms);
+                let eta_ms = if progress.events_indexed > 0 && total_estimate > 0 {
+                    let rate = progress.events_indexed as f64 / elapsed.max(1) as f64;
+                    let remaining = total_estimate.saturating_sub(progress.events_indexed);
+                    (remaining as f64 / rate.max(0.001)) as u64
+                } else {
+                    0
+                };
+
+                observer.on_progress(&offset, total_estimate, eta_ms);
+
+                if now_ms.saturating_sub(last_progress_ms) >= 1000 {
+                    let pct = if total_estimate > 0 {
+                        (progress.events_indexed as f64 / total_estimate as f64 * 100.0) as u64
+                    } else {
+                        0
+                    };
+                    tracing::info!(
+                        reindex_progress = %pct,
+                        events = progress.events_indexed,
+                        eta_ms = %eta_ms,
+                        "reindex progress (cx)"
+                    );
+                    last_progress_ms = now_ms;
+                }
+            }
+
+            if is_final_batch || progress.caught_up {
+                if !progress.caught_up {
+                    progress.caught_up = true;
+                }
+                break;
+            }
+        }
+
+        let stats = ReindexStats::from_progress(&progress, start_ms);
+        observer.on_complete(&stats);
+
+        tracing::info!(
+            reindex_complete = true,
+            duration_ms = %stats.duration_ms,
+            indexed_count = stats.indexed_count,
+            caught_up = %stats.caught_up,
+            "observed reindex complete (cx)"
+        );
+
+        Ok((progress, stats))
+    }
+
     /// Backfill a specific range of events.
     ///
     /// Events outside the specified range are skipped. The operation uses
@@ -4413,6 +4623,138 @@ mod tests {
                 "expected >= 2 progress calls, got {}",
                 calls.len()
             );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `reindex_range_observed_with_cx` must
+    /// match the legacy `reindex_range_observed` for an uncancelled
+    /// cx across ReindexProgress, indexed docs, AND observer
+    /// callback counts (on_progress invocations + on_complete
+    /// exactly-once).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn reindex_range_observed_with_cx_matches_legacy() {
+        run_async_test(async {
+            let dir_legacy = tempdir().unwrap();
+            let scfg_legacy = test_storage_config(dir_legacy.path());
+            let storage_legacy = AppendLogRecorderStorage::open(scfg_legacy.clone()).unwrap();
+
+            let events: Vec<_> = (0..10)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect();
+            populate_log(&storage_legacy, events.clone()).await;
+
+            let source_legacy = RecorderSourceDescriptor::AppendLog {
+                data_path: dir_legacy.path().join("events.log"),
+            };
+            let from = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 0,
+            };
+            let to = RecorderOffset {
+                segment_id: 0,
+                byte_offset: 0,
+                ordinal: 10,
+            };
+
+            let observer_legacy = TestObserver::new();
+            let mut pipeline_legacy = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let (p_legacy, s_legacy) = pipeline_legacy
+                .reindex_range_observed(
+                    &storage_legacy,
+                    &source_legacy,
+                    from.clone(),
+                    to.clone(),
+                    "legacy-observed-parity",
+                    5,
+                    false,
+                    RECORDER_EVENT_SCHEMA_VERSION_V1,
+                    &observer_legacy,
+                )
+                .await
+                .unwrap();
+
+            // Separate dir for cx path.
+            let dir_cx = tempdir().unwrap();
+            let scfg_cx = test_storage_config(dir_cx.path());
+            let storage_cx = AppendLogRecorderStorage::open(scfg_cx.clone()).unwrap();
+            populate_log(&storage_cx, events).await;
+
+            let source_cx = RecorderSourceDescriptor::AppendLog {
+                data_path: dir_cx.path().join("events.log"),
+            };
+
+            let observer_cx = TestObserver::new();
+            let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let cx = crate::cx::for_request();
+            let (p_cx, s_cx) = pipeline_cx
+                .reindex_range_observed_with_cx(
+                    &cx,
+                    &storage_cx,
+                    &source_cx,
+                    from,
+                    to,
+                    "cx-observed-parity",
+                    5,
+                    false,
+                    RECORDER_EVENT_SCHEMA_VERSION_V1,
+                    &observer_cx,
+                )
+                .await
+                .unwrap();
+
+            // ReindexProgress parity
+            assert_eq!(p_legacy.events_read, p_cx.events_read);
+            assert_eq!(p_legacy.events_indexed, p_cx.events_indexed);
+            assert_eq!(p_legacy.events_skipped, p_cx.events_skipped);
+            assert_eq!(p_legacy.events_filtered, p_cx.events_filtered);
+            assert_eq!(p_legacy.caught_up, p_cx.caught_up);
+            assert_eq!(p_legacy.current_ordinal, p_cx.current_ordinal);
+            assert_eq!(p_legacy.batches_committed, p_cx.batches_committed);
+            assert_eq!(p_cx.events_indexed, 10);
+
+            // Stats parity (duration_ms excluded because it's
+            // wall-clock dependent and will differ between the two
+            // calls).
+            assert_eq!(s_legacy.event_count, s_cx.event_count);
+            assert_eq!(s_legacy.indexed_count, s_cx.indexed_count);
+            assert_eq!(s_legacy.skipped_count, s_cx.skipped_count);
+            assert_eq!(s_legacy.filtered_count, s_cx.filtered_count);
+            assert_eq!(s_legacy.caught_up, s_cx.caught_up);
+
+            // Observer callback parity
+            let legacy_progress_calls = observer_legacy.progress_calls.lock().unwrap().len();
+            let cx_progress_calls = observer_cx.progress_calls.lock().unwrap().len();
+            assert_eq!(
+                legacy_progress_calls, cx_progress_calls,
+                "observer.on_progress invocation count must match"
+            );
+            assert_eq!(
+                observer_legacy.complete_calls.lock().unwrap().len(),
+                1,
+                "legacy on_complete should fire exactly once"
+            );
+            assert_eq!(
+                observer_cx.complete_calls.lock().unwrap().len(),
+                1,
+                "cx-first on_complete should fire exactly once"
+            );
+
+            // Indexed doc event_id slice parity.
+            let ids_legacy: Vec<&str> = pipeline_legacy
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            let ids_cx: Vec<&str> = pipeline_cx
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            assert_eq!(ids_legacy, ids_cx);
         });
     }
 
