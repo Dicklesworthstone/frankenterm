@@ -653,6 +653,21 @@ impl IpcServer {
         Self::bind_with_permissions(socket_path, Some(0o600)).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
+    ///
+    /// Pre-flight checkpoint gates IPC server bind before any
+    /// filesystem mutation (stale socket removal, parent dir
+    /// creation) or listener setup. CLI startup paths that are
+    /// already cancelled can bail before touching the socket
+    /// directory.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn bind_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        Self::bind_with_permissions_with_cx(cx, socket_path, Some(0o600)).await
+    }
+
     /// Create and bind a new IPC server with explicit permissions.
     ///
     /// # Arguments
@@ -683,6 +698,69 @@ impl IpcServer {
             std::fs::set_permissions(&socket_path, perms)?;
         }
         tracing::info!(path = %socket_path.display(), "IPC server listening");
+
+        Ok(Self {
+            socket_path,
+            listener,
+        })
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`bind_with_permissions`].
+    ///
+    /// Checkpoint seams before each filesystem/syscall boundary:
+    /// (1) pre-flight, (2) before stale-socket removal, (3)
+    /// before parent-dir creation, (4) before the actual bind.
+    /// Responsive cancellation during socket setup — a cx-driven
+    /// CLI that was cancelled mid-startup won't leave behind
+    /// empty parent dirs or touch files it doesn't need to.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn bind_with_permissions_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: impl AsRef<Path>,
+        permissions: Option<u32>,
+    ) -> std::io::Result<Self> {
+        cx.checkpoint().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("ipc bind cancelled: {err}"),
+            )
+        })?;
+
+        let socket_path = socket_path.as_ref().to_path_buf();
+
+        if socket_path.exists() {
+            cx.checkpoint().map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("ipc bind cancelled before stale-socket removal: {err}"),
+                )
+            })?;
+            std::fs::remove_file(&socket_path)?;
+        }
+
+        if let Some(parent) = socket_path.parent() {
+            cx.checkpoint().map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("ipc bind cancelled before parent-dir creation: {err}"),
+                )
+            })?;
+            std::fs::create_dir_all(parent)?;
+        }
+
+        cx.checkpoint().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("ipc bind cancelled before listener bind: {err}"),
+            )
+        })?;
+
+        let listener = compat_unix::bind(&socket_path).await?;
+        if let Some(mode) = permissions {
+            let perms = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&socket_path, perms)?;
+        }
+        tracing::info!(path = %socket_path.display(), "IPC server listening (cx-first)");
 
         Ok(Self {
             socket_path,
@@ -2058,6 +2136,59 @@ mod tests {
             drop(shutdown_tx);
 
             assert!(shutdown_signal_pending(&mut shutdown_rx).await);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must successfully
+    /// bind when given a fresh, uncancelled cx — producing a
+    /// server with the same socket path as the legacy `bind`.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn ipc_server_bind_with_cx_matches_legacy() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("bind-cx-test.sock");
+            let cx = crate::cx::for_testing();
+
+            let server = IpcServer::bind_with_cx(&cx, &socket_path)
+                .await
+                .expect("bind_with_cx should succeed on fresh cx");
+
+            assert_eq!(server.socket_path(), socket_path.as_path());
+            assert!(socket_path.exists(), "socket file should exist after bind");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must return a
+    /// cancellation error when given a pre-cancelled cx,
+    /// without creating the socket or parent directory.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn ipc_server_bind_with_precancelled_cx_fails_before_filesystem_mutation() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("bind-cancelled.sock");
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel bind test"),
+            );
+
+            let result = IpcServer::bind_with_cx(&cx, &socket_path).await;
+            let err = match result {
+                Err(e) => e,
+                Ok(_) => panic!("bind_with_cx should fail on cancelled cx"),
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+            assert!(
+                err.to_string().contains("cancelled"),
+                "error should mention cancellation: {err}"
+            );
+            assert!(
+                !socket_path.exists(),
+                "socket must not be created when cx is pre-cancelled"
+            );
         });
     }
 
