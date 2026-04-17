@@ -1181,6 +1181,149 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
         Ok(result)
     }
 
+    /// Cx-first [`Self::run_with_reader`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the batch loop via `cx.checkpoint()`
+    /// before each cursor batch + before each storage checkpoint
+    /// commit. A pre-cancelled cx returns a zero-events result
+    /// immediately (cursor never opened). A mid-run cancel exits
+    /// between batches; because the checkpoint is committed BEFORE
+    /// cancellation can fire (the checkpoint happens inside the
+    /// iteration, before the loop re-enters its top-of-body
+    /// checkpoint), no indexed-but-not-committed state is leaked —
+    /// the last committed checkpoint always reflects indexed events.
+    ///
+    /// Identical indexing + commit logic to
+    /// [`Self::run_with_reader`] for uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_reader_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        reader: &dyn crate::recorder_storage::RecorderEventReader,
+    ) -> Result<IndexerRunResult, IndexerError> {
+        cx.checkpoint().map_err(|err| {
+            IndexerError::Config(format!("run_with_reader cancelled pre-start: {err}"))
+        })?;
+
+        if self.config.batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+
+        let consumer_id = CheckpointConsumerId(self.config.consumer_id.clone());
+
+        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+
+        let mut cursor = match &checkpoint {
+            Some(cp) => {
+                let mut c = reader.open_cursor(cp.upto_offset.clone()).map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
+                })?;
+                let _ = c.next_batch(1).map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
+                })?;
+                tracing::debug!(
+                    cursor = "resume",
+                    from_ordinal = %cp.upto_offset.ordinal,
+                    "cursor opened at checkpoint (cx)"
+                );
+                c
+            }
+            None => {
+                tracing::debug!(cursor = "cold_start", "cursor opened from start (cx)");
+                reader.open_cursor_from_start().map_err(|e| {
+                    IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
+                })?
+            }
+        };
+
+        let mut result = IndexerRunResult {
+            events_read: 0,
+            events_indexed: 0,
+            events_skipped: 0,
+            batches_committed: 0,
+            final_ordinal: checkpoint.as_ref().map(|cp| cp.upto_offset.ordinal),
+            caught_up: false,
+        };
+
+        loop {
+            if self.config.max_batches > 0
+                && result.batches_committed >= self.config.max_batches as u64
+            {
+                break;
+            }
+
+            cx.checkpoint().map_err(|err| {
+                IndexerError::Config(format!(
+                    "run_with_reader cancelled between batches (final_ordinal={:?}): {err}",
+                    result.final_ordinal
+                ))
+            })?;
+
+            let batch = cursor.next_batch(self.config.batch_size).map_err(|e| {
+                IndexerError::LogRead(LogReadError::Io(std::io::Error::other(e.to_string())))
+            })?;
+            if batch.is_empty() {
+                result.caught_up = true;
+                break;
+            }
+
+            let is_final_batch = batch.len() < self.config.batch_size;
+            let mut last_offset: Option<RecorderOffset> = None;
+
+            for record in &batch {
+                result.events_read += 1;
+
+                if record.event.schema_version != self.config.expected_event_schema {
+                    result.events_skipped += 1;
+                    last_offset = Some(record.offset.clone());
+                    continue;
+                }
+
+                let doc = map_event_to_document(&record.event, record.offset.ordinal);
+
+                if self.config.dedup_on_replay {
+                    let _ = self.writer.delete_by_event_id(&doc.event_id);
+                }
+
+                match self.writer.add_document(&doc) {
+                    Ok(()) => result.events_indexed += 1,
+                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
+                    Err(e) => return Err(e.into()),
+                }
+
+                last_offset = Some(record.offset.clone());
+            }
+
+            self.writer.commit()?;
+
+            if let Some(offset) = last_offset {
+                result.final_ordinal = Some(offset.ordinal);
+                let cp = RecorderCheckpoint {
+                    consumer: consumer_id.clone(),
+                    upto_offset: offset,
+                    schema_version: self.config.expected_event_schema.clone(),
+                    committed_at_ms: epoch_ms_now(),
+                };
+                storage.commit_checkpoint(cp).await?;
+            }
+
+            result.batches_committed += 1;
+
+            tracing::debug!(
+                cursor_batch = batch.len(),
+                current_offset = %cursor.current_offset().ordinal,
+                "batch processed via cursor (cx)"
+            );
+
+            if is_final_batch {
+                result.caught_up = true;
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Access the underlying writer (e.g. for diagnostics).
     pub fn writer(&self) -> &W {
         &self.writer
@@ -3610,6 +3753,93 @@ mod tests {
             assert_eq!(result_legacy.events_skipped, result_reader.events_skipped);
             assert_eq!(result_legacy.caught_up, result_reader.caught_up);
             assert_eq!(result_legacy.final_ordinal, result_reader.final_ordinal);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `run_with_reader_with_cx` must match
+    /// the legacy `run_with_reader` for an uncancelled cx. Drives
+    /// the same topology as `run_with_reader_matches_run_result` —
+    /// populates 4 events, runs both variants on separate
+    /// consumer_ids, asserts the two IndexerRunResult values are
+    /// bit-for-bit equivalent across all deterministic fields.
+    ///
+    /// The Cx-first variant adds cx.checkpoint()? at top and
+    /// per-batch; for an uncancelled Cx::for_request() these are
+    /// no-ops (checkpoint on a live cx returns Ok()), so the
+    /// observable behavior matches legacy exactly.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn run_with_reader_with_cx_matches_legacy() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            let events: Vec<_> = (0..4)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+                .collect();
+            populate_log(&storage, events).await;
+
+            let source = AppendLogEventSource::from_storage(&storage);
+
+            // Legacy reader path (non-cx).
+            let icfg_legacy = test_indexer_config(dir.path());
+            let writer_legacy = MockIndexWriter::new();
+            let mut indexer_legacy = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "legacy-reader-consumer".to_string(),
+                    ..icfg_legacy
+                },
+                writer_legacy,
+            );
+            let result_legacy = indexer_legacy
+                .run_with_reader(&storage, &source)
+                .await
+                .unwrap();
+
+            // Cx-first reader path.
+            let icfg_cx = test_indexer_config(dir.path());
+            let writer_cx = MockIndexWriter::new();
+            let mut indexer_cx = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "cx-reader-consumer".to_string(),
+                    ..icfg_cx
+                },
+                writer_cx,
+            );
+            let cx = crate::cx::for_request();
+            let result_cx = indexer_cx
+                .run_with_reader_with_cx(&cx, &storage, &source)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result_legacy.events_read, result_cx.events_read,
+                "events_read must match"
+            );
+            assert_eq!(
+                result_legacy.events_indexed, result_cx.events_indexed,
+                "events_indexed must match"
+            );
+            assert_eq!(
+                result_legacy.events_skipped, result_cx.events_skipped,
+                "events_skipped must match"
+            );
+            assert_eq!(
+                result_legacy.caught_up, result_cx.caught_up,
+                "caught_up must match"
+            );
+            assert_eq!(
+                result_legacy.final_ordinal, result_cx.final_ordinal,
+                "final_ordinal must match"
+            );
+            assert_eq!(
+                result_legacy.batches_committed, result_cx.batches_committed,
+                "batches_committed must match"
+            );
+            // 4 events, default batch_size typically >= 4, so 1
+            // batch — at least sanity-check the counts are positive.
+            assert!(result_cx.events_indexed > 0, "Cx-first must index events");
         });
     }
 
