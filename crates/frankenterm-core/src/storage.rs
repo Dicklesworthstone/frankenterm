@@ -6293,6 +6293,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_mutes`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_active_mutes_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        now_ms: i64,
+    ) -> Result<Vec<EventMuteRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("list_active_mutes cancelled: {err}")))?;
+        self.list_active_mutes(now_ms).await
+    }
+
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
         let db_path = Arc::clone(&self.db_path);
@@ -6395,6 +6407,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_undo`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_action_undo_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        audit_action_id: i64,
+    ) -> Result<Option<ActionUndoRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_action_undo cancelled: {err}")))?;
+        self.get_action_undo(audit_action_id).await
+    }
+
     /// Mark an undo record as executed.
     ///
     /// Returns `true` when the row was updated and `false` when the target
@@ -6426,6 +6450,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`purge_audit_actions_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn purge_audit_actions_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("purge_audit_actions_before cancelled: {err}"))
+        })?;
+        self.purge_audit_actions_before(before_ts).await
     }
 
     /// Record a maintenance event
@@ -6669,6 +6706,19 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metric`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_usage_metric_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: UsageMetricRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_usage_metric cancelled: {err}"))
+        })?;
+        self.record_usage_metric(record).await
+    }
+
     /// Record multiple usage metrics for analytics tracking in a single transaction.
     ///
     /// Returns the number of rows inserted.
@@ -6837,6 +6887,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_segments_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_segments_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_segments_before cancelled: {err}"))
+        })?;
+        self.count_segments_before(before_ts).await
+    }
+
     /// Count events older than a cutoff (flat, no tier filters; read-path).
     pub async fn count_events_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
@@ -6894,6 +6957,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_audit_actions_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_audit_actions_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_audit_actions_before cancelled: {err}"))
+        })?;
+        self.count_audit_actions_before(before_ts).await
+    }
+
     /// Count usage_metrics older than a cutoff (read-path).
     pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
         let db_path = Arc::clone(&self.db_path);
@@ -6904,6 +6980,19 @@ impl StorageHandle {
             count_usage_metrics_before_sync(&conn, before_ts)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_usage_metrics_before`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_usage_metrics_before_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_usage_metrics_before cancelled: {err}"))
+        })?;
+        self.count_usage_metrics_before(before_ts).await
     }
 
     /// Count notification_history older than a cutoff (read-path).
@@ -20010,6 +20099,87 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
         );
 
         storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 119 hot-path batch smoke test —
+/// 7 more storage cx-first siblings exercised end-to-end:
+/// count/list/undo reads and a purge/usage-metric write.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick119_hot_path_siblings_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick119_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        let ts = 1_700_000_000_000_i64;
+        let future_ts = 1_800_000_000_000_i64;
+
+        // 1. list_active_mutes_with_cx — empty on fresh DB.
+        let mutes = storage.list_active_mutes_with_cx(&cx, ts).await.unwrap();
+        assert!(mutes.is_empty());
+
+        // 2. count_segments_before_with_cx — 0 on empty DB.
+        let segs = storage
+            .count_segments_before_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(segs, 0);
+
+        // 3. count_audit_actions_before_with_cx — 0.
+        let audits = storage
+            .count_audit_actions_before_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(audits, 0);
+
+        // 4. count_usage_metrics_before_with_cx — 0.
+        let usage = storage
+            .count_usage_metrics_before_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(usage, 0);
+
+        // 5. get_action_undo_with_cx — None for nonexistent.
+        let undo = storage.get_action_undo_with_cx(&cx, 999_999).await.unwrap();
+        assert!(undo.is_none());
+
+        // 6. record_usage_metric_with_cx — insert + verify id > 0.
+        let metric = UsageMetricRecord {
+            id: 0,
+            timestamp: ts,
+            metric_type: MetricType::ApiCall,
+            pane_id: None,
+            agent_type: None,
+            account_id: None,
+            workflow_id: None,
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: None,
+            created_at: ts,
+        };
+        let metric_id = storage
+            .record_usage_metric_with_cx(&cx, metric)
+            .await
+            .unwrap();
+        assert!(metric_id > 0);
+
+        // 7. purge_audit_actions_before_with_cx — runs cleanly on
+        // a DB with no audit actions, returns 0.
+        let purged = storage
+            .purge_audit_actions_before_with_cx(&cx, future_ts)
+            .await
+            .unwrap();
+        assert_eq!(purged, 0);
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
