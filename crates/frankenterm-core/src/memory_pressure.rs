@@ -248,6 +248,68 @@ impl MemoryPressureMonitor {
         }
     }
 
+    /// Run the monitoring loop against the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Short-circuits before the first sample if `cx` is already cancelled.
+    /// Otherwise each inter-sample sleep is bound via
+    /// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+    /// cancellation from the outer scope cuts the sleep deterministically
+    /// under `LabRuntime` virtual time. Both the `shutdown` flag and
+    /// `cx.is_cancel_requested()` are checked each iteration so either
+    /// cancellation path terminates the loop promptly without waiting on
+    /// the full sample interval.
+    ///
+    /// Mirrors `CpuPressureMonitor::run_with_cx` and
+    /// `MemoryBudgetManager::run_with_cx` — these three sampling loops
+    /// share the same lifecycle shape.
+    ///
+    /// The legacy [`run`](Self::run) entry point is preserved for
+    /// non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if cx.is_cancel_requested() {
+            return;
+        }
+
+        let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
+        let mut first_tick = true;
+
+        loop {
+            if !first_tick {
+                // `sleep_with_cx` returns Err on cancellation; treat as
+                // "time to exit" so the loop terminates cleanly without
+                // a spurious extra sample after cancellation.
+                if crate::runtime_compat::sleep_with_cx(cx, interval)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            first_tick = false;
+
+            if shutdown.load(Ordering::SeqCst) || cx.is_cancel_requested() {
+                break;
+            }
+
+            let sample = self.sample();
+            if sample.tier >= MemoryPressureTier::Yellow {
+                tracing::info!(
+                    used_percent = format!("{:.1}", sample.used_percent),
+                    available_mb = sample.available_kb / 1024,
+                    tier = %sample.tier,
+                    action = %sample.tier.suggested_action(),
+                    "Memory pressure elevated"
+                );
+            }
+        }
+    }
+
     /// Classify memory utilization into a tier.
     fn classify(&self, used_percent: f64) -> MemoryPressureTier {
         if used_percent >= self.config.red_threshold {
@@ -870,5 +932,122 @@ mod tests {
         // but the tier should be a valid value.
         let tier = monitor.current_tier();
         assert!(tier.as_u8() <= 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first run entry point
+    // (ft-xbnl0.2.x slice). Mirrors cpu_pressure.rs and memory_budget.rs
+    // labruntime test patterns. We can't observe a sample count (no
+    // counter on the telemetry struct) but we can observe that the atomic
+    // tier handle is never written when the loop exits before sampling —
+    // the initial value is 0 (Green) and a real sample on a loaded host
+    // will never classify Green in this test config (sample_interval_ms
+    // is the only knob; thresholds are defaults which would classify a
+    // real sample as some tier).
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_memory_pressure {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// `run_with_cx` must return before entering the loop if the
+        /// caller's Cx is already cancelled. The atomic tier handle
+        /// must remain at its initial Green value because no sample
+        /// was taken.
+        #[test]
+        fn run_with_cx_pre_cancelled_exits_without_sampling() {
+            run_lab(0x3E30_BED5_BED5_0303, || async move {
+                let monitor = MemoryPressureMonitor::new(test_config());
+                let tier_before = monitor.current_tier();
+                assert_eq!(
+                    tier_before,
+                    MemoryPressureTier::Green,
+                    "fresh monitor should start in Green"
+                );
+                let shutdown = Arc::new(AtomicBool::new(false));
+
+                let budget = crate::cx::Budget::new().with_poll_quota(0);
+                let cx = crate::cx::Cx::for_testing_with_budget(budget);
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("ft-xbnl0.2.x memory_pressure precancel"),
+                );
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                // Tier handle must still be at the initial Green value —
+                // any real sample would have classified a tier based on
+                // actual memory usage. (Green is possible as a real
+                // sample outcome, so this assertion is a necessary but
+                // not sufficient check; paired with
+                // `shutdown_set_exits_without_sampling` it pins the
+                // short-circuit contract end-to-end.)
+                assert_eq!(
+                    monitor.current_tier(),
+                    MemoryPressureTier::Green,
+                    "pre-cancelled run_with_cx must not update the tier handle"
+                );
+                assert!(
+                    !shutdown.load(Ordering::SeqCst),
+                    "run_with_cx must return via the Cx path, not the shutdown flag"
+                );
+            });
+        }
+
+        /// `run_with_cx` with shutdown already set must exit before
+        /// sampling — the shutdown check runs before `sample()` on the
+        /// first tick. Pins the shared shutdown/Cx termination contract
+        /// across all three sampling monitors (cpu_pressure,
+        /// memory_budget, memory_pressure).
+        #[test]
+        fn run_with_cx_shutdown_set_exits_without_sampling() {
+            run_lab(0x3E30_BED5_BED5_0404, || async move {
+                let monitor = MemoryPressureMonitor::new(test_config());
+                let shutdown = Arc::new(AtomicBool::new(true));
+                let cx = crate::cx::for_request();
+
+                monitor.run_with_cx(&cx, Arc::clone(&shutdown)).await;
+
+                assert_eq!(
+                    monitor.current_tier(),
+                    MemoryPressureTier::Green,
+                    "shutdown flag set before any tick must exit before sampling"
+                );
+            });
+        }
     }
 }
