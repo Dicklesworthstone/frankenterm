@@ -774,9 +774,71 @@ impl ShardedWeztermClient {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`shard_health_report`].
+    ///
+    /// Threads the caller's cx through each shard's `list_panes`
+    /// call (via `list_panes_with_cx`) so a cancelled parent
+    /// gets responsive shutdown across multi-shard topologies.
+    /// Per-shard checkpoint between iterations lets a caller
+    /// abort partway through a large fleet health scan and
+    /// return a partial report marked as potentially incomplete.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn shard_health_report_with_cx(&self, cx: &crate::cx::Cx) -> ShardHealthReport {
+        self.telemetry
+            .health_reports
+            .fetch_add(1, Ordering::Relaxed);
+        let mut overall = HealthStatus::Healthy;
+        let mut shards = Vec::with_capacity(self.backends.len());
+
+        for backend in &self.backends {
+            if cx.checkpoint().is_err() {
+                break;
+            }
+
+            let circuit = backend.handle.circuit_status();
+            let mut status = health_from_circuit_state(circuit.state);
+            let mut pane_count = None;
+            let mut error = None;
+
+            match backend.handle.list_panes_with_cx(cx).await {
+                Ok(panes) => {
+                    pane_count = Some(panes.len());
+                }
+                Err(err) => {
+                    status = status.max(HealthStatus::Hung);
+                    error = Some(err.to_string());
+                }
+            }
+
+            overall = overall.max(status);
+            shards.push(ShardHealthEntry {
+                shard_id: backend.id,
+                label: backend.label.clone(),
+                status,
+                pane_count,
+                circuit,
+                error,
+            });
+        }
+
+        ShardHealthReport {
+            timestamp_ms: now_epoch_ms(),
+            overall,
+            shards,
+        }
+    }
+
     /// Produce watchdog warning lines from current shard health.
     pub async fn shard_watchdog_warnings(&self) -> Vec<String> {
         self.shard_health_report().await.watchdog_warnings()
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`shard_watchdog_warnings`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn shard_watchdog_warnings_with_cx(&self, cx: &crate::cx::Cx) -> Vec<String> {
+        self.shard_health_report_with_cx(cx)
+            .await
+            .watchdog_warnings()
     }
 
     async fn route_for_global_pane_id(&self, pane_id: u64) -> Result<PaneRoute> {
@@ -2347,6 +2409,79 @@ mod tests {
             let trait_warnings = client.watchdog_warnings().await.unwrap();
             assert_eq!(trait_warnings.len(), 1);
             assert!(trait_warnings[0].contains("Shard 1 (failing)"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `shard_health_report_with_cx` must
+    /// produce an equivalent report to `shard_health_report` on
+    /// a 2-shard topology (healthy + failing), returning the
+    /// same overall status, shard count, and watchdog warnings.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn shard_health_report_with_cx_matches_legacy() {
+        run_async_test(async {
+            let healthy = Arc::new(MockWezterm::new());
+            healthy.add_default_pane(1).await;
+
+            let healthy_handle: WeztermHandle = healthy.clone();
+            let failing_handle: WeztermHandle = crate::wezterm::mock_wezterm_handle_failing();
+
+            let client = ShardedWeztermClient::new(
+                vec![
+                    ShardBackend::new(ShardId(0), "healthy", healthy_handle),
+                    ShardBackend::new(ShardId(1), "failing", failing_handle),
+                ],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let cx = crate::cx::for_testing();
+            let report = client.shard_health_report_with_cx(&cx).await;
+
+            assert_eq!(report.shards.len(), 2);
+            assert_eq!(report.overall, HealthStatus::Hung);
+
+            let healthy_entry = report
+                .shards
+                .iter()
+                .find(|entry| entry.shard_id == ShardId(0))
+                .unwrap();
+            assert_eq!(healthy_entry.status, HealthStatus::Healthy);
+            assert_eq!(healthy_entry.pane_count, Some(1));
+
+            let warnings = client.shard_watchdog_warnings_with_cx(&cx).await;
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("Shard 1 (failing)"));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `shard_health_report_with_cx` must
+    /// bail early on a pre-cancelled cx, returning a report
+    /// with 0 shards (never touched any backend).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn shard_health_report_with_cx_bails_on_precancelled_cx() {
+        run_async_test(async {
+            let healthy = Arc::new(MockWezterm::new());
+            let healthy_handle: WeztermHandle = healthy.clone();
+            let client = ShardedWeztermClient::new(
+                vec![ShardBackend::new(ShardId(0), "healthy", healthy_handle)],
+                AssignmentStrategy::RoundRobin,
+            )
+            .unwrap();
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel shard health test"),
+            );
+
+            let report = client.shard_health_report_with_cx(&cx).await;
+            assert_eq!(
+                report.shards.len(),
+                0,
+                "pre-cancelled cx should skip all shards"
+            );
         });
     }
 
