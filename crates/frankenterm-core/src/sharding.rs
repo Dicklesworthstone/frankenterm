@@ -589,6 +589,42 @@ impl ShardedWeztermClient {
         Ok(global_id)
     }
 
+    /// Spawn a new pane honoring shard-assignment hints, bound to the
+    /// caller's asupersync capability context (ft-xbnl0.2.3 Cx-first
+    /// entry point).
+    ///
+    /// The internal `pane_routes` RwLock acquire uses `write_with_cx(cx)`
+    /// so a caller-cancelled wait propagates cleanly. The
+    /// `backend.handle.spawn()` call remains ambient (WeztermHandle
+    /// spawn is CLI-only and out of scope; see ft-xbnl0.2.3 bead
+    /// for the retry-helper refactor seam).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn spawn_with_hints_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        cwd: Option<&str>,
+        domain_name: Option<&str>,
+        agent_hint: Option<AgentType>,
+    ) -> Result<u64> {
+        self.telemetry.spawns.fetch_add(1, Ordering::Relaxed);
+        let shard = self.choose_spawn_shard(domain_name, agent_hint);
+        let backend = self.backend_for_id(shard)?;
+        let local_id = backend
+            .handle
+            .spawn(cwd, domain_name)
+            .await
+            .map_err(|err| self.backend_error(shard, "spawn", None, err))?;
+        let global_id = encode_sharded_pane_id(shard, local_id);
+        self.pane_routes.write_with_cx(cx).await.insert(
+            global_id,
+            PaneRoute {
+                shard_id: shard,
+                local_pane_id: local_id,
+            },
+        );
+        Ok(global_id)
+    }
+
     async fn collect_panes(&self) -> Result<(Vec<PaneInfo>, HashMap<u64, PaneRoute>)> {
         let mut all = Vec::new();
         let mut routes = HashMap::new();
@@ -628,6 +664,26 @@ impl ShardedWeztermClient {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let (panes, routes) = self.collect_panes().await?;
         let mut guard = self.pane_routes.write().await;
+        *guard = routes;
+        Ok(panes)
+    }
+
+    /// Aggregate panes across all shards, bound to the caller's
+    /// asupersync capability context (ft-xbnl0.2.3 Cx-first entry
+    /// point).
+    ///
+    /// The internal `pane_routes` RwLock acquire uses `write_with_cx(cx)`
+    /// (the primitive from tick 9) so a caller-cancelled route-index
+    /// refresh propagates cleanly through the lock wait. The per-backend
+    /// `backend.handle.list_panes()` call remains ambient since
+    /// `WeztermInterface` trait does not yet expose `list_panes_with_cx`
+    /// (trait-level refactor scope; see wezterm.rs tick 19 which added
+    /// list_panes_with_cx on the concrete `WeztermClient` impl).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn list_all_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
+        let (panes, routes) = self.collect_panes().await?;
+        let mut guard = self.pane_routes.write_with_cx(cx).await;
         *guard = routes;
         Ok(panes)
     }
