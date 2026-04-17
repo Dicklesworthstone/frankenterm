@@ -479,6 +479,91 @@ impl MetricsServer {
 
         Ok(MetricsServerHandle { join, local_addr })
     }
+
+    /// Start the metrics server bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Clones `cx` into the spawned accept-loop task so budget-driven
+    /// cancellation from the outer scope propagates through to the
+    /// accept-poll timeout via
+    /// [`crate::runtime_compat::timeout_with_cx`]. Both the
+    /// `shutdown_flag` and `cx.is_cancel_requested()` are checked each
+    /// loop iteration so either cancellation path terminates the server
+    /// promptly without waiting on the 250ms accept poll.
+    ///
+    /// Pre-flight: if `cx` is already cancelled on entry, the method
+    /// returns `Err(Error::Runtime(...))` without attempting to bind
+    /// the TCP listener — an operator who has abandoned the metrics
+    /// server should not leave a socket in LISTEN state.
+    ///
+    /// The legacy [`start`](Self::start) entry point is preserved for
+    /// non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn start_with_cx(self, cx: &crate::cx::Cx) -> Result<MetricsServerHandle> {
+        if cx.is_cancel_requested() {
+            return Err(crate::Error::Runtime(
+                "metrics server start aborted: capability context already cancelled".to_string(),
+            ));
+        }
+
+        if !is_localhost_bind(&self.bind) && !self.allow_public_bind {
+            return Err(crate::Error::Runtime(format!(
+                "refusing to bind metrics on public address '{}' — use --dangerous-bind-any to override",
+                self.bind
+            )));
+        }
+        if !is_localhost_bind(&self.bind) {
+            warn!(
+                bind = %self.bind,
+                "binding metrics endpoint on non-localhost address — endpoint may be remotely reachable"
+            );
+        }
+
+        let bind_addr = self.bind.clone();
+        let listener = TcpListener::bind(bind_addr).await?;
+        let local_addr = listener.local_addr()?;
+        let prefix = sanitize_prefix(&self.prefix);
+        let collector = Arc::clone(&self.collector);
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let task_cx = cx.clone();
+
+        let join = crate::runtime_compat::task::spawn(async move {
+            let accept_poll_interval = Duration::from_millis(250);
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) || task_cx.is_cancel_requested() {
+                    break;
+                }
+
+                match crate::runtime_compat::timeout_with_cx(
+                    &task_cx,
+                    accept_poll_interval,
+                    listener.accept(),
+                )
+                .await
+                {
+                    Ok(Ok((socket, peer))) => {
+                        let collector = Arc::clone(&collector);
+                        let prefix = prefix.clone();
+                        crate::runtime_compat::task::spawn(async move {
+                            if let Err(err) = handle_connection(socket, &prefix, collector).await {
+                                debug!(error = %err, peer = %peer, "Metrics connection failed");
+                            }
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        warn!(error = %err, "Metrics listener accept failed");
+                    }
+                    // `timeout_with_cx` returns Err on either the poll
+                    // interval elapsing OR the Cx being cancelled. Loop
+                    // and re-evaluate shutdown / cancellation on the
+                    // next iteration.
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Ok(MetricsServerHandle { join, local_addr })
+    }
 }
 
 async fn handle_connection(
@@ -1196,6 +1281,86 @@ mod tests {
         assert!(is_localhost_bind("localhost:9090"));
         assert!(is_localhost_bind("[::1]:9090"));
         assert!(!is_localhost_bind("0.0.0.0:9090"));
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `start_with_cx` with a pre-cancelled Cx
+    /// must refuse to bind the TCP listener and surface an
+    /// `Error::Runtime` describing the cancellation. An operator who
+    /// has already abandoned the server should not leave a socket in
+    /// LISTEN state.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn metrics_server_start_with_cx_pre_cancelled_refuses_to_bind() {
+        run_async_test(async {
+            let snapshot = MetricsSnapshot::default();
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(snapshot));
+            let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.3 metrics precancel"),
+            );
+
+            let result = server.start_with_cx(&cx).await;
+            let err = match result {
+                Ok(_) => panic!("pre-cancelled start_with_cx should fail"),
+                Err(e) => e,
+            };
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cancelled") || msg.contains("abort"),
+                "pre-cancelled start_with_cx must surface a cancellation-shaped error, got: {msg}"
+            );
+            assert!(
+                !shutdown_flag.load(Ordering::SeqCst),
+                "Cx-cancelled start must not touch the shutdown flag"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: happy path — `start_with_cx` with a live
+    /// Cx spawns the accept loop, serves a request, and shuts down
+    /// cleanly via the shutdown flag. Pins no-regression on the normal
+    /// path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn metrics_server_start_with_cx_happy_path_serves_request() {
+        run_async_test(async {
+            let snapshot = MetricsSnapshot {
+                observed_panes: 42,
+                ..MetricsSnapshot::default()
+            };
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(snapshot));
+            let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
+            let cx = crate::cx::for_request();
+
+            let handle = server
+                .start_with_cx(&cx)
+                .await
+                .expect("happy-path start_with_cx");
+
+            let mut stream = TcpStream::connect(handle.local_addr())
+                .await
+                .expect("connect metrics");
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("send request");
+
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let response = String::from_utf8_lossy(&buf);
+            assert!(response.contains("200 OK"));
+            assert!(response.contains("wa_observed_panes"));
+
+            shutdown_flag.store(true, Ordering::SeqCst);
+            handle.wait().await;
+        });
     }
 
     #[test]
