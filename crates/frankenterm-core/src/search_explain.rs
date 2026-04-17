@@ -173,11 +173,11 @@ pub async fn build_explain_context(
 /// ft-xbnl0.2.3 Cx-first sibling of [`build_explain_context`].
 ///
 /// Pre-flight checkpoint gates the context-build before any
-/// storage queries fire. Delegates to [`build_explain_context`]
-/// for the actual work so the legacy path remains authoritative.
-/// Used by `ft search --explain` on the CLI — a single pre-flight
-/// checkpoint is sufficient because the operation is read-only
-/// and completes quickly on typical DBs.
+/// storage queries fire. Tick 125 deepened this from a pure
+/// delegate to a fully cx-threaded body: all 5 internal
+/// storage calls now route through their cx-first siblings so
+/// caller cancellation propagates into storage's pre-flight
+/// checkpoints.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn build_explain_context_with_cx(
     cx: &crate::cx::Cx,
@@ -187,7 +187,65 @@ pub async fn build_explain_context_with_cx(
 ) -> crate::Result<SearchExplainContext> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("build_explain_context cancelled: {err}")))?;
-    build_explain_context(storage, query, pane_filter).await
+
+    let pane_records = storage.get_panes_with_cx(cx).await?;
+    let indexing_stats_raw = storage.get_pane_indexing_stats_with_cx(cx).await?;
+    let gaps_raw = storage.get_gaps_with_cx(cx).await?;
+    let retention_cleanup_count = storage.get_retention_cleanup_count_with_cx(cx).await?;
+    let (earliest_segment_at, latest_segment_at) =
+        storage.get_segment_time_range_with_cx(cx).await?;
+
+    let panes = pane_records
+        .iter()
+        .map(|p| PaneExplainInfo {
+            pane_id: p.pane_id,
+            observed: p.observed,
+            ignore_reason: p.ignore_reason.clone(),
+            domain: p.domain.clone(),
+            last_seen_at: p.last_seen_at,
+        })
+        .collect();
+
+    let indexing_stats = indexing_stats_raw
+        .iter()
+        .map(|s| PaneIndexingInfo {
+            pane_id: s.pane_id,
+            segment_count: s.segment_count,
+            total_bytes: s.total_bytes,
+            last_segment_at: s.last_segment_at,
+            fts_row_count: s.fts_row_count,
+            fts_consistent: s.fts_consistent,
+        })
+        .collect();
+
+    let gaps = gaps_raw
+        .iter()
+        .map(|g| GapInfo {
+            pane_id: g.pane_id,
+            seq_before: g.seq_before,
+            seq_after: g.seq_after,
+            reason: g.reason.clone(),
+            detected_at: g.detected_at,
+        })
+        .collect();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+
+    Ok(SearchExplainContext {
+        query: query.to_string(),
+        pane_filter,
+        panes,
+        indexing_stats,
+        gaps,
+        retention_cleanup_count,
+        earliest_segment_at,
+        latest_segment_at,
+        now_ms,
+    })
 }
 
 /// Analyze the search context and produce a ranked explanation.

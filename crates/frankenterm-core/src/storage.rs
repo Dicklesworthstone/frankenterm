@@ -7240,6 +7240,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_indexing_stats`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_pane_indexing_stats_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<Vec<PaneIndexingStats>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_pane_indexing_stats cancelled: {err}"))
+        })?;
+        self.get_pane_indexing_stats().await
+    }
+
     /// Get a full indexing health report (per-pane stats + FTS integrity).
     pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
         let db_path = Arc::clone(&self.db_path);
@@ -8867,6 +8879,14 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_gaps_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<Gap>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
+        self.get_gaps().await
+    }
+
     /// Count retention cleanup events (for search explain diagnostics)
     pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
         let db_path = Arc::clone(&self.db_path);
@@ -8884,6 +8904,15 @@ impl StorageHandle {
             Ok(count as u64)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_retention_cleanup_count_with_cx(&self, cx: &crate::cx::Cx) -> Result<u64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
+        })?;
+        self.get_retention_cleanup_count().await
     }
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
@@ -8908,6 +8937,18 @@ impl StorageHandle {
             },
         )
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_segment_time_range`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_segment_time_range_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
+        })?;
+        self.get_segment_time_range().await
     }
 
     /// Export workflow executions with optional pane/time/limit filters
