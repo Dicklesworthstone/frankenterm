@@ -8239,6 +8239,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_history`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_action_history_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: ActionHistoryQuery,
+    ) -> Result<Vec<ActionHistoryRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_action_history cancelled: {err}"))
+        })?;
+        self.get_action_history(query).await
+    }
+
     /// Count active (unused + unexpired) approval tokens for a workspace
     pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
         let db_path = Arc::clone(&self.db_path);

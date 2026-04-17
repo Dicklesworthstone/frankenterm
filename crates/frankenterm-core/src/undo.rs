@@ -267,13 +267,17 @@ impl UndoExecutor {
         cx.checkpoint()
             .map_err(|err| Error::Runtime(format!("undo.execute cancelled pre-start: {err}")))?;
 
+        // ft-xbnl0.2.3 tick 130: route through cx-first storage.
         let mut history = self
             .storage
-            .get_action_history(ActionHistoryQuery {
-                audit_action_id: Some(request.action_id),
-                limit: Some(1),
-                ..Default::default()
-            })
+            .get_action_history_with_cx(
+                cx,
+                ActionHistoryQuery {
+                    audit_action_id: Some(request.action_id),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
             .await?;
 
         let Some(action) = history.pop() else {
@@ -294,7 +298,11 @@ impl UndoExecutor {
             ))
         })?;
 
-        let Some(undo) = self.storage.get_action_undo(request.action_id).await? else {
+        let Some(undo) = self
+            .storage
+            .get_action_undo_with_cx(cx, request.action_id)
+            .await?
+        else {
             return Ok(UndoExecutionResult::not_applicable(
                 request.action_id,
                 "none".to_string(),
@@ -573,7 +581,9 @@ impl UndoExecutor {
 
         match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
             Ok(()) => {
-                let undone_at = self.mark_undone(action.id, &request.actor).await?;
+                let undone_at = self
+                    .mark_undone_with_cx(cx, action.id, &request.actor)
+                    .await?;
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),
@@ -632,6 +642,29 @@ impl UndoExecutor {
         Ok(self
             .storage
             .get_action_undo(action_id)
+            .await?
+            .and_then(|row| row.undone_at))
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::mark_undone`].
+    /// Routes both storage calls through cx-first siblings.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn mark_undone_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        action_id: i64,
+        actor: &str,
+    ) -> Result<Option<i64>> {
+        let updated = self
+            .storage
+            .mark_action_undone_with_cx(cx, action_id, actor)
+            .await?;
+        if !updated {
+            return Ok(None);
+        }
+        Ok(self
+            .storage
+            .get_action_undo_with_cx(cx, action_id)
             .await?
             .and_then(|row| row.undone_at))
     }
