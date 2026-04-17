@@ -11,6 +11,7 @@ use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::timeout;
 #[cfg(feature = "cass-export")]
 use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery, StorageHandle};
@@ -689,42 +690,39 @@ impl CassClient {
         query: &str,
         options: &SearchOptions,
     ) -> Result<CassSearchResult, CassError> {
-        let mut args = vec![
-            "search".to_string(),
-            query.to_string(),
-            "--robot".to_string(),
-        ];
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.search_with_cx(&cx, query, options).await
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let args = build_search_args(query, options);
+            let output = self.run(&args).await?;
+            parse_json(&output, self.max_error_bytes)
+        }
+    }
 
-        if let Some(limit) = options.limit {
-            args.push("--limit".to_string());
-            args.push(limit.to_string());
-        }
-        if let Some(offset) = options.offset {
-            args.push("--offset".to_string());
-            args.push(offset.to_string());
-        }
-        if let Some(agent) = &options.agent {
-            args.push("--agent".to_string());
-            args.push(agent.as_str().to_string());
-        }
-        if let Some(workspace) = &options.workspace {
-            args.push("--workspace".to_string());
-            args.push(workspace.clone());
-        }
-        if let Some(days) = options.days {
-            args.push("--days".to_string());
-            args.push(days.to_string());
-        }
-        if let Some(fields) = &options.fields {
-            args.push("--fields".to_string());
-            args.push(fields.clone());
-        }
-        if let Some(max_tokens) = options.max_tokens {
-            args.push("--max-tokens".to_string());
-            args.push(max_tokens.to_string());
-        }
-
-        let output = self.run(&args).await?;
+    /// Search sessions via `cass search` under an explicit `&Cx`.
+    ///
+    /// Cx-first entry point (ft-xbnl0.2.3): the subprocess timeout binds
+    /// to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`]
+    /// so cancellation, budget, and virtual time propagate into the
+    /// `cass` invocation — matching the pattern established in
+    /// [`caut::CautClient::usage_cx`].
+    ///
+    /// The legacy [`search`](Self::search) entry point is preserved for
+    /// non-migrated callers; under `asupersync-runtime` it now delegates
+    /// to this method with an ambient Cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn search_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: &str,
+        options: &SearchOptions,
+    ) -> Result<CassSearchResult, CassError> {
+        let args = build_search_args(query, options);
+        let output = self.run_with_cx(cx, &args).await?;
         parse_json(&output, self.max_error_bytes)
     }
 
@@ -829,19 +827,58 @@ impl CassClient {
     }
 
     async fn run(&self, args: &[String]) -> Result<String, CassError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            return self.run_with_cx(&cx, args).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut cmd = Command::new(&self.binary);
+            cmd.args(args);
+            cmd.kill_on_drop(true);
+
+            let output = match timeout(self.timeout, cmd.output()).await {
+                Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
+                Err(_) => {
+                    return Err(CassError::Timeout {
+                        timeout_secs: self.timeout.as_secs(),
+                    });
+                }
+            };
+
+            self.finalize_output(output)
+        }
+    }
+
+    /// Cx-first subprocess execution (ft-xbnl0.2.3). The subprocess
+    /// timeout is bound to the provided `Cx` via
+    /// [`crate::runtime_compat::timeout_with_cx`] so cancellation,
+    /// budget, and virtual time propagate into the `cass` invocation.
+    /// Mirrors the pattern in [`caut::CautClient::run_with_cx`].
+    #[cfg(feature = "asupersync-runtime")]
+    async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CassError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
         cmd.kill_on_drop(true);
 
-        let output = match timeout(self.timeout, cmd.output()).await {
-            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-            Err(_) => {
-                return Err(CassError::Timeout {
-                    timeout_secs: self.timeout.as_secs(),
-                });
-            }
-        };
+        let output =
+            match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output()).await {
+                Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
+                Err(_) => {
+                    return Err(CassError::Timeout {
+                        timeout_secs: self.timeout.as_secs(),
+                    });
+                }
+            };
 
+        self.finalize_output(output)
+    }
+
+    /// Shared post-timeout validation: checks exit status, stderr, and
+    /// stdout size. Extracted so `run` and `run_with_cx` share the same
+    /// error surface bit-for-bit.
+    fn finalize_output(&self, output: std::process::Output) -> Result<String, CassError> {
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
             let stderr_bytes = if output.stderr.len() > self.max_error_bytes {
@@ -868,6 +905,47 @@ impl CassClient {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+}
+
+/// Build cass search subcommand args. Extracted so `search` and
+/// `search_with_cx` share the argv construction bit-for-bit.
+fn build_search_args(query: &str, options: &SearchOptions) -> Vec<String> {
+    let mut args = vec![
+        "search".to_string(),
+        query.to_string(),
+        "--robot".to_string(),
+    ];
+
+    if let Some(limit) = options.limit {
+        args.push("--limit".to_string());
+        args.push(limit.to_string());
+    }
+    if let Some(offset) = options.offset {
+        args.push("--offset".to_string());
+        args.push(offset.to_string());
+    }
+    if let Some(agent) = &options.agent {
+        args.push("--agent".to_string());
+        args.push(agent.as_str().to_string());
+    }
+    if let Some(workspace) = &options.workspace {
+        args.push("--workspace".to_string());
+        args.push(workspace.clone());
+    }
+    if let Some(days) = options.days {
+        args.push("--days".to_string());
+        args.push(days.to_string());
+    }
+    if let Some(fields) = &options.fields {
+        args.push("--fields".to_string());
+        args.push(fields.clone());
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        args.push("--max-tokens".to_string());
+        args.push(max_tokens.to_string());
+    }
+
+    args
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1808,5 +1886,119 @@ mod tests {
         assert_eq!(summary.total_tokens, None);
         assert!(summary.first_message_at_ms.is_none());
         assert!(summary.last_message_at_ms.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // ft-xbnl0.2.3 Cx-first slice: tests for extracted helpers.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_search_args_minimal_options() {
+        let options = SearchOptions::default();
+        let args = build_search_args("hello world", &options);
+        assert_eq!(
+            args,
+            vec![
+                "search".to_string(),
+                "hello world".to_string(),
+                "--robot".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_search_args_all_options_populated() {
+        let options = SearchOptions {
+            limit: Some(10),
+            offset: Some(5),
+            agent: Some(CassAgent::ClaudeCode),
+            workspace: Some("/tmp/ws".to_string()),
+            days: Some(30),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(4000),
+        };
+        let args = build_search_args("query", &options);
+        // Validate order and payload of the argv tail (after --robot).
+        assert!(args.starts_with(&[
+            "search".to_string(),
+            "query".to_string(),
+            "--robot".to_string(),
+        ]));
+        assert!(args.iter().any(|a| a == "--limit"));
+        assert!(args.iter().any(|a| a == "10"));
+        assert!(args.iter().any(|a| a == "--offset"));
+        assert!(args.iter().any(|a| a == "5"));
+        assert!(args.iter().any(|a| a == "--agent"));
+        assert!(args.iter().any(|a| a == "claude_code"));
+        assert!(args.iter().any(|a| a == "--workspace"));
+        assert!(args.iter().any(|a| a == "/tmp/ws"));
+        assert!(args.iter().any(|a| a == "--days"));
+        assert!(args.iter().any(|a| a == "30"));
+        assert!(args.iter().any(|a| a == "--fields"));
+        assert!(args.iter().any(|a| a == "minimal"));
+        assert!(args.iter().any(|a| a == "--max-tokens"));
+        assert!(args.iter().any(|a| a == "4000"));
+    }
+
+    #[test]
+    fn build_search_args_with_only_limit() {
+        let options = SearchOptions {
+            limit: Some(50),
+            ..SearchOptions::default()
+        };
+        let args = build_search_args("q", &options);
+        assert_eq!(
+            args,
+            vec![
+                "search".to_string(),
+                "q".to_string(),
+                "--robot".to_string(),
+                "--limit".to_string(),
+                "50".to_string(),
+            ]
+        );
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: search_with_cx with an invalid binary path
+    /// must surface an IO-shaped error (not Timeout, not NonZeroExit).
+    /// Pins the error-surface contract so a future refactor doesn't
+    /// accidentally flip invalid-binary into one of the other error
+    /// surfaces.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn search_with_cx_returns_io_error_for_invalid_binary() {
+        use crate::runtime_compat::CompatRuntime;
+
+        let client = CassClient::new().with_binary("/nonexistent/cass-binary-path");
+        let options = SearchOptions::default();
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result: Result<CassSearchResult, CassError> = runtime.block_on(async {
+            let cx = crate::cx::for_request();
+            client.search_with_cx(&cx, "test", &options).await
+        });
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+
+        // Invalid binary must surface an IO-shaped error. The exact
+        // variant (NotFound/SpawnFailure) depends on how the OS
+        // reports the failing exec, but it must NOT be Timeout or
+        // NonZeroExit.
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("timed out") && !msg.contains("non-zero"),
+                    "invalid-binary search_with_cx should surface IO error, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("search_with_cx must fail for a nonexistent binary"),
+        }
     }
 }
