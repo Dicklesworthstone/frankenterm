@@ -211,9 +211,27 @@ impl<T> Mutex<T> {
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
         let cx = crate::cx::for_request();
+        self.lock_with_cx(&cx).await
+    }
+
+    /// Acquire the mutex bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first primitive).
+    ///
+    /// Preferred over [`lock`](Self::lock) when the call site already
+    /// threads `&Cx` through its public API — budget-driven cancellation
+    /// and deadline propagation from the outer scope cut the acquire
+    /// wait deterministically under `LabRuntime` virtual time instead
+    /// of relying on `Cx::current()` thread-local lookup.
+    ///
+    /// Panics with the same "runtime_compat mutex lock failed" message
+    /// as [`lock`](Self::lock) if the underlying asupersync mutex
+    /// reports an acquire error. The panic surface is preserved
+    /// because changing it would break callers that rely on the legacy
+    /// `lock().await` infallible contract.
+    pub async fn lock_with_cx(&self, cx: &crate::cx::Cx) -> MutexGuard<'_, T> {
         let guard = self
             .inner
-            .lock(&cx)
+            .lock(cx)
             .await
             .expect("runtime_compat mutex lock failed");
         MutexGuard { inner: guard }
@@ -259,9 +277,21 @@ impl<T> RwLock<T> {
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
         let cx = crate::cx::for_request();
+        self.read_with_cx(&cx).await
+    }
+
+    /// Acquire a read guard bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first primitive).
+    ///
+    /// Preferred over [`read`](Self::read) when the call site already
+    /// threads `&Cx` through its public API. Same panic surface as
+    /// [`read`](Self::read) — "runtime_compat rwlock read failed" —
+    /// preserved for infallible-contract callers.
+    #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
+    pub async fn read_with_cx(&self, cx: &crate::cx::Cx) -> RwLockReadGuard<'_, T> {
         let guard = self
             .inner
-            .read(&cx)
+            .read(cx)
             .await
             .expect("runtime_compat rwlock read failed");
         RwLockReadGuard { inner: guard }
@@ -270,9 +300,20 @@ impl<T> RwLock<T> {
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
         let cx = crate::cx::for_request();
+        self.write_with_cx(&cx).await
+    }
+
+    /// Acquire a write guard bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first primitive).
+    ///
+    /// Preferred over [`write`](Self::write) when the call site already
+    /// threads `&Cx`. Same panic surface as [`write`](Self::write) —
+    /// "runtime_compat rwlock write failed".
+    #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
+    pub async fn write_with_cx(&self, cx: &crate::cx::Cx) -> RwLockWriteGuard<'_, T> {
         let guard = self
             .inner
-            .write(&cx)
+            .write(cx)
             .await
             .expect("runtime_compat rwlock write failed");
         RwLockWriteGuard { inner: guard }
@@ -5084,5 +5125,101 @@ mod tests {
     fn join_error_type_is_reexported() {
         // Verify the JoinError re-export compiles and is usable as a type.
         fn _accept_join_error(_e: JoinError) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // LabRuntime deterministic tests for the Cx-first Mutex/RwLock primitives
+    // (ft-xbnl0.2.x slice). Pin that lock_with_cx / read_with_cx /
+    // write_with_cx actually honor the passed-in Cx under virtual time,
+    // rather than falling back to cx::for_request() via the legacy path.
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "asupersync-runtime")]
+    mod labruntime_sync_primitives_cx {
+        use super::*;
+
+        fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let mut runtime = asupersync::LabRuntime::new(
+                asupersync::LabConfig::new(seed)
+                    .with_auto_advance()
+                    .worker_count(2)
+                    .max_steps(50_000),
+            );
+            let region = runtime
+                .state
+                .create_root_region(asupersync::Budget::INFINITE);
+            let (task_id, _handle) = runtime
+                .state
+                .create_task(region, asupersync::Budget::INFINITE, async move {
+                    f().await;
+                })
+                .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
+
+            let report = runtime.run_with_auto_advance();
+            assert!(
+                !matches!(
+                    report.termination,
+                    asupersync::lab::AutoAdvanceTermination::StuckBailout
+                ),
+                "LabRuntime got stuck; termination: {:?}",
+                report.termination,
+            );
+        }
+
+        /// `Mutex::lock_with_cx` acquires the guard and the caller observes
+        /// the stored value under a live Cx. Pin the happy-path contract.
+        #[test]
+        fn mutex_lock_with_cx_returns_guard_with_live_cx() {
+            run_lab(0x10C5_10C5_C410_4001, || async move {
+                let m = Mutex::new(42u32);
+                let cx = crate::cx::for_request();
+                let guard = m.lock_with_cx(&cx).await;
+                assert_eq!(*guard, 42);
+            });
+        }
+
+        /// `RwLock::read_with_cx` acquires a read guard under a live Cx.
+        #[test]
+        fn rwlock_read_with_cx_returns_guard_with_live_cx() {
+            run_lab(0x10C5_10C5_C410_4002, || async move {
+                let r = RwLock::new(7u32);
+                let cx = crate::cx::for_request();
+                let guard = r.read_with_cx(&cx).await;
+                assert_eq!(*guard, 7);
+            });
+        }
+
+        /// `RwLock::write_with_cx` acquires a write guard under a live Cx
+        /// and the mutation is visible to a subsequent read.
+        #[test]
+        fn rwlock_write_with_cx_mutates_under_live_cx() {
+            run_lab(0x10C5_10C5_C410_4003, || async move {
+                let r = RwLock::new(1u32);
+                let cx = crate::cx::for_request();
+                {
+                    let mut w = r.write_with_cx(&cx).await;
+                    *w = 100;
+                }
+                let read_cx = crate::cx::for_request();
+                let guard = r.read_with_cx(&read_cx).await;
+                assert_eq!(*guard, 100, "write_with_cx mutation must be durable");
+            });
+        }
+
+        /// `lock_with_cx` delegates from `lock()`: the legacy entry point
+        /// still works. Pin the delegation contract so a future refactor
+        /// doesn't accidentally diverge the two paths.
+        #[test]
+        fn mutex_lock_still_works_after_cx_first_delegation() {
+            run_lab(0x10C5_10C5_C410_4004, || async move {
+                let m = Mutex::new(99u32);
+                let guard = m.lock().await;
+                assert_eq!(*guard, 99);
+            });
+        }
     }
 }
