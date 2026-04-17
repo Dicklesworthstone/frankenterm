@@ -7712,6 +7712,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_agent_session`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_agent_session_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        session_id: i64,
+    ) -> Result<Option<AgentSessionRecord>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_agent_session cancelled: {err}")))?;
+        self.get_agent_session(session_id).await
+    }
+
     /// Get active agent sessions (those without an ended_at timestamp)
     pub async fn get_active_sessions(&self) -> Result<Vec<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);

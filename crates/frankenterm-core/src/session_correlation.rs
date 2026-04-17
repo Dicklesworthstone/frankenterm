@@ -363,12 +363,12 @@ pub async fn correlate_and_persist_for_pane(
 /// Cx-first [`correlate_and_persist_for_pane`] (ft-xbnl0.2.3).
 /// Routes the cass correlation through
 /// [`correlate_with_cass_with_cx`] so the subprocess call
-/// honors caller cancellation. The surrounding storage calls
-/// (`get_pane`, `upsert_agent_session`, `select_session_record`)
-/// stay on the ambient path — they're StorageHandle methods
-/// which don't yet have `_with_cx` siblings (147 storage async
-/// fns without cx surface). Pre-flight checkpoint and
-/// post-correlation checkpoint bracket the cass call.
+/// honors caller cancellation. Tick 126 upgrade: all three
+/// storage calls (`get_pane`, `select_session_record` internal
+/// `get_sessions_for_pane`, `upsert_agent_session`) now route
+/// through their cx-first siblings so caller cancellation
+/// propagates into storage's pre-flight checkpoints. Explicit
+/// `cx.checkpoint()` seams also bracket the cass call.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn correlate_and_persist_for_pane_with_cx(
     cx: &crate::cx::Cx,
@@ -388,7 +388,10 @@ pub async fn correlate_and_persist_for_pane_with_cx(
     let correlation = if options.override_session_id.is_some() {
         correlate_from_sessions(&[], session_started_at_ms, options)
     } else {
-        let pane = storage.get_pane(pane_id).await.map_err(|e| e.to_string())?;
+        let pane = storage
+            .get_pane_with_cx(cx, pane_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let project_path = pane
             .as_ref()
@@ -412,14 +415,15 @@ pub async fn correlate_and_persist_for_pane_with_cx(
         format!("correlate_and_persist_for_pane cancelled between cass and persist: {err}")
     })?;
 
-    let mut session_record = select_session_record(storage, pane_id, agent, session_started_at_ms)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut session_record =
+        select_session_record_with_cx(cx, storage, pane_id, agent, session_started_at_ms)
+            .await
+            .map_err(|e| e.to_string())?;
     session_record.external_id = correlation.external_id.clone();
     session_record.external_meta = Some(correlation.to_external_meta());
 
     storage
-        .upsert_agent_session(session_record)
+        .upsert_agent_session_with_cx(cx, session_record)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -538,7 +542,7 @@ pub async fn refresh_cass_summary_for_session_with_cx(
         .map_err(|err| format!("refresh_cass_summary_for_session cancelled pre-start: {err}"))?;
 
     let mut record = storage
-        .get_agent_session(session_id)
+        .get_agent_session_with_cx(cx, session_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("agent session not found: {session_id}"))?;
@@ -591,7 +595,7 @@ pub async fn refresh_cass_summary_for_session_with_cx(
     ));
 
     storage
-        .upsert_agent_session(record)
+        .upsert_agent_session_with_cx(cx, record)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -614,6 +618,29 @@ async fn select_session_record(
 ) -> Result<AgentSessionRecord, crate::Error> {
     let agent_type = agent.as_str();
     let sessions = storage.get_sessions_for_pane(pane_id).await?;
+    if let Some(existing) = sessions
+        .iter()
+        .find(|record| record.agent_type == agent_type && record.ended_at.is_none())
+    {
+        return Ok(existing.clone());
+    }
+
+    let mut record = AgentSessionRecord::new_start(pane_id, agent_type);
+    record.started_at = session_started_at_ms;
+    Ok(record)
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`select_session_record`].
+#[cfg(feature = "asupersync-runtime")]
+async fn select_session_record_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+) -> Result<AgentSessionRecord, crate::Error> {
+    let agent_type = agent.as_str();
+    let sessions = storage.get_sessions_for_pane_with_cx(cx, pane_id).await?;
     if let Some(existing) = sessions
         .iter()
         .find(|record| record.agent_type == agent_type && record.ended_at.is_none())
