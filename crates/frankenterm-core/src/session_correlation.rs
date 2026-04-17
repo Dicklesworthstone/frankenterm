@@ -280,6 +280,38 @@ pub async fn correlate_with_cass(
     }
 }
 
+/// Cx-first [`correlate_with_cass`] (ft-xbnl0.2.3). Routes the
+/// cass subprocess call through `search_sessions_with_cx` so
+/// caller cancellation propagates into the `cass` invocation.
+/// The override-session-id fast path short-circuits identically
+/// to the legacy function.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn correlate_with_cass_with_cx(
+    cx: &crate::cx::Cx,
+    cass: &CassClient,
+    project_path: &Path,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> SessionCorrelation {
+    if options.override_session_id.is_some() {
+        return correlate_from_sessions(&[], session_started_at_ms, options);
+    }
+
+    match cass
+        .search_sessions_with_cx(cx, project_path, Some(agent))
+        .await
+    {
+        Ok(sessions) => correlate_from_sessions(&sessions, session_started_at_ms, options),
+        Err(err) => SessionCorrelation::error(
+            err.to_string(),
+            vec!["cass_search_failed".to_string()],
+            window_start(session_started_at_ms, options),
+            window_end(session_started_at_ms, options),
+        ),
+    }
+}
+
 /// Correlate and persist the cass session for a pane/session.
 pub async fn correlate_and_persist_for_pane(
     storage: &StorageHandle,
@@ -313,6 +345,72 @@ pub async fn correlate_and_persist_for_pane(
             )
         }
     };
+
+    let mut session_record = select_session_record(storage, pane_id, agent, session_started_at_ms)
+        .await
+        .map_err(|e| e.to_string())?;
+    session_record.external_id = correlation.external_id.clone();
+    session_record.external_meta = Some(correlation.to_external_meta());
+
+    storage
+        .upsert_agent_session(session_record)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(correlation)
+}
+
+/// Cx-first [`correlate_and_persist_for_pane`] (ft-xbnl0.2.3).
+/// Routes the cass correlation through
+/// [`correlate_with_cass_with_cx`] so the subprocess call
+/// honors caller cancellation. The surrounding storage calls
+/// (`get_pane`, `upsert_agent_session`, `select_session_record`)
+/// stay on the ambient path — they're StorageHandle methods
+/// which don't yet have `_with_cx` siblings (147 storage async
+/// fns without cx surface). Pre-flight checkpoint and
+/// post-correlation checkpoint bracket the cass call.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn correlate_and_persist_for_pane_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    cass: &CassClient,
+    pane_id: u64,
+    agent: CassAgent,
+    session_started_at_ms: i64,
+    options: &CassCorrelationOptions,
+) -> Result<SessionCorrelation, String> {
+    cx.checkpoint()
+        .map_err(|err| format!("correlate_and_persist_for_pane cancelled pre-start: {err}"))?;
+
+    let window_start_ms = window_start(session_started_at_ms, options);
+    let window_end_ms = window_end(session_started_at_ms, options);
+
+    let correlation = if options.override_session_id.is_some() {
+        correlate_from_sessions(&[], session_started_at_ms, options)
+    } else {
+        let pane = storage.get_pane(pane_id).await.map_err(|e| e.to_string())?;
+
+        let project_path = pane
+            .as_ref()
+            .and_then(|record| record.cwd.as_ref())
+            .and_then(|cwd| resolve_project_path(cwd));
+
+        if let Some(path) = project_path {
+            correlate_with_cass_with_cx(cx, cass, &path, agent, session_started_at_ms, options)
+                .await
+        } else {
+            SessionCorrelation::unlinked(
+                vec!["missing_or_remote_cwd".to_string()],
+                0,
+                window_start_ms,
+                window_end_ms,
+            )
+        }
+    };
+
+    cx.checkpoint().map_err(|err| {
+        format!("correlate_and_persist_for_pane cancelled between cass and persist: {err}")
+    })?;
 
     let mut session_record = select_session_record(storage, pane_id, agent, session_started_at_ms)
         .await
@@ -1126,6 +1224,68 @@ mod tests {
 
             let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
             assert_eq!(updated.external_id.as_deref(), Some("cass-override"));
+            assert!(updated.external_meta.is_some());
+            assert_eq!(correlation.status, CorrelationStatus::Linked);
+
+            handle.shutdown().await.unwrap();
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `correlate_and_persist_for_pane_with_cx`
+    /// must match the legacy `correlate_and_persist_for_pane` on
+    /// the override-session-id fast path. Same fixture as
+    /// `correlate_and_persist_override_updates_session` but
+    /// drives the Cx-first entry point.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn correlate_and_persist_with_cx_override_updates_session() {
+        run_async_test(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("ft-cx.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let handle = StorageHandle::new(&db_path_str).await.unwrap();
+
+            let now = parse_cass_timestamp_ms("2026-01-29T17:00:00Z").unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                window_id: None,
+                tab_id: None,
+                domain: "local".to_string(),
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            handle.upsert_pane(pane).await.unwrap();
+
+            let mut session = AgentSessionRecord::new_start(1, "claude_code");
+            session.started_at = now;
+            let session_id = handle.upsert_agent_session(session).await.unwrap();
+
+            let mut options = CassCorrelationOptions::default();
+            options.override_session_id = Some("cass-override-cx".to_string());
+
+            let cass = CassClient::new();
+            let cx = crate::cx::for_request();
+            let correlation = correlate_and_persist_for_pane_with_cx(
+                &cx,
+                &handle,
+                &cass,
+                1,
+                CassAgent::ClaudeCode,
+                now,
+                &options,
+            )
+            .await
+            .unwrap();
+
+            let updated = handle.get_agent_session(session_id).await.unwrap().unwrap();
+            assert_eq!(updated.external_id.as_deref(), Some("cass-override-cx"));
             assert!(updated.external_meta.is_some());
             assert_eq!(correlation.status, CorrelationStatus::Linked);
 
