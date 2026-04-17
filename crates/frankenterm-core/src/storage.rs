@@ -6050,6 +6050,23 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_event`].
+    ///
+    /// Pre-flight checkpoint gates event recording — the hot
+    /// write path for pattern detections. A cx-driven detection
+    /// pipeline can bail before enqueuing the write if the
+    /// caller has already been cancelled.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn record_event_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event: StoredEvent,
+    ) -> Result<i64> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("record_event cancelled: {err}")))?;
+        self.record_event(event).await
+    }
+
     /// Mark an event as handled
     pub async fn mark_event_handled(
         &self,
@@ -7084,6 +7101,21 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_pane`].
+    ///
+    /// Pre-flight checkpoint gates the pane upsert before the
+    /// command is enqueued on the writer channel. Hot path for
+    /// pane discovery — the most-called storage mutation (29+
+    /// call sites across the codebase), so adding a cx-first
+    /// entry point lets observation loops propagate caller
+    /// cancellation into the write pipeline.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_pane_with_cx(&self, cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("upsert_pane cancelled: {err}")))?;
+        self.upsert_pane(pane).await
     }
 
     /// Upsert a workflow execution record
@@ -8411,6 +8443,47 @@ impl StorageHandle {
         Self::recv_writer_shutdown_ack(rx).await;
 
         // Wait for thread to finish (only the first caller does this)
+        let handle = self
+            .writer_handle
+            .lock()
+            .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
+            .take();
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .map_err(|_| StorageError::Database("Writer thread panicked".to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`shutdown`].
+    ///
+    /// Always enqueues the shutdown command (so the writer
+    /// thread always gets a chance to drain), then awaits the
+    /// shutdown ack + thread join only if the cx is not already
+    /// cancelled. Matches the `WatchdogHandle::join_with_cx` and
+    /// `PaneOutputSubscription::shutdown_with_cx` patterns: a
+    /// cx-cancelled caller bails fast while the background
+    /// writer still winds down on its own.
+    ///
+    /// Note: if the cx is cancelled before the thread join, the
+    /// writer_handle is left in place (take is skipped), so a
+    /// subsequent `shutdown()` or `shutdown_with_cx(fresh_cx)`
+    /// call will drive the join.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .write_tx
+            .send(WriteCommand::Shutdown { respond: tx })
+            .await;
+        Self::recv_writer_shutdown_ack(rx).await;
+
+        if cx.checkpoint().is_err() {
+            return Ok(());
+        }
+
         let handle = self
             .writer_handle
             .lock()
@@ -19609,6 +19682,133 @@ fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
             !db_path.exists(),
             "DB file should not be created when cx is pre-cancelled"
         );
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: `upsert_pane_with_cx` with a fresh
+/// cx must insert the pane identically to the legacy path.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_upsert_pane_with_cx_succeeds_on_fresh_cx() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_upsert_pane_cx_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        let pane = PaneRecord {
+            pane_id: 99,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("cx-first-upsert".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // Verify the pane landed in the DB by reading it back.
+        let panes = storage.get_panes().await.unwrap();
+        assert!(
+            panes.iter().any(|p| p.pane_id == 99),
+            "upserted pane 99 should be queryable"
+        );
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: `upsert_pane_with_cx` with a
+/// pre-cancelled cx must return error WITHOUT enqueuing the
+/// write (observable via the pane not being queryable).
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!(
+            "wa_test_upsert_pane_cx_cancel_{}.db",
+            std::process::id()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let fresh_cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&fresh_cx, &db_path_str)
+            .await
+            .unwrap();
+
+        let cancelled_cx = crate::cx::for_testing();
+        cancelled_cx.cancel_with(
+            crate::outcome::CancelKind::User,
+            Some("pre-cancel upsert test"),
+        );
+
+        let pane = PaneRecord {
+            pane_id: 55,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("never-landed".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        let result = storage.upsert_pane_with_cx(&cancelled_cx, pane).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(()) => panic!("upsert_pane_with_cx should fail on pre-cancelled cx"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cancelled"),
+            "error should mention cancellation: {msg}"
+        );
+
+        let panes = storage.get_panes().await.unwrap();
+        assert!(
+            !panes.iter().any(|p| p.pane_id == 55),
+            "pre-cancelled upsert must NOT reach the DB"
+        );
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: `shutdown_with_cx` must complete the
+/// full shutdown (including writer thread join) when given a
+/// fresh cx — identical to the legacy `shutdown` path.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_shutdown_cx_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     });
 }
 
