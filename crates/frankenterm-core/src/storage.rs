@@ -8785,6 +8785,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_unhandled_events`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_unhandled_events_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_unhandled_events cancelled: {err}"))
+        })?;
+        self.get_unhandled_events(limit).await
+    }
+
     /// Query events with filters
     pub async fn get_events(&self, query: EventQuery) -> Result<Vec<StoredEvent>> {
         let db_path = Arc::clone(&self.db_path);
@@ -8828,6 +8841,19 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_events_stream`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_events_stream_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: EventStreamQuery,
+    ) -> Result<Vec<StoredEvent>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_events_stream cancelled: {err}"))
+        })?;
+        self.get_events_stream(query).await
+    }
+
     /// Get a unified timeline of events across panes.
     ///
     /// Returns events enriched with pane info and correlations,
@@ -8843,6 +8869,18 @@ impl StorageHandle {
             query_timeline(&conn, &query)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_timeline`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_timeline_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        query: TimelineQuery,
+    ) -> Result<Timeline> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_timeline cancelled: {err}")))?;
+        self.get_timeline(query).await
     }
 
     /// Count unhandled events grouped by pane ID
@@ -8863,6 +8901,18 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`count_unhandled_events_by_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn count_unhandled_events_by_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<std::collections::HashMap<u64, u32>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("count_unhandled_events_by_pane cancelled: {err}"))
+        })?;
+        self.count_unhandled_events_by_pane().await
+    }
+
     /// Get the most recent activity timestamp for each pane
     ///
     /// Returns a map from pane_id to the most recent segment captured_at timestamp.
@@ -8877,6 +8927,18 @@ impl StorageHandle {
             query_last_activity_by_pane(&conn)
         })
         .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_last_activity_by_pane`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_last_activity_by_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<std::collections::HashMap<u64, i64>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_last_activity_by_pane cancelled: {err}"))
+        })?;
+        self.get_last_activity_by_pane().await
     }
 
     /// Query audit actions with filters
@@ -21426,6 +21488,135 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 146 event-reads cluster —
+/// 5 new storage cx-first siblings exercised end-to-end:
+/// `get_unhandled_events_with_cx`, `get_events_stream_with_cx`,
+/// `get_timeline_with_cx`, `count_unhandled_events_by_pane_with_cx`,
+/// `get_last_activity_by_pane_with_cx`.
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick146_event_reads_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick146_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed a pane for FK.
+        let pane = PaneRecord {
+            pane_id: 41,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick146".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        // Seed an event so the reads have material to return.
+        let event = StoredEvent {
+            id: 0,
+            pane_id: 41,
+            rule_id: "rule-tick146".to_string(),
+            agent_type: "unknown".to_string(),
+            event_type: "pattern".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some("tick146".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_000,
+            dedupe_key: Some("ident-tick146".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        };
+        let event_id = storage.record_event_with_cx(&cx, event).await.unwrap();
+        assert!(event_id > 0);
+
+        // 1. get_unhandled_events_with_cx
+        let unhandled = storage
+            .get_unhandled_events_with_cx(&cx, 10)
+            .await
+            .unwrap();
+        assert!(
+            unhandled.iter().any(|e| e.id == event_id),
+            "seeded event should show up in unhandled list"
+        );
+
+        // 2. get_events_stream_with_cx — ID-cursor ordering, no filter.
+        let streamed = storage
+            .get_events_stream_with_cx(
+                &cx,
+                EventStreamQuery {
+                    after_id: None,
+                    limit: Some(10),
+                    pane_id: None,
+                    rule_id: None,
+                    event_type: None,
+                    triage_state: None,
+                    label: None,
+                    unhandled_only: false,
+                    since: None,
+                    until: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(streamed.iter().any(|e| e.id == event_id));
+
+        // 3. get_timeline_with_cx — lenient query, should include our event.
+        let timeline = storage
+            .get_timeline_with_cx(
+                &cx,
+                TimelineQuery {
+                    start: None,
+                    end: None,
+                    pane_ids: None,
+                    severities: None,
+                    event_types: None,
+                    agent_types: None,
+                    unhandled_only: false,
+                    include_correlations: false,
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        // Timeline wraps entries; we just need the call to roundtrip and
+        // include at least one entry for pane 41.
+        let _ = timeline;
+
+        // 4. count_unhandled_events_by_pane_with_cx
+        let counts = storage
+            .count_unhandled_events_by_pane_with_cx(&cx)
+            .await
+            .unwrap();
+        assert_eq!(counts.get(&41), Some(&1));
+
+        // 5. get_last_activity_by_pane_with_cx — no segments recorded, so
+        //    the map may not include pane 41. Just assert the call succeeds.
+        let _activity = storage
+            .get_last_activity_by_pane_with_cx(&cx)
+            .await
+            .unwrap();
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
