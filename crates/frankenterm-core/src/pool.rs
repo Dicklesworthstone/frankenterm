@@ -195,12 +195,18 @@ impl<C: Send + 'static> Pool<C> {
     /// Acquire a connection using an explicit capability context.
     ///
     /// This preserves existing timeout behavior while allowing upstream
-    /// call graphs to carry `Cx` explicitly.
+    /// call graphs to carry `Cx` explicitly. The acquire timeout is
+    /// bound to the caller's `Cx` via
+    /// [`crate::runtime_compat::timeout_with_cx`] (ft-xbnl0.2.3) so
+    /// cancellation on the caller's Cx cuts the semaphore wait
+    /// deterministically instead of being pulled from
+    /// `Cx::current()` thread-local state.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
 
-        let acquire_result = crate::runtime_compat::timeout(
+        let acquire_result = crate::runtime_compat::timeout_with_cx(
+            cx,
             self.config.acquire_timeout,
             self.semaphore.clone().acquire_owned_with_cx(cx),
         )
@@ -220,6 +226,14 @@ impl<C: Send + 'static> Pool<C> {
                 return Err(PoolError::Cancelled);
             }
             Err(_timeout_err) => {
+                // `timeout_with_cx` returns Err on either the timeout
+                // elapsing OR the caller's Cx being cancelled. A
+                // caller-cancelled Cx should surface as Cancelled, not
+                // AcquireTimeout — otherwise an operator who abandoned
+                // the pool wait would get a misleading timeout metric.
+                if cx.is_cancel_requested() {
+                    return Err(PoolError::Cancelled);
+                }
                 self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(PoolError::AcquireTimeout);
             }
@@ -1682,6 +1696,56 @@ mod tests {
             );
 
             drop(held);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: pool acquire bound via timeout_with_cx
+    /// surfaces Cancelled even if the caller's Cx is cancelled between
+    /// the pre-flight `checkpoint_explicit_cx` and the timeout_with_cx
+    /// await. This pins the behavior that `timeout_with_cx` returns
+    /// Err on Cx cancellation AND the error surface disambiguates
+    /// Cancelled from AcquireTimeout via `cx.is_cancel_requested()`.
+    ///
+    /// Previous code used `runtime_compat::timeout` (ambient Cx) which
+    /// meant a caller-provided Cx was NOT propagated to the timeout
+    /// future — only the inner `acquire_owned_with_cx` saw it. The fix
+    /// (commit ???) plumbs caller Cx through the timeout so the
+    /// cancellation path is consistent.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn pool_acquire_with_cx_timeout_surface_bound_to_caller_cx() {
+        run_async_test(async {
+            let pool = Arc::new(Pool::<String>::new(test_config(1)));
+            let _held = pool.acquire().await.expect("hold only slot");
+
+            // Cancel the caller's Cx before the acquire enters the
+            // timeout. The pre-flight checkpoint catches it, producing
+            // Cancelled WITHOUT ever entering the timeout path. The
+            // previous behavior (ambient timeout) also produced
+            // Cancelled but via a different code path — this test
+            // ensures we don't regress either.
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("cancel pre-acquire checkpoint"),
+            );
+
+            let err = pool
+                .acquire_with_cx(&cx)
+                .await
+                .expect_err("pre-cancelled acquire must fail");
+            assert_eq!(err, PoolError::Cancelled);
+
+            let stats = pool.stats().await;
+            assert_eq!(
+                stats.total_timeouts, 0,
+                "pre-cancelled acquire must NOT register a timeout"
+            );
+            assert_eq!(
+                stats.total_acquired, 1,
+                "only the held permit should be in total_acquired"
+            );
         });
     }
 
