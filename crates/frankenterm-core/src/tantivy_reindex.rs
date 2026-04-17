@@ -924,6 +924,79 @@ impl<W: IndexWriter> ReindexPipeline<W> {
         Ok(progress)
     }
 
+    /// Cx-first [`Self::backfill`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the pre-loop storage read + the index loop
+    /// via [`Self::index_loop_with_cx`] (the helper added in
+    /// tick 55). Pre-flight checkpoint gates `create_event_reader`
+    /// and `storage.read_checkpoint`; per-batch checkpoints live
+    /// inside the index loop.
+    ///
+    /// Preserves the cursor-positioning fast path: for an
+    /// `OrdinalRange { start, .. }` with no existing checkpoint
+    /// and `start > 0`, the cursor is opened at the range start
+    /// (same as legacy), avoiding wasted batches on events before
+    /// the range.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn backfill_with_cx<S: RecorderStorage>(
+        &mut self,
+        cx: &crate::cx::Cx,
+        storage: &S,
+        config: &BackfillConfig,
+    ) -> Result<ReindexProgress, IndexerError> {
+        cx.checkpoint()
+            .map_err(|err| IndexerError::Config(format!("backfill cancelled pre-start: {err}")))?;
+
+        if config.batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+        let event_reader = create_event_reader(&config.source)?;
+
+        let mut progress = ReindexProgress::new();
+        let consumer_id = CheckpointConsumerId(config.consumer_id.clone());
+
+        let checkpoint = storage.read_checkpoint(&consumer_id).await?;
+
+        let mut cursor = match &checkpoint {
+            Some(cp) => {
+                let mut c = event_reader
+                    .open_cursor(cp.upto_offset.clone())
+                    .map_err(cursor_err)?;
+                let _ = c.next_batch(1).map_err(cursor_err)?;
+                progress.current_ordinal = Some(cp.upto_offset.ordinal);
+                c
+            }
+            None => {
+                if let BackfillRange::OrdinalRange { start, .. } = &config.range {
+                    if *start > 0 {
+                        event_reader
+                            .open_cursor_at_ordinal(*start)
+                            .map_err(cursor_err)?
+                    } else {
+                        event_reader.open_cursor_from_start().map_err(cursor_err)?
+                    }
+                } else {
+                    event_reader.open_cursor_from_start().map_err(cursor_err)?
+                }
+            }
+        };
+
+        self.index_loop_with_cx(
+            cx,
+            storage,
+            &mut *cursor,
+            &consumer_id,
+            &config.range,
+            config.batch_size,
+            config.dedup_on_replay,
+            &config.expected_event_schema,
+            config.max_batches,
+            &mut progress,
+        )
+        .await?;
+
+        Ok(progress)
+    }
+
     /// Access the writer (backfill variant).
     pub fn backfill_writer(&self) -> &W {
         &self.writer
@@ -2154,6 +2227,95 @@ mod tests {
                 .map(|d| d.event_id.as_str())
                 .collect();
             assert_eq!(event_ids, vec!["e3", "e4", "e5", "e6"]);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `backfill_with_cx` must match the
+    /// legacy `backfill` across all ReindexProgress fields and the
+    /// indexed event_id slice. Exercises the OrdinalRange fast-path
+    /// (start=3 > 0 triggers `open_cursor_at_ordinal` rather than
+    /// `open_cursor_from_start`). If a future refactor broke the
+    /// cursor-positioning branch on the Cx path, the indexed ids
+    /// would diverge from the legacy path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn backfill_with_cx_matches_legacy_ordinal_range() {
+        run_async_test(async {
+            let dir_legacy = tempdir().unwrap();
+            let scfg_legacy = test_storage_config(dir_legacy.path());
+            let storage_legacy = AppendLogRecorderStorage::open(scfg_legacy.clone()).unwrap();
+
+            let events: Vec<_> = (0..10)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("text-{i}")))
+                .collect();
+            populate_log(&storage_legacy, events.clone()).await;
+
+            let config_legacy = BackfillConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir_legacy.path().join("events.log"),
+                },
+                consumer_id: "legacy-backfill-parity".to_string(),
+                batch_size: 20,
+                range: BackfillRange::OrdinalRange { start: 3, end: 6 },
+                dedup_on_replay: true,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                max_batches: 0,
+            };
+
+            let mut pipeline_legacy = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let p_legacy = pipeline_legacy
+                .backfill(&storage_legacy, &config_legacy)
+                .await
+                .unwrap();
+
+            // Separate dir/storage/consumer_id for cx path.
+            let dir_cx = tempdir().unwrap();
+            let scfg_cx = test_storage_config(dir_cx.path());
+            let storage_cx = AppendLogRecorderStorage::open(scfg_cx.clone()).unwrap();
+            populate_log(&storage_cx, events).await;
+
+            let config_cx = BackfillConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir_cx.path().join("events.log"),
+                },
+                consumer_id: "cx-backfill-parity".to_string(),
+                batch_size: 20,
+                range: BackfillRange::OrdinalRange { start: 3, end: 6 },
+                dedup_on_replay: true,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+                max_batches: 0,
+            };
+
+            let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
+            let cx = crate::cx::for_request();
+            let p_cx = pipeline_cx
+                .backfill_with_cx(&cx, &storage_cx, &config_cx)
+                .await
+                .unwrap();
+
+            assert_eq!(p_legacy.events_read, p_cx.events_read);
+            assert_eq!(p_legacy.events_indexed, p_cx.events_indexed);
+            assert_eq!(p_legacy.events_skipped, p_cx.events_skipped);
+            assert_eq!(p_legacy.events_filtered, p_cx.events_filtered);
+            assert_eq!(p_legacy.caught_up, p_cx.caught_up);
+            assert_eq!(p_legacy.current_ordinal, p_cx.current_ordinal);
+            assert_eq!(p_legacy.batches_committed, p_cx.batches_committed);
+            assert_eq!(p_cx.events_indexed, 4, "range [3,6] has 4 events");
+
+            let ids_legacy: Vec<&str> = pipeline_legacy
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            let ids_cx: Vec<&str> = pipeline_cx
+                .backfill_writer()
+                .docs
+                .iter()
+                .map(|d| d.event_id.as_str())
+                .collect();
+            assert_eq!(ids_legacy, ids_cx);
+            assert_eq!(ids_cx, vec!["e3", "e4", "e5", "e6"]);
         });
     }
 
