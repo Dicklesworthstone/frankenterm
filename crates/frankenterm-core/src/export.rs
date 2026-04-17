@@ -228,6 +228,29 @@ pub async fn export_jsonl<W: Write>(
     Ok(count)
 }
 
+/// Cx-first [`export_jsonl`] (ft-xbnl0.2.3). Pre-flight
+/// cx checkpoint gates the expensive storage query — a
+/// pre-cancelled cx returns `Err(Error::Runtime(...))` without
+/// touching storage or writing a header to the output. For
+/// uncancelled cx the behavior is identical to `export_jsonl`.
+///
+/// Per-record cancellation is out of scope: once the storage
+/// query returns a `Vec<Record>`, the write loop is CPU-only
+/// serialization + I/O. Adding checkpoints inside the loop
+/// would be excessive — storage query cost dominates export
+/// time on large tables.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn export_jsonl_with_cx<W: Write>(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    opts: &ExportOptions,
+    writer: &mut W,
+) -> crate::Result<usize> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("export_jsonl cancelled: {err}")))?;
+    export_jsonl(storage, opts, writer).await
+}
+
 fn write_header<W: Write>(
     writer: &mut W,
     opts: &ExportOptions,
@@ -538,6 +561,72 @@ mod tests {
             // Verify record
             let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
             assert_eq!(record["content"], "test content");
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `export_jsonl_with_cx` must match
+    /// `export_jsonl` on the same fixture. Uses the same
+    /// topology as `export_segments_to_buffer` with a fresh cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn export_jsonl_with_cx_matches_legacy() {
+        run_async_test(async {
+            let tmp =
+                std::env::temp_dir().join(format!("wa_test_export_cx_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+            storage
+                .append_segment(1, "cx-test-content", None)
+                .await
+                .unwrap();
+
+            let opts = ExportOptions {
+                kind: ExportKind::Segments,
+                query: ExportQuery::default(),
+                audit_actor: None,
+                audit_action: None,
+                redact: false,
+                pretty: false,
+            };
+
+            let cx = crate::cx::for_request();
+            let mut buf = Vec::new();
+            let count = export_jsonl_with_cx(&cx, &storage, &opts, &mut buf)
+                .await
+                .unwrap();
+
+            assert_eq!(count, 1);
+            let output = String::from_utf8(buf).unwrap();
+            let lines: Vec<&str> = output.trim().lines().collect();
+            assert_eq!(lines.len(), 2); // header + 1 record
+
+            let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(header["_export"], true);
+            assert_eq!(header["record_count"], 1);
+
+            let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(record["content"], "cx-test-content");
 
             storage.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&tmp);
