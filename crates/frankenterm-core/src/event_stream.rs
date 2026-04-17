@@ -814,6 +814,41 @@ impl FilteredEventStream {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`next`].
+    ///
+    /// Threads the caller's cx through the underlying subscriber's
+    /// `recv_cx` so caller cancellation (not just channel-close)
+    /// can break the wait. Returns `None` on either channel close
+    /// or cx cancellation — the two paths are indistinguishable
+    /// from the caller's perspective, matching the legacy
+    /// close-returns-None contract.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn next_cx(&mut self, cx: &crate::cx::Cx) -> Option<Event> {
+        loop {
+            match self.subscriber.recv_cx(cx).await {
+                Ok(event) => {
+                    if self.filter.matches_event(&event) {
+                        self.delivered.fetch_add(1, Ordering::Relaxed);
+                        if let Event::PatternDetected {
+                            event_id: Some(id), ..
+                        } = &event
+                        {
+                            self.cursor.advance(*id);
+                        }
+                        return Some(event);
+                    }
+                    self.filtered_out.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(crate::events::RecvError::Lagged { .. }) => {
+                    // Subscriber fell behind; keep receiving.
+                }
+                Err(crate::events::RecvError::Closed) => {
+                    return None;
+                }
+            }
+        }
+    }
+
     /// Try to receive the next matching event without blocking.
     ///
     /// Returns `None` if no matching event is immediately available.
@@ -1909,5 +1944,37 @@ mod tests {
                 drop(waiter);
             });
         }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `EventFilterStream::next_cx` must
+    /// deliver a matching event identically to the legacy `next`
+    /// when given a fresh cx. Verified by publishing one matching
+    /// event and confirming the cx-first next returns it.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn event_filter_stream_next_cx_delivers_matching_event() {
+        run_async_test(async {
+            let bus = Arc::new(EventBus::new(16));
+            let filter = EventStreamFilter::default();
+            let cursor = StreamCursor::from_beginning();
+            let mut stream = FilteredEventStream::new(&bus, filter, cursor, 32);
+
+            let cx = crate::cx::for_testing();
+            let event = make_pattern_event(5, "rule-x", Some(99));
+            let _ = bus.publish(event);
+
+            let delivered = stream.next_cx(&cx).await.expect("should deliver event");
+            match delivered {
+                Event::PatternDetected {
+                    detection,
+                    event_id: Some(id),
+                    ..
+                } => {
+                    assert_eq!(detection.rule_id, "rule-x");
+                    assert_eq!(id, 99);
+                }
+                other => panic!("expected PatternDetected, got: {other:?}"),
+            }
+        });
     }
 }

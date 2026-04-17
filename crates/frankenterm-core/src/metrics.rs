@@ -394,6 +394,23 @@ impl MetricsServerHandle {
     pub async fn wait(self) {
         let _ = self.join.await;
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`wait`].
+    ///
+    /// Awaits the server task only if the cx is not already
+    /// cancelled. Unlike the watchdog's `join_with_cx` this
+    /// method cannot signal shutdown — the metrics server's
+    /// shutdown flag is owned by the caller, not the handle.
+    /// A cx-cancelled caller returns immediately but must still
+    /// flip the external `shutdown_flag` to make the background
+    /// task exit.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn wait_with_cx(self, cx: &crate::cx::Cx) {
+        if cx.checkpoint().is_err() {
+            return;
+        }
+        let _ = self.join.await;
+    }
 }
 
 /// Minimal Prometheus metrics server.
@@ -1360,6 +1377,42 @@ mod tests {
 
             shutdown_flag.store(true, Ordering::SeqCst);
             handle.wait().await;
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `wait_with_cx` must return
+    /// quickly on a pre-cancelled cx, even if the server task
+    /// is still running. The caller is responsible for flipping
+    /// the shutdown flag to make the task exit; the handle
+    /// method only decouples the caller's blocking wait from
+    /// the task's eventual shutdown.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn metrics_server_wait_with_precancelled_cx_returns_quickly() {
+        run_async_test(async {
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+            let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
+
+            let handle = server.start().await.expect("start metrics");
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel metrics wait"),
+            );
+
+            let start = std::time::Instant::now();
+            handle.wait_with_cx(&cx).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "wait_with_cx on cancelled cx should return quickly, took {elapsed:?}"
+            );
+
+            // Caller's responsibility to stop the background task.
+            shutdown_flag.store(true, Ordering::SeqCst);
         });
     }
 
