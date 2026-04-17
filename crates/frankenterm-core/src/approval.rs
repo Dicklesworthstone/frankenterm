@@ -380,6 +380,92 @@ impl<'a> ApprovalStore<'a> {
         }
     }
 
+    /// Cx-first [`Self::consume_for_plan`] (ft-xbnl0.2.3). Pure
+    /// delegate to [`Self::consume_for_plan_with_context_with_cx`]
+    /// with `None` audit context, mirroring the legacy delegation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_for_plan_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        allow_once_code: &str,
+        input: &PolicyInput,
+        plan_hash: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        self.consume_for_plan_with_context_with_cx(cx, allow_once_code, input, plan_hash, None)
+            .await
+    }
+
+    /// Cx-first [`Self::consume_for_plan_with_context`]
+    /// (ft-xbnl0.2.3). Parallel of tick-61's
+    /// `consume_with_context_with_cx` for the plan-bound consume
+    /// path. Same checkpoint seams:
+    ///   - pre-flight before `storage.consume_approval_token`,
+    ///   - between consume and audit, conditional on the token
+    ///     being valid (`Some` record) AND the plan_hash matching.
+    ///
+    /// TOCTOU contract preserved: if the stored `plan_hash`
+    /// doesn't match the presented `plan_hash`, the token is
+    /// still CONSUMED by the storage call (used_at set) but
+    /// returns `None` and no audit is recorded. This matches the
+    /// legacy semantic and prevents plan-hash-mismatch reuse.
+    /// The audit checkpoint fires only on the Some+match branch,
+    /// so the Cx-first variant is narrower than the legacy
+    /// version in one respect: a cancel during the checkpoint
+    /// window on a MISMATCHED-hash token would happen AFTER the
+    /// storage consume but before the `return Ok(None)` — which
+    /// is fine because no audit is attempted on that branch.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn consume_for_plan_with_context_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        allow_once_code: &str,
+        input: &PolicyInput,
+        plan_hash: &str,
+        audit_context: Option<ApprovalAuditContext>,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "approval.consume_for_plan cancelled pre-start: {err}"
+            ))
+        })?;
+
+        let code_hash = hash_allow_once_code(allow_once_code);
+        let fingerprint = fingerprint_for_input(input);
+        let record = self
+            .storage
+            .consume_approval_token(
+                &code_hash,
+                &self.workspace_id,
+                input.action.as_str(),
+                input.pane_id,
+                &fingerprint,
+            )
+            .await?;
+
+        match record {
+            Some(token) => {
+                if token
+                    .plan_hash
+                    .as_deref()
+                    .is_some_and(|stored| stored != plan_hash)
+                {
+                    return Ok(None);
+                }
+
+                cx.checkpoint().map_err(|err| {
+                    Error::Runtime(format!(
+                        "approval.consume_for_plan cancelled after plan-match, before audit: {err}"
+                    ))
+                })?;
+
+                self.audit_approval_grant(input, &code_hash, &fingerprint, audit_context.as_ref())
+                    .await?;
+                Ok(Some(token))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Attach an allow-once approval payload to a RequireApproval decision
     pub async fn attach_to_decision(
         &self,
@@ -389,6 +475,29 @@ impl<'a> ApprovalStore<'a> {
     ) -> Result<PolicyDecision> {
         if decision.requires_approval() {
             let approval = self.issue(input, summary).await?;
+            Ok(decision.with_approval(approval))
+        } else {
+            Ok(decision)
+        }
+    }
+
+    /// Cx-first [`Self::attach_to_decision`] (ft-xbnl0.2.3).
+    /// Pure delegate: when the decision requires approval, routes
+    /// through [`Self::issue_with_cx`] so the underlying token
+    /// issue honors caller cancellation. When the decision doesn't
+    /// require approval, returns the decision unchanged without
+    /// touching storage — no checkpoint needed on that branch
+    /// because it's a pure decision transformation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn attach_to_decision_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        decision: PolicyDecision,
+        input: &PolicyInput,
+        summary: Option<String>,
+    ) -> Result<PolicyDecision> {
+        if decision.requires_approval() {
+            let approval = self.issue_with_cx(cx, input, summary).await?;
             Ok(decision.with_approval(approval))
         } else {
             Ok(decision)
@@ -1349,6 +1458,148 @@ mod tests {
     // -----------------------------------------------------------------------
     // Async integration tests (existing)
     // -----------------------------------------------------------------------
+
+    /// ft-xbnl0.2.3 Cx-first: `consume_for_plan_with_cx` +
+    /// `attach_to_decision_with_cx` complete the approval.rs
+    /// Cx-first surface. Consolidated parity test covering:
+    ///   1. `consume_for_plan_with_cx` succeeds on a matching
+    ///      plan_hash.
+    ///   2. `consume_for_plan_with_context_with_cx` exercises
+    ///      the audit-context branch.
+    ///   3. `attach_to_decision_with_cx` with `requires_approval`
+    ///      routes through `issue_with_cx` and produces a
+    ///      decision with the approval attached.
+    ///   4. `attach_to_decision_with_cx` with a decision that
+    ///      doesn't require approval is a pure pass-through (no
+    ///      storage calls, no checkpoint).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn approval_rs_cx_first_trail_complete() {
+        run_async_test(async {
+            let temp_dir = std::env::temp_dir();
+            let db_path = temp_dir.join(format!(
+                "wa_test_approval_trail_complete_{}.db",
+                std::process::id()
+            ));
+            let db_path_str = db_path.to_string_lossy().to_string();
+
+            let storage = StorageHandle::new(&db_path_str).await.unwrap();
+            let pane = PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("test".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+            let cx = crate::cx::for_request();
+            let plan_hash = "sha256:tick62-trail-complete";
+
+            // Path 1: consume_for_plan_with_cx (shorthand)
+            let req1 = store
+                .issue_for_plan_with_cx(&cx, &input, plan_hash, Some(11), None)
+                .await
+                .unwrap();
+            let consumed1 = store
+                .consume_for_plan_with_cx(&cx, &req1.allow_once_code, &input, plan_hash)
+                .await
+                .unwrap();
+            assert!(
+                consumed1.is_some(),
+                "consume_for_plan_with_cx must succeed on matching plan_hash"
+            );
+
+            // Path 2: consume_for_plan_with_context_with_cx with audit
+            let req2 = store
+                .issue_for_plan_with_cx(&cx, &input, plan_hash, Some(22), None)
+                .await
+                .unwrap();
+            let audit_ctx = ApprovalAuditContext {
+                correlation_id: Some("corr-cx-62".to_string()),
+                decision_context: None,
+            };
+            let consumed2 = store
+                .consume_for_plan_with_context_with_cx(
+                    &cx,
+                    &req2.allow_once_code,
+                    &input,
+                    plan_hash,
+                    Some(audit_ctx),
+                )
+                .await
+                .unwrap();
+            assert!(
+                consumed2.is_some(),
+                "consume_for_plan_with_context_with_cx must succeed"
+            );
+
+            // Path 3: attach_to_decision_with_cx with RequireApproval
+            let require_decision = PolicyDecision::require_approval("needs review");
+            assert!(require_decision.requires_approval());
+            let with_approval = store
+                .attach_to_decision_with_cx(
+                    &cx,
+                    require_decision,
+                    &input,
+                    Some("Cx-first attach".to_string()),
+                )
+                .await
+                .unwrap();
+            let attached_code = match &with_approval {
+                PolicyDecision::RequireApproval { approval, .. } => {
+                    assert!(
+                        approval.is_some(),
+                        "attach_to_decision_with_cx must attach approval when required"
+                    );
+                    approval.as_ref().unwrap().allow_once_code.clone()
+                }
+                other => panic!("expected RequireApproval, got {other:?}"),
+            };
+
+            // Verify the attached token is consumable (round-trip).
+            let consumed3 = store
+                .consume_with_cx(&cx, &attached_code, &input)
+                .await
+                .unwrap();
+            assert!(
+                consumed3.is_some(),
+                "token attached via attach_to_decision_with_cx must be consumable"
+            );
+
+            // Path 4: attach_to_decision_with_cx on a decision
+            // that does NOT require approval — pure pass-through.
+            let allow_decision = PolicyDecision::allow();
+            assert!(!allow_decision.requires_approval());
+            let unchanged = store
+                .attach_to_decision_with_cx(&cx, allow_decision, &input, None)
+                .await
+                .unwrap();
+            assert!(
+                !unchanged.requires_approval(),
+                "attach_to_decision_with_cx must pass through non-approval decision"
+            );
+            assert!(
+                matches!(unchanged, PolicyDecision::Allow { .. }),
+                "pass-through must preserve the Allow variant"
+            );
+
+            storage.shutdown().await.unwrap();
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        });
+    }
 
     /// ft-xbnl0.2.3 Cx-first: `consume_with_cx` must match the
     /// legacy `consume` for an uncancelled cx. Issues a token
