@@ -712,6 +712,26 @@ pub async fn generate_bundle(
     })
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`generate_bundle`].
+///
+/// Pre-flight checkpoint gates the (potentially expensive)
+/// bundle generation — the CLI `ft diag bundle` command can
+/// be cancelled at entry before any storage work is done.
+/// Delegates to [`generate_bundle`] for the actual work so
+/// the legacy path remains authoritative.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn generate_bundle_with_cx(
+    cx: &crate::cx::Cx,
+    config: &Config,
+    layout: &WorkspaceLayout,
+    storage: &StorageHandle,
+    opts: &DiagnosticOptions,
+) -> crate::Result<DiagnosticResult> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("generate_bundle cancelled: {err}")))?;
+    generate_bundle(config, layout, storage, opts).await
+}
+
 // =============================================================================
 // Bundle manifest
 // =============================================================================
@@ -1171,6 +1191,67 @@ mod tests {
             storage.shutdown().await.unwrap();
             let _ = fs::remove_file(&tmp);
             let _ = fs::remove_dir_all(&output_dir);
+            let _ = fs::remove_dir_all(layout.root);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `generate_bundle_with_cx` must
+    /// produce a bundle equivalent to `generate_bundle` for
+    /// an uncancelled cx (same file set, same manifest shape).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn generate_bundle_with_cx_matches_legacy() {
+        run_async_test(async {
+            let tmp = std::env::temp_dir()
+                .join(format!("wa_test_diag_bundle_cx_{}.db", std::process::id()));
+            let db_path = tmp.to_string_lossy().to_string();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let pane = crate::storage::PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1000,
+                last_seen_at: 1000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+
+            let config = Config::default();
+            let layout = WorkspaceLayout::new(
+                std::env::temp_dir().join(format!("wa_test_diag_cx_ws_{}", std::process::id())),
+                &config.storage,
+                &config.ipc,
+            );
+
+            let out_dir =
+                std::env::temp_dir().join(format!("wa_test_diag_cx_output_{}", std::process::id()));
+            let opts = DiagnosticOptions {
+                output: Some(out_dir.clone()),
+                ..Default::default()
+            };
+
+            let cx = crate::cx::for_request();
+            let result = generate_bundle_with_cx(&cx, &config, &layout, &storage, &opts)
+                .await
+                .unwrap();
+
+            assert_eq!(result.output_path, out_dir.display().to_string());
+            assert!(result.file_count >= 9);
+            assert!(out_dir.join("manifest.json").exists());
+            assert!(out_dir.join("environment.json").exists());
+            assert!(out_dir.join("db_health.json").exists());
+
+            storage.shutdown().await.unwrap();
+            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_dir_all(&out_dir);
             let _ = fs::remove_dir_all(layout.root);
         });
     }
