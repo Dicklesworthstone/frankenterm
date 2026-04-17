@@ -108,6 +108,110 @@ pub async fn cleanup_preview(
     Ok(plan)
 }
 
+/// Cx-first [`cleanup_preview`] (ft-xbnl0.2.3). Threads caller `&Cx`
+/// through the sequence of storage queries via `cx.checkpoint()`
+/// boundaries between each table scan. Since the underlying
+/// `StorageHandle` methods do not yet expose `_with_cx` variants
+/// (147 async fns without cx surface — see ft-xbnl0.2.x inventory),
+/// the checkpoints provide caller-cancellation seams *between*
+/// queries: a late-cancelled caller can abort before the next table
+/// scan starts, and a pre-cancelled caller short-circuits before
+/// touching storage at all.
+///
+/// Identical semantics to [`cleanup_preview`] for uncancelled cx —
+/// only the await points gain cancellation awareness.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn cleanup_preview_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    config: &StorageConfig,
+) -> crate::Result<CleanupPlan> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("cleanup_preview cancelled: {err}")))?;
+
+    let now = now_ms();
+    let global_cutoff_ms = retention_cutoff_ms(now, config.retention_days);
+
+    let mut plan = CleanupPlan {
+        dry_run: true,
+        ..Default::default()
+    };
+
+    let events_summaries = preview_events_by_tier(storage, config, now).await?;
+    for summary in &events_summaries {
+        plan.total_eligible += summary.eligible_rows;
+    }
+    plan.tables.extend(events_summaries);
+
+    if config.retention_days > 0 {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "cleanup_preview cancelled before output_segments: {err}"
+            ))
+        })?;
+        let count = storage.count_segments_before(global_cutoff_ms).await?;
+        plan.tables.push(CleanupTableSummary {
+            table: "output_segments".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        });
+        plan.total_eligible += count;
+    }
+
+    if config.retention_days > 0 {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "cleanup_preview cancelled before audit_actions: {err}"
+            ))
+        })?;
+        let count = storage.count_audit_actions_before(global_cutoff_ms).await?;
+        plan.tables.push(CleanupTableSummary {
+            table: "audit_actions".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        });
+        plan.total_eligible += count;
+    }
+
+    if config.retention_days > 0 {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "cleanup_preview cancelled before usage_metrics: {err}"
+            ))
+        })?;
+        let count = storage.count_usage_metrics_before(global_cutoff_ms).await?;
+        plan.tables.push(CleanupTableSummary {
+            table: "usage_metrics".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        });
+        plan.total_eligible += count;
+    }
+
+    if config.retention_days > 0 {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "cleanup_preview cancelled before notification_history: {err}"
+            ))
+        })?;
+        let count = storage
+            .count_notification_history_before(global_cutoff_ms)
+            .await?;
+        plan.tables.push(CleanupTableSummary {
+            table: "notification_history".to_string(),
+            eligible_rows: count,
+            deleted_rows: 0,
+            retention_days: config.retention_days,
+        });
+        plan.total_eligible += count;
+    }
+
+    Ok(plan)
+}
+
 /// Apply cleanup: delete eligible rows and return the result plan.
 pub async fn cleanup_apply(
     storage: &StorageHandle,
@@ -582,6 +686,47 @@ mod tests {
             assert!(!plan.dry_run);
             assert_eq!(plan.total_eligible, 0);
             assert_eq!(plan.total_deleted, 0);
+
+            teardown(storage, &db_path).await;
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `cleanup_preview_with_cx` must match
+    /// the legacy `cleanup_preview` for an uncancelled cx — the
+    /// Cx-first variant only adds cancellation seams *between*
+    /// storage queries; the table scan logic is identical. Proves
+    /// the Cx-first variant produces bit-for-bit identical plan
+    /// shapes for an empty DB.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cleanup_preview_with_cx_matches_legacy_on_empty_db() {
+        run_async_test(async {
+            let (storage, db_path) = setup_storage("cx_empty_preview").await;
+            let config = StorageConfig::default();
+
+            let cx = crate::cx::for_request();
+            let legacy = cleanup_preview(&storage, &config)
+                .await
+                .expect("legacy preview");
+            let cx_first = cleanup_preview_with_cx(&cx, &storage, &config)
+                .await
+                .expect("cx-first preview");
+
+            assert_eq!(legacy.dry_run, cx_first.dry_run);
+            assert_eq!(legacy.total_eligible, cx_first.total_eligible);
+            assert_eq!(legacy.total_deleted, cx_first.total_deleted);
+            assert_eq!(
+                legacy.tables.len(),
+                cx_first.tables.len(),
+                "Cx-first must produce same number of table summaries"
+            );
+            // Every table summary should match by table name + counts.
+            for (a, b) in legacy.tables.iter().zip(cx_first.tables.iter()) {
+                assert_eq!(a.table, b.table, "table name mismatch");
+                assert_eq!(a.eligible_rows, b.eligible_rows);
+                assert_eq!(a.deleted_rows, b.deleted_rows);
+                assert_eq!(a.retention_days, b.retention_days);
+            }
 
             teardown(storage, &db_path).await;
         });
