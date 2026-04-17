@@ -600,6 +600,23 @@ pub async fn export_sessions(
     Ok(exported)
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
+///
+/// Pre-flight checkpoint gates the cass session export before
+/// any storage queries fire. The cass connector can have many
+/// concurrent export batches in flight; a cancelled parent cx
+/// bails immediately at the boundary.
+#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+pub async fn export_sessions_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    query: &CassExportQuery,
+) -> crate::Result<Vec<CassExportSessionRecord>> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("cass export_sessions cancelled: {err}")))?;
+    export_sessions(storage, query).await
+}
+
 /// Export recorder content chunks for a specific session.
 #[cfg(feature = "cass-export")]
 pub async fn export_content(
@@ -632,6 +649,23 @@ pub async fn export_content(
             content_type: "output".to_string(),
         })
         .collect())
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`export_content`].
+///
+/// Pre-flight checkpoint gates the cass content export before
+/// the session lookup + segment scan. Used by the cass
+/// connector's per-session chunk-fetch loop.
+#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+pub async fn export_content_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    session_id: &str,
+    query: &CassContentExportQuery,
+) -> crate::Result<Vec<CassExportContentChunk>> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("cass export_content cancelled: {err}")))?;
+    export_content(storage, session_id, query).await
 }
 
 /// Thin wrapper around the cass CLI.
@@ -2223,6 +2257,57 @@ mod tests {
                 );
             }
             Ok(_) => panic!("search_with_cx must fail for a nonexistent binary"),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `export_sessions_with_cx` with a
+    /// fresh cx on an empty DB must return an empty Vec (same
+    /// as the legacy `export_sessions` on an empty DB).
+    #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+    #[test]
+    fn cass_export_sessions_with_cx_empty_db_matches_legacy() {
+        use crate::runtime_compat::CompatRuntime;
+
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let tmp = std::env::temp_dir().join(format!(
+                    "wa_test_cass_export_sessions_cx_{}.db",
+                    std::process::id()
+                ));
+                let db_path = tmp.to_string_lossy().to_string();
+                let storage = StorageHandle::new(&db_path).await.unwrap();
+
+                let query = CassExportQuery {
+                    pane_id: None,
+                    since: None,
+                    until: None,
+                    after_id: None,
+                    limit: 10,
+                };
+
+                let cx = crate::cx::for_request();
+                let legacy = export_sessions(&storage, &query).await.unwrap();
+                let cx_first = export_sessions_with_cx(&cx, &storage, &query)
+                    .await
+                    .unwrap();
+
+                assert_eq!(legacy.len(), cx_first.len());
+                assert_eq!(legacy.len(), 0, "empty DB should return 0 sessions");
+
+                storage.shutdown().await.unwrap();
+                let _ = std::fs::remove_file(&tmp);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 }
