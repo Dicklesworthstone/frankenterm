@@ -135,6 +135,59 @@ impl LayoutRestorer {
         Ok(result)
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`restore`].
+    ///
+    /// Pre-flight checkpoint gates the restoration before any
+    /// mux spawn/split calls fire; additionally, a per-window
+    /// checkpoint between iterations makes cancellation
+    /// responsive for multi-window restores where each window
+    /// involves multiple expensive spawn operations.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn restore_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        snapshot: &TopologySnapshot,
+    ) -> crate::Result<RestoreResult> {
+        cx.checkpoint()
+            .map_err(|err| crate::Error::Runtime(format!("restore cancelled: {err}")))?;
+
+        let mut result = RestoreResult::new();
+
+        info!(
+            windows = snapshot.windows.len(),
+            "starting layout restoration from snapshot (cx-first)"
+        );
+
+        for (win_idx, window) in snapshot.windows.iter().enumerate() {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!("restore cancelled between windows: {err}"))
+            })?;
+            match self.restore_window(window, win_idx, &mut result).await {
+                Ok(restored_any_tabs) => {
+                    if restored_any_tabs {
+                        result.windows_created += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(window_id = window.window_id, error = %e, "failed to restore window");
+                    if !self.config.continue_on_error {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        info!(
+            windows = result.windows_created,
+            tabs = result.tabs_created,
+            panes = result.panes_created,
+            failed = result.failed_panes.len(),
+            "layout restoration complete (cx-first)"
+        );
+
+        Ok(result)
+    }
+
     /// Restore a single window and all its tabs.
     async fn restore_window(
         &self,
@@ -792,6 +845,36 @@ mod tests {
             assert_eq!(result.tabs_created, 1);
             assert!(result.failed_panes.is_empty());
             assert!(result.pane_id_map.contains_key(&42));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `restore_with_cx` must produce
+    /// the same RestoreResult shape (pane/window/tab counts,
+    /// pane_id_map coverage, no failures) as `restore` for an
+    /// uncancelled cx.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn restore_with_cx_matches_legacy() {
+        run_async_test(async {
+            let tree = hsplit(vec![(0.5, leaf(101, None)), (0.5, leaf(102, None))]);
+            let snapshot = single_tab_snapshot(tree);
+
+            let legacy_mock = Arc::new(MockWezterm::new());
+            let legacy_restorer = make_restorer(legacy_mock.clone());
+            let legacy = legacy_restorer.restore(&snapshot).await.unwrap();
+
+            let cx_mock = Arc::new(MockWezterm::new());
+            let cx_restorer = make_restorer(cx_mock.clone());
+            let cx = crate::cx::for_request();
+            let cx_first = cx_restorer.restore_with_cx(&cx, &snapshot).await.unwrap();
+
+            assert_eq!(legacy.panes_created, cx_first.panes_created);
+            assert_eq!(legacy.windows_created, cx_first.windows_created);
+            assert_eq!(legacy.tabs_created, cx_first.tabs_created);
+            assert_eq!(legacy.failed_panes.len(), cx_first.failed_panes.len());
+            assert_eq!(legacy.pane_id_map.len(), cx_first.pane_id_map.len());
+            assert!(cx_first.pane_id_map.contains_key(&101));
+            assert!(cx_first.pane_id_map.contains_key(&102));
         });
     }
 
