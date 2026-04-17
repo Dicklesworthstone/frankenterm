@@ -6509,11 +6509,43 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_action_undo_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: ActionUndoRecord,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("upsert_action_undo cancelled: {err}"))
+        })?;
+        self.upsert_action_undo(record).await
+    }
+
     /// Upsert undo metadata after applying redaction
     pub async fn upsert_action_undo_redacted(&self, mut record: ActionUndoRecord) -> Result<()> {
         let redactor = Redactor::new();
         record.redact_fields(&redactor);
         self.upsert_action_undo(record).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo_redacted`].
+    ///
+    /// Routes the post-redaction persistence through
+    /// `upsert_action_undo_with_cx` so the full composite honours
+    /// cancellation.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn upsert_action_undo_redacted_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mut record: ActionUndoRecord,
+    ) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("upsert_action_undo_redacted cancelled: {err}"))
+        })?;
+        let redactor = Redactor::new();
+        record.redact_fields(&redactor);
+        self.upsert_action_undo_with_cx(cx, record).await
     }
 
     /// Fetch undo metadata for a specific audit action ID.
@@ -21617,6 +21649,127 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
             .await
             .unwrap();
         assert!(muted, "event should be muted after add_event_mute_with_cx");
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-xbnl0.2.3 Cx-first: tick 148 action-undo cluster —
+/// 2 new storage cx-first siblings exercised end-to-end:
+/// `upsert_action_undo_with_cx` and
+/// `upsert_action_undo_redacted_with_cx` (composite that applies
+/// redaction then routes through `upsert_action_undo_with_cx`).
+#[cfg(feature = "asupersync-runtime")]
+#[test]
+fn storage_tick148_action_undo_cluster_roundtrip() {
+    run_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_tick148_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        // Seed pane + two audit actions (FK target for action_undo).
+        let pane = PaneRecord {
+            pane_id: 63,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("tick148".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane_with_cx(&cx, pane).await.unwrap();
+
+        let make_audit = |tag: &str| AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "human".to_string(),
+            actor_id: Some(tag.to_string()),
+            correlation_id: None,
+            pane_id: Some(63),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        let audit_plain = storage
+            .record_audit_action_with_cx(&cx, make_audit("tick148-plain"))
+            .await
+            .unwrap();
+        let audit_red = storage
+            .record_audit_action_with_cx(&cx, make_audit("tick148-red"))
+            .await
+            .unwrap();
+        assert!(audit_plain > 0 && audit_red > audit_plain);
+
+        // 1. upsert_action_undo_with_cx — straight insert, no redaction.
+        let plain_rec = ActionUndoRecord {
+            audit_action_id: audit_plain,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: Some("revert the send".to_string()),
+            undo_payload: Some("{\"op\":\"noop\"}".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        storage
+            .upsert_action_undo_with_cx(&cx, plain_rec)
+            .await
+            .unwrap();
+        let plain_round = storage
+            .get_action_undo_with_cx(&cx, audit_plain)
+            .await
+            .unwrap()
+            .expect("plain undo row should exist");
+        assert!(plain_round.undoable);
+        assert_eq!(plain_round.undo_strategy, "manual");
+        assert_eq!(plain_round.undo_hint.as_deref(), Some("revert the send"));
+
+        // 2. upsert_action_undo_redacted_with_cx — composite; hint + payload
+        //    are routed through Redactor before the cx-threaded insert.
+        //    The Redactor doesn't guarantee transformation of any specific
+        //    string (it's a no-op on benign input), but the roundtrip must
+        //    land the record and match what `redact_fields` produced.
+        let template = ActionUndoRecord {
+            audit_action_id: audit_red,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: Some("benign hint text".to_string()),
+            undo_payload: Some("{\"k\":\"v\"}".to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        let redactor = Redactor::new();
+        let mut expected = template.clone();
+        expected.redact_fields(&redactor);
+
+        storage
+            .upsert_action_undo_redacted_with_cx(&cx, template.clone())
+            .await
+            .unwrap();
+        let red_round = storage
+            .get_action_undo_with_cx(&cx, audit_red)
+            .await
+            .unwrap()
+            .expect("redacted undo row should exist");
+        assert_eq!(red_round.undo_hint, expected.undo_hint);
+        assert_eq!(red_round.undo_payload, expected.undo_payload);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
         let _ = std::fs::remove_file(&db_path);
