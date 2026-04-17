@@ -389,6 +389,66 @@ impl AlertMonitor {
         Ok(triggered)
     }
 
+    /// Cx-first [`Self::check_alerts`] (ft-xbnl0.2.3). Threads
+    /// caller `&Cx` through the rule-evaluation loop via
+    /// `cx.checkpoint()?` at the top of each iteration. Each
+    /// rule triggers a `storage.query_usage_metrics` call on
+    /// its own period window — a long rule list against a
+    /// busy DB can take seconds. Per-rule checkpoint lets an
+    /// operator cancel a slow alert sweep cleanly; triggered
+    /// alerts from rules already evaluated are discarded on
+    /// cancel (cancellation returns Err, not partial Vec).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn check_alerts_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+    ) -> crate::error::Result<Vec<TriggeredAlert>> {
+        cx.checkpoint()
+            .map_err(|err| crate::Error::Runtime(format!("check_alerts cancelled: {err}")))?;
+
+        let now = now_ms();
+        let mut triggered = Vec::new();
+
+        for rule in &self.rules {
+            if !rule.enabled {
+                continue;
+            }
+
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "check_alerts cancelled at rule '{}': {err}",
+                    rule.id
+                ))
+            })?;
+
+            let current_value = self.get_current_value(storage, rule, now).await?;
+            if let Some(level) = rule.check(current_value) {
+                let percent = if rule.threshold > 0.0 {
+                    match rule.metric {
+                        AlertMetric::AccountBalance => 1.0 - (current_value / rule.threshold),
+                        _ => current_value / rule.threshold,
+                    }
+                } else {
+                    0.0
+                };
+
+                triggered.push(TriggeredAlert {
+                    rule_id: rule.id.clone(),
+                    metric: rule.metric.clone(),
+                    level,
+                    current_value,
+                    threshold: rule.threshold,
+                    percent_of_threshold: percent,
+                    period: rule.period,
+                    evaluated_at: now,
+                });
+            }
+        }
+
+        Ok(triggered)
+    }
+
     /// Query storage for the current value of a metric.
     async fn get_current_value(
         &self,
@@ -472,6 +532,52 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ft-xbnl0.2.3 Cx-first: `check_alerts_with_cx` must match
+    /// `check_alerts` on a manager with 0 enabled rules — both
+    /// return empty Vec without touching storage. Uses raw
+    /// block_on because alerts::tests is sync fixtures.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn check_alerts_with_cx_empty_rules_matches_legacy() {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let db_path =
+                    std::env::temp_dir().join(format!("wa_alerts_cx_{}.db", std::process::id()));
+                let db_str = db_path.to_string_lossy().to_string();
+                let _ = std::fs::remove_file(&db_path);
+                let storage = StorageHandle::new(&db_str).await.expect("storage");
+
+                let monitor = AlertMonitor::new(Vec::new()); // no rules
+                let cx = crate::cx::for_request();
+
+                let legacy: Vec<TriggeredAlert> =
+                    monitor.check_alerts(&storage).await.expect("legacy");
+                let cx_first: Vec<TriggeredAlert> = monitor
+                    .check_alerts_with_cx(&cx, &storage)
+                    .await
+                    .expect("cx-first");
+
+                assert_eq!(legacy.len(), cx_first.len());
+                assert_eq!(cx_first.len(), 0);
+
+                storage.shutdown().await.expect("shutdown");
+                let _ = std::fs::remove_file(&db_path);
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle()
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn alert_level_from_percent_thresholds() {
