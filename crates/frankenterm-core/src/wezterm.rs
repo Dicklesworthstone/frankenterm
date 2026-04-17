@@ -2013,10 +2013,7 @@ impl WeztermInterface for WeztermClient {
     }
 
     #[cfg(feature = "asupersync-runtime")]
-    fn list_panes_with_cx<'a>(
-        &'a self,
-        cx: &'a crate::cx::Cx,
-    ) -> WeztermFuture<'a, Vec<PaneInfo>> {
+    fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move { WeztermClient::list_panes_with_cx(self, cx).await })
     }
 
