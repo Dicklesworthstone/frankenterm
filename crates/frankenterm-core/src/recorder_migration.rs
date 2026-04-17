@@ -360,7 +360,9 @@ impl MigrationEngine {
                 last_error: Some(format!("m0_preflight cancelled pre-start: {err}")),
             })?;
 
-        let health: RecorderStorageHealth = source_storage.health().await;
+        // ft-xbnl0.2.3 tick 128: route through cx-first health
+        // so caller cancellation propagates into the health probe.
+        let health: RecorderStorageHealth = source_storage.health_with_cx(cx).await;
         if health.degraded {
             return Err(MigrationError::SourceDegraded {
                 last_error: health.last_error,
@@ -1091,7 +1093,8 @@ impl MigrationEngine {
             ))
         })?;
 
-        let health = target.health().await;
+        // ft-xbnl0.2.3 tick 128: cx-first health probe.
+        let health = target.health_with_cx(cx).await;
 
         if source_path.is_some() {
             info!(

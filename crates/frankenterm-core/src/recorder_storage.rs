@@ -375,6 +375,26 @@ pub trait RecorderStorage: Send + Sync {
 
     async fn health(&self) -> RecorderStorageHealth;
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::health`]. Default
+    /// implementation checks caller cancellation before
+    /// delegating to the non-cx `health`. On cancellation, returns
+    /// a degraded health snapshot (the health call itself has no
+    /// error surface — it always returns a snapshot).
+    #[cfg(feature = "asupersync-runtime")]
+    async fn health_with_cx(&self, cx: &crate::cx::Cx) -> RecorderStorageHealth {
+        if cx.checkpoint().is_err() {
+            return RecorderStorageHealth {
+                backend: RecorderBackendKind::AppendLog,
+                degraded: true,
+                queue_depth: 0,
+                queue_capacity: 0,
+                latest_offset: None,
+                last_error: Some("health cancelled pre-start via Cx".to_string()),
+            };
+        }
+        self.health().await
+    }
+
     async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError>;
 
     /// Cx-first [`Self::lag_metrics`] (ft-xbnl0.2.3). Default
