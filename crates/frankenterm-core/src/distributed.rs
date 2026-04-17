@@ -900,6 +900,13 @@ pub struct DistributedHttpClient {
 }
 
 #[cfg(feature = "distributed")]
+impl Default for DistributedHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "distributed")]
 impl DistributedHttpClient {
     /// Create a client with default configuration (WebPKI roots for HTTPS).
     #[must_use]

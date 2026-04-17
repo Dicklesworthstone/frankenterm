@@ -2843,7 +2843,10 @@ mod tests {
                 .shutdown_checkpoint_with_cx(&cx, &panes2, Duration::from_secs(5))
                 .await
                 .expect("shutdown capture");
-            assert!(result.is_some(), "fresh-cx shutdown must capture a snapshot");
+            assert!(
+                result.is_some(),
+                "fresh-cx shutdown must capture a snapshot"
+            );
 
             let snap = result.unwrap();
             assert_eq!(snap.trigger, SnapshotTrigger::Shutdown);
