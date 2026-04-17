@@ -105,8 +105,35 @@ pub trait WeztermInterface: Send + Sync {
     }
     /// Send text using paste mode.
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
+
+    /// Send text using paste mode bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates to [`send_text`](Self::send_text); concrete
+    /// impls with a Cx-aware mux-pool write path SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_text(pane_id, text)
+    }
+
     /// Send text without paste mode.
     fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()>;
+
+    /// Send text without paste mode bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates; concrete impls SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_no_paste_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_text_no_paste(pane_id, text)
+    }
+
     /// Send text with explicit options (paste/newline).
     fn send_text_with_options(
         &self,
@@ -115,12 +142,64 @@ pub trait WeztermInterface: Send + Sync {
         no_paste: bool,
         no_newline: bool,
     ) -> WeztermFuture<'_, ()>;
+
+    /// Send text with explicit options bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates; concrete impls SHOULD
+    /// override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_options_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_text_with_options(pane_id, text, no_paste, no_newline)
+    }
+
     /// Send a control character (no-paste).
     fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()>;
+
+    /// Send a control character bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates; concrete impls SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_control_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_control(pane_id, control_char)
+    }
+
     /// Send Ctrl+C.
     fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+
+    /// Send Ctrl+C bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates; concrete impls SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_c_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_ctrl_c(pane_id)
+    }
+
     /// Send Ctrl+D.
     fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
+
+    /// Send Ctrl+D bound to the caller's Cx (ft-xbnl0.2.3).
+    /// Default delegates; concrete impls SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_d_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        self.send_ctrl_d(pane_id)
+    }
     /// Spawn a new root pane/tab using the backend default target.
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64>;
     /// Spawn a new root pane/tab into a specific window or a new window.
@@ -146,6 +225,22 @@ pub trait WeztermInterface: Send + Sync {
         pane_id: u64,
         direction: MoveDirection,
     ) -> WeztermFuture<'_, Option<u64>>;
+
+    /// Get a pane in a direction bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates to
+    /// [`get_pane_direction`](Self::get_pane_direction); concrete
+    /// impls with Cx-first geometry helpers (e.g.
+    /// `WeztermClient::get_pane_direction_with_cx` using
+    /// `list_panes_with_cx` + `find_neighbor_pane`) SHOULD override.
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_direction_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'a, Option<u64>> {
+        self.get_pane_direction(pane_id, direction)
+    }
     /// Kill (close) a pane.
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()>;
     /// Zoom or unzoom a pane.
@@ -175,6 +270,20 @@ pub trait WeztermInterface: Send + Sync {
             ))
             .into())
         })
+    }
+
+    /// Tiered scrollback summary bound to the caller's Cx
+    /// (ft-xbnl0.2.3). Default delegates to
+    /// [`pane_tiered_scrollback_summary`](Self::pane_tiered_scrollback_summary);
+    /// concrete impls with a Cx-aware mux-pool path SHOULD override to
+    /// route through `MuxPool::get_pane_render_changes_with_cx`.
+    #[cfg(feature = "asupersync-runtime")]
+    fn pane_tiered_scrollback_summary_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
+        self.pane_tiered_scrollback_summary(pane_id)
     }
 }
 
@@ -2087,9 +2196,33 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_text(self, pane_id, &text).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move { WeztermClient::send_text_with_cx(self, cx, pane_id, &text).await })
+    }
+
     fn send_text_no_paste(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {
         let text = text.to_string();
         Box::pin(async move { WeztermClient::send_text_no_paste(self, pane_id, &text).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_no_paste_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            WeztermClient::send_text_no_paste_with_cx(self, cx, pane_id, &text).await
+        })
     }
 
     fn send_text_with_options(
@@ -2105,17 +2238,66 @@ impl WeztermInterface for WeztermClient {
         })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_text_with_options_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> WeztermFuture<'a, ()> {
+        let text = text.to_string();
+        Box::pin(async move {
+            WeztermClient::send_text_with_options_with_cx(
+                self, cx, pane_id, &text, no_paste, no_newline,
+            )
+            .await
+        })
+    }
+
     fn send_control(&self, pane_id: u64, control_char: &str) -> WeztermFuture<'_, ()> {
         let control_char = control_char.to_string();
         Box::pin(async move { WeztermClient::send_control(self, pane_id, &control_char).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_control_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        control_char: &str,
+    ) -> WeztermFuture<'a, ()> {
+        let control_char = control_char.to_string();
+        Box::pin(async move {
+            WeztermClient::send_control_with_cx(self, cx, pane_id, &control_char).await
+        })
     }
 
     fn send_ctrl_c(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move { WeztermClient::send_ctrl_c(self, pane_id).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_c_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move { WeztermClient::send_ctrl_c_with_cx(self, cx, pane_id).await })
+    }
+
     fn send_ctrl_d(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move { WeztermClient::send_ctrl_d(self, pane_id).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_ctrl_d_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, ()> {
+        Box::pin(async move { WeztermClient::send_ctrl_d_with_cx(self, cx, pane_id).await })
     }
 
     fn spawn(&self, cwd: Option<&str>, domain_name: Option<&str>) -> WeztermFuture<'_, u64> {
@@ -2162,6 +2344,18 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_pane_direction(self, pane_id, direction).await })
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn get_pane_direction_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        direction: MoveDirection,
+    ) -> WeztermFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            WeztermClient::get_pane_direction_with_cx(self, cx, pane_id, direction).await
+        })
+    }
+
     fn kill_pane(&self, pane_id: u64) -> WeztermFuture<'_, ()> {
         Box::pin(async move { WeztermClient::kill_pane(self, pane_id).await })
     }
@@ -2202,6 +2396,17 @@ impl WeztermInterface for WeztermClient {
         pane_id: u64,
     ) -> WeztermFuture<'_, PaneTieredScrollbackSummary> {
         Box::pin(async move { WeztermClient::pane_tiered_scrollback_summary(self, pane_id).await })
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn pane_tiered_scrollback_summary_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+    ) -> WeztermFuture<'a, PaneTieredScrollbackSummary> {
+        Box::pin(async move {
+            WeztermClient::pane_tiered_scrollback_summary_with_cx(self, cx, pane_id).await
+        })
     }
 }
 
