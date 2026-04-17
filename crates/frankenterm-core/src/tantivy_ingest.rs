@@ -1489,7 +1489,61 @@ pub async fn compute_indexer_lag<S: RecorderStorage>(
         .read_checkpoint(&CheckpointConsumerId(consumer_id.to_string()))
         .await?;
 
-    let log_head = health.latest_offset.map(|o| o.ordinal);
+    Ok(build_indexer_lag_snapshot(&health, checkpoint))
+}
+
+/// Cx-first [`compute_indexer_lag`] (ft-xbnl0.2.3). Threads caller
+/// `&Cx` through the two storage reads via `cx.checkpoint()`
+/// boundaries:
+///
+///   * pre-flight: a pre-cancelled cx returns before calling
+///     `storage.health()`.
+///   * mid-flight: a cx cancelled during the health read can abort
+///     before the `read_checkpoint` call, avoiding a redundant
+///     query when the result will be discarded anyway.
+///
+/// Cancellation errors are mapped onto a fresh
+/// [`RecorderStorageError::Io`] variant by wrapping the reason
+/// string. This keeps the signature identical to the legacy version
+/// so callers can swap `_with_cx` in without adjusting error
+/// handling. The pure snapshot construction is shared with the
+/// legacy path via [`build_indexer_lag_snapshot`] so both variants
+/// produce bit-for-bit identical snapshots for the same health +
+/// checkpoint inputs.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
+    cx: &crate::cx::Cx,
+    storage: &S,
+    consumer_id: &str,
+) -> Result<IndexerLagSnapshot, RecorderStorageError> {
+    cx.checkpoint().map_err(|err| {
+        RecorderStorageError::Io(std::io::Error::other(format!(
+            "compute_indexer_lag cancelled pre-start: {err}"
+        )))
+    })?;
+
+    let health = storage.health().await;
+
+    cx.checkpoint().map_err(|err| {
+        RecorderStorageError::Io(std::io::Error::other(format!(
+            "compute_indexer_lag cancelled between health and checkpoint: {err}"
+        )))
+    })?;
+
+    let checkpoint = storage
+        .read_checkpoint(&CheckpointConsumerId(consumer_id.to_string()))
+        .await?;
+
+    Ok(build_indexer_lag_snapshot(&health, checkpoint))
+}
+
+/// Pure snapshot constructor. Extracted so legacy and Cx-first
+/// variants produce identical results for the same inputs.
+fn build_indexer_lag_snapshot(
+    health: &crate::recorder_storage::RecorderStorageHealth,
+    checkpoint: Option<RecorderCheckpoint>,
+) -> IndexerLagSnapshot {
+    let log_head = health.latest_offset.as_ref().map(|o| o.ordinal);
     let indexer_ord = checkpoint.map(|cp| cp.upto_offset.ordinal);
 
     let records_behind = match (log_head, indexer_ord) {
@@ -1500,12 +1554,12 @@ pub async fn compute_indexer_lag<S: RecorderStorage>(
 
     let caught_up = records_behind == 0;
 
-    Ok(IndexerLagSnapshot {
+    IndexerLagSnapshot {
         log_head_ordinal: log_head,
         indexer_ordinal: indexer_ord,
         records_behind,
         caught_up,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2435,6 +2489,88 @@ mod tests {
             assert_eq!(lag.indexer_ordinal, None);
             assert_eq!(lag.records_behind, 3);
             assert!(!lag.caught_up);
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `compute_indexer_lag_with_cx` must
+    /// match the legacy `compute_indexer_lag` for an uncancelled
+    /// cx across all three interesting states (empty storage,
+    /// populated but not indexed, partially indexed). Exercises
+    /// the shared `build_indexer_lag_snapshot` helper — if the
+    /// extraction regressed the `records_behind` computation or
+    /// the `caught_up` flag, both variants would diverge and the
+    /// parity assertions would fire.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn compute_indexer_lag_with_cx_matches_legacy() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+            let cx = crate::cx::for_request();
+
+            // State 1: empty storage, no events, no checkpoint.
+            let legacy_empty = compute_indexer_lag(&storage, "parity-consumer")
+                .await
+                .unwrap();
+            let cx_empty = compute_indexer_lag_with_cx(&cx, &storage, "parity-consumer")
+                .await
+                .unwrap();
+            assert_eq!(legacy_empty.log_head_ordinal, cx_empty.log_head_ordinal);
+            assert_eq!(legacy_empty.indexer_ordinal, cx_empty.indexer_ordinal);
+            assert_eq!(legacy_empty.records_behind, cx_empty.records_behind);
+            assert_eq!(legacy_empty.caught_up, cx_empty.caught_up);
+            assert!(cx_empty.caught_up, "empty storage should be caught up");
+
+            // State 2: populated but no checkpoint (never indexed).
+            populate_log(
+                &storage,
+                vec![
+                    sample_event("p1", 1, 0, "a"),
+                    sample_event("p2", 1, 1, "b"),
+                    sample_event("p3", 1, 2, "c"),
+                ],
+            )
+            .await;
+            let legacy_pop = compute_indexer_lag(&storage, "parity-consumer")
+                .await
+                .unwrap();
+            let cx_pop = compute_indexer_lag_with_cx(&cx, &storage, "parity-consumer")
+                .await
+                .unwrap();
+            assert_eq!(legacy_pop.log_head_ordinal, cx_pop.log_head_ordinal);
+            assert_eq!(legacy_pop.indexer_ordinal, cx_pop.indexer_ordinal);
+            assert_eq!(legacy_pop.records_behind, cx_pop.records_behind);
+            assert_eq!(legacy_pop.caught_up, cx_pop.caught_up);
+            assert_eq!(cx_pop.log_head_ordinal, Some(2));
+            assert_eq!(cx_pop.indexer_ordinal, None);
+            assert_eq!(cx_pop.records_behind, 3, "3 events, never indexed");
+            assert!(!cx_pop.caught_up);
+
+            // State 3: partially indexed.
+            let icfg = IndexerConfig {
+                consumer_id: "parity-consumer".to_string(),
+                batch_size: 2,
+                max_batches: 1,
+                ..test_indexer_config(dir.path())
+            };
+            let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
+            indexer.run(&storage).await.unwrap();
+
+            let legacy_partial = compute_indexer_lag(&storage, "parity-consumer")
+                .await
+                .unwrap();
+            let cx_partial = compute_indexer_lag_with_cx(&cx, &storage, "parity-consumer")
+                .await
+                .unwrap();
+            assert_eq!(legacy_partial.log_head_ordinal, cx_partial.log_head_ordinal);
+            assert_eq!(legacy_partial.indexer_ordinal, cx_partial.indexer_ordinal);
+            assert_eq!(legacy_partial.records_behind, cx_partial.records_behind);
+            assert_eq!(legacy_partial.caught_up, cx_partial.caught_up);
+            assert!(
+                cx_partial.indexer_ordinal.is_some(),
+                "partial index should have checkpoint"
+            );
         });
     }
 
