@@ -242,6 +242,123 @@ impl UndoExecutor {
         }
     }
 
+    /// Cx-first [`Self::execute`] (ft-xbnl0.2.3). Threads caller
+    /// `&Cx` through the three storage queries that precede the
+    /// strategy dispatch: `get_action_history`, `get_action_undo`,
+    /// and (inside the strategy handlers, unchanged) the wezterm
+    /// / storage calls that actually perform the undo. Checkpoints
+    /// at 3 seams give caller cancellation between each storage
+    /// read so a pre-cancelled cx returns an `Err` before touching
+    /// storage at all, and a late-cancelled caller can abort
+    /// before dispatch to the (potentially slow) strategy.
+    ///
+    /// The strategy handlers themselves remain on the ambient
+    /// path — they call `self.wezterm.*` and `self.mark_undone`
+    /// which don't yet have `_with_cx` surfaces. That is a
+    /// follow-on: once WeztermInterface pane-lifecycle methods
+    /// (all Cx-first since tick 46) are threaded through here,
+    /// the dispatched undo action will also honor caller cx.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: UndoRequest,
+    ) -> Result<UndoExecutionResult> {
+        cx.checkpoint()
+            .map_err(|err| Error::Runtime(format!("undo.execute cancelled pre-start: {err}")))?;
+
+        let mut history = self
+            .storage
+            .get_action_history(ActionHistoryQuery {
+                audit_action_id: Some(request.action_id),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?;
+
+        let Some(action) = history.pop() else {
+            return Ok(UndoExecutionResult::not_applicable(
+                request.action_id,
+                "none".to_string(),
+                format!("Action {} not found", request.action_id),
+                Some("Use `ft history` to list valid action IDs.".to_string()),
+                None,
+                None,
+            ));
+        };
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "undo.execute cancelled between get_action_history and get_action_undo (action_id={}): {err}",
+                request.action_id
+            ))
+        })?;
+
+        let Some(undo) = self.storage.get_action_undo(request.action_id).await? else {
+            return Ok(UndoExecutionResult::not_applicable(
+                request.action_id,
+                "none".to_string(),
+                "No undo metadata recorded for this action".to_string(),
+                Some(
+                    "This action predates undo metadata, or was recorded as non-undoable."
+                        .to_string(),
+                ),
+                action.actor_id.clone(),
+                action.pane_id,
+            ));
+        };
+
+        if !undo.undoable {
+            return Ok(UndoExecutionResult::not_applicable(
+                request.action_id,
+                undo.undo_strategy,
+                "Action is not currently undoable".to_string(),
+                undo.undo_hint.or(action.undo_hint),
+                action.actor_id,
+                action.pane_id,
+            ));
+        }
+
+        if undo.undone_at.is_some() {
+            return Ok(UndoExecutionResult::not_applicable(
+                request.action_id,
+                undo.undo_strategy,
+                "Action has already been undone".to_string(),
+                undo.undo_hint.or(action.undo_hint),
+                action.actor_id,
+                action.pane_id,
+            ));
+        }
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "undo.execute cancelled before strategy dispatch (action_id={}, strategy={}): {err}",
+                request.action_id, undo.undo_strategy
+            ))
+        })?;
+
+        match undo.undo_strategy.as_str() {
+            "workflow_abort" => self.execute_workflow_abort(request, &action, &undo).await,
+            "pane_close" => self.execute_pane_close(request, &action, &undo).await,
+            "manual" | "none" | "custom" => Ok(UndoExecutionResult::not_applicable(
+                action.id,
+                undo.undo_strategy,
+                "Automatic undo is not supported for this strategy".to_string(),
+                undo.undo_hint.or(action.undo_hint),
+                action.actor_id,
+                action.pane_id,
+            )),
+            _ => Ok(UndoExecutionResult::failed(
+                action.id,
+                undo.undo_strategy,
+                "Unknown undo strategy".to_string(),
+                undo.undo_hint.or(action.undo_hint),
+                action.actor_id,
+                action.pane_id,
+            )),
+        }
+    }
+
     async fn execute_workflow_abort(
         &self,
         request: UndoRequest,
@@ -1150,6 +1267,93 @@ mod tests {
 
             assert_eq!(result.outcome, UndoOutcome::NotApplicable);
             assert!(result.message.contains("No undo metadata"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `execute_with_cx` must match the
+    /// legacy `execute` for an uncancelled cx. Exercises the
+    /// not-found path (action_id=99999 returns NotApplicable with
+    /// a "not found" message) on both variants and asserts the
+    /// UndoExecutionResult is structurally equivalent.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn execute_with_cx_matches_legacy_on_not_found() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-cx-not-found.db");
+            let storage = Arc::new(
+                StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
+
+            let mock = Arc::new(MockWezterm::new());
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+            let cx = crate::cx::for_request();
+
+            // Legacy path.
+            let legacy = executor
+                .execute(UndoRequest::new(99999))
+                .await
+                .expect("legacy result");
+
+            // Cx-first path (on same storage — the action_id
+            // doesn't exist, so both queries return empty, no
+            // mutation possible).
+            let cx_first = executor
+                .execute_with_cx(&cx, UndoRequest::new(99999))
+                .await
+                .expect("cx-first result");
+
+            assert_eq!(legacy.outcome, cx_first.outcome);
+            assert_eq!(legacy.action_id, cx_first.action_id);
+            assert_eq!(legacy.strategy, cx_first.strategy);
+            assert_eq!(legacy.message, cx_first.message);
+            assert_eq!(legacy.guidance, cx_first.guidance);
+            assert_eq!(cx_first.outcome, UndoOutcome::NotApplicable);
+            assert!(cx_first.message.contains("not found"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `execute_with_cx` must match legacy
+    /// on the no-metadata path — a valid action_id with no undo
+    /// metadata returns NotApplicable via the second storage
+    /// query (`get_action_undo` returns None).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn execute_with_cx_matches_legacy_on_no_metadata() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-cx-no-metadata.db");
+            let storage = Arc::new(
+                StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
+
+            seed_pane(storage.as_ref(), 1).await;
+            let action_id =
+                seed_action(storage.as_ref(), 1, "human", Some("cli"), "send_text").await;
+
+            let mock = Arc::new(MockWezterm::new());
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock);
+            let cx = crate::cx::for_request();
+
+            let cx_first = executor
+                .execute_with_cx(&cx, UndoRequest::new(action_id))
+                .await
+                .expect("cx-first result");
+
+            assert_eq!(cx_first.outcome, UndoOutcome::NotApplicable);
+            assert!(cx_first.message.contains("No undo metadata"));
+            // Second-query branch exercised: if the pre-dispatch
+            // checkpoint had incorrectly short-circuited before
+            // `get_action_undo`, we'd never surface this
+            // specific message.
 
             storage.shutdown().await.expect("shutdown");
         });
