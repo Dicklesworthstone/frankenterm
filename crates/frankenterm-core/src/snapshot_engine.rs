@@ -502,6 +502,63 @@ impl SnapshotEngine {
         Ok(removed)
     }
 
+    /// Run retention cleanup bound to the caller's asupersync capability
+    /// context (ft-xbnl0.2.x Cx-first entry point).
+    ///
+    /// Mirrors the `session_retention::cleanup_sessions_async_cx` pattern:
+    /// a `cx.checkpoint()` before the `spawn_blocking` handoff lets a
+    /// canceled caller skip the blocking DB work entirely, and a
+    /// `cx.checkpoint()` after the join lets the caller abort before
+    /// propagating a stale `removed` count into the wider call graph.
+    ///
+    /// Pre-flight: if `cx` is already cancelled on entry, the
+    /// `cleanup_runs` counter is still incremented (to preserve
+    /// observability parity with `cleanup`), but the spawn_blocking is
+    /// skipped and the method returns `Ok(0)` without touching the
+    /// database.
+    ///
+    /// The legacy [`cleanup`](Self::cleanup) entry point is preserved
+    /// for non-migrated callers; this is strictly additive.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn cleanup_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> std::result::Result<usize, SnapshotError> {
+        self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
+
+        if cx.checkpoint().is_err() {
+            tracing::debug!(
+                "cleanup_with_cx: Cx cancelled before spawn_blocking; skipping cleanup"
+            );
+            return Ok(0);
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        let retention_count = self.config.retention_count;
+        let retention_days = self.config.retention_days;
+
+        let removed = Self::spawn_blocking_db(move || {
+            cleanup_sync(&db_path, retention_count, retention_days)
+        })
+        .await?;
+        self.telemetry
+            .cleanup_removed
+            .fetch_add(removed as u64, Ordering::Relaxed);
+
+        // Honor caller cancellation after the blocking work returns so a
+        // late-canceled caller does not propagate a stale result. The
+        // telemetry counter stays authoritative even if we short-circuit
+        // here because the removal already happened on the DB.
+        if cx.checkpoint().is_err() {
+            tracing::debug!(
+                "cleanup_with_cx: Cx cancelled after spawn_blocking returned; caller will see Ok(0)"
+            );
+            return Ok(0);
+        }
+
+        Ok(removed)
+    }
+
     /// Configured value contribution for a trigger type.
     fn trigger_value(&self, trigger: SnapshotTrigger) -> f64 {
         let s = &self.config.scheduling;
@@ -2860,6 +2917,120 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(clean, 1);
+        });
+    }
+
+    /// ft-xbnl0.2.x Cx-first: `cleanup_with_cx` with a pre-cancelled Cx
+    /// must NOT delete any checkpoints and must return `Ok(0)`. The
+    /// `cleanup_runs` counter MUST still increment so observability
+    /// stays honest about how many cleanup *attempts* the engine saw.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cleanup_with_cx_pre_cancelled_skips_db_work() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                retention_count: 2,
+                retention_days: 365,
+                ..SnapshotConfig::default()
+            };
+            let engine = SnapshotEngine::new(db_path.clone(), config);
+
+            // Plant 4 snapshots so a non-cancelled cleanup would remove 2.
+            for i in 0..4u64 {
+                let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
+                engine
+                    .capture(&panes, SnapshotTrigger::Manual)
+                    .await
+                    .expect("capture");
+            }
+
+            let runs_before = engine.telemetry().snapshot().cleanup_runs;
+            let removed_before = engine.telemetry().snapshot().cleanup_removed;
+
+            let budget = crate::cx::Budget::new().with_poll_quota(0);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.x snapshot cleanup precancel"),
+            );
+
+            let deleted = engine
+                .cleanup_with_cx(&cx)
+                .await
+                .expect("pre-cancelled cleanup returns Ok");
+            assert_eq!(deleted, 0, "pre-cancelled cleanup must return 0");
+
+            // 4 checkpoints must still be in the DB.
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 4,
+                "pre-cancelled cleanup must not delete any checkpoints"
+            );
+
+            // Observability parity: runs incremented, removed NOT changed.
+            assert_eq!(
+                engine.telemetry().snapshot().cleanup_runs,
+                runs_before + 1,
+                "cleanup_runs must still increment on pre-cancelled attempts \
+                 so operators can see how many cleanups the engine tried"
+            );
+            assert_eq!(
+                engine.telemetry().snapshot().cleanup_removed,
+                removed_before,
+                "cleanup_removed must NOT change when the DB work was skipped"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.x Cx-first: happy path — `cleanup_with_cx` with a
+    /// fresh Cx behaves identically to `cleanup`: removes the retention
+    /// overflow and increments both counters. Pins no-regression on the
+    /// success path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn cleanup_with_cx_happy_path_removes_overflow() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                retention_count: 2,
+                retention_days: 365,
+                ..SnapshotConfig::default()
+            };
+            let engine = SnapshotEngine::new(db_path.clone(), config);
+
+            for i in 0..4u64 {
+                let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
+                engine
+                    .capture(&panes, SnapshotTrigger::Manual)
+                    .await
+                    .expect("capture");
+            }
+
+            let cx = crate::cx::for_request();
+            let deleted = engine
+                .cleanup_with_cx(&cx)
+                .await
+                .expect("happy-path cleanup");
+            assert_eq!(deleted, 2, "should remove 2 overflow checkpoints");
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "retention_count=2 should leave 2 checkpoints");
+
+            assert!(
+                engine.telemetry().snapshot().cleanup_removed >= 2,
+                "cleanup_removed must reflect the actual deletion"
+            );
         });
     }
 
