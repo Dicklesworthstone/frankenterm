@@ -1126,6 +1126,64 @@ impl MigrationEngine {
 
         Ok(manifest)
     }
+
+    /// Cx-first [`Self::run_m0_m2`] (ft-xbnl0.2.3). Composite
+    /// pipeline that chains all three Cx-first M-stage methods:
+    ///
+    ///   1. `m0_preflight_with_cx` (tick 67) — per-batch
+    ///      checkpointed scan to build the manifest.
+    ///   2. `m1_export` — synchronous; no cx threading needed
+    ///      because the function is CPU-only (reader cursor
+    ///      traversal + FNV digest accumulation with no await
+    ///      points inside the per-record loop). An extra
+    ///      `cx.checkpoint()?` is placed BEFORE m1 so a cancel
+    ///      between m0 and m1 aborts the pipeline cleanly.
+    ///   3. `m2_import_with_cx` (tick 68) — per-chunk
+    ///      checkpointed write to target.
+    ///
+    /// Cancellation-safety: caller cancellation is honored at
+    /// every await point across the 3 stages, AND at an
+    /// additional checkpoint between m0 and m1 (since m1 is
+    /// synchronous and takes time on large ledgers). The
+    /// documented cancellation contracts on the component
+    /// methods still apply:
+    ///   - m0 cancel: manifest never returned, no target writes.
+    ///   - m1 cancel: m1 is sync, so cancellation only fires at
+    ///     the boundary checkpoint (before or after m1).
+    ///   - m2 cancel: already-committed chunks on target remain
+    ///     (batch_id idempotency on resume).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_m0_m2_with_cx<S: RecorderStorage, T: RecorderStorage>(
+        &self,
+        cx: &crate::cx::Cx,
+        source_storage: &S,
+        source_reader: &dyn RecorderEventReader,
+        target: &T,
+    ) -> Result<MigrationManifest, MigrationError> {
+        // M0 (tick 67)
+        let mut manifest = self
+            .m0_preflight_with_cx(cx, source_storage, source_reader)
+            .await?;
+
+        // Boundary checkpoint: m1 is synchronous so no internal
+        // cancellation seam exists; catching a cancel here
+        // prevents wasted sync CPU on the export loop.
+        cx.checkpoint().map_err(|err| {
+            MigrationError::StorageError(format!(
+                "run_m0_m2 cancelled between m0 and m1 (event_count={}): {err}",
+                manifest.event_count
+            ))
+        })?;
+
+        // M1 (sync)
+        let records = self.m1_export(source_reader, &mut manifest)?;
+
+        // M2 (tick 68)
+        self.m2_import_with_cx(cx, target, &records, &mut manifest)
+            .await?;
+
+        Ok(manifest)
+    }
 }
 
 // ===========================================================================
@@ -1824,6 +1882,70 @@ mod tests {
             assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
             assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
             assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `run_m0_m2_with_cx` composite must
+    /// produce a bit-for-bit identical manifest to the legacy
+    /// `run_m0_m2` for the same inputs. Exercises the full
+    /// M0 → M1 → M2 pipeline under the Cx-first path and
+    /// verifies the import digest matches the export digest
+    /// (round-trip parity).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn run_m0_m2_with_cx_matches_legacy() {
+        run_async_test(async {
+            let records = vec![
+                make_cursor_record(1, 0),
+                make_cursor_record(1, 1),
+                make_cursor_record(2, 2),
+                make_cursor_record(3, 3),
+                make_cursor_record(1, 4),
+            ];
+
+            // Legacy path
+            let reader_legacy = TestEventReader::new(records.clone());
+            let source_legacy = MockMigrationStorage::healthy();
+            let target_legacy = MockMigrationStorage::healthy();
+            let engine_legacy = MigrationEngine::new(MigrationConfig {
+                export_batch_size: 2,
+                import_batch_size: 3,
+                consumer_id: "legacy-composite".to_string(),
+            });
+            let m_legacy = engine_legacy
+                .run_m0_m2(&source_legacy, &reader_legacy, &target_legacy)
+                .await
+                .unwrap();
+
+            // Cx-first path
+            let reader_cx = TestEventReader::new(records);
+            let source_cx = MockMigrationStorage::healthy();
+            let target_cx = MockMigrationStorage::healthy();
+            let engine_cx = MigrationEngine::new(MigrationConfig {
+                export_batch_size: 2,
+                import_batch_size: 3,
+                consumer_id: "cx-composite".to_string(),
+            });
+            let cx = crate::cx::for_request();
+            let m_cx = engine_cx
+                .run_m0_m2_with_cx(&cx, &source_cx, &reader_cx, &target_cx)
+                .await
+                .unwrap();
+
+            // Manifest parity across the M0 + M1 + M2 stages.
+            assert_eq!(m_legacy.event_count, m_cx.event_count);
+            assert_eq!(m_legacy.first_ordinal, m_cx.first_ordinal);
+            assert_eq!(m_legacy.last_ordinal, m_cx.last_ordinal);
+            assert_eq!(m_legacy.export_count, m_cx.export_count);
+            assert_eq!(m_legacy.import_count, m_cx.import_count);
+            assert_eq!(m_legacy.export_digest, m_cx.export_digest);
+            assert_eq!(m_legacy.import_digest, m_cx.import_digest);
+            assert_eq!(m_legacy.per_pane_counts, m_cx.per_pane_counts);
+
+            // Absolute invariants
+            assert_eq!(m_cx.event_count, 5);
+            assert_eq!(m_cx.import_digest, m_cx.export_digest);
+            assert_eq!(target_cx.total_events_appended(), 5);
         });
     }
 
