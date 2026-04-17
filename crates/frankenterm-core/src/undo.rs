@@ -339,7 +339,10 @@ impl UndoExecutor {
 
         match undo.undo_strategy.as_str() {
             "workflow_abort" => self.execute_workflow_abort(request, &action, &undo).await,
-            "pane_close" => self.execute_pane_close(request, &action, &undo).await,
+            "pane_close" => {
+                self.execute_pane_close_with_cx(cx, request, &action, &undo)
+                    .await
+            }
             "manual" | "none" | "custom" => Ok(UndoExecutionResult::not_applicable(
                 action.id,
                 undo.undo_strategy,
@@ -464,6 +467,111 @@ impl UndoExecutor {
         }
 
         match self.wezterm.kill_pane(pane_id).await {
+            Ok(()) => {
+                let undone_at = self.mark_undone(action.id, &request.actor).await?;
+                Ok(UndoExecutionResult::success(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!("Closed pane {pane_id}"),
+                    action.actor_id.clone(),
+                    Some(pane_id),
+                    undone_at,
+                ))
+            }
+            Err(Error::Wezterm(WeztermError::PaneNotFound(_))) => {
+                Ok(UndoExecutionResult::not_applicable(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!("Pane {pane_id} was already closed"),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    action.actor_id.clone(),
+                    Some(pane_id),
+                ))
+            }
+            Err(err) => Ok(UndoExecutionResult::failed(
+                action.id,
+                undo.undo_strategy.clone(),
+                format!("Failed to close pane {pane_id}: {err}"),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                action.actor_id.clone(),
+                Some(pane_id),
+            )),
+        }
+    }
+
+    /// Cx-first [`Self::execute_pane_close`] (ft-xbnl0.2.3).
+    /// Threads caller `&Cx` through the two wezterm calls
+    /// (`get_pane_with_cx` + `kill_pane_with_cx` — both Cx-first
+    /// since ticks 44/45) and the `mark_undone` storage write
+    /// via checkpoint seams.
+    ///
+    /// Cancellation-safety contract: the checkpoint BEFORE
+    /// `kill_pane_with_cx` is the critical seam — a mid-run
+    /// cancel here aborts BEFORE destroying the pane. A
+    /// cancel between `kill_pane_with_cx` and `mark_undone`
+    /// leaves the pane closed but the audit record not flagged
+    /// as undone. This is a narrow window; the alternative
+    /// (skipping the audit flag) would be worse because the pane
+    /// IS gone. The error includes the pane_id so the caller can
+    /// surface "pane closed but audit update failed" to
+    /// operators.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn execute_pane_close_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: UndoRequest,
+        action: &crate::storage::ActionHistoryRecord,
+        undo: &ActionUndoRecord,
+    ) -> Result<UndoExecutionResult> {
+        let pane_id = pane_id_from_undo(undo).or(action.pane_id);
+        let Some(pane_id) = pane_id else {
+            return Ok(UndoExecutionResult::not_applicable(
+                action.id,
+                undo.undo_strategy.clone(),
+                "Undo payload did not contain a pane ID".to_string(),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                action.actor_id.clone(),
+                None,
+            ));
+        };
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "undo.execute_pane_close cancelled before get_pane_with_cx (pane_id={pane_id}): {err}"
+            ))
+        })?;
+
+        match self.wezterm.get_pane_with_cx(cx, pane_id).await {
+            Ok(_) => {}
+            Err(Error::Wezterm(WeztermError::PaneNotFound(_))) => {
+                return Ok(UndoExecutionResult::not_applicable(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!("Pane {pane_id} no longer exists"),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    action.actor_id.clone(),
+                    Some(pane_id),
+                ));
+            }
+            Err(err) => {
+                return Ok(UndoExecutionResult::failed(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!("Failed to validate pane {pane_id}: {err}"),
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    action.actor_id.clone(),
+                    Some(pane_id),
+                ));
+            }
+        }
+
+        cx.checkpoint().map_err(|err| {
+            Error::Runtime(format!(
+                "undo.execute_pane_close cancelled before kill_pane_with_cx (pane_id={pane_id}): {err}"
+            ))
+        })?;
+
+        match self.wezterm.kill_pane_with_cx(cx, pane_id).await {
             Ok(()) => {
                 let undone_at = self.mark_undone(action.id, &request.actor).await?;
                 Ok(UndoExecutionResult::success(
@@ -1700,6 +1808,84 @@ mod tests {
                 .expect("undo exists");
             assert!(undo.undone_at.is_some());
             assert_eq!(undo.undone_by.as_deref(), Some("operator"));
+
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `execute_with_cx` must close the
+    /// pane via the Cx-first wezterm kill_pane_with_cx (tick 45)
+    /// and mark the audit action as undone — end-to-end parallel
+    /// of `pane_close_undo_closes_existing_pane` under the
+    /// Cx-first dispatch path.
+    ///
+    /// This test exercises the FULL Cx-first chain that tick 64
+    /// wires together:
+    ///   execute_with_cx
+    ///   → execute_pane_close_with_cx (tick 64)
+    ///   → wezterm.get_pane_with_cx (tick 44 trait extension)
+    ///   → wezterm.kill_pane_with_cx (tick 45 trait extension)
+    ///   → mark_undone (ambient — no _with_cx surface yet)
+    ///
+    /// If any link in the chain regressed to the ambient path,
+    /// the MockWezterm (which has the trait-default _with_cx
+    /// delegation) would still succeed, but a future concrete
+    /// WeztermHandle with different pre-flight behavior on the
+    /// Cx vs non-Cx path would diverge.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn execute_with_cx_pane_close_end_to_end() {
+        run_async_test(async {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("undo-pane-close-cx.db");
+            let db_path = db_path.to_string_lossy().to_string();
+            let storage = Arc::new(StorageHandle::new(&db_path).await.expect("storage"));
+            let pane_id = 66_u64;
+            seed_pane(storage.as_ref(), pane_id).await;
+            let action_id =
+                seed_action(storage.as_ref(), pane_id, "human", Some("cli"), "spawn").await;
+
+            storage
+                .upsert_action_undo(ActionUndoRecord {
+                    audit_action_id: action_id,
+                    undoable: true,
+                    undo_strategy: "pane_close".to_string(),
+                    undo_hint: Some(format!("Close pane {pane_id}")),
+                    undo_payload: Some(serde_json::json!({ "pane_id": pane_id }).to_string()),
+                    undone_at: None,
+                    undone_by: None,
+                })
+                .await
+                .expect("undo metadata");
+
+            let mock = Arc::new(MockWezterm::new());
+            mock.add_default_pane(pane_id).await;
+            let executor = UndoExecutor::new(Arc::clone(&storage), mock.clone());
+            let cx = crate::cx::for_request();
+
+            let result = executor
+                .execute_with_cx(&cx, UndoRequest::new(action_id).with_actor("cx-operator"))
+                .await
+                .expect("cx-first undo result");
+
+            assert_eq!(result.outcome, UndoOutcome::Success);
+            assert_eq!(result.target_pane_id, Some(pane_id));
+
+            // Pane was closed via kill_pane_with_cx.
+            let pane_lookup = mock.get_pane(pane_id).await;
+            assert!(matches!(
+                pane_lookup,
+                Err(Error::Wezterm(WeztermError::PaneNotFound(id))) if id == pane_id
+            ));
+
+            // Audit action was marked undone with the cx-first actor.
+            let undo = storage
+                .get_action_undo(action_id)
+                .await
+                .expect("undo query")
+                .expect("undo exists");
+            assert!(undo.undone_at.is_some());
+            assert_eq!(undo.undone_by.as_deref(), Some("cx-operator"));
 
             storage.shutdown().await.expect("shutdown");
         });
