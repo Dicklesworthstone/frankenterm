@@ -6803,9 +6803,55 @@ impl MockWezterm {
         Ok(())
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::inject`].
+    ///
+    /// Threads the caller's cx through the panes RwLock write-lock
+    /// acquire (`write_with_cx`) so a cancelled parent cx interrupts
+    /// the lock wait rather than blocking. Unlocks simulation harness
+    /// migrations (`TutorialSandbox::trigger_exercise_events_with_cx`
+    /// already uses this pattern via `execute_all_with_cx`; the resize
+    /// timeline helpers on Scenario can now follow suit).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn inject_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        event: MockEvent,
+    ) -> crate::Result<()> {
+        let mut panes = self.panes.write_with_cx(cx).await;
+        let pane = panes.get_mut(&pane_id).ok_or_else(|| {
+            crate::Error::Runtime(format!("MockWezterm: pane {pane_id} not found"))
+        })?;
+        match event {
+            MockEvent::AppendOutput(text) => pane.content.push_str(&text),
+            MockEvent::ClearScreen => pane.content.clear(),
+            MockEvent::Resize(cols, rows) => {
+                pane.cols = cols;
+                pane.rows = rows;
+            }
+            MockEvent::SetTitle(title) => pane.title = title,
+        }
+        Ok(())
+    }
+
     /// Inject output text into a pane (convenience wrapper).
     pub async fn inject_output(&self, pane_id: u64, text: &str) -> crate::Result<()> {
         self.inject(pane_id, MockEvent::AppendOutput(text.to_string()))
+            .await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::inject_output`].
+    ///
+    /// Routes through `inject_with_cx` so caller cancellation
+    /// propagates all the way to the RwLock acquire.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn inject_output_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        text: &str,
+    ) -> crate::Result<()> {
+        self.inject_with_cx(cx, pane_id, MockEvent::AppendOutput(text.to_string()))
             .await
     }
 

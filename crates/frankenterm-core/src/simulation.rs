@@ -941,6 +941,50 @@ impl Scenario {
         self.execute_until_with_resize_timeline(mock, self.duration)
             .await
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of
+    /// [`Scenario::execute_until_with_resize_timeline`].
+    ///
+    /// Pre-flight `cx.checkpoint()` gates entry to the long
+    /// instrumentation loop (150+ LOC of stage-level probes). A
+    /// mid-execution cx cancel will not interrupt the current
+    /// iteration — the resize-timeline body is deliberately
+    /// deterministic for flamegraph reproducibility, so per-event
+    /// cx seams would drift the telemetry compared to the legacy
+    /// path. Callers that need per-event cancellation should use
+    /// the non-timeline variants (`execute_until_with_cx`).
+    ///
+    /// The returned Err variant mirrors the shape of
+    /// `execute_until_with_cx` cancellation errors so callers can
+    /// unify their error paths.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_until_with_resize_timeline_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mock: &MockWezterm,
+        elapsed: Duration,
+    ) -> Result<(usize, ResizeTimeline)> {
+        cx.checkpoint().map_err(|err| {
+            crate::Error::Runtime(format!(
+                "execute_until_with_resize_timeline cancelled: {err}"
+            ))
+        })?;
+        self.execute_until_with_resize_timeline(mock, elapsed).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of
+    /// [`Scenario::execute_all_with_resize_timeline`].
+    ///
+    /// Thin composite over `execute_until_with_resize_timeline_with_cx`.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn execute_all_with_resize_timeline_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        mock: &MockWezterm,
+    ) -> Result<(usize, ResizeTimeline)> {
+        self.execute_until_with_resize_timeline_with_cx(cx, mock, self.duration)
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
