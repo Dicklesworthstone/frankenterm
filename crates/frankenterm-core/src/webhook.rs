@@ -358,6 +358,27 @@ impl WebhookDispatcher {
         self.dispatch_payload(&payload).await
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch`].
+    ///
+    /// Builds the payload synchronously (cheap) then routes
+    /// through [`dispatch_payload_with_cx`] so caller cx
+    /// propagates through each endpoint's `transport.send_with_cx`
+    /// call. Caller cancellation cuts mid-fanout once the
+    /// transport observes it.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn dispatch_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        detection: &Detection,
+        pane_id: u64,
+        rendered: &RenderedEvent,
+        suppressed_since_last: u64,
+    ) -> Vec<DeliveryRecord> {
+        let payload =
+            WebhookPayload::from_detection(detection, pane_id, rendered, suppressed_since_last);
+        self.dispatch_payload_with_cx(cx, &payload).await
+    }
+
     /// Dispatch a pre-built payload to all matching endpoints.
     pub async fn dispatch_payload(&self, payload: &NotificationPayload) -> Vec<DeliveryRecord> {
         let mut records = Vec::new();
@@ -897,6 +918,44 @@ mod tests {
             assert!(
                 transport.requests().is_empty(),
                 "dispatch_payload_with_cx must NOT fall back to transport.send"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `WebhookDispatcher::dispatch_with_cx`
+    /// (the detection-entry sibling of `dispatch`) must route
+    /// through `dispatch_payload_with_cx` so caller cx reaches the
+    /// transport. Pins the same cx-forward contract as
+    /// `dispatch_payload_with_cx_invokes_transport_cx_path` but
+    /// via the higher-level detection surface used by pattern
+    /// handlers.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn dispatch_with_cx_routes_through_cx_aware_transport() {
+        run_async_test(async {
+            let transport = MockTransport::success();
+            let endpoints = vec![test_endpoint(
+                "slack",
+                "https://hooks.slack.com/test",
+                WebhookTemplate::Slack,
+            )];
+            let dispatcher = WebhookDispatcher::new(endpoints, Box::new(transport.clone()));
+
+            let cx = crate::cx::for_request();
+            let records = dispatcher
+                .dispatch_with_cx(&cx, &test_detection(), 7, &test_rendered(), 0)
+                .await;
+
+            assert_eq!(records.len(), 1);
+            assert!(records[0].accepted);
+            assert_eq!(
+                transport.cx_requests().len(),
+                1,
+                "dispatch_with_cx must route through the cx-aware transport path"
+            );
+            assert!(
+                transport.requests().is_empty(),
+                "dispatch_with_cx must NOT fall back to transport.send"
             );
         });
     }

@@ -342,6 +342,24 @@ impl WatchdogHandle {
     pub async fn join(self) {
         let _ = self.task.await;
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`join`].
+    ///
+    /// Signals shutdown unconditionally (so the watchdog task
+    /// always has a chance to exit) then awaits the task handle
+    /// only if the cx is not already cancelled. If the cx is
+    /// cancelled at entry, returns immediately after the shutdown
+    /// signal — the watchdog will still wind down on its own, but
+    /// the caller does not block on the join. Matches the
+    /// `PaneOutputSubscription::shutdown_with_cx` pattern.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn join_with_cx(self, cx: &crate::cx::Cx) {
+        self.signal_shutdown();
+        if cx.checkpoint().is_err() {
+            return;
+        }
+        let _ = self.task.await;
+    }
 }
 
 /// Spawn the watchdog monitor task.
@@ -1107,6 +1125,78 @@ mod tests {
             shutdown.store(true, Ordering::SeqCst);
             handle.join().await;
             // If we get here, shutdown worked.
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `WatchdogHandle::join_with_cx`
+    /// must signal shutdown + await the task normally when
+    /// given a fresh, uncancelled cx. Equivalent to the legacy
+    /// join path's happy flow.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn watchdog_join_with_cx_shuts_down_cleanly() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_millis(10),
+                ..WatchdogConfig::default()
+            };
+
+            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+            crate::runtime_compat::sleep(Duration::from_millis(30)).await;
+
+            let cx = crate::cx::for_testing();
+            handle.join_with_cx(&cx).await;
+            // `join_with_cx` calls `signal_shutdown` unconditionally,
+            // so the internal flag drives the task to exit even though
+            // `shutdown` was never flipped to true.
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `join_with_cx` with a pre-cancelled
+    /// cx must return quickly without blocking on the task join.
+    /// The internal shutdown signal is still issued so the
+    /// background task can exit cleanly on its own.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn watchdog_join_with_precancelled_cx_returns_quickly() {
+        run_async_test(async {
+            let heartbeats = Arc::new(HeartbeatRegistry::new());
+            heartbeats.record_discovery();
+            heartbeats.record_capture();
+            heartbeats.record_persistence();
+            heartbeats.record_maintenance();
+
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let config = WatchdogConfig {
+                check_interval: Duration::from_secs(60),
+                ..WatchdogConfig::default()
+            };
+
+            let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel watchdog join"),
+            );
+
+            let start = std::time::Instant::now();
+            handle.join_with_cx(&cx).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "join_with_cx on cancelled cx should return quickly, took {elapsed:?}"
+            );
+            // Drive the task to exit so the test harness doesn't leak it.
+            shutdown.store(true, Ordering::SeqCst);
         });
     }
 
