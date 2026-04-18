@@ -311,9 +311,19 @@ impl DirectMuxClient {
     ) -> Result<Self, DirectMuxError> {
         let connection_id = next_connection_id();
         checkpoint_mux_cx(cx, connection_id, "connect_start")?;
-        let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
-            .await
-            .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
+        // Tick 199 (ft-xbnl0.2.3): route the connect timeout through
+        // timeout_with_cx so the caller's explicit cx bounds the
+        // socket handshake. Previously used ambient `timeout` which
+        // falls back to `Cx::current()` thread-local lookup —
+        // orphan-cx hole whenever the mux client connects outside
+        // the caller's thread-local scope.
+        let stream = crate::runtime_compat::timeout_with_cx(
+            cx,
+            config.connect_timeout,
+            compat_unix::connect(&socket_path),
+        )
+        .await
+        .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
 
         let mut client = Self {
             connection_id,
@@ -1412,7 +1422,19 @@ impl DirectMuxClient {
             .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
         let encoded_len = buf.len();
         checkpoint_mux_cx(cx, self.connection_id, "request_write_wait")?;
-        match timeout(self.config.write_timeout, self.stream.write_all(&buf)).await {
+        // Tick 199 (ft-xbnl0.2.3): route the write timeout through
+        // timeout_with_cx so the caller's explicit cx bounds the
+        // PDU write. Previously used ambient `timeout` — cancel
+        // would only land via drop-cancel when the ambient wrapper
+        // saw cancel via `Cx::current()` thread-local, not via the
+        // explicit cx threaded into send_request_only_with_cx.
+        match crate::runtime_compat::timeout_with_cx(
+            cx,
+            self.config.write_timeout,
+            self.stream.write_all(&buf),
+        )
+        .await
+        {
             Ok(Ok(())) => {
                 tracing::trace!(
                     connection_id = self.connection_id,
