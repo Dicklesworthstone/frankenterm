@@ -4564,6 +4564,50 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 404: HTTP/1.0 response decodes correctly.
+    ///
+    /// Pins that `DistributedHttpClient::get` handles a response whose
+    /// status line declares `HTTP/1.0` (not `HTTP/1.1`). Older servers,
+    /// embedded HTTP stacks, and some reverse proxies emit `HTTP/1.0`
+    /// responses. A client that only parsed the `HTTP/1.1` shape would
+    /// fail on first contact with such a peer.
+    ///
+    /// Test server responds with `HTTP/1.0 200 OK` + `Content-Length`
+    /// + short body + `Connection: close`. The client must decode
+    /// status=200 + body="legacy".
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_decodes_http_1_0_response() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = b"HTTP/1.0 200 OK\r\n\
+                                 Content-Length: 6\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 legacy";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/legacy", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"legacy");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 402: Chunked transfer-encoding response parses correctly.
     ///
     /// Pins that `DistributedHttpClient::get` correctly handles a
