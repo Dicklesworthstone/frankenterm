@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **24 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
+| 3 | Verification covers correctness + basic performance non-regression | **25 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -59,6 +59,7 @@ surface of `DistributedHttpClient`:
 | Send + Sync compile-time assertion | `distributed_http_client_is_send_and_sync` | 364 |
 | Arc-sharing across tasks (runtime) | `distributed_http_client_shared_arc_across_tasks` | 365 |
 | Default impl preserves no-redirects policy | `distributed_http_client_default_works_identically_to_new` | 367 |
+| Response body bytes pass through verbatim | `distributed_http_client_response_body_bytes_pass_through_verbatim` | 371 |
 
 **Return-type three-outcome matrix** (criterion 3 correctness):
 - 2xx response body → `Ok(Response{status: 2xx, body})`
@@ -255,7 +256,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 ## 6. Closure Checklist (when ready to close)
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 76 tests pass: 24 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web)
+- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 77 tests pass: 25 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web)
 - [ ] `rch exec -- cargo test -p frankenterm-core --features distributed --lib distributed::tests::` passes (154/154 ok as of tick 362; verifies the broader `distributed::tests::` surface that the narrower check script's `tls_` filter doesn't hit)
 - [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
 - [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
