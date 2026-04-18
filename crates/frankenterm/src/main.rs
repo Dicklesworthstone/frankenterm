@@ -7006,7 +7006,10 @@ async fn authorize_read_or_search_policy(
         };
 
         let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-        match wezterm.get_pane(pane_id).await {
+        // ft-xbnl0.2.3 tick 230: cx-first wezterm dispatch.
+        let cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        match wezterm.get_pane_with_cx(&cx, pane_id).await {
             Ok(pane_info) => {
                 let inferred_domain = pane_info.inferred_domain();
                 domain = Some(inferred_domain.clone());
@@ -9014,7 +9017,10 @@ async fn execute_restart_workflow(
     let wezterm =
         frankenterm_core::wezterm::wezterm_handle_with_timeout(options.wezterm_timeout_secs);
 
-    let panes = wezterm.list_panes().await.map_err(|error| {
+    // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
+    let cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let panes = wezterm.list_panes_with_cx(&cx).await.map_err(|error| {
         RestartWorkflowAbort::new("preflight", format!("Failed to list panes: {error}"))
     })?;
     let existing_mux_pids =
@@ -9176,9 +9182,12 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
 async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
+    // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
+    let cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
 
     loop {
-        match wezterm.list_panes().await {
+        match wezterm.list_panes_with_cx(&cx).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 if Instant::now() >= deadline {
@@ -10946,7 +10955,10 @@ async fn batch_get_pane_text(
                 .acquire_owned()
                 .await
                 .map_err(|err| frankenterm_core::Error::Runtime(err.to_string()))?;
-            wezterm.get_text(pane_id, escapes).await
+            // ft-xbnl0.2.3 tick 230: cx-first wezterm get_text (inside spawn).
+            let cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            wezterm.get_text_with_cx(&cx, pane_id, escapes).await
         });
         tasks.push((pane_id, task));
     }
