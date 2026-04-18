@@ -30677,7 +30677,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if as_json {
                     // Collect all output and events
                     let mut sink = CollectorSink::new();
-                    player.play_simple(&mut sink).await?;
+                    // ft-xbnl0.2.3 tick 278: cx-first replay playback (json).
+                    let play_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    player.play_simple_with_cx(&play_cx, &mut sink).await?;
                     let result = serde_json::json!({
                         "duration_ms": info.duration_ms,
                         "frames": info.frame_count,
@@ -30720,7 +30723,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     let mut sink = StdoutSink;
-                    player.play_simple(&mut sink).await?;
+                    // ft-xbnl0.2.3 tick 278: cx-first replay playback (stdout).
+                    let play_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    player.play_simple_with_cx(&play_cx, &mut sink).await?;
                     eprintln!("\nReplay complete.");
                 }
             }
