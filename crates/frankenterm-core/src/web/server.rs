@@ -121,6 +121,44 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
+///
+/// Orchestrator-level cx threading: routes the initial bind
+/// through `start_web_server_with_cx` so the bind phase honours
+/// caller cancellation, and passes the caller's cx into
+/// `wait_for_shutdown_signal_with_cx` so the signal wait can be
+/// interrupted by cx-cancel as well as by Ctrl+C/SIGTERM. A
+/// caller-initiated cx-cancel now triggers the same graceful-
+/// shutdown path (`signal_shutdown` + `poke_listener` + drain
+/// join handle) that a SIGTERM would.
+#[cfg(feature = "asupersync-runtime")]
+pub async fn run_web_server_with_cx(
+    cx: &crate::cx::Cx,
+    config: WebServerConfig,
+) -> Result<()> {
+    let WebServerHandle {
+        bound_addr,
+        mut runtime,
+    } = start_web_server_with_cx(cx, config).await?;
+
+    println!("ft web listening on http://{bound_addr} (cx-first)");
+
+    select! {
+        result = runtime.join_handle_mut() => {
+            runtime.finish(result).await?;
+        }
+        shutdown = wait_for_shutdown_signal_with_cx(cx) => {
+            shutdown?;
+            runtime.signal_shutdown();
+            poke_listener(bound_addr);
+            let result = runtime.join_handle_mut().await;
+            runtime.finish(result).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
@@ -142,6 +180,64 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             .map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
         Ok(())
     }
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`wait_for_shutdown_signal`].
+///
+/// Races the OS signal futures against `cx` cancellation. On
+/// cx-cancel the function returns `Ok(())` — semantically
+/// "external shutdown request", indistinguishable from a SIGTERM
+/// for the caller's graceful-shutdown logic. That keeps
+/// `run_web_server_with_cx`'s shutdown branch simple: whichever
+/// of the three (SIGINT, SIGTERM, cx-cancel) fires first wins.
+#[cfg(all(unix, feature = "asupersync-runtime"))]
+async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
+    use crate::runtime_compat::signal::unix::SignalKind;
+
+    cx.checkpoint()
+        .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
+
+    let mut term = signal::unix::signal(SignalKind::terminate())
+        .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
+
+    let cancel_fut = async {
+        loop {
+            if cx.is_cancel_requested() {
+                return;
+            }
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+
+    select! {
+        _ = signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = cancel_fut => {}
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), feature = "asupersync-runtime"))]
+async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
+    cx.checkpoint()
+        .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
+
+    let cancel_fut = async {
+        loop {
+            if cx.is_cancel_requested() {
+                return;
+            }
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+
+    select! {
+        result = signal::ctrl_c() => {
+            result.map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
+        }
+        _ = cancel_fut => {}
+    }
+    Ok(())
 }
 
 pub(super) fn poke_listener(addr: SocketAddr) {
