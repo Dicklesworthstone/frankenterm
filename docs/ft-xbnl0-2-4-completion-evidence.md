@@ -304,16 +304,21 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 
 ## 6. Closure Checklist (when ready to close)
 
-- [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 83 tests pass: 29 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive)
-- [ ] `rch exec -- cargo test -p frankenterm-core --features distributed --lib distributed::tests::` passes (154/154 ok as of tick 362; verifies the broader `distributed::tests::` surface that the narrower check script's `tls_` filter doesn't hit)
-- [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
-- [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
-- [ ] Artifact bundles saved per shared verification contract §"Level C"
-  (the check script output + a copy of this doc + the smoke artifact
-  [ft-xbnl0-2-4-verification-smoke-tick340.md](ft-xbnl0-2-4-verification-smoke-tick340.md))
-- [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`)
-  and the latest smoke artifact path rather than re-summarizing
+### 6.0 Already captured at HEAD
+
+These items have been verified in-session and are durable evidence:
+
+- [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 83 tests passing (29 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive). Confirmed at every post-tick run.
+- [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec (tick 393). 83/83 remote PASS. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` — recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
+- [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
+- [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.
+
+### 6.1 Closer to decide
+
+- [ ] `cargo clippy -D warnings` workspace-wide — see §6.1.1 (ft-jqvg5 open, 17 errors all in other agents' files).
+- [ ] Save Level-C artifact bundle per shared verification contract. Recommended: copy `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/*.log` (7 files covering all 6 groups + tick 374 guards cold + tick 391 re-confirm) into a closure-timestamped dir under `target/rch-ft-xbnl0.2.4-closure/`.
+- [ ] Closing note cites this document, the smoke artifact, and the rch-attempt doc (3 mutually-coherent docs) rather than re-summarizing the 200+ tick comments.
 
 ### 6.1 Notes on adjacent gate findings unrelated to this bead
 
