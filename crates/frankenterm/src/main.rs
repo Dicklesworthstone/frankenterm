@@ -9201,7 +9201,20 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
                 remaining
             ));
         }
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(200)).await;
+        // ft-xbnl0.2.3 tick 283: cx-first mux-shutdown poll sleep.
+        let mux_stop_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        if frankenterm_core::runtime_compat::sleep_with_cx(
+            &mux_stop_cx,
+            Duration::from_millis(200),
+        )
+        .await
+        .is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "Cx cancelled while waiting for mux server shutdown"
+            ));
+        }
     }
 }
 
@@ -9225,7 +9238,15 @@ async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> any
             }
         }
 
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(250)).await;
+        // ft-xbnl0.2.3 tick 283: cx-first mux-ready poll sleep (reuse cx binding).
+        if frankenterm_core::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(250))
+            .await
+            .is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "Cx cancelled while waiting for mux server readiness"
+            ));
+        }
     }
 }
 
@@ -26627,13 +26648,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Wait for the lock to be released.
                 let deadline = Instant::now() + Duration::from_secs(timeout);
+                // ft-xbnl0.2.3 tick 283: cx-first watcher-stop poll sleep.
+                let watcher_stop_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 let mut stopped = false;
                 while Instant::now() < deadline {
                     if check_running(lock_path).is_none() {
                         stopped = true;
                         break;
                     }
-                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(200)).await;
+                    if frankenterm_core::runtime_compat::sleep_with_cx(
+                        &watcher_stop_cx,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        // Cx cancelled during graceful shutdown wait.
+                        break;
+                    }
                 }
 
                 if stopped {
@@ -26653,7 +26686,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     // Wait briefly for SIGKILL to take effect.
-                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(500)).await;
+                    // ft-xbnl0.2.3 tick 283: cx-first SIGKILL settle wait.
+                    let _ = frankenterm_core::runtime_compat::sleep_with_cx(
+                        &watcher_stop_cx,
+                        Duration::from_millis(500),
+                    )
+                    .await;
                     if check_running(lock_path).is_none() {
                         println!("Watcher killed (pid {pid}).");
                     } else {
