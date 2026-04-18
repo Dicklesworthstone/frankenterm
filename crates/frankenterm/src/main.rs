@@ -16367,8 +16367,17 @@ async fn wait_for_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    // ft-xbnl0.2.3 tick 289: cx-first shutdown-signal wait loop.
+    let wait_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     while !flag.load(Ordering::SeqCst) {
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(250)).await;
+        if frankenterm_core::runtime_compat::sleep_with_cx(&wait_cx, Duration::from_millis(250))
+            .await
+            .is_err()
+        {
+            // Cx cancelled — treat as shutdown-equivalent and return.
+            return;
+        }
     }
 }
 
