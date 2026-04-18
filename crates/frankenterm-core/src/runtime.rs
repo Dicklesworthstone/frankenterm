@@ -2887,7 +2887,13 @@ impl ObservationRuntime {
                         );
 
                         if let Some(ref manager) = recording {
-                            if let Err(err) = manager.record_segment(&event.segment).await {
+                            // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
+                            let recording_seg_cx = crate::cx::Cx::current()
+                                .unwrap_or_else(crate::cx::for_request);
+                            if let Err(err) = manager
+                                .record_segment_with_cx(&recording_seg_cx, &event.segment)
+                                .await
+                            {
                                 warn!(
                                     pane_id = pane_id,
                                     error = %err,
@@ -2967,10 +2973,19 @@ impl ObservationRuntime {
                             };
 
                             // Persist each detection as an event
+                            // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
+                            let recording_det_cx = crate::cx::Cx::current()
+                                .unwrap_or_else(crate::cx::for_request);
                             for detection in detections {
                                 if let Some(ref manager) = recording {
-                                    if let Err(err) =
-                                        manager.record_event(pane_id, &detection, captured_at).await
+                                    if let Err(err) = manager
+                                        .record_event_with_cx(
+                                            &recording_det_cx,
+                                            pane_id,
+                                            &detection,
+                                            captured_at,
+                                        )
+                                        .await
                                     {
                                         warn!(
                                             pane_id = pane_id,
