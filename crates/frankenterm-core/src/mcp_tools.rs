@@ -1643,7 +1643,10 @@ impl ToolHandler for WaEventsTool {
                 until: None,
             };
 
-            let events = storage.get_events(query).await?;
+            // ft-xbnl0.2.3 tick 258: cx-first MCP event-query + annotation loop.
+            let events_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let events = storage.get_events_with_cx(&events_cx, query).await?;
             let total_count = events.len();
 
             let mut items: Vec<McpEventItem> = Vec::with_capacity(events.len());
@@ -1653,7 +1656,10 @@ impl ToolHandler for WaEventsTool {
                     |agent| format!("builtin:{agent}"),
                 );
 
-                let annotations = match storage.get_event_annotations(e.id).await {
+                let annotations = match storage
+                    .get_event_annotations_with_cx(&events_cx, e.id)
+                    .await
+                {
                     Ok(Some(a)) => Some(a),
                     Ok(None) => None,
                     Err(err) => {
@@ -3158,7 +3164,12 @@ impl ToolHandler for WaAccountsTool {
 
         let result = runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            storage.get_accounts_by_service(&params.service).await
+            // ft-xbnl0.2.3 tick 258: cx-first account lookup.
+            let accounts_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            storage
+                .get_accounts_by_service_with_cx(&accounts_cx, &params.service)
+                .await
         });
 
         match result {
@@ -3313,7 +3324,13 @@ impl ToolHandler for WaAccountsRefreshTool {
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
-                if let Ok(accounts) = storage.get_accounts_by_service(&service).await {
+                // ft-xbnl0.2.3 tick 258: cx-first account lookup.
+                let refresh_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
+                if let Ok(accounts) = storage
+                    .get_accounts_by_service_with_cx(&refresh_cx, &service)
+                    .await
+                {
                     let now_check = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .ok()
@@ -4133,7 +4150,12 @@ impl ToolHandler for WaEventsAnnotateTool {
                 decision_context: serialize_mcp_audit_decision_context(&decision_context),
                 result: "success".to_string(),
             };
-            let _ = storage.record_audit_action_redacted(audit).await;
+            // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
+            let audit_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let _ = storage
+                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                .await;
 
             let annotations = storage
                 .get_event_annotations(params.event_id)
@@ -4287,7 +4309,12 @@ impl ToolHandler for WaEventsTriageTool {
                     "noop".to_string()
                 },
             };
-            let _ = storage.record_audit_action_redacted(audit).await;
+            // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
+            let audit_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let _ = storage
+                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                .await;
 
             let annotations = storage
                 .get_event_annotations(params.event_id)
@@ -4440,7 +4467,12 @@ impl ToolHandler for WaEventsLabelTool {
                         "noop".to_string()
                     },
                 };
-                let _ = storage.record_audit_action_redacted(audit).await;
+                // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
+            let audit_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let _ = storage
+                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                .await;
 
                 Some(inserted)
             } else if let Some(label) = params.remove.clone() {
@@ -4484,7 +4516,12 @@ impl ToolHandler for WaEventsLabelTool {
                         "noop".to_string()
                     },
                 };
-                let _ = storage.record_audit_action_redacted(audit).await;
+                // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
+            let audit_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let _ = storage
+                .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                .await;
 
                 Some(removed)
             } else {
