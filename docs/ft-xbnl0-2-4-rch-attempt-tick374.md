@@ -128,18 +128,22 @@ target-dir strategy (tick 393).
 
 | Group | Tests | Remote result | Wall | Tick |
 |-------|-------|---------------|------|------|
-| Regression guards | 3 | 3/3 PASS | 116s (cold) / 484s (re-confirm, fresh dir) | 374 + 391 |
-| HTTP client contracts | 29 | **29/29 PASS** | 589s (warm with guards) | 392 |
+| Regression guards | 3 | 3/3 PASS | 116s (cold) / 484s (re-confirm fresh dir) | 374 + 391 |
+| HTTP client contracts | **33** | **33/33 PASS** | 589s (tick 392 warm after guards, 29 tests) / **375s** (tick 407 re-verify at HEAD, 33 tests post ticks 400/402/404) | 392 + 407 |
 | TLS tests | 45 | **45/45 PASS** | **116s (fully warm)** | 393 |
 | Metrics server cx-family | 3 | **3/3 PASS** | 114s | 393 |
 | Web server cx pre-cancel | 1 | **1/1 PASS** | 122s | 393 |
 | runtime_compat primitive | 2 | **2/2 PASS** | 113s | 393 |
-| **Total** | **83** | **83/83 PASS remotely** | | |
+| **Total** | **87** | **87/87 PASS remotely** | | |
 
-**All 83 ft-xbnl0.2.4 tests have remote Level-C evidence.** Once the
-target dir is warm (first guards run: ~2 min cold, then HTTP: ~10
-min adding feature graph), every subsequent group completes in
-~2 min wall since the feature-conditional deps are cached.
+**All 87 ft-xbnl0.2.4 tests have remote Level-C evidence.** Post
+tick-407 re-verification, the remote count matches the local
+87/87 total exactly. Once the target dir is warm (first guards
+run: ~2 min cold, then HTTP: ~10 min adding feature graph), every
+subsequent group completes in ~2 min wall since the feature-
+conditional deps are cached. Re-verifying HTTP at HEAD (tick 407)
+took 375s since only 4 tests were added since tick 392 + some
+workspace file sync — no material recompile.
 
 ### Command recipe for full Level-C capture
 
