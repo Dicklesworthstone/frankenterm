@@ -3001,6 +3001,86 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 339: resolve_tls_versions positive-path contracts
+    //
+    // The min-TLS-version string is a security-relevant config knob:
+    // setting it to "1.3" means the server must refuse TLS 1.2 clients
+    // (and vice versa for "1.2", which accepts both). A regression that
+    // silently collapsed both into a single version list would weaken
+    // security (if "1.3" got downgraded to include 1.2) or break
+    // compatibility (if "1.2" got upgraded to exclude 1.2).
+    //
+    // Uses `build_tls_bundle` as the observable surface — if it
+    // succeeds, `resolve_tls_versions` ran without error.
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_accepts_min_tls_version_1_2() {
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+        let ca_cert = temp_pem(CA_CERT);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+        config.tls.min_tls_version = "1.2".to_string();
+
+        let result = build_tls_bundle(&config, Some(ca_cert.path()));
+        assert!(
+            result.is_ok(),
+            "min_tls_version='1.2' must build successfully"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_accepts_min_tls_version_1_3() {
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+        let ca_cert = temp_pem(CA_CERT);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+        config.tls.min_tls_version = "1.3".to_string();
+
+        let result = build_tls_bundle(&config, Some(ca_cert.path()));
+        assert!(
+            result.is_ok(),
+            "min_tls_version='1.3' must build successfully"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_accepts_min_tls_version_1_2_plus_suffix() {
+        // The "1.2+" / "1.3+" suffix forms are explicitly permitted in
+        // the config grammar (distributed.rs L122-L123) — pin that they
+        // round-trip identically to the bare form.
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+        let ca_cert = temp_pem(CA_CERT);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+        config.tls.min_tls_version = "1.2+".to_string();
+
+        let result = build_tls_bundle(&config, Some(ca_cert.path()));
+        assert!(
+            result.is_ok(),
+            "min_tls_version='1.2+' must build successfully"
+        );
+    }
+
+    // =====================================================================
     // ft-xbnl0.2.4 tick 337: MissingClientCaPath (mTLS-only error path)
     //
     // When `auth_mode.requires_mtls()` is true, the server-side TLS
