@@ -4564,6 +4564,63 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 402: Chunked transfer-encoding response parses correctly.
+    ///
+    /// Pins that `DistributedHttpClient::get` correctly handles a
+    /// response encoded with `Transfer-Encoding: chunked` — no
+    /// `Content-Length` header, body split into size-prefixed chunks
+    /// terminated by a zero-size chunk.
+    ///
+    /// Why matters: real HTTP/1.1 servers use chunked encoding for
+    /// responses whose length isn't known up-front (SSE, streaming
+    /// APIs, dynamically-generated content). A client that assumed
+    /// Content-Length always exists would fail to parse or hang.
+    ///
+    /// Test server sends a chunked response with body "HelloWorld"
+    /// split into 3 chunks (5+3+2 bytes) + terminator. Client must
+    /// reassemble as b"HelloWorld".
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_parses_chunked_transfer_encoding() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = b"HTTP/1.1 200 OK\r\n\
+                                 Transfer-Encoding: chunked\r\n\
+                                 \r\n\
+                                 5\r\nHello\r\n\
+                                 3\r\nWor\r\n\
+                                 2\r\nld\r\n\
+                                 0\r\n\r\n";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/stream", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.body,
+                b"HelloWorld",
+                "chunked response body must be reassembled as 'HelloWorld' from 3 chunks; \
+                 got body len={}, bytes={:?}",
+                resp.body.len(),
+                resp.body
+            );
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 400: URL percent-encoded characters pass through verbatim.
     ///
     /// Pins that `DistributedHttpClient::get` transmits percent-encoded
