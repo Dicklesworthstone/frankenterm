@@ -82,8 +82,16 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
         "orphan reaper started"
     );
 
+    // ft-xbnl0.2.3 tick 292: cx-first orphan reaper loop sleep.
+    let reaper_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     loop {
-        crate::runtime_compat::sleep(Duration::from_secs(interval)).await;
+        if crate::runtime_compat::sleep_with_cx(&reaper_cx, Duration::from_secs(interval))
+            .await
+            .is_err()
+        {
+            debug!("orphan reaper cancelled via cx");
+            return;
+        }
 
         if shutdown_flag.load(Ordering::Relaxed) {
             debug!("orphan reaper shutting down");
