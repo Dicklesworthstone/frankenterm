@@ -561,8 +561,12 @@ impl MetricsServer {
                     Ok(Ok((socket, peer))) => {
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
+                        let conn_cx = task_cx.clone();
                         crate::runtime_compat::task::spawn(async move {
-                            if let Err(err) = handle_connection(socket, &prefix, collector).await {
+                            if let Err(err) =
+                                handle_connection_with_cx(&conn_cx, socket, &prefix, collector)
+                                    .await
+                            {
                                 debug!(error = %err, peer = %peer, "Metrics connection failed");
                             }
                         });
@@ -593,8 +597,52 @@ async fn handle_connection(
     if read_len == 0 {
         return Ok(());
     }
+    let request_bytes = buf[..read_len].to_vec();
+    handle_connection_impl(socket, prefix, collector, request_bytes).await
+}
 
-    let request = String::from_utf8_lossy(&buf[..read_len]);
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
+///
+/// Pre-flight `cx.checkpoint()` folded into `crate::Error::Runtime`
+/// so a cancelled server shutdown interrupts the per-connection
+/// body before any TCP read. The read itself is not cx-aware
+/// (tokio/asupersync-compat `io::read` doesn't observe cx), but a
+/// cancel arriving between the accept in `start_with_cx` and the
+/// read will now bail the handler instead of reading 8KB from a
+/// dying connection.
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_connection_with_cx(
+    cx: &crate::cx::Cx,
+    mut socket: TcpStream,
+    prefix: &str,
+    collector: Arc<dyn MetricsCollector>,
+) -> Result<()> {
+    cx.checkpoint()
+        .map_err(|err| crate::Error::Runtime(format!("metrics handle_connection cancelled: {err}")))?;
+    let mut buf = [0_u8; 8192];
+    let read_len = crate::runtime_compat::io::read(&mut socket, &mut buf).await?;
+    if read_len == 0 {
+        return Ok(());
+    }
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!("metrics handle_connection cancelled after read: {err}"))
+    })?;
+    let request_bytes = buf[..read_len].to_vec();
+    handle_connection_impl(socket, prefix, collector, request_bytes).await
+}
+
+/// Shared response-formatting + write body. Factored out so both
+/// `handle_connection` and `handle_connection_with_cx` render the
+/// same HTTP responses byte-for-byte; the only difference between
+/// the two is whether cx.checkpoint gates entry and the post-read
+/// boundary.
+async fn handle_connection_impl(
+    mut socket: TcpStream,
+    prefix: &str,
+    collector: Arc<dyn MetricsCollector>,
+    buf: Vec<u8>,
+) -> Result<()> {
+    let request = String::from_utf8_lossy(&buf);
     let mut lines = request.lines();
     let first_line = lines.next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
