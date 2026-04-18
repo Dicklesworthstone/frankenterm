@@ -24944,7 +24944,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                         };
 
-                    match storage.get_workflow(&execution_id).await {
+                    // ft-xbnl0.2.3 tick 236: cx-first storage read.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage.get_workflow_with_cx(&storage_cx, &execution_id).await {
                         Ok(Some(record)) => {
                             println!("Workflow: {} ({})", record.workflow_name, record.id);
                             println!("Status: {}", record.status);
@@ -27019,7 +27022,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     };
 
-                    let current = storage.get_pane(pane_id).await.ok().flatten();
+                    // ft-xbnl0.2.3 tick 236: cx-first storage read.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let current = storage
+                        .get_pane_with_cx(&storage_cx, pane_id)
+                        .await
+                        .ok()
+                        .flatten();
                     let current_uuid = current.and_then(|pane| pane.pane_uuid);
                     if let Err(err) = ensure_pane_uuid_matches(
                         record.pane_uuid.as_deref(),
@@ -27299,7 +27309,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     ) {
                         exit_on_commit_validation_error(err, &plan_id);
                     }
-                    let current = storage.get_pane(pane_id).await.ok().flatten();
+                    // ft-xbnl0.2.3 tick 236: cx-first storage read.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let current = storage
+                        .get_pane_with_cx(&storage_cx, pane_id)
+                        .await
+                        .ok()
+                        .flatten();
                     let current_uuid = current.and_then(|pane| pane.pane_uuid);
                     if let Err(err) = ensure_pane_uuid_matches(
                         record.pane_uuid.as_deref(),
@@ -27944,8 +27961,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     eprintln!("Limit:     {limit}");
                 }
 
-                // Query audit actions
-                match storage.get_audit_actions(query).await {
+                // Query audit actions (ft-xbnl0.2.3 tick 236: cx-first).
+                let storage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match storage.get_audit_actions_with_cx(&storage_cx, query).await {
                     Ok(actions) => {
                         let ctx = RenderContext::new(output_format)
                             .verbose(cli.verbose)
@@ -32248,7 +32267,10 @@ async fn handle_why_recent(
             policy_decision: policy_filter.clone(),
             ..Default::default()
         };
-        match storage.get_audit_actions(query).await {
+        // ft-xbnl0.2.3 tick 236: cx-first storage read.
+        let storage_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        match storage.get_audit_actions_with_cx(&storage_cx, query).await {
             Ok(actions) => {
                 if let Some(record) = actions.iter().find(|a| a.id == record_id) {
                     render_why_decision(record, output_format, verbose);
@@ -32292,7 +32314,10 @@ async fn handle_why_recent(
         ..Default::default()
     };
 
-    match storage.get_audit_actions(query).await {
+    // ft-xbnl0.2.3 tick 236: cx-first storage read.
+    let storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    match storage.get_audit_actions_with_cx(&storage_cx, query).await {
         Ok(actions) => {
             if actions.is_empty() {
                 let filter_desc = effective_filter.as_deref().unwrap_or("any");
