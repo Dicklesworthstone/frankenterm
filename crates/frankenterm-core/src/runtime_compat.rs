@@ -2154,6 +2154,22 @@ pub async fn sleep(duration: Duration) {
 /// This is the Cx-first sleep seam used by the ft-xbnl0.2.2 migration. Call
 /// sites that have a `Cx` in hand should prefer this over the ambient
 /// [`sleep`] which falls back to `Cx::current()` thread-local lookup.
+///
+/// # Cancellation semantics (ft-xbnl0.2.4 tick 331)
+///
+/// Mirrors [`timeout_with_cx`]: this function observes the cx **budget
+/// deadline** (via [`asupersync::time::budget_sleep`], which caps the
+/// effective sleep duration by remaining budget), but does **not**
+/// directly check `cx.is_cancel_requested()`. A pre-cancelled cx with
+/// an infinite budget will still sleep for the full requested
+/// `duration` before returning `Ok`.
+///
+/// Callers who need a sleep that short-circuits on cancel MUST add an
+/// explicit `cx.checkpoint()?` (or equivalent `if cx.is_cancel_requested()`
+/// bail) **before** invoking `sleep_with_cx`, and MUST re-check cancel
+/// at loop iteration boundaries when using this inside a polling loop.
+/// Every cx-first accept/poll loop in this crate that uses `sleep_with_cx`
+/// already follows this pattern (e.g. watchdog.rs, backpressure polling).
 #[cfg(feature = "asupersync-runtime")]
 pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(), String> {
     asupersync::time::budget_sleep(cx, duration, cx_timer_now(cx))
