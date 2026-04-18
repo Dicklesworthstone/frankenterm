@@ -486,14 +486,20 @@ impl QueryClient for ProductionQueryClient {
         };
 
         let rows = self.runtime.block_on(async {
+            // ft-xbnl0.2.3 tick 255: cx-first TUI event query + annotation loop.
+            let query_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
             let events = storage
-                .get_events(query)
+                .get_events_with_cx(&query_cx, query)
                 .await
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
             let mut rows = Vec::with_capacity(events.len());
             for event in events {
-                let annotations = match storage.get_event_annotations(event.id).await {
+                let annotations = match storage
+                    .get_event_annotations_with_cx(&query_cx, event.id)
+                    .await
+                {
                     Ok(Some(annotations)) => annotations,
                     Ok(None) => crate::storage::EventAnnotations::default(),
                     Err(err) => {
@@ -786,7 +792,13 @@ impl QueryClient for ProductionQueryClient {
         };
 
         self.runtime.block_on(async {
-            if let Ok(Some(identity_key)) = storage.get_event_identity_key(event_id).await {
+            // ft-xbnl0.2.3 tick 255: cx-first TUI mute + handled writes.
+            let mute_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            if let Ok(Some(identity_key)) = storage
+                .get_event_identity_key_with_cx(&mute_cx, event_id)
+                .await
+            {
                 let record = EventMuteRecord {
                     identity_key,
                     scope: "workspace".to_string(),
@@ -796,13 +808,13 @@ impl QueryClient for ProductionQueryClient {
                     reason: Some("tui mute".to_string()),
                 };
                 storage
-                    .add_event_mute(record)
+                    .add_event_mute_with_cx(&mute_cx, record)
                     .await
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
             }
 
             storage
-                .mark_event_handled(event_id, None, "muted")
+                .mark_event_handled_with_cx(&mute_cx, event_id, None, "muted")
                 .await
                 .map_err(|e| QueryError::StorageError(e.to_string()))
         })
