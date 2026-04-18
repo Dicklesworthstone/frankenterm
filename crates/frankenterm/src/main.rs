@@ -22664,9 +22664,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             };
 
+            // ft-xbnl0.2.3 tick 244: cx-first storage reads for fts subcommand.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             match command {
                 Some(SearchCommands::Fts { command }) => match command {
-                    FtsCommands::Verify => match storage.get_indexing_health().await {
+                    FtsCommands::Verify => match storage.get_indexing_health_with_cx(&storage_cx).await {
                         Ok(report) => {
                             if output_format.is_json() {
                                 let payload = serde_json::json!({
@@ -26111,8 +26114,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .map(|m| m.identity_key.clone())
                 .collect();
 
-            // Query events
-            match storage.get_events(query).await {
+            // Query events (ft-xbnl0.2.3 tick 244: cx-first).
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match storage.get_events_with_cx(&storage_cx, query).await {
                 Ok(events) => {
                     let ctx = RenderContext::new(output_format)
                         .verbose(cli.verbose)
@@ -31141,7 +31146,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 since: None,
                                 until: None,
                             };
-                            if let Ok(events) = storage.get_events(query).await {
+                            // ft-xbnl0.2.3 tick 244: cx-first storage read.
+                            let storage_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            if let Ok(events) =
+                                storage.get_events_with_cx(&storage_cx, query).await
+                            {
                                 for event in &events {
                                     let is_muted = event
                                         .dedupe_key
@@ -31560,8 +31570,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 MuteCommands::List { format } => {
                     let fmt = resolve_prepare_output_format(&format);
                     let now = now_ms_i64();
-
-                    match storage.list_active_mutes(now).await {
+                    // ft-xbnl0.2.3 tick 244: cx-first storage read.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage.list_active_mutes_with_cx(&storage_cx, now).await {
                         Ok(mutes) => match fmt {
                             OutputFormat::Json => {
                                 let arr: Vec<serde_json::Value> = mutes
