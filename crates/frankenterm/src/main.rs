@@ -6951,7 +6951,13 @@ async fn record_read_search_policy_audit(
         result: result.to_string(),
     };
 
-    if let Err(e) = storage.record_audit_action_redacted(record).await {
+    // ft-xbnl0.2.3 tick 237: cx-first storage write.
+    let storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    if let Err(e) = storage
+        .record_audit_action_redacted_with_cx(&storage_cx, record)
+        .await
+    {
         tracing::warn!(
             action = action.as_str(),
             actor = actor.as_str(),
@@ -15946,7 +15952,10 @@ async fn run_saved_search_scheduler(
                 handled_status: None,
             };
 
-            let event_id = match storage.record_event(stored_event).await {
+            // ft-xbnl0.2.3 tick 237: cx-first storage write.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let event_id = match storage.record_event_with_cx(&storage_cx, stored_event).await {
                 Ok(id) => id,
                 Err(err) => {
                     tracing::warn!(
@@ -17397,7 +17406,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     Some(frankenterm_core::policy::build_send_text_audit_summary(
                                         &text, None, None,
                                     ));
-                                match storage.record_audit_action_redacted(audit_record).await {
+                                // ft-xbnl0.2.3 tick 237: cx-first storage write.
+                                let storage_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                match storage
+                                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
+                                    .await
+                                {
                                     Ok(audit_id) => {
                                         injection.set_audit_action_id(audit_id);
                                     }
