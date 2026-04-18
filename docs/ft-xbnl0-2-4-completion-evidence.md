@@ -261,7 +261,14 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 - [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`)
   and the latest smoke artifact path rather than re-summarizing
 
-### 6.1 Note on the workspace clippy gate
+### 6.1 Notes on adjacent gate failures unrelated to this bead
+
+Two findings surfaced during verification that are **not scoped to
+ft-xbnl0.2.4** but may affect workspace-level closure gates. Both are
+recommended for handling as separate follow-up beads rather than
+blocking this bead's closure.
+
+#### 6.1.1 Workspace clippy gate
 
 As of tick 356 (`cargo clippy --no-deps -p frankenterm-core --features distributed,asupersync-runtime,web --lib --tests -- -D warnings`), the `frankenterm-core` crate reports **17 clippy errors** on master. All 17 are located in files **unrelated to this bead** and unrelated to the session work on ft-xbnl0.2.4:
 
@@ -278,3 +285,15 @@ None of the files authored or modified by the ft-xbnl0.2.4 verification work (`s
 Closing recommendation: either (a) block closure behind the workspace-level clippy cleanup being completed by other owners, or (b) close this bead with a cross-reference noting that the bead-scoped files are clippy-clean and the workspace gate is a separate bead.
 
 Option (b) is consistent with AGENTS.md guidance on not disturbing other agents' in-progress work — the clippy violations may be intentional (awaiting `#[allow(...)]` annotations from their owners) and fixing them here without coordination would cross scope boundaries.
+
+#### 6.1.2 Pre-existing `bundle_acceptor_connector_mtls` test failure
+
+Running the broad `§4b` command `cargo test --lib distributed::tests::` surfaces a single failing test: `distributed::tests::bundle_acceptor_connector_mtls` at `distributed.rs:3805`. Failure message: `client bundle: MissingClientCaPath`.
+
+The test constructs a `client_cfg` with `auth_mode = Mtls` but **without** `client_ca_path` populated, then expects `build_tls_bundle(&client_cfg, ...)` to succeed. The current `build_server_config` requires `client_ca_path` whenever `auth_mode.requires_mtls()` and returns `MissingClientCaPath` otherwise — this is the exact behavior `build_tls_bundle_rejects_mtls_without_client_ca_path` (tick 337) explicitly pins as correct.
+
+**Attribution** (via `git blame`): the failing test was authored by `jemanuel` on 2026-04-10 — 8 days before this session started. The test predates this session's work; this session's work did NOT cause the failure. The `build_server_config` logic that produces the error has been present throughout.
+
+The narrower filter in `scripts/check_ft_xbnl0_2_4.sh` (`--lib tls_`) does NOT catch this test — `bundle_acceptor_connector_mtls` has no `tls_` substring (the `mtls` token has no underscore after). That's why the check script runs 73/73 passing while the broader individual-command in §4b surfaces the failure.
+
+Closing recommendation: the same "option (b)" pattern applies. Close this bead with a cross-reference noting that its scoped check script passes 73/73, and file a separate bead for the `bundle_acceptor_connector_mtls` test author to either (a) add `client_ca_path` to `client_cfg`, (b) restructure the bundle's Mtls validation, or (c) deprecate the test if the config shape is intentionally invalid.
