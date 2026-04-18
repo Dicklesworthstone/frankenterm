@@ -13060,7 +13060,11 @@ async fn distributed_handle_connection<S>(
     let mut reader = asupersync::io::BufReader::new(stream);
     let mut handshake_line = String::new();
 
-    let handshake_size = match frankenterm_core::runtime_compat::timeout(
+    // ft-xbnl0.2.3 tick 287: cx-first distributed handshake read timeout.
+    let handshake_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let handshake_size = match frankenterm_core::runtime_compat::timeout_with_cx(
+        &handshake_cx,
         DISTRIBUTED_HANDSHAKE_TIMEOUT,
         distributed_read_line(
             &mut reader,
@@ -13179,7 +13183,9 @@ async fn distributed_handle_connection<S>(
         }
 
         let mut line = String::new();
-        let read_size = match frankenterm_core::runtime_compat::timeout(
+        // ft-xbnl0.2.3 tick 287: cx-first distributed message read timeout (reuse handshake_cx).
+        let read_size = match frankenterm_core::runtime_compat::timeout_with_cx(
+            &handshake_cx,
             message_timeout,
             distributed_read_line(
                 &mut reader,
@@ -13372,12 +13378,16 @@ async fn spawn_distributed_listener(
     };
 
     let task = frankenterm_core::runtime_compat::task::spawn(async move {
+        // ft-xbnl0.2.3 tick 287: cx-first distributed listener accept timeout.
+        let accept_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
             }
 
-            let accept_result = frankenterm_core::runtime_compat::timeout(
+            let accept_result = frankenterm_core::runtime_compat::timeout_with_cx(
+                &accept_cx,
                 Duration::from_millis(500),
                 listener.accept(),
             )
@@ -14110,7 +14120,11 @@ async fn distributed_agent_stream_session(
     stream.get_mut().flush().await?;
 
     let mut handshake_response = String::new();
-    match frankenterm_core::runtime_compat::timeout(
+    // ft-xbnl0.2.3 tick 287: cx-first agent handshake response read timeout.
+    let agent_handshake_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    match frankenterm_core::runtime_compat::timeout_with_cx(
+        &agent_handshake_cx,
         DISTRIBUTED_HANDSHAKE_TIMEOUT,
         distributed_read_line(
             &mut stream,
