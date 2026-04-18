@@ -30765,7 +30765,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             pretty,
             output,
         }) => {
-            use frankenterm_core::export::{ExportKind, ExportOptions, export_jsonl};
+            use frankenterm_core::export::{ExportKind, ExportOptions, export_jsonl_with_cx};
             use frankenterm_core::storage::ExportQuery;
 
             let export_kind = match ExportKind::from_str_loose(&kind) {
@@ -30830,6 +30830,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             // Determine output target
+            // ft-xbnl0.2.3 tick 250: cx-first export.
+            let export_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             let result = if let Some(ref path) = output {
                 let mut file = match std::fs::File::create(path) {
                     Ok(f) => std::io::BufWriter::new(f),
@@ -30838,11 +30841,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 };
-                export_jsonl(&storage, &opts, &mut file).await
+                export_jsonl_with_cx(&export_cx, &storage, &opts, &mut file).await
             } else {
                 // Collect to a Vec first to avoid holding stdout lock across await
                 let mut buffer = Vec::new();
-                let count = export_jsonl(&storage, &opts, &mut buffer).await;
+                let count = export_jsonl_with_cx(&export_cx, &storage, &opts, &mut buffer).await;
                 // Now write to stdout synchronously
                 {
                     use std::io::Write;
