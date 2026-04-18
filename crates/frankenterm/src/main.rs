@@ -14218,7 +14218,16 @@ async fn distributed_agent_stream_session(
 
         let now = Instant::now();
         let wait_duration = next_heartbeat.saturating_duration_since(now);
-        match frankenterm_core::runtime_compat::timeout(wait_duration, subscriber.recv()).await {
+        // ft-xbnl0.2.3 tick 286: cx-first heartbeat timeout wait.
+        let heartbeat_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        match frankenterm_core::runtime_compat::timeout_with_cx(
+            &heartbeat_cx,
+            wait_duration,
+            subscriber.recv(),
+        )
+        .await
+        {
             Ok(event_result) => match event_result {
                 Ok(event) => {
                     distributed_agent_stream_event(
