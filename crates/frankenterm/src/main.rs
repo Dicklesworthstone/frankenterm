@@ -24650,7 +24650,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 std::process::exit(1);
             }
-            match wezterm.get_text(pane_id, escapes).await {
+            // ft-xbnl0.2.3 tick 234: cx-first.
+            let cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match wezterm.get_text_with_cx(&cx, pane_id, escapes).await {
                 Ok(text) => {
                     let output = if tail == 0 {
                         text
@@ -24732,7 +24735,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 && !std::io::stdout().is_terminal());
 
                         let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                        let pane_info = wezterm.get_pane(pane).await.ok();
+                        // ft-xbnl0.2.3 tick 234: cx-first.
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        let pane_info = wezterm.get_pane_with_cx(&cx, pane).await.ok();
                         let report = build_workflow_dry_run_report(
                             &command_ctx,
                             &name,
@@ -24758,7 +24764,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         // Verify pane exists
                         let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                        match wezterm.list_panes().await {
+                        // ft-xbnl0.2.3 tick 234: cx-first.
+                        let cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match wezterm.list_panes_with_cx(&cx).await {
                             Ok(panes) => {
                                 if !panes.iter().any(|p| p.pane_id == pane) {
                                     eprintln!("Error: Pane {pane} does not exist.");
@@ -25329,7 +25338,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                match wezterm.list_panes().await {
+                // ft-xbnl0.2.3 tick 234: cx-first.
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match wezterm.list_panes_with_cx(&cx).await {
                     Ok(panes) => {
                         let filter = &config.ingest.panes;
 
@@ -26466,7 +26478,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let now = now_ms_i64();
 
                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                let pane_info = match wezterm.get_pane(pane_id).await {
+                // ft-xbnl0.2.3 tick 234: cx-first.
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let pane_info = match wezterm.get_pane_with_cx(&cx, pane_id).await {
                     Ok(info) => info,
                     Err(e) => {
                         eprintln!("Error: Failed to query pane {pane_id}: {e}");
@@ -27016,7 +27031,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                    let pane_info = match wezterm.get_pane(pane_id).await {
+                    // ft-xbnl0.2.3 tick 234: cx-first.
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let pane_info = match wezterm.get_pane_with_cx(&cx, pane_id).await {
                         Ok(info) => info,
                         Err(e) => {
                             eprintln!("Error: Failed to query pane {pane_id}: {e}");
@@ -35489,7 +35507,10 @@ async fn resolve_real_tx_runtime(
     };
 
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
-    match wezterm.list_panes().await {
+    // ft-xbnl0.2.3 tick 234: cx-first.
+    let cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    match wezterm.list_panes_with_cx(&cx).await {
         Ok(_) => (Some((storage, wezterm)), None),
         Err(err) => (
             None,
