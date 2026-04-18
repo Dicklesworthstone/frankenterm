@@ -939,8 +939,14 @@ impl SnapshotEngine {
 
                 loop {
                     if !is_first {
+                        // ft-xbnl0.2.3 tick 296: cx-first timeout wrapping
+                        // shutdown.changed(cx) — both the outer interval-timeout
+                        // AND the inner shutdown wait now honor cx-cancel.
                         let shutdown_fut = shutdown.changed(cx);
-                        if timeout(interval, shutdown_fut).await.is_ok() {
+                        if crate::runtime_compat::timeout_with_cx(cx, interval, shutdown_fut)
+                            .await
+                            .is_ok()
+                        {
                             tracing::info!("snapshot engine shutting down");
                             break;
                         }
