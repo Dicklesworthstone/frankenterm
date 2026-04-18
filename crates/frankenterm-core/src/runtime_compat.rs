@@ -5307,6 +5307,50 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 383: `timeout_with_cx` observes cx budget deadline.
+    ///
+    /// Parallel to tick 382's `sleep_with_cx` budget test. Tick 328's
+    /// doc comment on `timeout_with_cx` claimed budget observation but
+    /// never tested it. This test pins the claim.
+    ///
+    /// Setup: cx with `Budget::with_deadline(Time::ZERO)` (budget already
+    /// elapsed). Call `timeout_with_cx(cx, 30s, pending_future)` — the
+    /// inner future never resolves, so without budget observation the
+    /// call would wait the full 30 seconds. With budget observation, it
+    /// must return Err promptly.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn timeout_with_cx_observes_budget_deadline() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let budget = asupersync::types::Budget::new()
+                .with_deadline(asupersync::types::Time::ZERO);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+
+            let started = std::time::Instant::now();
+            let result: std::result::Result<(), String> = timeout_with_cx(
+                &cx,
+                Duration::from_secs(30),
+                std::future::pending::<()>(),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "expired-budget cx must cause timeout_with_cx to return Err"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "expired-budget cx must cause timeout_with_cx to return promptly; \
+                 took {elapsed:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 382: `sleep_with_cx` observes cx budget deadline.
     ///
     /// The tick-331 doc comment on `sleep_with_cx` states the primitive
