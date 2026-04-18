@@ -5397,6 +5397,92 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 418: `yield_now_with_cx` observes cx-cancel
+    /// via the `cx.checkpoint()` pre-guard.
+    ///
+    /// Unlike `sleep_with_cx` / `timeout_with_cx` (which observe the
+    /// budget deadline but NOT direct `is_cancel_requested()`),
+    /// `yield_now_with_cx` **does** observe direct cx-cancel because
+    /// its implementation calls `cx.checkpoint()?` before yielding.
+    /// Tight poll loops use this as their cancellation-sensing yield
+    /// point — the return-`Err` contract is how they break cleanly
+    /// instead of spinning forever against a cancelled cx.
+    ///
+    /// This pins that contract. Setup: pre-cancelled cx (no budget
+    /// manipulation — cancel is direct). `yield_now_with_cx(&cx)`
+    /// must return `Err(String)` rather than yielding.
+    ///
+    /// Complements the two budget-observation tests above: together
+    /// the three tests cover the matrix of primitive × signal-kind:
+    /// - `sleep_with_cx`: budget ✓, direct-cancel ✗
+    /// - `timeout_with_cx`: budget ✓, direct-cancel ✗
+    /// - `yield_now_with_cx`: direct-cancel ✓ (this tick)
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn yield_now_with_cx_observes_cx_cancel_checkpoint() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 418 pre-cancel yield_now_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = task::yield_now_with_cx(&cx).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "pre-cancelled cx must cause yield_now_with_cx to return Err, got: {result:?}"
+            );
+            let err_msg = result.err().unwrap();
+            assert!(
+                err_msg.contains("cancelled") || err_msg.contains("yield_now_with_cx cancelled"),
+                "error should surface cancellation; got: {err_msg}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit yield_now_with_cx promptly; took {elapsed:?}"
+            );
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 418: `yield_now_with_cx` happy path — a live
+    /// (uncancelled) cx must allow the primitive to yield once and
+    /// return Ok.
+    ///
+    /// Pair with `yield_now_with_cx_observes_cx_cancel_checkpoint`:
+    /// together they pin both branches of the `cx.checkpoint()?`
+    /// pre-guard.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn yield_now_with_cx_yields_on_live_cx() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::for_request();
+
+            let started = std::time::Instant::now();
+            let result = task::yield_now_with_cx(&cx).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_ok(),
+                "live cx must allow yield_now_with_cx to succeed, got: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "yield_now_with_cx must return promptly on live cx; took {elapsed:?}"
+            );
+        });
+    }
+
     // ========================================================================
     // time module tests
     // ========================================================================
