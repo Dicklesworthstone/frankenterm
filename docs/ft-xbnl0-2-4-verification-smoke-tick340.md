@@ -1,4 +1,4 @@
-# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 353)
+# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 357)
 
 Date: 2026-04-18
 Authored by: RusticMaple
@@ -6,11 +6,12 @@ Tick 340: post-`bfb016b2` / ticks 311-339 (32 tests, HTTP+TLS+guards only)
 Tick 341: added service-boundary runs (36 tests)
 Tick 346: HTTP extended to 19 after ticks 342-345 (40 tests total)
 Tick 353: HTTP extended to 21 after tick 349→351→352 ft-kfkyi fix + companion (42 tests total)
+Tick 357: TLS filter broadened from `build_tls_` to `tls_` — catches 1 previously-excluded parser test + ~30 pre-existing TLS tests for stronger smoke (73 tests total)
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
-contract tests authored this session. Captured as an artifact so the bead
-owner can reference a concrete "32 of 32 passing at this commit" checkpoint
+contract tests this session touches. Captured as an artifact so the bead
+owner can reference a concrete "73 of 73 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
