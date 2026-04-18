@@ -200,12 +200,24 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     let mut term = signal::unix::signal(SignalKind::terminate())
         .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
+    // Tick 194 (ft-xbnl0.2.3): inner poll-sleep now threads the
+    // caller's cx via sleep_with_cx. Previously the cancel-watcher
+    // loop used ambient `sleep()` which falls back to
+    // `Cx::current()` thread-local — if the web server runs under a
+    // different thread-local cx than the caller's explicit one, the
+    // timer was bound to the wrong cx. Under LabRuntime virtual
+    // time that meant cancel could land later than the operator
+    // intended.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = crate::runtime_compat::sleep_with_cx(
+                cx,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
         }
     };
 
@@ -222,12 +234,18 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
 
+    // Tick 194 (ft-xbnl0.2.3): non-unix mirror of the poll-sleep
+    // cx-threading fix above.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = crate::runtime_compat::sleep_with_cx(
+                cx,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
         }
     };
 
