@@ -15318,7 +15318,10 @@ async fn run_watcher(
             } else {
                 server
             };
-            match server.start().await {
+            // ft-xbnl0.2.3 tick 276: cx-first metrics server start.
+            let metrics_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match server.start_with_cx(&metrics_cx).await {
                 Ok(handle) => {
                     tracing::info!(
                         bind = %handle.local_addr(),
