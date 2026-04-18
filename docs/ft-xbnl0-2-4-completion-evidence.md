@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **31 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests + 2 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) |
+| 3 | Verification covers correctness + basic performance non-regression | **32 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests + 2 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -60,6 +60,7 @@ surface of `DistributedHttpClient`:
 | Mid-flight cancel on POST (ft-l9mxa verb-parity) | `distributed_http_client_post_mid_flight_cancel_returns_cancelled` | 389 |
 | POST does not auto-inject Content-Type | `distributed_http_client_post_does_not_auto_inject_content_type` | 398 |
 | URL percent-encoding passes through verbatim | `distributed_http_client_percent_encoded_url_passes_through` | 400 |
+| Chunked transfer-encoding response decodes correctly | `distributed_http_client_parses_chunked_transfer_encoding` | 402 |
 | Send + Sync compile-time assertion | `distributed_http_client_is_send_and_sync` | 364 |
 | Arc-sharing across tasks (runtime) | `distributed_http_client_shared_arc_across_tasks` | 365 |
 | Default impl preserves no-redirects policy | `distributed_http_client_default_works_identically_to_new` | 367 |
@@ -259,8 +260,8 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (85 tests)`.
-Exit 0 iff all 85 tests pass.
+output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (86 tests)`.
+Exit 0 iff all 86 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
@@ -311,7 +312,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 These items have been verified in-session and are durable evidence:
 
 - [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
-- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 85 tests passing (31 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive). Confirmed at every post-tick run.
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 86 tests passing (32 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive). Confirmed at every post-tick run.
 - [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec (tick 393). 83/83 remote PASS. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` — recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
 - [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
 - [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.
