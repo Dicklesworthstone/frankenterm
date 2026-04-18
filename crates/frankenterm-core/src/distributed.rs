@@ -4526,6 +4526,34 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 364: `DistributedHttpClient` is `Send + Sync`.
+    ///
+    /// Compile-time assertion. The client holds an
+    /// `asupersync::http::h1::http_client::HttpClient` internally. For the
+    /// distributed RPC use case we want to store the client in `Arc<>`
+    /// and share it across concurrent request tasks — that requires
+    /// `Send + Sync + 'static`.
+    ///
+    /// This is a type-level test: if a future refactor of the inner
+    /// asupersync HttpClient or any wrapping future adds a non-Send/Sync
+    /// field (e.g. `Rc<T>` or a raw pointer), the build will fail here
+    /// before any callsite fires.
+    ///
+    /// Distinct from `distributed_http_client_concurrent_gets` (tick 318)
+    /// which exercises concurrent *creation* of per-task clients — this
+    /// tick proves concurrent *sharing* is type-safe.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_is_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+        assert_send::<DistributedHttpClient>();
+        assert_sync::<DistributedHttpClient>();
+        assert_send_sync_static::<DistributedHttpClient>();
+    }
+
     /// ft-xbnl0.2.4 tick 342: HTTPS URL against plaintext server → Err.
     ///
     /// Pins that `DistributedHttpClient::get` against an `https://` URL
