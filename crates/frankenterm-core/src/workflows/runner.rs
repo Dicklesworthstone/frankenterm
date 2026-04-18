@@ -2041,6 +2041,118 @@ impl WorkflowRunner {
         results
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`resume_incomplete`]
+    /// (tick 222). Final orphan from tick-187's pending list.
+    ///
+    /// Threads caller cx through the entire restart-resume chain:
+    /// - `find_incomplete_workflows_with_cx(cx)` for the initial read
+    /// - Per-record `cx.checkpoint()` gates entry to each resume
+    /// - `engine.resume_cx(cx, &storage, &record.id)` for the state
+    ///   load (tick 188 migration)
+    /// - `run_workflow_with_cx(cx, ...)` for the actual execution
+    ///   (tick 178 entry — runs through run_workflow_inner which is
+    ///   fully cx-threaded as of ticks 178-187)
+    ///
+    /// A cancel fired mid-restart-resume cleanly aborts between
+    /// workflow records instead of resuming all N incomplete ones.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn resume_incomplete_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Vec<WorkflowExecutionResult> {
+        let incomplete = match self.storage.find_incomplete_workflows_with_cx(cx).await {
+            Ok(workflows) => workflows,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    explicit_cx = true,
+                    "Failed to query incomplete workflows (cx)"
+                );
+                return vec![];
+            }
+        };
+
+        let mut results = Vec::new();
+
+        for record in incomplete {
+            if cx.checkpoint().is_err() {
+                tracing::info!(
+                    explicit_cx = true,
+                    "resume_incomplete_with_cx: cancelled between workflow records"
+                );
+                break;
+            }
+
+            let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) else {
+                tracing::warn!(
+                    workflow_name = %record.workflow_name,
+                    execution_id = %record.id,
+                    explicit_cx = true,
+                    "Cannot resume: workflow not registered (cx)"
+                );
+                continue;
+            };
+
+            let (execution, next_step) =
+                match self.engine.resume_cx(cx, &self.storage, &record.id).await {
+                    Ok(Some(resume)) => resume,
+                    Ok(None) => {
+                        tracing::debug!(
+                            execution_id = %record.id,
+                            explicit_cx = true,
+                            "Skipping resume for workflow already in a terminal state (cx)"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %record.id,
+                            error = %e,
+                            explicit_cx = true,
+                            "Failed to load workflow state for resume (cx)"
+                        );
+                        continue;
+                    }
+                };
+
+            let lock_result = self.lock_manager.try_acquire(
+                execution.pane_id,
+                &execution.workflow_name,
+                &execution.id,
+            );
+
+            match lock_result {
+                LockAcquisitionResult::AlreadyLocked { .. } => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        pane_id = execution.pane_id,
+                        explicit_cx = true,
+                        "Cannot resume: pane locked (cx)"
+                    );
+                    continue;
+                }
+                LockAcquisitionResult::Acquired => {}
+            }
+
+            tracing::info!(
+                execution_id = %execution.id,
+                workflow = %execution.workflow_name,
+                pane_id = execution.pane_id,
+                resume_step = next_step,
+                explicit_cx = true,
+                "Resuming workflow (cx)"
+            );
+
+            let result = self
+                .run_workflow_with_cx(cx, execution.pane_id, workflow, &execution.id, next_step)
+                .await;
+
+            results.push(result);
+        }
+
+        results
+    }
+
     // --- Private helper methods ---
 
     async fn update_execution_step(&self, execution_id: &str, step: usize) -> crate::Result<()> {
