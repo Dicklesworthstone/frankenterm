@@ -346,7 +346,10 @@ impl UndoExecutor {
         })?;
 
         match undo.undo_strategy.as_str() {
-            "workflow_abort" => self.execute_workflow_abort(request, &action, &undo).await,
+            "workflow_abort" => {
+                self.execute_workflow_abort_with_cx(cx, request, &action, &undo)
+                    .await
+            }
             "pane_close" => {
                 self.execute_pane_close_with_cx(cx, request, &action, &undo)
                     .await
@@ -395,6 +398,78 @@ impl UndoExecutor {
         {
             Ok(result) if result.aborted => {
                 let undone_at = self.mark_undone(action.id, &request.actor).await?;
+                Ok(UndoExecutionResult::success(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    format!("Aborted workflow {}", result.execution_id),
+                    Some(result.execution_id),
+                    Some(result.pane_id),
+                    undone_at,
+                ))
+            }
+            Ok(result) => {
+                let reason = result
+                    .error_reason
+                    .unwrap_or_else(|| "not_applicable".to_string());
+                let message = format!(
+                    "Workflow {} is not undoable in current state ({reason})",
+                    result.execution_id
+                );
+                Ok(UndoExecutionResult::not_applicable(
+                    action.id,
+                    undo.undo_strategy.clone(),
+                    message,
+                    undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                    Some(result.execution_id),
+                    Some(result.pane_id),
+                ))
+            }
+            Err(err) => Ok(UndoExecutionResult::failed(
+                action.id,
+                undo.undo_strategy.clone(),
+                format!("Failed to abort workflow {execution_id}: {err}"),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                Some(execution_id),
+                action.pane_id,
+            )),
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::execute_workflow_abort`].
+    ///
+    /// Routes the runner abort through `abort_execution_with_cx`
+    /// (tick 131) and the audit mark-undone through
+    /// `mark_undone_with_cx`, so undo of a workflow-abort action
+    /// honours caller cancellation at the two points where it can
+    /// actually block: the cross-WorkflowRunner abort flow and
+    /// the storage write.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn execute_workflow_abort_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        request: UndoRequest,
+        action: &crate::storage::ActionHistoryRecord,
+        undo: &ActionUndoRecord,
+    ) -> Result<UndoExecutionResult> {
+        let execution_id = execution_id_from_undo(undo, action);
+        let Some(execution_id) = execution_id else {
+            return Ok(UndoExecutionResult::not_applicable(
+                action.id,
+                undo.undo_strategy.clone(),
+                "Undo payload did not contain a workflow execution ID".to_string(),
+                undo.undo_hint.clone().or_else(|| action.undo_hint.clone()),
+                None,
+                action.pane_id,
+            ));
+        };
+
+        let runner = self.build_workflow_runner();
+        match runner
+            .abort_execution_with_cx(cx, &execution_id, request.reason.as_deref(), false)
+            .await
+        {
+            Ok(result) if result.aborted => {
+                let undone_at = self.mark_undone_with_cx(cx, action.id, &request.actor).await?;
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),

@@ -273,7 +273,7 @@ async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> Reap
         return report;
     }
 
-    let entries = match list_wezterm_cli_processes_via_ps().await {
+    let entries = match list_wezterm_cli_processes_via_ps_with_cx(cx).await {
         Ok(entries) => entries,
         Err(error) => {
             report.errors.push(error);
@@ -382,6 +382,24 @@ async fn list_wezterm_cli_processes_via_ps() -> Result<Vec<ProcessEntry>, String
     }
 
     Ok(entries)
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`list_wezterm_cli_processes_via_ps`].
+///
+/// Pre-flight `cx.checkpoint()` before spawning the blocking `ps`
+/// command and parsing its output. The spawn_blocking body is not
+/// itself cx-aware (asupersync doesn't yet offer a cx-threaded
+/// spawn_blocking), but this sibling at least lets callers bail
+/// from the reaper scan loop without kicking off another full
+/// `ps` fan-out when parent cancellation is already requested.
+#[cfg(feature = "asupersync-runtime")]
+async fn list_wezterm_cli_processes_via_ps_with_cx(
+    cx: &crate::cx::Cx,
+) -> Result<Vec<ProcessEntry>, String> {
+    cx.checkpoint().map_err(|err| {
+        format!("list_wezterm_cli_processes_via_ps cancelled: {err}")
+    })?;
+    list_wezterm_cli_processes_via_ps().await
 }
 
 /// Parse a single `ps -eo pid,etimes,args` line and return a [`ProcessEntry`]
