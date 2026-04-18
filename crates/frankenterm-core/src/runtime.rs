@@ -1521,7 +1521,13 @@ impl ObservationRuntime {
                             debug!("Retention cleanup completed");
                         }
                         // Also purge old audit actions
-                        if let Err(e) = storage.purge_audit_actions_before(cutoff_ms).await {
+                        // ft-xbnl0.2.3 tick 251: cx-first retention purge.
+                        let purge_cx = crate::cx::Cx::current()
+                            .unwrap_or_else(crate::cx::for_request);
+                        if let Err(e) = storage
+                            .purge_audit_actions_before_with_cx(&purge_cx, cutoff_ms)
+                            .await
+                        {
                             error!(error = %e, "Audit purge failed");
                         }
                     }
@@ -2065,9 +2071,14 @@ impl ObservationRuntime {
                             }
 
                             // Check if pane exists in storage to recover stable UUID
+                            // ft-xbnl0.2.3 tick 251: cx-first storage in pane-setup block.
+                            let pane_setup_cx = crate::cx::Cx::current()
+                                .unwrap_or_else(crate::cx::for_request);
                             let stable_uuid = {
-                                let result =
-                                    storage.get_pane(pane_id).await.unwrap_or_else(|e| {
+                                let result = storage
+                                    .get_pane_with_cx(&pane_setup_cx, pane_id)
+                                    .await
+                                    .unwrap_or_else(|e| {
                                         warn!(pane_id, error = %e, "Failed to check storage for existing pane");
                                         None
                                     });
@@ -2101,15 +2112,22 @@ impl ObservationRuntime {
                             }
 
                             // Upsert pane in storage
+                            // ft-xbnl0.2.3 tick 251: cx-first upsert (reuse pane_setup_cx).
                             let record = entry.to_pane_record();
-                            if let Err(e) = storage.upsert_pane(record).await {
+                            if let Err(e) =
+                                storage.upsert_pane_with_cx(&pane_setup_cx, record).await
+                            {
                                 error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
                             }
 
                             // Create cursor if observed
                             if entry.should_observe() {
                                 // Initialize cursor from storage to resume capture
-                                let max_seq = storage.get_max_seq(pane_id).await.unwrap_or(None);
+                                // ft-xbnl0.2.3 tick 251: cx-first max_seq (reuse pane_setup_cx).
+                                let max_seq = storage
+                                    .get_max_seq_with_cx(&pane_setup_cx, pane_id)
+                                    .await
+                                    .unwrap_or(None);
 
                                 let next_seq = max_seq.map_or(0, |s| s + 1);
 
@@ -2965,7 +2983,10 @@ impl ObservationRuntime {
                                     Some(persisted.segment.id),
                                 );
 
-                                match storage.record_event(stored_event).await {
+                                // ft-xbnl0.2.3 tick 251: cx-first event record.
+                                let event_cx = crate::cx::Cx::current()
+                                    .unwrap_or_else(crate::cx::for_request);
+                                match storage.record_event_with_cx(&event_cx, stored_event).await {
                                     Ok(event_id) => {
                                         metrics.events_recorded.increment();
 
@@ -3112,10 +3133,16 @@ async fn handle_native_event(
                 last_decision_at: Some(timestamp_ms),
             };
 
-            if let Err(err) = storage.upsert_pane(record).await {
+            // ft-xbnl0.2.3 tick 251: cx-first native-event pane upsert.
+            let native_event_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            if let Err(err) = storage.upsert_pane_with_cx(&native_event_cx, record).await {
                 warn!(pane_id, error = %err, "Failed to upsert pane from native event");
             }
-            let max_seq = storage.get_max_seq(pane_id).await.unwrap_or(None);
+            let max_seq = storage
+                .get_max_seq_with_cx(&native_event_cx, pane_id)
+                .await
+                .unwrap_or(None);
 
             if observed {
                 let next_seq = max_seq.map_or(0, |seq| seq + 1);
