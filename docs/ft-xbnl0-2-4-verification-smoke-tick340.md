@@ -1,8 +1,9 @@
-# ft-xbnl0.2.4 — Verification Smoke (tick 340)
+# ft-xbnl0.2.4 — Verification Smoke (tick 340, extended tick 346)
 
 Date: 2026-04-18
 Authored by: RusticMaple
-Commit at time of run: post-`bfb016b2` / ticks 311-339
+Original commit: post-`bfb016b2` / ticks 311-339 (32 tests)
+Extended commit: post-`7ace68aa` / ticks 311-345 (40 tests) — tick 346
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
@@ -35,25 +36,33 @@ cargo test -p frankenterm-core --features distributed,asupersync-runtime --lib d
 ```
 
 ```
-running 15 tests
+running 19 tests
 test distributed::tests::distributed_http_client_creates ... ok
 test distributed::tests::distributed_http_client_post_honors_pre_cancelled_cx ... ok
 test distributed::tests::distributed_http_client_honors_pre_cancelled_cx ... ok
+test distributed::tests::distributed_http_client_rejects_invalid_urls_without_panic ... ok
 test distributed::tests::distributed_http_client_connection_refused_returns_err ... ok
-test distributed::tests::distributed_http_client_sends_host_header_matching_authority ... ok
+test distributed::tests::distributed_http_client_https_url_against_plaintext_server_returns_err ... ok
 test distributed::tests::distributed_http_client_concurrent_gets ... ok
-test distributed::tests::distributed_http_client_url_without_path_defaults_to_slash ... ok
 test distributed::tests::distributed_http_client_preserves_trailing_slash_in_path ... ok
+test distributed::tests::distributed_http_client_surfaces_premature_server_close_as_err ... ok
 test distributed::tests::distributed_http_client_post_large_body_roundtrips ... ok
+test distributed::tests::distributed_http_client_post_empty_body_sends_content_length_zero ... ok
+test distributed::tests::distributed_http_client_sends_host_header_matching_authority ... ok
+test distributed::tests::distributed_http_client_local_get ... ok
+test distributed::tests::distributed_http_client_url_without_path_defaults_to_slash ... ok
 test distributed::tests::distributed_http_client_transmits_full_request_target ... ok
 test distributed::tests::distributed_http_client_sends_non_empty_user_agent ... ok
-test distributed::tests::distributed_http_client_post_empty_body_sends_content_length_zero ... ok
 test distributed::tests::distributed_http_client_local_post ... ok
-test distributed::tests::distributed_http_client_local_get ... ok
+test distributed::tests::distributed_http_client_handles_ipv6_literal_url ... ok
 test distributed::tests::distributed_http_client_returns_non_2xx_as_ok_response ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 25588 filtered out; finished in 0.03s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 25588 filtered out; finished in 0.02s
 ```
+
+Tick 346 extended this run from 15 tests (tick 340) to 19 tests with the
+additions from ticks 342 (https-vs-plaintext), 343 (invalid URL inputs),
+344 (IPv6 literal), and 345 (premature close).
 
 ### Run 2 — TLS bundle + server-name contract tests
 
@@ -100,14 +109,17 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Group | Tests | Result |
 |-------|-------|--------|
-| HTTP client contracts (Run 1) | 15 | 15/15 ok |
+| HTTP client contracts (Run 1) | 19 | 19/19 ok |
 | TLS contracts (Run 2) | 14 | 14/14 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
-| **Subtotal** | **36** | **36/36 ok** |
+| **Subtotal** | **40** | **40/40 ok** |
 
-Run 4 + Run 5 were added tick 341 to close the "individually-verified-only" caveat that was in the tick-340 version of this doc.
+Run 4 + Run 5 were added tick 341 to close the "individually-verified-only" caveat.
+Run 1 expanded from 15 → 19 tests at tick 346 after ticks 342-345 added
+scheme-dispatch (https-vs-plaintext), invalid-URL refusal, IPv6 literal,
+and premature-server-close contracts.
 
 ### Run 4 — metrics server cx-first family (includes tick 322)
 
@@ -146,11 +158,12 @@ Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 36 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
-- Compile time after the initial cold build: 0.26s-3.42s per filtered run. This is cheap to re-run per-commit in CI.
-- The 15 + 14 + 3 + 3 + 1 = 36 count matches the full roster claimed in
-  the completion-evidence doc (HTTP client §2.1 + TLS §2.2 + regression
-  guards §2.4 + service-boundary §2.3 — incl. the 2 pre-existing metrics
-  cx-family tests that tick 322 extended, plus tick 323's web pre-cancel).
+- All 40 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- Compile time after the initial cold build: 0.02s-3.42s per filtered run. This is cheap to re-run per-commit in CI.
+- The 19 + 14 + 3 + 3 + 1 = 40 count matches the full roster landed in
+  the completion-evidence doc through tick 345 (HTTP client §2.1 now
+  covering scheme-dispatch + IPv6 + truncation + invalid-URL paths;
+  TLS §2.2; service-boundary §2.3 incl. 3 pre-existing metrics tests
+  + tick 323's web pre-cancel; regression guards §2.4).
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
