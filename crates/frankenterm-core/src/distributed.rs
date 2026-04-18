@@ -4629,9 +4629,9 @@ KBAhs4snj5QspGFqkazmIw==
     /// responses. A client that only parsed the `HTTP/1.1` shape would
     /// fail on first contact with such a peer.
     ///
-    /// Test server responds with `HTTP/1.0 200 OK` + `Content-Length`
-    /// + short body + `Connection: close`. The client must decode
-    /// status=200 + body="legacy".
+    /// Test server responds with `HTTP/1.0 200 OK` and a short body
+    /// under Content-Length; the client must decode status=200 and
+    /// `body="legacy"`.
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_http_client_decodes_http_1_0_response() {
