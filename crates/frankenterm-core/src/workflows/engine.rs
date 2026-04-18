@@ -805,6 +805,70 @@ async fn record_workflow_action(
     }
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_action`].
+///
+/// Threads caller cx into `record_audit_action_redacted_with_cx`
+/// so the audit-row write honours cancellation. On cancel the
+/// return is `None` (same as legacy when the storage call fails)
+/// so callers in the startup path degrade gracefully — the
+/// workflow continues without a linked audit id rather than
+/// aborting.
+#[cfg(feature = "asupersync-runtime")]
+#[allow(clippy::too_many_arguments)]
+async fn record_workflow_action_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    action_kind: &str,
+    execution_id: &str,
+    pane_id: u64,
+    workflow_name: &str,
+    input_summary: Option<String>,
+    result: &str,
+    decision_reason: Option<String>,
+) -> Option<i64> {
+    let timestamp_ms = now_ms();
+    let decision_context = build_workflow_audit_decision_context(
+        action_kind,
+        execution_id,
+        pane_id,
+        workflow_name,
+        input_summary.as_deref(),
+        result,
+        decision_reason.as_deref(),
+        timestamp_ms,
+    );
+    let action = crate::storage::AuditActionRecord {
+        id: 0,
+        ts: timestamp_ms,
+        actor_kind: "workflow".to_string(),
+        actor_id: Some(execution_id.to_string()),
+        correlation_id: None,
+        pane_id: Some(pane_id),
+        domain: None,
+        action_kind: action_kind.to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason,
+        rule_id: None,
+        input_summary,
+        verification_summary: None,
+        decision_context,
+        result: result.to_string(),
+    };
+
+    match storage.record_audit_action_redacted_with_cx(cx, action).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                execution_id,
+                action_kind,
+                error = %e,
+                "Failed to record workflow audit action (cx path)"
+            );
+            None
+        }
+    }
+}
+
 fn build_workflow_audit_decision_context(
     action_kind: &str,
     execution_id: &str,
@@ -905,6 +969,73 @@ pub(super) async fn record_workflow_start_action(
     Some(action_id)
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_start_action`].
+///
+/// Routes both the audit-action write and the undo-metadata
+/// upsert through their cx-first storage siblings. On
+/// cancellation the return is `None` (legacy contract: a failed
+/// audit write returns None and the workflow continues without a
+/// linked action id) so the startup path degrades gracefully.
+#[cfg(feature = "asupersync-runtime")]
+pub(super) async fn record_workflow_start_action_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    step_count: usize,
+    start_step: usize,
+) -> Option<i64> {
+    let summary = serde_json::json!({
+        "workflow_name": workflow_name,
+        "execution_id": execution_id,
+        "step_count": step_count,
+        "start_step": start_step,
+    });
+    let summary = serde_json::to_string(&summary)
+        .inspect_err(|e| tracing::warn!(error = %e, "workflow start summary serialization failed"))
+        .ok();
+    let action_id = record_workflow_action_with_cx(
+        cx,
+        storage,
+        "workflow_start",
+        execution_id,
+        pane_id,
+        workflow_name,
+        summary,
+        "started",
+        None,
+    )
+    .await?;
+
+    let undo_payload = serde_json::json!({
+        "execution_id": execution_id,
+        "workflow_name": workflow_name,
+    });
+    let undo = crate::storage::ActionUndoRecord {
+        audit_action_id: action_id,
+        undoable: true,
+        undo_strategy: "workflow_abort".to_string(),
+        undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
+        undo_payload: serde_json::to_string(&undo_payload)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"),
+            )
+            .ok(),
+        undone_at: None,
+        undone_by: None,
+    };
+    if let Err(e) = storage.upsert_action_undo_redacted_with_cx(cx, undo).await {
+        tracing::warn!(
+            execution_id,
+            error = %e,
+            "Failed to record workflow undo metadata (cx path)"
+        );
+    }
+
+    Some(action_id)
+}
+
 pub(super) async fn fetch_workflow_start_action_id(
     storage: &crate::storage::StorageHandle,
     execution_id: &str,
@@ -917,6 +1048,31 @@ pub(super) async fn fetch_workflow_start_action_id(
     };
     storage
         .get_audit_actions(query)
+        .await
+        .ok()
+        .and_then(|mut rows| rows.pop().map(|row| row.id))
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`fetch_workflow_start_action_id`].
+///
+/// Routes the audit-query through `get_audit_actions_with_cx`.
+/// Returns `None` on cancellation (matches legacy "storage error
+/// → None" contract) so workflow resume paths degrade gracefully
+/// without a new error variant.
+#[cfg(feature = "asupersync-runtime")]
+pub(super) async fn fetch_workflow_start_action_id_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    execution_id: &str,
+) -> Option<i64> {
+    let query = crate::storage::AuditQuery {
+        limit: Some(1),
+        actor_id: Some(execution_id.to_string()),
+        action_kind: Some("workflow_start".to_string()),
+        ..Default::default()
+    };
+    storage
+        .get_audit_actions_with_cx(cx, query)
         .await
         .ok()
         .and_then(|mut rows| rows.pop().map(|row| row.id))
