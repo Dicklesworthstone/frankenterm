@@ -28311,10 +28311,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     if record_count < page_limit {
-                        frankenterm_core::runtime_compat::sleep(Duration::from_millis(
-                            poll_interval_ms,
-                        ))
-                        .await;
+                        // ft-xbnl0.2.3 tick 290: cx-first audit-stream follow poll sleep.
+                        if frankenterm_core::runtime_compat::sleep_with_cx(
+                            &storage_cx_stream,
+                            Duration::from_millis(poll_interval_ms),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            // Cx cancelled during follow-mode wait.
+                            break;
+                        }
                     }
                 }
             } else {
@@ -30056,6 +30063,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let mut last_text = String::new();
                 let start = std::time::Instant::now();
 
+                // ft-xbnl0.2.3 tick 290: cx-first ft record poll loop.
+                let record_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 loop {
                     if let Some(ms) = auto_stop_ms {
                         if start.elapsed().as_millis() as u64 >= ms {
@@ -30063,7 +30073,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
 
-                    match wez.get_text(pane_id, false).await {
+                    match wez.get_text_with_cx(&record_cx, pane_id, false).await {
                         Ok(text) => {
                             if text != last_text {
                                 let delta = if last_text.is_empty() {
@@ -30086,8 +30096,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
 
-                    frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(200))
-                        .await;
+                    if frankenterm_core::runtime_compat::sleep_with_cx(
+                        &record_cx,
+                        std::time::Duration::from_millis(200),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        // Cx cancelled during record poll.
+                        break;
+                    }
                 }
 
                 recorder.stop()?;
