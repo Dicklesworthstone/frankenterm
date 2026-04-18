@@ -15818,7 +15818,13 @@ async fn run_saved_search_scheduler(
             options.include_snippets = Some(true);
             options.snippet_max_tokens = Some(64);
 
-            let results = match storage.search_with_results(&search.query, options).await {
+            // ft-xbnl0.2.3 tick 245: cx-first storage search.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let results = match storage
+                .search_with_results_with_cx(&storage_cx, &search.query, options)
+                .await
+            {
                 Ok(results) => {
                     consecutive_errors_by_id.remove(&search_id);
                     next_allowed_run_at_by_id.remove(&search_id);
@@ -23020,7 +23026,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             highlight_suffix: Some("<<".to_string()),
                         };
 
-                        match storage.search_with_results(&saved.query, options).await {
+                        // ft-xbnl0.2.3 tick 245: cx-first storage search.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match storage
+                            .search_with_results_with_cx(&storage_cx, &saved.query, options)
+                            .await
+                        {
                             Ok(results) => {
                                 if let Err(e) = storage
                                     .update_saved_search_run(
@@ -23827,9 +23839,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             for candidate_pane in candidate_panes {
                                 let mut options = base_options.clone();
                                 options.pane_id = Some(candidate_pane);
+                                // ft-xbnl0.2.3 tick 245: cx-first storage search.
+                                let storage_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
                                 let mut pane_results = match requested_mode {
                                     frankenterm_core::query_contract::UnifiedSearchMode::Lexical => {
-                                        match storage.search_with_results(&query_for_storage, options).await {
+                                        match storage.search_with_results_with_cx(&storage_cx, &query_for_storage, options).await {
                                             Ok(results) => results,
                                             Err(e) => {
                                                 if output_format.is_json() {
