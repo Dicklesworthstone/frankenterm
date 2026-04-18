@@ -180,7 +180,13 @@ pub async fn persist_caut_refresh_accounts(
 
     // Best-effort: avoid breaking account selection due to metrics storage failure.
     if !metrics.is_empty() {
-        if let Err(err) = storage.record_usage_metrics_batch(metrics).await {
+        // ft-xbnl0.2.3 tick 260: cx-first batch usage-metric write.
+        let metrics_cx = crate::cx::Cx::current()
+            .unwrap_or_else(crate::cx::for_request);
+        if let Err(err) = storage
+            .record_usage_metrics_batch_with_cx(&metrics_cx, metrics)
+            .await
+        {
             tracing::warn!(error = %err, "Failed to record caut refresh usage metrics");
         }
     }
