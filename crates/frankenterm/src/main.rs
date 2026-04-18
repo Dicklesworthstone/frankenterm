@@ -18367,7 +18367,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
-                                let panes = match storage.get_panes().await {
+                                // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                                let reindex_panes_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                let panes = match storage.get_panes_with_cx(&reindex_panes_cx).await {
                                     Ok(panes) => panes,
                                     Err(err) => {
                                         let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
@@ -19754,15 +19757,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         Err(_) => (None, None),
                                                     }
                                                 } else {
+                                                    // ft-xbnl0.2.3 tick 249: cx-first storage read.
                                                     let latest = storage
-                                                        .get_latest_step_log(exec_id)
+                                                        .get_latest_step_log_with_cx(&storage_cx, exec_id)
                                                         .await
                                                         .unwrap_or_default();
                                                     (None, latest)
                                                 };
 
                                                 let (action_plan, plan_step_name, total_steps) =
-                                                    match storage.get_action_plan(exec_id).await {
+                                                    // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                                                    match storage
+                                                        .get_action_plan_with_cx(&storage_cx, exec_id)
+                                                        .await
+                                                    {
                                                         Ok(Some(plan_record)) => {
                                                             let parsed_plan =
                                                                 serde_json::from_str::<
@@ -24228,10 +24236,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     BookmarkAction::List { tag, json } => {
+                        // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
                         let bookmarks = if let Some(ref tag) = tag {
-                            storage.list_pane_bookmarks_by_tag(tag).await
+                            storage
+                                .list_pane_bookmarks_by_tag_with_cx(&storage_cx, tag)
+                                .await
                         } else {
-                            storage.list_pane_bookmarks().await
+                            storage.list_pane_bookmarks_with_cx(&storage_cx).await
                         };
                         match bookmarks {
                             Ok(list) => {
@@ -25094,7 +25107,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             if verbose > 0 {
-                                match storage.get_action_plan(&execution_id).await {
+                                // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                                match storage
+                                    .get_action_plan_with_cx(&storage_cx, &execution_id)
+                                    .await
+                                {
                                     Ok(Some(plan)) => {
                                         println!("\nAction plan:");
                                         println!("  plan_id: {}", plan.plan_id);
@@ -25125,7 +25142,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
 
-                                match storage.get_step_logs(&execution_id).await {
+                                // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                                match storage
+                                    .get_step_logs_with_cx(&storage_cx, &execution_id)
+                                    .await
+                                {
                                     Ok(logs) => {
                                         if logs.is_empty() {
                                             println!("\nStep logs: <none>");
@@ -26094,7 +26115,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                let annotations = match storage.get_event_annotations(event_id).await {
+                // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                let annotations_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let annotations = match storage
+                    .get_event_annotations_with_cx(&annotations_cx, event_id)
+                    .await
+                {
                     Ok(Some(a)) => a,
                     Ok(None) => die(
                         &format!("Event {event_id} not found"),
@@ -26176,8 +26203,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             out
                         };
                         let mut lines: Vec<String> = Vec::new();
+                        // ft-xbnl0.2.3 tick 249: cx-first storage read (loop-shared).
+                        let ann_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
                         for event in display_events {
-                            match storage.get_event_annotations(event.id).await {
+                            match storage.get_event_annotations_with_cx(&ann_cx, event.id).await {
                                 Ok(Some(annotations)) => {
                                     if annotations.triage_state.is_none()
                                         && annotations.note.is_none()
@@ -26317,7 +26347,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             // Fetch timeline
-            match storage.get_timeline(query).await {
+            // ft-xbnl0.2.3 tick 249: cx-first storage read.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match storage.get_timeline_with_cx(&storage_cx, query).await {
                 Ok(timeline) => {
                     let ctx = RenderContext::new(output_format).verbose(cli.verbose);
                     let rendered = TimelineRenderer::render(&timeline, &ctx);
@@ -27158,7 +27191,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 text.clone()
             };
 
-            let existing = match storage.get_prepared_plan(&plan_id).await {
+            // ft-xbnl0.2.3 tick 249: cx-first storage read.
+            let storage_cx_plan = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let existing = match storage
+                .get_prepared_plan_with_cx(&storage_cx_plan, &plan_id)
+                .await
+            {
                 Ok(record) => record,
                 Err(e) => {
                     eprintln!("Error: Failed to load prepared plan: {e}");
@@ -28037,7 +28076,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ..Default::default()
                     };
 
-                    let page = match storage.get_audit_actions_stream(query).await {
+                    // ft-xbnl0.2.3 tick 249: cx-first storage read.
+                    let storage_cx_stream = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let page = match storage
+                        .get_audit_actions_stream_with_cx(&storage_cx_stream, query)
+                        .await
+                    {
                         Ok(page) => page,
                         Err(e) => {
                             eprintln!("Error: Failed to stream audit trail: {e}");
