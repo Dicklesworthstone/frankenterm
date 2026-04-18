@@ -629,10 +629,17 @@ impl MuxWatchdog {
 
         let rss_bytes = get_mux_server_rss_with_cx(cx).await;
 
+        // Tick 211 (ft-xbnl0.2.3): route the warning probe through
+        // `watchdog_warnings_with_cx(cx)` (added this tick). Default
+        // trait impl delegates to ambient `watchdog_warnings()`, so
+        // impls without an override see identical behavior; impls
+        // that override get end-to-end cx threading. Previously this
+        // wrapped ambient watchdog_warnings() in timeout_with_cx —
+        // same shape as the ping path before tick 206.
         let warning_probe = match crate::runtime_compat::timeout_with_cx(
             cx,
             self.config.ping_timeout,
-            self.wezterm.watchdog_warnings(),
+            self.wezterm.watchdog_warnings_with_cx(cx),
         )
         .await
         {

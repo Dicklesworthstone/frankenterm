@@ -348,6 +348,20 @@ pub trait WeztermInterface: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`watchdog_warnings`]
+    /// (tick 211). Default implementation delegates to
+    /// [`watchdog_warnings`](Self::watchdog_warnings), which uses
+    /// ambient cx. Concrete impls with a Cx-aware path should
+    /// override to propagate caller cx into their backend
+    /// telemetry reads (e.g. mux pool status fetch).
+    #[cfg(feature = "asupersync-runtime")]
+    fn watchdog_warnings_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+    ) -> WeztermFuture<'a, Vec<String>> {
+        self.watchdog_warnings()
+    }
+
     /// Best-effort tiered scrollback summary for a pane.
     ///
     /// This is only available from backends that can expose mux-side pane
