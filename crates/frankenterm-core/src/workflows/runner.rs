@@ -735,7 +735,24 @@ impl WorkflowRunner {
             } else if idempotency_skip.is_some() {
                 StepResult::Continue
             } else {
-                workflow.execute_step(&mut ctx, current_step).await
+                // Tick 187: route step execution through execute_step_cx
+                // when cx is Some so workflow implementors that override
+                // the cx-first trait method (ft-xbnl0.2.2) can observe
+                // caller cancellation mid-step. Implementors that use
+                // the default trait impl still receive ambient semantics
+                // — the default delegates to execute_step unchanged.
+                #[cfg(feature = "asupersync-runtime")]
+                let step_outcome = if let Some(cx) = cx {
+                    workflow.execute_step_cx(cx, &mut ctx, current_step).await
+                } else {
+                    workflow.execute_step(&mut ctx, current_step).await
+                };
+                #[cfg(not(feature = "asupersync-runtime"))]
+                let step_outcome = {
+                    let _ = cx;
+                    workflow.execute_step(&mut ctx, current_step).await
+                };
+                step_outcome
             };
 
             // Log step result
