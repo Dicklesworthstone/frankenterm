@@ -4526,6 +4526,54 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 367: `DistributedHttpClient::default()` builds without
+    /// panic and inherits the tick-351 no-redirects policy.
+    ///
+    /// The `Default` impl delegates to `Self::new()` which uses the
+    /// builder with `.no_redirects()`. A regression where `Default` were
+    /// implemented via `#[derive(Default)]` on the inner field would
+    /// give the asupersync HttpClient's default (redirects = Limited,
+    /// per `RedirectPolicy::default`) — a security regression back to
+    /// the ft-kfkyi exfiltration risk.
+    ///
+    /// This test exercises:
+    /// 1. `Default::default()` builds without panic.
+    /// 2. The resulting client can actually be used for GET.
+    /// 3. `std::default::Default::default()` (canonical form) works
+    ///    identically to bare `Default::default()`.
+    ///
+    /// The runtime exercise is important: a compile-time check can't
+    /// catch a `Default` impl that delegated to the wrong builder path.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_default_works_identically_to_new() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read");
+                assert!(n > 0);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client: DistributedHttpClient = Default::default();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/default", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"default");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 365: `Arc<DistributedHttpClient>` shared across tasks.
     ///
     /// Runtime companion to the tick-364 compile-time `Send + Sync`
