@@ -24569,7 +24569,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 audit_record.input_summary = Some(
                     frankenterm_core::policy::build_send_text_audit_summary(&text, None, None),
                 );
-                match storage.record_audit_action_redacted(audit_record).await {
+                // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                let storage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match storage
+                    .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
+                    .await
+                {
                     Ok(audit_id) => {
                         injection.set_audit_action_id(audit_id);
                     }
@@ -25807,7 +25813,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             decision_context,
                             result: "success".to_string(),
                         };
-                        if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                        // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        if let Err(e) = storage
+                            .record_audit_action_redacted_with_cx(&storage_cx, audit)
+                            .await
+                        {
                             tracing::warn!("Failed to record event annotation audit: {e}");
                         }
 
@@ -25880,7 +25892,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "noop".to_string()
                             },
                         };
-                        if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                        // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        if let Err(e) = storage
+                            .record_audit_action_redacted_with_cx(&storage_cx, audit)
+                            .await
+                        {
                             tracing::warn!("Failed to record event triage audit: {e}");
                         }
 
@@ -25954,7 +25972,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     "noop".to_string()
                                 },
                             };
-                            if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                            // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                            let storage_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            if let Err(e) = storage
+                                .record_audit_action_redacted_with_cx(&storage_cx, audit)
+                                .await
+                            {
                                 tracing::warn!("Failed to record event label audit: {e}");
                             }
 
@@ -26002,7 +26026,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     "noop".to_string()
                                 },
                             };
-                            if let Err(e) = storage.record_audit_action_redacted(audit).await {
+                            // ft-xbnl0.2.3 tick 240: cx-first storage write.
+                            let storage_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            if let Err(e) = storage
+                                .record_audit_action_redacted_with_cx(&storage_cx, audit)
+                                .await
+                            {
                                 tracing::warn!("Failed to record event label audit: {e}");
                             }
 
