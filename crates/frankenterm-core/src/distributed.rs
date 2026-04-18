@@ -4166,6 +4166,59 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 345: Server closes mid-response → client returns Err.
+    ///
+    /// Pins that the client returns `Err` (not a truncated `Ok` and not
+    /// a hang) when the server begins writing a response but closes
+    /// the connection before the full `Content-Length` is delivered.
+    ///
+    /// This is a realistic network interruption mode: flaky connection,
+    /// server OOM-killed mid-response, upstream restarted. The client
+    /// should surface the failure so the caller can decide whether to
+    /// retry — a truncated `Ok` would leak corrupt data into the call
+    /// site, and a hang would stall an agent workflow indefinitely.
+    ///
+    /// Test: server sends headers promising 100 bytes, writes 5 bytes
+    /// of body, then closes. Client must return Err within a bounded
+    /// window.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_surfaces_premature_server_close_as_err() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                // Headers claim 100 bytes, but only 5 are sent before close.
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort";
+                let _ = stream.write_all(response).await;
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/short", addr.port());
+
+            let started = std::time::Instant::now();
+            let result = client.get(&cx, &url).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "premature server close must produce Err, not truncated Ok"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "premature close must fail fast; took {elapsed:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 344: IPv6 literal URL (bracketed authority) roundtrip.
     ///
     /// Pins that `DistributedHttpClient::get` correctly handles a URL
