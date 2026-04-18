@@ -64,7 +64,10 @@ run_test() {
     # Capture stdout + stderr to a tempfile so we can tally the "N passed"
     # count while still showing the output to the operator.
     local tmp
-    tmp="$(mktemp -t ft-xbnl0-2-4-check.XXXXXX)"
+    # Explicit template path for portability — BSD (`mktemp -t PREFIX`)
+    # and GNU (`mktemp -t TEMPLATE`) differ on the `-t` argument form,
+    # but both accept a full template path as a positional argument.
+    tmp="$(mktemp "${TMPDIR:-/tmp}/ft-xbnl0-2-4-check.XXXXXX")"
     if cargo test "$@" 2>&1 | tee "${tmp}"; then
         # Sum all "N passed" counts from all `test result: ok.` lines in
         # this run (per-binary splits may produce multiple result lines
