@@ -430,6 +430,31 @@ impl WorkflowRunner {
         execution_id: &str,
         start_step: usize,
     ) -> WorkflowExecutionResult {
+        self.run_workflow_inner(None, pane_id, workflow, execution_id, start_step)
+            .await
+    }
+
+    /// Tick 180: shared implementation for [`run_workflow`] and
+    /// [`run_workflow_with_cx`]. When `cx` is `Some`, the 4 startup
+    /// storage call sites (record_workflow_start_action,
+    /// fetch_workflow_start_action_id, get_workflow, get_pane) route
+    /// through their cx-first siblings so caller cancellation
+    /// propagates through the full workflow-start handshake. When
+    /// `cx` is `None` (legacy caller), the behavior is byte-for-byte
+    /// identical to the pre-tick-180 body.
+    ///
+    /// The step-loop portion (after ctx setup) does not yet thread
+    /// cx — future ticks (181+) will migrate per-step checkpoints
+    /// and per-step-branch storage calls progressively.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_workflow_inner(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
         let start_time = Instant::now();
         let workflow_name = workflow.name().to_string();
         let step_count = workflow.step_count();
@@ -440,17 +465,61 @@ impl WorkflowRunner {
         // A workflow with N steps should never need more than N*10 jumps.
         let max_total_jumps = step_count.saturating_mul(10).max(100);
         let start_action_id = if start_step == 0 {
-            record_workflow_start_action(
-                &self.storage,
-                &workflow_name,
-                execution_id,
-                pane_id,
-                step_count,
-                start_step,
-            )
-            .await
+            #[cfg(feature = "asupersync-runtime")]
+            let rec = if let Some(cx) = cx {
+                record_workflow_start_action_with_cx(
+                    cx,
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    step_count,
+                    start_step,
+                )
+                .await
+            } else {
+                record_workflow_start_action(
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    step_count,
+                    start_step,
+                )
+                .await
+            };
+            #[cfg(not(feature = "asupersync-runtime"))]
+            let rec = {
+                let _ = cx;
+                record_workflow_start_action(
+                    &self.storage,
+                    &workflow_name,
+                    execution_id,
+                    pane_id,
+                    step_count,
+                    start_step,
+                )
+                .await
+            };
+            rec
         } else {
-            fetch_workflow_start_action_id(&self.storage, execution_id).await
+            #[cfg(feature = "asupersync-runtime")]
+            let fetched = if let Some(cx) = cx {
+                fetch_workflow_start_action_id_with_cx(
+                    cx,
+                    &self.storage,
+                    execution_id,
+                )
+                .await
+            } else {
+                fetch_workflow_start_action_id(&self.storage, execution_id).await
+            };
+            #[cfg(not(feature = "asupersync-runtime"))]
+            let fetched = {
+                let _ = cx;
+                fetch_workflow_start_action_id(&self.storage, execution_id).await
+            };
+            fetched
         };
 
         // Create workflow context with injector for policy-gated actions.
@@ -467,13 +536,29 @@ impl WorkflowRunner {
         .with_injector(Arc::clone(&self.injector));
 
         // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
-        if let Ok(Some(record)) = self.storage.get_workflow(execution_id).await {
+        #[cfg(feature = "asupersync-runtime")]
+        let maybe_wf = if let Some(cx) = cx {
+            self.storage.get_workflow_with_cx(cx, execution_id).await
+        } else {
+            self.storage.get_workflow(execution_id).await
+        };
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let maybe_wf = self.storage.get_workflow(execution_id).await;
+        if let Ok(Some(record)) = maybe_wf {
             if let Some(trigger) = record.context {
                 ctx = ctx.with_trigger(trigger);
             }
         }
 
-        if let Ok(Some(record)) = self.storage.get_pane(pane_id).await {
+        #[cfg(feature = "asupersync-runtime")]
+        let maybe_pane = if let Some(cx) = cx {
+            self.storage.get_pane_with_cx(cx, pane_id).await
+        } else {
+            self.storage.get_pane(pane_id).await
+        };
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let maybe_pane = self.storage.get_pane(pane_id).await;
+        if let Ok(Some(record)) = maybe_pane {
             ctx.set_pane_meta(PaneMetadata::from_record(&record));
         }
 
@@ -1494,10 +1579,14 @@ impl WorkflowRunner {
     /// gates the workflow start — if the caller's cx is already
     /// cancelled, surfaces `WorkflowExecutionResult::Error` with
     /// a cancellation reason before touching storage or policy.
-    /// When the cx is healthy, delegates to the legacy
-    /// `run_workflow`. Future ticks (the strangler-fig plan
-    /// started here) will progressively migrate the legacy body
-    /// onto cx-aware storage and per-step checkpoints.
+    ///
+    /// Tick 180: upgraded to route through the shared
+    /// `run_workflow_inner(Some(cx), ...)` path so the 4 startup
+    /// storage call sites (record_workflow_start_action,
+    /// fetch_workflow_start_action_id, get_workflow, get_pane)
+    /// all thread the caller's cx. The step-loop portion after
+    /// ctx setup is still on the ambient path; future ticks
+    /// (181+) will migrate per-step cancellation.
     ///
     /// Using the `Error` variant (not a new variant) keeps the
     /// match surface stable — every `run_workflow` caller already
@@ -1517,7 +1606,7 @@ impl WorkflowRunner {
                 error: format!("run_workflow cancelled pre-start: {err}"),
             };
         }
-        self.run_workflow(pane_id, workflow, execution_id, start_step)
+        self.run_workflow_inner(Some(cx), pane_id, workflow, execution_id, start_step)
             .await
     }
 
