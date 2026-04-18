@@ -3594,6 +3594,57 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 320: Transport-error (connection-refused) contract.
+    ///
+    /// Pins that `DistributedHttpClient::get` returns `Err` promptly when
+    /// the target port has no listener. This is the "transport failed"
+    /// branch of the return type — contrasts with tick 319 which covers
+    /// "transport succeeded, but server returned an error status".
+    ///
+    /// Together, ticks 319 + 320 define a three-outcome matrix:
+    /// - 2xx body payload            → `Ok(Response{status: 2xx, body})`
+    /// - non-2xx response            → `Ok(Response{status: 4xx/5xx, body})`
+    /// - connection failed to open   → `Err(...)`
+    ///
+    /// Callers rely on this separation to route retries correctly:
+    /// transport `Err` is retryable (other side may come back), non-2xx
+    /// `Ok` may or may not be retryable depending on the status code.
+    ///
+    /// Acceptance criterion 3 of ft-xbnl0.2.4 ("Verification covers
+    /// correctness") includes this contract.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_connection_refused_returns_err() {
+        run_async_test(async {
+            // Bind then drop to grab an unused port. By the time we try
+            // to connect, nothing is listening on it.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            drop(listener);
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/health", addr.port());
+
+            let started = std::time::Instant::now();
+            let result = client.get(&cx, &url).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "connect to dead port must return Err, got: {result:?}"
+            );
+            // Connection refusal on loopback should be near-instant. Bound
+            // generously to tolerate kernel scheduling variance on loaded
+            // CI hosts; the contract is "does not hang" not a tight
+            // latency bound.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "connection-refused should fail fast; took {elapsed:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 319: Non-2xx response handling contract.
     ///
     /// Pins that `DistributedHttpClient::get` returns server error
