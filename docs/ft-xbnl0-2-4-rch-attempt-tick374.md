@@ -87,6 +87,42 @@ guards group first into the same target dir so dependency compilation
 is shared. Partial log at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/rch-http.log`
 (56 KB, mid-compile — no test result yet).
 
+### Re-confirmation at HEAD (tick 391, post-ft-l9mxa fix)
+
+Re-ran the guards rch test after the tick-387 ft-l9mxa fix landed
+to confirm the remote-build path still works at HEAD:
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-2-4-tick391-guards \
+    cargo test -p frankenterm-core \
+    --test ft_xbnl0_2_4_no_direct_tokio_net_or_rustls
+```
+
+Result: **3/3 guards PASS** on vmi1149989 (same worker as tick 374).
+
+```
+running 3 tests
+test ft_xbnl0_2_4_asupersync_workspace_dep_present ... ok
+test ft_xbnl0_2_4_no_tokio_net_deps_in_workspace_manifests ... ok
+test ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports ... ok
+
+test result: ok. 3 passed; 0 failed; finished in 1.26s
+[RCH] remote vmi1149989 (484.3s)
+```
+
+Total wall: 484.3s — longer than tick 374's 116s because the target
+dir was fresh (tick 391 uses `-tick391-` vs tick 374's `-tick374-`)
+and the workspace had grown with all the new tests/docs between
+the two runs (thus more to sync). Test-exec time itself was 1.26s.
+
+**Evidence**: the ft-xbnl0.2.4 remote verification path continues
+to work at HEAD. All code changes between tick 374 and tick 391
+(including ticks 375-390 test additions and the ft-l9mxa fix) are
+remote-build-compatible.
+
+Log at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/rch-guards-tick391.log`
+(50 KB).
+
 ## Implication for §6 closure checklist
 
 - The `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` form (§4a one-shot)
