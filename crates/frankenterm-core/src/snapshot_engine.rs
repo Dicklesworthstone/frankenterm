@@ -766,6 +766,11 @@ impl SnapshotEngine {
 
     /// Attempt a capture via the pane provider, with standard logging.
     /// Returns `true` if a new checkpoint was persisted.
+    ///
+    /// Retained as a legacy ambient path alongside the cx-first sibling
+    /// `capture_from_provider_with_cx` used by `run_periodic_with_cx`
+    /// and the current periodic scheduler (ticks 111/112).
+    #[allow(dead_code)]
     async fn capture_from_provider<F, Fut>(
         &self,
         pane_provider: &F,
