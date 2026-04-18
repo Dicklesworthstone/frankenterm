@@ -2316,6 +2316,114 @@ impl HandleOnErrorCassSearch {
                 .map(ToString::to_string),
         }
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`lookup_cass_hints`] (tick 216).
+    /// Mirrors HandleSessionStartContext::lookup_cass_hints_with_cx —
+    /// routes `storage.get_pane_with_cx` + each `cass.search_with_cx`
+    /// and adds a per-query checkpoint to avoid waiting through all
+    /// N cass timeouts after cancel.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn lookup_cass_hints_with_cx(
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> OnErrorCassHintsLookup {
+        let pane = match storage.get_pane_with_cx(cx, pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return OnErrorCassHintsLookup {
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                    ..Default::default()
+                };
+            }
+        };
+
+        let query_candidates = Self::query_candidates(trigger, pane.as_ref());
+        let Some(first_query) = query_candidates.first().cloned() else {
+            return OnErrorCassHintsLookup {
+                query_candidates,
+                error: Some("no_query_candidates".to_string()),
+                error_text: Self::extract_error_text(trigger),
+                rule_id: trigger
+                    .get("rule_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                ..Default::default()
+            };
+        };
+
+        let workspace = Self::workspace_from_pane(pane.as_ref());
+        let options = SearchOptions {
+            limit: Some(ON_ERROR_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(ON_ERROR_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(250),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(ON_ERROR_CASS_TIMEOUT_SECS);
+        let mut last_error: Option<String> = None;
+
+        for query in &query_candidates {
+            if cx.checkpoint().is_err() {
+                return OnErrorCassHintsLookup {
+                    query: Some(query.clone()),
+                    query_candidates,
+                    workspace,
+                    hints: vec![],
+                    error: Some("cancelled during on-error cass lookup".to_string()),
+                    error_text: Self::extract_error_text(trigger),
+                    rule_id: trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                };
+            }
+            match cass.search_with_cx(cx, query, &options).await {
+                Ok(result) => {
+                    let hints = result
+                        .hits
+                        .iter()
+                        .filter_map(Self::format_cass_hint)
+                        .take(ON_ERROR_CASS_HINT_LIMIT)
+                        .collect::<Vec<_>>();
+                    if !hints.is_empty() {
+                        return OnErrorCassHintsLookup {
+                            query: Some(query.clone()),
+                            query_candidates,
+                            workspace,
+                            hints,
+                            error: None,
+                            error_text: Self::extract_error_text(trigger),
+                            rule_id: trigger
+                                .get("rule_id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string),
+                        };
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+
+        OnErrorCassHintsLookup {
+            query: Some(first_query),
+            query_candidates,
+            workspace,
+            hints: vec![],
+            error: last_error,
+            error_text: Self::extract_error_text(trigger),
+            rule_id: trigger
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+        }
+    }
 }
 
 impl Default for HandleOnErrorCassSearch {
@@ -2549,6 +2657,183 @@ impl Workflow for HandleOnErrorCassSearch {
                             pane_id,
                             hint_count = lookup.hints.len(),
                             "handle_on_error_cass_search: found past fixes"
+                        );
+                        StepResult::done(serde_json::json!({
+                            "status": "hints_found",
+                            "pane_id": pane_id,
+                            "hint_count": lookup.hints.len(),
+                            "hints": lookup.hints,
+                            "query": lookup.query,
+                        }))
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 216). Third per-impl
+    /// Workflow migration following HandleSessionEnd (214) and
+    /// HandleSessionStartContext (215).
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `lookup_cass_hints_with_cx` (pane + cass subprocess loop
+    ///     with per-query checkpoint)
+    ///   - `record_audit_action_with_cx` (audit write)
+    ///
+    /// Pre-step cx.checkpoint() gates entry.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_on_error_cass_search cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Cooldown check (cx-first read)
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("on_error_cass_search".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_search_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_on_error_cass_search: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_search_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                explicit_cx = true,
+                                "handle_on_error_cass_search: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: cx-first cass search + audit record
+                1 => {
+                    let lookup =
+                        Self::lookup_cass_hints_with_cx(cx, &storage, pane_id, &trigger).await;
+                    let result_label = if lookup.hints.is_empty() {
+                        if lookup.error.is_some() {
+                            "lookup_error"
+                        } else {
+                            "no_hints"
+                        }
+                    } else {
+                        "hints_found"
+                    };
+
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let timestamp_ms = now_ms();
+
+                    let error_preview = lookup.error_text.as_deref().unwrap_or("unknown error");
+                    let input_summary =
+                        format!("On-error cass search for {agent_type}: {error_preview}");
+                    let decision_context = build_on_error_cass_audit_decision_context(
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &lookup,
+                        &input_summary,
+                        result_label,
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "on_error_cass_search".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: result_label.to_string(),
+                    };
+
+                    if let Err(error) = storage.record_audit_action_with_cx(cx, audit).await {
+                        tracing::error!(
+                            pane_id,
+                            error = %error,
+                            explicit_cx = true,
+                            "handle_on_error_cass_search: failed to record audit (cx)"
+                        );
+                        return StepResult::abort(format!(
+                            "Failed to record on_error_cass_search audit: {error}"
+                        ));
+                    }
+
+                    if lookup.hints.is_empty() {
+                        tracing::info!(
+                            pane_id,
+                            result = result_label,
+                            explicit_cx = true,
+                            "handle_on_error_cass_search: no past fixes found (cx)"
+                        );
+                        StepResult::done(serde_json::json!({
+                            "status": result_label,
+                            "pane_id": pane_id,
+                            "error_text": lookup.error_text,
+                        }))
+                    } else {
+                        tracing::info!(
+                            pane_id,
+                            hint_count = lookup.hints.len(),
+                            explicit_cx = true,
+                            "handle_on_error_cass_search: found past fixes (cx)"
                         );
                         StepResult::done(serde_json::json!({
                             "status": "hints_found",
