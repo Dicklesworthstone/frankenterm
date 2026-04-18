@@ -3001,6 +3001,40 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 337: MissingClientCaPath (mTLS-only error path)
+    //
+    // When `auth_mode.requires_mtls()` is true, the server-side TLS
+    // config needs a client CA path to verify incoming client certs.
+    // Omitting it surfaces `MissingClientCaPath` — pinned here to
+    // complete the error-variant coverage matrix (now 7 of 8
+    // DistributedTlsError variants via build_tls_bundle round-trip).
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_rejects_mtls_without_client_ca_path() {
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+        // client_ca_path intentionally left as None.
+        config.auth_mode = DistributedAuthMode::Mtls;
+
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("mTLS without client CA path must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DistributedTlsError::MissingClientCaPath),
+            "mTLS without client CA must surface MissingClientCaPath variant; got: {err:?}"
+        );
+    }
+
+    // =====================================================================
     // ft-xbnl0.2.4 tick 336: empty-PEM error paths
     //
     // Operators sometimes create the expected cert file but populate it
