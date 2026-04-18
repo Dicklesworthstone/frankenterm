@@ -17524,9 +17524,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             // Create WezTerm client
                             let wezterm = default_wezterm_handle();
+                            // ft-xbnl0.2.3 tick 232: cx-first.
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
 
                             // First verify the pane exists
-                            match wezterm.list_panes().await {
+                            match wezterm.list_panes_with_cx(&cx).await {
                                 Ok(panes) => {
                                     if !panes.iter().any(|p| p.pane_id == pane_id) {
                                         let response =
@@ -19236,7 +19239,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             );
                                         let wezterm =
                                             frankenterm_core::wezterm::default_wezterm_handle();
-                                        let pane_info = wezterm.get_pane(pane_id).await.ok();
+                                        // ft-xbnl0.2.3 tick 232: cx-first.
+                                        let cx = frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                                        let pane_info =
+                                            wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
                                         let report = build_workflow_dry_run_report(
                                             &command_ctx,
                                             &name,
@@ -19255,7 +19262,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Verify pane exists
                                     let wezterm =
                                         frankenterm_core::wezterm::default_wezterm_handle();
-                                    match wezterm.list_panes().await {
+                                    // ft-xbnl0.2.3 tick 232: cx-first.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    match wezterm.list_panes_with_cx(&cx).await {
                                         Ok(panes) => {
                                             if !panes.iter().any(|p| p.pane_id == pane_id) {
                                                 let response =
@@ -21163,7 +21173,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         frankenterm_core::wezterm::wezterm_handle_from_config(
                                             &config,
                                         );
-                                    let running_agents = match wezterm.list_panes().await {
+                                    // ft-xbnl0.2.3 tick 232: cx-first.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    let running_agents = match wezterm.list_panes_with_cx(&cx).await
+                                    {
                                         Ok(panes) => infer_running_agents_from_panes(&panes),
                                         Err(err) => {
                                             tracing::warn!(
@@ -21215,7 +21229,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         frankenterm_core::wezterm::wezterm_handle_from_config(
                                             &config,
                                         );
-                                    let panes = match wezterm.list_panes().await {
+                                    // ft-xbnl0.2.3 tick 232: cx-first.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    let panes = match wezterm.list_panes_with_cx(&cx).await {
                                         Ok(panes) => panes,
                                         Err(err) => {
                                             let response =
@@ -21279,7 +21296,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         frankenterm_core::wezterm::wezterm_handle_from_config(
                                             &config,
                                         );
-                                    let running_agents = match wezterm.list_panes().await {
+                                    // ft-xbnl0.2.3 tick 232: cx-first.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    let running_agents = match wezterm.list_panes_with_cx(&cx).await
+                                    {
                                         Ok(panes) => infer_running_agents_from_panes(&panes),
                                         Err(err) => {
                                             tracing::warn!(
