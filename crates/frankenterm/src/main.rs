@@ -18459,7 +18459,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         max_tokens,
                                     };
 
-                                    match client.search(&query, &options).await {
+                                    // ft-xbnl0.2.3 tick 229: cx-first cass search.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    match client.search_with_cx(&cx, &query, &options).await {
                                         Ok(result) => {
                                             let response =
                                                 RobotResponse::success(result, elapsed_ms(start));
@@ -18490,7 +18493,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         context_lines: Some(context_lines),
                                     };
                                     let path = std::path::PathBuf::from(&source_path);
-                                    match client.query(&path, line_number, &options).await {
+                                    // ft-xbnl0.2.3 tick 229: cx-first cass query.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    match client
+                                        .query_with_cx(&cx, &path, line_number, &options)
+                                        .await
+                                    {
                                         Ok(result) => {
                                             let response =
                                                 RobotResponse::success(result, elapsed_ms(start));
