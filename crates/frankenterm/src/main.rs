@@ -9051,8 +9051,11 @@ async fn execute_restart_workflow(
     execute_restart_post_preflight(
         options,
         move || async move {
+            // ft-xbnl0.2.3 tick 273: cx-first snapshot capture.
+            let snapshot_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             snapshot_engine
-                .capture(&panes, SnapshotTrigger::Shutdown)
+                .capture_with_cx(&snapshot_cx, &panes, SnapshotTrigger::Shutdown)
                 .await
                 .map_err(anyhow::Error::from)
         },
@@ -38620,7 +38623,10 @@ async fn handle_snapshot_command(
                 std::process::exit(1);
             }
 
-            match engine.capture(&panes, snap_trigger).await {
+            // ft-xbnl0.2.3 tick 273: cx-first snapshot capture (ft snapshot save).
+            let snap_save_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match engine.capture_with_cx(&snap_save_cx, &panes, snap_trigger).await {
                 Ok(result) => {
                     if format == "json" {
                         let resp = serde_json::json!({
