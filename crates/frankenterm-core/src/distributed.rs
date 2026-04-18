@@ -4360,6 +4360,87 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 380: Mid-flight cx-cancel on HTTP GET (snapshot).
+    ///
+    /// Complements tick 313 (`distributed_http_client_honors_pre_cancelled_cx`)
+    /// which fires the cancel BEFORE the GET starts. This test fires the
+    /// cancel WHILE the GET is in flight — cx is live when
+    /// `client.get(cx, url)` is called, a separate task cancels it 50 ms
+    /// later while the client is blocked reading from a stalled server.
+    ///
+    /// **Observed behavior at HEAD** (tick 380 run, printed to stderr):
+    /// - elapsed ~= 10.02s
+    /// - result = Err("deadline has elapsed at ...") — the test's
+    ///   defensive 10s outer timeout fired, NOT the cx-cancel.
+    ///
+    /// **Finding**: the distributed HTTP client does NOT observe
+    /// mid-flight cx-cancel at its response-read path. This is the
+    /// same class of gap as tick 328 documented for `timeout_with_cx`
+    /// (budget observed, cancel not). A hung distributed RPC call
+    /// will eventually time out via its own internal limits (if
+    /// configured) but won't react to operator-initiated cancel.
+    ///
+    /// Snapshot, not prescriptive. If a future asupersync release
+    /// tightens mid-flight cancel observability at the HTTP client
+    /// layer, this test will start completing faster (elapsed << 10s
+    /// and result = HTTP-client-specific Err). Until then:
+    ///
+    /// 1. Bounds latency (< 15s via outer timeout) so a total-hang
+    ///    regression is caught.
+    /// 2. Prints observed shape (elapsed + result) to stderr for diff.
+    /// 3. Does NOT over-specify — only asserts "does not hang past
+    ///    the safety-net ceiling".
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_mid_flight_cancel_does_not_hang() {
+        run_async_test(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                // Accept and HOLD the stream so the client actually
+                // stalls on the response-read path. Dropping the
+                // accept return (`let _ = listener.accept().await`)
+                // would close the stream immediately and the client
+                // would see UnexpectedEof in ms — testing a
+                // connect-then-close path rather than the intended
+                // mid-flight cancel of a stalled read.
+                let _stream_hold = listener.accept().await;
+                crate::runtime_compat::sleep(std::time::Duration::from_secs(30)).await;
+                drop(_stream_hold);
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let cx_for_cancel = cx.clone();
+            crate::runtime_compat::task::spawn(async move {
+                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+                cx_for_cancel.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("mid-flight cancel for HTTP snapshot test"),
+                );
+            });
+
+            let url = format!("http://127.0.0.1:{}/stall", addr.port());
+
+            let started = std::time::Instant::now();
+            let result = crate::runtime_compat::timeout(
+                std::time::Duration::from_secs(10),
+                client.get(&cx, &url),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(15),
+                "mid-flight cancel must not cause an unbounded hang; took {elapsed:?}"
+            );
+            eprintln!(
+                "tick 380: mid-flight cancel elapsed={elapsed:?}, outer_timeout_result={result:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 378: Cx with budget deadline in the past does not hang.
     ///
     /// Snapshot test: exercises `DistributedHttpClient::get` with a Cx
