@@ -618,7 +618,7 @@ impl MuxWatchdog {
             None
         };
 
-        let rss_bytes = get_mux_server_rss().await;
+        let rss_bytes = get_mux_server_rss_with_cx(cx).await;
 
         let warning_probe = match crate::runtime_compat::timeout_with_cx(
             cx,
@@ -836,6 +836,27 @@ pub fn spawn_mux_watchdog(
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
 async fn get_mux_server_rss() -> Option<u64> {
+    crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`get_mux_server_rss`].
+///
+/// Pre-flight `cx.checkpoint()` gates spawning the blocking
+/// `pgrep`/`ps` fan-out. On a cancelled caller cx the function
+/// returns `None` (same sentinel as the legacy "process not
+/// found" path), so `check_cx` sees `rss_bytes = None` and skips
+/// the memory-threshold status check. spawn_blocking body is
+/// still std::process::Command — cx isn't threaded inside — but
+/// adding the pre-flight seam means a cancelled watchdog.check
+/// sweep bails before triggering another pgrep shell-out.
+#[cfg(feature = "asupersync-runtime")]
+async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
+    if cx.checkpoint().is_err() {
+        return None;
+    }
     crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
         .await
         .ok()
