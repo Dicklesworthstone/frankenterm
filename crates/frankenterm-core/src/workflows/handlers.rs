@@ -4374,6 +4374,190 @@ impl Workflow for HandleClaudeCodeLimits {
             }
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 219). Sixth per-impl
+    /// Workflow migration. No cass calls, no private lookup
+    /// helper — cleanest of the "policy dispatch" family.
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `record_audit_action_with_cx` (audit write)
+    ///
+    /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+        let caps = ctx.capabilities().to_owned();
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_claude_code_limits cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Guard checks (pure CPU)
+                0 => {
+                    if caps.alt_screen == Some(true) {
+                        return StepResult::abort("Pane is in alt-screen mode");
+                    }
+                    if caps.command_running {
+                        return StepResult::abort("Command is running in pane");
+                    }
+                    tracing::debug!(
+                        pane_id,
+                        explicit_cx = true,
+                        "handle_claude_code_limits: guard checks passed (cx)"
+                    );
+                    StepResult::cont()
+                }
+
+                // Step 1: Cooldown check (cx-first read)
+                1 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("claude_code_usage_limit".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_limit_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_claude_code_limits: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_limit_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                explicit_cx = true,
+                                "handle_claude_code_limits: no recent limit events, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_claude_code_limits: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 2: Classify limit, record audit event (cx-first write)
+                2 => {
+                    let (limit_type, reset_time) = Self::classify_limit(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("claude_code");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+
+                    let plan =
+                        Self::build_recovery_plan(limit_type, reset_time.as_deref(), pane_id);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let timestamp_ms = now_ms();
+                    let input_summary = format!("Claude Code {limit_type} on pane {pane_id}");
+                    let decision_context = build_recovery_plan_audit_decision_context(
+                        "claude_code_usage_limit",
+                        "handle_claude_code_limits",
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &input_summary,
+                        "recorded",
+                        "limit_type",
+                        "reset_time",
+                        &plan,
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "claude_code_usage_limit".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action_with_cx(cx, audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                limit_type,
+                                reset_time = ?reset_time,
+                                explicit_cx = true,
+                                "handle_claude_code_limits: recorded usage limit event (cx)"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "recorded",
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "limit_type": limit_type,
+                                "reset_time": reset_time,
+                                "recovery_plan": plan,
+                                "audit_id": audit_id,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_claude_code_limits: failed to record limit event (cx)"
+                            );
+                            StepResult::abort(format!("Failed to record usage limit event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
 }
 
 // ============================================================================
