@@ -1279,7 +1279,14 @@ impl TutorialSandbox {
             }
             match &exp.kind {
                 ExpectationKind::Contains { .. } => {
-                    if self.check_expectation(&exp.kind).await {
+                    // Tick 210 (ft-xbnl0.2.3): route each expectation
+                    // check through check_expectation_with_cx so the
+                    // inner `mock.get_text_with_cx(cx, ...)` observes
+                    // caller cancellation. Previously used the ambient
+                    // `check_expectation` which called `get_text()`
+                    // picking up cx via Cx::current() thread-local
+                    // fallback.
+                    if self.check_expectation_with_cx(cx, &exp.kind).await {
                         pass += 1;
                     } else {
                         fail += 1;
