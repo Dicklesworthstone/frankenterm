@@ -19540,7 +19540,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Set up workflow infrastructure
                                     let db_path = &ctx.effective.paths.db_path;
-                                    let storage = match StorageHandle::new(db_path).await {
+                                    // ft-xbnl0.2.3 tick 302: cx-first storage open.
+                                    let storage = match StorageHandle::new_with_cx(
+                                        &frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request),
+                                        db_path,
+                                    )
+                                    .await
+                                    {
                                         Ok(s) => Arc::new(s),
                                         Err(e) => {
                                             let response =
@@ -20212,7 +20219,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Set up storage
                                     let db_path = &ctx.effective.paths.db_path;
-                                    let storage = match StorageHandle::new(db_path).await {
+                                    // ft-xbnl0.2.3 tick 302: cx-first storage open.
+                                    let storage = match StorageHandle::new_with_cx(
+                                        &frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request),
+                                        db_path,
+                                    )
+                                    .await
+                                    {
                                         Ok(s) => Arc::new(s),
                                         Err(e) => {
                                             let response =
@@ -24666,7 +24680,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .unwrap_or_else(frankenterm_core::cx::for_request);
                 let pane_info = wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
+                // ft-xbnl0.2.3 tick 302: cx-first storage open (reuse cx).
+                let storage = frankenterm_core::storage::StorageHandle::new_with_cx(&cx, &db_path)
                     .await
                     .ok();
                 let resolution = resolve_pane_capabilities(
@@ -24964,10 +24979,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 escapes
             );
             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-            let storage =
-                frankenterm_core::storage::StorageHandle::new(&layout.db_path.to_string_lossy())
-                    .await
-                    .ok();
+            // ft-xbnl0.2.3 tick 302: cx-first storage open.
+            let gettext_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage = frankenterm_core::storage::StorageHandle::new_with_cx(
+                &gettext_cx,
+                &layout.db_path.to_string_lossy(),
+            )
+            .await
+            .ok();
             let policy_summary = format!("get-text pane_id={pane_id} tail={tail}");
             let (policy_decision, policy_domain) = match authorize_read_or_search_policy(
                 &config,
@@ -25154,7 +25174,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         // Set up workflow infrastructure
                         let db_path = layout.db_path.to_string_lossy();
-                        let storage = match StorageHandle::new(&db_path).await {
+                        // ft-xbnl0.2.3 tick 302: cx-first storage open.
+                        let storage = match StorageHandle::new_with_cx(
+                            &frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request),
+                            &db_path,
+                        )
+                        .await
+                        {
                             Ok(s) => Arc::new(s),
                             Err(e) => {
                                 eprintln!("Error: Failed to open storage: {e}");
@@ -25671,8 +25698,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 let bookmark_pane_ids = if bookmark.is_some() || bookmark_tag.is_some() {
                     let db_path = layout.db_path.to_string_lossy();
-                    let storage = match frankenterm_core::storage::StorageHandle::new(&db_path)
-                        .await
+                    // ft-xbnl0.2.3 tick 302: cx-first storage open.
+                    let bookmark_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                        &bookmark_cx,
+                        &db_path,
+                    )
+                    .await
                     {
                         Ok(storage) => storage,
                         Err(e) => {
