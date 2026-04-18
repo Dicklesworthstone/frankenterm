@@ -121,21 +121,68 @@ shaves ~10+ min off a cold HTTP/TLS rch run. Closer recommendation:
 always run the guards group first (fast, ~2 min cold), THEN the
 HTTP / TLS / metrics / web groups can reuse the target dir.
 
-### Level-C evidence coverage rollup
+### Level-C evidence coverage rollup — COMPLETE at tick 393
 
-| Group | Remote run | Tick |
-|-------|------------|------|
-| Regression guards (3 tests) | 3/3 PASS on vmi1149989 | 374 + re-confirmed 391 |
-| HTTP client contracts (29 tests) | **29/29 PASS on vmi1149989** | **392** |
-| TLS tests | not yet run remotely | — |
-| Metrics server cx-family | not yet run remotely | — |
-| Web server cx pre-cancel | not yet run remotely | — |
-| runtime_compat primitive | not yet run remotely | — |
+All 6 test groups verified remotely on `vmi1149989` using the warm
+target-dir strategy (tick 393).
 
-**32 of 83 tests** now have remote Level-C evidence. The remaining
-51 are local-only (via the fork-bypass pattern / `check_ft_xbnl0_2_4.sh`).
-The closer can fill the gap by running the remaining group commands
-via rch using the same warm-target-dir strategy.
+| Group | Tests | Remote result | Wall | Tick |
+|-------|-------|---------------|------|------|
+| Regression guards | 3 | 3/3 PASS | 116s (cold) / 484s (re-confirm, fresh dir) | 374 + 391 |
+| HTTP client contracts | 29 | **29/29 PASS** | 589s (warm with guards) | 392 |
+| TLS tests | 45 | **45/45 PASS** | **116s (fully warm)** | 393 |
+| Metrics server cx-family | 3 | **3/3 PASS** | 114s | 393 |
+| Web server cx pre-cancel | 1 | **1/1 PASS** | 122s | 393 |
+| runtime_compat primitive | 2 | **2/2 PASS** | 113s | 393 |
+| **Total** | **83** | **83/83 PASS remotely** | | |
+
+**All 83 ft-xbnl0.2.4 tests have remote Level-C evidence.** Once the
+target dir is warm (first guards run: ~2 min cold, then HTTP: ~10
+min adding feature graph), every subsequent group completes in
+~2 min wall since the feature-conditional deps are cached.
+
+### Command recipe for full Level-C capture
+
+To reproduce the complete remote evidence bundle, run these in order
+with the SAME target dir:
+
+```bash
+# 1. Cold run (guards, no features) — establishes warm target dir.
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --test ft_xbnl0_2_4_no_direct_tokio_net_or_rustls
+
+# 2. HTTP client (adds distributed + asupersync-runtime features).
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --features distributed,asupersync-runtime \
+    --lib distributed_http_client_
+
+# 3-5. TLS + metrics + web (all reuse the warm target).
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --features distributed,asupersync-runtime \
+    --lib tls_
+
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --features distributed,asupersync-runtime,web \
+    --lib metrics_server_start_with_cx_
+
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --features web,asupersync-runtime \
+    --test web web_server_with_cx_
+
+# 6. Primitive budget tests.
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-full \
+    cargo test -p frankenterm-core \
+    --features asupersync-runtime \
+    --lib _with_cx_observes_budget_deadline
+```
+
+Total wall time: ~20 min for the first two commands (cold+HTTP), then
+~2 min each for the remaining four. ~28 min total.
 
 ### Re-confirmation at HEAD (tick 391, post-ft-l9mxa fix)
 
