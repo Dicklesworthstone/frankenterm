@@ -226,6 +226,36 @@ impl WorkflowContext {
         Ok(result)
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`send_text`] (tick 213).
+    ///
+    /// Routes through `injector.lock_with_cx(cx)` (async Mutex
+    /// acquire observes caller cancel) + `guard.send_text_with_cx(cx, ...)`
+    /// (policy engine's cx-aware inject path from policy.rs L6346).
+    /// A cancelled caller interrupts either the lock wait OR the
+    /// inner wezterm dispatch — depending on where the contention is.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_text_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        text: &str,
+    ) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let result = {
+            let mut guard = injector.lock_with_cx(cx).await;
+            guard
+                .send_text_with_cx(
+                    cx,
+                    self.pane_id,
+                    text,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
+    }
+
     /// Send Ctrl-C (interrupt) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
@@ -235,6 +265,28 @@ impl WorkflowContext {
             let mut guard = injector.lock().await;
             guard
                 .send_ctrl_c(
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_c`] (tick 213).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_c_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let result = {
+            let mut guard = injector.lock_with_cx(cx).await;
+            guard
+                .send_ctrl_c_with_cx(
+                    cx,
                     self.pane_id,
                     crate::policy::ActorKind::Workflow,
                     &self.capabilities,
@@ -264,6 +316,28 @@ impl WorkflowContext {
         Ok(result)
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_d`] (tick 213).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_d_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let result = {
+            let mut guard = injector.lock_with_cx(cx).await;
+            guard
+                .send_ctrl_d_with_cx(
+                    cx,
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
+    }
+
     /// Send Ctrl-Z (suspend) to the target pane via policy-gated injection.
     ///
     /// See [`send_text`](Self::send_text) for lock safety rationale.
@@ -273,6 +347,28 @@ impl WorkflowContext {
             let mut guard = injector.lock().await;
             guard
                 .send_ctrl_z(
+                    self.pane_id,
+                    crate::policy::ActorKind::Workflow,
+                    &self.capabilities,
+                    Some(&self.execution_id),
+                )
+                .await
+        };
+        Ok(result)
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`send_ctrl_z`] (tick 213).
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn send_ctrl_z_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+    ) -> Result<crate::policy::InjectionResult, &'static str> {
+        let injector = self.injector.as_ref().ok_or("No injector configured")?;
+        let result = {
+            let mut guard = injector.lock_with_cx(cx).await;
+            guard
+                .send_ctrl_z_with_cx(
+                    cx,
                     self.pane_id,
                     crate::policy::ActorKind::Workflow,
                     &self.capabilities,
