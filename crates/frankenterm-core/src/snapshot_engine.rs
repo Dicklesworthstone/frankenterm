@@ -1429,7 +1429,13 @@ impl SnapshotEngine {
     ) -> std::result::Result<(), SnapshotError> {
         cx.checkpoint().map_err(|_| SnapshotError::Cancelled)?;
 
-        let session_id = { self.session_id.read().await.clone() };
+        // Tick 204 (ft-xbnl0.2.3): route the session_id read-lock
+        // through read_with_cx(cx) so the lock wait honors caller
+        // cancellation. Previously used the legacy ambient
+        // `read().await` which picks up cx via Cx::current()
+        // thread-local fallback. Matches the pattern already used
+        // by ensure_session_with_cx (L1260) in this same file.
+        let session_id = { self.session_id.read_with_cx(cx).await.clone() };
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
             Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
