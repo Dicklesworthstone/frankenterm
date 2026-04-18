@@ -1131,7 +1131,15 @@ async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,
 ) -> bool {
-    match crate::runtime_compat::timeout(
+    // Tick 193 (ft-xbnl0.2.3): outer timeout now bound to the caller's
+    // cx via timeout_with_cx. Previously used ambient `timeout` which
+    // falls back to `Cx::current()` thread-local — orphan hole whenever
+    // this helper runs in a thread-local scope different from the
+    // caller's explicit cx. The inner mpsc_recv_state_with_cx already
+    // threads cx, so with this fix both the recv future AND the poll
+    // interval timer honor the caller's cx.
+    match crate::runtime_compat::timeout_with_cx(
+        cx,
         IPC_SHUTDOWN_POLL_INTERVAL,
         mpsc_recv_state_with_cx(shutdown_rx, cx),
     )
