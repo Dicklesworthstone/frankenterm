@@ -545,7 +545,9 @@ pub(super) fn record_mcp_audit_sync(
             }
         };
         rt.block_on(async {
-            if let Ok(storage) = StorageHandle::new(&db_path_str).await {
+            // ft-xbnl0.2.3 tick 304: cx-first MCP audit storage open (helpers).
+            let audit_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            if let Ok(storage) = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await {
                 record_mcp_audit(
                     &storage,
                     &tool_name,
