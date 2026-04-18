@@ -3594,6 +3594,78 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 326: Empty-body POST contract.
+    ///
+    /// Pins that `DistributedHttpClient::post` correctly sends
+    /// `Content-Length: 0` and no body bytes when invoked with an
+    /// empty `Vec<u8>`. Empty-body POST is a common edge case —
+    /// health check endpoints, webhooks, and some idempotent-create
+    /// APIs all accept body-less POST and the client must send the
+    /// right framing for the server to recognize end-of-request
+    /// without hanging on read.
+    ///
+    /// Test asserts:
+    /// 1. Server sees `Content-Length: 0` header in the request.
+    /// 2. Server sees no body bytes after the blank-line separator
+    ///    (i.e. the total request byte count equals headers-including-CRLF).
+    /// 3. Happy-path roundtrip: client sees the server's 200 OK.
+    ///
+    /// ft-xbnl0.2.4 acceptance criterion 3 ("Verification covers
+    /// correctness") includes HTTP framing edge cases — a regression
+    /// where the client sent no Content-Length header (or a wrong one)
+    /// would cause servers to either hang waiting for a body or reject
+    /// the request as malformed.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_empty_body_sends_content_length_zero() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                let lower = req.to_ascii_lowercase();
+                assert!(
+                    lower.contains("content-length: 0"),
+                    "empty-body POST must send `Content-Length: 0` header; got: {req:?}"
+                );
+                // After the CRLF CRLF separator, there must be no body bytes.
+                if let Some(idx) = req.find("\r\n\r\n") {
+                    let after_headers = &req.as_bytes()[idx + 4..];
+                    assert!(
+                        after_headers.iter().all(|b| *b == 0),
+                        "empty-body POST must send zero body bytes after header separator; \
+                         got {} bytes: {after_headers:?}",
+                        after_headers.len()
+                    );
+                } else {
+                    panic!("request did not end with CRLF CRLF separator: {req:?}");
+                }
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/ping", addr.port());
+            let resp = client
+                .post(&cx, &url, Vec::new())
+                .await
+                .expect("empty-body post");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 325: `Host:` header roundtrip contract.
     ///
     /// HTTP/1.1 requires a `Host:` header that matches the URL's
