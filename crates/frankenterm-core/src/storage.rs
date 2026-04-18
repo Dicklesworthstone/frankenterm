@@ -6814,6 +6814,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_saved_search`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_saved_search_with_cx(
         &self,
@@ -6823,7 +6824,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_saved_search cancelled: {err}"))
         })?;
-        self.insert_saved_search(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertSavedSearch {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Update last-run metadata for a saved search.
@@ -6850,6 +6862,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_run`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn update_saved_search_run_with_cx(
         &self,
@@ -6862,8 +6875,21 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("update_saved_search_run cancelled: {err}"))
         })?;
-        self.update_saved_search_run(id, last_run_at, last_result_count, last_error)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpdateSavedSearchRun {
+                    id: id.to_string(),
+                    last_run_at,
+                    last_result_count,
+                    last_error,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Update scheduling settings for a saved search.
@@ -6888,6 +6914,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_schedule`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn update_saved_search_schedule_with_cx(
         &self,
@@ -6899,8 +6926,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("update_saved_search_schedule cancelled: {err}"))
         })?;
-        self.update_saved_search_schedule(id, enabled, schedule_interval_ms)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpdateSavedSearchSchedule {
+                    id: id.to_string(),
+                    enabled,
+                    schedule_interval_ms,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete a saved search by name. Returns number of rows deleted.
@@ -6918,6 +6957,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_saved_search`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_saved_search_with_cx(
         &self,
@@ -6927,7 +6967,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("delete_saved_search cancelled: {err}"))
         })?;
-        self.delete_saved_search(name).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteSavedSearch {
+                    name: name.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Fetch a saved search by name.
@@ -6995,6 +7046,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_pane_bookmark`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_pane_bookmark_with_cx(
         &self,
@@ -7004,7 +7056,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_pane_bookmark cancelled: {err}"))
         })?;
-        self.insert_pane_bookmark(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertPaneBookmark {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
@@ -7022,6 +7085,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_pane_bookmark`].
+    /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_pane_bookmark_with_cx(
         &self,
@@ -7031,7 +7095,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("delete_pane_bookmark cancelled: {err}"))
         })?;
-        self.delete_pane_bookmark(alias).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeletePaneBookmark {
+                    alias: alias.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get a pane bookmark by alias.
