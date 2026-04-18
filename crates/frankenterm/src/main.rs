@@ -11751,7 +11751,13 @@ async fn record_ipc_rpc_audit(
 
     // Clone handle under the outer mutex, then perform async I/O without holding the lock.
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    if let Err(e) = storage_handle.record_audit_action_redacted(audit).await {
+    // ft-xbnl0.2.3 tick 280: cx-first IPC RPC audit write.
+    let ipc_audit_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    if let Err(e) = storage_handle
+        .record_audit_action_redacted_with_cx(&ipc_audit_cx, audit)
+        .await
+    {
         tracing::warn!("Failed to record IPC RPC audit: {e}");
     }
 }
@@ -13577,13 +13583,16 @@ async fn distributed_agent_seed_segment_cursors(
     cursors: &mut std::collections::HashMap<u64, i64>,
 ) -> anyhow::Result<()> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    let panes = storage_handle.get_panes().await?;
+    // ft-xbnl0.2.3 tick 280: cx-first seed cursors.
+    let seed_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let panes = storage_handle.get_panes_with_cx(&seed_cx).await?;
     for pane in panes {
         if !distributed_agent_local_pane(&pane) || cursors.contains_key(&pane.pane_id) {
             continue;
         }
         if let Some(segment) = storage_handle
-            .get_segments(pane.pane_id, 1)
+            .get_segments_with_cx(&seed_cx, pane.pane_id, 1)
             .await?
             .into_iter()
             .next()
