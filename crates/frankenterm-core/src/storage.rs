@@ -10939,12 +10939,20 @@ impl StorageHandle {
     /// writer_handle is left in place (take is skipped), so a
     /// subsequent `shutdown()` or `shutdown_with_cx(fresh_cx)`
     /// call will drive the join.
+    ///
+    /// Tick 176: the shutdown enqueue now routes through
+    /// `send_with_cx` — closing the last remaining orphan-cx
+    /// hole in storage write-path methods. This also means a
+    /// cx-cancelled shutdown caller releases the mpsc reserve
+    /// immediately instead of holding it until backpressure
+    /// drains, which matters if callers race shutdown against
+    /// a saturating writer queue.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .write_tx
-            .send(WriteCommand::Shutdown { respond: tx })
+            .send_with_cx(cx, WriteCommand::Shutdown { respond: tx })
             .await;
         Self::recv_writer_shutdown_ack(rx).await;
 
