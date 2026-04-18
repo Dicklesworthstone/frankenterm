@@ -15108,11 +15108,20 @@ async fn run_watcher(
             "Registered enabled workflows"
         );
 
-        // Spawn workflow runner event loop
+        // Spawn workflow runner event loop (ft-xbnl0.2.3 tick 224:
+        // cross-crate migration to cx-first entry point). Uses
+        // `Cx::current().unwrap_or_else(for_request)` to pick up any
+        // ambient cx installed by the runtime driver, falling back
+        // to a fresh request-scoped cx. Threads that cx through the
+        // entire event-loop + child-spawn chain via
+        // `run_with_cx` (tick 223). A cx-cancel bubbles through the
+        // runner loop AND all child workflow executions in flight.
         let event_bus_clone = Arc::clone(&event_bus);
         let runner_handle = frankenterm_core::runtime_compat::task::spawn(async move {
             tracing::info!("Workflow runner started, listening for detection events");
-            workflow_runner.run(&event_bus_clone).await;
+            let cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            workflow_runner.run_with_cx(&cx, &event_bus_clone).await;
             tracing::info!("Workflow runner stopped");
         });
 
@@ -17385,6 +17394,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     "Timeout waiting for pattern '{pattern}'"
                                                 ));
                                             }
+                                            Ok(
+                                                frankenterm_core::wezterm::WaitResult::Cancelled {
+                                                    reason,
+                                                    polls,
+                                                },
+                                            ) => {
+                                                // wait_for (ambient) should not return Cancelled;
+                                                // this arm exists only for exhaustiveness after the
+                                                // ft-xbnl0.2.3 WaitResult::Cancelled variant was added.
+                                                wait_for_data = Some(RobotWaitForData {
+                                                    pane_id,
+                                                    pattern: pattern.clone(),
+                                                    matched: false,
+                                                    elapsed_ms: 0,
+                                                    polls,
+                                                    is_regex: wait_for_regex,
+                                                });
+                                                verification_error = Some(format!(
+                                                    "wait-for cancelled ({reason})"
+                                                ));
+                                            }
                                             Err(e) => {
                                                 verification_error =
                                                     Some(format!("wait-for failed: {e}"));
@@ -17516,6 +17546,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "Timeout waiting for pattern '{pattern}' after {elapsed}ms ({polls} polls)"
                                         ),
                                         Some("Increase --timeout-secs or check if the pattern is correct".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                }
+                                Ok(WaitResult::Cancelled { reason, polls }) => {
+                                    // ambient wait_for should not return Cancelled; arm for
+                                    // exhaustiveness after ft-xbnl0.2.3 added the variant.
+                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                        ROBOT_ERR_TIMEOUT,
+                                        format!(
+                                            "Wait cancelled ({reason}) after {polls} polls"
+                                        ),
+                                        None,
                                         elapsed_ms(start),
                                     );
                                     print_robot_response(&response, format, stats)?;
@@ -24358,6 +24401,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 verification_error =
                                     Some(format!("Timeout waiting for pattern '{pattern}'"));
                             }
+                            Ok(frankenterm_core::wezterm::WaitResult::Cancelled {
+                                reason,
+                                polls,
+                            }) => {
+                                // ambient wait_for should not return Cancelled; arm exists
+                                // for exhaustiveness after ft-xbnl0.2.3 added the variant.
+                                let pattern_out =
+                                    redacted_wait_for.clone().unwrap_or_else(|| pattern.clone());
+                                wait_for_data = Some(RobotWaitForData {
+                                    pane_id,
+                                    pattern: pattern_out,
+                                    matched: false,
+                                    elapsed_ms: 0,
+                                    polls,
+                                    is_regex: wait_for_regex,
+                                });
+                                verification_error =
+                                    Some(format!("wait-for cancelled ({reason})"));
+                            }
                             Err(e) => {
                                 verification_error = Some(format!("wait-for failed: {e}"));
                             }
@@ -26992,6 +27054,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Ok(frankenterm_core::wezterm::WaitResult::TimedOut { .. }) => {
                                     eprintln!("Commit succeeded but wait-for timed out.");
                                     wait_summary = Some("wait_for=timed_out".to_string());
+                                }
+                                Ok(frankenterm_core::wezterm::WaitResult::Cancelled {
+                                    reason,
+                                    ..
+                                }) => {
+                                    // ambient wait_for should not return Cancelled; arm exists
+                                    // for exhaustiveness after ft-xbnl0.2.3 added the variant.
+                                    eprintln!("Commit succeeded but wait-for cancelled: {reason}");
+                                    wait_summary = Some(format!("wait_for=cancelled:{reason}"));
                                 }
                                 Err(e) => {
                                     eprintln!("Commit succeeded but wait-for failed: {e}");
