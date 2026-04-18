@@ -4183,6 +4183,99 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-kfkyi / tick 352: 3xx with a **resolvable** redirect target.
+    ///
+    /// Companion to `distributed_http_client_returns_3xx_redirect_as_ok_response`
+    /// which uses an unresolvable `Location:` target. The unresolvable-
+    /// target variant proves that the client doesn't burn DNS time on
+    /// a follow — but it could still pass accidentally if the client's
+    /// "don't follow" check happened to fail early on DNS before a
+    /// latent bug manifested.
+    ///
+    /// This test uses TWO loopback listeners: the primary redirects to
+    /// a secondary, which would *happily* accept a follow-up connection
+    /// and respond. If the client silently followed the redirect, the
+    /// secondary listener would see an incoming request — the test
+    /// asserts it does NOT by counting received connections.
+    ///
+    /// Stronger pinning than the unresolvable-target variant: proves
+    /// the "don't follow" policy is observed even when the Location is
+    /// reachable.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_does_not_follow_3xx_even_with_resolvable_location() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let primary = TcpListener::bind("127.0.0.1:0").await.expect("primary bind");
+            let primary_addr = primary.local_addr().expect("primary addr");
+
+            let secondary = TcpListener::bind("127.0.0.1:0").await.expect("secondary bind");
+            let secondary_addr = secondary.local_addr().expect("secondary addr");
+            let secondary_was_hit = Arc::new(AtomicBool::new(false));
+
+            let secondary_flag = Arc::clone(&secondary_was_hit);
+            let _secondary_task = crate::runtime_compat::task::spawn(async move {
+                // If this accept resolves, the client followed the redirect.
+                // Flip the flag then respond so the client doesn't hang.
+                if let Ok((mut stream, _)) = secondary.accept().await {
+                    secondary_flag.store(true, Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfollowed!")
+                        .await;
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            });
+
+            let primary_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = primary.accept().await.expect("primary accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                // 302 redirecting to the secondary — a resolvable, live target.
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: http://127.0.0.1:{}/redirected\r\n\
+                     Content-Length: 0\r\n\r\n",
+                    secondary_addr.port()
+                );
+                stream.write_all(response.as_bytes()).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/origin", primary_addr.port());
+
+            let resp = client
+                .get(&cx, &url)
+                .await
+                .expect("3xx must be Ok(Response)");
+
+            assert_eq!(resp.status, 302, "status must be the original 302, not 200 from the secondary");
+            assert!(
+                !resp.body.eq(b"followed!"),
+                "body must be the 302 body (empty), not the secondary's 'followed!'"
+            );
+            primary_task.await.expect("primary join");
+
+            // Give any stray follow attempt a small window to land on the
+            // secondary so we catch the regression if the client does
+            // follow but we raced past the accept.
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+
+            assert!(
+                !secondary_was_hit.load(Ordering::SeqCst),
+                "client followed the redirect — secondary listener saw a connection, \
+                 proving the 'no_redirects' policy regressed"
+            );
+        });
+    }
+
     /// ft-kfkyi: 3xx redirects are NOT transparently followed.
     ///
     /// `DistributedHttpClient` is used for distributed node-to-node RPC
