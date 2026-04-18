@@ -3484,6 +3484,52 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 316: Happy-path POST roundtrip test.
+    ///
+    /// Complements the GET happy-path test (`distributed_http_client_local_get`,
+    /// L3458) and the cancel-path tests (ticks 313/314). Verifies that
+    /// POST with a non-empty body reaches the server and the response body
+    /// round-trips correctly.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_local_post() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                // Request must contain our request body.
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                assert!(
+                    req.contains("payload=xyz"),
+                    "request body not found in server-received bytes: {req}"
+                );
+                // Respond with a small body.
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nposted!";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/events", addr.port());
+            let resp = client
+                .post(&cx, &url, b"payload=xyz".to_vec())
+                .await
+                .expect("post");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"posted!");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 313: Pin the cx-cancel contract for
     /// `DistributedHttpClient::get`.
     ///
