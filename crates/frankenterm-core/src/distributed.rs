@@ -3594,6 +3594,62 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 321: Request-target (path + query) roundtrip contract.
+    ///
+    /// Pins that `DistributedHttpClient::get` transmits the full URL
+    /// request-target to the server — path segments AND query string,
+    /// without dropping, reordering, or double-encoding either.
+    ///
+    /// Why: the HTTP client is used by distributed event forwarding and
+    /// health checks; both rely on query-string parameters (`?src=...`,
+    /// `?agent_id=...`) and nested paths (`/api/v1/events`) arriving at
+    /// the server exactly as constructed. A regression in URL parsing
+    /// that dropped the query string would silently degrade event
+    /// routing in production without surfacing a transport error.
+    ///
+    /// Test asserts the server-received request line starts with
+    /// `GET /api/v1/events?src=rustic-maple&seq=42 HTTP/1.`
+    /// (trailing space + version check tolerates HTTP/1.0 vs HTTP/1.1).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_transmits_full_request_target() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                // First line is the request line: METHOD SP request-target SP HTTP-version CRLF
+                let first_line = req.lines().next().expect("at least one line");
+                assert!(
+                    first_line.starts_with("GET /api/v1/events?src=rustic-maple&seq=42 HTTP/1."),
+                    "request-target did not round-trip intact; got: {first_line:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!(
+                "http://127.0.0.1:{}/api/v1/events?src=rustic-maple&seq=42",
+                addr.port()
+            );
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 320: Transport-error (connection-refused) contract.
     ///
     /// Pins that `DistributedHttpClient::get` returns `Err` promptly when
