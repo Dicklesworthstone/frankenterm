@@ -3594,6 +3594,63 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 325: `Host:` header roundtrip contract.
+    ///
+    /// HTTP/1.1 requires a `Host:` header that matches the URL's
+    /// authority. Reverse proxies and virtual-hosted servers route
+    /// requests based on this header — if the client omitted it or
+    /// sent the wrong value, requests to multi-tenant endpoints would
+    /// be silently misrouted (or 400-ed by strict servers).
+    ///
+    /// Pins that `DistributedHttpClient::get` sends `Host: 127.0.0.1:<port>`
+    /// matching the URL authority, case-insensitively (HTTP headers are
+    /// case-insensitive per RFC 7230 §3.2; we accept either casing).
+    ///
+    /// ft-xbnl0.2.4 acceptance criterion 3 ("Verification covers
+    /// correctness") includes HTTP protocol compliance — a missing or
+    /// wrong Host header would silently break production routing in a
+    /// multi-tenant deployment.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_sends_host_header_matching_authority() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let expected_authority = format!("127.0.0.1:{}", addr.port());
+            let expected_authority_for_server = expected_authority.clone();
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                // Scan for Host: line, case-insensitive per RFC 7230.
+                let lower = req.to_ascii_lowercase();
+                let expected_lower = format!("host: {}", expected_authority_for_server.to_ascii_lowercase());
+                assert!(
+                    lower.contains(&expected_lower),
+                    "request must include a Host header matching the URL authority. \
+                     expected a line containing {expected_lower:?}, got request: {req:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://{expected_authority}/health");
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 324: URL with no path defaults to `/`.
     ///
     /// HTTP/1.1 requires a non-empty request-target on the request line.
