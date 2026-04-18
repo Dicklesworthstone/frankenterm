@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::{Mutex, RwLock, mpsc, timeout, watch};
+use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -1010,8 +1010,16 @@ impl SnapshotEngine {
                         break;
                     }
 
+                    // ft-xbnl0.2.3 tick 297: cx-first timeouts in intelligent scheduler.
                     let shutdown_check_fut = shutdown.changed(cx);
-                    if timeout(Duration::ZERO, shutdown_check_fut).await.is_ok() {
+                    if crate::runtime_compat::timeout_with_cx(
+                        cx,
+                        Duration::ZERO,
+                        shutdown_check_fut,
+                    )
+                    .await
+                    .is_ok()
+                    {
                         tracing::info!("snapshot engine shutting down");
                         break;
                     }
@@ -1023,8 +1031,11 @@ impl SnapshotEngine {
                     } else {
                         let wait_step = fallback_wait.min(Duration::from_millis(250));
                         let recv_fut = trigger_rx.recv(cx);
-                        let recv_result =
-                            timeout(wait_step, recv_fut).await.map(|result| result.ok());
+                        let recv_result = crate::runtime_compat::timeout_with_cx(
+                            cx, wait_step, recv_fut,
+                        )
+                        .await
+                        .map(|result| result.ok());
 
                         match recv_result {
                             Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
