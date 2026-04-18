@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **13 HTTP client contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2) |
+| 3 | Verification covers correctness + basic performance non-regression | **14 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4; E2E script pending if needed |
 
@@ -49,6 +49,7 @@ surface of `DistributedHttpClient`:
 | Host header matches authority | `distributed_http_client_sends_host_header_matching_authority` | 325 |
 | Empty-body POST → `Content-Length: 0` | `distributed_http_client_post_empty_body_sends_content_length_zero` | 326 |
 | Large-body POST (128 KiB) roundtrip | `distributed_http_client_post_large_body_roundtrips` | 327 |
+| Non-empty User-Agent header | `distributed_http_client_sends_non_empty_user_agent` | 332 |
 
 **Return-type three-outcome matrix** (criterion 3 correctness):
 - 2xx response body → `Ok(Response{status: 2xx, body})`
@@ -58,7 +59,54 @@ surface of `DistributedHttpClient`:
 Pinning this separation lets callers route retries correctly: transport
 `Err` is retryable, non-2xx `Ok` may or may not be depending on status.
 
-### 2.2 Service-boundary cx contract tests
+**Request-line fidelity pins** (criterion 3 correctness):
+- Header roundtrip: Host matches authority, non-empty User-Agent.
+- Body framing: empty-body POST sends `Content-Length: 0`; large-body
+  POST (128 KiB) roundtrips byte-for-byte across kernel send-buffer
+  boundaries.
+
+### 2.2 TLS contract tests (`crates/frankenterm-core/src/distributed.rs`)
+
+Happy-path + bidirectional-exchange tests existed previously
+(`bundle_tls_bidirectional_exchange`, `bundle_tls_large_payload`).
+Ticks 333-337 added **12 new contract tests** covering the TLS bundle
+construction surface:
+
+**Success-path shape contracts** (§2.2a):
+
+| Contract | Test name | Tick |
+|----------|-----------|------|
+| IPv4 literal → `ServerName::IpAddress` | `build_tls_server_name_accepts_ipv4_literal` | 334 |
+| DNS hostname → `ServerName::DnsName` | `build_tls_server_name_accepts_dns_hostname` | 334 |
+| Empty bind → defaults to `localhost` | `build_tls_server_name_defaults_empty_host_to_localhost` | 334 |
+
+The IPv4-vs-DNS variant split is load-bearing: rustls verifies IP SANs
+via `ServerName::IpAddress` and DNS SANs via `ServerName::DnsName`.
+Mis-routing between them opens cert-verification holes.
+
+**Error-variant fidelity contracts** (§2.2b) — pins that
+`build_tls_bundle` returns the right `DistributedTlsError` variant
+under each mis-config, so caller-side error routing can key on variant
+type (retry-on-network vs fail-fast-on-config):
+
+| Variant | Test name | Tick |
+|---------|-----------|------|
+| `TlsDisabled` | `build_tls_bundle_rejects_tls_disabled_config` | 333 |
+| `MissingCertPath` | `build_tls_bundle_rejects_missing_cert_path` | 333 |
+| `MissingKeyPath` | `build_tls_bundle_rejects_missing_key_path` | 333 |
+| `Io { path, source }` | `build_tls_bundle_surfaces_io_error_with_path_for_missing_cert_file` | 335 |
+| `InvalidMinTlsVersion` | `resolve_tls_versions_rejects_unsupported_version_string` | 335 |
+| `EmptyCertChain` | `build_tls_bundle_surfaces_empty_cert_chain_for_empty_pem_file` | 336 |
+| `EmptyPrivateKey` | `build_tls_bundle_surfaces_empty_private_key_for_cert_in_key_slot` | 336 |
+| `MissingClientCaPath` | `build_tls_bundle_rejects_mtls_without_client_ca_path` | 337 |
+| Invalid host → `Config` | `build_tls_server_name_rejects_invalid_host` | 334 |
+
+**7 of 8** `DistributedTlsError` variants pinned via `build_tls_bundle`
+round-trip; the remaining `Config` variant (rustls-internal builder
+failures) is not practical to provoke from a test fixture, so is
+covered instead via the `build_tls_server_name` invalid-host path.
+
+### 2.3 Service-boundary cx contract tests
 
 | Surface | Contract | Test | Tick |
 |---------|----------|------|------|
@@ -69,7 +117,7 @@ Together with pre-existing happy-path tests on both, three cx signal timings
 are pinned: pre-start, mid-flight, and happy for service boundaries —
 matching what the HTTP client side (§2.1) already has.
 
-### 2.3 Regression guards (`crates/frankenterm-core/tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`)
+### 2.4 Regression guards (`crates/frankenterm-core/tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`)
 
 | Guard | Scope | Tick |
 |-------|-------|------|
@@ -82,14 +130,15 @@ in manifests for vendored ex-WezTerm crates (`frankenterm/ssh`, `frankenterm/cod
 `frankenterm/lua-api-crates/mux-lua`) that predate the FrankenTerm async
 migration. The import-scan still flags leakage INTO FrankenTerm core logic.
 
-### 2.4 Primitive documentation (`runtime_compat::timeout_with_cx`)
+### 2.5 Primitive documentation (`runtime_compat::{timeout_with_cx, sleep_with_cx}`)
 
-`timeout_with_cx` observes cx **budget deadline** but not direct cx
-**cancel**. Every existing cx-first surface in this crate pre-flights
-with `cx.checkpoint()?` before calling `timeout_with_cx`, but this
-pattern is not compile-time enforced. The doc comment now makes the
-cancel-vs-budget distinction explicit so future cx-first migrations
-don't miss the required pre-flight. Tick 328.
+Both `timeout_with_cx` and `sleep_with_cx` observe cx **budget
+deadline** but not direct cx **cancel**. Every existing cx-first
+surface in this crate pre-flights with `cx.checkpoint()?` before
+calling either primitive, but this pattern is not compile-time
+enforced. The doc comments now make the cancel-vs-budget distinction
+explicit so future cx-first migrations don't miss the required
+pre-flight. Ticks 328 (`timeout_with_cx`) + 331 (`sleep_with_cx`).
 
 ---
 
