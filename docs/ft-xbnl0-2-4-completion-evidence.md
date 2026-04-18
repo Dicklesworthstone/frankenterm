@@ -297,6 +297,8 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 
 - **3xx transparent redirect following (ft-kfkyi)**: discovered during tick 349 verification work. Security concern — a compromised peer could respond 302 with `Location: http://attacker.com/` to exfiltrate the next request's body. Resolved: `DistributedHttpClient::new()` now constructs via the asupersync HttpClient builder with `.no_redirects()` explicitly set (tick 351, commit `4717c434`). Two tests pin the contract: `distributed_http_client_returns_3xx_redirect_as_ok_response` (unresolvable Location, tick 351) and `distributed_http_client_does_not_follow_3xx_even_with_resolvable_location` (resolvable Location + secondary listener counter, tick 352). ft-kfkyi bead closed tick 351.
 
+- **Mid-flight cx-cancel gap on HTTP client (ft-l9mxa)**: discovered during tick 380 snapshot test. Operational-ergonomics concern — the inner asupersync HTTP client's response-read path didn't observe mid-flight `cx.cancel_with(...)`, so agent workflows firing cancel to abort a slow peer call would wait the full internal-timeout window. Resolved: `DistributedHttpClient::{get,post}` now race the inner call against a cx-cancel watcher (50 ms poll) via `crate::runtime_compat::select!` (tick 387, commit `99640e41`). Mid-flight cancel now surfaces as `Ok(Err(ClientError::Cancelled))` in ~70-75 ms. The tick-380 snapshot test (`distributed_http_client_mid_flight_cancel_does_not_hang`) was flipped to assert the new fast-cancel behavior (`elapsed < 1s` + exact `Cancelled` variant match). ft-l9mxa bead closed tick 387.
+
 ---
 
 ## 6. Closure Checklist (when ready to close)
