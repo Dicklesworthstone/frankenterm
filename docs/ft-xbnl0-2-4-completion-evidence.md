@@ -23,7 +23,7 @@ locally with isolated target dirs.
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
 | 3 | Verification covers correctness + basic performance non-regression | **14 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
-| 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4; E2E script pending if needed |
+| 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
 ---
 
@@ -187,10 +187,25 @@ Invoke via `python3 /tmp/ft-cargo-test-<purpose>.py`.
 
 ## 4. Remote Verification Recipe (rch exec, when workers are up)
 
-Per the shared verification contract ([ft-xbnl0-verification-contract.md](ft-xbnl0-verification-contract.md) §"Remote Execution Policy"):
+Per the shared verification contract ([ft-xbnl0-verification-contract.md](ft-xbnl0-verification-contract.md) §"Remote Execution Policy").
+
+### 4a. One-shot check script (recommended)
+
+Since tick 347 there is a consolidated verification script that runs all
+five test groups in sequence with a single exit code:
 
 ```bash
 rch workers probe --all --json                                         # capacity proof
+rch exec -- ./scripts/check_ft_xbnl0_2_4.sh
+```
+
+The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
+and prints `[PASS]`/`[FAIL]` labels per run for grep-able output.
+Exit 0 iff all 40 tests pass.
+
+### 4b. Individual commands (when you need to isolate a failure group)
+
+```bash
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-check \
     cargo check -p frankenterm-core --features distributed,asupersync-runtime --all-targets
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-clippy \
@@ -227,9 +242,10 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 ## 6. Closure Checklist (when ready to close)
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] All commands in §4 run cleanly (exit 0, saved output)
-- [ ] `cargo fmt --check` is clean
-- [ ] Import and manifest regression guards in §2.3 all pass
-- [ ] The 13 HTTP client contract tests + 2 service-boundary tests in §2.1/§2.2 all pass
+- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 40 tests pass)
+- [ ] `rch exec -- cargo fmt --check` is clean
 - [ ] Artifact bundles saved per shared verification contract §"Level C"
-- [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`) rather than re-summarizing
+  (the check script output + a copy of this doc + the smoke artifact
+  [ft-xbnl0-2-4-verification-smoke-tick340.md](ft-xbnl0-2-4-verification-smoke-tick340.md))
+- [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`)
+  and the latest smoke artifact path rather than re-summarizing
