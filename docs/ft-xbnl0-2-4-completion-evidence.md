@@ -253,9 +253,28 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
 - [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 42 tests pass)
-- [ ] `rch exec -- cargo fmt --check` is clean
+- [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
+- [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
 - [ ] Artifact bundles saved per shared verification contract §"Level C"
   (the check script output + a copy of this doc + the smoke artifact
   [ft-xbnl0-2-4-verification-smoke-tick340.md](ft-xbnl0-2-4-verification-smoke-tick340.md))
 - [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`)
   and the latest smoke artifact path rather than re-summarizing
+
+### 6.1 Note on the workspace clippy gate
+
+As of tick 356 (`cargo clippy --no-deps -p frankenterm-core --features distributed,asupersync-runtime,web --lib --tests -- -D warnings`), the `frankenterm-core` crate reports **17 clippy errors** on master. All 17 are located in files **unrelated to this bead** and unrelated to the session work on ft-xbnl0.2.4:
+
+- `crates/frankenterm-core/src/ipc.rs`
+- `crates/frankenterm-core/src/robot_sdk_contracts.rs`
+- `crates/frankenterm-core/src/runtime.rs`
+- `crates/frankenterm-core/src/snapshot_engine.rs`
+- `crates/frankenterm-core/src/ui_query.rs`
+- `crates/frankenterm-core/src/workflows/engine.rs`
+- `crates/frankenterm-core/src/workflows/runner.rs`
+
+None of the files authored or modified by the ft-xbnl0.2.4 verification work (`src/distributed.rs`, `src/metrics.rs`, `src/runtime_compat.rs`, `tests/web.rs`, `tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`) produce any clippy warnings.
+
+Closing recommendation: either (a) block closure behind the workspace-level clippy cleanup being completed by other owners, or (b) close this bead with a cross-reference noting that the bead-scoped files are clippy-clean and the workspace gate is a separate bead.
+
+Option (b) is consistent with AGENTS.md guidance on not disturbing other agents' in-progress work — the clippy violations may be intentional (awaiting `#[allow(...)]` annotations from their owners) and fixing them here without coordination would cross scope boundaries.
