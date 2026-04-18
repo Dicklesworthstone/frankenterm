@@ -3769,6 +3769,62 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 329: URL trailing-slash preservation contract.
+    ///
+    /// Servers commonly treat `/api/events` and `/api/events/` as
+    /// **different** routes — one might be a collection listing and
+    /// the other a specific resource. A client that silently stripped
+    /// (or appended) a trailing slash would misroute requests.
+    ///
+    /// Pins that `DistributedHttpClient::get` transmits the URL path
+    /// byte-for-byte, including any trailing slash. Asserts the
+    /// server-received request line starts with
+    /// `GET /api/events/ HTTP/1.` (note the trailing `/` before the
+    /// space-separated HTTP version).
+    ///
+    /// Complements:
+    /// - tick 321: path + query roundtrip (explicit path, no trailing)
+    /// - tick 324: no-path URL defaults to `/`
+    ///
+    /// Three URL-path variants are now pinned: explicit with trailing,
+    /// explicit without trailing (321), empty → default `/` (324).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_preserves_trailing_slash_in_path() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                let first_line = req.lines().next().expect("at least one line");
+                assert!(
+                    first_line.starts_with("GET /api/events/ HTTP/1."),
+                    "trailing slash must be preserved in request-target; got: {first_line:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            // Trailing slash is significant — different route from /api/events.
+            let url = format!("http://127.0.0.1:{}/api/events/", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 325: `Host:` header roundtrip contract.
     ///
     /// HTTP/1.1 requires a `Host:` header that matches the URL's
