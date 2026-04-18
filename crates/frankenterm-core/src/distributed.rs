@@ -4166,6 +4166,48 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 343: Invalid URL inputs → Err, no panic.
+    ///
+    /// Pins that `DistributedHttpClient::get` returns `Err` cleanly on
+    /// malformed inputs: empty string, unsupported scheme (`ftp://`),
+    /// and garbage. Specifically asserts these do not panic and do not
+    /// hang (bounded <5s).
+    ///
+    /// Why this matters: the distributed HTTP client is invoked from
+    /// runtime paths where URLs may be operator-supplied (config) or
+    /// peer-supplied (discovery / introspection response). A panic on
+    /// bad input would crash the containing task; a hang would stall
+    /// an agent-mediated workflow. Both are production risks — the
+    /// contract is graceful refusal.
+    ///
+    /// Not testing the exact error variant because URL parsing is a
+    /// library-owned detail (asupersync::http::h1::http_client) that
+    /// may classify these inputs differently. The stable contract is:
+    /// `Result` is `Err`; bounded latency; no panic.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_rejects_invalid_urls_without_panic() {
+        run_async_test(async {
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+
+            for url in &["", "not-a-url", "ftp://example.com/", "http://", "://bad"] {
+                let started = std::time::Instant::now();
+                let result = client.get(&cx, url).await;
+                let elapsed = started.elapsed();
+
+                assert!(
+                    result.is_err(),
+                    "invalid URL {url:?} must return Err, got Ok"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(5),
+                    "invalid URL {url:?} must fail fast; took {elapsed:?}"
+                );
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 342: HTTPS URL against plaintext server → Err.
     ///
     /// Pins that `DistributedHttpClient::get` against an `https://` URL
