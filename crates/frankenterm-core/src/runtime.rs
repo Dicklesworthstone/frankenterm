@@ -2762,7 +2762,10 @@ impl ObservationRuntime {
                                 );
                             }
 
-                            if capture_ring_tx.send(event).await.is_err() {
+                            // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
+                            let relay_cx = crate::cx::Cx::current()
+                                .unwrap_or_else(crate::cx::for_request);
+                            if capture_ring_tx.send_with_cx(&relay_cx, event).await.is_err() {
                                 debug!("Capture relay: persistence ring closed");
                                 return;
                             }
