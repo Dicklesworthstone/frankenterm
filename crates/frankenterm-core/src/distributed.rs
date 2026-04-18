@@ -3594,6 +3594,109 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 327: Large-body POST roundtrip contract.
+    ///
+    /// Pins that `DistributedHttpClient::post` correctly transmits
+    /// a body that exceeds a single kernel send buffer (128 KiB).
+    /// The small-body happy-path test (tick 316, 11 bytes) and the
+    /// empty-body test (tick 326, 0 bytes) both fit comfortably in
+    /// one write() syscall. A regression in the chunking / write-loop
+    /// path that only surfaced for large payloads (e.g. dropping bytes
+    /// past the first `EWOULDBLOCK`, or failing to await between
+    /// partial writes) would not fire on either.
+    ///
+    /// Body shape: 128 KiB of an ASCII byte pattern (`b'x'`) with an
+    /// incrementing 4-byte header so the server can verify the body
+    /// is contiguous, not silently truncated or reordered.
+    ///
+    /// ft-xbnl0.2.4 acceptance criterion 3 ("Verification covers
+    /// correctness") includes large-payload framing — event forwarding
+    /// in production regularly pushes multi-KB bodies (captured pane
+    /// scrollback, detection events with rich context).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_large_body_roundtrips() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            const BODY_LEN: usize = 128 * 1024;
+            let mut body = Vec::with_capacity(BODY_LEN);
+            // Sentinel header (first 4 bytes: 'R','M','S',':') so the
+            // server can assert body start is intact.
+            body.extend_from_slice(b"RMS:");
+            body.resize(BODY_LEN, b'x');
+            // Sentinel trailer (last 4 bytes) so the server can assert
+            // the end is intact too.
+            let tail_start = BODY_LEN - 4;
+            body[tail_start..].copy_from_slice(b":END");
+
+            let expected_body = body.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                // Read full request. May require multiple read() calls for a
+                // payload this size.
+                let mut accum = Vec::with_capacity(BODY_LEN + 512);
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    let n = stream.read(&mut buf).await.expect("read request chunk");
+                    if n == 0 {
+                        break;
+                    }
+                    accum.extend_from_slice(&buf[..n]);
+                    // Early exit once we have headers + full body length.
+                    if let Some(sep) = accum.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if accum.len() >= sep + 4 + BODY_LEN {
+                            break;
+                        }
+                    }
+                }
+                let sep = accum
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .expect("headers separator");
+                let recv_body = &accum[sep + 4..sep + 4 + BODY_LEN];
+                assert_eq!(
+                    recv_body.len(),
+                    BODY_LEN,
+                    "server received body length mismatch"
+                );
+                assert_eq!(
+                    &recv_body[..4],
+                    b"RMS:",
+                    "body head sentinel did not round-trip"
+                );
+                assert_eq!(
+                    &recv_body[recv_body.len() - 4..],
+                    b":END",
+                    "body tail sentinel did not round-trip"
+                );
+                assert_eq!(
+                    recv_body, &expected_body[..],
+                    "body bytes did not round-trip intact"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/bulk", addr.port());
+            let resp = client
+                .post(&cx, &url, body)
+                .await
+                .expect("large-body post");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 326: Empty-body POST contract.
     ///
     /// Pins that `DistributedHttpClient::post` correctly sends
