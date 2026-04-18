@@ -89,10 +89,12 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Flag lines whose trimmed content starts with:
-///   - `use tokio::net::Tcp`  (TCP surface)
-///   - `use tokio_rustls`     (tokio TLS)
-///   - `use hyper`            (tokio HTTP)
-///   - `use async_native_tls` (tokio TLS alternate)
+///   - `use tokio::net::Tcp`   (TCP surface)
+///   - `use tokio_rustls`      (tokio TLS)
+///   - `use hyper`             (tokio HTTP)
+///   - `use async_native_tls`  (tokio TLS alternate)
+///   - `use async_std::net`    (async-std TCP/UDP)
+///   - `use smol::net`         (smol TCP/UDP)
 ///   - `pub use` / `extern crate` variants of above
 ///
 /// The `::Tcp` prefix targets `TcpListener` / `TcpStream` re-exports.
@@ -126,7 +128,17 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
                 || trimmed.starts_with("extern crate async_native_tls")
                 || trimmed.starts_with("use async-native-tls")
                 || trimmed.starts_with("pub use async-native-tls");
-            if is_tokio_tcp_net || is_tokio_rustls || is_hyper || is_async_native_tls {
+            let is_async_std_net = trimmed.starts_with("use async_std::net")
+                || trimmed.starts_with("pub use async_std::net");
+            let is_smol_net = trimmed.starts_with("use smol::net")
+                || trimmed.starts_with("pub use smol::net");
+            if is_tokio_tcp_net
+                || is_tokio_rustls
+                || is_hyper
+                || is_async_native_tls
+                || is_async_std_net
+                || is_smol_net
+            {
                 Some((idx + 1, line.to_string()))
             } else {
                 None
@@ -150,6 +162,17 @@ fn scan_toml_for_banned_net_dep(path: &Path) -> Vec<(usize, String)> {
                     || trimmed.starts_with(&format!("{name}="))
                     || trimmed.starts_with(&format!("{name}."))
             };
+            // NOTE: `async-std` and `smol` are NOT flagged at the manifest
+            // level because they're transitive deps of the legacy
+            // frankenterm/ (ex-wezterm) vendored crates (ssh, codec,
+            // lua-api-crates/mux-lua). Those crates are out of scope
+            // for this bead — the bead targets "TCP, TLS, and HTTP
+            // client or service surfaces" that FrankenTerm's own code
+            // owns (distributed.rs, web/*.rs, web_framework.rs). The
+            // import-scan test above DOES flag `use async_std::net`
+            // or `use smol::net` in any file (including frankenterm/
+            // vendored) to prevent the wezterm code from leaking these
+            // async-runtime-TCP layers into core FrankenTerm logic.
             if starts_like_dep("tokio-rustls")
                 || starts_like_dep("tokio_rustls")
                 || starts_like_dep("hyper")
@@ -221,8 +244,9 @@ fn ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports() {
     assert!(
         violations.is_empty(),
         "ft-xbnl0.2.4 regression: {} file(s) reintroduced direct tokio-era \
-         networking imports (tokio::net::Tcp* / tokio_rustls / hyper / \
-         async_native_tls). Replace with asupersync::net::{{TcpStream, \
+         or competing-runtime networking imports (tokio::net::Tcp* / \
+         tokio_rustls / hyper / async_native_tls / async_std::net / \
+         smol::net). Replace with asupersync::net::{{TcpStream, \
          TcpListener}}, asupersync::tls::{{TlsAcceptor, TlsConnector}}, \
          or asupersync::http before re-running:\n{}",
         violations.len(),
