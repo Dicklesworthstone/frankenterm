@@ -100,19 +100,57 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Group | Tests | Result |
 |-------|-------|--------|
-| HTTP client contracts | 15 | 15/15 ok |
-| TLS contracts | 14 | 14/14 ok |
-| Regression guards | 3 | 3/3 ok |
-| **Subtotal** | **32** | **32/32 ok** |
+| HTTP client contracts (Run 1) | 15 | 15/15 ok |
+| TLS contracts (Run 2) | 14 | 14/14 ok |
+| Regression guards (Run 3) | 3 | 3/3 ok |
+| Metrics server cx-family (Run 4) | 3 | 3/3 ok |
+| Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
+| **Subtotal** | **36** | **36/36 ok** |
 
-Not included in this smoke run (they live in separate test files / feature sets):
-- `metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop` (tick 322, `src/metrics.rs`)
-- `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick 323, `tests/web.rs` under `--features web,asupersync-runtime`)
+Run 4 + Run 5 were added tick 341 to close the "individually-verified-only" caveat that was in the tick-340 version of this doc.
 
-These were individually verified at commit time of their respective ticks (322, 323) and are expected to still pass — add them to the rch remote-verification run recipe in the completion-evidence doc §4 for formal closure.
+### Run 4 — metrics server cx-first family (includes tick 322)
+
+```
+cargo test -p frankenterm-core --features distributed,asupersync-runtime,web --lib metrics_server_start_with_cx_
+```
+
+```
+running 3 tests
+test metrics::tests::metrics_server_start_with_cx_pre_cancelled_refuses_to_bind ... ok
+test metrics::tests::metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop ... ok
+test metrics::tests::metrics_server_start_with_cx_happy_path_serves_request ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 25600 filtered out; finished in 0.26s
+```
+
+Covers the three cx-signal timings (pre-start / mid-flight / happy)
+on the metrics server service boundary. Tick 322 added the
+mid-flight-cancel test; the other two were pre-existing from the
+ft-xbnl0.2.3 era.
+
+### Run 5 — web server cx-first pre-cancel (tick 323)
+
+```
+cargo test -p frankenterm-core --features web,asupersync-runtime --test web web_server_with_cx_
+```
+
+```
+running 1 test
+test web_tests::web_server_with_cx_pre_cancelled_refuses_to_bind ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+```
+
+Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 32 tests that land directly in the distributed + tests-guard surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
-- Compile time after the initial cold build: 0.36s-0.94s per filtered run. This is cheap to re-run per-commit in CI.
-- The 15 + 14 + 3 = 32 count matches the 32 tests claimed in the completion-evidence doc §2.1 + §2.2 + §2.4. The evidence and the observable reality agree.
+- All 36 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- Compile time after the initial cold build: 0.26s-3.42s per filtered run. This is cheap to re-run per-commit in CI.
+- The 15 + 14 + 3 + 3 + 1 = 36 count matches the full roster claimed in
+  the completion-evidence doc (HTTP client §2.1 + TLS §2.2 + regression
+  guards §2.4 + service-boundary §2.3 — incl. the 2 pre-existing metrics
+  cx-family tests that tick 322 extended, plus tick 323's web pre-cancel).
+- The evidence and the observable reality agree — no stale or missing
+  entries in either direction.
