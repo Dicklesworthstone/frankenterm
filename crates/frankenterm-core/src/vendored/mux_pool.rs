@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
-#[cfg(not(feature = "asupersync-runtime"))]
+// Retained across cfg gates: used by `execute_with_recovery_inner`
+// (non-asupersync fallback) and by test-mod eviction tests under both
+// runtime variants.
+#[allow(unused_imports)]
 use crate::runtime_compat::sleep;
 
 use super::mux_client::{

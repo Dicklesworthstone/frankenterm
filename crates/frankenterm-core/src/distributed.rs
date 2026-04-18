@@ -3484,6 +3484,59 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 313: Pin the cx-cancel contract for
+    /// `DistributedHttpClient::get`.
+    ///
+    /// The HTTP client wraps `asupersync::http::h1::http_client::HttpClient`,
+    /// which accepts `&Cx` and should honor cancellation. A pre-cancelled
+    /// cx must cause `get` to return an error (not silently complete
+    /// against a cooperative server, and not hang against a stalled one).
+    ///
+    /// Acceptance criterion 3 of ft-xbnl0.2.4 — "Verification covers
+    /// correctness" — includes the cx-cancel semantics of the migrated
+    /// HTTP client boundary.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_honors_pre_cancelled_cx() {
+        run_async_test(async {
+            // Server accepts but never writes a response. Without cx-cancel
+            // propagation, the client would hang waiting for response bytes.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                let _ = listener.accept().await;
+                // Hold the connection open; never write a response.
+                crate::runtime_compat::sleep(std::time::Duration::from_secs(10)).await;
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel for HTTP cx contract test"),
+            );
+
+            let url = format!("http://127.0.0.1:{}/health", addr.port());
+            let started = std::time::Instant::now();
+            let result = client.get(&cx, &url).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "pre-cancelled cx must cause get() to return an error, got: {result:?}"
+            );
+            // A pre-cancelled cx should fail fast. Bound generously to
+            // tolerate kernel connect/accept scheduling — the point is
+            // "does not hang against a stalled server", not a tight
+            // latency bound.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "pre-cancelled cx should fail fast; took {elapsed:?}"
+            );
+        });
+    }
+
     /// Verify bidirectional data exchange over TLS using bundle helpers.
     #[cfg(feature = "distributed")]
     #[test]
