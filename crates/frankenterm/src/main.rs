@@ -26735,7 +26735,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     consumed_at: None,
                 };
 
-                if let Err(e) = storage.insert_prepared_plan(record).await {
+                // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                let storage_cx_for_plan = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                if let Err(e) = storage
+                    .insert_prepared_plan_with_cx(&storage_cx_for_plan, record)
+                    .await
+                {
                     eprintln!("Error: Failed to store prepared plan: {e}");
                     std::process::exit(1);
                 }
@@ -26767,7 +26773,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     decision_context: prepare_context,
                     result: "success".to_string(),
                 };
-                if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
+                // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                let storage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                if let Err(e) = storage
+                    .record_audit_action_redacted_with_cx(&storage_cx, prepare_audit)
+                    .await
+                {
                     eprintln!("Warning: Failed to record prepare audit: {e}");
                 }
 
@@ -26948,7 +26960,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         consumed_at: None,
                     };
 
-                    if let Err(e) = storage.insert_prepared_plan(record).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx_for_plan = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .insert_prepared_plan_with_cx(&storage_cx_for_plan, record)
+                        .await
+                    {
                         eprintln!("Error: Failed to store prepared plan: {e}");
                         std::process::exit(1);
                     }
@@ -26980,7 +26998,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         decision_context: prepare_context,
                         result: "success".to_string(),
                     };
-                    if let Err(e) = storage.record_audit_action_redacted(prepare_audit).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .record_audit_action_redacted_with_cx(&storage_cx, prepare_audit)
+                        .await
+                    {
                         eprintln!("Warning: Failed to record prepare audit: {e}");
                     }
 
@@ -27315,7 +27339,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     audit_record.input_summary = Some(
                         frankenterm_core::policy::build_send_text_audit_summary(&text, None, None),
                     );
-                    if let Err(e) = storage.record_audit_action_redacted(audit_record).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .record_audit_action_redacted_with_cx(&storage_cx, audit_record)
+                        .await
+                    {
                         tracing::warn!(pane_id, "Failed to record audit: {e}");
                     }
 
@@ -27394,7 +27424,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         decision_context: commit_context,
                         result: commit_result.to_string(),
                     };
-                    if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .record_audit_action_redacted_with_cx(&storage_cx, commit_audit)
+                        .await
+                    {
                         tracing::warn!(pane_id, "Failed to record commit audit: {e}");
                     }
 
@@ -27655,7 +27691,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         decision_context: commit_context,
                         result: commit_result.to_string(),
                     };
-                    if let Err(e) = storage.record_audit_action_redacted(commit_audit).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .record_audit_action_redacted_with_cx(&storage_cx, commit_audit)
+                        .await
+                    {
                         tracing::warn!(pane_id, "Failed to record commit audit: {e}");
                     }
 
@@ -30855,7 +30897,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         caut_service,
                         now,
                     );
-                    if let Err(e) = storage.upsert_account(record.clone()).await {
+                    // ft-xbnl0.2.3 tick 241: cx-first storage write.
+                    let storage_cx_for_acct = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage
+                        .upsert_account_with_cx(&storage_cx_for_acct, record.clone())
+                        .await
+                    {
                         tracing::warn!("Failed to upsert account {}: {e}", record.account_id);
                     }
                     count += 1;
