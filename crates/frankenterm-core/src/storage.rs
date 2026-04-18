@@ -6621,6 +6621,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_action_undo_with_cx(
         &self,
@@ -6630,7 +6631,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("upsert_action_undo cancelled: {err}"))
         })?;
-        self.upsert_action_undo(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertActionUndo {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert undo metadata after applying redaction
@@ -10094,6 +10106,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_account`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_account_with_cx(
         &self,
@@ -10102,7 +10115,18 @@ impl StorageHandle {
     ) -> Result<i64> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("upsert_account cancelled: {err}")))?;
-        self.upsert_account(account).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertAccount {
+                    account,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Update an account's last_used_at timestamp
@@ -10129,6 +10153,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_account_last_used`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn update_account_last_used_with_cx(
         &self,
@@ -10140,8 +10165,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("update_account_last_used cancelled: {err}"))
         })?;
-        self.update_account_last_used(service, account_id, last_used_at)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpdateAccountLastUsed {
+                    service: service.to_string(),
+                    account_id: account_id.to_string(),
+                    last_used_at,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete an account by service and account_id
@@ -10162,6 +10199,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_account`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_account_with_cx(
         &self,
@@ -10171,7 +10209,19 @@ impl StorageHandle {
     ) -> Result<bool> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("delete_account cancelled: {err}")))?;
-        self.delete_account(service, account_id).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteAccount {
+                    service: service.to_string(),
+                    account_id: account_id.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get all accounts for a service
@@ -10297,6 +10347,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`create_reservation`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn create_reservation_with_cx(
         &self,
@@ -10310,8 +10361,22 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("create_reservation cancelled: {err}"))
         })?;
-        self.create_reservation(pane_id, owner_kind, owner_id, reason, ttl_ms)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::CreateReservation {
+                    pane_id,
+                    owner_kind: owner_kind.to_string(),
+                    owner_id: owner_id.to_string(),
+                    reason: reason.map(String::from),
+                    ttl_ms,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Release a pane reservation by ID.
@@ -10331,6 +10396,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`release_reservation`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn release_reservation_with_cx(
         &self,
@@ -10340,7 +10406,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("release_reservation cancelled: {err}"))
         })?;
-        self.release_reservation(reservation_id).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ReleaseReservation {
+                    reservation_id,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get the active reservation for a pane (read-only).
@@ -10664,6 +10741,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
+    /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn expire_stale_reservations_with_cx(
         &self,
@@ -10672,7 +10750,12 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("expire_stale_reservations cancelled: {err}"))
         })?;
-        self.expire_stale_reservations().await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::ExpireStaleReservations { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Shutdown the storage handle
