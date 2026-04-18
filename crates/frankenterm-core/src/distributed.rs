@@ -4566,6 +4566,74 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 389: Mid-flight cx-cancel on HTTP POST.
+    ///
+    /// Parallel to tick 380's GET test. Verifies the cancel-watcher
+    /// race added by tick 387's ft-l9mxa fix also applies to POST —
+    /// the fix lives in `race_with_cx_cancel` which both `::get` and
+    /// `::post` delegate to, but tests should verify both verbs
+    /// empirically.
+    ///
+    /// Same structure as tick 380: server accepts + holds the stream
+    /// so the client stalls on response-read; concurrent task cancels
+    /// cx 50 ms after POST starts; assert `elapsed < 1s` and
+    /// `Ok(Err(ClientError::Cancelled))`.
+    ///
+    /// Regression scenario caught: a future refactor bypassing
+    /// `race_with_cx_cancel` for POST (e.g. a direct `.post().await`
+    /// in a per-verb optimization) would cause POST-only mid-flight
+    /// cancel hang — invisible to the GET test.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_mid_flight_cancel_returns_cancelled() {
+        run_async_test(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                let _stream_hold = listener.accept().await;
+                crate::runtime_compat::sleep(std::time::Duration::from_secs(30)).await;
+                drop(_stream_hold);
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let cx_for_cancel = cx.clone();
+            crate::runtime_compat::task::spawn(async move {
+                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+                cx_for_cancel.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("mid-flight cancel for HTTP POST test"),
+                );
+            });
+
+            let url = format!("http://127.0.0.1:{}/stall", addr.port());
+            let body = b"body=cancelled-mid-flight".to_vec();
+
+            let started = std::time::Instant::now();
+            let result = crate::runtime_compat::timeout(
+                std::time::Duration::from_secs(10),
+                client.post(&cx, &url, body),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "POST mid-flight cancel should fire within ~1s (tick-387 ft-l9mxa fix); \
+                 took {elapsed:?}"
+            );
+            match result {
+                Ok(Err(asupersync::http::h1::http_client::ClientError::Cancelled)) => {}
+                other => panic!(
+                    "POST mid-flight cancel must produce Ok(Err(ClientError::Cancelled)); \
+                     got: {other:?}"
+                ),
+            }
+            eprintln!("tick 389: POST mid-flight cancel elapsed={elapsed:?}");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 378: Cx with budget deadline in the past does not hang.
     ///
     /// Snapshot test: exercises `DistributedHttpClient::get` with a Cx
