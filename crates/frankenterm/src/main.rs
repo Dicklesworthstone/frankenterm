@@ -15532,7 +15532,10 @@ async fn run_watcher(
                     .run_periodic(snap_shutdown_rx, move || async move {
                         let wez =
                             frankenterm_core::wezterm::wezterm_handle_with_timeout(loop_timeout);
-                        wez.list_panes().await.ok()
+                        // ft-xbnl0.2.3 tick 284: cx-first periodic list_panes probe.
+                        let probe_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        wez.list_panes_with_cx(&probe_cx).await.ok()
                     })
                     .await;
             });
