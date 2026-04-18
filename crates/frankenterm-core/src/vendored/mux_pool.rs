@@ -388,7 +388,20 @@ impl MuxPool {
                             .retry_policy
                             .delay_for_attempt(attempt.saturating_sub(1));
                         if !delay.is_zero() {
-                            cx::with_cx_async(cx, |_| sleep(delay)).await;
+                            // Tick 195 (ft-xbnl0.2.3): route the retry
+                            // backoff through sleep_with_cx(cx, ...).
+                            // Previously this used
+                            // `cx::with_cx_async(cx, |_| sleep(delay))`
+                            // which discarded cx via `|_|` — the inner
+                            // ambient `sleep` then fell back to
+                            // `Cx::current()` thread-local lookup,
+                            // making the backoff timer bound to a
+                            // different cx than the enclosing
+                            // execute_with_recovery_with_cx path.
+                            let _ = crate::runtime_compat::sleep_with_cx(
+                                cx, delay,
+                            )
+                            .await;
                         }
                         continue;
                     }
