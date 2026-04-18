@@ -204,12 +204,18 @@ pub(super) fn handle_events(
             Ok(s) => s,
             Err(resp) => return resp,
         };
-        match storage.get_events(query).await {
+        // ft-xbnl0.2.3 tick 257: cx-first web events handler.
+        let events_cx = crate::cx::Cx::current()
+            .unwrap_or_else(crate::cx::for_request);
+        match storage.get_events_with_cx(&events_cx, query).await {
             Ok(events) => {
                 let total = events.len();
                 let mut views: Vec<EventView> = Vec::with_capacity(total);
                 for event in events {
-                    let annotations = match storage.get_event_annotations(event.id).await {
+                    let annotations = match storage
+                        .get_event_annotations_with_cx(&events_cx, event.id)
+                        .await
+                    {
                         Ok(Some(annotations)) => {
                             Some(EventAnnotationsView::from_stored(annotations, &redactor))
                         }
@@ -308,7 +314,13 @@ pub(super) fn handle_search(
             Ok(s) => s,
             Err(resp) => return resp,
         };
-        match storage.search_with_results(&query, options).await {
+        // ft-xbnl0.2.3 tick 257: cx-first web search handler.
+        let search_cx = crate::cx::Cx::current()
+            .unwrap_or_else(crate::cx::for_request);
+        match storage
+            .search_with_results_with_cx(&search_cx, &query, options)
+            .await
+        {
             Ok(results) => {
                 let total = results.len();
                 let hits: Vec<SearchHit> = results
