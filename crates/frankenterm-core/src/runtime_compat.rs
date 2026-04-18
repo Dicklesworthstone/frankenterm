@@ -2176,6 +2176,27 @@ where
 /// Cx-first timeout seam for the ft-xbnl0.2.2 migration. Call sites that
 /// already thread `&Cx` should prefer this over the ambient [`timeout`]
 /// which falls back to `Cx::current()` thread-local lookup.
+///
+/// # Cancellation semantics (ft-xbnl0.2.4 tick 328)
+///
+/// This function observes the cx **budget deadline** (via
+/// [`asupersync::time::budget_timeout`], which bounds the effective
+/// timeout by the remaining budget), but does **not** directly check
+/// `cx.is_cancel_requested()`. A pre-cancelled cx with an infinite
+/// budget will still wait up to the full requested `duration` before
+/// returning `Err`.
+///
+/// Callers who need pre-cancellation short-circuit MUST add an explicit
+/// `cx.checkpoint()?` (or equivalent `if cx.is_cancel_requested()` bail)
+/// **before** invoking `timeout_with_cx`. Every cx-first function in
+/// this crate that wraps an inner future with `timeout_with_cx` already
+/// follows this pattern (e.g. `MetricsServer::start_with_cx`,
+/// `start_web_server_with_cx`, `EventWaiter::wait_with_cx`).
+///
+/// Mid-flight cancellation is observable only at await points inside
+/// the wrapped future whose primitives *themselves* honour cx cancel
+/// (e.g. `sleep_with_cx`, `broadcast_recv_with_cx`) — it is not
+/// otherwise observed by `timeout_with_cx`'s own polling.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn timeout_with_cx<F>(
     cx: &crate::cx::Cx,
