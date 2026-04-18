@@ -163,8 +163,11 @@ fn mcp_is_distributed_remote_domain(domain: &str) -> bool {
 async fn load_distributed_remote_panes(
     db_path: &Path,
 ) -> std::result::Result<Vec<crate::storage::PaneRecord>, crate::Error> {
-    let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-    let panes = storage.get_panes().await?;
+    // ft-xbnl0.2.3 tick 303: cx-first MCP scratch-handle open + panes read.
+    let mcp_panes_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    let storage =
+        StorageHandle::new_with_cx(&mcp_panes_cx, &db_path.to_string_lossy()).await?;
+    let panes = storage.get_panes_with_cx(&mcp_panes_cx).await?;
     if let Err(err) = storage.shutdown().await {
         tracing::warn!(error = %err, "Failed to shutdown storage cleanly after MCP pane query");
     }
@@ -938,9 +941,11 @@ impl ToolHandler for WaGetTextTool {
 
         let result: std::result::Result<McpGetTextData, McpToolError> =
             runtime.block_on(async move {
+                // ft-xbnl0.2.3 tick 303: cx-first MCP get-text storage open.
+                let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 let storage = if let Some(path) = db_path.as_ref() {
                     Some(
-                        StorageHandle::new(&path.to_string_lossy())
+                        StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
                             .await
                             .map_err(McpToolError::from_error)?,
                     )
@@ -1352,7 +1357,10 @@ impl ToolHandler for WaSearchTool {
 
         let result: std::result::Result<SearchExecution, McpToolError> =
             runtime.block_on(async move {
-                let storage = StorageHandle::new(&db_path.to_string_lossy())
+                // ft-xbnl0.2.3 tick 303: cx-first MCP search storage open.
+                let search_open_cx =
+                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let storage = StorageHandle::new_with_cx(&search_open_cx, &db_path.to_string_lossy())
                     .await
                     .map_err(McpToolError::from_error)?;
                 let mut semantic_budget_config = storage.semantic_budget_snapshot().config;
@@ -1632,7 +1640,10 @@ impl ToolHandler for WaEventsTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result: crate::Result<McpEventsData> = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            // ft-xbnl0.2.3 tick 303: cx-first MCP events storage open.
+            let events_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let storage =
+                StorageHandle::new_with_cx(&events_open_cx, &db_path.to_string_lossy()).await?;
 
             let query = EventQuery {
                 limit: Some(params.limit),
@@ -1783,11 +1794,12 @@ impl ToolHandler for WaSendTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async move {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            let wezterm = default_wezterm_handle();
-            // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
+            // ft-xbnl0.2.3 tick 303: cx-first MCP pane-state storage open (reuse wezterm_cx).
             let wezterm_cx = crate::cx::Cx::current()
                 .unwrap_or_else(crate::cx::for_request);
+            let storage =
+                StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
+            let wezterm = default_wezterm_handle();
             let pane_info = wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await?;
             let domain = pane_info.inferred_domain();
 
@@ -2017,9 +2029,12 @@ impl ToolHandler for WaWorkflowRunTool {
 
         let result: std::result::Result<McpWorkflowRunData, McpToolError> =
             runtime.block_on(async move {
-                let storage = StorageHandle::new(&db_path.to_string_lossy())
-                    .await
-                    .map_err(McpToolError::from_error)?;
+                // ft-xbnl0.2.3 tick 303: cx-first MCP workflow run storage open.
+                let wf_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let storage =
+                    StorageHandle::new_with_cx(&wf_open_cx, &db_path.to_string_lossy())
+                        .await
+                        .map_err(McpToolError::from_error)?;
                 let storage = Arc::new(storage);
 
                 let wezterm = default_wezterm_handle();
@@ -2822,8 +2837,11 @@ impl ToolHandler for WaReservationsTool {
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
         let result = runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            storage.list_active_reservations().await
+            // ft-xbnl0.2.3 tick 303: cx-first MCP reservation list.
+            let res_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let storage =
+                StorageHandle::new_with_cx(&res_cx, &db_path.to_string_lossy()).await?;
+            storage.list_active_reservations_with_cx(&res_cx).await
         });
 
         match result {
@@ -2925,9 +2943,12 @@ impl ToolHandler for WaReserveTool {
 
         let result: std::result::Result<McpReserveData, McpToolError> =
             runtime.block_on(async move {
-                let storage = StorageHandle::new(&db_path.to_string_lossy())
-                    .await
-                    .map_err(McpToolError::from_error)?;
+                // ft-xbnl0.2.3 tick 303: cx-first MCP reserve storage open.
+                let reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let storage =
+                    StorageHandle::new_with_cx(&reserve_cx, &db_path.to_string_lossy())
+                        .await
+                        .map_err(McpToolError::from_error)?;
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
                 let summary = format!("reserve pane {}", params.pane_id);
@@ -3046,9 +3067,12 @@ impl ToolHandler for WaReleaseTool {
 
         let result: std::result::Result<McpReleaseData, McpToolError> =
             runtime.block_on(async move {
-                let storage = StorageHandle::new(&db_path.to_string_lossy())
-                    .await
-                    .map_err(McpToolError::from_error)?;
+                // ft-xbnl0.2.3 tick 303: cx-first MCP release storage open.
+                let release_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let storage =
+                    StorageHandle::new_with_cx(&release_cx, &db_path.to_string_lossy())
+                        .await
+                        .map_err(McpToolError::from_error)?;
 
                 let active = storage
                     .list_active_reservations()
