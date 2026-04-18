@@ -4360,6 +4360,68 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 385: POST also does not transparently follow 3xx.
+    ///
+    /// Parallel to `distributed_http_client_returns_3xx_redirect_as_ok_response`
+    /// (ft-kfkyi fix, tick 351) which tests the GET verb. This pins that
+    /// the same security policy (no transparent redirect follow) applies
+    /// to POST.
+    ///
+    /// Why both: ft-kfkyi's fix in tick 351 configured the client at
+    /// construction site (`.no_redirects()` on the asupersync HttpClient
+    /// builder). Both GET and POST route through the same inner client,
+    /// so they should share the policy. This test verifies that
+    /// empirically rather than assuming the build propagation.
+    ///
+    /// A regression scenario this catches: if a future refactor wrapped
+    /// GET but not POST (e.g. per-verb redirect override), only POST
+    /// would transparently follow — the GET test wouldn't catch it.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_returns_3xx_redirect_as_ok_response() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = b"HTTP/1.1 302 Found\r\n\
+                                 Location: http://does-not-resolve.invalid./\r\n\
+                                 Content-Length: 0\r\n\r\n";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/origin", addr.port());
+
+            let started = std::time::Instant::now();
+            let resp = client
+                .post(&cx, &url, b"body=data".to_vec())
+                .await
+                .expect("3xx must be Ok(Response) for POST with .no_redirects()");
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                resp.status, 302,
+                "302 redirect on POST must be Ok(Response{{status: 302}}) — \
+                 if this fails, ft-kfkyi RedirectPolicy likely only applies \
+                 to GET, not POST."
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "client must not burn DNS time following redirect on POST; took {elapsed:?}"
+            );
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 380: Mid-flight cx-cancel on HTTP GET (snapshot).
     ///
     /// Complements tick 313 (`distributed_http_client_honors_pre_cancelled_cx`)
