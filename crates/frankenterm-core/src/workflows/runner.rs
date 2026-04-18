@@ -710,7 +710,18 @@ impl WorkflowRunner {
                 };
             }
 
-            if let Err(e) = self.storage.upsert_action_plan(execution_id, &plan).await {
+            // ft-xbnl0.2.3 tick 259: cx-first action-plan persist with maybe-cx fallback.
+            #[cfg(feature = "asupersync-runtime")]
+            let persist_result = if let Some(cx) = cx {
+                self.storage
+                    .upsert_action_plan_with_cx(cx, execution_id, &plan)
+                    .await
+            } else {
+                self.storage.upsert_action_plan(execution_id, &plan).await
+            };
+            #[cfg(not(feature = "asupersync-runtime"))]
+            let persist_result = self.storage.upsert_action_plan(execution_id, &plan).await;
+            if let Err(e) = persist_result {
                 tracing::warn!(
                     execution_id,
                     error = %e,
