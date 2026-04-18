@@ -595,12 +595,7 @@ impl WorkflowRunner {
         } else {
             #[cfg(feature = "asupersync-runtime")]
             let fetched = if let Some(cx) = cx {
-                fetch_workflow_start_action_id_with_cx(
-                    cx,
-                    &self.storage,
-                    execution_id,
-                )
-                .await
+                fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
             } else {
                 fetch_workflow_start_action_id(&self.storage, execution_id).await
             };
@@ -675,14 +670,20 @@ impl WorkflowRunner {
                     "Action plan validation failed"
                 );
                 let reason = format!("Plan validation failed: {validation_error}");
-                if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
+                if let Err(e) = self
+                    .fail_execution_maybe_cx(cx, execution_id, &reason)
+                    .await
+                {
                     tracing::warn!(
                         execution_id,
                         error = %e,
                         "Failed to fail execution after plan validation error"
                     );
                 }
-                if let Err(e) = self.mark_trigger_event_handled_maybe_cx(cx, execution_id, "error").await {
+                if let Err(e) = self
+                    .mark_trigger_event_handled_maybe_cx(cx, execution_id, "error")
+                    .await
+                {
                     tracing::warn!(
                         execution_id,
                         error = %e,
@@ -743,8 +744,7 @@ impl WorkflowRunner {
             #[cfg(feature = "asupersync-runtime")]
             if let Some(cx) = cx {
                 if let Err(err) = cx.checkpoint() {
-                    let reason =
-                        format!("run_workflow cancelled at step {current_step}: {err}");
+                    let reason = format!("run_workflow cancelled at step {current_step}: {err}");
                     if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
                         tracing::warn!(
                             execution_id,
@@ -1003,7 +1003,10 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution state
-                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
+                    if let Err(e) = self
+                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .await
+                    {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1056,7 +1059,10 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution state
-                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
+                    if let Err(e) = self
+                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .await
+                    {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1153,7 +1159,10 @@ impl WorkflowRunner {
                         );
 
                         // Update execution to failed
-                        if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
+                        if let Err(e) = self
+                            .fail_execution_maybe_cx(cx, execution_id, &reason)
+                            .await
+                        {
                             tracing::warn!(
                                 execution_id,
                                 error = %e,
@@ -1207,7 +1216,10 @@ impl WorkflowRunner {
                     let elapsed_ms = elapsed_ms(start_time);
 
                     // Update execution to failed
-                    if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
+                    if let Err(e) = self
+                        .fail_execution_maybe_cx(cx, execution_id, &reason)
+                        .await
+                    {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1334,7 +1346,10 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution back to running
-                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
+                    if let Err(e) = self
+                        .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                        .await
+                    {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1467,8 +1482,9 @@ impl WorkflowRunner {
                             current_step += 1;
                             retries = 0;
 
-                            if let Err(e) =
-                                self.update_execution_step_maybe_cx(cx, execution_id, current_step).await
+                            if let Err(e) = self
+                                .update_execution_step_maybe_cx(cx, execution_id, current_step)
+                                .await
                             {
                                 tracing::warn!(
                                     execution_id,
@@ -1521,7 +1537,10 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed
-                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
+                            if let Err(e) = self
+                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .await
+                            {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -1595,7 +1614,10 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed (approval not auto-granted for workflows)
-                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
+                            if let Err(e) = self
+                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .await
+                            {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -1605,7 +1627,11 @@ impl WorkflowRunner {
 
                             // Mark trigger event as handled (with requires_approval status)
                             if let Err(e) = self
-                                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "requires_approval")
+                                .mark_trigger_event_handled_maybe_cx(
+                                    cx,
+                                    execution_id,
+                                    "requires_approval",
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -1654,7 +1680,10 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed
-                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
+                            if let Err(e) = self
+                                .fail_execution_maybe_cx(cx, execution_id, &abort_reason)
+                                .await
+                            {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -1663,8 +1692,9 @@ impl WorkflowRunner {
                             }
 
                             // Mark trigger event as handled (with error status)
-                            if let Err(e) =
-                                self.mark_trigger_event_handled_maybe_cx(cx, execution_id, "error").await
+                            if let Err(e) = self
+                                .mark_trigger_event_handled_maybe_cx(cx, execution_id, "error")
+                                .await
                             {
                                 tracing::warn!(
                                     execution_id,
@@ -1995,11 +2025,7 @@ impl WorkflowRunner {
     ///
     /// Legacy [`run`](Self::run) preserved unchanged.
     #[cfg(feature = "asupersync-runtime")]
-    pub async fn run_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        event_bus: &crate::events::EventBus,
-    ) {
+    pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
         let resumed = self.resume_incomplete_with_cx(cx).await;
         if !resumed.is_empty() {
             tracing::info!(
@@ -2010,13 +2036,22 @@ impl WorkflowRunner {
             for result in &resumed {
                 match result {
                     WorkflowExecutionResult::Completed { execution_id, .. } => {
-                        tracing::info!(execution_id, explicit_cx = true, "Resumed workflow completed (cx)");
+                        tracing::info!(
+                            execution_id,
+                            explicit_cx = true,
+                            "Resumed workflow completed (cx)"
+                        );
                     }
                     WorkflowExecutionResult::Error {
                         execution_id,
                         error,
                     } => {
-                        tracing::warn!(?execution_id, error, explicit_cx = true, "Resumed workflow errored (cx)");
+                        tracing::warn!(
+                            ?execution_id,
+                            error,
+                            explicit_cx = true,
+                            "Resumed workflow errored (cx)"
+                        );
                     }
                     _ => {}
                 }
@@ -2434,7 +2469,9 @@ impl WorkflowRunner {
     ) -> crate::Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
-            return self.update_execution_step_with_cx(cx, execution_id, step).await;
+            return self
+                .update_execution_step_with_cx(cx, execution_id, step)
+                .await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         let _ = cx;
@@ -2569,11 +2606,14 @@ impl WorkflowRunner {
     ) -> crate::Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
-            return self.set_execution_waiting_with_cx(cx, execution_id, step, condition).await;
+            return self
+                .set_execution_waiting_with_cx(cx, execution_id, step, condition)
+                .await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         let _ = cx;
-        self.set_execution_waiting(execution_id, step, condition).await
+        self.set_execution_waiting(execution_id, step, condition)
+            .await
     }
 
     async fn complete_execution(
@@ -2699,7 +2739,9 @@ impl WorkflowRunner {
     ) -> crate::Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
-            return self.complete_execution_with_cx(cx, execution_id, result).await;
+            return self
+                .complete_execution_with_cx(cx, execution_id, result)
+                .await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         let _ = cx;

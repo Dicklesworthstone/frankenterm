@@ -310,8 +310,7 @@ async fn emit_new_segment_frames(
         };
 
         // ft-xbnl0.2.3 tick 257: cx-first SSE delta-stream scan.
-        let scan_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let scan_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let segments = match storage.scan_segments_with_cx(&scan_cx, query).await {
             Ok(segments) => segments,
             Err(err) => {

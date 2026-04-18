@@ -2358,7 +2358,9 @@ impl WeztermClient {
     ) -> Result<String> {
         self.circuit_guard()?;
         let result = self
-            .retry_with_with_cx(cx, || self.run_cli_with_pane_check_with_cx(cx, args, pane_id))
+            .retry_with_with_cx(cx, || {
+                self.run_cli_with_pane_check_with_cx(cx, args, pane_id)
+            })
             .await;
         self.circuit_record_result(&result);
         result
@@ -2420,11 +2422,7 @@ impl WeztermClient {
     /// a cx-first path itself; this helper only owns cancellation of
     /// the retry schedule, not of the underlying IO.
     #[allow(dead_code)]
-    async fn retry_with_with_cx<F, Fut>(
-        &self,
-        cx: &crate::cx::Cx,
-        mut runner: F,
-    ) -> Result<String>
+    async fn retry_with_with_cx<F, Fut>(&self, cx: &crate::cx::Cx, mut runner: F) -> Result<String>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<String>>,
@@ -4358,9 +4356,7 @@ mod tests {
                         "error should mention cancellation: {msg}"
                     );
                 }
-                other => panic!(
-                    "expected Wezterm(CommandFailed) on pre-cancel, got {other:?}"
-                ),
+                other => panic!("expected Wezterm(CommandFailed) on pre-cancel, got {other:?}"),
             }
         });
     }

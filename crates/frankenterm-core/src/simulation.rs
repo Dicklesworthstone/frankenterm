@@ -1087,10 +1087,7 @@ impl TutorialSandbox {
     ///
     /// Routes the scenario setup through `Scenario::setup_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
-    pub async fn with_scenario_with_cx(
-        cx: &crate::cx::Cx,
-        scenario: Scenario,
-    ) -> Result<Self> {
+    pub async fn with_scenario_with_cx(cx: &crate::cx::Cx, scenario: Scenario) -> Result<Self> {
         let mock = MockWezterm::new();
         scenario.setup_with_cx(cx, &mock).await?;
 
@@ -1181,8 +1178,7 @@ impl TutorialSandbox {
         match kind {
             ExpectationKind::Contains { pane, text } => {
                 // ft-xbnl0.2.3 tick 263: cx-first simulation expectation check.
-                let expect_cx = crate::cx::Cx::current()
-                    .unwrap_or_else(crate::cx::for_request);
+                let expect_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 if let Ok(content) = self.mock.get_text_with_cx(&expect_cx, *pane, false).await {
                     content.contains(text)
                 } else {

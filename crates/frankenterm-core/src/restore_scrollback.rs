@@ -462,7 +462,9 @@ impl ScrollbackInjector {
                     total = chunks.len()
                 ))
             })?;
-            self.wezterm.send_text_with_cx(cx, new_pane_id, chunk).await?;
+            self.wezterm
+                .send_text_with_cx(cx, new_pane_id, chunk)
+                .await?;
             bytes_written += chunk.len();
 
             if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {

@@ -165,8 +165,7 @@ async fn load_distributed_remote_panes(
 ) -> std::result::Result<Vec<crate::storage::PaneRecord>, crate::Error> {
     // ft-xbnl0.2.3 tick 303: cx-first MCP scratch-handle open + panes read.
     let mcp_panes_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-    let storage =
-        StorageHandle::new_with_cx(&mcp_panes_cx, &db_path.to_string_lossy()).await?;
+    let storage = StorageHandle::new_with_cx(&mcp_panes_cx, &db_path.to_string_lossy()).await?;
     let panes = storage.get_panes_with_cx(&mcp_panes_cx).await?;
     if let Err(err) = storage.shutdown().await {
         tracing::warn!(error = %err, "Failed to shutdown storage cleanly after MCP pane query");
@@ -1360,9 +1359,10 @@ impl ToolHandler for WaSearchTool {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP search storage open.
                 let search_open_cx =
                     crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let storage = StorageHandle::new_with_cx(&search_open_cx, &db_path.to_string_lossy())
-                    .await
-                    .map_err(McpToolError::from_error)?;
+                let storage =
+                    StorageHandle::new_with_cx(&search_open_cx, &db_path.to_string_lossy())
+                        .await
+                        .map_err(McpToolError::from_error)?;
                 let mut semantic_budget_config = storage.semantic_budget_snapshot().config;
                 semantic_budget_config.max_semantic_latency_ms =
                     effective_search_quality_timeout_ms(config.as_ref());
@@ -1658,8 +1658,7 @@ impl ToolHandler for WaEventsTool {
             };
 
             // ft-xbnl0.2.3 tick 258: cx-first MCP event-query + annotation loop.
-            let events_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let events_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let events = storage.get_events_with_cx(&events_cx, query).await?;
             let total_count = events.len();
 
@@ -1795,12 +1794,13 @@ impl ToolHandler for WaSendTool {
 
         let result = runtime.block_on(async move {
             // ft-xbnl0.2.3 tick 303: cx-first MCP pane-state storage open (reuse wezterm_cx).
-            let wezterm_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let storage =
                 StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
             let wezterm = default_wezterm_handle();
-            let pane_info = wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await?;
+            let pane_info = wezterm
+                .get_pane_with_cx(&wezterm_cx, params.pane_id)
+                .await?;
             let domain = pane_info.inferred_domain();
 
             let resolution =
@@ -2839,8 +2839,7 @@ impl ToolHandler for WaReservationsTool {
         let result = runtime.block_on(async {
             // ft-xbnl0.2.3 tick 303: cx-first MCP reservation list.
             let res_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            let storage =
-                StorageHandle::new_with_cx(&res_cx, &db_path.to_string_lossy()).await?;
+            let storage = StorageHandle::new_with_cx(&res_cx, &db_path.to_string_lossy()).await?;
             storage.list_active_reservations_with_cx(&res_cx).await
         });
 
@@ -2945,10 +2944,9 @@ impl ToolHandler for WaReserveTool {
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP reserve storage open.
                 let reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let storage =
-                    StorageHandle::new_with_cx(&reserve_cx, &db_path.to_string_lossy())
-                        .await
-                        .map_err(McpToolError::from_error)?;
+                let storage = StorageHandle::new_with_cx(&reserve_cx, &db_path.to_string_lossy())
+                    .await
+                    .map_err(McpToolError::from_error)?;
 
                 let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
                 let summary = format!("reserve pane {}", params.pane_id);
@@ -3069,10 +3067,9 @@ impl ToolHandler for WaReleaseTool {
             runtime.block_on(async move {
                 // ft-xbnl0.2.3 tick 303: cx-first MCP release storage open.
                 let release_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let storage =
-                    StorageHandle::new_with_cx(&release_cx, &db_path.to_string_lossy())
-                        .await
-                        .map_err(McpToolError::from_error)?;
+                let storage = StorageHandle::new_with_cx(&release_cx, &db_path.to_string_lossy())
+                    .await
+                    .map_err(McpToolError::from_error)?;
 
                 let active = storage
                     .list_active_reservations()
@@ -3195,8 +3192,7 @@ impl ToolHandler for WaAccountsTool {
         let result = runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
             // ft-xbnl0.2.3 tick 258: cx-first account lookup.
-            let accounts_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let accounts_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             storage
                 .get_accounts_by_service_with_cx(&accounts_cx, &params.service)
                 .await
@@ -4181,8 +4177,7 @@ impl ToolHandler for WaEventsAnnotateTool {
                 result: "success".to_string(),
             };
             // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-            let audit_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let _ = storage
                 .record_audit_action_redacted_with_cx(&audit_cx, audit)
                 .await;
@@ -4340,8 +4335,7 @@ impl ToolHandler for WaEventsTriageTool {
                 },
             };
             // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-            let audit_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let _ = storage
                 .record_audit_action_redacted_with_cx(&audit_cx, audit)
                 .await;
@@ -4498,11 +4492,10 @@ impl ToolHandler for WaEventsLabelTool {
                     },
                 };
                 // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-            let audit_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
-            let _ = storage
-                .record_audit_action_redacted_with_cx(&audit_cx, audit)
-                .await;
+                let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let _ = storage
+                    .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                    .await;
 
                 Some(inserted)
             } else if let Some(label) = params.remove.clone() {
@@ -4547,11 +4540,10 @@ impl ToolHandler for WaEventsLabelTool {
                     },
                 };
                 // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-            let audit_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
-            let _ = storage
-                .record_audit_action_redacted_with_cx(&audit_cx, audit)
-                .await;
+                let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let _ = storage
+                    .record_audit_action_redacted_with_cx(&audit_cx, audit)
+                    .await;
 
                 Some(removed)
             } else {

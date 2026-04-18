@@ -449,8 +449,7 @@ impl QueryClient for ProductionQueryClient {
 
             if let Some(storage) = storage {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI pane-aggregation reads.
-                let agg_cx = crate::cx::Cx::current()
-                    .unwrap_or_else(crate::cx::for_request);
+                let agg_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 let (unhandled_res, last_activity_res) = crate::runtime_compat::join!(
                     storage.count_unhandled_events_by_pane_with_cx(&agg_cx),
                     storage.get_last_activity_by_pane_with_cx(&agg_cx)
@@ -490,8 +489,7 @@ impl QueryClient for ProductionQueryClient {
 
         let rows = self.runtime.block_on(async {
             // ft-xbnl0.2.3 tick 255: cx-first TUI event query + annotation loop.
-            let query_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let query_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let events = storage
                 .get_events_with_cx(&query_cx, query)
                 .await
@@ -796,8 +794,7 @@ impl QueryClient for ProductionQueryClient {
 
         self.runtime.block_on(async {
             // ft-xbnl0.2.3 tick 255: cx-first TUI mute + handled writes.
-            let mute_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let mute_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if let Ok(Some(identity_key)) = storage
                 .get_event_identity_key_with_cx(&mute_cx, event_id)
                 .await
@@ -957,8 +954,7 @@ impl QueryClient for ProductionQueryClient {
         self.runtime
             .block_on(async {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI timeline read.
-                let timeline_cx = crate::cx::Cx::current()
-                    .unwrap_or_else(crate::cx::for_request);
+                let timeline_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 storage.get_timeline_with_cx(&timeline_cx, query).await
             })
             .map_err(|e| QueryError::StorageError(e.to_string()))

@@ -441,8 +441,7 @@ async fn resolve_pane_capabilities(
 
     if let Some(storage) = storage {
         // ft-xbnl0.2.3 tick 253: cx-first reservation lookup.
-        let reservation_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let reservation_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         match storage
             .get_active_reservation_with_cx(&reservation_cx, pane_id)
             .await
@@ -588,8 +587,7 @@ async fn record_mcp_audit(
         result: result.to_string(),
     };
     // ft-xbnl0.2.3 tick 253: cx-first MCP audit write.
-    let audit_cx = crate::cx::Cx::current()
-        .unwrap_or_else(crate::cx::for_request);
+    let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     if let Err(e) = storage
         .record_audit_action_redacted_with_cx(&audit_cx, audit)
         .await

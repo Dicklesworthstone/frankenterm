@@ -1546,9 +1546,7 @@ async fn handle_request_with_context_with_cx(
         request,
     } = envelope;
     match request {
-        IpcRequest::PaneState { pane_id } => {
-            handle_pane_state_with_cx(cx, pane_id, ctx).await
-        }
+        IpcRequest::PaneState { pane_id } => handle_pane_state_with_cx(cx, pane_id, ctx).await,
         IpcRequest::SetPanePriority {
             pane_id,
             priority,

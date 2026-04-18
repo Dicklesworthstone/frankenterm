@@ -226,13 +226,15 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         tracing::info!(pane_id, rule_id, timeout_ms, "pattern_wait start");
 
         // ft-xbnl0.2.3 tick 264: cx-first pattern-wait poll loop.
-        let poll_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let poll_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         loop {
             polls += 1;
 
             // Get pane text
-            let text = self.source.get_text_with_cx(&poll_cx, pane_id, false).await?;
+            let text = self
+                .source
+                .get_text_with_cx(&poll_cx, pane_id, false)
+                .await?;
             let tail = tail_text(&text, self.options.tail_lines);
 
             // Run pattern detection
@@ -397,8 +399,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         // Fallback: Use heuristic prompt detection
         if self.options.allow_idle_heuristics {
             // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
-            let idle_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let idle_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let text = self
                 .source
                 .get_text_with_cx(&idle_cx, pane_id, false)

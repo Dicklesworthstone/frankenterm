@@ -407,10 +407,7 @@ impl MuxPool {
                             // making the backoff timer bound to a
                             // different cx than the enclosing
                             // execute_with_recovery_with_cx path.
-                            let _ = crate::runtime_compat::sleep_with_cx(
-                                cx, delay,
-                            )
-                            .await;
+                            let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
                         }
                         continue;
                     }

@@ -568,7 +568,9 @@ impl AlertMonitor {
                     Some(s) => s.to_string(),
                     None => return Ok(100.0),
                 };
-                let accounts = storage.get_accounts_by_service_with_cx(cx, &service).await?;
+                let accounts = storage
+                    .get_accounts_by_service_with_cx(cx, &service)
+                    .await?;
                 if let Some(ref target_id) = rule.account_id {
                     accounts
                         .iter()

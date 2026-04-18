@@ -970,7 +970,10 @@ async fn record_workflow_action_with_cx(
         result: result.to_string(),
     };
 
-    match storage.record_audit_action_redacted_with_cx(cx, action).await {
+    match storage
+        .record_audit_action_redacted_with_cx(cx, action)
+        .await
+    {
         Ok(id) => Some(id),
         Err(e) => {
             tracing::warn!(

@@ -2444,14 +2444,9 @@ mod tests {
                 let legacy_err = export_content(&storage, "session-tick151-none", &query)
                     .await
                     .expect_err("missing session must surface an error");
-                let cx_err = export_content_with_cx(
-                    &cx,
-                    &storage,
-                    "session-tick151-none",
-                    &query,
-                )
-                .await
-                .expect_err("missing session must surface an error via cx-first path");
+                let cx_err = export_content_with_cx(&cx, &storage, "session-tick151-none", &query)
+                    .await
+                    .expect_err("missing session must surface an error via cx-first path");
 
                 match (&legacy_err, &cx_err) {
                     (
@@ -2460,9 +2455,7 @@ mod tests {
                     ) => {
                         assert_eq!(a, b, "NotFound messages should match on both paths");
                     }
-                    other => panic!(
-                        "expected Storage(NotFound) on both paths, got {other:?}"
-                    ),
+                    other => panic!("expected Storage(NotFound) on both paths, got {other:?}"),
                 }
 
                 storage.shutdown().await.unwrap();

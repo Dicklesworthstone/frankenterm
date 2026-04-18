@@ -250,7 +250,14 @@ pub async fn check_step_idempotency_maybe_cx(
 ) -> IdempotencyCheckResult {
     #[cfg(feature = "asupersync-runtime")]
     if let Some(cx) = cx {
-        return check_step_idempotency_with_cx(cx, storage, execution_id, idempotency_key, step_index).await;
+        return check_step_idempotency_with_cx(
+            cx,
+            storage,
+            execution_id,
+            idempotency_key,
+            step_index,
+        )
+        .await;
     }
     #[cfg(not(feature = "asupersync-runtime"))]
     let _ = cx;

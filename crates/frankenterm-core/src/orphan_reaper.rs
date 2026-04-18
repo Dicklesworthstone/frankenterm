@@ -404,9 +404,8 @@ async fn list_wezterm_cli_processes_via_ps() -> Result<Vec<ProcessEntry>, String
 async fn list_wezterm_cli_processes_via_ps_with_cx(
     cx: &crate::cx::Cx,
 ) -> Result<Vec<ProcessEntry>, String> {
-    cx.checkpoint().map_err(|err| {
-        format!("list_wezterm_cli_processes_via_ps cancelled: {err}")
-    })?;
+    cx.checkpoint()
+        .map_err(|err| format!("list_wezterm_cli_processes_via_ps cancelled: {err}"))?;
     list_wezterm_cli_processes_via_ps().await
 }
 

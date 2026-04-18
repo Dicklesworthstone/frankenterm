@@ -205,8 +205,7 @@ pub(super) fn handle_events(
             Err(resp) => return resp,
         };
         // ft-xbnl0.2.3 tick 257: cx-first web events handler.
-        let events_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let events_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         match storage.get_events_with_cx(&events_cx, query).await {
             Ok(events) => {
                 let total = events.len();
@@ -315,8 +314,7 @@ pub(super) fn handle_search(
             Err(resp) => return resp,
         };
         // ft-xbnl0.2.3 tick 257: cx-first web search handler.
-        let search_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let search_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         match storage
             .search_with_results_with_cx(&search_cx, &query, options)
             .await

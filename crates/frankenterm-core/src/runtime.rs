@@ -1522,8 +1522,8 @@ impl ObservationRuntime {
                         }
                         // Also purge old audit actions
                         // ft-xbnl0.2.3 tick 251: cx-first retention purge.
-                        let purge_cx = crate::cx::Cx::current()
-                            .unwrap_or_else(crate::cx::for_request);
+                        let purge_cx =
+                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                         if let Err(e) = storage
                             .purge_audit_actions_before_with_cx(&purge_cx, cutoff_ms)
                             .await
@@ -2072,8 +2072,8 @@ impl ObservationRuntime {
 
                             // Check if pane exists in storage to recover stable UUID
                             // ft-xbnl0.2.3 tick 251: cx-first storage in pane-setup block.
-                            let pane_setup_cx = crate::cx::Cx::current()
-                                .unwrap_or_else(crate::cx::for_request);
+                            let pane_setup_cx =
+                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             let stable_uuid = {
                                 let result = storage
                                     .get_pane_with_cx(&pane_setup_cx, pane_id)
@@ -2763,9 +2763,13 @@ impl ObservationRuntime {
                             }
 
                             // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                            let relay_cx = crate::cx::Cx::current()
-                                .unwrap_or_else(crate::cx::for_request);
-                            if capture_ring_tx.send_with_cx(&relay_cx, event).await.is_err() {
+                            let relay_cx =
+                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                            if capture_ring_tx
+                                .send_with_cx(&relay_cx, event)
+                                .await
+                                .is_err()
+                            {
                                 debug!("Capture relay: persistence ring closed");
                                 return;
                             }
@@ -2848,8 +2852,7 @@ impl ObservationRuntime {
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
-                let persist_cx = crate::cx::Cx::current()
-                    .unwrap_or_else(crate::cx::for_request);
+                let persist_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 match persist_captured_segment_with_cx(
                     &persist_cx,
                     &storage,
@@ -2891,8 +2894,8 @@ impl ObservationRuntime {
 
                         if let Some(ref manager) = recording {
                             // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
-                            let recording_seg_cx = crate::cx::Cx::current()
-                                .unwrap_or_else(crate::cx::for_request);
+                            let recording_seg_cx =
+                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             if let Err(err) = manager
                                 .record_segment_with_cx(&recording_seg_cx, &event.segment)
                                 .await
@@ -2977,8 +2980,8 @@ impl ObservationRuntime {
 
                             // Persist each detection as an event
                             // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
-                            let recording_det_cx = crate::cx::Cx::current()
-                                .unwrap_or_else(crate::cx::for_request);
+                            let recording_det_cx =
+                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             for detection in detections {
                                 if let Some(ref manager) = recording {
                                     if let Err(err) = manager
@@ -3006,8 +3009,8 @@ impl ObservationRuntime {
                                 );
 
                                 // ft-xbnl0.2.3 tick 251: cx-first event record.
-                                let event_cx = crate::cx::Cx::current()
-                                    .unwrap_or_else(crate::cx::for_request);
+                                let event_cx =
+                                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                                 match storage.record_event_with_cx(&event_cx, stored_event).await {
                                     Ok(event_id) => {
                                         metrics.events_recorded.increment();
@@ -3156,8 +3159,7 @@ async fn handle_native_event(
             };
 
             // ft-xbnl0.2.3 tick 251: cx-first native-event pane upsert.
-            let native_event_cx = crate::cx::Cx::current()
-                .unwrap_or_else(crate::cx::for_request);
+            let native_event_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if let Err(err) = storage.upsert_pane_with_cx(&native_event_cx, record).await {
                 warn!(pane_id, error = %err, "Failed to upsert pane from native event");
             }
@@ -3600,8 +3602,7 @@ async fn collect_pane_tiered_scrollback_summaries(
     let mut fetch = PaneTieredScrollbackFetch::default();
 
     // ft-xbnl0.2.3 tick 266: cx-first tiered scrollback summary collection.
-    let summary_cx = crate::cx::Cx::current()
-        .unwrap_or_else(crate::cx::for_request);
+    let summary_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     for &pane_id in pane_ids {
         let result = wezterm_handle
             .pane_tiered_scrollback_summary_with_cx(&summary_cx, pane_id)

@@ -130,8 +130,8 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
                 || trimmed.starts_with("pub use async-native-tls");
             let is_async_std_net = trimmed.starts_with("use async_std::net")
                 || trimmed.starts_with("pub use async_std::net");
-            let is_smol_net = trimmed.starts_with("use smol::net")
-                || trimmed.starts_with("pub use smol::net");
+            let is_smol_net =
+                trimmed.starts_with("use smol::net") || trimmed.starts_with("pub use smol::net");
             if is_tokio_tcp_net
                 || is_tokio_rustls
                 || is_hyper
@@ -322,14 +322,12 @@ fn ft_xbnl0_2_4_asupersync_workspace_dep_present() {
     // Match either `asupersync = "..."` (string version) or
     // `asupersync = { ... }` (table form). Both are valid dep
     // declarations in Cargo.toml.
-    let has_asupersync = content
-        .lines()
-        .any(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("asupersync = \"")
-                || trimmed.starts_with("asupersync = {")
-                || trimmed.starts_with("asupersync.")
-        });
+    let has_asupersync = content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("asupersync = \"")
+            || trimmed.starts_with("asupersync = {")
+            || trimmed.starts_with("asupersync.")
+    });
 
     assert!(
         has_asupersync,

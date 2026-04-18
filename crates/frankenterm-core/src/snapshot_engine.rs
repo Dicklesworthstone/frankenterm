@@ -968,7 +968,9 @@ impl SnapshotEngine {
                     } else {
                         SnapshotTrigger::Periodic
                     };
-                    let _ = self.capture_from_provider_with_cx(cx, &pane_provider, trigger).await;
+                    let _ = self
+                        .capture_from_provider_with_cx(cx, &pane_provider, trigger)
+                        .await;
                 }
             }
             SnapshotSchedulingMode::Intelligent => {
@@ -1036,11 +1038,10 @@ impl SnapshotEngine {
                     } else {
                         let wait_step = fallback_wait.min(Duration::from_millis(250));
                         let recv_fut = trigger_rx.recv(cx);
-                        let recv_result = crate::runtime_compat::timeout_with_cx(
-                            cx, wait_step, recv_fut,
-                        )
-                        .await
-                        .map(|result| result.ok());
+                        let recv_result =
+                            crate::runtime_compat::timeout_with_cx(cx, wait_step, recv_fut)
+                                .await
+                                .map(|result| result.ok());
 
                         match recv_result {
                             Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
@@ -1062,8 +1063,9 @@ impl SnapshotEngine {
                                 || accumulated_value >= snapshot_threshold;
 
                             if should_capture {
-                                let captured =
-                                    self.capture_from_provider_with_cx(cx, &pane_provider, trigger).await;
+                                let captured = self
+                                    .capture_from_provider_with_cx(cx, &pane_provider, trigger)
+                                    .await;
                                 if captured || immediate || snapshot_threshold <= 0.0 {
                                     accumulated_value = 0.0;
                                 }

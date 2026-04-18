@@ -320,8 +320,7 @@ fn execute_step_action(
                     .expect("failed to build runtime for pane step");
                 rt.block_on(async {
                     // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
-                    let send_cx = crate::cx::Cx::current()
-                        .unwrap_or_else(crate::cx::for_request);
+                    let send_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     if no_paste {
                         h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
                     } else {
@@ -377,8 +376,7 @@ fn execute_step_action(
                     .expect("failed to build runtime for wait_for step");
                 rt.block_on(async {
                     // ft-xbnl0.2.3 tick 262: cx-first tx-execution wait_for poll.
-                    let wait_cx = crate::cx::Cx::current()
-                        .unwrap_or_else(crate::cx::for_request);
+                    let wait_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     let deadline = std::time::Instant::now() + timeout;
                     let poll_interval = std::time::Duration::from_millis(200);
                     loop {

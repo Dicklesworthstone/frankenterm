@@ -563,9 +563,10 @@ impl Player {
                             "replay.handle_control paused-wait cancelled: {err}"
                         ))
                     })?;
-                    control_rx.changed(cx).await.map_err(|_| {
-                        crate::Error::Runtime("control channel closed".into())
-                    })?;
+                    control_rx
+                        .changed(cx)
+                        .await
+                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
                     let sig = *control_rx.borrow();
                     match sig {
                         PlayerControl::Play => {
@@ -686,7 +687,10 @@ impl Player {
             })?;
 
             if let Some(ctrl) = check_control(&mut control_rx) {
-                if self.handle_control_with_cx(cx, ctrl, &mut control_rx).await? {
+                if self
+                    .handle_control_with_cx(cx, ctrl, &mut control_rx)
+                    .await?
+                {
                     return Ok(());
                 }
             }
@@ -710,7 +714,10 @@ impl Player {
                 }
 
                 if let Some(ctrl) = check_control(&mut control_rx) {
-                    if self.handle_control_with_cx(cx, ctrl, &mut control_rx).await? {
+                    if self
+                        .handle_control_with_cx(cx, ctrl, &mut control_rx)
+                        .await?
+                    {
                         return Ok(());
                     }
                 }

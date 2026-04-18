@@ -132,10 +132,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 /// shutdown path (`signal_shutdown` + `poke_listener` + drain
 /// join handle) that a SIGTERM would.
 #[cfg(feature = "asupersync-runtime")]
-pub async fn run_web_server_with_cx(
-    cx: &crate::cx::Cx,
-    config: WebServerConfig,
-) -> Result<()> {
+pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
         bound_addr,
         mut runtime,
@@ -213,11 +210,8 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(100),
-            )
-            .await;
+            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+                .await;
         }
     };
 
@@ -241,11 +235,8 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(100),
-            )
-            .await;
+            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+                .await;
         }
     };
 

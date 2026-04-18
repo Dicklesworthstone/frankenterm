@@ -469,7 +469,9 @@ impl UndoExecutor {
             .await
         {
             Ok(result) if result.aborted => {
-                let undone_at = self.mark_undone_with_cx(cx, action.id, &request.actor).await?;
+                let undone_at = self
+                    .mark_undone_with_cx(cx, action.id, &request.actor)
+                    .await?;
                 Ok(UndoExecutionResult::success(
                     action.id,
                     undo.undo_strategy.clone(),

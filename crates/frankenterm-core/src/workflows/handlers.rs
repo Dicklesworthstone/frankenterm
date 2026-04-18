@@ -763,8 +763,9 @@ impl Workflow for HandleSessionEnd {
                             }
 
                             if !metrics.is_empty() {
-                                if let Err(err) =
-                                    storage.record_usage_metrics_batch_with_cx(cx, metrics).await
+                                if let Err(err) = storage
+                                    .record_usage_metrics_batch_with_cx(cx, metrics)
+                                    .await
                                 {
                                     tracing::warn!(
                                         pane_id,
@@ -3198,32 +3199,30 @@ impl Workflow for HandleSwarmLearningIndex {
 
                     let cass =
                         CassClient::new().with_timeout_secs(SWARM_LEARNING_INDEX_TIMEOUT_SECS);
-                    let result_label = match cass
-                        .trigger_index_with_cx(cx, workspace.as_deref())
-                        .await
-                    {
-                        Ok(index_result) => {
-                            let sessions = index_result.sessions_indexed.unwrap_or(0);
-                            let new_sessions = index_result.new_sessions.unwrap_or(0);
-                            tracing::info!(
-                                pane_id,
-                                sessions,
-                                new_sessions,
-                                explicit_cx = true,
-                                "handle_swarm_learning_index: cass index complete (cx)"
-                            );
-                            "index_complete"
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                pane_id,
-                                error = %error,
-                                explicit_cx = true,
-                                "handle_swarm_learning_index: cass index failed (cx)"
-                            );
-                            "index_error"
-                        }
-                    };
+                    let result_label =
+                        match cass.trigger_index_with_cx(cx, workspace.as_deref()).await {
+                            Ok(index_result) => {
+                                let sessions = index_result.sessions_indexed.unwrap_or(0);
+                                let new_sessions = index_result.new_sessions.unwrap_or(0);
+                                tracing::info!(
+                                    pane_id,
+                                    sessions,
+                                    new_sessions,
+                                    explicit_cx = true,
+                                    "handle_swarm_learning_index: cass index complete (cx)"
+                                );
+                                "index_complete"
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    pane_id,
+                                    error = %error,
+                                    explicit_cx = true,
+                                    "handle_swarm_learning_index: cass index failed (cx)"
+                                );
+                                "index_error"
+                            }
+                        };
 
                     let timestamp_ms = now_ms();
                     let input_summary =

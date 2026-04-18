@@ -7321,9 +7321,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         before_ts: i64,
     ) -> Result<usize> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("retention_cleanup cancelled: {err}"))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("retention_cleanup cancelled: {err}")))?;
         let deleted = self.prune_segments_before_with_cx(cx, before_ts).await?;
         let metadata = serde_json::json!({
             "deleted_segments": deleted,
@@ -7679,7 +7678,10 @@ impl StorageHandle {
         })?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
-            .send_with_cx(cx, WriteCommand::IncrementNotificationRetry { id, respond: tx })
+            .send_with_cx(
+                cx,
+                WriteCommand::IncrementNotificationRetry { id, respond: tx },
+            )
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
@@ -9070,11 +9072,7 @@ impl StorageHandle {
     /// Routes through `search_with_results_with_cx` so the inner call
     /// honours cancellation as well.
     #[cfg(feature = "asupersync-runtime")]
-    pub async fn search_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        query: &str,
-    ) -> Result<Vec<Segment>> {
+    pub async fn search_with_cx(&self, cx: &crate::cx::Cx, query: &str) -> Result<Vec<Segment>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("search cancelled: {err}")))?;
         let results = self
@@ -9341,10 +9339,7 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
     #[cfg(feature = "asupersync-runtime")]
-    pub async fn embedding_stats_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-    ) -> Result<Vec<EmbeddingStats>> {
+    pub async fn embedding_stats_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<EmbeddingStats>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
         self.embedding_stats().await
@@ -9588,9 +9583,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         query: EventStreamQuery,
     ) -> Result<Vec<StoredEvent>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_events_stream cancelled: {err}"))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_events_stream cancelled: {err}")))?;
         self.get_events_stream(query).await
     }
 
@@ -10880,10 +10874,7 @@ impl StorageHandle {
     /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
-    pub async fn expire_stale_reservations_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-    ) -> Result<usize> {
+    pub async fn expire_stale_reservations_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("expire_stale_reservations cancelled: {err}"))
         })?;
@@ -22515,12 +22506,7 @@ fn storage_tick149_search_semantic_cluster_roundtrip() {
         // vectors. Exact order is a function of cosine similarity; we just
         // assert the call roundtrips and returns at most 2 hits.
         let hits = storage
-            .semantic_search_with_cx(
-                &cx,
-                "embedder-tick149",
-                &vec_f32,
-                SearchOptions::default(),
-            )
+            .semantic_search_with_cx(&cx, "embedder-tick149", &vec_f32, SearchOptions::default())
             .await
             .unwrap();
         assert!(hits.len() <= 2);
@@ -22856,10 +22842,7 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
         assert!(event_id > 0);
 
         // 1. get_unhandled_events_with_cx
-        let unhandled = storage
-            .get_unhandled_events_with_cx(&cx, 10)
-            .await
-            .unwrap();
+        let unhandled = storage.get_unhandled_events_with_cx(&cx, 10).await.unwrap();
         assert!(
             unhandled.iter().any(|e| e.id == event_id),
             "seeded event should show up in unhandled list"
@@ -22979,7 +22962,10 @@ fn storage_tick145_reservation_cluster_roundtrip() {
 
         // 2. expire_stale_reservations_with_cx — our reservation is fresh,
         //    so the call should return 0 but still roundtrip.
-        let expired = storage.expire_stale_reservations_with_cx(&cx).await.unwrap();
+        let expired = storage
+            .expire_stale_reservations_with_cx(&cx)
+            .await
+            .unwrap();
         assert_eq!(expired, 0, "fresh reservation should not be expired");
 
         // 3. release_reservation_with_cx — first call removes the row,
@@ -23038,10 +23024,7 @@ fn storage_tick144_account_cluster_roundtrip() {
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         };
-        let id_hi = storage
-            .upsert_account_with_cx(&cx, acct_hi)
-            .await
-            .unwrap();
+        let id_hi = storage.upsert_account_with_cx(&cx, acct_hi).await.unwrap();
         assert!(id_hi > 0);
 
         let acct_lo = crate::accounts::AccountRecord {
@@ -23059,10 +23042,7 @@ fn storage_tick144_account_cluster_roundtrip() {
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         };
-        let id_lo = storage
-            .upsert_account_with_cx(&cx, acct_lo)
-            .await
-            .unwrap();
+        let id_lo = storage.upsert_account_with_cx(&cx, acct_lo).await.unwrap();
         assert!(id_lo > 0 && id_lo != id_hi);
 
         // 2. get_account_with_cx
@@ -23190,7 +23170,10 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
             .prune_session_checkpoints_with_cx(&cx, session_id.clone(), 1)
             .await
             .unwrap();
-        assert_eq!(pruned, 2, "retention=1 should prune the two older checkpoints");
+        assert_eq!(
+            pruned, 2,
+            "retention=1 should prune the two older checkpoints"
+        );
 
         // Latest should still be state-hash-2 after pruning.
         let after_prune = storage
@@ -23503,7 +23486,10 @@ fn storage_tick139_notification_cluster_roundtrip() {
             .await
             .unwrap();
         let after_ack = storage.get_notification_with_cx(&cx, id).await.unwrap();
-        assert_eq!(after_ack.acknowledged_by.as_deref(), Some("operator-tick139"));
+        assert_eq!(
+            after_ack.acknowledged_by.as_deref(),
+            Some("operator-tick139")
+        );
         assert_eq!(after_ack.action_taken.as_deref(), Some("dismissed"));
         assert!(after_ack.acknowledged_at.is_some());
 
@@ -23685,13 +23671,7 @@ fn storage_tick137_saved_search_cluster_roundtrip() {
 
         // 4. update_saved_search_run_with_cx
         storage
-            .update_saved_search_run_with_cx(
-                &cx,
-                "ss-tick137",
-                1_700_000_001_000,
-                Some(12),
-                None,
-            )
+            .update_saved_search_run_with_cx(&cx, "ss-tick137", 1_700_000_001_000, Some(12), None)
             .await
             .unwrap();
         let after_run = storage
@@ -23720,7 +23700,10 @@ fn storage_tick137_saved_search_cluster_roundtrip() {
             .delete_saved_search_with_cx(&cx, "tick137-errors")
             .await
             .unwrap();
-        assert_eq!(deleted, 1, "delete_saved_search_with_cx should remove one row");
+        assert_eq!(
+            deleted, 1,
+            "delete_saved_search_with_cx should remove one row"
+        );
         let after_delete = storage
             .get_saved_search_by_name_with_cx(&cx, "tick137-errors")
             .await
