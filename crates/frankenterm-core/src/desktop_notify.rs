@@ -509,6 +509,33 @@ impl NotificationSender for DesktopNotifier {
             result
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 212). Adds a pre-flight
+    /// cx.checkpoint() so a cancelled caller skips the blocking
+    /// Command::output() entirely. The sync subprocess exec
+    /// itself can't observe cx, so this is pre-flight-only —
+    /// matches the scoping used for other sync-subprocess
+    /// boundaries (e.g. cass/caut clients before their
+    /// timeout_with_cx wrappers). Without this override the
+    /// trait default would delegate to `send()` which ignores cx.
+    #[cfg(feature = "asupersync-runtime")]
+    fn send_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        payload: &'a NotificationPayload,
+    ) -> NotificationFuture<'a> {
+        if cx.is_cancel_requested() {
+            let delivery = NotificationDelivery {
+                sender: self.name().to_string(),
+                success: false,
+                rate_limited: false,
+                error: Some("cancelled before desktop notification dispatch".to_string()),
+                records: Vec::new(),
+            };
+            return Box::pin(async move { delivery });
+        }
+        self.send(payload)
+    }
 }
 
 // ============================================================================
