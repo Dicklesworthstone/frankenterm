@@ -200,6 +200,10 @@ impl WorkflowEngine {
     }
 
     /// Cx-first variant of [`resume`] (ft-xbnl0.2.2).
+    ///
+    /// Tick 188 (ft-xbnl0.2.3): threads cx into the inner storage calls
+    /// (`get_workflow_with_cx` + `get_step_logs_with_cx`) instead of
+    /// delegating to the ambient-cx `resume`. Legacy `resume` preserved.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn resume_cx(
         &self,
@@ -209,10 +213,33 @@ impl WorkflowEngine {
     ) -> crate::Result<Option<(WorkflowExecution, usize)>> {
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        let result = self.resume(storage, execution_id).await;
+        let Some(record) = storage.get_workflow_with_cx(cx, execution_id).await? else {
+            return Ok(None);
+        };
+
+        if matches!(record.status.as_str(), "completed" | "aborted" | "failed") {
+            return Ok(None);
+        }
+
+        let step_logs = storage.get_step_logs_with_cx(cx, execution_id).await?;
+        let next_step = resolve_resume_step(&record, &step_logs);
+
+        let execution = WorkflowExecution {
+            id: record.id,
+            workflow_name: record.workflow_name,
+            pane_id: record.pane_id,
+            current_step: next_step,
+            status: match record.status.as_str() {
+                "waiting" => ExecutionStatus::Waiting,
+                _ => ExecutionStatus::Running,
+            },
+            started_at: record.started_at,
+            updated_at: record.updated_at,
+        };
+
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        result
+        Ok(Some((execution, next_step)))
     }
 
     /// Resume a workflow execution from storage
@@ -264,6 +291,10 @@ impl WorkflowEngine {
     }
 
     /// Cx-first variant of [`find_incomplete`] (ft-xbnl0.2.2).
+    ///
+    /// Tick 188 (ft-xbnl0.2.3): routes to `find_incomplete_workflows_with_cx`
+    /// so the inner storage call threads cx instead of running under ambient
+    /// cx. Legacy `find_incomplete` preserved.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn find_incomplete_cx(
         &self,
@@ -272,7 +303,7 @@ impl WorkflowEngine {
     ) -> crate::Result<Vec<crate::storage::WorkflowRecord>> {
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        let result = self.find_incomplete(storage).await;
+        let result = storage.find_incomplete_workflows_with_cx(cx).await;
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
         result
