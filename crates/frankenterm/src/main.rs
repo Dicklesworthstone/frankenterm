@@ -29009,7 +29009,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     audit,
                     workflows,
                 } => {
-                    use frankenterm_core::diagnostic::{DiagnosticOptions, generate_bundle};
+                    use frankenterm_core::diagnostic::{DiagnosticOptions, generate_bundle_with_cx};
 
                     // Resolve output path
                     let output_path = output;
@@ -29052,7 +29052,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     eprintln!("Generating diagnostic bundle...");
 
-                    match generate_bundle(&config, &layout, &storage, &opts).await {
+                    // ft-xbnl0.2.3 tick 252: cx-first diagnostic bundle.
+                    let diag_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match generate_bundle_with_cx(&diag_cx, &config, &layout, &storage, &opts).await {
                         Ok(result) => {
                             eprintln!("Bundle generated: {}", result.output_path);
                             eprintln!("  Files:      {}", result.file_count);
