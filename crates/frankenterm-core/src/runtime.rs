@@ -45,7 +45,7 @@ use crate::fleet_scrollback_coordinator::{
 };
 use crate::gc::{CacheGcSettings, compact_u64_map, should_vacuum};
 use crate::ingest::{
-    PaneCursor, PaneRegistry, bounded_segment_for_persistence, persist_captured_segment,
+    PaneCursor, PaneRegistry, bounded_segment_for_persistence, persist_captured_segment_with_cx,
 };
 use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
@@ -2844,7 +2844,11 @@ impl ObservationRuntime {
                 let captured_seq = bounded_segment.seq;
 
                 // Persist the segment
-                match persist_captured_segment(
+                // ft-xbnl0.2.3 tick 254: cx-first segment persist.
+                let persist_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
+                match persist_captured_segment_with_cx(
+                    &persist_cx,
                     &storage,
                     &bounded_segment,
                     max_persist_segment_bytes,
