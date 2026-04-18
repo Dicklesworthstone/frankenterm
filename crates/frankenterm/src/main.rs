@@ -22073,7 +22073,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                                 RobotReservationCommands::Release { reservation_id } => {
-                                    match storage.release_reservation(reservation_id).await {
+                                    // ft-xbnl0.2.3 tick 243: cx-first storage write.
+                                    let storage_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    match storage
+                                        .release_reservation_with_cx(&storage_cx, reservation_id)
+                                        .await
+                                    {
                                         Ok(released) => {
                                             let data = RobotReleaseData {
                                                 reservation_id,
@@ -22096,12 +22102,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 }
                                 RobotReservationCommands::List => {
+                                    // ft-xbnl0.2.3 tick 243: cx-first storage ops.
+                                    let storage_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
                                     // Expire stale reservations first
-                                    if let Err(e) = storage.expire_stale_reservations().await {
+                                    if let Err(e) = storage
+                                        .expire_stale_reservations_with_cx(&storage_cx)
+                                        .await
+                                    {
                                         tracing::warn!("Failed to expire stale reservations: {e}");
                                     }
 
-                                    match storage.list_active_reservations().await {
+                                    match storage.list_active_reservations_with_cx(&storage_cx).await {
                                         Ok(reservations) => {
                                             let total = reservations.len();
                                             let infos: Vec<RobotReservationInfo> = reservations
@@ -30588,13 +30600,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Reservations { json }) => {
             let db_path = layout.db_path.to_string_lossy();
             let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
+            // ft-xbnl0.2.3 tick 243: cx-first storage ops.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
 
             // Expire stale reservations first
-            if let Err(e) = storage.expire_stale_reservations().await {
+            if let Err(e) = storage.expire_stale_reservations_with_cx(&storage_cx).await {
                 tracing::warn!("Failed to expire stale reservations: {e}");
             }
 
-            match storage.list_active_reservations().await {
+            match storage.list_active_reservations_with_cx(&storage_cx).await {
                 Ok(reservations) => {
                     if json {
                         let infos: Vec<RobotReservationInfo> = reservations
@@ -30960,7 +30975,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                let accounts = match storage.get_accounts_by_service(&service_key).await {
+                // ft-xbnl0.2.3 tick 243: cx-first storage read.
+                let storage_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let accounts = match storage
+                    .get_accounts_by_service_with_cx(&storage_cx, &service_key)
+                    .await
+                {
                     Ok(a) => a,
                     Err(e) => {
                         die(&format!("Failed to fetch accounts: {e}"), None);
@@ -31822,10 +31843,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         ..Default::default()
                     };
 
-                    let token_metrics = storage.query_usage_metrics(query_tokens).await?;
-                    let cost_metrics = storage.query_usage_metrics(query_cost).await?;
-                    let rl_metrics = storage.query_usage_metrics(query_rl).await?;
-                    let wf_metrics = storage.query_usage_metrics(query_wf).await?;
+                    // ft-xbnl0.2.3 tick 243: cx-first storage reads (4 queries).
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let token_metrics = storage
+                        .query_usage_metrics_with_cx(&storage_cx, query_tokens)
+                        .await?;
+                    let cost_metrics = storage
+                        .query_usage_metrics_with_cx(&storage_cx, query_cost)
+                        .await?;
+                    let rl_metrics = storage
+                        .query_usage_metrics_with_cx(&storage_cx, query_rl)
+                        .await?;
+                    let wf_metrics = storage
+                        .query_usage_metrics_with_cx(&storage_cx, query_wf)
+                        .await?;
 
                     let total_tokens: i64 = token_metrics.iter().filter_map(|m| m.tokens).sum();
                     let total_cost: f64 = cost_metrics.iter().filter_map(|m| m.amount).sum();
