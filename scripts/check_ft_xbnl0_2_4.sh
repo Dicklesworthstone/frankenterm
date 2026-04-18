@@ -3,10 +3,17 @@
 #
 # Invokes the 5 filtered cargo test runs that collectively verify the
 # ft-xbnl0.2.4 acceptance contract:
-#   1. HTTP client contract tests (19) — distributed_http_client_*
-#   2. TLS bundle + server-name + error-path + version tests (14) — build_tls_*
-#   3. Regression guards (3) — ft_xbnl0_2_4_* (imports, manifests, dep presence)
+#   1. HTTP client contract tests (21) — distributed_http_client_*
+#      Includes all this-session-added + pre-existing happy-path GET.
+#   2. TLS tests (~45) — tls_*
+#      Broader filter than `build_tls_` — catches bundle / server-name /
+#      error-variant / version-string tests added this session AND
+#      pre-existing happy-path bundle-exchange, large-payload, and
+#      token-auth TLS tests. Stronger smoke than the narrow filter.
+#   3. Regression guards (3) — ft_xbnl0_2_4_*
+#      Import scan + manifest scan + asupersync-dep positive guard.
 #   4. Metrics server cx-first family (3) — metrics_server_start_with_cx_*
+#      Pre-cancel / mid-flight-cancel / happy path.
 #   5. Web server cx pre-cancel (1) — web_server_with_cx_*
 #
 # Exit code 0 on all passing; non-zero on any failure.
@@ -67,10 +74,10 @@ run_test "Run 1/5: HTTP client contract tests" \
     --lib distributed_http_client_ \
     -- --nocapture
 
-run_test "Run 2/5: TLS bundle + server-name + error-path + version tests" \
+run_test "Run 2/5: TLS tests (bundle + server-name + errors + versions + happy-path)" \
     -p frankenterm-core \
     --features distributed,asupersync-runtime \
-    --lib build_tls_ \
+    --lib tls_ \
     -- --nocapture
 
 run_test "Run 3/5: Regression guards" \

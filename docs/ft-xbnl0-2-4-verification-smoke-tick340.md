@@ -96,19 +96,29 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | Group | Tests | Result |
 |-------|-------|--------|
 | HTTP client contracts (Run 1) | 21 | 21/21 ok |
-| TLS contracts (Run 2) | 14 | 14/14 ok |
+| TLS tests (Run 2) | 45 | 45/45 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
-| **Subtotal** | **42** | **42/42 ok** |
+| **Subtotal** | **73** | **73/73 ok** |
 
-Captured via `scripts/check_ft_xbnl0_2_4.sh` (added tick 347) at
-commit post-`46f0ac4a` (tick 352).
+Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
+tick 357).
 
 Run 1 growth over the session:
 - tick 340: 15 tests (HTTP baseline)
 - tick 346: +4 scheme-dispatch / invalid-URL / IPv6 / premature-close
 - tick 353: +2 from the ft-kfkyi 3xx no-follow fix + companion
+
+Run 2 growth:
+- tick 340-346: 14 tests via `build_tls_` filter (this session's new
+  TLS contract tests: bundle rejection, server-name, error-path,
+  version parsing).
+- tick 357: filter broadened from `build_tls_` to `tls_`, now catching
+  this session's 14 new tests + 1 parser test (`resolve_tls_versions_*`)
+  + ~30 pre-existing TLS tests (happy-path bundle exchange, large
+  payload, token validation, TLS session windows, etc.) = 45 total.
+  Broader smoke without any additional authoring work.
 
 ### Run 4 — metrics server cx-first family (includes tick 322)
 
@@ -147,10 +157,9 @@ Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 42 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
-- Compile time after the initial cold build: 0.01s-1.19s per filtered run. This is cheap to re-run per-commit in CI.
-- The 21 + 14 + 3 + 3 + 1 = 42 count matches the full roster landed in
-  the completion-evidence doc through tick 352.
+- All 73 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- Compile time after the initial cold build: 0.00s-1.18s per filtered run. This is cheap to re-run per-commit in CI.
+- The 21 + 45 + 3 + 3 + 1 = 73 count covers both this-session deliverables (21 HTTP + 14 new TLS + 1 parser + 2 service-boundary + 3 guards = 41) AND 32 pre-existing TLS tests that the broadened tick-357 filter now smoke-verifies as a side benefit. Running more passing tests is a stronger signal.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)

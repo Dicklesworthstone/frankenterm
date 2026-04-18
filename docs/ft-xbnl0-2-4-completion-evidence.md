@@ -252,7 +252,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 ## 6. Closure Checklist (when ready to close)
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 42 tests pass)
+- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 73 tests pass: 21 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web)
 - [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
 - [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
 - [ ] Artifact bundles saved per shared verification contract §"Level C"
