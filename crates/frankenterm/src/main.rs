@@ -6990,7 +6990,10 @@ async fn authorize_read_or_search_policy(
         let resolution = resolve_pane_capabilities(pane_id, storage, ipc_socket_path).await;
         input = input.with_capabilities(resolution.capabilities);
         let distributed_remote_pane = if let Some(storage) = storage {
-            match storage.get_pane(pane_id).await {
+            // ft-xbnl0.2.3 tick 235: cx-first storage read.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match storage.get_pane_with_cx(&storage_cx, pane_id).await {
                 Ok(record) => record.filter(|pane| is_distributed_remote_domain(&pane.domain)),
                 Err(err) => {
                     tracing::warn!(
@@ -8097,7 +8100,10 @@ async fn generate_workflow_plan(
         frankenterm_core::policy::PaneCapabilities::default(),
         execution_id,
     );
-    if let Ok(Some(record)) = storage.get_pane(pane_id).await {
+    // ft-xbnl0.2.3 tick 235: cx-first storage read.
+    let storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    if let Ok(Some(record)) = storage.get_pane_with_cx(&storage_cx, pane_id).await {
         ctx.set_pane_meta(PaneMetadata {
             domain: Some(record.domain),
             title: record.title,
@@ -19580,9 +19586,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         return Ok(());
                                     }
 
+                                    // ft-xbnl0.2.3 tick 235: cx-first storage reads.
+                                    let storage_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+
                                     if execution_id.is_none() {
                                         if let Some(pane_id) = pane {
-                                            match storage.get_pane(pane_id).await {
+                                            match storage
+                                                .get_pane_with_cx(&storage_cx, pane_id)
+                                                .await
+                                            {
                                                 Ok(Some(_)) => {}
                                                 Ok(None) => {
                                                     let response = RobotResponse::<
@@ -19621,10 +19634,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Query by execution_id if provided
                                     if let Some(exec_id) = &execution_id {
-                                        match storage.get_workflow(exec_id).await {
+                                        match storage
+                                            .get_workflow_with_cx(&storage_cx, exec_id)
+                                            .await
+                                        {
                                             Ok(Some(record)) => {
                                                 let (step_logs, latest_log) = if verbose > 0 {
-                                                    match storage.get_step_logs(exec_id).await {
+                                                    match storage
+                                                        .get_step_logs_with_cx(
+                                                            &storage_cx,
+                                                            exec_id,
+                                                        )
+                                                        .await
+                                                    {
                                                         Ok(logs) => {
                                                             let latest = logs.last().cloned();
                                                             let mapped = logs
