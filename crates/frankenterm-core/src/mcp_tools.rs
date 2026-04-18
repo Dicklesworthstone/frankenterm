@@ -952,7 +952,10 @@ impl ToolHandler for WaGetTextTool {
                     .await
                     .map_err(McpToolError::from_error)?;
                 let wezterm = default_wezterm_handle();
-                let pane_info = match wezterm.get_pane(params.pane_id).await {
+                // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
+                let wezterm_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
+                let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await {
                     Ok(pane_info) => Some(pane_info),
                     Err(err) => {
                         if remote_pane.is_some() {
@@ -1782,7 +1785,10 @@ impl ToolHandler for WaSendTool {
         let result = runtime.block_on(async move {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
             let wezterm = default_wezterm_handle();
-            let pane_info = wezterm.get_pane(params.pane_id).await?;
+            // ft-xbnl0.2.3 tick 261: cx-first wezterm pane lookup.
+            let wezterm_cx = crate::cx::Cx::current()
+                .unwrap_or_else(crate::cx::for_request);
+            let pane_info = wezterm.get_pane_with_cx(&wezterm_cx, params.pane_id).await?;
             let domain = pane_info.inferred_domain();
 
             let resolution =
