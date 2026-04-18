@@ -15519,12 +15519,25 @@ async fn run_watcher(
             // Bridge AtomicBool shutdown flag into a watch channel for run_periodic
             let (snap_shutdown_tx, snap_shutdown_rx) = watch::channel(false);
             frankenterm_core::runtime_compat::task::spawn(async move {
+                // ft-xbnl0.2.3 tick 285: cx-first shutdown-bridge poll sleep.
+                let bridge_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 loop {
                     if shutdown_flag_for_snap.load(std::sync::atomic::Ordering::SeqCst) {
                         let _ = snap_shutdown_tx.send(true);
                         break;
                     }
-                    frankenterm_core::runtime_compat::sleep(Duration::from_millis(500)).await;
+                    if frankenterm_core::runtime_compat::sleep_with_cx(
+                        &bridge_cx,
+                        Duration::from_millis(500),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        // Cx cancelled — send shutdown signal to the periodic loop.
+                        let _ = snap_shutdown_tx.send(true);
+                        break;
+                    }
                 }
             });
             frankenterm_core::runtime_compat::task::spawn(async move {
