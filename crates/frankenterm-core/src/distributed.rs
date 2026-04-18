@@ -4166,6 +4166,76 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 344: IPv6 literal URL (bracketed authority) roundtrip.
+    ///
+    /// Pins that `DistributedHttpClient::get` correctly handles a URL
+    /// whose authority is a bracketed IPv6 literal —
+    /// `http://[::1]:<port>/path`. IPv6 authorities in URLs use
+    /// square brackets to disambiguate the colon in the address from
+    /// the colon separating host:port (RFC 3986 §3.2.2).
+    ///
+    /// Two regression modes this catches:
+    /// 1. Client strips the brackets before transport → connect fails
+    ///    because `[::1]:port` and `::1:port` parse differently.
+    /// 2. Client passes the brackets through into the `Host:` header
+    ///    verbatim — `Host: [::1]:port` is RFC-compliant and many
+    ///    reverse proxies route on the bracketed form.
+    ///
+    /// Test binds a loopback IPv6 listener, makes a request, and
+    /// asserts the server receives a well-formed HTTP request with a
+    /// `Host: [::1]:<port>` header (bracketed per RFC 7230 §5.4).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_handles_ipv6_literal_url() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            // Bind to IPv6 loopback.
+            let listener = match TcpListener::bind("[::1]:0").await {
+                Ok(l) => l,
+                Err(_) => {
+                    // Some CI hosts disable IPv6 loopback. Skip cleanly
+                    // rather than failing — the contract is only
+                    // meaningful when IPv6 is available.
+                    eprintln!("skipping: IPv6 loopback unavailable on this host");
+                    return;
+                }
+            };
+            let addr = listener.local_addr().expect("addr");
+            let port = addr.port();
+            let expected_host = format!("[::1]:{port}");
+            let expected_host_for_server = expected_host.clone();
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                // Host header should include the bracketed form per RFC 7230.
+                let lower = req.to_ascii_lowercase();
+                let expected_lower = format!("host: {}", expected_host_for_server.to_ascii_lowercase());
+                assert!(
+                    lower.contains(&expected_lower),
+                    "IPv6 literal URL must preserve bracketed authority in Host header. \
+                     expected line containing {expected_lower:?}, got request: {req:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://{expected_host}/ipv6");
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 343: Invalid URL inputs → Err, no panic.
     ///
     /// Pins that `DistributedHttpClient::get` returns `Err` cleanly on
