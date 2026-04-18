@@ -3769,6 +3769,73 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 332: Non-empty User-Agent header contract.
+    ///
+    /// Pins that `DistributedHttpClient::get` sends a non-empty
+    /// `User-Agent:` header. The specific value is intentionally not
+    /// asserted — that's a library-owned detail that may evolve (the
+    /// underlying asupersync HTTP client defaults to
+    /// `asupersync/<version>` but may change). The *contract* is that
+    /// the client identifies itself in some way.
+    ///
+    /// Why this matters: server-side logging pipelines and security
+    /// tooling (rate limiters, WAFs, observability) commonly key on
+    /// User-Agent. A client that omitted UA entirely would be invisible
+    /// to these systems — or worse, trigger "missing UA" heuristics
+    /// that reject the request as a bot. A regression that stripped UA
+    /// would silently break production routing and logging.
+    ///
+    /// Test asserts the server-received bytes contain `user-agent:`
+    /// (case-insensitive) followed by at least one non-whitespace char.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_sends_non_empty_user_agent() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                // Find any line that case-insensitively starts with "user-agent:"
+                let ua_line = req.lines().find(|line| {
+                    line.to_ascii_lowercase().starts_with("user-agent:")
+                });
+                let ua_line = ua_line.unwrap_or_else(|| {
+                    panic!(
+                        "request must include a User-Agent header; got: {req:?}"
+                    )
+                });
+                // Value must be non-empty (something after the colon).
+                let colon_idx = ua_line
+                    .find(':')
+                    .expect("user-agent line must have colon");
+                let value = ua_line[colon_idx + 1..].trim();
+                assert!(
+                    !value.is_empty(),
+                    "User-Agent value must not be empty; header was {ua_line:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/observability", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 329: URL trailing-slash preservation contract.
     ///
     /// Servers commonly treat `/api/events` and `/api/events/` as
