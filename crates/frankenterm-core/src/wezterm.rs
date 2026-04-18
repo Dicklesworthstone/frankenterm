@@ -3569,7 +3569,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
 
         loop {
             polls += 1;
-            let text = self.source.get_text(pane_id, self.options.escapes).await?;
+            // ft-xbnl0.2.3 tick 281: cx-first get_text inside wait_for_with_cx.
+            let text = self
+                .source
+                .get_text_with_cx(cx, pane_id, self.options.escapes)
+                .await?;
             let tail = tail_text(&text, self.options.tail_lines);
             let tail_hash = stable_hash(tail.as_bytes());
 
@@ -3781,7 +3785,10 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
 
     loop {
         polls += 1;
-        let text = source.get_text(pane_id, options.escapes).await?;
+        // ft-xbnl0.2.3 tick 281: cx-first get_text inside codex_summary_wait.
+        let text = source
+            .get_text_with_cx(cx, pane_id, options.escapes)
+            .await?;
         let tail = tail_text(&text, options.tail_lines);
         let last_tail_hash = Some(stable_hash(tail.as_bytes()));
 
