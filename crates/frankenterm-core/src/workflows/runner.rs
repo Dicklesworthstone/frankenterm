@@ -1488,6 +1488,39 @@ impl WorkflowRunner {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run_workflow`].
+    ///
+    /// Tick 178: entry-point shim. Pre-flight `cx.checkpoint()`
+    /// gates the workflow start — if the caller's cx is already
+    /// cancelled, surfaces `WorkflowExecutionResult::Error` with
+    /// a cancellation reason before touching storage or policy.
+    /// When the cx is healthy, delegates to the legacy
+    /// `run_workflow`. Future ticks (the strangler-fig plan
+    /// started here) will progressively migrate the legacy body
+    /// onto cx-aware storage and per-step checkpoints.
+    ///
+    /// Using the `Error` variant (not a new variant) keeps the
+    /// match surface stable — every `run_workflow` caller already
+    /// handles Error.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_workflow_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        start_step: usize,
+    ) -> WorkflowExecutionResult {
+        if let Err(err) = cx.checkpoint() {
+            return WorkflowExecutionResult::Error {
+                execution_id: Some(execution_id.to_string()),
+                error: format!("run_workflow cancelled pre-start: {err}"),
+            };
+        }
+        self.run_workflow(pane_id, workflow, execution_id, start_step)
+            .await
+    }
+
     /// Run the event loop, subscribing to detection events.
     ///
     /// This spawns workflow executions for matching detections. The loop
