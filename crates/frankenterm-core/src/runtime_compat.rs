@@ -1550,6 +1550,71 @@ pub mod process {
             kill_guard.disarm();
             result
         }
+
+        /// ft-xbnl0.2.3 Cx-first sibling of [`Command::output`].
+        ///
+        /// Pre-flight `cx.checkpoint()` gates spawn, and a dedicated
+        /// watcher task bridges caller-cx cancellation into the
+        /// already-existing `cancel: Arc<AtomicBool>` signal that the
+        /// `run_output_command` worker polls at
+        /// `PROCESS_POLL_INTERVAL`. The result: a caller cancelling
+        /// its cx surfaces as `io::ErrorKind::Interrupted` within
+        /// ~10ms of the signal (one PROCESS_POLL_INTERVAL tick),
+        /// including for long-running child processes that would
+        /// otherwise block the spawn_blocking indefinitely.
+        ///
+        /// Kill-on-drop semantics are preserved: if the future is
+        /// dropped before completion and kill_on_drop was set, the
+        /// KillOnDropGuard still fires the cancel flag. The cx
+        /// watcher sets `watcher_done` on normal-path exit so it
+        /// never leaks past the body.
+        #[cfg(feature = "asupersync-runtime")]
+        pub async fn output_with_cx(
+            &mut self,
+            cx: &crate::cx::Cx,
+        ) -> std::io::Result<Output> {
+            cx.checkpoint().map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    format!("process command cancelled pre-spawn: {err}"),
+                )
+            })?;
+
+            let program = self.get_program();
+            let args = self.get_args();
+            let envs = self.get_envs();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut kill_guard = KillOnDropGuard::new(Arc::clone(&cancel), self.kill_on_drop);
+
+            // Spawn cx→AtomicBool bridge watcher. It polls cx at
+            // PROCESS_POLL_INTERVAL and sets `cancel` on cx cancel.
+            // It also exits when `watcher_done` is set (normal path).
+            let watcher_done = Arc::new(AtomicBool::new(false));
+            let watcher_cancel = Arc::clone(&cancel);
+            let watcher_done_inner = Arc::clone(&watcher_done);
+            let watcher_cx = cx.clone();
+            let watcher_handle = super::task::spawn(async move {
+                while !watcher_done_inner.load(Ordering::SeqCst) {
+                    if watcher_cx.is_cancel_requested() {
+                        watcher_cancel.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    super::sleep(PROCESS_POLL_INTERVAL).await;
+                }
+            });
+
+            let result =
+                super::spawn_blocking(move || run_output_command(program, args, envs, cancel))
+                    .await
+                    .map_err(std::io::Error::other)?;
+
+            // Signal watcher to exit on normal path and drain.
+            watcher_done.store(true, Ordering::SeqCst);
+            let _ = watcher_handle.await;
+
+            kill_guard.disarm();
+            result
+        }
     }
 
     impl Command {
@@ -4677,6 +4742,49 @@ mod tests {
             !marker_path.exists(),
             "timed-out child should have been terminated before writing output"
         );
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `Command::output_with_cx` must
+    /// bridge caller-cx cancellation into the underlying
+    /// process-polling worker within ~PROCESS_POLL_INTERVAL (10ms).
+    /// This test spawns a `sleep 10`, cancels the cx after 100ms,
+    /// and asserts the call returns with `ErrorKind::Interrupted`
+    /// in well under the 10s the child would otherwise run.
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn process_command_output_with_cx_cancellation_surfaces_as_interrupted() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::for_testing();
+            let cx_cancel_trigger = cx.clone();
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cx_cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("process_command_output_with_cx test cancel"),
+                );
+            });
+
+            let mut cmd = process::Command::new("sh");
+            cmd.arg("-c");
+            cmd.arg("sleep 10");
+            cmd.kill_on_drop(true);
+
+            let start = std::time::Instant::now();
+            let result = cmd.output_with_cx(&cx).await;
+            let elapsed = start.elapsed();
+
+            let err = result.expect_err("cancelled cx should surface as IO error");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::Interrupted,
+                "cx-cancelled process output must surface as Interrupted: {err}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "cancellation should surface promptly (got {elapsed:?}); the 10s sleep would dominate if cx was ignored"
+            );
+        });
     }
 
     #[cfg(all(feature = "asupersync-runtime", unix))]
