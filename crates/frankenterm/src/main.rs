@@ -14564,7 +14564,11 @@ async fn run_distributed_agent(
     let storage_config = frankenterm_core::storage::StorageConfig {
         write_queue_size: config.storage.writer_queue_size as usize,
     };
-    let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    // ft-xbnl0.2.3 tick 299: cx-first distributed agent storage open.
+    let storage_open_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage =
+        StorageHandle::with_config_with_cx(&storage_open_cx, &db_path, storage_config).await?;
     tracing::info!(db_path = %db_path, "Distributed agent storage initialized");
 
     let patterns_root = config_path
@@ -15005,7 +15009,11 @@ async fn run_watcher(
         "Recorder backend startup health probe passed"
     );
 
-    let storage = StorageHandle::with_config(&db_path, storage_config).await?;
+    // ft-xbnl0.2.3 tick 299: cx-first watch-runtime storage open.
+    let watch_storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage =
+        StorageHandle::with_config_with_cx(&watch_storage_cx, &db_path, storage_config).await?;
     let lifecycle_event_id =
         emit_recorder_backend_lifecycle_event(&storage, &recorder_startup_selection).await?;
     tracing::info!(db_path = %db_path, "Storage initialized");
@@ -15215,8 +15223,13 @@ async fn run_watcher(
         let workflow_storage_config = frankenterm_core::storage::StorageConfig {
             write_queue_size: config.storage.writer_queue_size as usize,
         };
-        let storage_for_workflows =
-            Arc::new(StorageHandle::with_config(&db_path, workflow_storage_config).await?);
+        // ft-xbnl0.2.3 tick 299: cx-first workflow storage open.
+        let wf_storage_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let storage_for_workflows = Arc::new(
+            StorageHandle::with_config_with_cx(&wf_storage_cx, &db_path, workflow_storage_config)
+                .await?,
+        );
 
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
