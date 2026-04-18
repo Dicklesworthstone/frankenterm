@@ -298,3 +298,44 @@ fn ft_xbnl0_2_4_no_tokio_net_deps_in_workspace_manifests() {
             .join("\n")
     );
 }
+
+/// ft-xbnl0.2.4 tick 317: positive guard — root Cargo.toml MUST declare
+/// asupersync as a workspace dependency.
+///
+/// This test complements the banned-import guards above by ensuring
+/// asupersync is actually available for the cutover. If someone
+/// accidentally removes the asupersync workspace dep, all the
+/// `asupersync::{net, tls, http}` imports in production code would
+/// stop resolving — this test gives a direct, clear failure signal
+/// before the compilation cascade.
+///
+/// Guards acceptance criterion 2 ("Any temporary compat boundary is
+/// isolated and named") positively: asupersync IS the named boundary,
+/// and its presence in the workspace manifest is what makes the
+/// cutover real.
+#[test]
+fn ft_xbnl0_2_4_asupersync_workspace_dep_present() {
+    let root = workspace_root();
+    let root_manifest = root.join("Cargo.toml");
+    let content = fs::read_to_string(&root_manifest).expect("read root Cargo.toml");
+
+    // Match either `asupersync = "..."` (string version) or
+    // `asupersync = { ... }` (table form). Both are valid dep
+    // declarations in Cargo.toml.
+    let has_asupersync = content
+        .lines()
+        .any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("asupersync = \"")
+                || trimmed.starts_with("asupersync = {")
+                || trimmed.starts_with("asupersync.")
+        });
+
+    assert!(
+        has_asupersync,
+        "ft-xbnl0.2.4 regression: root Cargo.toml no longer declares \
+         asupersync as a workspace dependency. This would break every \
+         `asupersync::{{net, tls, http}}` import in production code. \
+         Re-add the `asupersync = ...` declaration to [workspace.dependencies]."
+    );
+}
