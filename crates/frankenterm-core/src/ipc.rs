@@ -1335,7 +1335,14 @@ async fn handle_client_with_context_with_cx(
     let bounded_reader = reader.take((MAX_MESSAGE_SIZE + 1) as u64);
 
     let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
-    let Some(line) = compat_unix::next_line(&mut lines).await? else {
+    // Tick 200 (ft-xbnl0.2.3): route the request-line read through
+    // next_line_with_cx(&cx, ...) so the pre-read checkpoint honors
+    // the caller's explicit cx. Previously used the ambient
+    // next_line() — which returns whenever the stream yields but
+    // doesn't observe cx cancellation at the entry checkpoint. A
+    // client that hangs without sending a full line would block
+    // the handler indefinitely even under an outer cx cancel.
+    let Some(line) = compat_unix::next_line_with_cx(&cx, &mut lines).await? else {
         return Ok(());
     };
 
