@@ -12721,6 +12721,9 @@ async fn distributed_persist_payload(
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
 
+    // ft-xbnl0.2.3 tick 277: cx-first distributed persistence path.
+    let persist_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     let canonical_sender = distributed_normalize_identity(sender);
     let sequence_scope = sequence_scope
         .map(ToOwned::to_owned)
@@ -12765,7 +12768,7 @@ async fn distributed_persist_payload(
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                if storage_handle.get_pane(remote_pane_id).await?.is_none() {
+                if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
                     let ts = now_ms_i64();
                     distributed_upsert_pane(
                         &storage_handle,
@@ -12781,7 +12784,7 @@ async fn distributed_persist_payload(
                 }
 
                 if let Some(reason) = gap_reason {
-                    if let Some(gap) = storage_handle.record_gap(remote_pane_id, &reason).await? {
+                    if let Some(gap) = storage_handle.record_gap_with_cx(&persist_cx, remote_pane_id, &reason).await? {
                         let _ = event_bus.publish(Event::GapDetected {
                             pane_id: gap.pane_id,
                             seq_before: gap.seq_before,
@@ -12847,7 +12850,7 @@ async fn distributed_persist_payload(
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                if storage_handle.get_pane(remote_pane_id).await?.is_none() {
+                if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
                     let ts = now_ms_i64();
                     distributed_upsert_pane(
                         &storage_handle,
@@ -12866,7 +12869,7 @@ async fn distributed_persist_payload(
                     "distributed_gap:{}:{}:{}",
                     gap.reason, gap.seq_before, gap.seq_after
                 );
-                if let Some(stored_gap) = storage_handle.record_gap(remote_pane_id, &reason).await?
+                if let Some(stored_gap) = storage_handle.record_gap_with_cx(&persist_cx, remote_pane_id, &reason).await?
                 {
                     let _ = event_bus.publish(Event::GapDetected {
                         pane_id: stored_gap.pane_id,
@@ -12919,7 +12922,7 @@ async fn distributed_persist_payload(
             };
 
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            if storage_handle.get_pane(remote_pane_id).await?.is_none() {
+            if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
                 distributed_upsert_pane(
                     &storage_handle,
                     remote_pane_id,
@@ -12942,7 +12945,7 @@ async fn distributed_persist_payload(
                 None,
                 detected_at,
             );
-            let event_id = storage_handle.record_event(stored_event).await?;
+            let event_id = storage_handle.record_event_with_cx(&persist_cx, stored_event).await?;
             drop(storage_handle);
 
             let _ = event_bus.publish(Event::PatternDetected {
@@ -12983,8 +12986,11 @@ async fn distributed_persist_pane_meta(
         .clone()
         .or_else(|| Some(format!("remote:{canonical_sender}:{}", meta.pane_id)));
 
+    // ft-xbnl0.2.3 tick 277: cx-first distributed pane-meta persist.
+    let meta_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    let is_new = storage_handle.get_pane(remote_pane_id).await?.is_none();
+    let is_new = storage_handle.get_pane_with_cx(&meta_cx, remote_pane_id).await?.is_none();
     distributed_upsert_pane(
         &storage_handle,
         remote_pane_id,
@@ -13511,7 +13517,10 @@ async fn distributed_agent_should_skip_remote_pane(
     pane_id: u64,
 ) -> anyhow::Result<bool> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    let pane = storage_handle.get_pane(pane_id).await?;
+    // ft-xbnl0.2.3 tick 277: cx-first distributed remote pane check.
+    let check_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let pane = storage_handle.get_pane_with_cx(&check_cx, pane_id).await?;
     Ok(matches!(
         pane.as_ref(),
         Some(record) if !distributed_agent_local_pane(record)
@@ -13991,7 +14000,10 @@ async fn distributed_agent_stream_event(
                 if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                     let pane_record = {
                         let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                        storage_handle.get_pane(meta.pane_id).await?
+                        // ft-xbnl0.2.3 tick 277: cx-first envelope pane-meta enrich.
+                        let env_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        storage_handle.get_pane_with_cx(&env_cx, meta.pane_id).await?
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
@@ -14013,7 +14025,10 @@ async fn distributed_agent_stream_event(
                 if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                     let pane_record = {
                         let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                        storage_handle.get_pane(meta.pane_id).await?
+                        // ft-xbnl0.2.3 tick 277: cx-first envelope pane-meta enrich.
+                        let env_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        storage_handle.get_pane_with_cx(&env_cx, meta.pane_id).await?
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
@@ -16736,7 +16751,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     SemanticAnomalyConfig, SemanticAnomalyDetector,
                                 };
 
-                                let segments = storage_handle.get_segments(pane_id, limit).await?;
+                                // ft-xbnl0.2.3 tick 277: cx-first segment fetch.
+                                let seg_cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                let segments = storage_handle
+                                    .get_segments_with_cx(&seg_cx, pane_id, limit)
+                                    .await?;
                                 let embedder = frankenterm_core::search::HashEmbedder::default();
                                 let mut detector =
                                     SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
