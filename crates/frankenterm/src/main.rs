@@ -14297,13 +14297,25 @@ async fn distributed_agent_sleep_with_shutdown(
 ) -> bool {
     use std::sync::atomic::Ordering;
 
+    // ft-xbnl0.2.3 tick 282: cx-first distributed agent shutdown-sleep.
+    let sleep_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     let started = Instant::now();
     while started.elapsed() < duration {
         if shutdown_flag.load(Ordering::SeqCst) {
             return true;
         }
         let remaining = duration.saturating_sub(started.elapsed());
-        frankenterm_core::runtime_compat::sleep(remaining.min(Duration::from_millis(250))).await;
+        if frankenterm_core::runtime_compat::sleep_with_cx(
+            &sleep_cx,
+            remaining.min(Duration::from_millis(250)),
+        )
+        .await
+        .is_err()
+        {
+            // Cx cancelled during backoff — treat as shutdown signal.
+            return true;
+        }
     }
     shutdown_flag.load(Ordering::SeqCst)
 }
