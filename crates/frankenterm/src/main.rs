@@ -10916,10 +10916,11 @@ async fn load_distributed_remote_panes(
     db_path: &Path,
 ) -> Result<Vec<frankenterm_core::storage::PaneRecord>, frankenterm_core::Error> {
     let db_path = db_path.to_string_lossy();
-    let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
-    // ft-xbnl0.2.3 tick 248: cx-first storage read.
+    // ft-xbnl0.2.3 tick 248/300: cx-first storage open + read (shared binding).
     let storage_cx = frankenterm_core::cx::Cx::current()
         .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage =
+        frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path).await?;
     let panes = storage.get_panes_with_cx(&storage_cx).await?;
     if let Err(err) = storage.shutdown().await {
         tracing::warn!(error = %err, "Failed to shutdown storage cleanly after distributed pane query");
@@ -30882,11 +30883,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             json,
         }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
+            // ft-xbnl0.2.3 tick 300: cx-first storage open + create reservation.
+            let reservation_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage =
+                frankenterm_core::storage::StorageHandle::new_with_cx(&reservation_cx, &db_path)
+                    .await?;
 
             let ttl_ms = (ttl * 1000) as i64;
             match storage
-                .create_reservation(pane_id, &owner_kind, &owner_id, reason.as_deref(), ttl_ms)
+                .create_reservation_with_cx(
+                    &reservation_cx,
+                    pane_id,
+                    &owner_kind,
+                    &owner_id,
+                    reason.as_deref(),
+                    ttl_ms,
+                )
                 .await
             {
                 Ok(r) => {
@@ -30939,10 +30952,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Reservations { json }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
-            // ft-xbnl0.2.3 tick 243: cx-first storage ops.
+            // ft-xbnl0.2.3 tick 243/300: cx-first storage open + ops (shared binding).
             let storage_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage =
+                frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path)
+                    .await?;
 
             // Expire stale reservations first
             if let Err(e) = storage.expire_stale_reservations_with_cx(&storage_cx).await {
@@ -31996,14 +32011,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         #[cfg(feature = "web")]
         Some(Commands::Web { port }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
+            // ft-xbnl0.2.3 tick 298/300: cx-first web server storage + orchestrator.
+            let web_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let storage =
+                frankenterm_core::storage::StorageHandle::new_with_cx(&web_cx, &db_path).await?;
             let event_bus = Arc::new(frankenterm_core::events::EventBus::new(1024));
             let config = frankenterm_core::web::WebServerConfig::new(port)
                 .with_storage(storage)
                 .with_event_bus(event_bus);
-            // ft-xbnl0.2.3 tick 298: cx-first web server orchestrator.
-            let web_cx = frankenterm_core::cx::Cx::current()
-                .unwrap_or_else(frankenterm_core::cx::for_request);
             frankenterm_core::web::run_web_server_with_cx(&web_cx, config).await?;
         }
 
