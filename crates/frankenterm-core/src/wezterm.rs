@@ -6766,6 +6766,31 @@ impl MockWezterm {
             .fetch_max(tab_id + 1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`MockWezterm::add_pane`]
+    /// (tick 203).
+    ///
+    /// Routes the panes RwLock write-lock acquire through
+    /// `write_with_cx(cx)` so a caller-cancelled cx interrupts the
+    /// lock wait. Used by `Scenario::setup_with_cx` for the
+    /// simulation-harness setup loop.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn add_pane_with_cx(&self, cx: &crate::cx::Cx, pane: MockPane) {
+        let mut panes = self.panes.write_with_cx(cx).await;
+        let id = pane.pane_id;
+        let window_id = pane.window_id;
+        let tab_id = pane.tab_id;
+        panes.insert(id, pane);
+        let _ = self
+            .next_pane_id
+            .fetch_max(id + 1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .next_window_id
+            .fetch_max(window_id + 1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self
+            .next_tab_id
+            .fetch_max(tab_id + 1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Create a simple mock pane with defaults.
     pub async fn add_default_pane(&self, pane_id: u64) -> MockPane {
         let pane = MockPane {

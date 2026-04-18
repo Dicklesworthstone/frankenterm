@@ -648,7 +648,11 @@ impl Scenario {
                 rows: pane_def.rows,
                 content: pane_def.initial_content.clone(),
             };
-            mock.add_pane(pane).await;
+            // Tick 203 (ft-xbnl0.2.3): route the mock pane insert
+            // through add_pane_with_cx(cx, ...) so the inner
+            // MockWezterm RwLock write-lock wait honors caller
+            // cancellation. Same rationale as tick 202.
+            mock.add_pane_with_cx(cx, pane).await;
         }
         Ok(())
     }
