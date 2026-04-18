@@ -5570,17 +5570,25 @@ KBAhs4snj5QspGFqkazmIw==
             let result = client.get(&cx, &url).await;
             let elapsed = started.elapsed();
 
+            // Tick 313 original: assert_err only ("some error, just not a hang").
+            // Tick 396: tightened to the exact contract now that tick-387's
+            // ft-l9mxa fix added a pre-flight cx.is_cancel_requested() short-
+            // circuit at DistributedHttpClient::get entry. The pre-cancelled
+            // cx path now surfaces ClientError::Cancelled deterministically
+            // (no TCP connect, no server interaction) — distinct from the
+            // mid-flight cancel path (ticks 380 + 389) which also produces
+            // Cancelled but via the cancel-watcher race mid-read.
+            match &result {
+                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
+                other => panic!(
+                    "pre-cancelled cx must cause get() to return Err(ClientError::Cancelled) \
+                     (tight contract post tick-387 ft-l9mxa fix), got: {other:?}"
+                ),
+            }
             assert!(
-                result.is_err(),
-                "pre-cancelled cx must cause get() to return an error, got: {result:?}"
-            );
-            // A pre-cancelled cx should fail fast. Bound generously to
-            // tolerate kernel connect/accept scheduling — the point is
-            // "does not hang against a stalled server", not a tight
-            // latency bound.
-            assert!(
-                elapsed < std::time::Duration::from_secs(5),
-                "pre-cancelled cx should fail fast; took {elapsed:?}"
+                elapsed < std::time::Duration::from_secs(1),
+                "pre-cancelled cx should fail nearly instantaneously (no TCP activity); \
+                 took {elapsed:?}"
             );
         });
     }
@@ -5620,13 +5628,20 @@ KBAhs4snj5QspGFqkazmIw==
             let result = client.post(&cx, &url, b"body=data".to_vec()).await;
             let elapsed = started.elapsed();
 
+            // Tick 314 original: assert_err only. Tick 396: tightened to the
+            // exact contract post tick-387 ft-l9mxa fix — the pre-flight
+            // cx.is_cancel_requested() check at DistributedHttpClient::post
+            // entry surfaces ClientError::Cancelled deterministically.
+            match &result {
+                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
+                other => panic!(
+                    "pre-cancelled cx must cause post() to return Err(ClientError::Cancelled) \
+                     (tight contract post tick-387 ft-l9mxa fix), got: {other:?}"
+                ),
+            }
             assert!(
-                result.is_err(),
-                "pre-cancelled cx must cause post() to return an error, got: {result:?}"
-            );
-            assert!(
-                elapsed < std::time::Duration::from_secs(5),
-                "pre-cancelled cx should fail fast; took {elapsed:?}"
+                elapsed < std::time::Duration::from_secs(1),
+                "pre-cancelled cx should fail nearly instantaneously; took {elapsed:?}"
             );
         });
     }
