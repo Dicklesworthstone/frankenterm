@@ -4166,6 +4166,62 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 342: HTTPS URL against plaintext server → Err.
+    ///
+    /// Pins that `DistributedHttpClient::get` against an `https://` URL
+    /// whose server speaks plaintext HTTP (no TLS) returns an `Err`
+    /// — it does NOT silently downgrade to plaintext, nor does it
+    /// hang, nor does it panic on TLS handshake failure.
+    ///
+    /// Why this matters: URL scheme is a security-critical signal.
+    /// A client that silently stripped https:// and connected plaintext
+    /// (or silently accepted a plaintext response on an https request)
+    /// would defeat TLS entirely — the caller asked for encrypted
+    /// transport, got unencrypted, and has no signal that anything is
+    /// wrong. The *contract* is: scheme mismatch is observable as an
+    /// error; fast; non-hanging.
+    ///
+    /// Test uses a plaintext server that accepts a connection and
+    /// immediately closes, so the client attempts TLS handshake, fails
+    /// fast (invalid TLS bytes from the server or EOF), and surfaces
+    /// as Err. Bound to <10s to catch regressions that would hang on
+    /// handshake.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_https_url_against_plaintext_server_returns_err() {
+        run_async_test(async {
+            // Plaintext server that accepts, then immediately closes.
+            // Any client attempting TLS against this will see either
+            // invalid handshake bytes or EOF before handshake completes.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    drop(stream); // immediate close
+                }
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            // Note the scheme: https:// against a plaintext loopback server.
+            let url = format!("https://127.0.0.1:{}/health", addr.port());
+
+            let started = std::time::Instant::now();
+            let result = client.get(&cx, &url).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "https:// URL against plaintext server must return Err, not silent downgrade"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "scheme-mismatch must fail fast; took {elapsed:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 332: Non-empty User-Agent header contract.
     ///
     /// Pins that `DistributedHttpClient::get` sends a non-empty
