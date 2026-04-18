@@ -18101,8 +18101,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                 };
 
-                            match frankenterm_core::search_explain::build_explain_context(
-                                &storage, &query, pane,
+                            // ft-xbnl0.2.3 tick 269: cx-first search explain.
+                            let explain_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            match frankenterm_core::search_explain::build_explain_context_with_cx(
+                                &explain_cx,
+                                &storage,
+                                &query,
+                                pane,
                             )
                             .await
                             {
