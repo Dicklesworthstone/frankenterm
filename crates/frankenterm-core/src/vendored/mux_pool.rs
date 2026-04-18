@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::sleep;
 
 use super::mux_client::{

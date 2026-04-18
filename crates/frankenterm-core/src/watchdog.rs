@@ -867,6 +867,12 @@ pub fn spawn_mux_watchdog(
 }
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
+///
+/// Legacy ambient path preserved alongside the cx-first sibling
+/// `get_mux_server_rss_with_cx` used by the cx-first `check_inner`
+/// watchdog body. This ambient version is only invoked in the
+/// `#[cfg(not(feature = "asupersync-runtime"))]` fallback.
+#[allow(dead_code)]
 async fn get_mux_server_rss() -> Option<u64> {
     crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
         .await
