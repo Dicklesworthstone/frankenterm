@@ -4579,7 +4579,7 @@ KBAhs4snj5QspGFqkazmIw==
     /// needing a full HTTP server setup.
     #[cfg(feature = "distributed")]
     #[test]
-    fn race_with_cx_cancel_surfaces_cancel_on_pending_inner() {
+    fn distributed_http_client_race_with_cx_cancel_surfaces_cancel_on_pending_inner() {
         run_async_test(async {
             let cx = asupersync::cx::Cx::for_testing();
             let cx_for_cancel = cx.clone();
