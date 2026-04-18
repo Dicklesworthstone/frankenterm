@@ -3501,6 +3501,71 @@ impl HandleAuthRequired {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`lookup_cass_hints`] (tick 218).
+    /// Single-query cass lookup (no candidate loop like the other two
+    /// cass handlers), so no per-query checkpoint needed — the
+    /// `cass.search_with_cx` call itself observes cx at entry.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn lookup_cass_hints_with_cx(
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> AuthCassHintsLookup {
+        let query = Self::normalized_cass_query(trigger);
+        let Some(query_value) = query.clone() else {
+            return AuthCassHintsLookup::default();
+        };
+
+        let pane = match storage.get_pane_with_cx(cx, pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return AuthCassHintsLookup {
+                    query,
+                    workspace: None,
+                    hints: Vec::new(),
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                };
+            }
+        };
+
+        let workspace = pane.as_ref().and_then(Self::workspace_for_pane);
+
+        let options = SearchOptions {
+            limit: Some(AUTH_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(AUTH_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(180),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(AUTH_CASS_TIMEOUT_SECS);
+        match cass.search_with_cx(cx, &query_value, &options).await {
+            Ok(result) => {
+                let hints = result
+                    .hits
+                    .iter()
+                    .filter_map(Self::format_cass_hint)
+                    .take(AUTH_CASS_HINT_LIMIT)
+                    .collect();
+                AuthCassHintsLookup {
+                    query,
+                    workspace,
+                    hints,
+                    error: None,
+                }
+            }
+            Err(error) => AuthCassHintsLookup {
+                query,
+                workspace,
+                hints: Vec::new(),
+                error: Some(error.to_string()),
+            },
+        }
+    }
+
     pub fn build_recovery_prompt(
         strategy: &AuthRecoveryStrategy,
         trigger: &serde_json::Value,
@@ -3776,6 +3841,197 @@ impl Workflow for HandleAuthRequired {
                                 pane_id,
                                 error = %e,
                                 "handle_auth_required: failed to record auth event"
+                            );
+                            StepResult::abort(format!("Failed to record auth event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 218). Fifth per-impl
+    /// Workflow migration. First "policy dispatch" family handler —
+    /// uses StepResult::send_text(prompt) so cx doesn't need to be
+    /// threaded into injection (the runner dispatches the send).
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `lookup_cass_hints_with_cx` (pane + single cass search)
+    ///   - `record_audit_action_with_cx` (audit write)
+    ///
+    /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_auth_required cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Cooldown check (cx-first read)
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("auth_required".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_auth_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_auth_required: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_auth_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                explicit_cx = true,
+                                "handle_auth_required: no recent auth events, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_auth_required: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: Classify the auth event (pure CPU, no storage/cass)
+                1 => {
+                    let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    tracing::info!(
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        strategy = strategy.label(),
+                        explicit_cx = true,
+                        "handle_auth_required: classified auth event (cx)"
+                    );
+
+                    StepResult::cont()
+                }
+
+                // Step 2: cx-first cass lookup + audit record + injection prompt
+                2 => {
+                    let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let cass_lookup =
+                        Self::lookup_cass_hints_with_cx(cx, &storage, pane_id, &trigger).await;
+                    let cass_hint_count = cass_lookup.hints.len();
+                    let recovery_prompt =
+                        Self::build_recovery_prompt(&strategy, &trigger, &cass_lookup);
+                    let timestamp_ms = now_ms();
+                    let input_summary =
+                        format!("Auth required for {agent_type}: {}", strategy.label());
+                    let decision_context = build_auth_required_audit_decision_context(
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &strategy,
+                        &cass_lookup,
+                        &input_summary,
+                        "recorded",
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "auth_required".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action_with_cx(cx, audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                strategy = strategy.label(),
+                                explicit_cx = true,
+                                "handle_auth_required: recorded auth event (cx)"
+                            );
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                event_type,
+                                cass_hint_count,
+                                explicit_cx = true,
+                                "handle_auth_required: injecting auth recovery prompt (cx)"
+                            );
+                            StepResult::send_text(recovery_prompt)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_auth_required: failed to record auth event (cx)"
                             );
                             StepResult::abort(format!("Failed to record auth event: {e}"))
                         }
