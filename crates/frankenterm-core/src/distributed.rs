@@ -4360,6 +4360,67 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 371: Response body bytes pass through verbatim.
+    ///
+    /// Pins that when the server sends a body containing CRLF, LF, CR,
+    /// null byte, high-bit bytes, and tab, the client returns the body
+    /// bytes **exactly** as received — no line-ending normalization, no
+    /// null byte stripping, no UTF-8 transcoding.
+    ///
+    /// Why this matters: distributed RPC bodies include:
+    /// - Serialized binary data (bincode, msgpack, protobuf) containing
+    ///   all byte values 0-255.
+    /// - JSON payloads with embedded `\r\n` inside string fields
+    ///   (unescaped CR/LF can appear in multi-line string fields).
+    /// - Captured pane scrollback with mixed LF / CRLF line endings.
+    ///
+    /// Any of these would silently corrupt if the client normalized body
+    /// bytes. The body is opaque from the client's perspective.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_response_body_bytes_pass_through_verbatim() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            // Body with edge-case byte values: CR, LF, CRLF patterns,
+            // null byte, high-bit bytes, tab.
+            let body: Vec<u8> = vec![
+                b'a', b'\r', b'b', b'\n', b'c', b'\r', b'\n', b'd', 0x00, 0xFF, b'\t', b'e',
+            ];
+            let content_length = body.len();
+            let body_for_server = body.clone();
+            let expected_body = body.clone();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let mut response =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\n\r\n")
+                        .into_bytes();
+                response.extend_from_slice(&body_for_server);
+                stream.write_all(&response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/binary", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                resp.body, expected_body,
+                "response body bytes must pass through verbatim; any normalization \
+                 would corrupt binary payloads"
+            );
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 345: Server closes mid-response → client returns Err.
     ///
     /// Pins that the client returns `Err` (not a truncated `Ok` and not
