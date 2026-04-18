@@ -5483,6 +5483,65 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 419: `oneshot_recv_with_cx` observes cx-cancel.
+    ///
+    /// Pins the cx-cancel observation on the oneshot receive primitive.
+    /// With a still-alive sender (no disconnect) but a pre-cancelled cx,
+    /// `oneshot_recv_with_cx` must return `Err` promptly rather than
+    /// blocking indefinitely waiting for a send that will never happen.
+    ///
+    /// Setup:
+    /// 1. Create `(tx, rx)` oneshot channel.
+    /// 2. Keep `_tx` alive (no drop; receiver does not see disconnect).
+    /// 3. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 4. Wrap `oneshot_recv_with_cx(&cx, rx)` in a 2 s outer timeout.
+    /// 5. Assert elapsed < 1 s AND result is Err.
+    ///
+    /// This complements the yield_now_with_cx cancel-checkpoint tests
+    /// (tick 418) and pins the same direct-cancel observability on the
+    /// oneshot receive path used throughout the core for single-fire
+    /// event signalling.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn oneshot_recv_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, rx) = oneshot::channel::<u64>();
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 419 pre-cancel oneshot_recv_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                oneshot_recv_with_cx(&cx, rx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            // Outer wrapper is a safety-net: if the primitive is
+            // NOT cancel-observing it would block 2 s until the
+            // timeout fires. With cx-cancel observation, the inner
+            // Err arrives well before the outer timeout.
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit oneshot_recv_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                inner.is_err(),
+                "pre-cancelled cx must cause oneshot_recv_with_cx to return Err, got: {inner:?}"
+            );
+        });
+    }
+
     // ========================================================================
     // time module tests
     // ========================================================================
