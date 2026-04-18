@@ -24,7 +24,7 @@ mod websocket;
 
 use server::poke_listener;
 #[cfg(feature = "asupersync-runtime")]
-pub use server::start_web_server_with_cx;
+pub use server::{run_web_server_with_cx, start_web_server_with_cx};
 pub use server::{run_web_server, start_web_server};
 
 #[cfg(test)]

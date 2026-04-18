@@ -31988,7 +31988,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let config = frankenterm_core::web::WebServerConfig::new(port)
                 .with_storage(storage)
                 .with_event_bus(event_bus);
-            frankenterm_core::web::run_web_server(config).await?;
+            // ft-xbnl0.2.3 tick 298: cx-first web server orchestrator.
+            let web_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            frankenterm_core::web::run_web_server_with_cx(&web_cx, config).await?;
         }
 
         #[cfg(all(feature = "tui", not(feature = "rollout")))]
