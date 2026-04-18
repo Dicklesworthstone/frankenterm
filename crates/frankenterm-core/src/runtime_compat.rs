@@ -1618,6 +1618,13 @@ pub mod process {
             // Spawn cx→AtomicBool bridge watcher. It polls cx at
             // PROCESS_POLL_INTERVAL and sets `cancel` on cx cancel.
             // It also exits when `watcher_done` is set (normal path).
+            //
+            // Tick 205 (ft-xbnl0.2.3): the inter-poll sleep now uses
+            // sleep_with_cx(&watcher_cx, ...) so both the cancel check
+            // and the sleep timer observe the same cx. Previously used
+            // ambient super::sleep which falls back to Cx::current()
+            // thread-local — asymmetric cx ownership where the watcher
+            // checks watcher_cx for cancel but times out via ambient.
             let watcher_done = Arc::new(AtomicBool::new(false));
             let watcher_cancel = Arc::clone(&cancel);
             let watcher_done_inner = Arc::clone(&watcher_done);
@@ -1628,7 +1635,7 @@ pub mod process {
                         watcher_cancel.store(true, Ordering::SeqCst);
                         return;
                     }
-                    super::sleep(PROCESS_POLL_INTERVAL).await;
+                    let _ = super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL).await;
                 }
             });
 
