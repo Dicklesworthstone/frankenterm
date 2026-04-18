@@ -2935,6 +2935,72 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 333: build_tls_bundle failure-path contracts
+    //
+    // The error-variant Display tests above prove each enum variant has
+    // a reasonable operator-facing message. These tests prove
+    // `build_tls_bundle` actually *returns* the right variant under the
+    // relevant failure conditions. Without these, a regression that
+    // quietly swapped `MissingCertPath` for `Config("missing cert")`
+    // (or vice-versa) would not be caught — the operator-facing
+    // message would still look reasonable, but automated matching on
+    // the error variant (e.g. for retry vs. config-error handling)
+    // would break silently.
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_rejects_tls_disabled_config() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        // tls.enabled is left as default (false).
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("disabled TLS must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DistributedTlsError::TlsDisabled),
+            "TLS disabled must surface TlsDisabled variant; got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_rejects_missing_cert_path() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.key_path = Some("/dev/null".to_string()); // populated
+        // cert_path intentionally left None.
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("missing cert must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DistributedTlsError::MissingCertPath),
+            "missing cert path must surface MissingCertPath variant; got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_rejects_missing_key_path() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some("/dev/null".to_string()); // populated
+        // key_path intentionally left None.
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("missing key must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DistributedTlsError::MissingKeyPath),
+            "missing key path must surface MissingKeyPath variant; got: {err:?}"
+        );
+    }
+
+    // =====================================================================
     // DistributedCredentialError Display
     // =====================================================================
 
