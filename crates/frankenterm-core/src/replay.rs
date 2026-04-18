@@ -528,6 +528,67 @@ impl Player {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`Self::handle_control`].
+    ///
+    /// Fixes a latent cancellation hole in the legacy handler: the
+    /// Pause branch spins on `control_rx.changed(&watch_cx)` where
+    /// `watch_cx = crate::cx::for_request()` — an orphan cx that
+    /// doesn't inherit cancellation from the parent. The cx-first
+    /// variant threads the caller's cx into the wait, so a Pause
+    /// that lingers after `play_with_cx`'s parent was cancelled now
+    /// exits within one cancel-signal tick instead of requiring an
+    /// external Play/Stop control signal to wake it up.
+    ///
+    /// Return contract: `Ok(true)` means "stop playback" (caller
+    /// should return from its play loop). `Ok(false)` means
+    /// "continue". `Err(...)` folds both control-channel-closed
+    /// and cx-cancellation into `crate::Error::Runtime(...)`.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn handle_control_with_cx(
+        &mut self,
+        cx: &crate::cx::Cx,
+        ctrl: PlayerControl,
+        control_rx: &mut watch::Receiver<PlayerControl>,
+    ) -> Result<bool> {
+        match ctrl {
+            PlayerControl::Stop => {
+                self.state = PlayerState::Stopped;
+                Ok(true)
+            }
+            PlayerControl::Pause => {
+                self.state = PlayerState::Paused;
+                loop {
+                    cx.checkpoint().map_err(|err| {
+                        crate::Error::Runtime(format!(
+                            "replay.handle_control paused-wait cancelled: {err}"
+                        ))
+                    })?;
+                    control_rx.changed(cx).await.map_err(|_| {
+                        crate::Error::Runtime("control channel closed".into())
+                    })?;
+                    let sig = *control_rx.borrow();
+                    match sig {
+                        PlayerControl::Play => {
+                            self.state = PlayerState::Playing;
+                            return Ok(false);
+                        }
+                        PlayerControl::Stop => {
+                            self.state = PlayerState::Stopped;
+                            return Ok(true);
+                        }
+                        PlayerControl::SetSpeed(s) => self.speed = s,
+                        PlayerControl::Pause => {}
+                    }
+                }
+            }
+            PlayerControl::SetSpeed(s) => {
+                self.speed = s;
+                Ok(false)
+            }
+            PlayerControl::Play => Ok(false),
+        }
+    }
+
     /// Play the recording from the current position with timing delays.
     ///
     /// A `watch::Receiver<PlayerControl>` is used for external control
@@ -625,7 +686,7 @@ impl Player {
             })?;
 
             if let Some(ctrl) = check_control(&mut control_rx) {
-                if self.handle_control(ctrl, &mut control_rx).await? {
+                if self.handle_control_with_cx(cx, ctrl, &mut control_rx).await? {
                     return Ok(());
                 }
             }
@@ -649,7 +710,7 @@ impl Player {
                 }
 
                 if let Some(ctrl) = check_control(&mut control_rx) {
-                    if self.handle_control(ctrl, &mut control_rx).await? {
+                    if self.handle_control_with_cx(cx, ctrl, &mut control_rx).await? {
                         return Ok(());
                     }
                 }
