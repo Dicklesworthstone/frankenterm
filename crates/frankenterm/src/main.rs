@@ -16556,7 +16556,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         } => {
                             let wezterm =
                                 frankenterm_core::wezterm::wezterm_handle_from_config(&config);
-                            match wezterm.list_panes().await {
+                            // ft-xbnl0.2.3 tick 231: cx-first wezterm.
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            match wezterm.list_panes_with_cx(&cx).await {
                                 Ok(panes) => {
                                     let filter = &config.ingest.panes;
                                     let mut states: Vec<PaneState> = panes
@@ -16764,8 +16767,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 return Ok(());
                             }
 
+                            // ft-xbnl0.2.3 tick 231: cx-first wezterm.
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             let mut pane_ids = if all {
-                                match wezterm.list_panes().await {
+                                match wezterm.list_panes_with_cx(&cx).await {
                                     Ok(panes) => panes.iter().map(|pane| pane.pane_id).collect(),
                                     Err(e) => {
                                         let response = RobotResponse::<RobotBatchGetTextData>::error_with_code(
@@ -16914,7 +16920,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
-                                match wezterm.get_text(pane_id, escapes).await {
+                                // ft-xbnl0.2.3 tick 231: cx-first wezterm.
+                                let cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                match wezterm.get_text_with_cx(&cx, pane_id, escapes).await {
                                     Ok(full_text) => {
                                         let (text, truncated, truncation_info) =
                                             apply_tail_truncation(&full_text, tail);
@@ -17189,7 +17198,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             if command_ctx.is_dry_run() {
                                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                                let pane_info = wezterm.get_pane(pane_id).await.ok();
+                                // ft-xbnl0.2.3 tick 231: cx-first.
+                                let cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                let pane_info =
+                                    wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
                                 let storage = frankenterm_core::storage::StorageHandle::new(
                                     &ctx.effective.paths.db_path,
                                 )
@@ -17249,7 +17262,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 };
 
                                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                                let pane_info = match wezterm.get_pane(pane_id).await {
+                                // ft-xbnl0.2.3 tick 231: cx-first.
+                                let cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                let pane_info = match wezterm.get_pane_with_cx(&cx, pane_id).await {
                                     Ok(info) => info,
                                     Err(e) => {
                                         let (code, hint) = map_wezterm_error_to_robot(&e);
@@ -17327,7 +17343,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                 let mut injection = match decision {
                                     PolicyDecision::Allow { .. } => {
-                                        let send_result = wezterm.send_text(pane_id, &text).await;
+                                        // ft-xbnl0.2.3 tick 231: cx-first send_text. Reuses
+                                        // the `cx` from the get_pane migration above (same scope).
+                                        let send_result =
+                                            wezterm.send_text_with_cx(&cx, pane_id, &text).await;
                                         match send_result {
                                             Ok(()) => InjectionResult::Allowed {
                                                 decision,
