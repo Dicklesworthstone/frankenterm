@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **26 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
+| 3 | Verification covers correctness + basic performance non-regression | **27 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests + 2 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -141,6 +141,22 @@ in manifests for vendored ex-WezTerm crates (`frankenterm/ssh`, `frankenterm/cod
 `frankenterm/lua-api-crates/mux-lua`) that predate the FrankenTerm async
 migration. The import-scan still flags leakage INTO FrankenTerm core logic.
 
+### 2.6 Primitive contract tests (`runtime_compat` — ticks 382/383)
+
+Ticks 382/383 landed runtime-level tests pinning the doc claims
+recorded in §2.5:
+
+| Contract | Test name | Tick |
+|----------|-----------|------|
+| `sleep_with_cx` observes cx budget deadline | `sleep_with_cx_observes_budget_deadline` | 382 |
+| `timeout_with_cx` observes cx budget deadline | `timeout_with_cx_observes_budget_deadline` | 383 |
+
+Both use `Budget::with_deadline(Time::ZERO)` (budget already
+elapsed at construction) and assert that the primitive returns
+`Err` promptly rather than blocking for the full requested
+duration. A future regression removing the `budget_*` short-circuit
+in asupersync would fire both tests.
+
 ### 2.5 Primitive documentation (`runtime_compat::{timeout_with_cx, sleep_with_cx}`)
 
 Both `timeout_with_cx` and `sleep_with_cx` observe cx **budget
@@ -239,8 +255,8 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 5 runs PASS (78 tests)`.
-Exit 0 iff all 78 tests pass.
+output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (81 tests)`.
+Exit 0 iff all 81 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
@@ -285,7 +301,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 ## 6. Closure Checklist (when ready to close)
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 78 tests pass: 26 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web)
+- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 81 tests pass: 27 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive)
 - [ ] `rch exec -- cargo test -p frankenterm-core --features distributed --lib distributed::tests::` passes (154/154 ok as of tick 362; verifies the broader `distributed::tests::` surface that the narrower check script's `tls_` filter doesn't hit)
 - [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
 - [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
