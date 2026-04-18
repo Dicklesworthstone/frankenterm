@@ -1109,6 +1109,56 @@ pub mod task {
             .await
         }
 
+        /// ft-xbnl0.2.3 Cx-first sibling of [`JoinSet::join_next`].
+        ///
+        /// Pre-flight `cx.checkpoint()` gates entry, and each
+        /// subsequent poll loop also invokes `cx.checkpoint()`
+        /// before scanning the handles so a cancelled caller
+        /// surfaces within the same tick as the cancel signal
+        /// rather than waiting for the next task completion.
+        /// Returns `Some(Err(JoinError))` on cancellation — the
+        /// JoinError is synthesized from a cancellation reason so
+        /// downstream match arms can fold cancel into their normal
+        /// task-failure path.
+        ///
+        /// Note the local shadowing of `cx`: the poll_fn closure
+        /// receives a `std::task::Context` also conventionally
+        /// named `cx`, so the outer capability context is bound
+        /// as `caller_cx` to avoid name collision inside the
+        /// poll body.
+        pub async fn join_next_with_cx(
+            &mut self,
+            caller_cx: &crate::cx::Cx,
+        ) -> Option<Result<T, JoinError>> {
+            if self.handles.is_empty() {
+                return None;
+            }
+            if let Err(err) = caller_cx.checkpoint() {
+                return Some(Err(JoinError::new(format!(
+                    "aborted: join_next cancelled: {err}"
+                ))));
+            }
+
+            std::future::poll_fn(|cx| {
+                if let Err(err) = caller_cx.checkpoint() {
+                    return std::task::Poll::Ready(Some(Err(
+                        JoinError::new(format!(
+                            "aborted: join_next cancelled mid-poll: {err}"
+                        )),
+                    )));
+                }
+                for i in 0..self.handles.len() {
+                    let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
+                    if let std::task::Poll::Ready(result) = pinned.as_mut().poll(cx) {
+                        self.handles.swap_remove(i);
+                        return std::task::Poll::Ready(Some(result));
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await
+        }
+
         /// Non-blocking poll for the next completed task.
         ///
         /// Checks if any handle is finished and returns its result.
@@ -5033,6 +5083,52 @@ mod tests {
         rt.block_on(async {
             for _ in 0..5 {
                 task::yield_now().await;
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: `JoinSet::join_next_with_cx` must
+    /// short-circuit on entry when the caller's cx is already
+    /// cancelled — never polling the inner handles. A
+    /// pre-cancelled cx with a never-completing task must yield
+    /// `Some(Err(JoinError { is_cancelled: true }))` immediately
+    /// instead of blocking forever.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn join_next_with_cx_short_circuits_on_precancelled_cx() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel join_next"),
+            );
+
+            let mut set: task::JoinSet<()> = task::JoinSet::new();
+            // Spawn a task that will never complete on its own.
+            set.spawn(async {
+                std::future::pending::<()>().await;
+            });
+
+            let result = set.join_next_with_cx(&cx).await;
+            match result {
+                Some(Err(err)) => {
+                    assert!(
+                        err.is_cancelled(),
+                        "pre-cancelled cx must produce a cancelled JoinError: {err}"
+                    );
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("join_next cancelled"),
+                        "error should mention join_next cancellation: {msg}"
+                    );
+                }
+                other => panic!(
+                    "expected Some(Err(cancelled)) on pre-cancel, got {other:?}"
+                ),
             }
         });
     }
