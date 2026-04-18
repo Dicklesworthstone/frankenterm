@@ -1428,6 +1428,70 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 322: Mid-flight cx-cancel contract for the
+    /// metrics server accept loop.
+    ///
+    /// `start_with_cx` clones the `Cx` into the spawned accept-loop
+    /// task. Cancelling that cx *after* the server has started must
+    /// cause the loop to exit without requiring the shutdown flag.
+    /// The two signals are redundant-on-purpose (an operator may
+    /// cancel the cx while the shutdown flag is still unset, e.g. on
+    /// program termination via a signal handler), and this test pins
+    /// that the cx path alone is sufficient to stop the accept loop.
+    ///
+    /// Structure: start the server with a live cx, cancel the cx,
+    /// wait for the handle to complete, assert the wait returns
+    /// within a bounded time (the accept poll interval is 250 ms, so
+    /// worst case is one poll + task cleanup). Complements ticks 319
+    /// (pre-cancel-refuses-bind) and 320 (wait_with_cx on pre-cancel),
+    /// which exercise other timings of the cancel signal.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop() {
+        run_async_test(async {
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(FixedMetricsCollector::new(MetricsSnapshot::default()));
+            let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
+            let cx = crate::cx::for_request();
+
+            let handle = server
+                .start_with_cx(&cx)
+                .await
+                .expect("start_with_cx");
+
+            // Cancel the cx while the server is running. The shutdown
+            // flag is intentionally NOT flipped — this test pins that
+            // the cx path alone is sufficient to terminate the accept
+            // loop.
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("mid-flight cancel of metrics accept loop"),
+            );
+
+            let start = std::time::Instant::now();
+            handle.wait().await;
+            let elapsed = start.elapsed();
+
+            // Accept poll interval is 250ms; the loop checks
+            // `task_cx.is_cancel_requested()` at the top of each
+            // iteration. Bound generously to tolerate scheduling
+            // variance on loaded CI hosts, but a regression that
+            // removed the cx check would never exit (we'd hit the
+            // test's outer runtime shutdown after minutes).
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "accept loop must exit after cx-cancel without shutdown flag; took {elapsed:?}"
+            );
+
+            // Sanity: the flag is still unset — proves the cancel took
+            // effect via the cx path, not the flag path.
+            assert!(
+                !shutdown_flag.load(Ordering::SeqCst),
+                "shutdown flag should still be false at test end"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.3 Cx-first: `wait_with_cx` must return
     /// quickly on a pre-cancelled cx, even if the server task
     /// is still running. The caller is responsible for flipping
