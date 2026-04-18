@@ -23900,9 +23900,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 #[cfg(unix)]
                 {
                     let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
+                    // ft-xbnl0.2.3 tick 228: cx-first IPC dispatch.
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
 
                     let response = if clear {
-                        client.clear_pane_priority(pane_id).await
+                        client.clear_pane_priority_with_cx(&cx, pane_id).await
                     } else {
                         let Some(weight) = weight else {
                             eprintln!("Error: missing --weight (or use --clear)");
@@ -23910,7 +23913,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         };
                         let ttl_ms = ttl_secs.saturating_mul(1000);
                         client
-                            .set_pane_priority(pane_id, weight, Some(ttl_ms))
+                            .set_pane_priority_with_cx(&cx, pane_id, weight, Some(ttl_ms))
                             .await
                     };
 
@@ -27578,7 +27581,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     "Forwarding user-var event to watcher"
                 );
 
-                match client.send_user_var(pane, name, value).await {
+                // ft-xbnl0.2.3 tick 228: cx-first IPC dispatch.
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match client.send_user_var_with_cx(&cx, pane, name, value).await {
                     Ok(response) => {
                         if !response.ok {
                             let detail = response
