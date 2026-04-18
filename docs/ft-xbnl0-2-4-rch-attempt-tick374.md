@@ -87,6 +87,56 @@ guards group first into the same target dir so dependency compilation
 is shared. Partial log at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/rch-http.log`
 (56 KB, mid-compile — no test result yet).
 
+### HTTP-client rch run via warm-cache strategy (tick 392)
+
+Tick 375 hit the 20-min wall-time mid-compile when running the
+HTTP-client group with a fresh target dir. Tick 392 retried using
+the SAME target dir as tick 391's successful guards run
+(`target/rch-ft-xbnl0-2-4-tick391-guards`) so the base workspace
+deps would be warm-cached on the remote worker.
+
+**Result**: **29/29 HTTP client tests PASS** on vmi1149989.
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-2-4-tick391-guards \
+    cargo test -p frankenterm-core \
+    --features distributed,asupersync-runtime \
+    --lib distributed_http_client_
+```
+
+```
+running 29 tests
+test result: ok. 29 passed; 0 failed; finished in 0.12s
+[RCH] remote vmi1149989 (589.6s)
+```
+
+Total wall: 589.6s (~10 min). Test exec itself: 0.12s. The remaining
+~10 min was dominated by feature-conditional recompile (the guards
+run uses default features; the HTTP run adds `distributed` +
+`asupersync-runtime`, which pulls in rustls, webpki, H1 HTTP client
+code, etc. that weren't in the guards build).
+
+**Warm-cache strategy confirmed**: reusing an existing target dir
+shaves ~10+ min off a cold HTTP/TLS rch run. Closer recommendation:
+always run the guards group first (fast, ~2 min cold), THEN the
+HTTP / TLS / metrics / web groups can reuse the target dir.
+
+### Level-C evidence coverage rollup
+
+| Group | Remote run | Tick |
+|-------|------------|------|
+| Regression guards (3 tests) | 3/3 PASS on vmi1149989 | 374 + re-confirmed 391 |
+| HTTP client contracts (29 tests) | **29/29 PASS on vmi1149989** | **392** |
+| TLS tests | not yet run remotely | — |
+| Metrics server cx-family | not yet run remotely | — |
+| Web server cx pre-cancel | not yet run remotely | — |
+| runtime_compat primitive | not yet run remotely | — |
+
+**32 of 83 tests** now have remote Level-C evidence. The remaining
+51 are local-only (via the fork-bypass pattern / `check_ft_xbnl0_2_4.sh`).
+The closer can fill the gap by running the remaining group commands
+via rch using the same warm-target-dir strategy.
+
 ### Re-confirmation at HEAD (tick 391, post-ft-l9mxa fix)
 
 Re-ran the guards rch test after the tick-387 ft-l9mxa fix landed
