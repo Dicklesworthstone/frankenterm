@@ -3798,6 +3798,14 @@ KBAhs4snj5QspGFqkazmIw==
             client_cfg.tls.enabled = true;
             client_cfg.tls.cert_path = Some(client_cert.path().display().to_string());
             client_cfg.tls.key_path = Some(client_key.path().display().to_string());
+            // ft-326s9: populate client_ca_path. When `auth_mode.requires_mtls()`
+            // is true, `build_server_config` requires this field (the CA used
+            // to verify incoming client certs). Previously missing → the test
+            // failed with `MissingClientCaPath` because `build_tls_bundle`
+            // internally builds a server config from the supplied config,
+            // regardless of which side the bundle is intended for. Matches
+            // the tick-337 positive-guard contract.
+            client_cfg.tls.client_ca_path = Some(ca_cert.path().display().to_string());
 
             let server_bundle =
                 build_tls_bundle(&server_cfg, Some(ca_cert.path())).expect("server bundle");
