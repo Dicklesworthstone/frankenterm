@@ -631,6 +631,56 @@ impl WorkflowRunner {
         }
 
         while current_step < step_count {
+            // Tick 181: per-step cancellation seam. On cx-cancel
+            // we do the same cleanup sequence as a plan-validation
+            // error (fail_execution + mark_trigger_event_handled +
+            // lock release + terminal-action audit) so the pane
+            // lock and trigger state don't leak under a cancelled
+            // parent. No-op when cx is None (legacy caller) or
+            // healthy.
+            #[cfg(feature = "asupersync-runtime")]
+            if let Some(cx) = cx {
+                if let Err(err) = cx.checkpoint() {
+                    let reason =
+                        format!("run_workflow cancelled at step {current_step}: {err}");
+                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to fail execution on cx cancel"
+                        );
+                    }
+                    if let Err(e) = self
+                        .mark_trigger_event_handled(execution_id, "error")
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Failed to mark trigger event handled on cx cancel"
+                        );
+                    }
+                    self.lock_manager.release(pane_id, execution_id);
+                    record_workflow_terminal_action(
+                        &self.storage,
+                        &workflow_name,
+                        execution_id,
+                        pane_id,
+                        "workflow_error",
+                        "error",
+                        Some(&reason),
+                        Some(current_step),
+                        None,
+                        start_action_id,
+                    )
+                    .await;
+                    return WorkflowExecutionResult::Error {
+                        execution_id: Some(execution_id.to_string()),
+                        error: reason,
+                    };
+                }
+            }
+
             let step_plan = ctx.get_step_plan(current_step).cloned();
             let mut idempotency_skip: Option<(i64, Option<String>)> = None;
             let mut idempotency_abort: Option<String> = None;
