@@ -48,6 +48,7 @@ export CARGO_TARGET_DIR
 export CC CXX
 
 FAIL=0
+TOTAL_PASSED=0
 
 log_header() {
     echo
@@ -60,12 +61,24 @@ run_test() {
     local label="$1"
     shift
     log_header "${label}"
-    if cargo test "$@"; then
-        echo "[PASS] ${label}"
+    # Capture stdout + stderr to a tempfile so we can tally the "N passed"
+    # count while still showing the output to the operator.
+    local tmp
+    tmp="$(mktemp -t ft-xbnl0-2-4-check.XXXXXX)"
+    if cargo test "$@" 2>&1 | tee "${tmp}"; then
+        # Sum all "N passed" counts from all `test result: ok.` lines in
+        # this run (per-binary splits may produce multiple result lines
+        # under --all-targets; normally there's just one for our filters).
+        local passed
+        passed="$(grep -oE 'test result: ok\. [0-9]+ passed' "${tmp}" \
+            | awk '{ s += $4 } END { print (s ? s : 0) }')"
+        TOTAL_PASSED=$(( TOTAL_PASSED + passed ))
+        echo "[PASS] ${label} — ${passed} tests"
     else
         echo "[FAIL] ${label}"
         FAIL=1
     fi
+    rm -f "${tmp}"
 }
 
 run_test "Run 1/5: HTTP client contract tests" \
@@ -101,11 +114,11 @@ run_test "Run 5/5: Web server cx pre-cancel" \
 echo
 echo "=============================================================="
 if [[ ${FAIL} -eq 0 ]]; then
-    echo "  ft-xbnl0.2.4 — all 5 runs PASS"
+    echo "  ft-xbnl0.2.4 — all 5 runs PASS (${TOTAL_PASSED} tests)"
     echo "=============================================================="
     exit 0
 else
-    echo "  ft-xbnl0.2.4 — ONE OR MORE RUNS FAILED"
+    echo "  ft-xbnl0.2.4 — ONE OR MORE RUNS FAILED (${TOTAL_PASSED} tests passed before failure)"
     echo "=============================================================="
     exit 1
 fi
