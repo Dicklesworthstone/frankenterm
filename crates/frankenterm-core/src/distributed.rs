@@ -4564,6 +4564,63 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 408: `race_with_cx_cancel` helper isolated unit test.
+    ///
+    /// Directly exercises the `race_with_cx_cancel` helper added by
+    /// tick 387's ft-l9mxa fix, isolated from the full HTTP client
+    /// path. Feeds it a future that never completes (`pending::<...>`)
+    /// and cancels cx externally 50 ms later; the helper must return
+    /// `Err(ClientError::Cancelled)` within one 50 ms poll cycle.
+    ///
+    /// Complements the end-to-end tests (ticks 380 + 389) which
+    /// exercise the helper through the HTTP client path. This
+    /// isolated test pins the helper's core race mechanics directly —
+    /// a regression in the race logic would fire here without
+    /// needing a full HTTP server setup.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn race_with_cx_cancel_surfaces_cancel_on_pending_inner() {
+        run_async_test(async {
+            let cx = asupersync::cx::Cx::for_testing();
+            let cx_for_cancel = cx.clone();
+
+            crate::runtime_compat::task::spawn(async move {
+                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+                cx_for_cancel.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("isolated race test"),
+                );
+            });
+
+            let never_resolves = async {
+                std::future::pending::<
+                    Result<
+                        asupersync::http::h1::types::Response,
+                        asupersync::http::h1::http_client::ClientError,
+                    >,
+                >()
+                .await
+            };
+
+            let started = std::time::Instant::now();
+            let result = race_with_cx_cancel(&cx, never_resolves).await;
+            let elapsed = started.elapsed();
+
+            match result {
+                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
+                other => panic!(
+                    "race_with_cx_cancel must return Err(Cancelled) when inner never completes \
+                     and cx is cancelled; got: {other:?}"
+                ),
+            }
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "race should fire within ~1s (one 50ms poll cycle post-cancel); took {elapsed:?}"
+            );
+            eprintln!("tick 408: race_with_cx_cancel elapsed={elapsed:?}");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 404: HTTP/1.0 response decodes correctly.
     ///
     /// Pins that `DistributedHttpClient::get` handles a response whose
