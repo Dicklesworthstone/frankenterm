@@ -1173,6 +1173,126 @@ pub(super) async fn record_workflow_terminal_action(
     }
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_terminal_action`].
+///
+/// Tick 185: routes both inner writes (record_workflow_action +
+/// storage.upsert_action_undo_redacted) through their cx-first
+/// siblings. Preserves the "fire-and-forget on error" contract
+/// that matches the legacy helper — every audit/undo failure
+/// is warn-and-continue, not fail-fast.
+#[cfg(feature = "asupersync-runtime")]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_workflow_terminal_action_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    action_kind: &str,
+    result: &str,
+    reason: Option<&str>,
+    step_index: Option<usize>,
+    steps_executed: Option<usize>,
+    start_action_id: Option<i64>,
+) {
+    let summary = serde_json::json!({
+        "workflow_name": workflow_name,
+        "execution_id": execution_id,
+        "reason": reason,
+        "step_index": step_index,
+        "steps_executed": steps_executed,
+        "parent_action_id": start_action_id,
+    });
+    let summary = serde_json::to_string(&summary)
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"),
+        )
+        .ok();
+    let _ = record_workflow_action_with_cx(
+        cx,
+        storage,
+        action_kind,
+        execution_id,
+        pane_id,
+        workflow_name,
+        summary,
+        result,
+        reason.map(str::to_string),
+    )
+    .await;
+
+    if let Some(start_action_id) = start_action_id {
+        let undo = crate::storage::ActionUndoRecord {
+            audit_action_id: start_action_id,
+            undoable: false,
+            undo_strategy: "workflow_abort".to_string(),
+            undo_hint: Some("workflow no longer running".to_string()),
+            undo_payload: None,
+            undone_at: None,
+            undone_by: None,
+        };
+        if let Err(e) = storage.upsert_action_undo_redacted_with_cx(cx, undo).await {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to update workflow undo metadata (cx path)"
+            );
+        }
+    }
+}
+
+/// Tick 185: dispatcher for record_workflow_terminal_action call sites.
+/// Takes `Option<&Cx>` — when Some routes through the cx-first variant,
+/// otherwise falls through to the legacy helper.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_workflow_terminal_action_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    action_kind: &str,
+    result: &str,
+    reason: Option<&str>,
+    step_index: Option<usize>,
+    steps_executed: Option<usize>,
+    start_action_id: Option<i64>,
+) {
+    #[cfg(feature = "asupersync-runtime")]
+    if let Some(cx) = cx {
+        record_workflow_terminal_action_with_cx(
+            cx,
+            storage,
+            workflow_name,
+            execution_id,
+            pane_id,
+            action_kind,
+            result,
+            reason,
+            step_index,
+            steps_executed,
+            start_action_id,
+        )
+        .await;
+        return;
+    }
+    #[cfg(not(feature = "asupersync-runtime"))]
+    let _ = cx;
+    record_workflow_terminal_action(
+        storage,
+        workflow_name,
+        execution_id,
+        pane_id,
+        action_kind,
+        result,
+        reason,
+        step_index,
+        steps_executed,
+        start_action_id,
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

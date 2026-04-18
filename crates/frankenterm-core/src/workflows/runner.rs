@@ -600,7 +600,8 @@ impl WorkflowRunner {
                     );
                 }
                 self.lock_manager.release(pane_id, execution_id);
-                record_workflow_terminal_action(
+                record_workflow_terminal_action_maybe_cx(
+                    cx,
                     &self.storage,
                     &workflow_name,
                     execution_id,
@@ -661,7 +662,8 @@ impl WorkflowRunner {
                         );
                     }
                     self.lock_manager.release(pane_id, execution_id);
-                    record_workflow_terminal_action(
+                    record_workflow_terminal_action_with_cx(
+                        cx,
                         &self.storage,
                         &workflow_name,
                         execution_id,
@@ -893,7 +895,8 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -945,7 +948,8 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -998,7 +1002,8 @@ impl WorkflowRunner {
                     // Release lock
                     self.lock_manager.release(pane_id, execution_id);
 
-                    record_workflow_terminal_action(
+                    record_workflow_terminal_action_maybe_cx(
+                        cx,
                         &self.storage,
                         &workflow_name,
                         execution_id,
@@ -1053,7 +1058,8 @@ impl WorkflowRunner {
                         workflow.cleanup(&mut ctx).await;
                         self.lock_manager.release(pane_id, execution_id);
 
-                        record_workflow_terminal_action(
+                        record_workflow_terminal_action_maybe_cx(
+                            cx,
                             &self.storage,
                             &workflow_name,
                             execution_id,
@@ -1106,7 +1112,8 @@ impl WorkflowRunner {
                     workflow.cleanup(&mut ctx).await;
                     self.lock_manager.release(pane_id, execution_id);
 
-                    record_workflow_terminal_action(
+                    record_workflow_terminal_action_maybe_cx(
+                        cx,
                         &self.storage,
                         &workflow_name,
                         execution_id,
@@ -1146,7 +1153,8 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -1218,7 +1226,8 @@ impl WorkflowRunner {
                         )) = e
                         {
                             self.lock_manager.release(pane_id, execution_id);
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -1352,7 +1361,8 @@ impl WorkflowRunner {
                                 ) = e
                                 {
                                     self.lock_manager.release(pane_id, execution_id);
-                                    record_workflow_terminal_action(
+                                    record_workflow_terminal_action_maybe_cx(
+                                        cx,
                                         &self.storage,
                                         &workflow_name,
                                         execution_id,
@@ -1416,7 +1426,8 @@ impl WorkflowRunner {
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
 
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -1489,7 +1500,8 @@ impl WorkflowRunner {
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
 
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -1546,7 +1558,8 @@ impl WorkflowRunner {
                             workflow.cleanup(&mut ctx).await;
                             self.lock_manager.release(pane_id, execution_id);
 
-                            record_workflow_terminal_action(
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
                                 &self.storage,
                                 &workflow_name,
                                 execution_id,
@@ -1601,7 +1614,8 @@ impl WorkflowRunner {
 
         self.lock_manager.release(pane_id, execution_id);
 
-        record_workflow_terminal_action(
+        record_workflow_terminal_action_maybe_cx(
+            cx,
             &self.storage,
             &workflow_name,
             execution_id,
