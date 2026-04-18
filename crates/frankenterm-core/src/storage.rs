@@ -8467,6 +8467,8 @@ impl StorageHandle {
     /// Pre-flight checkpoint gates workflow state writes
     /// (18+ call sites) — second most-called business mutation
     /// after upsert_pane.
+    ///
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_workflow_with_cx(
         &self,
@@ -8475,7 +8477,18 @@ impl StorageHandle {
     ) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("upsert_workflow cancelled: {err}")))?;
-        self.upsert_workflow(workflow).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertWorkflow {
+                    workflow,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a workflow action plan (canonical JSON + hash)
@@ -8498,6 +8511,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_plan`].
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_action_plan_with_cx(
         &self,
@@ -8508,7 +8522,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("upsert_action_plan cancelled: {err}"))
         })?;
-        self.upsert_action_plan(workflow_id, plan).await
+        let record = action_plan_record_from_plan(workflow_id, plan)?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertActionPlan {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a prepared plan preview for later commit
