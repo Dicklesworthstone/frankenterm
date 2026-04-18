@@ -2118,7 +2118,13 @@ impl IpcClient {
         })?;
 
         let mut lines = compat_unix::lines(compat_unix::buffered(reader));
-        let line = compat_unix::next_line(&mut lines)
+        // Tick 201 (ft-xbnl0.2.3): route the response read through
+        // next_line_with_cx(cx, ...) so the pre-read checkpoint
+        // observes the caller's explicit cx. Previously used ambient
+        // next_line — if the server stalled mid-response, the client
+        // hung on the read until the stream closed or the server
+        // eventually wrote, even when an outer cx-cancel had fired.
+        let line = compat_unix::next_line_with_cx(cx, &mut lines)
             .await
             .map_err(|e| UserVarError::IpcSendFailed {
                 message: format!("failed to read response: {e}"),
