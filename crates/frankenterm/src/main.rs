@@ -7604,7 +7604,12 @@ async fn fetch_pane_state_from_ipc(
     pane_id: u64,
 ) -> Result<Option<IpcPaneState>, String> {
     let client = frankenterm_core::ipc::IpcClient::new(socket_path);
-    match client.pane_state(pane_id).await {
+    // ft-xbnl0.2.3 tick 227: route through pane_state_with_cx so the
+    // IPC round-trip observes caller cancellation at the pre-read
+    // checkpoint (tick 201) and the mpsc-reserve/response boundaries.
+    let cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    match client.pane_state_with_cx(&cx, pane_id).await {
         Ok(response) => {
             if !response.ok {
                 let detail = response
@@ -10637,7 +10642,11 @@ async fn load_runtime_health_snapshot(
     #[cfg(unix)]
     {
         let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
-        if let Ok(response) = client.status().await {
+        // ft-xbnl0.2.3 tick 227: status_with_cx routes through
+        // send_request_with_id_with_cx — full cx-first IPC path.
+        let cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        if let Ok(response) = client.status_with_cx(&cx).await {
             if response.ok {
                 if let Some(data) = response.data {
                     if let Some(health) = data.get("health") {
@@ -18503,7 +18512,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                                 RobotCassCommands::Status { timeout_secs } => {
                                     let client = CassClient::new().with_timeout_secs(timeout_secs);
-                                    match client.status().await {
+                                    // ft-xbnl0.2.3 tick 227: cass.status_with_cx routes
+                                    // through run_with_cx which binds the subprocess
+                                    // timeout to the caller's cx via timeout_with_cx.
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    match client.status_with_cx(&cx).await {
                                         Ok(result) => {
                                             let response =
                                                 RobotResponse::success(result, elapsed_ms(start));
@@ -22021,7 +22035,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 let client =
                                     frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
-                                match client.status().await {
+                                // ft-xbnl0.2.3 tick 227: cx-first IPC status.
+                                let cx = frankenterm_core::cx::Cx::current()
+                                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                                match client.status_with_cx(&cx).await {
                                     Ok(response) if response.ok => {
                                         payload["watcher_running"] = serde_json::json!(true);
                                         if let Some(ref data) = response.data {
@@ -24934,7 +24951,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 #[cfg(unix)]
                 {
                     let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
-                    match client.status().await {
+                    // ft-xbnl0.2.3 tick 227: cx-first IPC status.
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match client.status_with_cx(&cx).await {
                         Ok(response) => {
                             if response.ok {
                                 Ok(response.data)
