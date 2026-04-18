@@ -1141,11 +1141,9 @@ pub mod task {
 
             std::future::poll_fn(|cx| {
                 if let Err(err) = caller_cx.checkpoint() {
-                    return std::task::Poll::Ready(Some(Err(
-                        JoinError::new(format!(
-                            "aborted: join_next cancelled mid-poll: {err}"
-                        )),
-                    )));
+                    return std::task::Poll::Ready(Some(Err(JoinError::new(format!(
+                        "aborted: join_next cancelled mid-poll: {err}"
+                    )))));
                 }
                 for i in 0..self.handles.len() {
                     let mut pinned = std::pin::Pin::new(&mut self.handles[i]);
@@ -1598,10 +1596,7 @@ pub mod process {
         /// watcher sets `watcher_done` on normal-path exit so it
         /// never leaks past the body.
         #[cfg(feature = "asupersync-runtime")]
-        pub async fn output_with_cx(
-            &mut self,
-            cx: &crate::cx::Cx,
-        ) -> std::io::Result<Output> {
+        pub async fn output_with_cx(&mut self, cx: &crate::cx::Cx) -> std::io::Result<Output> {
             cx.checkpoint().map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
@@ -5307,10 +5302,58 @@ mod tests {
                         "error should mention join_next cancellation: {msg}"
                     );
                 }
-                other => panic!(
-                    "expected Some(Err(cancelled)) on pre-cancel, got {other:?}"
-                ),
+                other => panic!("expected Some(Err(cancelled)) on pre-cancel, got {other:?}"),
             }
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 382: `sleep_with_cx` observes cx budget deadline.
+    ///
+    /// The tick-331 doc comment on `sleep_with_cx` states the primitive
+    /// observes the cx **budget deadline** (via
+    /// `asupersync::time::budget_sleep`, which caps effective sleep by
+    /// remaining budget) even though it does NOT observe direct
+    /// `is_cancel_requested()`. This test pins that claim.
+    ///
+    /// Setup: create a cx whose budget has already elapsed
+    /// (`Time::ZERO` deadline), then call `sleep_with_cx(cx,
+    /// Duration::from_secs(30))`. If budget observation works, the
+    /// sleep returns fast (Err) instead of blocking for 30 seconds.
+    ///
+    /// Observable contract:
+    /// 1. Return type is Err (budget exceeded).
+    /// 2. Elapsed << 30s (well under the requested duration).
+    ///
+    /// This complements the tick-378 `distributed_http_client_...`
+    /// snapshot: that pins budget-aware behavior at the HTTP client
+    /// layer (transitively via asupersync's HTTP client); this pins
+    /// it at the foundational runtime_compat primitive level.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn sleep_with_cx_observes_budget_deadline() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Budget with deadline already elapsed.
+            let budget = asupersync::types::Budget::new()
+                .with_deadline(asupersync::types::Time::ZERO);
+            let cx = crate::cx::Cx::for_testing_with_budget(budget);
+
+            let started = std::time::Instant::now();
+            let result = sleep_with_cx(&cx, Duration::from_secs(30)).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "expired-budget cx must cause sleep_with_cx to return Err, got: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "expired-budget cx must cause sleep_with_cx to return promptly, \
+                 not block for the requested duration; took {elapsed:?}"
+            );
         });
     }
 
