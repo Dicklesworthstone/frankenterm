@@ -602,11 +602,20 @@ impl MuxWatchdog {
         let now = epoch_ms();
         let start = std::time::Instant::now();
 
+        // Tick 206 (ft-xbnl0.2.3): route the ping through
+        // list_panes_with_cx(cx) so the inner WeztermInterface call
+        // observes the caller's cx. Previously wrapped ambient
+        // list_panes() in timeout_with_cx — the outer timer bound
+        // the caller's cx but the inner future ran with ambient cx.
+        // Concrete impls like WeztermClient::list_panes_with_cx
+        // route through MuxPool::list_panes_with_cx for real
+        // cx threading; impls without an override see an identical
+        // trait-default delegation to ambient list_panes().
         let ping_ok = matches!(
             crate::runtime_compat::timeout_with_cx(
                 cx,
                 self.config.ping_timeout,
-                self.wezterm.list_panes()
+                self.wezterm.list_panes_with_cx(cx)
             )
             .await,
             Ok(Ok(_))
