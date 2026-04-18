@@ -19296,9 +19296,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             .as_millis();
                                         let execution_id = format!("robot-{name}-{now_ms}");
 
-                                        // Run the workflow
+                                        // Run the workflow (ft-xbnl0.2.3 tick 226:
+                                        // cross-crate cx-first migration matching the
+                                        // pattern from ticks 224/225).
+                                        let cx = frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(
+                                                frankenterm_core::cx::for_request,
+                                            );
                                         let result = runner
-                                            .run_workflow(pane_id, wf, &execution_id, 0)
+                                            .run_workflow_with_cx(
+                                                &cx,
+                                                pane_id,
+                                                wf,
+                                                &execution_id,
+                                                0,
+                                            )
                                             .await;
 
                                         let (
@@ -19916,9 +19928,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         runner_config,
                                     );
 
-                                    // Execute the abort
+                                    // Execute the abort (ft-xbnl0.2.3 tick 226:
+                                    // cross-crate cx-first migration).
+                                    let cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
                                     match runner
-                                        .abort_execution(&execution_id, reason.as_deref(), force)
+                                        .abort_execution_with_cx(
+                                            &cx,
+                                            &execution_id,
+                                            reason.as_deref(),
+                                            force,
+                                        )
                                         .await
                                     {
                                         Ok(result) => {
@@ -24717,9 +24737,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .as_millis();
                             let execution_id = format!("human-{name}-{now_ms}");
 
-                            // Run the workflow
+                            // Run the workflow (ft-xbnl0.2.3 tick 226: cx-first)
                             let run_start = std::time::Instant::now();
-                            let result = runner.run_workflow(pane, wf, &execution_id, 0).await;
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            let result = runner
+                                .run_workflow_with_cx(&cx, pane, wf, &execution_id, 0)
+                                .await;
                             let elapsed = run_start.elapsed();
 
                             match result {
@@ -27288,8 +27312,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!();
 
                     let run_start = std::time::Instant::now();
+                    // ft-xbnl0.2.3 tick 226: cross-crate cx-first migration.
+                    let cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
                     let result = runner
-                        .run_workflow(pane_id, workflow, &execution_id, 0)
+                        .run_workflow_with_cx(&cx, pane_id, workflow, &execution_id, 0)
                         .await;
                     let elapsed = run_start.elapsed();
 
