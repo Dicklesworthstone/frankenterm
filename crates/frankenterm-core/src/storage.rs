@@ -6051,6 +6051,10 @@ impl StorageHandle {
     /// The ingest pipeline lives downstream of this method, so
     /// threading cx here lets a cx-cancelled observation loop
     /// bail before enqueuing the write.
+    ///
+    /// Tick 175: inlined to route the mpsc send through
+    /// `send_with_cx` — segment writes are the highest-volume
+    /// per-pane ingest path.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn append_segment_with_cx(
         &self,
@@ -6061,7 +6065,20 @@ impl StorageHandle {
     ) -> Result<Segment> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
-        self.append_segment(pane_id, content, content_hash).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::AppendSegment {
+                    pane_id,
+                    content: content.to_string(),
+                    content_hash,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a gap event
@@ -6087,6 +6104,8 @@ impl StorageHandle {
     /// Pre-flight checkpoint gates gap recording. Called from
     /// ingest detector paths where caller cx propagation is
     /// common.
+    ///
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_gap_with_cx(
         &self,
@@ -6096,7 +6115,19 @@ impl StorageHandle {
     ) -> Result<Option<Gap>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("record_gap cancelled: {err}")))?;
-        self.record_gap(pane_id, reason).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordGap {
+                    pane_id,
+                    reason: reason.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record an event (pattern detection)
@@ -6794,6 +6825,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_maintenance`].
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_maintenance_with_cx(
         &self,
@@ -6803,7 +6835,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("record_maintenance cancelled: {err}"))
         })?;
-        self.record_maintenance(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordMaintenance {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a secret scan report (checkpoint + payload).
@@ -7313,6 +7356,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metric`].
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_usage_metric_with_cx(
         &self,
@@ -7322,7 +7366,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("record_usage_metric cancelled: {err}"))
         })?;
-        self.record_usage_metric(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordUsageMetric {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record multiple usage metrics for analytics tracking in a single transaction.
@@ -8228,6 +8283,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
+    /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_approval_token_with_cx(
         &self,
@@ -8241,14 +8297,22 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("consume_approval_token cancelled: {err}"))
         })?;
-        self.consume_approval_token(
-            code_hash,
-            workspace_id,
-            action_kind,
-            pane_id,
-            action_fingerprint,
-        )
-        .await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ConsumeApprovalToken {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    action_kind: action_kind.to_string(),
+                    pane_id,
+                    action_fingerprint: action_fingerprint.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get an approval token by code hash (without consuming)
