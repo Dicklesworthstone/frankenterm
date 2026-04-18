@@ -3212,6 +3212,24 @@ pub trait PaneTextSource {
 
     /// Fetch the pane text. Implementations may ignore tail_lines and return full text.
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_>;
+
+    /// Cx-first sibling of [`get_text`] (ft-xbnl0.2.3 tick 264).
+    ///
+    /// Default impl delegates to `get_text` (no cancel propagation). Impls
+    /// backed by a cx-aware backend (`WeztermClient`, `WeztermHandleSource`)
+    /// should override to route through their `_with_cx` siblings so a
+    /// caller cx-cancel cleanly aborts the underlying RPC.
+    fn get_text_with_cx<'a>(
+        &'a self,
+        _cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move { self.get_text(pane_id, escapes).await })
+    }
 }
 
 impl PaneTextSource for WeztermClient {
@@ -3220,6 +3238,18 @@ impl PaneTextSource for WeztermClient {
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
         Box::pin(async move { self.get_text(pane_id, escapes).await })
     }
+
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move { self.get_text_with_cx(cx, pane_id, escapes).await })
+    }
 }
 
 impl PaneTextSource for WeztermHandleSource {
@@ -3227,6 +3257,18 @@ impl PaneTextSource for WeztermHandleSource {
 
     fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
         self.handle.get_text(pane_id, escapes)
+    }
+
+    fn get_text_with_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
+    where
+        Self: 'a + Sync,
+    {
+        Box::pin(async move { self.handle.get_text_with_cx(cx, pane_id, escapes).await })
     }
 }
 
