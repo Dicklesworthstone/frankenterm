@@ -10884,7 +10884,10 @@ async fn load_distributed_remote_panes(
 ) -> Result<Vec<frankenterm_core::storage::PaneRecord>, frankenterm_core::Error> {
     let db_path = db_path.to_string_lossy();
     let storage = frankenterm_core::storage::StorageHandle::new(&db_path).await?;
-    let panes = storage.get_panes().await?;
+    // ft-xbnl0.2.3 tick 248: cx-first storage read.
+    let storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let panes = storage.get_panes_with_cx(&storage_cx).await?;
     if let Err(err) = storage.shutdown().await {
         tracing::warn!(error = %err, "Failed to shutdown storage cleanly after distributed pane query");
     }
