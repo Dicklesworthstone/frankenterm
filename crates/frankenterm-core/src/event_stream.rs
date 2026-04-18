@@ -607,12 +607,19 @@ impl EventWaiter {
         let start = std::time::Instant::now();
         let mut subscriber = bus.subscribe();
 
+        // Tick 191 (ft-xbnl0.2.3): each inner recv now routes through
+        // `subscriber.recv_cx(cx)` so individual receives are themselves
+        // cx-aware (via `broadcast_recv_with_cx`). The outer
+        // `timeout_with_cx` still bounds the overall wait; this adds
+        // belt-and-suspenders per-recv cancel observation so a cancel
+        // fired under LabRuntime virtual time lands at the recv boundary
+        // rather than waiting on drop-cancel of the outer future.
         let recv_loop = async move {
             match condition {
                 WaitCondition::AllOf { conditions } => {
                     let mut tracker = AllOfTracker::new(conditions);
                     loop {
-                        match subscriber.recv().await {
+                        match subscriber.recv_cx(cx).await {
                             Ok(event) => {
                                 if filter.matches_event(&event) && tracker.check(&event) {
                                     return Some(event);
@@ -624,7 +631,7 @@ impl EventWaiter {
                     }
                 }
                 condition => loop {
-                    match subscriber.recv().await {
+                    match subscriber.recv_cx(cx).await {
                         Ok(event) => {
                             if filter.matches_event(&event) && condition.matches(&event) {
                                 return Some(event);
