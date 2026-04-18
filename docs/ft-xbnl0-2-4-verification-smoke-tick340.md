@@ -1,4 +1,4 @@
-# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 357)
+# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 366)
 
 Date: 2026-04-18
 Authored by: RusticMaple
@@ -7,11 +7,12 @@ Tick 341: added service-boundary runs (36 tests)
 Tick 346: HTTP extended to 19 after ticks 342-345 (40 tests total)
 Tick 353: HTTP extended to 21 after tick 349→351→352 ft-kfkyi fix + companion (42 tests total)
 Tick 357: TLS filter broadened from `build_tls_` to `tls_` — catches 1 previously-excluded parser test + ~30 pre-existing TLS tests for stronger smoke (73 tests total)
+Tick 366: HTTP extended to 23 after ticks 364 (Send+Sync compile-time) + 365 (Arc-sharing runtime) (75 tests total)
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
 contract tests this session touches. Captured as an artifact so the bead
-owner can reference a concrete "73 of 73 passing at this commit" checkpoint
+owner can reference a concrete "75 of 75 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
@@ -96,12 +97,12 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Group | Tests | Result |
 |-------|-------|--------|
-| HTTP client contracts (Run 1) | 21 | 21/21 ok |
+| HTTP client contracts (Run 1) | 23 | 23/23 ok |
 | TLS tests (Run 2) | 45 | 45/45 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
-| **Subtotal** | **73** | **73/73 ok** |
+| **Subtotal** | **75** | **75/75 ok** |
 
 Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
 tick 357).
@@ -110,6 +111,7 @@ Run 1 growth over the session:
 - tick 340: 15 tests (HTTP baseline)
 - tick 346: +4 scheme-dispatch / invalid-URL / IPv6 / premature-close
 - tick 353: +2 from the ft-kfkyi 3xx no-follow fix + companion
+- tick 366: +2 Send+Sync compile-time (tick 364) + Arc-sharing runtime (tick 365)
 
 Run 2 growth:
 - tick 340-346: 14 tests via `build_tls_` filter (this session's new
@@ -158,9 +160,9 @@ Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 73 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
-- Compile time after the initial cold build: 0.00s-1.18s per filtered run. This is cheap to re-run per-commit in CI.
-- The 21 + 45 + 3 + 3 + 1 = 73 count covers both this-session deliverables (21 HTTP + 14 new TLS + 1 parser + 2 service-boundary + 3 guards = 41) AND 32 pre-existing TLS tests that the broadened tick-357 filter now smoke-verifies as a side benefit. Running more passing tests is a stronger signal.
+- All 75 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- Compile time after the initial cold build: 0.00s-1.19s per filtered run. This is cheap to re-run per-commit in CI.
+- The 23 + 45 + 3 + 3 + 1 = 75 count covers both this-session deliverables (23 HTTP + 14 new TLS + 1 parser + 2 service-boundary + 3 guards = 43) AND 32 pre-existing TLS tests that the broadened tick-357 filter now smoke-verifies as a side benefit. Running more passing tests is a stronger signal.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)
