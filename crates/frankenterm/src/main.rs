@@ -7348,8 +7348,11 @@ async fn resolve_inline_send_approval(
             ),
         };
 
+        // ft-xbnl0.2.3 tick 274: cx-first approval consume.
+        let approval_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
         return match store
-            .consume_with_context(code, input, Some(approval_context))
+            .consume_with_context_with_cx(&approval_cx, code, input, Some(approval_context))
             .await
         {
             Ok(Some(_)) => Ok(frankenterm_core::policy::PolicyDecision::allow_with_rule(
@@ -7363,8 +7366,11 @@ async fn resolve_inline_send_approval(
         };
     }
 
+    // ft-xbnl0.2.3 tick 274: cx-first approval issue.
+    let issue_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     let mut approval = store
-        .issue(input, Some(summary.to_string()))
+        .issue_with_cx(&issue_cx, input, Some(summary.to_string()))
         .await
         .map_err(|e| format!("Failed to issue approval token: {e}"))?;
     approval.command = build_inline_approval_retry_command(command_name, &approval.allow_once_code);
