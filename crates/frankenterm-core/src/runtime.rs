@@ -3596,8 +3596,13 @@ async fn collect_pane_tiered_scrollback_summaries(
 ) -> PaneTieredScrollbackFetch {
     let mut fetch = PaneTieredScrollbackFetch::default();
 
+    // ft-xbnl0.2.3 tick 266: cx-first tiered scrollback summary collection.
+    let summary_cx = crate::cx::Cx::current()
+        .unwrap_or_else(crate::cx::for_request);
     for &pane_id in pane_ids {
-        let result = wezterm_handle.pane_tiered_scrollback_summary(pane_id).await;
+        let result = wezterm_handle
+            .pane_tiered_scrollback_summary_with_cx(&summary_cx, pane_id)
+            .await;
         record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result);
     }
 
