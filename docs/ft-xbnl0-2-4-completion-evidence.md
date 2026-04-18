@@ -152,10 +152,31 @@ pre-flight. Ticks 328 (`timeout_with_cx`) + 331 (`sleep_with_cx`).
 
 ---
 
-## 3. Local Verification Recipe (fork-bypass pattern)
+## 3. Local Verification Recipe
 
-RCH workers are intermittently unavailable with `force_remote=true`.
-Local verification uses a Python fork-bypass wrapper that:
+### 3a. Consolidated one-shot (recommended for local smoke)
+
+Since tick 347 the repo contains `scripts/check_ft_xbnl0_2_4.sh` which
+runs all 5 filtered cargo test groups in sequence. Use this when you
+want a single-exit-code yes/no for the whole verification surface:
+
+```bash
+./scripts/check_ft_xbnl0_2_4.sh
+```
+
+The script handles `CC`/`CXX`/`CARGO_TARGET_DIR` defaults internally
+(see tick 355 / 370). On a warm target dir, finishes in a few seconds;
+cold build ~90s. Final output line is the aggregate:
+
+```
+  ft-xbnl0.2.4 — all 5 runs PASS (77 tests)
+```
+
+### 3b. Fork-bypass wrapper (when you need to pin specific flags)
+
+For per-test debugging or when you need a custom filter / feature
+combination, the Python fork-bypass pattern is the reliable local
+escape hatch (used throughout this session's tick-by-tick authoring):
 
 1. Calls `os.fork()` + `os.setsid()` so the child runs in a new session
    that bypasses the rch PreToolUse hook.
