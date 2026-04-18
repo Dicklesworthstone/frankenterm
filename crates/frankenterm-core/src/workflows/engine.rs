@@ -171,6 +171,10 @@ impl WorkflowEngine {
     }
 
     /// Cx-first variant of [`start_with_id`] (ft-xbnl0.2.2).
+    ///
+    /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
+    /// `upsert_workflow_with_cx` storage call rather than delegating to the
+    /// ambient-cx `start_with_id`. Legacy `start_with_id` preserved.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn start_with_id_cx(
         &self,
@@ -184,19 +188,37 @@ impl WorkflowEngine {
     ) -> crate::Result<WorkflowExecution> {
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        let result = self
-            .start_with_id(
-                storage,
-                execution_id,
-                workflow_name,
-                pane_id,
-                trigger_event_id,
-                context,
-            )
-            .await;
+
+        let now = now_ms();
+        let record = crate::storage::WorkflowRecord {
+            id: execution_id.clone(),
+            workflow_name: workflow_name.to_string(),
+            pane_id,
+            trigger_event_id,
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context,
+            result: None,
+            error: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+
+        storage.upsert_workflow_with_cx(cx, record).await?;
+
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        result
+        Ok(WorkflowExecution {
+            id: execution_id,
+            workflow_name: workflow_name.to_string(),
+            pane_id,
+            current_step: 0,
+            status: ExecutionStatus::Running,
+            started_at: now,
+            updated_at: now,
+        })
     }
 
     /// Cx-first variant of [`resume`] (ft-xbnl0.2.2).
@@ -310,6 +332,11 @@ impl WorkflowEngine {
     }
 
     /// Cx-first variant of [`update_status`] (ft-xbnl0.2.2).
+    ///
+    /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
+    /// `get_workflow_with_cx` + `upsert_workflow_with_cx` storage calls
+    /// rather than delegating to the ambient-cx `update_status`. Legacy
+    /// `update_status` preserved.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn update_status_cx(
         &self,
@@ -323,16 +350,42 @@ impl WorkflowEngine {
     ) -> crate::Result<()> {
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        let result = self
-            .update_status(
-                storage,
-                execution_id,
-                status,
-                current_step,
-                wait_condition,
-                error,
-            )
-            .await;
+
+        let now = now_ms();
+        let status_str = match status {
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Waiting => "waiting",
+            ExecutionStatus::Completed => "completed",
+            ExecutionStatus::Aborted => "aborted",
+        };
+
+        let Some(existing) = storage.get_workflow_with_cx(cx, execution_id).await? else {
+            return Err(crate::error::WorkflowError::NotFound(execution_id.to_string()).into());
+        };
+
+        let record = crate::storage::WorkflowRecord {
+            id: existing.id,
+            workflow_name: existing.workflow_name,
+            pane_id: existing.pane_id,
+            trigger_event_id: existing.trigger_event_id,
+            current_step,
+            status: status_str.to_string(),
+            wait_condition: wait_condition.map(|wc| serde_json::to_value(wc).unwrap_or_default()),
+            context: existing.context,
+            result: existing.result,
+            error: error.map(String::from),
+            started_at: existing.started_at,
+            updated_at: now,
+            completed_at: if status == ExecutionStatus::Completed
+                || status == ExecutionStatus::Aborted
+            {
+                Some(now)
+            } else {
+                None
+            },
+        };
+
+        let result = storage.upsert_workflow_with_cx(cx, record).await;
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
         result
@@ -387,6 +440,10 @@ impl WorkflowEngine {
     }
 
     /// Cx-first variant of [`log_step`] (ft-xbnl0.2.2).
+    ///
+    /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
+    /// `insert_step_log_with_cx` storage call rather than delegating to the
+    /// ambient-cx `log_step`. Legacy `log_step` preserved.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn log_step_cx(
         &self,
@@ -400,14 +457,41 @@ impl WorkflowEngine {
     ) -> crate::Result<()> {
         cx.checkpoint()
             .map_err(|e| crate::error::Error::Runtime(format!("cx checkpoint: {e}")))?;
-        let res = self
-            .log_step(
-                storage,
+
+        let completed_at = now_ms();
+        let result_type = match result {
+            StepResult::Continue => "continue",
+            StepResult::Done { .. } => "done",
+            StepResult::Abort { .. } => "abort",
+            StepResult::Retry { .. } => "retry",
+            StepResult::WaitFor { .. } => "wait_for",
+            StepResult::SendText { .. } => "send_text",
+            StepResult::JumpTo { .. } => "jump_to",
+        };
+        let result_data = serde_json::to_string(result)
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "workflow step result serialization failed"),
+            )
+            .ok();
+        let verification_refs = build_verification_refs(result, None);
+        let error_code = step_error_code_from_result(result);
+
+        let res = storage
+            .insert_step_log_with_cx(
+                cx,
                 execution_id,
+                None,
                 step_index,
                 step_name,
-                result,
+                None,
+                None,
+                result_type,
+                result_data,
+                None,
+                verification_refs,
+                error_code,
                 started_at,
+                completed_at,
             )
             .await;
         cx.checkpoint()
