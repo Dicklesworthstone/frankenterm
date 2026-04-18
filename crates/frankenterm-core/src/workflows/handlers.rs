@@ -1228,6 +1228,37 @@ impl Workflow for HandleProcessTriageLifecycle {
             }
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 221). Eighth and FINAL
+    /// per-impl Workflow migration — closes the handlers.rs sweep.
+    ///
+    /// `HandleProcessTriageLifecycle` is unique among the 8 impls in
+    /// that its step bodies do NO async I/O — they're pure computation
+    /// on the incoming `trigger` JSON payload. Stats extraction,
+    /// guard checks, invariant verification, diff, snapshot artifact —
+    /// all pure functions. The only real concern for cx is giving
+    /// the caller a cancellation boundary between steps since the
+    /// runner may invoke the trait many times in rapid succession.
+    ///
+    /// This override delegates to `execute_step` after a pre-step
+    /// `cx.checkpoint()`. No body inlining needed — there's nothing
+    /// to thread cx through.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        if cx.checkpoint().is_err() {
+            return Box::pin(async move {
+                StepResult::abort(
+                    "handle_process_triage_lifecycle cancelled pre-step via Cx".to_string(),
+                )
+            });
+        }
+        self.execute_step(ctx, step_idx)
+    }
 }
 
 // ============================================================================
