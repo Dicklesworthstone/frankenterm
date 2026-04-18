@@ -882,7 +882,7 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution state
-                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -934,7 +934,7 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution state
-                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1207,7 +1207,7 @@ impl WorkflowRunner {
                     retries = 0;
 
                     // Update execution back to running
-                    if let Err(e) = self.update_execution_step(execution_id, current_step).await {
+                    if let Err(e) = self.update_execution_step_maybe_cx(cx, execution_id, current_step).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1340,7 +1340,7 @@ impl WorkflowRunner {
                             retries = 0;
 
                             if let Err(e) =
-                                self.update_execution_step(execution_id, current_step).await
+                                self.update_execution_step_maybe_cx(cx, execution_id, current_step).await
                             {
                                 tracing::warn!(
                                     execution_id,
@@ -1948,6 +1948,74 @@ impl WorkflowRunner {
         record.updated_at = now_ms();
 
         self.storage.upsert_workflow(record).await
+    }
+
+    /// Tick 182: dispatcher used by `run_workflow_inner` step-loop
+    /// call sites. When `cx` is `Some`, routes through
+    /// `update_execution_step_with_cx`; otherwise falls through to
+    /// the legacy `update_execution_step`. Keeps the 4 call sites
+    /// inside the step loop to a single `.await` line rather than
+    /// a match-on-cx boilerplate at each site.
+    async fn update_execution_step_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        execution_id: &str,
+        step: usize,
+    ) -> crate::Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        if let Some(cx) = cx {
+            return self.update_execution_step_with_cx(cx, execution_id, step).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let _ = cx;
+        self.update_execution_step(execution_id, step).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`update_execution_step`].
+    ///
+    /// Tick 182: routes both the read (get_workflow_with_cx) and
+    /// the write (upsert_workflow_with_cx) through storage cx-first
+    /// siblings. The "externally modified" check stays inline —
+    /// it's a pure status-enum match on the already-fetched record
+    /// so no cx threading is needed.
+    ///
+    /// This is the per-step progress-tracking write, called 4x
+    /// inside `run_workflow_inner`'s step loop on the normal
+    /// (non-error) path. Threading cx here means a cancelled
+    /// parent cx releases the writer-queue reserve immediately
+    /// under backpressure instead of waiting for drain.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn update_execution_step_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        step: usize,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        if record.status == "aborted" || record.status == "failed" || record.status == "completed" {
+            return Err(crate::Error::Workflow(
+                crate::error::WorkflowError::Aborted(format!(
+                    "Workflow externally modified to status: {}",
+                    record.status
+                )),
+            ));
+        }
+
+        record.current_step = step;
+        record.status = "running".to_string();
+        record.wait_condition = None;
+        record.updated_at = now_ms();
+
+        self.storage.upsert_workflow_with_cx(cx, record).await
     }
 
     async fn set_execution_waiting(
