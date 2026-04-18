@@ -5326,17 +5326,13 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let budget = asupersync::types::Budget::new()
-                .with_deadline(asupersync::types::Time::ZERO);
+            let budget =
+                asupersync::types::Budget::new().with_deadline(asupersync::types::Time::ZERO);
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
 
             let started = std::time::Instant::now();
-            let result: std::result::Result<(), String> = timeout_with_cx(
-                &cx,
-                Duration::from_secs(30),
-                std::future::pending::<()>(),
-            )
-            .await;
+            let result: std::result::Result<(), String> =
+                timeout_with_cx(&cx, Duration::from_secs(30), std::future::pending::<()>()).await;
             let elapsed = started.elapsed();
 
             assert!(
@@ -5381,8 +5377,8 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             // Budget with deadline already elapsed.
-            let budget = asupersync::types::Budget::new()
-                .with_deadline(asupersync::types::Time::ZERO);
+            let budget =
+                asupersync::types::Budget::new().with_deadline(asupersync::types::Time::ZERO);
             let cx = crate::cx::Cx::for_testing_with_budget(budget);
 
             let started = std::time::Instant::now();

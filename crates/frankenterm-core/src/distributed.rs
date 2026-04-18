@@ -996,11 +996,11 @@ async fn race_with_cx_cancel<F>(
 ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
 where
     F: std::future::Future<
-        Output = Result<
-            asupersync::http::h1::types::Response,
-            asupersync::http::h1::http_client::ClientError,
+            Output = Result<
+                asupersync::http::h1::types::Response,
+                asupersync::http::h1::http_client::ClientError,
+            >,
         >,
-    >,
 {
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
@@ -1010,9 +1010,7 @@ where
                 return Err::<
                     asupersync::http::h1::types::Response,
                     asupersync::http::h1::http_client::ClientError,
-                >(
-                    asupersync::http::h1::http_client::ClientError::Cancelled,
-                );
+                >(asupersync::http::h1::http_client::ClientError::Cancelled);
             }
         }
     };
@@ -4671,8 +4669,8 @@ KBAhs4snj5QspGFqkazmIw==
             });
 
             // Cx with budget deadline already elapsed (Time::ZERO).
-            let budget = asupersync::types::Budget::new()
-                .with_deadline(asupersync::types::Time::ZERO);
+            let budget =
+                asupersync::types::Budget::new().with_deadline(asupersync::types::Time::ZERO);
             let cx = asupersync::cx::Cx::for_testing_with_budget(budget);
 
             let client = DistributedHttpClient::plaintext();
