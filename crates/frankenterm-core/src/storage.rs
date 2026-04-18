@@ -8231,6 +8231,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token_by_code`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn get_approval_token_by_code_with_cx(
         &self,
@@ -8241,8 +8242,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_approval_token_by_code cancelled: {err}"))
         })?;
-        self.get_approval_token_by_code(code_hash, workspace_id)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::GetApprovalTokenByCode {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume an approval token by code hash only (without fingerprint validation).
@@ -8270,6 +8282,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token_by_code`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_approval_token_by_code_with_cx(
         &self,
@@ -8280,8 +8293,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("consume_approval_token_by_code cancelled: {err}"))
         })?;
-        self.consume_approval_token_by_code(code_hash, workspace_id)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ConsumeApprovalTokenByCode {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a pane record
@@ -8388,6 +8412,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_prepared_plan`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_prepared_plan_with_cx(
         &self,
@@ -8397,7 +8422,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_prepared_plan cancelled: {err}"))
         })?;
-        self.insert_prepared_plan(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertPreparedPlan {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume a prepared plan by plan_id (marks as used if valid)
@@ -8420,6 +8456,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_prepared_plan`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_prepared_plan_with_cx(
         &self,
@@ -8430,7 +8467,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("consume_prepared_plan cancelled: {err}"))
         })?;
-        self.consume_prepared_plan(plan_id, now_ms).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ConsumePreparedPlan {
+                    plan_id: plan_id.to_string(),
+                    now_ms,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a workflow step log entry
@@ -8546,6 +8595,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_mux_session`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_mux_session_with_cx(
         &self,
@@ -8558,8 +8608,21 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_mux_session cancelled: {err}"))
         })?;
-        self.insert_mux_session(session_id, topology_json, ft_version, host_id)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertMuxSession {
+                    session_id,
+                    topology_json,
+                    ft_version,
+                    host_id,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Insert a session checkpoint with per-pane state rows.
@@ -8592,6 +8655,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_session_checkpoint_with_cx(
@@ -8608,16 +8672,24 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_session_checkpoint cancelled: {err}"))
         })?;
-        self.insert_session_checkpoint(
-            session_id,
-            checkpoint_type,
-            state_hash,
-            pane_count,
-            total_bytes,
-            metadata_json,
-            pane_states,
-        )
-        .await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertSessionCheckpoint {
+                    session_id,
+                    checkpoint_type,
+                    state_hash,
+                    pane_count,
+                    total_bytes,
+                    metadata_json,
+                    pane_states,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Prune old checkpoints beyond the retention limit.
@@ -8640,6 +8712,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_session_checkpoints`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn prune_session_checkpoints_with_cx(
         &self,
@@ -8650,7 +8723,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("prune_session_checkpoints cancelled: {err}"))
         })?;
-        self.prune_session_checkpoints(session_id, retention).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PruneSessionCheckpoints {
+                    session_id,
+                    retention,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Mark a session as cleanly shut down.
@@ -8667,6 +8752,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
+    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_session_shutdown_clean_with_cx(
         &self,
@@ -8676,7 +8762,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("mark_session_shutdown_clean cancelled: {err}"))
         })?;
-        self.mark_session_shutdown_clean(session_id).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::MarkSessionShutdownClean {
+                    session_id,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Get the state_hash of the latest checkpoint for a session.
