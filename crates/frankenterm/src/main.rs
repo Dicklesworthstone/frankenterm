@@ -28737,7 +28737,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     let engine = SecretScanEngine::new();
-                    let report = match engine.scan_storage_incremental(&storage, options).await {
+                    // ft-xbnl0.2.3 tick 253: cx-first secret scan.
+                    let secret_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let report = match engine
+                        .scan_storage_incremental_with_cx(&secret_cx, &storage, options)
+                        .await
+                    {
                         Ok(report) => report,
                         Err(e) => {
                             eprintln!("Error: Secret scan failed: {e}");

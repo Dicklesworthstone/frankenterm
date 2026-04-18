@@ -440,7 +440,13 @@ async fn resolve_pane_capabilities(
         PaneCapabilities::from_ingest_state(osc_state.as_ref(), alt_screen, in_gap);
 
     if let Some(storage) = storage {
-        match storage.get_active_reservation(pane_id).await {
+        // ft-xbnl0.2.3 tick 253: cx-first reservation lookup.
+        let reservation_cx = crate::cx::Cx::current()
+            .unwrap_or_else(crate::cx::for_request);
+        match storage
+            .get_active_reservation_with_cx(&reservation_cx, pane_id)
+            .await
+        {
             Ok(Some(reservation)) => {
                 capabilities.is_reserved = true;
                 capabilities.reserved_by = Some(reservation.owner_id);
@@ -581,7 +587,13 @@ async fn record_mcp_audit(
         ),
         result: result.to_string(),
     };
-    if let Err(e) = storage.record_audit_action_redacted(audit).await {
+    // ft-xbnl0.2.3 tick 253: cx-first MCP audit write.
+    let audit_cx = crate::cx::Cx::current()
+        .unwrap_or_else(crate::cx::for_request);
+    if let Err(e) = storage
+        .record_audit_action_redacted_with_cx(&audit_cx, audit)
+        .await
+    {
         tracing::warn!(tool = tool_name, error = %e, "Failed to record MCP audit entry");
     }
 }
