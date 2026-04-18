@@ -15,6 +15,8 @@
 #   4. Metrics server cx-first family (3) — metrics_server_start_with_cx_*
 #      Pre-cancel / mid-flight-cancel / happy path.
 #   5. Web server cx pre-cancel (1) — web_server_with_cx_*
+#   6. runtime_compat primitive contracts (2) — _with_cx_observes_budget_deadline
+#      sleep_with_cx and timeout_with_cx budget-observation tests (ticks 382/383)
 #
 # Exit code 0 on all passing; non-zero on any failure.
 #
@@ -84,40 +86,47 @@ run_test() {
     rm -f "${tmp}"
 }
 
-run_test "Run 1/5: HTTP client contract tests" \
+run_test "Run 1/6: HTTP client contract tests" \
     -p frankenterm-core \
     --features distributed,asupersync-runtime \
     --lib distributed_http_client_ \
     -- --nocapture
 
-run_test "Run 2/5: TLS tests (bundle + server-name + errors + versions + happy-path)" \
+run_test "Run 2/6: TLS tests (bundle + server-name + errors + versions + happy-path)" \
     -p frankenterm-core \
     --features distributed,asupersync-runtime \
     --lib tls_ \
     -- --nocapture
 
-run_test "Run 3/5: Regression guards" \
+run_test "Run 3/6: Regression guards" \
     -p frankenterm-core \
     --test ft_xbnl0_2_4_no_direct_tokio_net_or_rustls \
     -- --nocapture
 
-run_test "Run 4/5: Metrics server cx-first family" \
+run_test "Run 4/6: Metrics server cx-first family" \
     -p frankenterm-core \
     --features distributed,asupersync-runtime,web \
     --lib metrics_server_start_with_cx_ \
     -- --nocapture
 
-run_test "Run 5/5: Web server cx pre-cancel" \
+run_test "Run 5/6: Web server cx pre-cancel" \
     -p frankenterm-core \
     --features web,asupersync-runtime \
     --test web \
     web_server_with_cx_ \
     -- --nocapture
 
+run_test "Run 6/6: runtime_compat primitive contracts (budget observation)" \
+    -p frankenterm-core \
+    --features asupersync-runtime \
+    --lib \
+    _with_cx_observes_budget_deadline \
+    -- --nocapture
+
 echo
 echo "=============================================================="
 if [[ ${FAIL} -eq 0 ]]; then
-    echo "  ft-xbnl0.2.4 — all 5 runs PASS (${TOTAL_PASSED} tests)"
+    echo "  ft-xbnl0.2.4 — all 6 runs PASS (${TOTAL_PASSED} tests)"
     echo "=============================================================="
     exit 0
 else
