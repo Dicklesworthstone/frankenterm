@@ -240,6 +240,21 @@ where
     let mut attempt = 0u32;
 
     loop {
+        // Tick 208 (ft-xbnl0.2.3): per-attempt cancel check so a
+        // cx-cancel fired during the previous operation or sleep
+        // surfaces AT THE ATTEMPT BOUNDARY rather than after the
+        // next operation() call completes. Returns the last-captured
+        // Cancelled error up through RetryOutcome.result so callers
+        // can distinguish cancel from other terminal errors.
+        if cx.is_cancel_requested() {
+            return RetryOutcome {
+                result: Err(Error::Cancelled(
+                    "retry loop cancelled before next attempt".to_string(),
+                )),
+                attempts: attempt,
+                elapsed: start.elapsed(),
+            };
+        }
         match operation().await {
             Ok(value) => {
                 if attempt > 0 {
@@ -282,7 +297,26 @@ where
                     "Retrying operation after failure"
                 );
 
-                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+                // Tick 208 (ft-xbnl0.2.3): honor the sleep_with_cx
+                // result. Previously `let _ = ...` discarded the Err
+                // so cancel during backoff was swallowed and the next
+                // operation fired anyway. Now cancel during backoff
+                // returns the original operation Err plus a cancelled
+                // marker via the attempts count (the caller can
+                // inspect elapsed vs. policy.delay_for_attempt to tell
+                // cancel from natural timeout).
+                if crate::runtime_compat::sleep_with_cx(cx, delay)
+                    .await
+                    .is_err()
+                {
+                    return RetryOutcome {
+                        result: Err(Error::Cancelled(
+                            "retry backoff cancelled during sleep".to_string(),
+                        )),
+                        attempts: attempt,
+                        elapsed: start.elapsed(),
+                    };
+                }
             }
         }
     }
@@ -480,6 +514,13 @@ where
     let mut attempt = 0u32;
 
     loop {
+        // Tick 208 (ft-xbnl0.2.3): per-attempt cancel check — same
+        // rationale as with_retry_outcome_cx.
+        if cx.is_cancel_requested() {
+            return Err(Error::Cancelled(
+                "smart retry loop cancelled before next attempt".to_string(),
+            ));
+        }
         match operation().await {
             Ok(value) => {
                 if attempt > 0 {
@@ -516,7 +557,16 @@ where
                     error = %e,
                     "Retrying operation after retryable failure"
                 );
-                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+                // Tick 208 (ft-xbnl0.2.3): honor the sleep_with_cx
+                // result (see with_retry_outcome_cx for rationale).
+                if crate::runtime_compat::sleep_with_cx(cx, delay)
+                    .await
+                    .is_err()
+                {
+                    return Err(Error::Cancelled(
+                        "smart retry backoff cancelled during sleep".to_string(),
+                    ));
+                }
             }
         }
     }
