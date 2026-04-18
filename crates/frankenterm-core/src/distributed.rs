@@ -940,16 +940,30 @@ impl DistributedHttpClient {
     }
 
     /// Send a GET request.
+    ///
+    /// Races the inner HTTP call against a cx-cancel watcher (ft-l9mxa):
+    /// if `cx.is_cancel_requested()` becomes true during the in-flight
+    /// request, the call returns `Err(ClientError::Cancelled)` within
+    /// one 50 ms poll cycle rather than blocking until the inner IO
+    /// completes / times out.
     pub async fn get(
         &self,
         cx: &asupersync::cx::Cx,
         url: &str,
     ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
     {
-        self.inner.get(cx, url).await
+        if cx.is_cancel_requested() {
+            return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
+        }
+        race_with_cx_cancel(cx, self.inner.get(cx, url)).await
     }
 
     /// Send a POST request with a body.
+    ///
+    /// Races the inner HTTP call against a cx-cancel watcher (ft-l9mxa):
+    /// if `cx.is_cancel_requested()` becomes true during the in-flight
+    /// request, the call returns `Err(ClientError::Cancelled)` within
+    /// one 50 ms poll cycle.
     pub async fn post(
         &self,
         cx: &asupersync::cx::Cx,
@@ -957,7 +971,56 @@ impl DistributedHttpClient {
         body: Vec<u8>,
     ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
     {
-        self.inner.post(cx, url, body).await
+        if cx.is_cancel_requested() {
+            return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
+        }
+        race_with_cx_cancel(cx, self.inner.post(cx, url, body)).await
+    }
+}
+
+/// ft-l9mxa: race a HTTP-client future against a cx-cancel watcher.
+///
+/// The HTTP client's inner IO await points don't observe cx-cancel
+/// (documented tick 380). Wrapping the inner call in a race with a
+/// periodic `cx.is_cancel_requested()` poll lets an operator-initiated
+/// cancel abort the in-flight request within one poll cycle (50 ms)
+/// without having to wait for the inner IO to complete or time out.
+///
+/// Polling interval (50 ms) trades responsiveness against the cost of
+/// waking up per cycle. 50 ms matches the observed shutdown-flag poll
+/// cadence elsewhere in this crate.
+#[cfg(feature = "distributed")]
+async fn race_with_cx_cancel<F>(
+    cx: &asupersync::cx::Cx,
+    inner: F,
+) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
+where
+    F: std::future::Future<
+        Output = Result<
+            asupersync::http::h1::types::Response,
+            asupersync::http::h1::http_client::ClientError,
+        >,
+    >,
+{
+    let inner = std::pin::pin!(inner);
+    let cancel_watcher = async {
+        loop {
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            if cx.is_cancel_requested() {
+                return Err::<
+                    asupersync::http::h1::types::Response,
+                    asupersync::http::h1::http_client::ClientError,
+                >(
+                    asupersync::http::h1::http_client::ClientError::Cancelled,
+                );
+            }
+        }
+    };
+    let cancel_watcher = std::pin::pin!(cancel_watcher);
+
+    crate::runtime_compat::select! {
+        result = inner => result,
+        result = cancel_watcher => result,
     }
 }
 
@@ -4422,7 +4485,8 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
-    /// ft-xbnl0.2.4 tick 380: Mid-flight cx-cancel on HTTP GET (snapshot).
+    /// ft-xbnl0.2.4 tick 380 (tightened by ft-l9mxa fix, tick 387):
+    /// Mid-flight cx-cancel on HTTP GET is observed within one poll cycle.
     ///
     /// Complements tick 313 (`distributed_http_client_honors_pre_cancelled_cx`)
     /// which fires the cancel BEFORE the GET starts. This test fires the
@@ -4430,28 +4494,18 @@ KBAhs4snj5QspGFqkazmIw==
     /// `client.get(cx, url)` is called, a separate task cancels it 50 ms
     /// later while the client is blocked reading from a stalled server.
     ///
-    /// **Observed behavior at HEAD** (tick 380 run, printed to stderr):
-    /// - elapsed ~= 10.02s
-    /// - result = Err("deadline has elapsed at ...") — the test's
-    ///   defensive 10s outer timeout fired, NOT the cx-cancel.
+    /// **History**:
+    /// - Tick 380 originally recorded a snapshot: cancel NOT observed,
+    ///   elapsed ~= 10.02s (the test's defensive outer timeout), result
+    ///   = outer-timeout Err. Filed as ft-l9mxa.
+    /// - Tick 387 fixed ft-l9mxa by wrapping `DistributedHttpClient::{get,post}`
+    ///   with a cx-cancel watcher race (50 ms poll). Cancel now observed
+    ///   in ~70 ms (one poll cycle).
     ///
-    /// **Finding**: the distributed HTTP client does NOT observe
-    /// mid-flight cx-cancel at its response-read path. This is the
-    /// same class of gap as tick 328 documented for `timeout_with_cx`
-    /// (budget observed, cancel not). A hung distributed RPC call
-    /// will eventually time out via its own internal limits (if
-    /// configured) but won't react to operator-initiated cancel.
-    ///
-    /// Snapshot, not prescriptive. If a future asupersync release
-    /// tightens mid-flight cancel observability at the HTTP client
-    /// layer, this test will start completing faster (elapsed << 10s
-    /// and result = HTTP-client-specific Err). Until then:
-    ///
-    /// 1. Bounds latency (< 15s via outer timeout) so a total-hang
-    ///    regression is caught.
-    /// 2. Prints observed shape (elapsed + result) to stderr for diff.
-    /// 3. Does NOT over-specify — only asserts "does not hang past
-    ///    the safety-net ceiling".
+    /// **Current contract** (post tick-387 fix):
+    /// - elapsed < 1 second
+    /// - result = `Ok(Err(ClientError::Cancelled))` — the outer timeout
+    ///   did NOT fire; the inner cancel-watcher-race surfaced the cancel.
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_http_client_mid_flight_cancel_does_not_hang() {
@@ -4493,13 +4547,22 @@ KBAhs4snj5QspGFqkazmIw==
             .await;
             let elapsed = started.elapsed();
 
+            // Tightened assertions post tick-387 ft-l9mxa fix.
             assert!(
-                elapsed < std::time::Duration::from_secs(15),
-                "mid-flight cancel must not cause an unbounded hang; took {elapsed:?}"
+                elapsed < std::time::Duration::from_secs(1),
+                "mid-flight cancel should fire within ~1s (observed 70ms typical post tick-387); took {elapsed:?}"
             );
-            eprintln!(
-                "tick 380: mid-flight cancel elapsed={elapsed:?}, outer_timeout_result={result:?}"
-            );
+            // Post-tick-387 shape: Ok(Err(ClientError::Cancelled)) — the
+            // outer timeout did NOT fire; the cx-cancel watcher race
+            // surfaced the Cancelled variant from the inner client.
+            match result {
+                Ok(Err(asupersync::http::h1::http_client::ClientError::Cancelled)) => {}
+                other => panic!(
+                    "mid-flight cancel must produce Ok(Err(ClientError::Cancelled)) \
+                     post-tick-387 fix; got: {other:?}"
+                ),
+            }
+            eprintln!("tick 380 (post-387): mid-flight cancel elapsed={elapsed:?}");
         });
     }
 
