@@ -710,6 +710,20 @@ impl RecoveryEngine {
         let mut last_kind = ProtocolErrorKind::Recoverable;
 
         for attempt in 0..max_attempts {
+            // Tick 207 (ft-xbnl0.2.3): per-attempt checkpoint so a
+            // cx-cancel fired during the previous operation's await
+            // or backoff sleep lands BEFORE the next operation call
+            // fires, rather than after the operation completes. The
+            // between-attempt sleep_with_cx check below catches
+            // cancel during backoff; this catches cancel at the
+            // attempt boundary itself.
+            if cx.is_cancel_requested() {
+                return RecoveryOutcome {
+                    result: Err(RecoveryError::Cancelled),
+                    attempts: attempt,
+                    error_kinds,
+                };
+            }
             match operation(attempt).await {
                 Ok(value) => {
                     self.circuit.record_success();
