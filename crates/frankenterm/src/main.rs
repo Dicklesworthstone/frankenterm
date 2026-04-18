@@ -14953,10 +14953,27 @@ async fn run_watcher(
                 mute_storage,
             );
             let mut subscriber = event_bus.subscribe_detections();
+            // ft-xbnl0.2.3 tick 225: notification pipeline event loop
+            // routes through cx-first entry points. Uses
+            // `Cx::current().unwrap_or_else(for_request)` — matches
+            // tick 224's workflow runner spawn pattern.
+            //
+            // A cx-cancel on the outer runtime cx now cleanly aborts:
+            // - the subscriber.recv_cx wait via broadcast_recv_with_cx
+            // - the pipeline.handle_detection_with_cx mute-check read
+            //   (tick 198) AND the downstream send_with_cx dispatch
+            //   into each configured sender (tick 211/212 overrides
+            //   on NotificationSender impls).
             let handle = frankenterm_core::runtime_compat::task::spawn(async move {
                 tracing::info!("Notification pipeline started, listening for detection events");
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 loop {
-                    match subscriber.recv().await {
+                    if cx.checkpoint().is_err() {
+                        tracing::info!("Notification pipeline cancelled via Cx, stopping");
+                        break;
+                    }
+                    match subscriber.recv_cx(&cx).await {
                         Ok(Event::PatternDetected {
                             pane_id,
                             pane_uuid,
@@ -14964,7 +14981,8 @@ async fn run_watcher(
                             event_id,
                         }) => {
                             let outcome = pipeline
-                                .handle_detection(
+                                .handle_detection_with_cx(
+                                    &cx,
                                     &detection,
                                     pane_id,
                                     pane_uuid.as_deref(),
