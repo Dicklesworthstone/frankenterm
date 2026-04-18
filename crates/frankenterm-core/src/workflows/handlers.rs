@@ -4856,6 +4856,190 @@ impl Workflow for HandleGeminiQuota {
             }
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 220). Seventh per-impl
+    /// Workflow migration. Parallel shape to HandleClaudeCodeLimits
+    /// (tick 219): guard checks, cooldown read, classify + audit write.
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `record_audit_action_with_cx` (audit write)
+    ///
+    /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+        let caps = ctx.capabilities().clone();
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_gemini_quota cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Guard checks (pure CPU)
+                0 => {
+                    if caps.alt_screen == Some(true) {
+                        return StepResult::abort("Pane is in alt-screen mode");
+                    }
+                    if caps.command_running {
+                        return StepResult::abort("Command is running in pane");
+                    }
+                    tracing::debug!(
+                        pane_id,
+                        explicit_cx = true,
+                        "handle_gemini_quota: guard checks passed (cx)"
+                    );
+                    StepResult::cont()
+                }
+
+                // Step 1: Cooldown check (cx-first read)
+                1 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("gemini_quota_limit".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_quota_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_gemini_quota: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_quota_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                explicit_cx = true,
+                                "handle_gemini_quota: no recent quota events, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_gemini_quota: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 2: Classify quota, record audit event (cx-first write)
+                2 => {
+                    let (quota_type, remaining_pct) = Self::classify_quota(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("gemini");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+
+                    let plan =
+                        Self::build_recovery_plan(quota_type, remaining_pct.as_deref(), pane_id);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let timestamp_ms = now_ms();
+                    let input_summary = format!("Gemini {quota_type} on pane {pane_id}");
+                    let decision_context = build_recovery_plan_audit_decision_context(
+                        "gemini_quota_limit",
+                        "handle_gemini_quota",
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &input_summary,
+                        "recorded",
+                        "quota_type",
+                        "remaining_pct",
+                        &plan,
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "gemini_quota_limit".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action_with_cx(cx, audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                quota_type,
+                                remaining_pct = ?remaining_pct,
+                                explicit_cx = true,
+                                "handle_gemini_quota: recorded quota event (cx)"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "recorded",
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "quota_type": quota_type,
+                                "remaining_pct": remaining_pct,
+                                "recovery_plan": plan,
+                                "audit_id": audit_id,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_gemini_quota: failed to record quota event (cx)"
+                            );
+                            StepResult::abort(format!("Failed to record quota event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
 }
 
 // ============================================================================
