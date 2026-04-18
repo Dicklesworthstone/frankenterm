@@ -338,7 +338,11 @@ impl ScrollbackInjector {
 
             let _permit = semaphore.acquire().await.expect("semaphore closed");
 
-            match self.inject_pane(*old_id, new_id, scrollback).await {
+            // ft-xbnl0.2.3 tick 295: route through cx-first inject_pane sibling.
+            match self
+                .inject_pane_with_cx(cx, *old_id, new_id, scrollback)
+                .await
+            {
                 Ok(stats) => report.successes.push(stats),
                 Err(e) => {
                     warn!(old_pane = old_id, new_pane = new_id, error = %e, "injection failed");
@@ -400,6 +404,73 @@ impl ScrollbackInjector {
             // Inter-chunk delay to prevent parser overload.
             if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
                 sleep(Duration::from_millis(self.config.inter_chunk_delay_ms)).await;
+            }
+        }
+
+        Ok(PaneInjectionStats {
+            old_pane_id,
+            new_pane_id,
+            lines_injected: data.lines.len(),
+            bytes_written,
+            chunks_sent: chunks.len(),
+        })
+    }
+
+    /// ft-xbnl0.2.3 tick 295: Cx-first sibling of [`Self::inject_pane`].
+    ///
+    /// Threads caller `&Cx` through the per-chunk send loop + inter-chunk
+    /// delays so a cx-cancel during a large-scrollback injection cleanly
+    /// aborts at the next chunk boundary rather than completing the full
+    /// injection before unwinding.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn inject_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        old_pane_id: u64,
+        new_pane_id: u64,
+        scrollback: &ScrollbackData,
+    ) -> crate::Result<PaneInjectionStats> {
+        let mut data = scrollback.clone();
+        data.truncate(self.config.max_lines);
+
+        if data.lines.is_empty() {
+            return Ok(PaneInjectionStats {
+                old_pane_id,
+                new_pane_id,
+                lines_injected: 0,
+                bytes_written: 0,
+                chunks_sent: 0,
+            });
+        }
+
+        debug!(
+            old_pane = old_pane_id,
+            new_pane = new_pane_id,
+            lines = data.lines.len(),
+            bytes = data.total_bytes,
+            "injecting scrollback (cx-first)"
+        );
+
+        let content = build_injection_content(&data.lines);
+        let chunks = chunk_content(&content, self.config.chunk_size);
+        let mut bytes_written = 0;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            cx.checkpoint().map_err(|err| {
+                crate::Error::Runtime(format!(
+                    "inject_pane cancelled at chunk {i}/{total} for new pane {new_pane_id}: {err}",
+                    total = chunks.len()
+                ))
+            })?;
+            self.wezterm.send_text_with_cx(cx, new_pane_id, chunk).await?;
+            bytes_written += chunk.len();
+
+            if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
+                let _ = crate::runtime_compat::sleep_with_cx(
+                    cx,
+                    Duration::from_millis(self.config.inter_chunk_delay_ms),
+                )
+                .await;
             }
         }
 
