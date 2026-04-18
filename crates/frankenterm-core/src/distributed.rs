@@ -3001,6 +3001,79 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 335: cert-file and min-TLS-version error paths
+    //
+    // Operators mis-configure TLS paths frequently in practice (typo in
+    // cert_path, file deleted, wrong chmod). These tests pin that the
+    // resulting error surfaces via the right error variant with enough
+    // context to diagnose (path name) rather than being collapsed into
+    // a generic string.
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_surfaces_io_error_with_path_for_missing_cert_file() {
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        // Point at a path that does not exist.
+        config.tls.cert_path = Some("/nonexistent/frankenterm-rusticmaple-cert.pem".to_string());
+        config.tls.key_path = Some("/nonexistent/frankenterm-rusticmaple-key.pem".to_string());
+
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("nonexistent cert path must fail"),
+            Err(e) => e,
+        };
+        match err {
+            DistributedTlsError::Io { path, source: _ } => {
+                assert!(
+                    path.contains("nonexistent"),
+                    "Io variant must include the offending path; got: {path}"
+                );
+            }
+            other => panic!(
+                "nonexistent cert path must surface Io {{ path, source }} variant; got: {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn resolve_tls_versions_rejects_unsupported_version_string() {
+        // An unsupported min_tls_version string ("2.0" — not a real
+        // TLS version) must fail with InvalidMinTlsVersion carrying
+        // the offending input. Uses real test fixtures for cert/key
+        // so the version-check path is actually reached (load_cert_chain
+        // runs first — with /dev/null placeholders it returns
+        // EmptyCertChain before the version check fires).
+        let server_cert = temp_pem(SERVER_CERT);
+        let server_key = temp_pem(SERVER_KEY);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+        config.tls.min_tls_version = "2.0".to_string();
+
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("unsupported TLS version must fail"),
+            Err(e) => e,
+        };
+        match err {
+            DistributedTlsError::InvalidMinTlsVersion(v) => {
+                assert_eq!(
+                    v, "2.0",
+                    "InvalidMinTlsVersion must carry the offending version string"
+                );
+            }
+            other => panic!(
+                "unsupported TLS version must surface InvalidMinTlsVersion variant; got: {other:?}"
+            ),
+        }
+    }
+
+    // =====================================================================
     // ft-xbnl0.2.4 tick 334: build_tls_server_name contract tests
     //
     // `build_tls_server_name` is the SNI / server-name-verification
