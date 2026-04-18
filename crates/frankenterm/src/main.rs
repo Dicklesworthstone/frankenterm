@@ -32448,19 +32448,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let speed_factor = if speed > 0.0 { speed } else { 1.0 };
                 let start = std::time::Instant::now();
 
+                // ft-xbnl0.2.3 tick 291: cx-first simulation event-pacing loop.
+                let inject_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 for (i, event) in scenario.events.iter().enumerate() {
                     // Wait until the scaled time for this event
                     let target_elapsed =
                         std::time::Duration::from_secs_f64(event.at.as_secs_f64() / speed_factor);
                     let actual_elapsed = start.elapsed();
                     if let Some(wait) = target_elapsed.checked_sub(actual_elapsed) {
-                        frankenterm_core::runtime_compat::sleep(wait).await;
+                        if frankenterm_core::runtime_compat::sleep_with_cx(&inject_cx, wait)
+                            .await
+                            .is_err()
+                        {
+                            // Cx cancelled during simulation pacing.
+                            break;
+                        }
                     }
 
                     let mock_event = Scenario::to_mock_event(event)?;
-                    // ft-xbnl0.2.3 tick 279: cx-first simulation mock inject.
-                    let inject_cx = frankenterm_core::cx::Cx::current()
-                        .unwrap_or_else(frankenterm_core::cx::for_request);
                     mock.inject_with_cx(&inject_cx, event.pane, mock_event).await?;
 
                     if json {
