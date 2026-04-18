@@ -4564,6 +4564,71 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 400: URL percent-encoded characters pass through verbatim.
+    ///
+    /// Pins that `DistributedHttpClient::get` transmits percent-encoded
+    /// characters in the URL request-target exactly as given — no
+    /// double-encoding, no decoding, no re-normalization. Caller owns
+    /// URL encoding; client is transport-only.
+    ///
+    /// Two regression modes caught:
+    /// 1. Double-encoding: `%20` re-encoded to `%2520`.
+    /// 2. Silent decoding: `%20` decoded to a literal space (invalid
+    ///    in the request-target, would fail or re-encode weirdly).
+    ///
+    /// Test URL: `/api/v1/search?q=hello%20world&filter=a%2Bb`
+    /// - `%20` is a space (valid percent-encoded form).
+    /// - `%2B` is a plus sign (valid percent-encoded form).
+    ///
+    /// Asserts the server-received first line preserves both sequences
+    /// byte-for-byte AND contains no double-encoded `%2520`.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_percent_encoded_url_passes_through() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                let first_line = req.lines().next().expect("at least one line");
+                assert!(
+                    first_line.contains("%20"),
+                    "`%20` must pass through verbatim (not decoded or double-encoded); got: {first_line:?}"
+                );
+                assert!(
+                    first_line.contains("%2B"),
+                    "`%2B` must pass through verbatim; got: {first_line:?}"
+                );
+                assert!(
+                    !first_line.contains("%2520"),
+                    "percent sign must not be double-encoded; got: {first_line:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!(
+                "http://127.0.0.1:{}/api/v1/search?q=hello%20world&filter=a%2Bb",
+                addr.port()
+            );
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 398: POST does not auto-inject Content-Type.
     ///
     /// `DistributedHttpClient::post` accepts `body: Vec<u8>` as opaque
