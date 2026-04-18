@@ -1214,6 +1214,24 @@ pub mod task {
     pub async fn yield_now() {
         asupersync::runtime::yield_now().await;
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`yield_now`].
+    ///
+    /// Hot-loop cooperative cancellation point: a pre-flight
+    /// `cx.checkpoint()` before the runtime yield turns this into
+    /// a fast cancellation-sensing yield. Returns `Err(String)` with
+    /// the formatted checkpoint error when the caller's cx is
+    /// cancelled so tight poll loops can break out cleanly instead
+    /// of yielding into an infinite retry. The `String` error is
+    /// chosen for cross-module simplicity (callers' error enums
+    /// already have a String variant) rather than re-exporting
+    /// asupersync's `Cancelled` type at this boundary.
+    pub async fn yield_now_with_cx(cx: &crate::cx::Cx) -> std::result::Result<(), String> {
+        cx.checkpoint()
+            .map_err(|err| format!("yield_now_with_cx cancelled: {err}"))?;
+        asupersync::runtime::yield_now().await;
+        Ok(())
+    }
 }
 
 /// Re-export `join!` macro for concurrent future evaluation.
@@ -1350,6 +1368,31 @@ pub mod unix {
     where
         T: AsyncRead + Unpin,
     {
+        lines.next_line().await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`].
+    ///
+    /// Pre-flight `cx.checkpoint()` folded into
+    /// `io::ErrorKind::Interrupted` so a cancelled IPC client
+    /// handler (or any line-reading loop) bails from the read
+    /// instead of blocking on the next newline. The underlying
+    /// `tokio::io::AsyncBufReadExt::next_line` does not itself
+    /// observe cx — this seam gates entry to the wait.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn next_line_with_cx<T>(
+        cx: &crate::cx::Cx,
+        lines: &mut LineReader<T>,
+    ) -> io::Result<Option<String>>
+    where
+        T: AsyncRead + Unpin,
+    {
+        cx.checkpoint().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("next_line cancelled: {err}"),
+            )
+        })?;
         lines.next_line().await
     }
 }
