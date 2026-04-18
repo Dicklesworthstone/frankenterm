@@ -3537,6 +3537,52 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 314: Pin the cx-cancel contract for
+    /// `DistributedHttpClient::post` (mirror of tick 313's GET test).
+    ///
+    /// POST carries a body, so the cancel-propagation path differs from
+    /// GET — the client must check cx at body-send boundaries too, not
+    /// just at response-read. This test pre-cancels the cx and verifies
+    /// POST fails fast against a stalled server.
+    ///
+    /// Acceptance criterion 3 of ft-xbnl0.2.4 — "Verification covers
+    /// correctness" — includes both HTTP verbs the production code uses
+    /// (GET for health checks, POST for event forwarding).
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_honors_pre_cancelled_cx() {
+        run_async_test(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let _server_task = crate::runtime_compat::task::spawn(async move {
+                let _ = listener.accept().await;
+                crate::runtime_compat::sleep(std::time::Duration::from_secs(10)).await;
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel for HTTP POST cx contract test"),
+            );
+
+            let url = format!("http://127.0.0.1:{}/events", addr.port());
+            let started = std::time::Instant::now();
+            let result = client.post(&cx, &url, b"body=data".to_vec()).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "pre-cancelled cx must cause post() to return an error, got: {result:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "pre-cancelled cx should fail fast; took {elapsed:?}"
+            );
+        });
+    }
+
     /// Verify bidirectional data exchange over TLS using bundle helpers.
     #[cfg(feature = "distributed")]
     #[test]
