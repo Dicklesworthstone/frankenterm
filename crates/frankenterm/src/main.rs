@@ -26809,8 +26809,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         config.safety.approval.clone(),
                         workspace_id.clone(),
                     );
+                    // ft-xbnl0.2.3 tick 275: cx-first plan approval issue.
+                    let plan_approval_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
                     let approval = match store
-                        .issue_for_plan(
+                        .issue_for_plan_with_cx(
+                            &plan_approval_cx,
                             &input,
                             &plan_hash,
                             i32::try_from(plan.plan_version).ok(),
@@ -27050,8 +27054,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             config.safety.approval.clone(),
                             workspace_id.clone(),
                         );
+                        // ft-xbnl0.2.3 tick 275: cx-first plan approval issue.
+                        let plan_prepare_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
                         let approval = match store
-                            .issue_for_plan(
+                            .issue_for_plan_with_cx(
+                                &plan_prepare_cx,
                                 &input,
                                 &plan_hash,
                                 i32::try_from(plan.plan_version).ok(),
