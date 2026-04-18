@@ -3001,6 +3001,82 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 336: empty-PEM error paths
+    //
+    // Operators sometimes create the expected cert file but populate it
+    // with the wrong contents — an empty file, a comment-only file, or
+    // the wrong PEM block type (key in cert path, cert in key path).
+    // Pinning the specific error variants protects the caller-side
+    // classification: "file exists but is the wrong shape" surfaces as
+    // EmptyCertChain/EmptyPrivateKey (operator actionable: re-paste
+    // the correct PEM) rather than collapsing into Config (ambiguous).
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_surfaces_empty_cert_chain_for_empty_pem_file() {
+        // A file that parses as PEM but contains no cert blocks.
+        let empty_cert = temp_pem("# placeholder — no cert blocks\n");
+        let server_key = temp_pem(SERVER_KEY);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(empty_cert.path().display().to_string());
+        config.tls.key_path = Some(server_key.path().display().to_string());
+
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("empty cert PEM must fail"),
+            Err(e) => e,
+        };
+        match err {
+            DistributedTlsError::EmptyCertChain(path) => {
+                assert!(
+                    path.contains(empty_cert.path().file_name().unwrap().to_str().unwrap()),
+                    "EmptyCertChain must carry the offending path; got: {path}"
+                );
+            }
+            other => panic!(
+                "empty cert PEM must surface EmptyCertChain variant; got: {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_bundle_surfaces_empty_private_key_for_cert_in_key_slot() {
+        // A valid cert file pointed at by key_path — parses as PEM but
+        // contains no private-key blocks, only cert blocks.
+        let server_cert = temp_pem(SERVER_CERT);
+        // Second cert file to serve as the `key_path` — it has cert
+        // blocks but no key blocks, which is exactly what
+        // `load_private_key` should reject as EmptyPrivateKey.
+        let wrong_key = temp_pem(SERVER_CERT);
+
+        let mut config = DistributedConfig::default();
+        config.enabled = true;
+        config.tls.enabled = true;
+        config.tls.cert_path = Some(server_cert.path().display().to_string());
+        config.tls.key_path = Some(wrong_key.path().display().to_string());
+
+        let err = match build_tls_bundle(&config, None) {
+            Ok(_) => panic!("cert-in-key-slot must fail"),
+            Err(e) => e,
+        };
+        match err {
+            DistributedTlsError::EmptyPrivateKey(path) => {
+                assert!(
+                    path.contains(wrong_key.path().file_name().unwrap().to_str().unwrap()),
+                    "EmptyPrivateKey must carry the offending path; got: {path}"
+                );
+            }
+            other => panic!(
+                "cert-in-key-slot must surface EmptyPrivateKey variant; got: {other:?}"
+            ),
+        }
+    }
+
+    // =====================================================================
     // ft-xbnl0.2.4 tick 335: cert-file and min-TLS-version error paths
     //
     // Operators mis-configure TLS paths frequently in practice (typo in
