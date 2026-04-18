@@ -1,9 +1,11 @@
-# ft-xbnl0.2.4 — Verification Smoke (tick 340, extended tick 346)
+# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 353)
 
 Date: 2026-04-18
 Authored by: RusticMaple
-Original commit: post-`bfb016b2` / ticks 311-339 (32 tests)
-Extended commit: post-`7ace68aa` / ticks 311-345 (40 tests) — tick 346
+Tick 340: post-`bfb016b2` / ticks 311-339 (32 tests, HTTP+TLS+guards only)
+Tick 341: added service-boundary runs (36 tests)
+Tick 346: HTTP extended to 19 after ticks 342-345 (40 tests total)
+Tick 353: HTTP extended to 21 after tick 349→351→352 ft-kfkyi fix + companion (42 tests total)
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
@@ -36,33 +38,17 @@ cargo test -p frankenterm-core --features distributed,asupersync-runtime --lib d
 ```
 
 ```
-running 19 tests
-test distributed::tests::distributed_http_client_creates ... ok
-test distributed::tests::distributed_http_client_post_honors_pre_cancelled_cx ... ok
-test distributed::tests::distributed_http_client_honors_pre_cancelled_cx ... ok
-test distributed::tests::distributed_http_client_rejects_invalid_urls_without_panic ... ok
-test distributed::tests::distributed_http_client_connection_refused_returns_err ... ok
-test distributed::tests::distributed_http_client_https_url_against_plaintext_server_returns_err ... ok
-test distributed::tests::distributed_http_client_concurrent_gets ... ok
-test distributed::tests::distributed_http_client_preserves_trailing_slash_in_path ... ok
-test distributed::tests::distributed_http_client_surfaces_premature_server_close_as_err ... ok
-test distributed::tests::distributed_http_client_post_large_body_roundtrips ... ok
-test distributed::tests::distributed_http_client_post_empty_body_sends_content_length_zero ... ok
-test distributed::tests::distributed_http_client_sends_host_header_matching_authority ... ok
-test distributed::tests::distributed_http_client_local_get ... ok
-test distributed::tests::distributed_http_client_url_without_path_defaults_to_slash ... ok
-test distributed::tests::distributed_http_client_transmits_full_request_target ... ok
-test distributed::tests::distributed_http_client_sends_non_empty_user_agent ... ok
-test distributed::tests::distributed_http_client_local_post ... ok
-test distributed::tests::distributed_http_client_handles_ipv6_literal_url ... ok
-test distributed::tests::distributed_http_client_returns_non_2xx_as_ok_response ... ok
-
-test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 25588 filtered out; finished in 0.02s
+running 21 tests
+(all distributed_http_client_* tests pass)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 25588 filtered out; finished in 0.12s
 ```
 
-Tick 346 extended this run from 15 tests (tick 340) to 19 tests with the
-additions from ticks 342 (https-vs-plaintext), 343 (invalid URL inputs),
-344 (IPv6 literal), and 345 (premature close).
+Run 1 progression:
+- Tick 340: 15 tests
+- Tick 346: +4 from ticks 342-345 (https-vs-plaintext, invalid URLs,
+  IPv6 literal, premature close) = 19 tests
+- Tick 353: +2 from ticks 349→351→352 (ft-kfkyi 3xx no-follow fix
+  + companion test with resolvable Location target) = 21 tests
 
 ### Run 2 — TLS bundle + server-name contract tests
 
@@ -109,17 +95,20 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Group | Tests | Result |
 |-------|-------|--------|
-| HTTP client contracts (Run 1) | 19 | 19/19 ok |
+| HTTP client contracts (Run 1) | 21 | 21/21 ok |
 | TLS contracts (Run 2) | 14 | 14/14 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
-| **Subtotal** | **40** | **40/40 ok** |
+| **Subtotal** | **42** | **42/42 ok** |
 
-Run 4 + Run 5 were added tick 341 to close the "individually-verified-only" caveat.
-Run 1 expanded from 15 → 19 tests at tick 346 after ticks 342-345 added
-scheme-dispatch (https-vs-plaintext), invalid-URL refusal, IPv6 literal,
-and premature-server-close contracts.
+Captured via `scripts/check_ft_xbnl0_2_4.sh` (added tick 347) at
+commit post-`46f0ac4a` (tick 352).
+
+Run 1 growth over the session:
+- tick 340: 15 tests (HTTP baseline)
+- tick 346: +4 scheme-dispatch / invalid-URL / IPv6 / premature-close
+- tick 353: +2 from the ft-kfkyi 3xx no-follow fix + companion
 
 ### Run 4 — metrics server cx-first family (includes tick 322)
 
@@ -158,12 +147,14 @@ Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 40 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
-- Compile time after the initial cold build: 0.02s-3.42s per filtered run. This is cheap to re-run per-commit in CI.
-- The 19 + 14 + 3 + 3 + 1 = 40 count matches the full roster landed in
-  the completion-evidence doc through tick 345 (HTTP client §2.1 now
-  covering scheme-dispatch + IPv6 + truncation + invalid-URL paths;
-  TLS §2.2; service-boundary §2.3 incl. 3 pre-existing metrics tests
-  + tick 323's web pre-cancel; regression guards §2.4).
+- All 42 tests that land directly in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- Compile time after the initial cold build: 0.01s-1.19s per filtered run. This is cheap to re-run per-commit in CI.
+- The 21 + 14 + 3 + 3 + 1 = 42 count matches the full roster landed in
+  the completion-evidence doc through tick 352.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
+- The ft-kfkyi security follow-up (3xx transparent redirect following)
+  discovered in tick 349, filed tick 350, fixed tick 351, companion
+  test added tick 352 — is closed. The distributed HTTP client now
+  explicitly disables redirect following via `.no_redirects()` on the
+  asupersync HttpClient builder.
