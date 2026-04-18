@@ -3085,6 +3085,168 @@ impl Workflow for HandleSwarmLearningIndex {
             }
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 217). Fourth per-impl
+    /// Workflow migration.
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `get_pane_with_cx` (pane lookup)
+    ///   - `cass.trigger_index_with_cx` (cass subprocess dispatch)
+    ///   - `record_audit_action_with_cx` (audit write)
+    ///
+    /// No private helper to migrate — all calls inline. Pre-step
+    /// `cx.checkpoint()` gates entry between steps.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_swarm_learning_index cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Cooldown check (cx-first read)
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("swarm_learning_index".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_index_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_swarm_learning_index: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_index_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                explicit_cx = true,
+                                "handle_swarm_learning_index: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: cx-first cass index trigger + audit record
+                1 => {
+                    let pane = storage.get_pane_with_cx(cx, pane_id).await.ok().flatten();
+                    let workspace = Self::workspace_from_pane(pane.as_ref());
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    let cass =
+                        CassClient::new().with_timeout_secs(SWARM_LEARNING_INDEX_TIMEOUT_SECS);
+                    let result_label = match cass
+                        .trigger_index_with_cx(cx, workspace.as_deref())
+                        .await
+                    {
+                        Ok(index_result) => {
+                            let sessions = index_result.sessions_indexed.unwrap_or(0);
+                            let new_sessions = index_result.new_sessions.unwrap_or(0);
+                            tracing::info!(
+                                pane_id,
+                                sessions,
+                                new_sessions,
+                                explicit_cx = true,
+                                "handle_swarm_learning_index: cass index complete (cx)"
+                            );
+                            "index_complete"
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                explicit_cx = true,
+                                "handle_swarm_learning_index: cass index failed (cx)"
+                            );
+                            "index_error"
+                        }
+                    };
+
+                    let timestamp_ms = now_ms();
+                    let input_summary =
+                        format!("Swarm learning index for {agent_type} session end");
+                    let mut context = new_workflow_handler_audit_context(
+                        "swarm_learning_index",
+                        "handle_swarm_learning_index",
+                        &execution_id,
+                        pane_id,
+                        Some(&input_summary),
+                        result_label,
+                        timestamp_ms,
+                    );
+                    context.add_evidence("agent_type", agent_type);
+                    add_optional_evidence(&mut context, "workspace", workspace.as_deref());
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "swarm_learning_index".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id: None,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context: serialize_workflow_handler_audit_context(&context),
+                        result: result_label.to_string(),
+                    };
+
+                    if let Err(error) = storage.record_audit_action_with_cx(cx, audit).await {
+                        tracing::error!(
+                            pane_id,
+                            error = %error,
+                            explicit_cx = true,
+                            "handle_swarm_learning_index: audit recording failed (cx)"
+                        );
+                    }
+
+                    StepResult::done(serde_json::json!({
+                        "status": result_label,
+                        "pane_id": pane_id,
+                        "workspace": workspace,
+                    }))
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
 }
 
 // ============================================================================
