@@ -6118,6 +6118,10 @@ impl StorageHandle {
     /// write path for pattern detections. A cx-driven detection
     /// pipeline can bail before enqueuing the write if the
     /// caller has already been cancelled.
+    ///
+    /// Tick 174: inlined to route the mpsc send through
+    /// `send_with_cx` so a backpressured writer queue releases
+    /// immediately under caller cancellation.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_event_with_cx(
         &self,
@@ -6126,7 +6130,12 @@ impl StorageHandle {
     ) -> Result<i64> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("record_event cancelled: {err}")))?;
-        self.record_event(event).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::RecordEvent { event, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Mark an event as handled
@@ -6572,6 +6581,8 @@ impl StorageHandle {
     /// Pre-flight checkpoint gates audit writes. Audit-trail
     /// emitters are on a hot path (14+ call sites) — a cx-driven
     /// caller bails before enqueuing the write if cancelled.
+    ///
+    /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_audit_action_with_cx(
         &self,
@@ -6581,7 +6592,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("record_audit_action cancelled: {err}"))
         })?;
-        self.record_audit_action(action).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordAuditAction {
+                    action,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record an audit action after applying redaction
@@ -8161,6 +8183,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_approval_token`].
+    /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_approval_token_with_cx(
         &self,
@@ -8170,7 +8193,12 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("insert_approval_token cancelled: {err}"))
         })?;
-        self.insert_approval_token(token).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::InsertApprovalToken { token, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Consume an approval token if it matches scope and is valid
@@ -8339,11 +8367,21 @@ impl StorageHandle {
     /// call sites across the codebase), so adding a cx-first
     /// entry point lets observation loops propagate caller
     /// cancellation into the write pipeline.
+    ///
+    /// Tick 174: inlined to route the mpsc send through
+    /// `send_with_cx` — closes the orphan-cx hole in the hottest
+    /// storage write in the tree. A backpressured writer queue
+    /// under a cancelled observation loop now releases immediately.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_pane_with_cx(&self, cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("upsert_pane cancelled: {err}")))?;
-        self.upsert_pane(pane).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::UpsertPane { pane, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Upsert a workflow execution record
@@ -8537,6 +8575,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_step_log`].
+    /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_step_log_with_cx(
@@ -8558,22 +8597,30 @@ impl StorageHandle {
     ) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("insert_step_log cancelled: {err}")))?;
-        self.insert_step_log(
-            workflow_id,
-            audit_action_id,
-            step_index,
-            step_name,
-            step_id,
-            step_kind,
-            result_type,
-            result_data,
-            policy_summary,
-            verification_refs,
-            error_code,
-            started_at,
-            completed_at,
-        )
-        .await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertStepLog {
+                    workflow_id: workflow_id.to_string(),
+                    audit_action_id,
+                    step_index,
+                    step_name: step_name.to_string(),
+                    step_id,
+                    step_kind,
+                    result_type: result_type.to_string(),
+                    result_data,
+                    policy_summary,
+                    verification_refs,
+                    error_code,
+                    started_at,
+                    completed_at,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     // Upsert an agent session record
