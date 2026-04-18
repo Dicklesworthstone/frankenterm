@@ -21928,8 +21928,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
 
                                     // Call caut refresh
+                                    // ft-xbnl0.2.3 tick 272: cx-first caut refresh.
+                                    let caut_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let caut = frankenterm_core::caut::CautClient::new();
-                                    let refresh_result = match caut.refresh(caut_service).await {
+                                    let refresh_result = match caut.refresh_cx(&caut_cx, caut_service).await {
                                         Ok(r) => r,
                                         Err(e) => {
                                             let response =
@@ -31039,8 +31042,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 // Call caut refresh
+                // ft-xbnl0.2.3 tick 272: cx-first caut refresh.
+                let caut_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
                 let caut = frankenterm_core::caut::CautClient::new();
-                let refresh_result = match caut.refresh(caut_service).await {
+                let refresh_result = match caut.refresh_cx(&caut_cx, caut_service).await {
                     Ok(r) => r,
                     Err(e) => {
                         die(
