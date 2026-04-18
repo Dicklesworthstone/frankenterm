@@ -4586,10 +4586,8 @@ KBAhs4snj5QspGFqkazmIw==
 
             crate::runtime_compat::task::spawn(async move {
                 crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
-                cx_for_cancel.cancel_with(
-                    crate::outcome::CancelKind::User,
-                    Some("isolated race test"),
-                );
+                cx_for_cancel
+                    .cancel_with(crate::outcome::CancelKind::User, Some("isolated race test"));
             });
 
             let never_resolves = async {
