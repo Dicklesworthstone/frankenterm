@@ -2349,6 +2349,7 @@ impl WeztermClient {
     /// Routes the inner CLI invocation through
     /// `run_cli_with_pane_check_with_cx` and calls
     /// `retry_with_with_cx` so each attempt honours cancellation.
+    #[allow(dead_code)]
     async fn run_cli_with_pane_check_retry_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2374,6 +2375,7 @@ impl WeztermClient {
     ///
     /// Routes the inner CLI invocation through `run_cli_with_cx` and
     /// calls `retry_with_with_cx` so each attempt honours cancellation.
+    #[allow(dead_code)]
     async fn run_cli_with_retry_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2417,6 +2419,7 @@ impl WeztermClient {
     /// sleep. The inner `runner` closure is expected to route through
     /// a cx-first path itself; this helper only owns cancellation of
     /// the retry schedule, not of the underlying IO.
+    #[allow(dead_code)]
     async fn retry_with_with_cx<F, Fut>(
         &self,
         cx: &crate::cx::Cx,
