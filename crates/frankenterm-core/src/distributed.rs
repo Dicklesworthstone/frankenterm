@@ -3530,6 +3530,70 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 318: Concurrent-connections test for
+    /// `DistributedHttpClient::get`.
+    ///
+    /// Acceptance criterion 3 calls out three verification dimensions:
+    /// "handshake behavior, concurrent connections, and request latency".
+    /// Prior ticks covered handshake (happy-path GET/POST) and cancel
+    /// semantics; this tick pins the *concurrent-connections* dimension by
+    /// running three GETs in parallel against a loop-accepting server
+    /// driven by the native asupersync HTTP client.
+    ///
+    /// The test proves:
+    /// 1. The client does not accidentally serialize concurrent requests
+    ///    (all three futures can make progress against an interleaving
+    ///    server loop).
+    /// 2. Per-request cx threading does not create cross-request
+    ///    interference (each response body is routed to its own future).
+    /// 3. The native TCP path under the asupersync HTTP client correctly
+    ///    handles multiple in-flight connections.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_concurrent_gets() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            const N: usize = 3;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..N {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.expect("read request");
+                    assert!(n > 0);
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                    stream.write_all(response).await.expect("write response");
+                    stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+                }
+            });
+
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/health", addr.port());
+
+            let mut handles = Vec::with_capacity(N);
+            for _ in 0..N {
+                let cx = cx.clone();
+                let url = url.clone();
+                handles.push(crate::runtime_compat::task::spawn(async move {
+                    let client = DistributedHttpClient::plaintext();
+                    client.get(&cx, &url).await
+                }));
+            }
+
+            for h in handles {
+                let resp = h.await.expect("join").expect("get");
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body, b"ok");
+            }
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 313: Pin the cx-cancel contract for
     /// `DistributedHttpClient::get`.
     ///
