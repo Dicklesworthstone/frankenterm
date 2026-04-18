@@ -4564,6 +4564,67 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 398: POST does not auto-inject Content-Type.
+    ///
+    /// `DistributedHttpClient::post` accepts `body: Vec<u8>` as opaque
+    /// bytes. This test pins that the client does NOT auto-detect the
+    /// body shape (e.g. JSON vs form-encoded vs binary) and inject a
+    /// `Content-Type` header — that's the caller's responsibility.
+    ///
+    /// Why matters: distributed RPC endpoints rely on explicit request
+    /// shapes. An auto-injected `Content-Type: application/json` would
+    /// misroute bincode / msgpack / protobuf bodies at servers that
+    /// content-negotiate. The client should be transport-only, not
+    /// payload-inspecting.
+    ///
+    /// Test scans the server-received request lines for
+    /// `content-type:` (case-insensitive). If the asupersync HTTP
+    /// client sets a default, this test fires — the assertion doc
+    /// pointing at the finding.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_post_does_not_auto_inject_content_type() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                let lower = req.to_ascii_lowercase();
+                // Content-Type should NOT be auto-injected by the client.
+                // If asupersync's HTTP client starts setting a default,
+                // this test will fire — the bead author can then decide
+                // whether to pin the default explicitly or override it.
+                assert!(
+                    !lower.contains("content-type:"),
+                    "DistributedHttpClient::post must not auto-inject Content-Type; \
+                     got request: {req:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/opaque", addr.port());
+            // Body is valid JSON but that's incidental — the client shouldn't
+            // peek at the bytes to detect shape.
+            let body = br#"{"kind":"test","v":1}"#.to_vec();
+            let resp = client.post(&cx, &url, body).await.expect("post");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 389: Mid-flight cx-cancel on HTTP POST.
     ///
     /// Parallel to tick 380's GET test. Verifies the cancel-watcher
