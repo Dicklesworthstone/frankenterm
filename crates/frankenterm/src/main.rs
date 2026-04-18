@@ -21938,7 +21938,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 caut_service,
                                                 now_ms,
                                             );
-                                        if let Err(e) = storage.upsert_account(record.clone()).await
+                                        // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                                        let storage_cx = frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                                        if let Err(e) = storage
+                                            .upsert_account_with_cx(&storage_cx, record.clone())
+                                            .await
                                         {
                                             tracing::warn!(
                                                 "Failed to upsert account {}: {e}",
@@ -22832,7 +22837,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         since,
                     );
 
-                    match storage.insert_saved_search(record.clone()).await {
+                    // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage
+                        .insert_saved_search_with_cx(&storage_cx, record.clone())
+                        .await
+                    {
                         Ok(()) => {
                             if output_format.is_json() {
                                 let payload = serde_json::json!({
@@ -23423,7 +23434,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     SavedSearchCommands::Delete { name } => {
-                        match storage.delete_saved_search(&name).await {
+                        // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match storage.delete_saved_search_with_cx(&storage_cx, &name).await {
                             Ok(deleted) => {
                                 if deleted == 0 {
                                     if output_format.is_json() {
@@ -24134,7 +24148,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             created_at: now,
                             updated_at: now,
                         };
-                        match storage.insert_pane_bookmark(record).await {
+                        // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match storage
+                            .insert_pane_bookmark_with_cx(&storage_cx, record)
+                            .await
+                        {
                             Ok(id) => {
                                 if json {
                                     println!(
@@ -24208,7 +24228,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     BookmarkAction::Remove { alias, json } => {
-                        match storage.delete_pane_bookmark(&alias).await {
+                        // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match storage
+                            .delete_pane_bookmark_with_cx(&storage_cx, &alias)
+                            .await
+                        {
                             Ok(true) => {
                                 if json {
                                     println!(r#"{{"ok": true, "alias": "{}"}}"#, alias);
