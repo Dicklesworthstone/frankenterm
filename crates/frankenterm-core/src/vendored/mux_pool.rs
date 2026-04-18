@@ -285,6 +285,11 @@ impl MuxPool {
     }
 
     /// Return a healthy client to the pool for reuse.
+    ///
+    /// Legacy ambient path retained alongside the cx-first sibling
+    /// `return_client_with_cx` (below). Current production MuxPool
+    /// ops route through the cx-first path.
+    #[allow(dead_code)]
     async fn return_client(&self, client: DirectMuxClient) {
         tracing::trace!(
             subsystem = "mux_pool",
