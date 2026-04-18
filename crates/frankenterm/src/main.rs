@@ -7477,7 +7477,10 @@ async fn evaluate_approve(
 ) -> Result<RobotApproveData, RobotApproveError> {
     let code_hash = frankenterm_core::approval::hash_allow_once_code(code);
 
-    let token = match storage.get_approval_token(&code_hash).await {
+    // ft-xbnl0.2.3 tick 246: cx-first storage read.
+    let storage_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let token = match storage.get_approval_token_with_cx(&storage_cx, &code_hash).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err(RobotApproveError::new(
@@ -15757,7 +15760,10 @@ async fn run_saved_search_scheduler(
 
         let now = epoch_ms();
 
-        let searches = match storage.list_saved_searches().await {
+        // ft-xbnl0.2.3 tick 246: cx-first storage read.
+        let storage_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let searches = match storage.list_saved_searches_with_cx(&storage_cx).await {
             Ok(searches) => searches,
             Err(err) => {
                 tracing::warn!(error = %err, "Saved search scheduler: failed to list searches");
@@ -22897,36 +22903,41 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
                 Some(SearchCommands::Saved { command }) => match command {
-                    SavedSearchCommands::List => match storage.list_saved_searches().await {
-                        Ok(searches) => {
-                            if output_format.is_json() {
-                                let payload = serde_json::json!({
-                                    "ok": true,
-                                    "saved_searches": searches,
-                                    "total": searches.len(),
-                                    "version": frankenterm_core::VERSION,
-                                });
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                );
-                            } else {
-                                print!("{}", format_saved_searches_plain(&searches));
+                    SavedSearchCommands::List => {
+                        // ft-xbnl0.2.3 tick 246: cx-first storage read.
+                        let storage_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
+                        match storage.list_saved_searches_with_cx(&storage_cx).await {
+                            Ok(searches) => {
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({
+                                        "ok": true,
+                                        "saved_searches": searches,
+                                        "total": searches.len(),
+                                        "version": frankenterm_core::VERSION,
+                                    });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                    );
+                                } else {
+                                    print!("{}", format_saved_searches_plain(&searches));
+                                }
+                            }
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
+                                        e,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to list saved searches: {e}");
+                                }
+                                std::process::exit(1);
                             }
                         }
-                        Err(e) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to list saved searches: {e}");
-                            }
-                            std::process::exit(1);
-                        }
-                    },
+                    }
                     SavedSearchCommands::Run { name } => {
                         let saved = match storage.get_saved_search_by_name(&name).await {
                             Ok(Some(search)) => search,
@@ -28310,7 +28321,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 eprintln!("Limit:     {limit}");
             }
 
-            match storage.get_action_history(query).await {
+            // ft-xbnl0.2.3 tick 246: cx-first storage read.
+            let storage_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match storage.get_action_history_with_cx(&storage_cx, query).await {
                 Ok(actions) => {
                     if matches!(export_format.as_deref(), Some("csv")) {
                         let output = ActionHistoryRenderer::render_csv(&actions);
