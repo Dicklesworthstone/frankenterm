@@ -1378,6 +1378,35 @@ pub mod unix {
             None => Ok(None),
         }
     }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`] (asupersync
+    /// path). Mirrors the non-asupersync variant: pre-flight
+    /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`
+    /// so cancelled line-reading loops bail before the next
+    /// `lines.next()` poll. The underlying asupersync stream
+    /// doesn't itself observe cx here — this seam gates entry to
+    /// the wait.
+    pub async fn next_line_with_cx<T>(
+        cx: &crate::cx::Cx,
+        lines: &mut LineReader<T>,
+    ) -> io::Result<Option<String>>
+    where
+        T: AsyncRead + Unpin,
+    {
+        use asupersync::stream::StreamExt;
+
+        cx.checkpoint().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("next_line cancelled: {err}"),
+            )
+        })?;
+        match lines.next().await {
+            Some(Ok(line)) => Ok(Some(line)),
+            Some(Err(err)) => Err(err),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Unix socket aliases/helpers for the active runtime.

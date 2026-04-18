@@ -297,8 +297,9 @@ impl NativeEventListener {
             {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
+                    let child_cx = cx.clone();
                     connection_tasks.spawn(async move {
-                        if let Err(err) = handle_connection(stream, tx).await {
+                        if let Err(err) = handle_connection_with_cx(child_cx, stream, tx).await {
                             debug!(error = %err, "native event connection closed with error");
                         }
                     });
@@ -433,6 +434,70 @@ async fn handle_connection(
     Ok(())
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
+///
+/// Plugs the orphan-cx hole documented in tick 165's lesson:
+/// `dispatch_event_with_timeout` (called indirectly from this
+/// handler via `dispatch_event`) used `crate::cx::for_request()`
+/// for its mpsc reserve, severing the cancellation chain from
+/// `run_with_cx`'s parent cx. The cx-first variant routes the
+/// dispatch through `dispatch_event_with_cx`, which threads the
+/// caller's cx all the way into the `event_tx.reserve(&cx)` wait.
+///
+/// `next_line_with_cx` (tick 160) replaces the line-read so a
+/// cancelled parent can also interrupt a slow client. The pre-
+/// flight checkpoint gates the handler's first iteration.
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_connection_with_cx(
+    cx: crate::cx::Cx,
+    stream: UnixStream,
+    event_tx: mpsc::Sender<NativeEvent>,
+) -> Result<(), std::io::Error> {
+    debug!("native event connection accepted (cx path)");
+    cx.checkpoint().map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("native handle_connection cancelled pre-read: {err}"),
+        )
+    })?;
+    let mut lines = compat_unix::lines(compat_unix::buffered(stream));
+
+    while let Some(line) = compat_unix::next_line_with_cx(&cx, &mut lines).await? {
+        if line.len() > MAX_EVENT_LINE_BYTES {
+            warn!(len = line.len(), "native event line too large; dropping");
+            continue;
+        }
+
+        match decode_wire_event(&line) {
+            Ok(Some(event)) => {
+                let (event_kind, pane_id) = event_metadata(&event);
+                match dispatch_event_with_cx(&cx, &event_tx, event).await {
+                    EventDispatchOutcome::Sent => {
+                        debug!(event_kind, pane_id, "native event dispatched (cx path)");
+                    }
+                    EventDispatchOutcome::Backpressure => {
+                        debug!(
+                            event_kind,
+                            pane_id, "native event queue full; dropping event (cx path)"
+                        );
+                    }
+                    EventDispatchOutcome::Closed => {
+                        debug!(event_kind, pane_id, "native event channel closed (cx path)");
+                        break;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!(error = %err, "failed to decode native event (cx path)");
+            }
+        }
+    }
+
+    debug!("native event connection closed (cx path)");
+    Ok(())
+}
+
 fn event_metadata(event: &NativeEvent) -> (&'static str, u64) {
     match event {
         NativeEvent::PaneOutput { pane_id, .. } => ("pane_output", *pane_id),
@@ -450,6 +515,16 @@ async fn dispatch_event(
     dispatch_event_with_timeout(event_tx, event, EVENT_SEND_TIMEOUT).await
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event`].
+#[cfg(feature = "asupersync-runtime")]
+async fn dispatch_event_with_cx(
+    cx: &crate::cx::Cx,
+    event_tx: &mpsc::Sender<NativeEvent>,
+    event: NativeEvent,
+) -> EventDispatchOutcome {
+    dispatch_event_with_timeout_with_cx(cx, event_tx, event, EVENT_SEND_TIMEOUT).await
+}
+
 async fn dispatch_event_with_timeout(
     event_tx: &mpsc::Sender<NativeEvent>,
     event: NativeEvent,
@@ -465,6 +540,34 @@ async fn dispatch_event_with_timeout(
             EventDispatchOutcome::Sent
         }
         Ok(Err(_)) => EventDispatchOutcome::Closed,
+        Err(_) => EventDispatchOutcome::Backpressure,
+    }
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event_with_timeout`].
+///
+/// Threads the caller's cx into the `event_tx.reserve(cx)` wait,
+/// replacing the orphan `cx::for_request()` that severed the
+/// cancellation chain from `run_with_cx`'s parent. Also uses
+/// `timeout_with_cx` so a cx-cancel unblocks the reserve wait
+/// immediately rather than waiting for the full `send_timeout`.
+#[cfg(feature = "asupersync-runtime")]
+async fn dispatch_event_with_timeout_with_cx(
+    cx: &crate::cx::Cx,
+    event_tx: &mpsc::Sender<NativeEvent>,
+    event: NativeEvent,
+    send_timeout: Duration,
+) -> EventDispatchOutcome {
+    match crate::runtime_compat::timeout_with_cx(cx, send_timeout, event_tx.reserve(cx)).await {
+        Ok(Ok(permit)) => {
+            permit.send(event);
+            EventDispatchOutcome::Sent
+        }
+        Ok(Err(_)) => EventDispatchOutcome::Closed,
+        // `timeout_with_cx` Err surfaces as Backpressure to match
+        // the legacy semantics — at this layer we can't
+        // distinguish "queue full too long" from "parent cx
+        // cancelled", and both warrant dropping the event.
         Err(_) => EventDispatchOutcome::Backpressure,
     }
 }
