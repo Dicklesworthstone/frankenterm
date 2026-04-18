@@ -390,9 +390,17 @@ impl NotificationPipeline {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
             let muted = {
+                // Tick 198 (ft-xbnl0.2.3): route the mute-check through
+                // `is_event_muted_with_cx(cx, ...)` so caller
+                // cancellation lands at the storage pre-flight
+                // checkpoint rather than after the DB read. Previously
+                // used legacy `is_event_muted` which picked up cx via
+                // `Cx::current()` thread-local fallback — orphan hole
+                // whenever this notify path ran outside the caller's
+                // thread-local scope.
                 let storage_guard = storage.read_with_cx(cx).await;
                 storage_guard
-                    .is_event_muted(&identity_key, now_ms)
+                    .is_event_muted_with_cx(cx, &identity_key, now_ms)
                     .await
                     .unwrap_or(false)
             };
