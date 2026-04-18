@@ -690,7 +690,8 @@ impl WorkflowRunner {
 
             if let Some(step_plan) = step_plan.as_ref() {
                 if step_plan.idempotent {
-                    match check_step_idempotency(
+                    match check_step_idempotency_maybe_cx(
+                        cx,
                         &self.storage,
                         execution_id,
                         &step_plan.step_id,
