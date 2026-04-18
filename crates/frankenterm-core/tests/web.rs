@@ -211,6 +211,48 @@ mod web_tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 323: Pre-cancelled cx must refuse to bind.
+    ///
+    /// `start_web_server_with_cx` has a pre-flight `cx.checkpoint()` at
+    /// the top of the function. A cx that is already cancelled when the
+    /// call is made must cause the function to return `Err` *before*
+    /// any TCP bind is attempted — an operator who has abandoned the
+    /// request should not leave a socket in LISTEN state.
+    ///
+    /// Complements:
+    /// - tick 322: metrics server mid-flight cancel stops accept loop
+    ///   (parallel service-boundary contract on a different server)
+    /// - `web_health_with_cx_ephemeral_port`: happy path (live cx binds)
+    ///
+    /// Together they pin three timings of the cx signal: pre-start (this
+    /// tick), mid-start (metrics), and happy (pre-existing). ft-xbnl0.2.4
+    /// acceptance criterion 1 covers "TCP, TLS, and HTTP client or
+    /// service boundaries"; this is a service-boundary test.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_server_with_cx_pre_cancelled_refuses_to_bind() {
+        run_async_test(async {
+            let cx = frankenterm_core::cx::for_request();
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("pre-cancel web_server_with_cx test"),
+            );
+
+            let result =
+                start_web_server_with_cx(&cx, WebServerConfig::default().with_port(0)).await;
+
+            assert!(
+                result.is_err(),
+                "pre-cancelled cx must cause start_web_server_with_cx to fail (WebServerHandle does not impl Debug so result value is elided)"
+            );
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("cancelled") || err_msg.contains("start_web_server cancelled"),
+                "error should surface cancellation; got: {err_msg}"
+            );
+        });
+    }
+
     // =========================================================================
     // Hardening tests (wa-nu4.3.6.3)
     // =========================================================================
