@@ -23917,7 +23917,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::List { json }) => {
             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-            let panes = match wezterm.list_panes().await {
+            // ft-xbnl0.2.3 tick 233: cx-first.
+            let cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            let panes = match wezterm.list_panes_with_cx(&cx).await {
                 Ok(panes) => panes,
                 Err(e) => {
                     eprintln!("Failed to list panes: {e}");
@@ -24161,7 +24164,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Show { pane_id, output }) => {
             tracing::info!("Showing pane {} (output={})", pane_id, output);
             let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-            match wezterm.get_pane(pane_id).await {
+            // ft-xbnl0.2.3 tick 233: cx-first.
+            let cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
+            match wezterm.get_pane_with_cx(&cx, pane_id).await {
                 Ok(pane) => {
                     println!("Pane {}", pane.pane_id);
                     println!(
@@ -24198,7 +24204,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         println!("  TTY: {tty}");
                     }
                     if output {
-                        match wezterm.get_text(pane_id, false).await {
+                        // ft-xbnl0.2.3 tick 233: cx-first get_text reusing
+                        // `cx` from the same-scope get_pane migration above.
+                        match wezterm.get_text_with_cx(&cx, pane_id, false).await {
                             Ok(text) => {
                                 println!("\n--- Output ---");
                                 print!("{text}");
@@ -24296,7 +24304,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             if command_ctx.is_dry_run() {
                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                let pane_info = wezterm.get_pane(pane_id).await.ok();
+                // ft-xbnl0.2.3 tick 233: cx-first.
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let pane_info = wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
                     .await
@@ -24346,7 +24357,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
-                let pane_info = match wezterm.get_pane(pane_id).await {
+                // ft-xbnl0.2.3 tick 233: cx-first.
+                let cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let pane_info = match wezterm.get_pane_with_cx(&cx, pane_id).await {
                     Ok(info) => info,
                     Err(e) => {
                         let (_code, hint) = map_wezterm_error_to_robot(&e);
