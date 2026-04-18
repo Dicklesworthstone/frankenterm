@@ -32129,7 +32129,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 let scenario = Scenario::load(&scenario)?;
                 let mock = MockWezterm::new();
-                scenario.setup(&mock).await?;
+                // ft-xbnl0.2.3 tick 279: cx-first simulation setup/execute.
+                let sim_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                scenario.setup_with_cx(&sim_cx, &mock).await?;
 
                 if resize_timeline_json && !json {
                     return Err(frankenterm_core::Error::Runtime(
@@ -32173,8 +32176,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 if resize_timeline_json {
-                    let (executed, timeline) =
-                        scenario.execute_all_with_resize_timeline(&mock).await?;
+                    let (executed, timeline) = scenario
+                        .execute_all_with_resize_timeline_with_cx(&sim_cx, &mock)
+                        .await?;
                     let stage_summary = timeline.stage_summary();
                     let flame_samples = timeline.flame_samples();
 
@@ -32326,7 +32330,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     let mock_event = Scenario::to_mock_event(event)?;
-                    mock.inject(event.pane, mock_event).await?;
+                    // ft-xbnl0.2.3 tick 279: cx-first simulation mock inject.
+                    let inject_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    mock.inject_with_cx(&inject_cx, event.pane, mock_event).await?;
 
                     if json {
                         let ev = serde_json::json!({
