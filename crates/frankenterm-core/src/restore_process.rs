@@ -593,8 +593,9 @@ impl ProcessLauncher {
         cwd: &Path,
     ) -> Result<(), String> {
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
+        // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_shell_cx.
         self.wezterm
-            .send_text(pane_id, &cd_cmd)
+            .send_text_with_cx(cx, pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
         let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
@@ -602,7 +603,7 @@ impl ProcessLauncher {
         if shell != current_shell && !shell.is_empty() {
             let exec_cmd = format!("exec {shell}\r");
             self.wezterm
-                .send_text(pane_id, &exec_cmd)
+                .send_text_with_cx(cx, pane_id, &exec_cmd)
                 .await
                 .map_err(|e| format!("send exec: {e}"))?;
         }
@@ -644,14 +645,15 @@ impl ProcessLauncher {
         agent_type: &str,
     ) -> Result<(), String> {
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
+        // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_agent_cx.
         self.wezterm
-            .send_text(pane_id, &cd_cmd)
+            .send_text_with_cx(cx, pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
         let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
         let full_cmd = format!("{command}\r");
         self.wezterm
-            .send_text(pane_id, &full_cmd)
+            .send_text_with_cx(cx, pane_id, &full_cmd)
             .await
             .map_err(|e| format!("send agent command: {e}"))?;
         info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
