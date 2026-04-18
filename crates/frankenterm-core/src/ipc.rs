@@ -950,8 +950,19 @@ impl IpcServer {
                 break;
             }
 
-            match crate::runtime_compat::timeout(IPC_ACCEPT_POLL_INTERVAL, self.listener.accept())
-                .await
+            // Tick 192 (ft-xbnl0.2.3): accept-poll now bounded by the
+            // caller's cx via timeout_with_cx, matching the pattern
+            // used by native_events::run_with_cx. Previously this
+            // used ambient `timeout` which falls back to
+            // `Cx::current()` thread-local lookup — orphan cx hole
+            // whenever the server loop runs outside a thread-local
+            // cx scope (e.g. spawned directly from CLI startup).
+            match crate::runtime_compat::timeout_with_cx(
+                cx,
+                IPC_ACCEPT_POLL_INTERVAL,
+                self.listener.accept(),
+            )
+            .await
             {
                 Ok(Ok((stream, _addr))) => {
                     let ctx = ctx.clone();
