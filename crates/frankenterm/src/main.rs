@@ -15601,8 +15601,10 @@ async fn run_watcher(
                 }
             }
             _ => {
-                // No panes available, just mark shutdown
-                let _ = engine.mark_shutdown().await;
+                // No panes available, just mark shutdown (ft-xbnl0.2.3 tick 242: cx-first).
+                let shutdown_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                let _ = engine.mark_shutdown_with_cx(&shutdown_cx).await;
             }
         }
     }
@@ -28521,11 +28523,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             target_action_ids.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
 
             let mut results: Vec<UndoExecutionResult> = Vec::with_capacity(target_action_ids.len());
+            // ft-xbnl0.2.3 tick 242: cx-first undo dispatch.
+            let undo_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             for action_id in target_action_ids {
                 let request = UndoRequest::new(action_id)
                     .with_actor("human-cli")
                     .with_reason(reason.clone());
-                match executor.execute(request).await {
+                match executor.execute_with_cx(&undo_cx, request).await {
                     Ok(result) => results.push(result),
                     Err(err) => results.push(UndoExecutionResult {
                         action_id,
