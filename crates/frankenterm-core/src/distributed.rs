@@ -909,14 +909,31 @@ impl Default for DistributedHttpClient {
 #[cfg(feature = "distributed")]
 impl DistributedHttpClient {
     /// Create a client with default configuration (WebPKI roots for HTTPS).
+    ///
+    /// # Redirect policy (ft-kfkyi)
+    ///
+    /// This client is used for node-to-node RPC where URLs are supposed
+    /// to point at trusted peer nodes. Transparent redirect following
+    /// would let a compromised peer respond 302 with an attacker-controlled
+    /// `Location:` header and exfiltrate the next request's body there.
+    ///
+    /// The builder here disables redirect following explicitly via
+    /// `.no_redirects()` — 3xx responses are returned to the caller as
+    /// `Ok(Response{status: 3xx})` so the caller must decide whether
+    /// (and how) to follow.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: asupersync::http::h1::http_client::HttpClient::new(),
+            inner: asupersync::http::h1::http_client::HttpClient::builder()
+                .no_redirects()
+                .build(),
         }
     }
 
     /// Create a plaintext-only client for loopback/testing.
+    ///
+    /// Inherits the `no_redirects` policy of [`Self::new`] — see the
+    /// doc comment there for the security rationale.
     #[must_use]
     pub fn plaintext() -> Self {
         Self::new()
@@ -4166,37 +4183,32 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
-    /// ft-xbnl0.2.4 tick 349: 3xx redirect — observed-behavior snapshot.
+    /// ft-kfkyi: 3xx redirects are NOT transparently followed.
     ///
-    /// Discovery during development: `DistributedHttpClient` (built on
-    /// the default asupersync HTTP client config) currently **follows
-    /// 3xx redirects transparently**. A 302 with a `Location:` header
-    /// pointing at an unresolvable host causes the client to attempt
-    /// to connect to that location, which returns `Err(ConnectError)`.
+    /// `DistributedHttpClient` is used for distributed node-to-node RPC
+    /// where URLs are supposed to point at trusted peer nodes.
+    /// Transparent redirect following would let a compromised peer
+    /// respond `302 Location: http://attacker.com/` and exfiltrate the
+    /// next request's body.
     ///
-    /// This test pins that observed behavior — a 302 with an invalid
-    /// Location returns `Err(ConnectError-shaped error)`, NOT `Ok(302)`.
+    /// The client construction site now explicitly disables redirects
+    /// via `.no_redirects()` on the asupersync HttpClient builder. This
+    /// test pins that contract: a 302 response is surfaced to the
+    /// caller as `Ok(Response{status: 302})`, never transparently
+    /// followed.
     ///
-    /// **SECURITY NOTE**: transparent redirect following is a concern
-    /// for a distributed RPC client where URLs are supposed to point
-    /// at trusted peer nodes. A compromised peer could respond 302 →
-    /// `Location: http://attacker.com/` and exfiltrate the next
-    /// request's body there. The HTTP-client layer should probably
-    /// default to `RedirectPolicy::none()` for DistributedHttpClient
-    /// so the decision to follow is explicit at the caller. That's
-    /// a follow-up bead (not ft-xbnl0.2.4 scope — this bead is about
-    /// migrating OFF tokio, not about client policy defaults).
+    /// The server responds 302 with `Location: http://does-not-resolve.invalid./`.
+    /// If the client were following redirects, it would try to connect
+    /// to that unresolvable host and return Err — and this test would
+    /// fail with a diagnostic pointing at RedirectPolicy regression.
     ///
-    /// The current test pins the status quo so:
-    /// 1. Any caller relying on the current "Err on redirect"
-    ///    behavior (e.g. treating it as unreachable) stays working.
-    /// 2. A future change to `RedirectPolicy::none()` will cause this
-    ///    test to fail with a clear signal — update the test to
-    ///    assert `resp.status == 302` and the security concern is
-    ///    resolved.
+    /// History: tick 349 added this as a "current-behavior-snapshot"
+    /// test asserting Err (current behavior was to follow). Tick 351
+    /// (ft-kfkyi fix) switched the construction site to `.no_redirects()`
+    /// and flipped this test to assert Ok(302).
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_http_client_3xx_redirect_current_behavior_snapshot() {
+    fn distributed_http_client_returns_3xx_redirect_as_ok_response() {
         run_async_test(async {
             use asupersync::io::AsyncWriteExt as _;
 
@@ -4207,7 +4219,6 @@ KBAhs4snj5QspGFqkazmIw==
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
-                // 302 Found with a Location pointing at an unresolvable host.
                 let response = b"HTTP/1.1 302 Found\r\n\
                                  Location: http://does-not-resolve.invalid./\r\n\
                                  Content-Length: 0\r\n\r\n";
@@ -4219,22 +4230,23 @@ KBAhs4snj5QspGFqkazmIw==
             let cx = asupersync::cx::Cx::for_testing();
             let url = format!("http://127.0.0.1:{}/origin", addr.port());
 
-            let result = client.get(&cx, &url).await;
+            let started = std::time::Instant::now();
+            let resp = client
+                .get(&cx, &url)
+                .await
+                .expect("3xx must be Ok(Response) with .no_redirects() policy");
+            let elapsed = started.elapsed();
 
-            // Current behavior: client follows redirect, hits DNS
-            // failure on the invalid Location, returns Err.
-            //
-            // If a future commit configures RedirectPolicy::none() at
-            // the DistributedHttpClient construction site, this test
-            // will flip to passing an Err-shaped assertion — that's
-            // the intended trigger to update this test to assert
-            // `resp.status == 302` for the security-improved path.
+            assert_eq!(
+                resp.status, 302,
+                "302 redirect must be observable as Ok(Response{{status: 302}}) — \
+                 if this fails with an Err, the RedirectPolicy likely regressed \
+                 to transparent-follow and the security concern (peer-injected \
+                 exfiltration via Location) is back open."
+            );
             assert!(
-                result.is_err(),
-                "current behavior: 302 with unresolvable Location → Err(ConnectError-shaped). \
-                 If this assertion flips, RedirectPolicy likely changed — update the test to \
-                 assert status == 302 and the transparent-redirect security concern is \
-                 resolved. got: {result:?}"
+                elapsed < std::time::Duration::from_secs(5),
+                "client must not burn DNS time trying to follow the redirect; took {elapsed:?}"
             );
 
             server_task.await.expect("join");
