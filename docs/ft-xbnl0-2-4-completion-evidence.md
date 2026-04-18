@@ -253,6 +253,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
 - [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 73 tests pass: 21 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web)
+- [ ] `rch exec -- cargo test -p frankenterm-core --features distributed --lib distributed::tests::` passes (154/154 ok as of tick 362; verifies the broader `distributed::tests::` surface that the narrower check script's `tls_` filter doesn't hit)
 - [ ] `rch exec -- cargo fmt --check` is clean — files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) are pre-formatted as of tick 355
 - [ ] `rch exec -- cargo clippy -D warnings` for this crate — *see note 6.1 below*
 - [ ] Artifact bundles saved per shared verification contract §"Level C"
@@ -261,12 +262,19 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 - [ ] Closing note cites this document path (`docs/ft-xbnl0-2-4-completion-evidence.md`)
   and the latest smoke artifact path rather than re-summarizing
 
-### 6.1 Notes on adjacent gate failures unrelated to this bead
+### 6.1 Notes on adjacent gate findings unrelated to this bead
 
 Two findings surfaced during verification that are **not scoped to
-ft-xbnl0.2.4** but may affect workspace-level closure gates. Both are
-recommended for handling as separate follow-up beads rather than
-blocking this bead's closure.
+ft-xbnl0.2.4** but touch workspace-level closure gates. As of tick 362,
+one is resolved in-session (§6.1.2) and one remains open as a separate
+follow-up (§6.1.1). Both were filed as separate follow-up beads rather
+than blocking this bead's closure.
+
+- **§6.1.1** (workspace clippy) — filed ft-jqvg5 (P3, open). Needs
+  coordination with owners of `ipc.rs`, `robot_sdk_contracts.rs`,
+  `runtime.rs`, `snapshot_engine.rs`, `ui_query.rs`, `workflows/*.rs`.
+- **§6.1.2** (`bundle_acceptor_connector_mtls` test) — filed ft-326s9
+  (P3), fixed and closed same-session (tick 362). No remaining work.
 
 #### 6.1.1 Workspace clippy gate
 
@@ -286,14 +294,32 @@ Closing recommendation: either (a) block closure behind the workspace-level clip
 
 Option (b) is consistent with AGENTS.md guidance on not disturbing other agents' in-progress work — the clippy violations may be intentional (awaiting `#[allow(...)]` annotations from their owners) and fixing them here without coordination would cross scope boundaries.
 
-#### 6.1.2 Pre-existing `bundle_acceptor_connector_mtls` test failure
+#### 6.1.2 `bundle_acceptor_connector_mtls` test failure → RESOLVED (tick 362)
 
-Running the broad `§4b` command `cargo test --lib distributed::tests::` surfaces a single failing test: `distributed::tests::bundle_acceptor_connector_mtls` at `distributed.rs:3805`. Failure message: `client bundle: MissingClientCaPath`.
+**Status: RESOLVED**. Filed as ft-326s9 (tick 361), fixed + closed
+tick 362 via commit `c799aad4`.
 
-The test constructs a `client_cfg` with `auth_mode = Mtls` but **without** `client_ca_path` populated, then expects `build_tls_bundle(&client_cfg, ...)` to succeed. The current `build_server_config` requires `client_ca_path` whenever `auth_mode.requires_mtls()` and returns `MissingClientCaPath` otherwise — this is the exact behavior `build_tls_bundle_rejects_mtls_without_client_ca_path` (tick 337) explicitly pins as correct.
+The test at `distributed.rs:3805` was constructing a `client_cfg` with
+`auth_mode = Mtls` but without `client_ca_path` populated, then expecting
+`build_tls_bundle(&client_cfg, ...)` to succeed. The current
+`build_server_config` requires `client_ca_path` whenever
+`auth_mode.requires_mtls()` — the tick-337 positive-guard
+(`build_tls_bundle_rejects_mtls_without_client_ca_path`) explicitly pins
+that behavior as correct. So the fix was in the test, not in production.
 
-**Attribution** (via `git blame`): the failing test was authored by `jemanuel` on 2026-04-10 — 8 days before this session started. The test predates this session's work; this session's work did NOT cause the failure. The `build_server_config` logic that produces the error has been present throughout.
+**Fix**: populated `client_cfg.tls.client_ca_path` with the same CA the
+server uses to verify client certs. 1-line change in the test. Now:
+- `bundle_acceptor_connector_mtls` alone: 1/1 ok (was 0/1 failing).
+- Broad `distributed::tests::` filter: **154/154 ok** (was 153/154).
 
-The narrower filter in `scripts/check_ft_xbnl0_2_4.sh` (`--lib tls_`) does NOT catch this test — `bundle_acceptor_connector_mtls` has no `tls_` substring (the `mtls` token has no underscore after). That's why the check script runs 73/73 passing while the broader individual-command in §4b surfaces the failure.
+Attribution: the failing test was authored by `jemanuel` on
+2026-04-10 — 8 days before this session started. Fix is a test-file-only
+change that matches both the test's intent (exercise bidirectional mTLS)
+and production logic, so the "don't disturb other agents' work"
+AGENTS.md guidance was satisfied.
 
-Closing recommendation: the same "option (b)" pattern applies. Close this bead with a cross-reference noting that its scoped check script passes 73/73, and file a separate bead for the `bundle_acceptor_connector_mtls` test author to either (a) add `client_ca_path` to `client_cfg`, (b) restructure the bundle's Mtls validation, or (c) deprecate the test if the config shape is intentionally invalid.
+The narrower filter in `scripts/check_ft_xbnl0_2_4.sh` (`--lib tls_`)
+still doesn't catch this test (its name has `mtls` with no `tls_`
+substring). That was fine before the fix (avoiding a known-broken
+unrelated test) and remains fine after (the test passes independently
+and is verified by the broader §4b command).
