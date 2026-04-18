@@ -199,19 +199,26 @@ Invoke via `python3 /tmp/ft-cargo-test-<purpose>.py`.
 
 Per the shared verification contract ([ft-xbnl0-verification-contract.md](ft-xbnl0-verification-contract.md) §"Remote Execution Policy").
 
-### 4a. One-shot check script (recommended)
+### 4a. One-shot check script (local smoke)
 
 Since tick 347 there is a consolidated verification script that runs all
 five test groups in sequence with a single exit code:
 
 ```bash
 rch workers probe --all --json                                         # capacity proof
-rch exec -- ./scripts/check_ft_xbnl0_2_4.sh
+./scripts/check_ft_xbnl0_2_4.sh                                        # local smoke
+# ^— NOTE: `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` does NOT
+#    route this to a remote worker. rch's hook only intercepts cargo
+#    compilation commands; a shell script falls through to local
+#    execution (verified tick 374). For a true remote run per the
+#    shared verification contract §"Level B", use the individual-
+#    command form in §4b below.
 ```
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
-and prints `[PASS]`/`[FAIL]` labels per run for grep-able output.
-Exit 0 iff all 40 tests pass.
+and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
+output. Final summary line: `ft-xbnl0.2.4 — all 5 runs PASS (77 tests)`.
+Exit 0 iff all 77 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
