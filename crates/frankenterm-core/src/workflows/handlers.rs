@@ -588,6 +588,230 @@ impl Workflow for HandleSessionEnd {
             }
         })
     }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 214). First per-impl
+    /// Workflow override in the codebase — sets the pattern for the
+    /// other 7+ impls in this file.
+    ///
+    /// Routes all 3 storage calls through their cx-first siblings:
+    ///   - `get_sessions_for_pane_with_cx` (read)
+    ///   - `upsert_agent_session_with_cx` (write, routes through
+    ///     `send_with_cx` mpsc backpressure path from tick 173)
+    ///   - `record_usage_metrics_batch_with_cx` (write)
+    ///
+    /// Pre-step cx.checkpoint() gates entry so a cx-cancel fired
+    /// between steps short-circuits before touching storage.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_session_end cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Extract and validate detection data
+                0 => {
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    tracing::info!(
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        has_trigger = !trigger.is_null(),
+                        explicit_cx = true,
+                        "handle_session_end: extracted session data from detection (cx)"
+                    );
+
+                    StepResult::cont()
+                }
+
+                // Step 1: Build and persist the session record (cx-first)
+                1 => {
+                    let mut record = Self::record_from_detection(pane_id, &trigger);
+
+                    if let Ok(existing) = storage.get_sessions_for_pane_with_cx(cx, pane_id).await {
+                        let want_session_id = record.session_id.as_deref();
+                        let candidate = existing
+                            .into_iter()
+                            .filter(|s| s.ended_at.is_none() && s.agent_type == record.agent_type)
+                            .filter(|s| {
+                                want_session_id.is_none_or(|id| s.session_id.as_deref() == Some(id))
+                            })
+                            .max_by_key(|s| s.started_at);
+
+                        if let Some(active) = candidate {
+                            record.id = active.id;
+                            record.started_at = active.started_at;
+                            if record.session_id.is_none() {
+                                record.session_id = active.session_id;
+                            }
+                            if record.external_id.is_none() {
+                                record.external_id = active.external_id;
+                            }
+                            if record.external_meta.is_none() {
+                                record.external_meta = active.external_meta;
+                            }
+                        }
+                    }
+
+                    let agent_type = record.agent_type.clone();
+                    let session_id = record.session_id.clone();
+                    let has_tokens = record.total_tokens.is_some();
+                    let has_cost = record.estimated_cost_usd.is_some();
+                    let record_for_metrics = record.clone();
+
+                    match storage.upsert_agent_session_with_cx(cx, record).await {
+                        Ok(db_id) => {
+                            let mut metrics: Vec<crate::storage::UsageMetricRecord> = Vec::new();
+                            let now = now_ms();
+
+                            if let Some(total) = record_for_metrics.total_tokens {
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: now,
+                                    metric_type: crate::storage::MetricType::TokenUsage,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: None,
+                                    amount: None,
+                                    tokens: Some(total),
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "input_tokens": record_for_metrics.input_tokens,
+                                            "output_tokens": record_for_metrics.output_tokens,
+                                            "cached_tokens": record_for_metrics.cached_tokens,
+                                            "reasoning_tokens": record_for_metrics.reasoning_tokens,
+                                            "model": record_for_metrics.model_name.clone(),
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if let Some(cost) = record_for_metrics.estimated_cost_usd {
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: now,
+                                    metric_type: crate::storage::MetricType::ApiCost,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: None,
+                                    amount: Some(cost),
+                                    tokens: None,
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "model": record_for_metrics.model_name.clone(),
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if let Some(ended_at) = record_for_metrics.ended_at {
+                                let duration_ms =
+                                    ended_at.saturating_sub(record_for_metrics.started_at);
+                                let duration_secs = duration_ms / 1000;
+                                metrics.push(crate::storage::UsageMetricRecord {
+                                    id: 0,
+                                    timestamp: ended_at,
+                                    metric_type: crate::storage::MetricType::SessionDuration,
+                                    pane_id: Some(pane_id),
+                                    agent_type: Some(record_for_metrics.agent_type.clone()),
+                                    account_id: None,
+                                    workflow_id: None,
+                                    count: Some(duration_secs),
+                                    amount: None,
+                                    tokens: None,
+                                    metadata: Some(
+                                        serde_json::json!({
+                                            "source": "workflow.handle_session_end",
+                                            "session_id": record_for_metrics.session_id.clone(),
+                                            "duration_ms": duration_ms,
+                                        })
+                                        .to_string(),
+                                    ),
+                                    created_at: now,
+                                });
+                            }
+
+                            if !metrics.is_empty() {
+                                if let Err(err) =
+                                    storage.record_usage_metrics_batch_with_cx(cx, metrics).await
+                                {
+                                    tracing::warn!(
+                                        pane_id,
+                                        error = %err,
+                                        explicit_cx = true,
+                                        "handle_session_end: failed to record usage metrics (cx)"
+                                    );
+                                }
+                            }
+
+                            tracing::info!(
+                                pane_id,
+                                db_id,
+                                agent_type = %agent_type,
+                                session_id = ?session_id,
+                                has_tokens,
+                                has_cost,
+                                explicit_cx = true,
+                                "handle_session_end: persisted session record (cx)"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "persisted",
+                                "db_id": db_id,
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "session_id": session_id,
+                                "has_tokens": has_tokens,
+                                "has_cost": has_cost,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                explicit_cx = true,
+                                "handle_session_end: failed to persist session record (cx)"
+                            );
+                            StepResult::abort(format!("Failed to persist session: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
 }
 
 // ============================================================================
