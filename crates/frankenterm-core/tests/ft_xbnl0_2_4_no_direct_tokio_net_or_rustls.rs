@@ -89,11 +89,11 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Flag lines whose trimmed content starts with:
-///   - `use tokio::net::Tcp`
-///   - `use tokio_rustls`
-///   - `pub use tokio::net::Tcp`
-///   - `pub use tokio_rustls`
-///   - `extern crate tokio_rustls`
+///   - `use tokio::net::Tcp`  (TCP surface)
+///   - `use tokio_rustls`     (tokio TLS)
+///   - `use hyper`            (tokio HTTP)
+///   - `use async_native_tls` (tokio TLS alternate)
+///   - `pub use` / `extern crate` variants of above
 ///
 /// The `::Tcp` prefix targets `TcpListener` / `TcpStream` re-exports.
 /// Unix-domain sockets (`UnixListener`/`UnixStream`) are intentionally
@@ -118,7 +118,15 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
             let is_tokio_rustls = trimmed.starts_with("use tokio_rustls")
                 || trimmed.starts_with("pub use tokio_rustls")
                 || trimmed.starts_with("extern crate tokio_rustls");
-            if is_tokio_tcp_net || is_tokio_rustls {
+            let is_hyper = trimmed.starts_with("use hyper")
+                || trimmed.starts_with("pub use hyper")
+                || trimmed.starts_with("extern crate hyper");
+            let is_async_native_tls = trimmed.starts_with("use async_native_tls")
+                || trimmed.starts_with("pub use async_native_tls")
+                || trimmed.starts_with("extern crate async_native_tls")
+                || trimmed.starts_with("use async-native-tls")
+                || trimmed.starts_with("pub use async-native-tls");
+            if is_tokio_tcp_net || is_tokio_rustls || is_hyper || is_async_native_tls {
                 Some((idx + 1, line.to_string()))
             } else {
                 None
@@ -127,7 +135,7 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn scan_toml_for_tokio_rustls_dep(path: &Path) -> Vec<(usize, String)> {
+fn scan_toml_for_banned_net_dep(path: &Path) -> Vec<(usize, String)> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -137,11 +145,16 @@ fn scan_toml_for_tokio_rustls_dep(path: &Path) -> Vec<(usize, String)> {
         .enumerate()
         .filter_map(|(idx, line)| {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("tokio-rustls ")
-                || trimmed.starts_with("tokio-rustls=")
-                || trimmed.starts_with("tokio-rustls.")
-                || trimmed.starts_with("tokio_rustls ")
-                || trimmed.starts_with("tokio_rustls=")
+            let starts_like_dep = |name: &str| {
+                trimmed.starts_with(&format!("{name} "))
+                    || trimmed.starts_with(&format!("{name}="))
+                    || trimmed.starts_with(&format!("{name}."))
+            };
+            if starts_like_dep("tokio-rustls")
+                || starts_like_dep("tokio_rustls")
+                || starts_like_dep("hyper")
+                || starts_like_dep("async-native-tls")
+                || starts_like_dep("async_native_tls")
             {
                 Some((idx + 1, line.to_string()))
             } else {
@@ -182,7 +195,7 @@ fn collect_workspace_cargo_manifests(root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn ft_xbnl0_2_4_no_direct_tokio_tcp_or_rustls_imports() {
+fn ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports() {
     let root = workspace_root();
     let mut rust_files = Vec::new();
     for src_root in supported_path_roots(&root) {
@@ -207,10 +220,11 @@ fn ft_xbnl0_2_4_no_direct_tokio_tcp_or_rustls_imports() {
 
     assert!(
         violations.is_empty(),
-        "ft-xbnl0.2.4 regression: {} file(s) reintroduced direct tokio TCP \
-         or tokio_rustls usage. Replace with asupersync::net::{{TcpStream, \
-         TcpListener}} or asupersync::tls::{{TlsAcceptor, TlsConnector}} \
-         before re-running:\n{}",
+        "ft-xbnl0.2.4 regression: {} file(s) reintroduced direct tokio-era \
+         networking imports (tokio::net::Tcp* / tokio_rustls / hyper / \
+         async_native_tls). Replace with asupersync::net::{{TcpStream, \
+         TcpListener}}, asupersync::tls::{{TlsAcceptor, TlsConnector}}, \
+         or asupersync::http before re-running:\n{}",
         violations.len(),
         violations
             .iter()
@@ -227,14 +241,14 @@ fn ft_xbnl0_2_4_no_direct_tokio_tcp_or_rustls_imports() {
 }
 
 #[test]
-fn ft_xbnl0_2_4_no_tokio_rustls_in_workspace_manifests() {
+fn ft_xbnl0_2_4_no_tokio_net_deps_in_workspace_manifests() {
     let root = workspace_root();
     let mut manifests = Vec::new();
     collect_workspace_cargo_manifests(&root, &mut manifests);
 
     let mut violations: Vec<(PathBuf, Vec<(usize, String)>)> = Vec::new();
     for path in &manifests {
-        let hits = scan_toml_for_tokio_rustls_dep(path);
+        let hits = scan_toml_for_banned_net_dep(path);
         if !hits.is_empty() {
             violations.push((path.clone(), hits));
         }
@@ -243,8 +257,9 @@ fn ft_xbnl0_2_4_no_tokio_rustls_in_workspace_manifests() {
     assert!(
         violations.is_empty(),
         "ft-xbnl0.2.4 regression: {} workspace Cargo.toml file(s) declare \
-         a tokio-rustls dependency. Remove the declaration or replace with \
-         asupersync::tls before re-running:\n{}",
+         a banned tokio-era networking dependency (tokio-rustls / hyper / \
+         async-native-tls). Remove the declaration or replace with \
+         asupersync::{{net, tls, http}} before re-running:\n{}",
         violations.len(),
         violations
             .iter()
