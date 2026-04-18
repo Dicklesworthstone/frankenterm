@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **14 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
+| 3 | Verification covers correctness + basic performance non-regression | **21 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests** (§2.1, §2.2, §2.3) |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -50,6 +50,12 @@ surface of `DistributedHttpClient`:
 | Empty-body POST → `Content-Length: 0` | `distributed_http_client_post_empty_body_sends_content_length_zero` | 326 |
 | Large-body POST (128 KiB) roundtrip | `distributed_http_client_post_large_body_roundtrips` | 327 |
 | Non-empty User-Agent header | `distributed_http_client_sends_non_empty_user_agent` | 332 |
+| HTTPS URL against plaintext server → Err | `distributed_http_client_https_url_against_plaintext_server_returns_err` | 342 |
+| Invalid URL inputs → Err without panic | `distributed_http_client_rejects_invalid_urls_without_panic` | 343 |
+| IPv6 literal URL (bracketed authority) | `distributed_http_client_handles_ipv6_literal_url` | 344 |
+| Premature server close → Err | `distributed_http_client_surfaces_premature_server_close_as_err` | 345 |
+| 3xx redirect → `Ok(Response{status: 302})` (ft-kfkyi) | `distributed_http_client_returns_3xx_redirect_as_ok_response` | 349→351 |
+| 3xx no-follow — resolvable Location (ft-kfkyi companion) | `distributed_http_client_does_not_follow_3xx_even_with_resolvable_location` | 352 |
 
 **Return-type three-outcome matrix** (criterion 3 correctness):
 - 2xx response body → `Ok(Response{status: 2xx, body})`
@@ -233,16 +239,20 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 
 ## 5. Out of Scope
 
-- **Runtime-level cancel-aware `timeout_with_cx`**: the primitive observes budget deadline but not direct cancel (documented tick 328). Callers must pre-flight with `cx.checkpoint()?`. Changing the primitive would be a cross-crate change belonging in a follow-up bead.
+- **Runtime-level cancel-aware `timeout_with_cx` / `sleep_with_cx`**: the primitives observe budget deadline but not direct cancel (documented ticks 328 + 331). Callers must pre-flight with `cx.checkpoint()?`. Changing the primitives would be a cross-crate change belonging in a follow-up bead.
 - **Performance benchmark**: criterion 3 mentions "basic performance non-regression". A bench comparing asupersync vs the old tokio-based client path would require a historical baseline that no longer exists (the old path is gone). The correctness-focused contract tests in §2.1 are the effective performance floor.
 - **TLS mid-handshake cancel**: `TlsAcceptor::accept` / `TlsConnector::connect` do not currently take a `&Cx` parameter, so cx-cancel during handshake is observable only via the outer timeout, not at the handshake primitive itself. That would be an asupersync API extension, out of scope for ft-xbnl0.2.4.
+
+### 5a. Resolved adjacent concerns
+
+- **3xx transparent redirect following (ft-kfkyi)**: discovered during tick 349 verification work. Security concern — a compromised peer could respond 302 with `Location: http://attacker.com/` to exfiltrate the next request's body. Resolved: `DistributedHttpClient::new()` now constructs via the asupersync HttpClient builder with `.no_redirects()` explicitly set (tick 351, commit `4717c434`). Two tests pin the contract: `distributed_http_client_returns_3xx_redirect_as_ok_response` (unresolvable Location, tick 351) and `distributed_http_client_does_not_follow_3xx_even_with_resolvable_location` (resolvable Location + secondary listener counter, tick 352). ft-kfkyi bead closed tick 351.
 
 ---
 
 ## 6. Closure Checklist (when ready to close)
 
 - [ ] `rch workers probe --all --json` shows at least one reachable worker
-- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 40 tests pass)
+- [ ] `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` exits 0 (all 42 tests pass)
 - [ ] `rch exec -- cargo fmt --check` is clean
 - [ ] Artifact bundles saved per shared verification contract §"Level C"
   (the check script output + a copy of this doc + the smoke artifact
