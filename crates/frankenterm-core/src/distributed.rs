@@ -4526,6 +4526,77 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 365: `Arc<DistributedHttpClient>` shared across tasks.
+    ///
+    /// Runtime companion to the tick-364 compile-time `Send + Sync`
+    /// assertion. Proves that wrapping the client in `Arc<>` and
+    /// sharing a *single* client instance across concurrent request
+    /// tasks actually works end-to-end — matches the tick-318
+    /// concurrent-GET pattern but with one shared client instead of
+    /// per-task clients.
+    ///
+    /// This is the pattern distributed RPC code uses in production:
+    /// one `Arc<DistributedHttpClient>` stored in the orchestrator,
+    /// cloned cheaply (Arc refcount increment) into each outbound
+    /// request task. If connection pooling inside the client assumes
+    /// single-threaded access, this test fails.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_shared_arc_across_tasks() {
+        use std::sync::Arc;
+
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            const N: usize = 3;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                for _ in 0..N {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.expect("read");
+                    assert!(n > 0);
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nshared";
+                    stream.write_all(response).await.expect("write response");
+                    stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+                }
+            });
+
+            // ONE shared client wrapped in Arc. Each task clones the
+            // Arc (refcount increment), not the underlying client —
+            // the inner connection pool is literally the same instance
+            // across all three request tasks.
+            let client = Arc::new(DistributedHttpClient::plaintext());
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/shared", addr.port());
+
+            let mut handles = Vec::with_capacity(N);
+            for _ in 0..N {
+                let client = Arc::clone(&client);
+                let cx = cx.clone();
+                let url = url.clone();
+                handles.push(crate::runtime_compat::task::spawn(async move {
+                    client.get(&cx, &url).await
+                }));
+            }
+
+            for h in handles {
+                let resp = h.await.expect("join").expect("get");
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body, b"shared");
+            }
+
+            server_task.await.expect("join");
+
+            // Sanity: after all tasks dropped their clones, strong count
+            // returns to 1 (the local `client` binding).
+            assert_eq!(Arc::strong_count(&client), 1);
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 364: `DistributedHttpClient` is `Send + Sync`.
     ///
     /// Compile-time assertion. The client holds an
