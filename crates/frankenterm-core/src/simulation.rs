@@ -1180,7 +1180,10 @@ impl TutorialSandbox {
 
         match kind {
             ExpectationKind::Contains { pane, text } => {
-                if let Ok(content) = self.mock.get_text(*pane, false).await {
+                // ft-xbnl0.2.3 tick 263: cx-first simulation expectation check.
+                let expect_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
+                if let Ok(content) = self.mock.get_text_with_cx(&expect_cx, *pane, false).await {
                     content.contains(text)
                 } else {
                     false
