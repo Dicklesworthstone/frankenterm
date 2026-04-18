@@ -3594,6 +3594,65 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 319: Non-2xx response handling contract.
+    ///
+    /// Pins that `DistributedHttpClient::get` returns server error
+    /// responses (404, 500) via `Ok(Response{status, body})` rather than
+    /// mapping them to `Err`. The distinction matters: `Err` is for
+    /// transport/connection failures, `Ok` with a non-2xx status is a
+    /// successful HTTP round-trip that the caller must interpret.
+    ///
+    /// Confusing the two breaks retry logic — a caller that retries on
+    /// `Err` would retry a 404 forever (it is not a transport issue and
+    /// will not succeed on retry), while a caller that checks `.status`
+    /// can correctly distinguish permanent from transient failures.
+    ///
+    /// Acceptance criterion 3 of ft-xbnl0.2.4 ("Verification covers
+    /// correctness") includes this contract.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_returns_non_2xx_as_ok_response() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            // Spin up server that responds 404 to first request, 500 to second.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                for (status, body) in &[("404 Not Found", "gone"), ("500 Internal Server Error", "broken")] {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.expect("read request");
+                    assert!(n > 0);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write response");
+                    stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+                }
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            let url = format!("http://127.0.0.1:{}/missing", addr.port());
+
+            let resp_404 = client.get(&cx, &url).await.expect("404 must be Ok");
+            assert_eq!(resp_404.status, 404, "404 body: {:?}", resp_404.body);
+            assert_eq!(resp_404.body, b"gone");
+
+            let resp_500 = client.get(&cx, &url).await.expect("500 must be Ok");
+            assert_eq!(resp_500.status, 500, "500 body: {:?}", resp_500.body);
+            assert_eq!(resp_500.body, b"broken");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 313: Pin the cx-cancel contract for
     /// `DistributedHttpClient::get`.
     ///
