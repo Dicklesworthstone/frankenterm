@@ -18294,7 +18294,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         until,
                                         limit: scan_batch_size,
                                     };
-                                    let segments = match storage.scan_segments(query).await {
+                                    // ft-xbnl0.2.3 tick 271: cx-first segment scan.
+                                    let scan_cx = frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                                    let segments = match storage
+                                        .scan_segments_with_cx(&scan_cx, query)
+                                        .await
+                                    {
                                         Ok(segments) => segments,
                                         Err(err) => {
                                             let response = RobotResponse::<
@@ -18709,7 +18715,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
 
                                         if let Err(e) =
-                                            storage.set_event_note(event_id, note, by.clone()).await
+                                            {
+                                            // ft-xbnl0.2.3 tick 271: cx-first event note set.
+                                            let note_cx = frankenterm_core::cx::Cx::current()
+                                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                                            storage.set_event_note_with_cx(&note_cx, event_id, note, by.clone()).await
+                                        }
                                         {
                                             let response = RobotResponse::<RobotEventMutationData>::error_with_code(
                                                 ROBOT_ERR_STORAGE,
@@ -19920,17 +19931,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     } else {
                                         // Query active/by-pane workflows
+                                        // ft-xbnl0.2.3 tick 271: cx-first workflow query.
+                                        let workflows_cx = frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request);
                                         let records = if active {
-                                            storage.find_incomplete_workflows().await
+                                            storage.find_incomplete_workflows_with_cx(&workflows_cx).await
                                         } else if let Some(pane_id) = pane {
                                             let query = frankenterm_core::storage::ExportQuery {
                                                 pane_id: Some(pane_id),
                                                 limit: Some(50),
                                                 ..Default::default()
                                             };
-                                            storage.export_workflows(query).await
+                                            storage.export_workflows_with_cx(&workflows_cx, query).await
                                         } else {
-                                            storage.find_incomplete_workflows().await
+                                            storage.find_incomplete_workflows_with_cx(&workflows_cx).await
                                         };
 
                                         match records {
@@ -22756,7 +22770,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             println!("Rebuilding FTS index...");
                         }
                         let config = frankenterm_core::storage::FtsSyncConfig::default();
-                        match storage.rebuild_fts(config).await {
+                        // ft-xbnl0.2.3 tick 271: cx-first FTS rebuild.
+                        match storage.rebuild_fts_with_cx(&storage_cx, config).await {
                             Ok(result) => {
                                 if output_format.is_json() {
                                     let payload = serde_json::json!({
@@ -25853,7 +25868,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             );
                         }
 
-                        if let Err(e) = storage.set_event_note(event_id, note, by.clone()).await {
+                        if let Err(e) = {
+                                            // ft-xbnl0.2.3 tick 271: cx-first event note set.
+                                            let note_cx = frankenterm_core::cx::Cx::current()
+                                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                                            storage.set_event_note_with_cx(&note_cx, event_id, note, by.clone()).await
+                                        } {
                             die(&format!("Failed to update note: {e}"), None);
                         }
 
@@ -26063,8 +26083,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             Some(inserted)
                         } else if let Some(label) = remove.clone() {
+                            // ft-xbnl0.2.3 tick 271: cx-first remove event label.
+                            let rm_label_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
                             let removed =
-                                match storage.remove_event_label(event_id, label.clone()).await {
+                                match storage
+                                    .remove_event_label_with_cx(&rm_label_cx, event_id, label.clone())
+                                    .await
+                                {
                                     Ok(v) => v,
                                     Err(e) => die(&format!("Failed to remove label: {e}"), None),
                                 };
@@ -27398,7 +27424,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
 
-                    match storage.consume_prepared_plan(&plan_id, now).await {
+                    // ft-xbnl0.2.3 tick 271: cx-first consume prepared plan.
+                    let consume_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage
+                        .consume_prepared_plan_with_cx(&consume_cx, &plan_id, now)
+                        .await
+                    {
                         Ok(Some(_)) => {}
                         Ok(None) => {
                             eprintln!("Error: Plan already consumed or expired.");
@@ -27659,7 +27691,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
 
-                    match storage.consume_prepared_plan(&plan_id, now).await {
+                    // ft-xbnl0.2.3 tick 271: cx-first consume prepared plan.
+                    let consume_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage
+                        .consume_prepared_plan_with_cx(&consume_cx, &plan_id, now)
+                        .await
+                    {
                         Ok(Some(_)) => {}
                         Ok(None) => {
                             eprintln!("Error: Plan already consumed or expired.");
@@ -28786,7 +28824,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     };
 
-                    let record = match storage.latest_secret_scan_report(&scope).await {
+                    // ft-xbnl0.2.3 tick 271: cx-first latest secret scan.
+                    let scan_report_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    let record = match storage
+                        .latest_secret_scan_report_with_cx(&scan_report_cx, &scope)
+                        .await
+                    {
                         Ok(record) => record,
                         Err(e) => {
                             eprintln!("Error: Failed to load secret scan report: {e}");
@@ -31336,7 +31380,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                         // Incomplete workflows
                         if show_all || section == "workflows" {
-                            if let Ok(workflows) = storage.find_incomplete_workflows().await {
+                            // ft-xbnl0.2.3 tick 271: cx-first incomplete workflows lookup.
+                            let incomplete_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            if let Ok(workflows) = storage
+                                .find_incomplete_workflows_with_cx(&incomplete_cx)
+                                .await
+                            {
                                 for wf in &workflows {
                                     items.push(serde_json::json!({
                                         "section": "workflows",
@@ -31615,7 +31665,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         reason: reason.clone(),
                     };
 
-                    if let Err(e) = storage.add_event_mute(record).await {
+                    // ft-xbnl0.2.3 tick 271: cx-first add event mute.
+                    let add_mute_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    if let Err(e) = storage.add_event_mute_with_cx(&add_mute_cx, record).await {
                         eprintln!("Error: Failed to add mute: {e}");
                         std::process::exit(1);
                     }
@@ -31650,7 +31703,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 } => {
                     let fmt = resolve_prepare_output_format(&format);
 
-                    match storage.remove_event_mute(&identity_key).await {
+                    // ft-xbnl0.2.3 tick 271: cx-first remove event mute.
+                    let rm_mute_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match storage
+                        .remove_event_mute_with_cx(&rm_mute_cx, &identity_key)
+                        .await
+                    {
                         Ok(removed) => match fmt {
                             OutputFormat::Json => {
                                 let obj = serde_json::json!({
@@ -31907,13 +31966,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let ctx = RenderContext::new(output_format);
 
+            // ft-xbnl0.2.3 tick 271: cx-first analytics metric aggregations.
+            let analytics_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             match command {
                 Some(AnalyticsCommands::Daily) => {
-                    let days = storage.aggregate_daily_metrics(since_ts).await?;
+                    let days = storage
+                        .aggregate_daily_metrics_with_cx(&analytics_cx, since_ts)
+                        .await?;
                     print!("{}", AnalyticsDailyRenderer::render(&days, &ctx));
                 }
                 Some(AnalyticsCommands::ByAgent) => {
-                    let agents = storage.aggregate_by_agent(since_ts).await?;
+                    let agents = storage
+                        .aggregate_by_agent_with_cx(&analytics_cx, since_ts)
+                        .await?;
                     print!("{}", AnalyticsAgentRenderer::render(&agents, &ctx));
                 }
                 Some(AnalyticsCommands::Export {
@@ -31921,10 +31987,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     output: output_path,
                 }) => {
                     let metrics = storage
-                        .query_usage_metrics(MetricQuery {
-                            since: Some(since_ts),
-                            ..Default::default()
-                        })
+                        .query_usage_metrics_with_cx(
+                            &analytics_cx,
+                            MetricQuery {
+                                since: Some(since_ts),
+                                ..Default::default()
+                            },
+                        )
                         .await?;
 
                     let rendered = match export_format.to_lowercase().as_str() {
