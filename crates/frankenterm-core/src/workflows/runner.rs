@@ -1959,6 +1959,231 @@ impl WorkflowRunner {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`run`] (tick 223).
+    ///
+    /// Threads the caller's cx through the entire event-loop
+    /// driver:
+    /// - `resume_incomplete_with_cx(cx)` on startup (tick 222)
+    /// - `subscriber.recv_cx(cx)` for detection reads (cancel-aware
+    ///   instead of ambient `recv`)
+    /// - Top-of-loop `cx.checkpoint()` lets a cx-cancelled caller
+    ///   break the loop cleanly between events.
+    /// - `handle_detection_with_cx(cx, ...)` instead of ambient
+    ///   `handle_detection` — tick-190 migration means this threads
+    ///   cx into `engine.start_with_id_cx`.
+    /// - Per-spawn `child_cx = cx.clone()` into each spawned
+    ///   workflow-execution task, and `run_workflow_with_cx`
+    ///   inside the spawn so the execution chain is cx-threaded
+    ///   end-to-end (ticks 178-187).
+    ///
+    /// Callers (watcher startup) can now thread an operator-scoped
+    /// cx into the runner loop. A cx-cancel at any point bubbles
+    /// through cleanly: the loop exits on cancel, and the
+    /// child tasks already in flight terminate at their next
+    /// cx-observing await.
+    ///
+    /// Legacy [`run`](Self::run) preserved unchanged.
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn run_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        event_bus: &crate::events::EventBus,
+    ) {
+        let resumed = self.resume_incomplete_with_cx(cx).await;
+        if !resumed.is_empty() {
+            tracing::info!(
+                count = resumed.len(),
+                explicit_cx = true,
+                "Resumed incomplete workflows from previous run (cx)"
+            );
+            for result in &resumed {
+                match result {
+                    WorkflowExecutionResult::Completed { execution_id, .. } => {
+                        tracing::info!(execution_id, explicit_cx = true, "Resumed workflow completed (cx)");
+                    }
+                    WorkflowExecutionResult::Error {
+                        execution_id,
+                        error,
+                    } => {
+                        tracing::warn!(?execution_id, error, explicit_cx = true, "Resumed workflow errored (cx)");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut subscriber = event_bus.subscribe_detections();
+
+        loop {
+            if cx.checkpoint().is_err() {
+                tracing::info!(
+                    explicit_cx = true,
+                    "Workflow runner loop cancelled via Cx, stopping"
+                );
+                break;
+            }
+            match subscriber.recv_cx(cx).await {
+                Ok(event) => {
+                    if let crate::events::Event::PatternDetected {
+                        pane_id,
+                        pane_uuid: _,
+                        detection,
+                        event_id,
+                    } = event
+                    {
+                        let result = self
+                            .handle_detection_with_cx(cx, pane_id, &detection, event_id)
+                            .await;
+
+                        match result {
+                            WorkflowStartResult::Started {
+                                execution_id,
+                                workflow_name,
+                            } => {
+                                if let Some(workflow) = self.find_workflow_by_name(&workflow_name) {
+                                    let execution_id_clone = execution_id.clone();
+                                    let workflow_clone = Arc::clone(&workflow);
+                                    let storage = Arc::clone(&self.storage);
+                                    let lock_manager = Arc::clone(&self.lock_manager);
+                                    let config = self.config.clone();
+                                    let engine = WorkflowEngine::new(config.max_concurrent);
+
+                                    let runner = Self {
+                                        workflows: std::sync::RwLock::new(vec![
+                                            workflow_clone.clone(),
+                                        ]),
+                                        engine,
+                                        lock_manager,
+                                        storage,
+                                        injector: Arc::clone(&self.injector),
+                                        config,
+                                        replay_capture: self.replay_capture.clone(),
+                                    };
+
+                                    let child_cx = cx.clone();
+                                    crate::runtime_compat::task::spawn(async move {
+                                        let result = runner
+                                            .run_workflow_with_cx(
+                                                &child_cx,
+                                                pane_id,
+                                                workflow_clone,
+                                                &execution_id_clone,
+                                                0,
+                                            )
+                                            .await;
+
+                                        match &result {
+                                            WorkflowExecutionResult::Completed {
+                                                execution_id,
+                                                steps_executed,
+                                                elapsed_ms,
+                                                ..
+                                            } => {
+                                                tracing::info!(
+                                                    execution_id,
+                                                    steps = steps_executed,
+                                                    elapsed_ms,
+                                                    explicit_cx = true,
+                                                    "Workflow completed (cx)"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::Aborted {
+                                                execution_id,
+                                                reason,
+                                                step_index,
+                                                ..
+                                            } => {
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    step = step_index,
+                                                    reason,
+                                                    explicit_cx = true,
+                                                    "Workflow aborted (cx)"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::PolicyDenied {
+                                                execution_id,
+                                                step_index,
+                                                reason,
+                                            } => {
+                                                tracing::warn!(
+                                                    execution_id,
+                                                    step = step_index,
+                                                    reason,
+                                                    explicit_cx = true,
+                                                    "Workflow denied by policy (cx)"
+                                                );
+                                            }
+                                            WorkflowExecutionResult::Error {
+                                                execution_id,
+                                                error,
+                                            } => {
+                                                tracing::error!(
+                                                    execution_id = execution_id.as_deref(),
+                                                    error,
+                                                    explicit_cx = true,
+                                                    "Workflow error (cx)"
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
+                                tracing::debug!(
+                                    rule_id,
+                                    explicit_cx = true,
+                                    "No workflow handles detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::PaneLocked {
+                                pane_id,
+                                held_by_workflow,
+                                ..
+                            } => {
+                                tracing::debug!(
+                                    pane_id,
+                                    held_by = %held_by_workflow,
+                                    explicit_cx = true,
+                                    "Pane locked, skipping detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::ConcurrencyLimitReached { active, limit } => {
+                                tracing::debug!(
+                                    active,
+                                    limit,
+                                    explicit_cx = true,
+                                    "Workflow concurrency limit reached, skipping detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::Error { error } => {
+                                tracing::error!(
+                                    error,
+                                    explicit_cx = true,
+                                    "Failed to start workflow (cx)"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(crate::events::RecvError::Lagged { missed_count }) => {
+                    tracing::warn!(
+                        skipped = missed_count,
+                        explicit_cx = true,
+                        "Workflow runner lagged, skipped events (cx)"
+                    );
+                }
+                Err(crate::events::RecvError::Closed) => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Event bus closed, workflow runner stopping (cx)"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     /// Resume incomplete workflows after restart.
     ///
     /// Queries storage for workflows with status 'running' or 'waiting'
