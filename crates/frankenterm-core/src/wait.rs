@@ -189,6 +189,22 @@ where
     let mut last_observed = None;
 
     loop {
+        // Tick 209 (ft-xbnl0.2.3): per-attempt cancel check. Cancel
+        // fired during the previous predicate.check() or backoff
+        // sleep lands BEFORE the next predicate call fires, rather
+        // than after. Returns a WaitError with last_observed set
+        // to "cancelled" so callers can distinguish cancel from a
+        // natural timeout (though the error type remains the same
+        // for API stability — elapsed < timeout also indicates
+        // premature return).
+        if cx.is_cancel_requested() {
+            return Err(WaitError {
+                expected,
+                last_observed: Some("cancelled".to_string()),
+                retries,
+                elapsed: Instant::now().saturating_duration_since(start),
+            });
+        }
         retries = retries.saturating_add(1);
         match predicate.check().await {
             WaitFor::Ready(value) => return Ok(value),
@@ -214,7 +230,21 @@ where
         let remaining = deadline.saturating_duration_since(now);
         let sleep_for = if delay > remaining { remaining } else { delay };
         if !sleep_for.is_zero() {
-            let _ = crate::runtime_compat::sleep_with_cx(cx, sleep_for).await;
+            // Tick 209 (ft-xbnl0.2.3): honor sleep_with_cx result.
+            // Previously `let _ = ...` swallowed cancel during
+            // backoff; the next iteration would call predicate.check
+            // anyway even though the caller had abandoned the wait.
+            if crate::runtime_compat::sleep_with_cx(cx, sleep_for)
+                .await
+                .is_err()
+            {
+                return Err(WaitError {
+                    expected,
+                    last_observed: Some("cancelled".to_string()),
+                    retries,
+                    elapsed: Instant::now().saturating_duration_since(start),
+                });
+            }
         }
         delay = backoff.next_delay(delay);
     }
