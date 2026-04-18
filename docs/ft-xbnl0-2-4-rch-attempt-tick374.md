@@ -70,6 +70,23 @@ run. Re-running the other 4 groups (HTTP client, TLS, metrics, web)
 via the same pattern would give the complete Level-C bundle; deferred
 to the closer since those are larger and would take longer wall time.
 
+### Wall-time note for larger groups (tick 375 attempt)
+
+Kicking off the HTTP-client group via rch
+(`cargo test --features distributed,asupersync-runtime --lib distributed_http_client_`)
+with a fresh target dir hit the 20-minute wall-time limit **mid-compile**
+on vmi1149989 — it was still linking frankenterm-alloc, fastmcp-*,
+mux, frankensearch as of the 1200s timeout. A cold remote build
+pulling in the full `distributed` + `asupersync-runtime` feature graph
+is ~30 min on a Contabo VPS; warm builds (reusing a target dir from a
+prior run) are seconds.
+
+Closer recommendation: do the first HTTP-client rch run with a
+higher-ceiling timeout (e.g. 45 min) OR pre-warm by running the
+guards group first into the same target dir so dependency compilation
+is shared. Partial log at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/rch-http.log`
+(56 KB, mid-compile — no test result yet).
+
 ## Implication for §6 closure checklist
 
 - The `rch exec -- ./scripts/check_ft_xbnl0_2_4.sh` form (§4a one-shot)
