@@ -3594,6 +3594,64 @@ KBAhs4snj5QspGFqkazmIw==
         });
     }
 
+    /// ft-xbnl0.2.4 tick 324: URL with no path defaults to `/`.
+    ///
+    /// HTTP/1.1 requires a non-empty request-target on the request line.
+    /// When a client is handed a URL with no explicit path (e.g.
+    /// `http://127.0.0.1:8080`), the correct behavior is to send
+    /// `GET / HTTP/1.1`, *not* `GET  HTTP/1.1` (invalid) or omit the
+    /// request-target entirely.
+    ///
+    /// Pins that `DistributedHttpClient::get` applies this default,
+    /// which is subtle and commonly regressed in hand-rolled HTTP
+    /// parsers. Complements tick 321 which covered explicit path +
+    /// query-string roundtrip.
+    ///
+    /// ft-xbnl0.2.4 acceptance criterion 3 ("Verification covers
+    /// correctness") includes URL parsing edge cases — real distributed
+    /// callers construct URLs dynamically from host + port pairs, and a
+    /// missing path segment would silently break every no-path callsite
+    /// if the client didn't default correctly.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_http_client_url_without_path_defaults_to_slash() {
+        run_async_test(async {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+
+            let server_task = crate::runtime_compat::task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                assert!(n > 0);
+                let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+                let first_line = req.lines().next().expect("at least one line");
+                // The client MUST default to `/` when the URL has no
+                // path — anything else (empty request-target, `//`,
+                // or host-included request-target) is a bug.
+                assert!(
+                    first_line.starts_with("GET / HTTP/1."),
+                    "no-path URL must default to `/`; got: {first_line:?}"
+                );
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nroot";
+                stream.write_all(response).await.expect("write response");
+                stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            });
+
+            let client = DistributedHttpClient::plaintext();
+            let cx = asupersync::cx::Cx::for_testing();
+            // Note: no trailing slash, no path segment.
+            let url = format!("http://127.0.0.1:{}", addr.port());
+            let resp = client.get(&cx, &url).await.expect("get");
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"root");
+
+            server_task.await.expect("join");
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 321: Request-target (path + query) roundtrip contract.
     ///
     /// Pins that `DistributedHttpClient::get` transmits the full URL
