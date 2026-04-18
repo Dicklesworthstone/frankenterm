@@ -1,4 +1,4 @@
-# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 401)
+# ft-xbnl0.2.4 — Verification Smoke (tick 340, re-verified through tick 403)
 
 Date: 2026-04-18
 Authored by: RusticMaple
@@ -16,11 +16,12 @@ Tick 386: HTTP extended to 28 after tick 385 (POST 3xx no-follow verb-parity) (8
 Tick 390: HTTP extended to 29 after ticks 387 (ft-l9mxa fix flipping tick-380 snapshot) + 389 (POST mid-flight verb-parity) (83 tests total)
 Tick 399: HTTP extended to 30 after tick 398 (POST Content-Type non-auto-inject) (84 tests total)
 Tick 401: HTTP extended to 31 after tick 400 (URL percent-encoding pass-through) (85 tests total) — tick 400 milestone
+Tick 403: HTTP extended to 32 after tick 402 (chunked transfer-encoding response) (86 tests total)
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
 contract tests this session touches. Captured as an artifact so the bead
-owner can reference a concrete "85 of 85 passing at this commit" checkpoint
+owner can reference a concrete "86 of 86 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
@@ -105,13 +106,13 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Group | Tests | Result |
 |-------|-------|--------|
-| HTTP client contracts (Run 1) | 31 | 31/31 ok |
+| HTTP client contracts (Run 1) | 32 | 32/32 ok |
 | TLS tests (Run 2) | 45 | 45/45 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
 | Runtime-primitive contracts (Run 6) | 2 | 2/2 ok |
-| **Subtotal** | **85** | **85/85 ok** |
+| **Subtotal** | **86** | **86/86 ok** |
 
 Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
 tick 357).
@@ -129,6 +130,7 @@ Run 1 growth over the session:
 - tick 390: +1 POST mid-flight cancel verb-parity (tick 389); tick-380 snapshot flipped by ft-l9mxa fix (tick 387)
 - tick 399: +1 POST Content-Type non-auto-inject (tick 398)
 - tick 401: +1 URL percent-encoding pass-through (tick 400 milestone)
+- tick 403: +1 chunked transfer-encoding response decoding (tick 402)
 
 Run 2 growth:
 - tick 340-346: 14 tests via `build_tls_` filter (this session's new
@@ -177,9 +179,9 @@ Tick 323's pre-cancel contract for the web server bind path.
 
 ## Interpretation
 
-- All 85 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- All 86 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
 - Compile time after the initial cold build: 0.00s-1.19s per filtered run. All tests now complete in sub-second wall time after tick 387's ft-l9mxa fix (previously Run 1 was 10.02s because the tick-380 snapshot's outer timeout fired; now the inner cancel-watcher race surfaces the cancel in ~70ms).
-- The 31 + 45 + 3 + 3 + 1 + 2 = 85 count covers this-session deliverables AND 32 pre-existing TLS tests that the broadened tick-357 filter smoke-verifies as a side benefit.
+- The 32 + 45 + 3 + 3 + 1 + 2 = 86 count covers this-session deliverables AND 32 pre-existing TLS tests that the broadened tick-357 filter smoke-verifies as a side benefit.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)
