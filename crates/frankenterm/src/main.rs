@@ -16836,7 +16836,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             };
                             let db_path = layout.db_path.to_string_lossy();
                             let storage_handle =
-                                match frankenterm_core::storage::StorageHandle::new(&db_path).await
+                                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await
                                 {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -18221,7 +18226,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             let db_path = layout.db_path.to_string_lossy();
                             let storage =
-                                match frankenterm_core::storage::StorageHandle::new(&db_path).await
+                                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await
                                 {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -20728,7 +20738,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // Open storage handle
                             let db_path = layout.db_path.to_string_lossy();
                             let storage =
-                                match frankenterm_core::storage::StorageHandle::new(&db_path).await
+                                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await
                                 {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -22019,12 +22034,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Rate-limit: check last refresh time in DB
                                     let db_path = layout.db_path.to_string_lossy();
                                     {
+                                        // ft-xbnl0.2.3 tick 301: cx-first storage + accounts.
+                                        let ratelimit_cx = frankenterm_core::cx::Cx::current()
+                                            .unwrap_or_else(frankenterm_core::cx::for_request);
                                         if let Ok(storage_check) =
-                                            frankenterm_core::storage::StorageHandle::new(&db_path)
-                                                .await
+                                            frankenterm_core::storage::StorageHandle::new_with_cx(
+                                                &ratelimit_cx,
+                                                &db_path,
+                                            )
+                                            .await
                                         {
                                             if let Ok(accounts) = storage_check
-                                                .get_accounts_by_service(&service_key)
+                                                .get_accounts_by_service_with_cx(
+                                                    &ratelimit_cx,
+                                                    &service_key,
+                                                )
                                                 .await
                                             {
                                                 let now_check = std::time::SystemTime::now()
@@ -22835,7 +22859,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     if output_format.is_json() {
@@ -24339,7 +24368,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
             PanesCommands::Bookmark { action } => {
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -24668,7 +24702,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 );
 
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         emit_error(
@@ -25243,7 +25282,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     let db_path = layout.db_path.to_string_lossy();
                     let storage =
-                        match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                        match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!("Failed to open storage: {e}");
@@ -25970,7 +26014,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     die(
@@ -26516,7 +26565,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     die(
@@ -26874,7 +26928,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             } => {
                 let output_format = resolve_prepare_output_format(&format);
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open database: {e}");
@@ -27136,7 +27195,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let output_format = resolve_prepare_output_format(&format);
                     let db_path = layout.db_path.to_string_lossy();
                     let storage =
-                        match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                        match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                             Ok(s) => std::sync::Arc::new(s),
                             Err(e) => {
                                 eprintln!("Error: Failed to open database: {e}");
@@ -27367,7 +27431,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             approval_code,
         }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {
                     eprintln!("Error: Failed to open database: {e}");
@@ -28026,7 +28095,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             dry_run,
         }) => {
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open database: {e}");
@@ -28238,7 +28312,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -28369,7 +28448,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Open storage handle
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         if output_format.is_json() {
@@ -28542,7 +28626,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     fail(&format!("Failed to open storage: {e}"));
@@ -28682,7 +28771,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 Err(err) => fail(&format!("Failed to get workspace layout: {err}")),
             };
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(value) => Arc::new(value),
                 Err(err) => fail(&format!("Failed to open storage: {err}")),
             };
@@ -28921,7 +29015,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -29270,7 +29369,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     let db_path = layout.db_path.to_string_lossy();
                     let storage =
-                        match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                        match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!("Error: Failed to open storage: {e}");
@@ -31076,7 +31180,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -31214,7 +31323,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // Open storage for rate-limit check
                 let db_path = layout.db_path.to_string_lossy();
                 if let Ok(storage_check) =
-                    frankenterm_core::storage::StorageHandle::new(&db_path).await
+                    frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await
                 {
                     if let Ok(accounts) = storage_check.get_accounts_by_service(&service_key).await
                     {
@@ -31260,7 +31374,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Persist refreshed data
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         die(
@@ -31326,7 +31445,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // Default: list accounts
                 let service_key = canonical_accounts_service_key(&service);
                 let db_path = layout.db_path.to_string_lossy();
-                let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+                let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                     Ok(s) => s,
                     Err(e) => {
                         die(
@@ -31474,7 +31598,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let needs_db = show_all || section == "events" || section == "workflows";
             if needs_db {
                 let db_path = layout.db_path.to_string_lossy();
-                let storage_result = frankenterm_core::storage::StorageHandle::new(&db_path).await;
+                let storage_result = frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await;
 
                 match storage_result {
                     Ok(storage) => {
@@ -31832,7 +31961,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -32029,7 +32163,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             use std::time::Duration;
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -32067,7 +32206,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             use std::time::Duration;
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -32109,7 +32253,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             tracing::info!(%backend, "TUI rollout mode — backend selected");
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(%e, "Failed to open storage for TUI");
@@ -32159,7 +32308,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let period_label = format_period_label(&period);
 
             let db_path = layout.db_path.to_string_lossy();
-            let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+            let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
                 Ok(s) => s,
                 Err(e) => {
                     if output_format.is_json() {
@@ -32835,7 +32989,12 @@ async fn handle_why_recent(
 
     // Open storage
     let db_path = layout.db_path.to_string_lossy();
-    let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
         Ok(s) => s,
         Err(e) => {
             if output_format.is_json() {
@@ -36141,7 +36300,12 @@ async fn resolve_real_tx_runtime(
     Option<String>,
 ) {
     let db_path = layout.db_path.to_string_lossy();
-    let storage = match frankenterm_core::storage::StorageHandle::new(&db_path).await {
+    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                                    &frankenterm_core::cx::Cx::current()
+                                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                                    &db_path,
+                                )
+                                .await {
         Ok(storage) => storage,
         Err(err) => {
             return (
