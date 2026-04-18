@@ -5806,6 +5806,31 @@ impl WriteCommandSender {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
+    ///
+    /// Plugs the orphan-cx hole at the root of the storage write
+    /// path: the legacy `send` uses `crate::cx::for_request()` for
+    /// its inner mpsc reserve wait, severing the cancellation
+    /// chain from every storage `_with_cx` caller. This sibling
+    /// threads the caller's cx all the way into
+    /// `self.inner.send(cx, command)` so a full writer queue
+    /// under a cancelled parent cx releases immediately rather
+    /// than waiting for backpressure to drain.
+    ///
+    /// Per-call-site migration is incremental; this tick wires
+    /// the 6 event-annotation writes from tick 136. Future ticks
+    /// can progressively migrate the remaining ~50+ `_with_cx`
+    /// storage methods. Legacy `send` stays available for
+    /// ambient-cx callers.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn send_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        command: WriteCommand,
+    ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
+        self.inner.send(cx, command).await
+    }
+
     fn max_capacity(&self) -> usize {
         #[cfg(feature = "asupersync-runtime")]
         {
@@ -6126,6 +6151,13 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_event_handled`].
+    ///
+    /// Tick 169: inlined the write-send so the mpsc reserve wait
+    /// routes through `write_tx.send_with_cx(cx, ...)`. Prior to
+    /// tick 169 this delegated to the legacy `mark_event_handled`,
+    /// which under asupersync-runtime reserves with an orphan
+    /// `cx::for_request()` — a latent hole in the cancellation
+    /// chain when the writer queue is backpressured.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_event_handled_with_cx(
         &self,
@@ -6137,7 +6169,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("mark_event_handled cancelled: {err}"))
         })?;
-        self.mark_event_handled(event_id, workflow_id, status).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::MarkEventHandled {
+                    event_id,
+                    workflow_id,
+                    status: status.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Set or clear an event's triage state.
@@ -6164,6 +6209,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_triage_state`].
+    /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn set_event_triage_state_with_cx(
         &self,
@@ -6175,8 +6221,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("set_event_triage_state cancelled: {err}"))
         })?;
-        self.set_event_triage_state(event_id, triage_state, updated_by)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::SetEventTriageState {
+                    event_id,
+                    triage_state,
+                    updated_by,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Set or clear an event's note.
@@ -6203,6 +6261,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_note`].
+    /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn set_event_note_with_cx(
         &self,
@@ -6213,7 +6272,20 @@ impl StorageHandle {
     ) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("set_event_note cancelled: {err}")))?;
-        self.set_event_note(event_id, note, updated_by).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::SetEventNote {
+                    event_id,
+                    note,
+                    updated_by,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Add a label to an event.
@@ -6240,6 +6312,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_label`].
+    /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn add_event_label_with_cx(
         &self,
@@ -6250,7 +6323,20 @@ impl StorageHandle {
     ) -> Result<bool> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("add_event_label cancelled: {err}")))?;
-        self.add_event_label(event_id, label, created_by).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::AddEventLabel {
+                    event_id,
+                    label,
+                    created_by,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Remove a label from an event.
@@ -6271,6 +6357,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_label`].
+    /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn remove_event_label_with_cx(
         &self,
@@ -6281,7 +6368,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("remove_event_label cancelled: {err}"))
         })?;
-        self.remove_event_label(event_id, label).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RemoveEventLabel {
+                    event_id,
+                    label,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Fetch triage state, note, and labels for an event.
@@ -6324,6 +6423,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_mute`].
+    /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn add_event_mute_with_cx(
         &self,
@@ -6332,7 +6432,18 @@ impl StorageHandle {
     ) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("add_event_mute cancelled: {err}")))?;
-        self.add_event_mute(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpsertEventMute {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Remove a persistent event mute by identity key.
