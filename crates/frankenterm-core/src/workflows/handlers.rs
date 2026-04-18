@@ -1538,6 +1538,116 @@ impl HandleSessionStartContext {
         }
     }
 
+    /// ft-xbnl0.2.3 Cx-first sibling of [`lookup_cass_hints`] (tick 215).
+    /// Threads cx through `storage.get_pane_with_cx` + `cass.search_with_cx`
+    /// so a cancelled outer scope interrupts the pane read AND the cass
+    /// subprocess loop without running the full multi-query cass sweep.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn lookup_cass_hints_with_cx(
+        cx: &crate::cx::Cx,
+        storage: &StorageHandle,
+        pane_id: u64,
+        trigger: &serde_json::Value,
+    ) -> SessionStartCassHintsLookup {
+        let pane = match storage.get_pane_with_cx(cx, pane_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return SessionStartCassHintsLookup {
+                    query: None,
+                    query_candidates: vec![],
+                    workspace: None,
+                    hints: vec![],
+                    error: Some(format!("pane_lookup_failed: {error}")),
+                    bead_id: None,
+                    pane_title: None,
+                    pane_cwd: None,
+                };
+            }
+        };
+
+        let (query_candidates, bead_id) = Self::query_candidates(trigger, pane.as_ref());
+        let Some(first_query) = query_candidates.first().cloned() else {
+            return SessionStartCassHintsLookup {
+                query: None,
+                query_candidates,
+                workspace: None,
+                hints: vec![],
+                error: Some("no_query_candidates".to_string()),
+                bead_id,
+                pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+                pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+            };
+        };
+
+        let workspace = pane.as_ref().and_then(Self::workspace_for_pane);
+        let options = SearchOptions {
+            limit: Some(SESSION_START_CASS_HINT_LIMIT),
+            offset: None,
+            agent: Self::cass_agent_from_trigger(trigger),
+            workspace: workspace.clone(),
+            days: Some(SESSION_START_CASS_LOOKBACK_DAYS),
+            fields: Some("minimal".to_string()),
+            max_tokens: Some(220),
+        };
+
+        let cass = CassClient::new().with_timeout_secs(SESSION_START_CASS_TIMEOUT_SECS);
+        let mut last_error: Option<String> = None;
+
+        for query in &query_candidates {
+            // Per-query cx checkpoint: a cancel fired during the
+            // previous cass subprocess call lands BEFORE the next
+            // query fires instead of running all candidates.
+            if cx.checkpoint().is_err() {
+                return SessionStartCassHintsLookup {
+                    query: Some(query.clone()),
+                    query_candidates,
+                    workspace,
+                    hints: vec![],
+                    error: Some("cancelled during cass hint lookup".to_string()),
+                    bead_id,
+                    pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+                    pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+                };
+            }
+            match cass.search_with_cx(cx, query, &options).await {
+                Ok(result) => {
+                    let hints = result
+                        .hits
+                        .iter()
+                        .filter_map(Self::format_cass_hint)
+                        .take(SESSION_START_CASS_HINT_LIMIT)
+                        .collect::<Vec<_>>();
+                    if !hints.is_empty() {
+                        return SessionStartCassHintsLookup {
+                            query: Some(query.clone()),
+                            query_candidates,
+                            workspace,
+                            hints,
+                            error: None,
+                            bead_id,
+                            pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+                            pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+                        };
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+
+        SessionStartCassHintsLookup {
+            query: Some(first_query),
+            query_candidates,
+            workspace,
+            hints: vec![],
+            error: last_error,
+            bead_id,
+            pane_title: pane.as_ref().and_then(|record| record.title.clone()),
+            pane_cwd: pane.as_ref().and_then(|record| record.cwd.clone()),
+        }
+    }
+
     pub fn build_context_prompt(
         trigger: &serde_json::Value,
         cass_lookup: &SessionStartCassHintsLookup,
@@ -1780,6 +1890,165 @@ impl Workflow for HandleSessionStartContext {
                                 pane_id,
                                 error = %error,
                                 "handle_session_start_context: failed to record audit decision"
+                            );
+                            StepResult::abort(format!(
+                                "Failed to record session_start_context decision: {error}"
+                            ))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+
+    /// ft-xbnl0.2.3 Cx-first override (tick 215). Second per-impl
+    /// Workflow migration following HandleSessionEnd (tick 214).
+    ///
+    /// Routes through cx-first siblings:
+    ///   - `get_audit_actions_with_cx` (cooldown read)
+    ///   - `lookup_cass_hints_with_cx` (pane + cass subprocess loop
+    ///     with per-query checkpoint — tick 215 addition)
+    ///   - `record_audit_action_with_cx` (audit write →
+    ///     `send_with_cx` mpsc backpressure)
+    ///
+    /// Pre-step cx.checkpoint() gates entry.
+    #[cfg(feature = "asupersync-runtime")]
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a crate::cx::Cx,
+        ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            if cx.checkpoint().is_err() {
+                return StepResult::abort(
+                    "handle_session_start_context cancelled pre-step via Cx".to_string(),
+                );
+            }
+
+            match step_idx {
+                // Step 0: Cooldown check (cx-first read)
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("session_start_context".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions_with_cx(cx, query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_context_ts = recent[0].ts,
+                                explicit_cx = true,
+                                "handle_session_start_context: within cooldown, skipping (cx)"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_context_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => StepResult::cont(),
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %error,
+                                explicit_cx = true,
+                                "handle_session_start_context: cooldown check failed, proceeding (cx)"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: cx-first cass lookup + audit record
+                1 => {
+                    let lookup =
+                        Self::lookup_cass_hints_with_cx(cx, &storage, pane_id, &trigger).await;
+                    let prompt = Self::build_context_prompt(&trigger, &lookup);
+                    let result = if lookup.hints.is_empty() {
+                        if lookup.error.is_some() {
+                            "lookup_error"
+                        } else {
+                            "no_hints"
+                        }
+                    } else {
+                        "hints_injected"
+                    };
+
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string);
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    let timestamp_ms = now_ms();
+                    let input_summary = format!("Session start context injection for {agent_type}");
+                    let decision_context = build_session_start_audit_decision_context(
+                        &execution_id,
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        rule_id.as_deref(),
+                        &lookup,
+                        &input_summary,
+                        result,
+                        timestamp_ms,
+                    );
+
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: timestamp_ms,
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        correlation_id: None,
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "session_start_context".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(input_summary),
+                        verification_summary: None,
+                        decision_context,
+                        result: result.to_string(),
+                    };
+
+                    match storage.record_audit_action_with_cx(cx, audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                result,
+                                explicit_cx = true,
+                                "handle_session_start_context: recorded session-start context decision (cx)"
+                            );
+                            StepResult::send_text(prompt)
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %error,
+                                explicit_cx = true,
+                                "handle_session_start_context: failed to record audit decision (cx)"
                             );
                             StepResult::abort(format!(
                                 "Failed to record session_start_context decision: {error}"
