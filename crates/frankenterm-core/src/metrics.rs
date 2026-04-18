@@ -617,15 +617,18 @@ async fn handle_connection_with_cx(
     prefix: &str,
     collector: Arc<dyn MetricsCollector>,
 ) -> Result<()> {
-    cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("metrics handle_connection cancelled: {err}")))?;
+    cx.checkpoint().map_err(|err| {
+        crate::Error::Runtime(format!("metrics handle_connection cancelled: {err}"))
+    })?;
     let mut buf = [0_u8; 8192];
     let read_len = crate::runtime_compat::io::read(&mut socket, &mut buf).await?;
     if read_len == 0 {
         return Ok(());
     }
     cx.checkpoint().map_err(|err| {
-        crate::Error::Runtime(format!("metrics handle_connection cancelled after read: {err}"))
+        crate::Error::Runtime(format!(
+            "metrics handle_connection cancelled after read: {err}"
+        ))
     })?;
     let request_bytes = buf[..read_len].to_vec();
     handle_connection_impl(socket, prefix, collector, request_bytes).await
@@ -1454,10 +1457,7 @@ mod tests {
             let server = MetricsServer::new("127.0.0.1:0", "wa", collector, shutdown_flag.clone());
             let cx = crate::cx::for_request();
 
-            let handle = server
-                .start_with_cx(&cx)
-                .await
-                .expect("start_with_cx");
+            let handle = server.start_with_cx(&cx).await.expect("start_with_cx");
 
             // Cancel the cx while the server is running. The shutdown
             // flag is intentionally NOT flipped — this test pins that

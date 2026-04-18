@@ -3167,9 +3167,7 @@ KBAhs4snj5QspGFqkazmIw==
                     "EmptyCertChain must carry the offending path; got: {path}"
                 );
             }
-            other => panic!(
-                "empty cert PEM must surface EmptyCertChain variant; got: {other:?}"
-            ),
+            other => panic!("empty cert PEM must surface EmptyCertChain variant; got: {other:?}"),
         }
     }
 
@@ -3201,9 +3199,9 @@ KBAhs4snj5QspGFqkazmIw==
                     "EmptyPrivateKey must carry the offending path; got: {path}"
                 );
             }
-            other => panic!(
-                "cert-in-key-slot must surface EmptyPrivateKey variant; got: {other:?}"
-            ),
+            other => {
+                panic!("cert-in-key-slot must surface EmptyPrivateKey variant; got: {other:?}")
+            }
         }
     }
 
@@ -4089,7 +4087,8 @@ KBAhs4snj5QspGFqkazmIw==
                     "body tail sentinel did not round-trip"
                 );
                 assert_eq!(
-                    recv_body, &expected_body[..],
+                    recv_body,
+                    &expected_body[..],
                     "body bytes did not round-trip intact"
                 );
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -4100,10 +4099,7 @@ KBAhs4snj5QspGFqkazmIw==
             let client = DistributedHttpClient::plaintext();
             let cx = asupersync::cx::Cx::for_testing();
             let url = format!("http://127.0.0.1:{}/bulk", addr.port());
-            let resp = client
-                .post(&cx, &url, body)
-                .await
-                .expect("large-body post");
+            let resp = client.post(&cx, &url, body).await.expect("large-body post");
             assert_eq!(resp.status, 200);
             assert_eq!(resp.body, b"ok");
 
@@ -4204,16 +4200,20 @@ KBAhs4snj5QspGFqkazmIw==
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_http_client_does_not_follow_3xx_even_with_resolvable_location() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         run_async_test(async {
             use asupersync::io::AsyncWriteExt as _;
 
-            let primary = TcpListener::bind("127.0.0.1:0").await.expect("primary bind");
+            let primary = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("primary bind");
             let primary_addr = primary.local_addr().expect("primary addr");
 
-            let secondary = TcpListener::bind("127.0.0.1:0").await.expect("secondary bind");
+            let secondary = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("secondary bind");
             let secondary_addr = secondary.local_addr().expect("secondary addr");
             let secondary_was_hit = Arc::new(AtomicBool::new(false));
 
@@ -4243,7 +4243,10 @@ KBAhs4snj5QspGFqkazmIw==
                      Content-Length: 0\r\n\r\n",
                     secondary_addr.port()
                 );
-                stream.write_all(response.as_bytes()).await.expect("write response");
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
                 stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
             });
 
@@ -4256,7 +4259,10 @@ KBAhs4snj5QspGFqkazmIw==
                 .await
                 .expect("3xx must be Ok(Response)");
 
-            assert_eq!(resp.status, 302, "status must be the original 302, not 200 from the secondary");
+            assert_eq!(
+                resp.status, 302,
+                "status must be the original 302, not 200 from the secondary"
+            );
             assert!(
                 !resp.body.eq(b"followed!"),
                 "body must be the 302 body (empty), not the secondary's 'followed!'"
@@ -4447,7 +4453,8 @@ KBAhs4snj5QspGFqkazmIw==
                 let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
                 // Host header should include the bracketed form per RFC 7230.
                 let lower = req.to_ascii_lowercase();
-                let expected_lower = format!("host: {}", expected_host_for_server.to_ascii_lowercase());
+                let expected_lower =
+                    format!("host: {}", expected_host_for_server.to_ascii_lowercase());
                 assert!(
                     lower.contains(&expected_lower),
                     "IPv6 literal URL must preserve bracketed authority in Host header. \
@@ -4601,18 +4608,14 @@ KBAhs4snj5QspGFqkazmIw==
                 assert!(n > 0);
                 let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
                 // Find any line that case-insensitively starts with "user-agent:"
-                let ua_line = req.lines().find(|line| {
-                    line.to_ascii_lowercase().starts_with("user-agent:")
-                });
+                let ua_line = req
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"));
                 let ua_line = ua_line.unwrap_or_else(|| {
-                    panic!(
-                        "request must include a User-Agent header; got: {req:?}"
-                    )
+                    panic!("request must include a User-Agent header; got: {req:?}")
                 });
                 // Value must be non-empty (something after the colon).
-                let colon_idx = ua_line
-                    .find(':')
-                    .expect("user-agent line must have colon");
+                let colon_idx = ua_line.find(':').expect("user-agent line must have colon");
                 let value = ua_line[colon_idx + 1..].trim();
                 assert!(
                     !value.is_empty(),
@@ -4725,7 +4728,10 @@ KBAhs4snj5QspGFqkazmIw==
                 let req = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
                 // Scan for Host: line, case-insensitive per RFC 7230.
                 let lower = req.to_ascii_lowercase();
-                let expected_lower = format!("host: {}", expected_authority_for_server.to_ascii_lowercase());
+                let expected_lower = format!(
+                    "host: {}",
+                    expected_authority_for_server.to_ascii_lowercase()
+                );
                 assert!(
                     lower.contains(&expected_lower),
                     "request must include a Host header matching the URL authority. \
@@ -4938,7 +4944,10 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let server_task = crate::runtime_compat::task::spawn(async move {
-                for (status, body) in &[("404 Not Found", "gone"), ("500 Internal Server Error", "broken")] {
+                for (status, body) in &[
+                    ("404 Not Found", "gone"),
+                    ("500 Internal Server Error", "broken"),
+                ] {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).await.expect("read request");
