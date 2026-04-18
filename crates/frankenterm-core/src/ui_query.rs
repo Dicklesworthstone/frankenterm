@@ -104,15 +104,16 @@ pub async fn list_pane_bookmarks(storage: &StorageHandle) -> crate::Result<Vec<P
     Ok(records.into_iter().map(PaneBookmarkView::from).collect())
 }
 
-/// Cx-first [`list_pane_bookmarks`] (ft-xbnl0.2.3). Pre-flight
-/// cx checkpoint gates the storage query — a pre-cancelled cx
-/// returns `Err(crate::Error::Runtime(..))` without touching
-/// storage. Caller-cancellation during the storage call itself
-/// is out of scope — `StorageHandle` has no `_with_cx` siblings
-/// yet (147 async fns without cx surface). The pre-flight
-/// checkpoint is still valuable for UI surfaces that want to
-/// short-circuit cheaply when the operator has already
-/// cancelled (e.g. closed the bookmark picker).
+/// Cx-first [`list_pane_bookmarks`] (ft-xbnl0.2.3).
+///
+/// Tick 197: upgraded from pre-flight-only wrapper to fully
+/// cx-threaded. Routes the storage read through
+/// `list_pane_bookmarks_with_cx` (tick 149 sibling milestone).
+/// Previously the docstring admitted "StorageHandle has no _with_cx
+/// siblings yet (147 async fns without cx surface)" — that was
+/// written before tick 149's 140/140 completion. The sibling is
+/// available now, so a caller-cancelled cx lands at the storage
+/// pre-flight checkpoint instead of after the DB read returns.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn list_pane_bookmarks_with_cx(
     cx: &crate::cx::Cx,
@@ -120,7 +121,8 @@ pub async fn list_pane_bookmarks_with_cx(
 ) -> crate::Result<Vec<PaneBookmarkView>> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("list_pane_bookmarks cancelled: {err}")))?;
-    list_pane_bookmarks(storage).await
+    let records = storage.list_pane_bookmarks_with_cx(cx).await?;
+    Ok(records.into_iter().map(PaneBookmarkView::from).collect())
 }
 
 /// List saved searches for UI surfaces.
@@ -129,8 +131,12 @@ pub async fn list_saved_searches(storage: &StorageHandle) -> crate::Result<Vec<S
     Ok(records.into_iter().map(SavedSearchView::from).collect())
 }
 
-/// Cx-first [`list_saved_searches`] (ft-xbnl0.2.3). Pre-flight
-/// cx checkpoint gates the storage query.
+/// Cx-first [`list_saved_searches`] (ft-xbnl0.2.3).
+///
+/// Tick 197: upgraded from pre-flight-only wrapper to fully
+/// cx-threaded. Routes the storage read through
+/// `list_saved_searches_with_cx` so a caller-cancelled cx lands at
+/// the storage pre-flight checkpoint instead of after the DB read.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn list_saved_searches_with_cx(
     cx: &crate::cx::Cx,
@@ -138,7 +144,8 @@ pub async fn list_saved_searches_with_cx(
 ) -> crate::Result<Vec<SavedSearchView>> {
     cx.checkpoint()
         .map_err(|err| crate::Error::Runtime(format!("list_saved_searches cancelled: {err}")))?;
-    list_saved_searches(storage).await
+    let records = storage.list_saved_searches_with_cx(cx).await?;
+    Ok(records.into_iter().map(SavedSearchView::from).collect())
 }
 
 /// Resolve ruleset profile status, including the currently active profile.
