@@ -392,9 +392,11 @@ impl WorkflowRunner {
     /// to a cancelled context from acquiring a lock that no workflow
     /// will ever release on the inner path.
     ///
-    /// When the Cx is healthy the call simply delegates to
-    /// [`WorkflowRunner::handle_detection`]; the inner engine already
-    /// installs a fresh per-execution Cx as needed.
+    /// Tick 190 (ft-xbnl0.2.3): inlines the detection body and routes
+    /// the engine start through `engine.start_with_id_cx(cx, ...)` so
+    /// the persist threads cx into `upsert_workflow_with_cx` (tick 189).
+    /// Legacy `handle_detection` preserved verbatim; this variant no
+    /// longer delegates so the storage insert is cancel-observant.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn handle_detection_with_cx(
         &self,
@@ -408,7 +410,95 @@ impl WorkflowRunner {
                 error: "capability context already cancelled".to_owned(),
             };
         }
-        self.handle_detection(pane_id, detection, event_id).await
+
+        let Some(workflow) = self.find_matching_workflow(detection) else {
+            return WorkflowStartResult::NoMatchingWorkflow {
+                rule_id: detection.rule_id.clone(),
+            };
+        };
+
+        let workflow_name = workflow.name().to_string();
+
+        let execution_id = generate_workflow_id(&workflow_name);
+        let lock_result = match self.lock_manager.try_acquire_with_limit(
+            pane_id,
+            &workflow_name,
+            &execution_id,
+            self.config.max_concurrent,
+        ) {
+            Ok(lock_result) => lock_result,
+            Err(limit_info) => {
+                return WorkflowStartResult::ConcurrencyLimitReached {
+                    active: limit_info.active,
+                    limit: limit_info.limit,
+                };
+            }
+        };
+
+        match lock_result {
+            LockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            } => {
+                return WorkflowStartResult::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
+            LockAcquisitionResult::Acquired => {}
+        }
+
+        let agent_type_str = match detection.agent_type {
+            crate::patterns::AgentType::Codex => "codex",
+            crate::patterns::AgentType::ClaudeCode => "claude_code",
+            crate::patterns::AgentType::Gemini => "gemini",
+            crate::patterns::AgentType::Wezterm => "wezterm",
+            crate::patterns::AgentType::Unknown => "unknown",
+        };
+        let severity_str = format!("{:?}", detection.severity).to_lowercase();
+
+        let context = serde_json::json!({
+            "rule_id": detection.rule_id,
+            "agent_type": agent_type_str,
+            "event_type": detection.event_type,
+            "severity": severity_str,
+            "confidence": detection.confidence,
+            "extracted": detection.extracted,
+            "matched_text": detection.matched_text,
+            "span": { "start": detection.span.0, "end": detection.span.1 },
+            "detection": {
+                "rule_id": detection.rule_id,
+                "matched_text": detection.matched_text,
+                "severity": format!("{:?}", detection.severity),
+            }
+        });
+
+        match self
+            .engine
+            .start_with_id_cx(
+                cx,
+                &self.storage,
+                execution_id.clone(),
+                &workflow_name,
+                pane_id,
+                event_id,
+                Some(context),
+            )
+            .await
+        {
+            Ok(_execution) => WorkflowStartResult::Started {
+                execution_id,
+                workflow_name,
+            },
+            Err(e) => {
+                self.lock_manager.release(pane_id, &execution_id);
+                WorkflowStartResult::Error {
+                    error: e.to_string(),
+                }
+            }
+        }
     }
 
     /// Run a workflow execution to completion.
