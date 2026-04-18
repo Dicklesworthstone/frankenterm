@@ -3001,6 +3001,74 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // =====================================================================
+    // ft-xbnl0.2.4 tick 334: build_tls_server_name contract tests
+    //
+    // `build_tls_server_name` is the SNI / server-name-verification
+    // surface: the name returned here is what the TLS connector uses
+    // to verify the server's certificate. A regression that silently
+    // accepted a malformed input (e.g. stripped invalid characters
+    // instead of erroring) would open a cert-verification hole.
+    // =====================================================================
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_server_name_accepts_ipv4_literal() {
+        let name = build_tls_server_name("127.0.0.1:8443").expect("IPv4 literal must parse");
+        // ServerName::IpAddress variant is what rustls expects for IP-addressed
+        // targets; a ServerName::DnsName would attempt DNS verification and fail.
+        match name {
+            ServerName::IpAddress(_) => {}
+            other => panic!("expected ServerName::IpAddress for IPv4 literal, got: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_server_name_accepts_dns_hostname() {
+        let name = build_tls_server_name("example.com:443").expect("DNS hostname must parse");
+        match name {
+            ServerName::DnsName(_) => {}
+            other => panic!("expected ServerName::DnsName for hostname, got: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_server_name_defaults_empty_host_to_localhost() {
+        // Truly empty bind addr (empty string) should default to
+        // "localhost" rather than fail or accept an empty string.
+        // Note: `":8443"` has a colon but empty host-before-colon, and
+        // that falls through to the literal passthrough branch in
+        // `distributed_bind_host` — not the empty-host branch.
+        let name = build_tls_server_name("").expect("empty bind defaults to localhost");
+        match name {
+            ServerName::DnsName(dns) => {
+                // The DNS name should be "localhost" (case-insensitive).
+                let as_ref: &str = dns.as_ref();
+                assert!(
+                    as_ref.eq_ignore_ascii_case("localhost"),
+                    "empty host must default to 'localhost'; got: {as_ref:?}"
+                );
+            }
+            other => panic!("expected ServerName::DnsName for defaulted host, got: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn build_tls_server_name_rejects_invalid_host() {
+        // Spaces are invalid in DNS names and not a valid IP literal.
+        let err = match build_tls_server_name("bad host name:443") {
+            Ok(n) => panic!("invalid host must fail; got: {n:?}"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DistributedTlsError::Config(_)),
+            "invalid host must surface Config variant; got: {err:?}"
+        );
+    }
+
+    // =====================================================================
     // DistributedCredentialError Display
     // =====================================================================
 
