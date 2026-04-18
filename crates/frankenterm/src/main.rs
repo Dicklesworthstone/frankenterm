@@ -8381,8 +8381,11 @@ async fn restore_snapshot_checkpoint(
         },
     );
 
+    // ft-xbnl0.2.3 tick 268: cx-first session restore.
+    let restore_cx = frankenterm_core::cx::Cx::current()
+        .unwrap_or_else(frankenterm_core::cx::for_request);
     restorer
-        .restore(&session, &checkpoint, wezterm)
+        .restore_with_cx(&restore_cx, &session, &checkpoint, wezterm)
         .await
         .map_err(|e| anyhow::anyhow!("Restore failed: {e}"))
 }
