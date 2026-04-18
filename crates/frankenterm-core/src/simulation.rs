@@ -742,7 +742,14 @@ impl Scenario {
                 ))
             })?;
             let mock_event = Self::to_mock_event(event)?;
-            mock.inject(event.pane, mock_event).await?;
+            // Tick 202 (ft-xbnl0.2.3): route the mock inject through
+            // `inject_with_cx(cx, ...)` so the inner MockWezterm
+            // RwLock write-lock wait honors caller cancellation.
+            // Previously used the legacy `inject` which picked up cx
+            // via `Cx::current()` thread-local fallback — orphan
+            // hole whenever the simulation runs outside the caller's
+            // thread-local scope.
+            mock.inject_with_cx(cx, event.pane, mock_event).await?;
             count += 1;
         }
         Ok(count)
