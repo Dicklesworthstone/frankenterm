@@ -319,10 +319,13 @@ fn execute_step_action(
                     .build()
                     .expect("failed to build runtime for pane step");
                 rt.block_on(async {
+                    // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
+                    let send_cx = crate::cx::Cx::current()
+                        .unwrap_or_else(crate::cx::for_request);
                     if no_paste {
-                        h.send_text_no_paste(pane_id, &text).await
+                        h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
                     } else {
-                        h.send_text(pane_id, &text).await
+                        h.send_text_with_cx(&send_cx, pane_id, &text).await
                     }
                 })
             })
@@ -373,10 +376,13 @@ fn execute_step_action(
                     .build()
                     .expect("failed to build runtime for wait_for step");
                 rt.block_on(async {
+                    // ft-xbnl0.2.3 tick 262: cx-first tx-execution wait_for poll.
+                    let wait_cx = crate::cx::Cx::current()
+                        .unwrap_or_else(crate::cx::for_request);
                     let deadline = std::time::Instant::now() + timeout;
                     let poll_interval = std::time::Duration::from_millis(200);
                     loop {
-                        match h.get_text(target_pane, false).await {
+                        match h.get_text_with_cx(&wait_cx, target_pane, false).await {
                             Ok(text) if !pattern.is_empty() && text.contains(&pattern) => {
                                 return Ok(());
                             }
