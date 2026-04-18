@@ -26172,9 +26172,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             // Fetch active mutes for noise control annotations
+            // ft-xbnl0.2.3 tick 270: cx-first active mutes fetch.
+            let mutes_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             let now_events = now_ms_i64();
             let active_mutes = storage
-                .list_active_mutes(now_events)
+                .list_active_mutes_with_cx(&mutes_cx, now_events)
                 .await
                 .unwrap_or_default();
             let muted_keys: std::collections::HashSet<String> = active_mutes
@@ -31224,9 +31227,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 match storage_result {
                     Ok(storage) => {
                         // Fetch active mutes for noise control annotations
+                        // ft-xbnl0.2.3 tick 270: cx-first active mutes fetch.
+                        let triage_mutes_cx = frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request);
                         let now_triage = now_ms_i64();
                         let active_mutes = storage
-                            .list_active_mutes(now_triage)
+                            .list_active_mutes_with_cx(&triage_mutes_cx, now_triage)
                             .await
                             .unwrap_or_default();
                         let muted_keys: std::collections::HashSet<String> = active_mutes
