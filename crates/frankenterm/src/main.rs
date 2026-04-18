@@ -15696,10 +15696,13 @@ async fn run_watcher(
     if let Some(ref engine) = snapshot_engine {
         let wez =
             frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
-        match wez.list_panes().await {
+        // ft-xbnl0.2.3 tick 288: cx-first shutdown list_panes + checkpoint.
+        let shutdown_snap_cx = frankenterm_core::cx::Cx::current()
+            .unwrap_or_else(frankenterm_core::cx::for_request);
+        match wez.list_panes_with_cx(&shutdown_snap_cx).await {
             Ok(panes) if !panes.is_empty() => {
                 match engine
-                    .shutdown_checkpoint(&panes, Duration::from_secs(5))
+                    .shutdown_checkpoint_with_cx(&shutdown_snap_cx, &panes, Duration::from_secs(5))
                     .await
                 {
                     Ok(Some(snap)) => {
