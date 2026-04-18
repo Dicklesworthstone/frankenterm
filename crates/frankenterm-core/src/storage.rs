@@ -7442,6 +7442,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_notification`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_notification_with_cx(
         &self,
@@ -7451,7 +7452,18 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("record_notification cancelled: {err}"))
         })?;
-        self.record_notification(record).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordNotification {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Update the delivery status of a notification.
@@ -7476,6 +7488,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_notification_status`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn update_notification_status_with_cx(
         &self,
@@ -7487,8 +7500,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("update_notification_status cancelled: {err}"))
         })?;
-        self.update_notification_status(id, status, error_message)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::UpdateNotificationStatus {
+                    id,
+                    status,
+                    error_message,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Acknowledge a notification (marks when and by whom).
@@ -7513,6 +7538,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`acknowledge_notification`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn acknowledge_notification_with_cx(
         &self,
@@ -7524,8 +7550,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("acknowledge_notification cancelled: {err}"))
         })?;
-        self.acknowledge_notification(id, acknowledged_by, action_taken)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::AcknowledgeNotification {
+                    id,
+                    acknowledged_by,
+                    action_taken,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Increment the retry count for a notification and reset its status to pending.
@@ -7540,6 +7578,7 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`increment_notification_retry`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn increment_notification_retry_with_cx(
         &self,
@@ -7549,7 +7588,12 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("increment_notification_retry cancelled: {err}"))
         })?;
-        self.increment_notification_retry(id).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::IncrementNotificationRetry { id, respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge notification history older than the given timestamp.
@@ -7896,11 +7940,17 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`vacuum`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn vacuum_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("vacuum cancelled: {err}")))?;
-        self.vacuum().await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::Vacuum { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Lightweight WAL checkpoint (PASSIVE) + PRAGMA optimize.
@@ -7918,11 +7968,17 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`checkpoint`].
+    /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn checkpoint_with_cx(&self, cx: &crate::cx::Cx) -> Result<CheckpointResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("checkpoint cancelled: {err}")))?;
-        self.checkpoint().await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(cx, WriteCommand::Checkpoint { respond: tx })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
