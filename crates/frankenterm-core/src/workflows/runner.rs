@@ -585,7 +585,7 @@ impl WorkflowRunner {
                     "Action plan validation failed"
                 );
                 let reason = format!("Plan validation failed: {validation_error}");
-                if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
                     tracing::warn!(
                         execution_id,
                         error = %e,
@@ -643,7 +643,7 @@ impl WorkflowRunner {
                 if let Err(err) = cx.checkpoint() {
                     let reason =
                         format!("run_workflow cancelled at step {current_step}: {err}");
-                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                    if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1029,7 +1029,7 @@ impl WorkflowRunner {
                         );
 
                         // Update execution to failed
-                        if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                        if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
                             tracing::warn!(
                                 execution_id,
                                 error = %e,
@@ -1082,7 +1082,7 @@ impl WorkflowRunner {
                     let elapsed_ms = elapsed_ms(start_time);
 
                     // Update execution to failed
-                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                    if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &reason).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
@@ -1392,7 +1392,7 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed
-                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
+                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -1465,7 +1465,7 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed (approval not auto-granted for workflows)
-                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
+                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -1523,7 +1523,7 @@ impl WorkflowRunner {
                             );
 
                             // Update execution to failed
-                            if let Err(e) = self.fail_execution(execution_id, &abort_reason).await {
+                            if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, &abort_reason).await {
                                 tracing::warn!(
                                     execution_id,
                                     error = %e,
@@ -2154,6 +2154,85 @@ impl WorkflowRunner {
             tracing::warn!(pane_id, error = %err, "Failed to record workflow failure metric");
         }
         Ok(())
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`fail_execution`].
+    ///
+    /// Tick 183: all 3 storage calls (get_workflow + upsert_workflow
+    /// + record_usage_metric) route through their cx-first siblings.
+    /// Keeps the "metric-write failure is warn-only" contract — the
+    /// metric write uses `if let Err` on the cx-first path same as
+    /// legacy, so a cx-cancelled metric write logs-and-continues.
+    #[cfg(feature = "asupersync-runtime")]
+    async fn fail_execution_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        execution_id: &str,
+        error: &str,
+    ) -> crate::Result<()> {
+        let mut record = self
+            .storage
+            .get_workflow_with_cx(cx, execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        record.status = "failed".to_string();
+        record.error = Some(error.to_string());
+        let now = now_ms();
+        record.updated_at = now;
+        record.completed_at = Some(now);
+
+        let duration_ms = now.saturating_sub(record.started_at);
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let metric = crate::storage::UsageMetricRecord {
+            id: 0,
+            timestamp: now,
+            metric_type: crate::storage::MetricType::WorkflowCost,
+            pane_id: Some(pane_id),
+            agent_type: None,
+            account_id: None,
+            workflow_id: Some(record.id.clone()),
+            count: Some(1),
+            amount: None,
+            tokens: None,
+            metadata: Some(
+                serde_json::json!({
+                    "source": "workflow.runner",
+                    "workflow_name": workflow_name,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            ),
+            created_at: now,
+        };
+
+        self.storage.upsert_workflow_with_cx(cx, record).await?;
+        if let Err(err) = self.storage.record_usage_metric_with_cx(cx, metric).await {
+            tracing::warn!(pane_id, error = %err, "Failed to record workflow failure metric (cx path)");
+        }
+        Ok(())
+    }
+
+    /// Tick 183: dispatcher for fail_execution call sites.
+    async fn fail_execution_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        execution_id: &str,
+        error: &str,
+    ) -> crate::Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        if let Some(cx) = cx {
+            return self.fail_execution_with_cx(cx, execution_id, error).await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let _ = cx;
+        self.fail_execution(execution_id, error).await
     }
 
     /// Mark the triggering event as handled after workflow completion.
