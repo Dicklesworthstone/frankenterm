@@ -955,8 +955,11 @@ impl IpcServer {
             {
                 Ok(Ok((stream, _addr))) => {
                     let ctx = ctx.clone();
+                    let child_cx = cx.clone();
                     connection_tasks.spawn(async move {
-                        if let Err(e) = handle_client_with_context(stream, ctx).await {
+                        if let Err(e) =
+                            handle_client_with_context_with_cx(child_cx, stream, ctx).await
+                        {
                             tracing::warn!(error = %e, "IPC client error");
                         }
                     });
@@ -1290,6 +1293,70 @@ async fn handle_client_with_context(
     Ok(())
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_client_with_context`].
+///
+/// Threads the caller's cx into the request dispatcher so registry
+/// lock acquires (via `handle_request_with_context_with_cx`) honor
+/// cancellation from the parent run loop. The line-reading and
+/// response-write paths are left on the legacy IO adapters; those
+/// are already bounded by `MAX_MESSAGE_SIZE + 1` and the short-lived
+/// request-response lifetime of a single connection, so the
+/// primary value of the cx seam is interrupting slow lock waits
+/// during server shutdown.
+#[cfg(all(unix, feature = "asupersync-runtime"))]
+async fn handle_client_with_context_with_cx(
+    cx: crate::cx::Cx,
+    stream: UnixStream,
+    ctx: Arc<IpcHandlerContext>,
+) -> std::io::Result<()> {
+    let start = Instant::now();
+    let (reader, mut writer) = stream.into_split();
+
+    use crate::runtime_compat::unix::AsyncReadExt;
+    let bounded_reader = reader.take((MAX_MESSAGE_SIZE + 1) as u64);
+
+    let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
+    let Some(line) = compat_unix::next_line(&mut lines).await? else {
+        return Ok(());
+    };
+
+    if line.len() > MAX_MESSAGE_SIZE {
+        let response = IpcResponse::error("message too large");
+        let response_json = serde_json::to_string(&response)
+            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
+        writer.write_all(response_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        return Ok(());
+    }
+
+    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
+        Ok(envelope) => {
+            if let Some(auth) = ctx.auth.as_ref() {
+                if let Err(err) =
+                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
+                {
+                    IpcResponse::error(err.message())
+                } else {
+                    handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+                }
+            } else {
+                handle_request_with_context_with_cx(&cx, envelope, &ctx).await
+            }
+        }
+        Err(e) => IpcResponse::error(format!("invalid request: {e}")),
+    };
+
+    let response = response.with_timing(start);
+
+    let response_json = serde_json::to_string(&response)
+        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
+    writer.write_all(response_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
 /// Handle a parsed IPC request with full context.
 async fn handle_request_with_context(
     envelope: IpcEnvelope,
@@ -1432,6 +1499,52 @@ async fn handle_request_with_context(
     }
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_request_with_context`].
+///
+/// Routes PaneState / SetPanePriority / ClearPanePriority to their
+/// cx-first handler siblings so a cancelled client-handler cx
+/// propagates into the registry RwLock acquires. All other branches
+/// (UserVar, Ping, Status, Rpc) delegate to the legacy dispatcher;
+/// they don't benefit from cx threading at this layer (Status does
+/// have a registry read but the telemetry-friendly path is
+/// best-effort — cancel-surfaces-as-delay is acceptable there).
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_request_with_context_with_cx(
+    cx: &crate::cx::Cx,
+    envelope: IpcEnvelope,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    let IpcEnvelope {
+        token,
+        request_id,
+        request,
+    } = envelope;
+    match request {
+        IpcRequest::PaneState { pane_id } => {
+            handle_pane_state_with_cx(cx, pane_id, ctx).await
+        }
+        IpcRequest::SetPanePriority {
+            pane_id,
+            priority,
+            ttl_ms,
+        } => handle_set_pane_priority_with_cx(cx, pane_id, priority, ttl_ms, ctx).await,
+        IpcRequest::ClearPanePriority { pane_id } => {
+            handle_clear_pane_priority_with_cx(cx, pane_id, ctx).await
+        }
+        // Non-lock branches delegate to the legacy dispatcher (the
+        // registry-read in the Status branch is best-effort; a
+        // cancel-surfaces-as-delay contract is acceptable there).
+        other => {
+            let envelope = IpcEnvelope {
+                token,
+                request_id,
+                request: other,
+            };
+            handle_request_with_context(envelope, ctx).await
+        }
+    }
+}
+
 async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse {
     let Some(ref registry_lock) = ctx.registry else {
         return IpcResponse::ok_with_data(serde_json::json!({
@@ -1463,6 +1576,48 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         "last_status_at": entry.last_status_at,  // DEPRECATED: always null
         "in_gap": cursor.as_ref().map(|c| c.in_gap),
         "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),  // Authoritative alt-screen state
+    }))
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_pane_state`].
+///
+/// Threads caller cx through the registry RwLock `read_with_cx`
+/// acquire so a client-disconnection-cancelled cx interrupts the
+/// lock wait cleanly rather than blocking.
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_pane_state_with_cx(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::ok_with_data(serde_json::json!({
+            "pane_id": pane_id,
+            "known": false,
+            "reason": "no_registry",
+        }));
+    };
+
+    let (entry, cursor) = {
+        let registry = registry_lock.read_with_cx(cx).await;
+        let Some(entry) = registry.get_entry(pane_id) else {
+            return IpcResponse::ok_with_data(serde_json::json!({
+                "pane_id": pane_id,
+                "known": false,
+                "reason": "unknown_pane",
+            }));
+        };
+        (entry.clone(), registry.get_cursor(pane_id).cloned())
+    };
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "known": true,
+        "observed": entry.should_observe(),
+        "alt_screen": entry.is_alt_screen,
+        "last_status_at": entry.last_status_at,
+        "in_gap": cursor.as_ref().map(|c| c.in_gap),
+        "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),
     }))
 }
 
@@ -1506,6 +1661,52 @@ async fn handle_set_pane_priority(
     }))
 }
 
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_set_pane_priority`].
+///
+/// Threads caller cx through the registry RwLock `write_with_cx`
+/// acquire.
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_set_pane_priority_with_cx(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    priority: u32,
+    ttl_ms: Option<u64>,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::error_with_code(
+            "ipc.no_registry",
+            "pane registry not available",
+            Some("Start the watcher with `ft watch` in this workspace.".to_string()),
+        );
+    };
+
+    let installed = {
+        let mut registry = registry_lock.write_with_cx(cx).await;
+        match registry.set_priority_override(pane_id, priority, ttl_ms) {
+            Ok(ov) => ov,
+            Err(e) => {
+                return IpcResponse::error_with_code(
+                    "ipc.pane_not_found",
+                    format!("pane {pane_id} not found: {e}"),
+                    Some(
+                        "Use `ft robot state` or `wezterm cli list` to find valid pane IDs."
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    };
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "priority": installed.priority,
+        "set_at": installed.set_at,
+        "expires_at": installed.expires_at,
+        "ttl_ms": ttl_ms,
+    }))
+}
+
 async fn handle_clear_pane_priority(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse {
     let Some(ref registry_lock) = ctx.registry else {
         return IpcResponse::error_with_code(
@@ -1517,6 +1718,44 @@ async fn handle_clear_pane_priority(pane_id: u64, ctx: &IpcHandlerContext) -> Ip
 
     {
         let mut registry = registry_lock.write().await;
+        if let Err(e) = registry.clear_priority_override(pane_id) {
+            return IpcResponse::error_with_code(
+                "ipc.pane_not_found",
+                format!("pane {pane_id} not found: {e}"),
+                Some(
+                    "Use `ft robot state` or `wezterm cli list` to find valid pane IDs."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
+    IpcResponse::ok_with_data(serde_json::json!({
+        "pane_id": pane_id,
+        "cleared": true,
+    }))
+}
+
+/// ft-xbnl0.2.3 Cx-first sibling of [`handle_clear_pane_priority`].
+///
+/// Threads caller cx through the registry RwLock `write_with_cx`
+/// acquire.
+#[cfg(feature = "asupersync-runtime")]
+async fn handle_clear_pane_priority_with_cx(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    ctx: &IpcHandlerContext,
+) -> IpcResponse {
+    let Some(ref registry_lock) = ctx.registry else {
+        return IpcResponse::error_with_code(
+            "ipc.no_registry",
+            "pane registry not available",
+            Some("Start the watcher with `ft watch` in this workspace.".to_string()),
+        );
+    };
+
+    {
+        let mut registry = registry_lock.write_with_cx(cx).await;
         if let Err(e) = registry.clear_priority_override(pane_id) {
             return IpcResponse::error_with_code(
                 "ipc.pane_not_found",
