@@ -13,9 +13,9 @@ mod web_tests {
     };
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
 
-    #[cfg(feature = "asupersync-runtime")]
-    use frankenterm_core::web::start_web_server_with_cx;
     use frankenterm_core::web::{WebServerConfig, start_web_server};
+    #[cfg(feature = "asupersync-runtime")]
+    use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
 
     fn run_async_test<F>(future: F)
     where
@@ -250,6 +250,60 @@ mod web_tests {
                 err_msg.contains("cancelled") || err_msg.contains("start_web_server cancelled"),
                 "error should surface cancellation; got: {err_msg}"
             );
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 417: `run_web_server_with_cx` orchestrator-level
+    /// mid-flight cx-cancel exits gracefully.
+    ///
+    /// Complements `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick
+    /// 323) which pins the pre-start timing. This test pins the mid-flight
+    /// timing: cx is live when `run_web_server_with_cx` is called, the
+    /// server binds and enters its `select! { join | shutdown_signal }`
+    /// orchestration, then a separate task cancels cx ~200 ms later.
+    ///
+    /// `wait_for_shutdown_signal_with_cx` polls `cx.is_cancel_requested()`
+    /// every 100 ms via `sleep_with_cx`, so cx-cancel must wake the
+    /// shutdown branch, which then runs the graceful `signal_shutdown` +
+    /// `poke_listener` + drain path. The net observable effect: the
+    /// outer `run_web_server_with_cx` future resolves to `Ok(())` within
+    /// one or two poll cycles.
+    ///
+    /// This pins the orchestrator-level cx→shutdown wiring that was
+    /// previously only covered by the pre-cancel pre-bind path.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn web_server_with_cx_mid_flight_cancel_exits_cleanly() {
+        run_async_test(async {
+            let cx = frankenterm_core::cx::for_request();
+            let cx_for_cancel = cx.clone();
+
+            let server_task = task::spawn(async move {
+                run_web_server_with_cx(&cx, WebServerConfig::default().with_port(0)).await
+            });
+
+            // Give the server time to bind + enter the select! loop.
+            task::spawn(async move {
+                sleep(Duration::from_millis(200)).await;
+                cx_for_cancel.cancel_with(
+                    frankenterm_core::outcome::CancelKind::User,
+                    Some("mid-flight cancel run_web_server_with_cx test"),
+                );
+            });
+
+            // The orchestrator should exit within ~1s: 200ms pre-cancel
+            // delay + up to 100ms poll cycle + graceful shutdown drain.
+            let started = Instant::now();
+            let outer = timeout(Duration::from_secs(10), server_task).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "run_web_server_with_cx should exit within 5s of cx-cancel; took {elapsed:?}"
+            );
+            let join = outer.expect("outer timeout should not fire");
+            let inner = join.expect("run_web_server_with_cx task must not panic");
+            inner.expect("run_web_server_with_cx must return Ok on cx-cancel");
         });
     }
 
