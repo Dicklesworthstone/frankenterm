@@ -448,9 +448,12 @@ impl QueryClient for ProductionQueryClient {
             let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();
 
             if let Some(storage) = storage {
+                // ft-xbnl0.2.3 tick 256: cx-first TUI pane-aggregation reads.
+                let agg_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
                 let (unhandled_res, last_activity_res) = crate::runtime_compat::join!(
-                    storage.count_unhandled_events_by_pane(),
-                    storage.get_last_activity_by_pane()
+                    storage.count_unhandled_events_by_pane_with_cx(&agg_cx),
+                    storage.get_last_activity_by_pane_with_cx(&agg_cx)
                 );
                 let unhandled_by_pane = unhandled_res.unwrap_or_default();
                 let last_activity_by_pane = last_activity_res.unwrap_or_default();
@@ -952,7 +955,12 @@ impl QueryClient for ProductionQueryClient {
             .with_range(start, now)
             .with_pagination(limit, 0);
         self.runtime
-            .block_on(storage.get_timeline(query))
+            .block_on(async {
+                // ft-xbnl0.2.3 tick 256: cx-first TUI timeline read.
+                let timeline_cx = crate::cx::Cx::current()
+                    .unwrap_or_else(crate::cx::for_request);
+                storage.get_timeline_with_cx(&timeline_cx, query).await
+            })
             .map_err(|e| QueryError::StorageError(e.to_string()))
     }
 
