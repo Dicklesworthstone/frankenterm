@@ -1561,21 +1561,22 @@ pub async fn persist_captured_segment(
 }
 
 /// Cx-first [`persist_captured_segment`] (ft-xbnl0.2.3).
-/// Threads caller `&Cx` through the storage operations via a
-/// pre-flight checkpoint plus one before the main
-/// `append_segment` write. The record_gap calls that may
-/// precede or follow the append are left uncheckpointed —
-/// they're cheap and skipping them to break out early would
-/// leave the cursor in a half-recorded state.
 ///
-/// Cancellation-safety: pre-flight cancel returns before any
-/// storage write happens. A late cancel (between the
-/// pre-flight check and the append) is out of the narrow
-/// window this variant covers; callers depending on this
-/// would require a deeper refactor with per-step checkpoints.
-/// The pre-flight checkpoint alone is valuable because
-/// tailer code paths frequently call persist in a loop and
-/// may want to bail out when shutdown arrives.
+/// Tick 196: upgraded from pre-flight-only wrapper to a fully
+/// cx-threaded body. Every inner storage call now routes through
+/// its `_with_cx` sibling:
+///   - `storage.record_gap_with_cx(cx, ...)` for the initial gap.
+///   - `storage.append_segment_with_cx(cx, ...)` for the main write.
+///   - `storage.record_gap_with_cx(cx, ...)` for the truncation gap.
+///   - `storage.record_gap_with_cx(cx, ...)` for the discontinuity gap.
+///
+/// Cancellation now propagates into each mpsc backpressure reserve
+/// (send_with_cx, tick 176) and each storage pre-flight checkpoint,
+/// so an operator who cancels mid-ingest bails at the next await
+/// boundary rather than blocking until the whole chain drains.
+///
+/// Legacy [`persist_captured_segment`] preserved for ambient-cx
+/// callers and non-asupersync builds.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn persist_captured_segment_with_cx(
     cx: &crate::cx::Cx,
@@ -1586,7 +1587,60 @@ pub async fn persist_captured_segment_with_cx(
     cx.checkpoint().map_err(|err| {
         crate::Error::Runtime(format!("persist_captured_segment cancelled: {err}"))
     })?;
-    persist_captured_segment(storage, captured, max_segment_bytes).await
+
+    let (bounded_segment, truncation) =
+        enforce_segment_size_for_persistence(captured, max_segment_bytes);
+
+    if let Some(detail) = truncation.as_ref() {
+        warn!(
+            pane_id = bounded_segment.pane_id,
+            seq = bounded_segment.seq,
+            original_bytes = detail.original_bytes,
+            kept_bytes = detail.kept_bytes,
+            max_bytes = detail.max_bytes,
+            "Captured segment exceeded max bytes and was truncated with explicit GAP"
+        );
+    }
+
+    let mut gap = match &bounded_segment.kind {
+        CapturedSegmentKind::Gap { reason } => {
+            storage
+                .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
+                .await?
+        }
+        CapturedSegmentKind::Delta => None,
+    };
+
+    let stored = storage
+        .append_segment_with_cx(cx, bounded_segment.pane_id, &bounded_segment.content, None)
+        .await?;
+
+    if gap.is_none() && truncation.is_some() {
+        if let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind {
+            gap = storage
+                .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
+                .await?;
+        }
+    }
+
+    if stored.seq != bounded_segment.seq {
+        let discontinuity_reason = format!(
+            "seq_discontinuity:expected={},actual={}",
+            bounded_segment.seq, stored.seq
+        );
+        let discontinuity_gap = storage
+            .record_gap_with_cx(cx, bounded_segment.pane_id, &discontinuity_reason)
+            .await?;
+
+        if gap.is_none() {
+            gap = discontinuity_gap;
+        }
+    }
+
+    Ok(PersistedCapture {
+        segment: stored,
+        gap,
+    })
 }
 
 fn hash_text(text: &str) -> u64 {
