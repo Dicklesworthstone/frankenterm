@@ -22820,7 +22820,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         eprint!("{}", format_search_lints_plain(&lints));
                     }
 
-                    match storage.get_saved_search_by_name(&name).await {
+                    match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                         Ok(Some(_)) => {
                             if output_format.is_json() {
                                 println!(
@@ -22902,11 +22902,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Some(SearchCommands::Saved { command }) => match command {
+                Some(SearchCommands::Saved { command }) => {
+                    // ft-xbnl0.2.3 ticks 246/247: cx-first storage — single
+                    // binding scoped across all SavedSearchCommands arms.
+                    let storage_cx = frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request);
+                    match command {
                     SavedSearchCommands::List => {
-                        // ft-xbnl0.2.3 tick 246: cx-first storage read.
-                        let storage_cx = frankenterm_core::cx::Cx::current()
-                            .unwrap_or_else(frankenterm_core::cx::for_request);
                         match storage.list_saved_searches_with_cx(&storage_cx).await {
                             Ok(searches) => {
                                 if output_format.is_json() {
@@ -22939,7 +22941,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     SavedSearchCommands::Run { name } => {
-                        let saved = match storage.get_saved_search_by_name(&name).await {
+                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23109,7 +23111,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
 
-                        let saved = match storage.get_saved_search_by_name(&name).await {
+                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23153,7 +23155,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
 
-                        let updated = match storage.get_saved_search_by_name(&name).await {
+                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23195,7 +23197,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     SavedSearchCommands::Unschedule { name } => {
-                        let saved = match storage.get_saved_search_by_name(&name).await {
+                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23239,7 +23241,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
 
-                        let updated = match storage.get_saved_search_by_name(&name).await {
+                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23281,7 +23283,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     SavedSearchCommands::Enable { name } => {
-                        let saved = match storage.get_saved_search_by_name(&name).await {
+                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23342,7 +23344,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
 
-                        let updated = match storage.get_saved_search_by_name(&name).await {
+                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23384,7 +23386,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                     }
                     SavedSearchCommands::Disable { name } => {
-                        let saved = match storage.get_saved_search_by_name(&name).await {
+                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23432,7 +23434,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
 
-                        let updated = match storage.get_saved_search_by_name(&name).await {
+                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
                             Ok(Some(search)) => search,
                             Ok(None) => {
                                 if output_format.is_json() {
@@ -23521,7 +23523,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
                         }
                     }
-                },
+                    }
+                }
                 None if suggest => {
                     let partial = query.as_deref().unwrap_or("");
                     let suggestions =
