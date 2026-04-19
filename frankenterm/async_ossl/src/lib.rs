@@ -15,11 +15,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 #[cfg(feature = "async-asupersync")]
+use asupersync::Cx;
+#[cfg(feature = "async-asupersync")]
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "async-asupersync")]
 use asupersync::runtime::{Interest, IoRegistration};
-#[cfg(feature = "async-asupersync")]
-use asupersync::Cx;
 #[cfg(feature = "async-asupersync")]
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 
@@ -66,6 +66,20 @@ impl AsyncSslStream {
                 return Poll::Ready(Ok(()));
             }
             self.register_interest_for_read(cx)?;
+            armed = true;
+            Poll::Pending
+        })
+        .await
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    pub async fn wait_for_writable(&self) -> std::io::Result<()> {
+        let mut armed = false;
+        poll_fn(|cx| {
+            if armed {
+                return Poll::Ready(Ok(()));
+            }
+            self.register_interest_for_write(cx)?;
             armed = true;
             Poll::Pending
         })

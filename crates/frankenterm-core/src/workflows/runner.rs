@@ -627,7 +627,7 @@ impl WorkflowRunner {
             PaneCapabilities::prompt(),
             execution_id,
         )
-        .with_injector(Arc::clone(&self.injector));
+        .with_injector(self.injector.clone());
 
         // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
         #[cfg(feature = "asupersync-runtime")]
@@ -657,8 +657,7 @@ impl WorkflowRunner {
         }
 
         if let Some(adapter) = self.replay_capture.as_ref() {
-            let mut injector = self.injector.lock().await;
-            injector.set_decision_capture(adapter.clone());
+            self.injector.set_decision_capture(adapter.clone()).await;
         }
 
         // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
@@ -1405,18 +1404,16 @@ impl WorkflowRunner {
                         "Workflow requesting text injection"
                     );
 
-                    let send_result = {
-                        let mut guard = self.injector.lock().await;
-                        guard
-                            .send_text(
-                                pane_id,
-                                &text,
-                                crate::policy::ActorKind::Workflow,
-                                ctx.capabilities(),
-                                Some(execution_id),
-                            )
-                            .await
-                    };
+                    let send_result = self
+                        .injector
+                        .send_text(
+                            pane_id,
+                            &text,
+                            crate::policy::ActorKind::Workflow,
+                            ctx.capabilities(),
+                            Some(execution_id),
+                        )
+                        .await;
 
                     // Log the SendText step with audit_action_id (wa-nu4.1.1.11)
                     let audit_action_id = send_result.audit_action_id();
@@ -1900,7 +1897,7 @@ impl WorkflowRunner {
                                         engine,
                                         lock_manager,
                                         storage,
-                                        injector: Arc::clone(&self.injector),
+                                        injector: self.injector.clone(),
                                         config,
                                         replay_capture: self.replay_capture.clone(),
                                     };
@@ -1909,65 +1906,65 @@ impl WorkflowRunner {
                                     crate::runtime_compat::task::spawn_with_cx(
                                         &request_cx,
                                         move |_child_cx| async move {
-                                        let result = runner
-                                            .run_workflow(
-                                                pane_id,
-                                                workflow_clone,
-                                                &execution_id_clone,
-                                                0,
-                                            )
-                                            .await;
+                                            let result = runner
+                                                .run_workflow(
+                                                    pane_id,
+                                                    workflow_clone,
+                                                    &execution_id_clone,
+                                                    0,
+                                                )
+                                                .await;
 
-                                        match &result {
-                                            WorkflowExecutionResult::Completed {
-                                                execution_id,
-                                                steps_executed,
-                                                elapsed_ms,
-                                                ..
-                                            } => {
-                                                tracing::info!(
+                                            match &result {
+                                                WorkflowExecutionResult::Completed {
                                                     execution_id,
-                                                    steps = steps_executed,
+                                                    steps_executed,
                                                     elapsed_ms,
-                                                    "Workflow completed"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::Aborted {
-                                                execution_id,
-                                                reason,
-                                                step_index,
-                                                ..
-                                            } => {
-                                                tracing::warn!(
+                                                    ..
+                                                } => {
+                                                    tracing::info!(
+                                                        execution_id,
+                                                        steps = steps_executed,
+                                                        elapsed_ms,
+                                                        "Workflow completed"
+                                                    );
+                                                }
+                                                WorkflowExecutionResult::Aborted {
                                                     execution_id,
-                                                    step = step_index,
                                                     reason,
-                                                    "Workflow aborted"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::PolicyDenied {
-                                                execution_id,
-                                                step_index,
-                                                reason,
-                                            } => {
-                                                tracing::warn!(
+                                                    step_index,
+                                                    ..
+                                                } => {
+                                                    tracing::warn!(
+                                                        execution_id,
+                                                        step = step_index,
+                                                        reason,
+                                                        "Workflow aborted"
+                                                    );
+                                                }
+                                                WorkflowExecutionResult::PolicyDenied {
                                                     execution_id,
-                                                    step = step_index,
+                                                    step_index,
                                                     reason,
-                                                    "Workflow denied by policy"
-                                                );
-                                            }
-                                            WorkflowExecutionResult::Error {
-                                                execution_id,
-                                                error,
-                                            } => {
-                                                tracing::error!(
-                                                    execution_id = execution_id.as_deref(),
+                                                } => {
+                                                    tracing::warn!(
+                                                        execution_id,
+                                                        step = step_index,
+                                                        reason,
+                                                        "Workflow denied by policy"
+                                                    );
+                                                }
+                                                WorkflowExecutionResult::Error {
+                                                    execution_id,
                                                     error,
-                                                    "Workflow error"
-                                                );
+                                                } => {
+                                                    tracing::error!(
+                                                        execution_id = execution_id.as_deref(),
+                                                        error,
+                                                        "Workflow error"
+                                                    );
+                                                }
                                             }
-                                        }
                                         },
                                     );
                                 }
@@ -2114,7 +2111,7 @@ impl WorkflowRunner {
                                         engine,
                                         lock_manager,
                                         storage,
-                                        injector: Arc::clone(&self.injector),
+                                        injector: self.injector.clone(),
                                         config,
                                         replay_capture: self.replay_capture.clone(),
                                     };

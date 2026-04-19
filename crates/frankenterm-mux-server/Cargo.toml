@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
+io-uring = ["frankenterm-mux-server-impl/io-uring"]
 
 [dependencies]
 anyhow.workspace = true

@@ -3,30 +3,73 @@
 use crate::sessionhandler::{PduSender, SessionHandler};
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use async_channel::unbounded;
+use async_channel::{Receiver, Sender, TryRecvError, unbounded};
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
 use futures::future::{Either, select};
 use futures::{FutureExt, pin_mut};
 use mux::{Mux, MuxNotification};
 use std::future::Future;
+use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Arc;
 use wezterm_uds::UnixStream;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchIoBackend {
+    IoUring,
+    Epoll,
+    Kqueue,
+    Poll,
+}
+
+impl DispatchIoBackend {
+    pub const fn current_default() -> Self {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        {
+            return Self::IoUring;
+        }
+        #[cfg(all(not(feature = "io-uring"), target_os = "linux"))]
+        {
+            return Self::Epoll;
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            return Self::Kqueue;
+        }
+        Self::Poll
+    }
+}
+
 pub trait DispatchStream: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug {
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
+    fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
 }
 
 impl DispatchStream for UnixStream {
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(UnixStream::wait_for_readable(self))
     }
+
+    fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(UnixStream::wait_for_writable(self))
+    }
 }
 
 impl DispatchStream for AsyncSslStream {
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(AsyncSslStream::wait_for_readable(self))
+    }
+
+    fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(AsyncSslStream::wait_for_writable(self))
     }
 }
 
@@ -54,6 +97,63 @@ impl Drop for MuxSubscriptionGuard {
     }
 }
 
+fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()> {
+    item_tx
+        .try_send(Item::WritePdu(Box::new(DecodedPdu { pdu, serial })))
+        .map_err(|err| anyhow::anyhow!("{err:?}"))
+}
+
+fn is_clean_disconnect(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NotConnected
+            )
+        })
+}
+
+async fn write_pending_pdus<T>(
+    stream: &mut T,
+    first: Box<DecodedPdu>,
+    item_rx: &Receiver<Item>,
+    deferred_item: &mut Option<Item>,
+) -> anyhow::Result<()>
+where
+    T: DispatchStream,
+{
+    stream
+        .wait_for_writable()
+        .await
+        .context("waiting for mux stream to become writable")?;
+
+    let mut current = Some(first);
+    loop {
+        let Some(decoded) = current.take() else {
+            break;
+        };
+        decoded
+            .pdu
+            .encode_async(stream, decoded.serial)
+            .await
+            .context("encoding PDU to client")?;
+        match item_rx.try_recv() {
+            Ok(Item::WritePdu(next)) => current = Some(next),
+            Ok(other) => {
+                *deferred_item = Some(other);
+                break;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+
+    stream.flush().await.context("flushing PDU to client")
+}
+
 pub async fn process<T>(stream: T) -> anyhow::Result<()>
 where
     T: 'static,
@@ -67,17 +167,17 @@ where
     T: 'static,
     T: DispatchStream,
 {
-    log::trace!("process_async called");
+    log::trace!(
+        "process_async called with backend {:?}",
+        DispatchIoBackend::current_default()
+    );
 
     let (item_tx, item_rx) = unbounded::<Item>();
+    let mut deferred_item = None;
 
     let pdu_sender = PduSender::new({
         let item_tx = item_tx.clone();
-        move |pdu| {
-            item_tx
-                .try_send(Item::WritePdu(Box::new(pdu)))
-                .map_err(|e| anyhow::anyhow!("{:?}", e))
-        }
+        move |pdu| queue_pdu(&item_tx, pdu.pdu, pdu.serial)
     });
     let mut handler = SessionHandler::new(pdu_sender);
 
@@ -88,18 +188,28 @@ where
         let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
 
         loop {
-            let next_item = {
-                let rx_msg = item_rx
-                    .recv()
-                    .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
-                let wait_for_read = stream
-                    .wait_for_readable()
-                    .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
+            let next_item = if let Some(item) = deferred_item.take() {
+                Ok(item)
+            } else {
+                match item_rx.try_recv() {
+                    Ok(item) => Ok(item),
+                    Err(TryRecvError::Closed) => {
+                        Err(anyhow::anyhow!("mux dispatch item queue closed"))
+                    }
+                    Err(TryRecvError::Empty) => {
+                        let rx_msg = item_rx
+                            .recv()
+                            .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
+                        let wait_for_read = stream.wait_for_readable().map(|result| {
+                            result.map(|()| Item::Readable).map_err(anyhow::Error::from)
+                        });
 
-                pin_mut!(rx_msg);
-                pin_mut!(wait_for_read);
-                match select(rx_msg, wait_for_read).await {
-                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                        pin_mut!(rx_msg);
+                        pin_mut!(wait_for_read);
+                        match select(rx_msg, wait_for_read).await {
+                            Either::Left((result, _)) | Either::Right((result, _)) => result,
+                        }
+                    }
                 }
             };
 
@@ -120,27 +230,13 @@ where
                     handler.process_one(decoded);
                 }
                 Ok(Item::WritePdu(decoded)) => {
-                    match decoded.pdu.encode_async(&mut stream, decoded.serial).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
-                                if err.kind() == std::io::ErrorKind::BrokenPipe {
-                                    // Client disconnected: no need to make a noise
-                                    return Ok(());
-                                }
-                            }
-                            return Err(err).context("encoding PDU to client");
+                    if let Err(err) =
+                        write_pending_pdus(&mut stream, decoded, &item_rx, &mut deferred_item).await
+                    {
+                        if is_clean_disconnect(&err) {
+                            return Ok(());
                         }
-                    }
-                    match stream.flush().await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                                // Client disconnected: no need to make a noise
-                                return Ok(());
-                            }
-                            return Err(err).context("flushing PDU to client");
-                        }
+                        return Err(err);
                     }
                 }
                 Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
@@ -149,10 +245,11 @@ where
                 Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
                 Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
                     handler.remove_per_pane(pane_id);
-                    Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                     {
@@ -170,20 +267,22 @@ where
                     selection,
                     clipboard,
                 })) => {
-                    Pdu::SetClipboard(codec::SetClipboard {
-                        pane_id,
-                        clipboard,
-                        selection,
-                    })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::SetClipboard(codec::SetClipboard {
+                            pane_id,
+                            clipboard,
+                            selection,
+                        }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::TabAddedToWindow { tab_id, window_id })) => {
-                    Pdu::TabAddedToWindow(codec::TabAddedToWindow { tab_id, window_id })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::TabAddedToWindow(codec::TabAddedToWindow { tab_id, window_id }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
@@ -195,50 +294,52 @@ where
                             .map(|w| w.get_workspace().to_string())
                     };
                     if let Some(workspace) = workspace {
-                        Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
-                            window_id,
-                            workspace,
-                        })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                        stream.flush().await.context("flushing PDU to client")?;
+                        queue_pdu(
+                            &item_tx,
+                            Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                                window_id,
+                                workspace,
+                            }),
+                            0,
+                        )?;
                     }
                 }
                 Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
-                    Pdu::PaneFocused(codec::PaneFocused { pane_id })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::PaneFocused(codec::PaneFocused { pane_id }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
-                    Pdu::TabResized(codec::TabResized { tab_id })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(&item_tx, Pdu::TabResized(codec::TabResized { tab_id }), 0)?;
                 }
                 Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
-                    Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::WindowTitleChanged { window_id, title })) => {
-                    Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title })
-                        .encode_async(&mut stream, 0)
-                        .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::WorkspaceRenamed {
                     old_workspace,
                     new_workspace,
                 })) => {
-                    Pdu::RenameWorkspace(codec::RenameWorkspace {
-                        old_workspace,
-                        new_workspace,
-                    })
-                    .encode_async(&mut stream, 0)
-                    .await?;
-                    stream.flush().await.context("flushing PDU to client")?;
+                    queue_pdu(
+                        &item_tx,
+                        Pdu::RenameWorkspace(codec::RenameWorkspace {
+                            old_workspace,
+                            new_workspace,
+                        }),
+                        0,
+                    )?;
                 }
                 Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
                 Ok(Item::Notif(MuxNotification::Empty)) => {}
@@ -255,6 +356,7 @@ where
 mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use codec::Ping;
     use std::io;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -287,6 +389,10 @@ mod tests {
 
     impl DispatchStream for EofDispatchStream {
         fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -353,5 +459,136 @@ mod tests {
             result.is_ok(),
             "EOF should be treated as a normal client disconnect"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingDispatchStream {
+        bytes_written: AtomicUsize,
+        flush_calls: AtomicUsize,
+        writable_waits: AtomicUsize,
+    }
+
+    impl DispatchStream for CountingDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for CountingDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for CountingDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.bytes_written.fetch_add(buf.len(), Ordering::Relaxed);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn queued_ping(serial: u64) -> Box<DecodedPdu> {
+        Box::new(DecodedPdu {
+            pdu: Pdu::Ping(Ping {}),
+            serial,
+        })
+    }
+
+    #[test]
+    fn write_pending_pdus_batches_flush_and_preserves_first_non_write_item() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let (item_tx, item_rx) = unbounded();
+        item_tx
+            .try_send(Item::WritePdu(queued_ping(2)))
+            .expect("queue second ping");
+        item_tx
+            .try_send(Item::Notif(MuxNotification::Empty))
+            .expect("queue notification");
+
+        let mut deferred_item = None;
+        let mut stream = CountingDispatchStream::default();
+        let result = promise::spawn::block_on(write_pending_pdus(
+            &mut stream,
+            queued_ping(1),
+            &item_rx,
+            &mut deferred_item,
+        ));
+
+        assert!(result.is_ok(), "batched write helper should succeed");
+        assert!(
+            stream.bytes_written.load(Ordering::Relaxed) > 0,
+            "encoded PDUs should write bytes"
+        );
+        assert_eq!(
+            stream.flush_calls.load(Ordering::Relaxed),
+            1,
+            "batched writes should flush once"
+        );
+        assert_eq!(
+            stream.writable_waits.load(Ordering::Relaxed),
+            1,
+            "batched writes should wait once"
+        );
+        assert!(
+            matches!(deferred_item, Some(Item::Notif(MuxNotification::Empty))),
+            "first non-write item should be preserved for the main loop"
+        );
+        assert!(
+            matches!(item_rx.try_recv(), Err(TryRecvError::Empty)),
+            "write batch should drain only queued write items"
+        );
+    }
+
+    #[test]
+    fn dispatch_backend_reports_platform_default() {
+        let backend = DispatchIoBackend::current_default();
+
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        assert_eq!(backend, DispatchIoBackend::IoUring);
+        #[cfg(all(not(feature = "io-uring"), target_os = "linux"))]
+        assert_eq!(backend, DispatchIoBackend::Epoll);
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        assert_eq!(backend, DispatchIoBackend::Kqueue);
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        assert_eq!(backend, DispatchIoBackend::Poll);
     }
 }

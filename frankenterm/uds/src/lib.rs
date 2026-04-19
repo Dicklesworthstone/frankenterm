@@ -29,11 +29,11 @@ use uds_windows::UnixStream as StreamImpl;
 #[allow(dead_code)]
 struct _AsupersyncDep(asupersync::io::IoNotAvailable);
 #[cfg(feature = "async-asupersync")]
+use asupersync::Cx;
+#[cfg(feature = "async-asupersync")]
 use asupersync::io::{AsyncRead, AsyncReadVectored, AsyncWrite, ReadBuf};
 #[cfg(feature = "async-asupersync")]
 use asupersync::runtime::{Interest, IoRegistration};
-#[cfg(feature = "async-asupersync")]
-use asupersync::Cx;
 #[cfg(feature = "async-asupersync")]
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 
@@ -95,6 +95,20 @@ impl UnixStream {
                 return Poll::Ready(Ok(()));
             }
             self.register_interest_for_read(cx)?;
+            armed = true;
+            Poll::Pending
+        })
+        .await
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    pub async fn wait_for_writable(&self) -> std::io::Result<()> {
+        let mut armed = false;
+        std::future::poll_fn(|cx| {
+            if armed {
+                return Poll::Ready(Ok(()));
+            }
+            self.register_interest_for_write(cx)?;
             armed = true;
             Poll::Pending
         })
@@ -1636,7 +1650,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let mut c = client.join().unwrap();
         drop(listener); // drop listener
-                        // Communication should still work
+        // Communication should still work
         server.write_all(b"after drop").unwrap();
         server.flush().unwrap();
         let mut buf = [0u8; 64];
@@ -1679,7 +1693,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let c = client.join().unwrap();
         drop(c); // close client end
-                 // Give OS time to propagate the close
+        // Give OS time to propagate the close
         std::thread::sleep(std::time::Duration::from_millis(50));
         // First write may succeed (buffered), but repeated writes should eventually fail
         let mut failed = false;

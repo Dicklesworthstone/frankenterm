@@ -200,39 +200,32 @@ impl WorkflowContext {
     /// - Emits audit entries
     /// - Only sends if allowed
     ///
-    /// Note: The injector lock (`runtime_compat::Mutex`) is intentionally held across
-    /// the `.await` because `inject()` requires `&mut self` for the entire
-    /// policy-check-then-send operation. This is safe because:
-    /// 1. `inject()` does not re-acquire this lock (no re-entrant locking)
-    /// 2. `runtime_compat::Mutex` is designed for async contexts
-    /// 3. The lock ensures atomicity of policy evaluation + send
+    /// Note: [`PolicyInjectorHandle`] keeps the underlying injector lock
+    /// around the async send so policy evaluation and terminal injection
+    /// remain one atomic operation from the workflow caller's perspective.
     pub async fn send_text(
         &mut self,
         text: &str,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock().await;
-            guard
-                .send_text(
-                    self.pane_id,
-                    text,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_text(
+                self.pane_id,
+                text,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`send_text`] (tick 213).
     ///
-    /// Routes through `injector.lock_with_cx(cx)` (async Mutex
-    /// acquire observes caller cancel) + `guard.send_text_with_cx(cx, ...)`
-    /// (policy engine's cx-aware inject path from policy.rs L6346).
-    /// A cancelled caller interrupts either the lock wait OR the
-    /// inner wezterm dispatch — depending on where the contention is.
+    /// Routes through [`PolicyInjectorHandle::send_text_with_cx`], so the
+    /// handle owns the lock acquisition and the policy engine's cx-aware
+    /// inject path. A cancelled caller interrupts either the lock wait or
+    /// the inner wezterm dispatch depending on where contention exists.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn send_text_with_cx(
         &mut self,
@@ -240,19 +233,16 @@ impl WorkflowContext {
         text: &str,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock_with_cx(cx).await;
-            guard
-                .send_text_with_cx(
-                    cx,
-                    self.pane_id,
-                    text,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_text_with_cx(
+                cx,
+                self.pane_id,
+                text,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -261,17 +251,14 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_c(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock().await;
-            guard
-                .send_ctrl_c(
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_c(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -282,18 +269,15 @@ impl WorkflowContext {
         cx: &crate::cx::Cx,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock_with_cx(cx).await;
-            guard
-                .send_ctrl_c_with_cx(
-                    cx,
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_c_with_cx(
+                cx,
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -302,17 +286,14 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_d(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock().await;
-            guard
-                .send_ctrl_d(
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_d(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -323,18 +304,15 @@ impl WorkflowContext {
         cx: &crate::cx::Cx,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock_with_cx(cx).await;
-            guard
-                .send_ctrl_d_with_cx(
-                    cx,
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_d_with_cx(
+                cx,
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -343,17 +321,14 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_z(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock().await;
-            guard
-                .send_ctrl_z(
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_z(
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 
@@ -364,18 +339,15 @@ impl WorkflowContext {
         cx: &crate::cx::Cx,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let result = {
-            let mut guard = injector.lock_with_cx(cx).await;
-            guard
-                .send_ctrl_z_with_cx(
-                    cx,
-                    self.pane_id,
-                    crate::policy::ActorKind::Workflow,
-                    &self.capabilities,
-                    Some(&self.execution_id),
-                )
-                .await
-        };
+        let result = injector
+            .send_ctrl_z_with_cx(
+                cx,
+                self.pane_id,
+                crate::policy::ActorKind::Workflow,
+                &self.capabilities,
+                Some(&self.execution_id),
+            )
+            .await;
         Ok(result)
     }
 

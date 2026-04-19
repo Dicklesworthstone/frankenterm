@@ -9,6 +9,10 @@ license-file.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+io-uring = []
+
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
