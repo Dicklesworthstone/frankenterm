@@ -5483,6 +5483,71 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 423: `watch::Receiver::changed(cx)` observes cx-cancel.
+    ///
+    /// Pins cx-cancel observation on the asupersync watch-channel
+    /// `changed` primitive. With the sender alive but no new value
+    /// published (version unchanged) and a pre-cancelled cx,
+    /// `rx.changed(&cx).await` must return `Err(RecvError::Cancelled)`
+    /// promptly rather than blocking for a publish that is not coming.
+    ///
+    /// Cancel semantics surfaced by asupersync's `poll_changed`:
+    ///
+    ///     if cx.checkpoint().is_err() {
+    ///         Poll::Ready(Err(RecvError::Cancelled))
+    ///     }
+    ///
+    /// Setup:
+    /// 1. Create `(tx, mut rx) = watch::channel::<u64>(0)` — keep `_tx` alive.
+    /// 2. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 3. Wrap `rx.changed(&cx)` in a 2 s outer safety-net timeout.
+    /// 4. Assert elapsed < 1 s AND `Err(RecvError::Cancelled)`.
+    ///
+    /// Like mpsc, watch is re-exported directly (no runtime_compat wrapper).
+    /// Watch channels underpin config-change notification and
+    /// snapshot-version signalling — pinning cx-cancel guards those sites.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn watch_changed_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = watch::channel::<u64>(0);
+            // Mark the initial value as seen so `changed` waits for a
+            // new publish rather than returning immediately.
+            let _ = rx.borrow_and_update();
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 423 pre-cancel watch::Receiver::changed test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                rx.changed(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit watch::Receiver::changed promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                matches!(inner, Err(watch::RecvError::Cancelled)),
+                "pre-cancelled cx must yield watch::RecvError::Cancelled (not Closed); \
+                 got: {inner:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 422: `mpsc::Receiver::recv(cx)` observes cx-cancel.
     ///
     /// Pins cx-cancel observation on the asupersync mpsc receiver — the
