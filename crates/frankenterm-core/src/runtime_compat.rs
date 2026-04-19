@@ -4713,7 +4713,10 @@ mod tests {
         rt.block_on(async move {
             let handle = task::spawn_with_cx(&cx, |child_cx| async move {
                 let active = crate::cx::Cx::current().expect("installed child cx");
-                (active == child_cx, crate::runtime_compat::current_runtime_handle().is_some())
+                (
+                    std::sync::Arc::ptr_eq(&active.inner, &child_cx.inner),
+                    crate::runtime_compat::current_runtime_handle().is_some(),
+                )
             });
             let result = handle.await.expect("task should complete");
             assert_eq!(result, (true, true));
@@ -4729,7 +4732,10 @@ mod tests {
             let mut set = task::JoinSet::new();
             set.spawn_with_cx(&cx, |child_cx| async move {
                 let active = crate::cx::Cx::current().expect("installed child cx");
-                (active == child_cx, crate::runtime_compat::current_runtime_handle().is_some())
+                (
+                    std::sync::Arc::ptr_eq(&active.inner, &child_cx.inner),
+                    crate::runtime_compat::current_runtime_handle().is_some(),
+                )
             });
 
             let result = set
