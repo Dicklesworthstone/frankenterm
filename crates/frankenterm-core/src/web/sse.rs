@@ -185,41 +185,69 @@ async fn sender_closed<T>(tx: &mpsc::Sender<T>) {
 
 struct SseByteStream {
     rx: mpsc::Receiver<SseEvent>,
+    recv_state: SseRecvState,
+}
+
+struct SseRecvState {
     #[cfg(feature = "asupersync-runtime")]
     cx: asupersync::Cx,
 }
 
-impl SseByteStream {
-    #[cfg(feature = "asupersync-runtime")]
-    fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
+impl SseRecvState {
+    fn new() -> Self {
         Self {
-            rx,
+            #[cfg(feature = "asupersync-runtime")]
             cx: crate::cx::for_request(),
         }
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    fn poll_recv(
+        &self,
+        rx: &mut mpsc::Receiver<SseEvent>,
+        poll_cx: &mut Context<'_>,
+    ) -> Poll<Option<SseEvent>> {
+        match rx.poll_recv(&self.cx, poll_cx) {
+            Poll::Ready(Ok(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Explicit quarantine for legacy non-asupersync builds.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this method once the workspace no longer supports
+    /// non-`asupersync-runtime` SSE builds.
     #[cfg(not(feature = "asupersync-runtime"))]
+    fn poll_recv(
+        &self,
+        rx: &mut mpsc::Receiver<SseEvent>,
+        poll_cx: &mut Context<'_>,
+    ) -> Poll<Option<SseEvent>> {
+        match rx.poll_recv(poll_cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl SseByteStream {
     fn new(rx: mpsc::Receiver<SseEvent>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            recv_state: SseRecvState::new(),
+        }
     }
 }
 
 impl Stream for SseByteStream {
     type Item = Vec<u8>;
 
-    #[cfg(feature = "asupersync-runtime")]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.rx.poll_recv(&this.cx, cx) {
-            Poll::Ready(Ok(event)) => Poll::Ready(Some(event.to_bytes())),
-            Poll::Ready(Err(_)) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.rx.poll_recv(cx) {
+        match this.recv_state.poll_recv(&mut this.rx, cx) {
             Poll::Ready(Some(event)) => Poll::Ready(Some(event.to_bytes())),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,

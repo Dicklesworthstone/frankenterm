@@ -222,7 +222,7 @@ impl DirectMuxClient {
             // actual transport work through the explicit-Cx path so connect,
             // handshake, and timeout boundaries inherit the caller's runtime
             // budget/cancellation context instead of open-coding a fresh one.
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let cx = ambient_mux_cx();
             return Self::connect_with_cx(&cx, config).await;
         }
 
@@ -1817,6 +1817,11 @@ impl DirectMuxClient {
     }
 }
 
+#[cfg(feature = "asupersync-runtime")]
+fn ambient_mux_cx() -> Cx {
+    Cx::current().unwrap_or_else(crate::cx::for_request)
+}
+
 fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -2300,7 +2305,7 @@ impl PaneOutputSubscription {
     pub async fn next(&mut self) -> Option<PaneDelta> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = ambient_mux_cx();
             self.next_with_cx(&cx).await
         }
 
@@ -2444,7 +2449,7 @@ pub fn subscribe_pane_output(
 ) -> PaneOutputSubscription {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = ambient_mux_cx();
         subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config)
     }
 
@@ -9024,6 +9029,41 @@ mod tests {
                 assert!(
                     result.is_none(),
                     "cancelled Cx must surface as None from pane_delta_recv_with_cx, got {result:?}"
+                );
+            });
+        }
+
+        /// 5b. The ambient `PaneOutputSubscription::next` path must inherit the
+        /// current LabRuntime Cx rather than minting a fresh request scope.
+        /// Otherwise deterministic schedulers deadlock because the recv waits
+        /// on a foreign capability context.
+        #[test]
+        fn ambient_subscription_next_inherits_current_cx_under_labruntime() {
+            run_lab(8051, || async move {
+                let (tx, rx) = compat_mpsc::channel::<PaneDelta>(4);
+                let (cancel_tx, _cancel_rx) = compat_watch::channel(false);
+                let cx = asupersync::Cx::current().expect("lab Cx");
+
+                lab_send(
+                    &cx,
+                    &tx,
+                    PaneDelta::Gap {
+                        pane_id: 55,
+                        reason: "lab-inherited-current-cx".into(),
+                    },
+                )
+                .await;
+
+                let mut sub = PaneOutputSubscription {
+                    receiver: rx,
+                    cancel: cancel_tx,
+                    task: None,
+                };
+
+                let result = sub.next().await;
+                assert!(
+                    matches!(result, Some(PaneDelta::Gap { pane_id: 55, reason }) if reason == "lab-inherited-current-cx"),
+                    "ambient subscription recv must inherit current cx, got {result:?}"
                 );
             });
         }
