@@ -3,9 +3,9 @@
 //! Keeps framework dependency boundaries explicit and centralized.
 //! Re-exports are consumed by web.rs sub-modules during migration.
 
-use crate::runtime_compat::task;
 use crate::{Error, Result};
 use asupersync::net::TcpListener;
+use asupersync::runtime::{JoinHandle, Runtime};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::warn;
@@ -31,8 +31,7 @@ pub use fastapi::prelude::{
 };
 
 #[doc(hidden)]
-pub type FrameworkServerJoinResult =
-    std::result::Result<std::result::Result<(), ServerError>, task::JoinError>;
+pub type FrameworkServerJoinResult = std::result::Result<(), ServerError>;
 
 /// Framework-owned runtime state for the feature-gated web server.
 ///
@@ -43,7 +42,7 @@ pub type FrameworkServerJoinResult =
 pub struct FrameworkWebRuntime {
     app: Arc<App>,
     server: Arc<TcpServer>,
-    join: task::JoinHandle<std::result::Result<(), ServerError>>,
+    join: JoinHandle<std::result::Result<(), ServerError>>,
 }
 
 impl FrameworkWebRuntime {
@@ -70,10 +69,12 @@ impl FrameworkWebRuntime {
 
         let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
         let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
+        let runtime_handle = Runtime::current_handle()
+            .ok_or_else(|| Error::Runtime("web runtime unavailable during startup".to_string()))?;
 
         let join = {
             let server = Arc::clone(&server);
-            task::spawn(async move {
+            runtime_handle.spawn(async move {
                 let cx = crate::cx::for_request();
                 server.serve_on_handler(&cx, listener, handler).await
             })
@@ -124,11 +125,14 @@ impl FrameworkWebRuntime {
 
         let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
         let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
+        let runtime_handle = Runtime::current_handle()
+            .ok_or_else(|| Error::Runtime("web runtime unavailable during startup".to_string()))?;
 
         let join = {
             let server = Arc::clone(&server);
             let child_cx = cx.clone();
-            task::spawn(async move { server.serve_on_handler(&child_cx, listener, handler).await })
+            runtime_handle
+                .spawn(async move { server.serve_on_handler(&child_cx, listener, handler).await })
         };
 
         Ok((local_addr, Self { app, server, join }))
@@ -140,22 +144,17 @@ impl FrameworkWebRuntime {
     }
 
     #[doc(hidden)]
-    pub fn join_handle_mut(
-        &mut self,
-    ) -> &mut task::JoinHandle<std::result::Result<(), ServerError>> {
+    pub fn join_handle_mut(&mut self) -> &mut JoinHandle<std::result::Result<(), ServerError>> {
         &mut self.join
     }
 
     #[doc(hidden)]
     pub async fn finish(self, result: FrameworkServerJoinResult) -> Result<()> {
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(ServerError::Shutdown)) => {}
-            Ok(Err(err)) => {
-                return Err(Error::Runtime(format!("web server error: {err}")));
-            }
+            Ok(()) => {}
+            Err(ServerError::Shutdown) => {}
             Err(err) => {
-                return Err(Error::Runtime(format!("web server join error: {err}")));
+                return Err(Error::Runtime(format!("web server error: {err}")));
             }
         }
 
@@ -185,13 +184,10 @@ impl FrameworkWebRuntime {
         result: FrameworkServerJoinResult,
     ) -> Result<()> {
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(ServerError::Shutdown)) => {}
-            Ok(Err(err)) => {
-                return Err(Error::Runtime(format!("web server error: {err}")));
-            }
+            Ok(()) => {}
+            Err(ServerError::Shutdown) => {}
             Err(err) => {
-                return Err(Error::Runtime(format!("web server join error: {err}")));
+                return Err(Error::Runtime(format!("web server error: {err}")));
             }
         }
 
