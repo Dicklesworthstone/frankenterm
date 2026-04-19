@@ -248,6 +248,26 @@ impl CpuPressureMonitor {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.run_with_cx(&cx, shutdown).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            self.run_legacy(shutdown).await;
+            return;
+        }
+    }
+
+    /// Explicit quarantine for legacy non-asupersync CPU-pressure sampling.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this helper once the workspace no longer supports
+    /// non-`asupersync-runtime` sampling loops.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run_legacy(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
         let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
         let mut first_tick = true;
 
@@ -284,8 +304,8 @@ impl CpuPressureMonitor {
     /// iteration so either cancellation path terminates the loop
     /// promptly without waiting on the full sample interval.
     ///
-    /// The legacy [`run`](Self::run) entry point is preserved for
-    /// non-migrated callers; this is strictly additive.
+    /// [`run`](Self::run) now prefers the ambient current Cx under
+    /// `asupersync-runtime`; this remains the explicit inherited-Cx sibling.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx(
         &self,
