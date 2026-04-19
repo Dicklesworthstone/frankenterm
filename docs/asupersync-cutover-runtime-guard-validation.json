@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-19T16:25:02Z",
+  "checked_at": "2026-04-19T16:47:27Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -31,7 +31,7 @@
       "counts": {
         "async_io::": 6,
         "smol::": 35,
-        "tokio::": 201
+        "tokio::": 181
       },
       "files": {
         "async_io::": [
@@ -47,8 +47,6 @@
           "frankenterm/ssh/src/lib.rs"
         ],
         "tokio::": [
-          "crates/frankenterm-core/benches/ipc_throughput.rs",
-          "crates/frankenterm-core/benches/mux_client_ops.rs",
           "crates/frankenterm-core/src/dependency_eradication.rs",
           "crates/frankenterm-core/src/forbidden_dep_guards.rs",
           "crates/frankenterm-core/src/manifest_dep_eradication.rs",
@@ -134,7 +132,7 @@
     "forbidden_token_counts": {
       "async_io::": 6,
       "smol::": 35,
-      "tokio::": 201
+      "tokio::": 181
     }
   }
 }

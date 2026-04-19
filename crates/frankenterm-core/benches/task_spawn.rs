@@ -6,7 +6,6 @@
 //! - single-task spawn latency
 //! - bounded region fanout overhead
 //! - flat spawn fanout overhead
-//! - comparison against equivalent tokio spawn/join workloads
 
 use std::hint::black_box;
 
@@ -22,10 +21,6 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "task_spawn/scope_spawn_noop",
         budget: "single asupersync spawn+join no-op task latency",
-    },
-    bench_common::BenchBudget {
-        name: "task_spawn/tokio_spawn_noop",
-        budget: "single tokio spawn+join no-op task latency",
     },
     bench_common::BenchBudget {
         name: "task_spawn/region_batch",
@@ -49,13 +44,6 @@ fn build_asupersync_runtime() -> asupersync::runtime::Runtime {
         .expect("build asupersync benchmark runtime")
 }
 
-fn build_tokio_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio benchmark runtime")
-}
-
 fn bench_spawn_noop(c: &mut Criterion) {
     let as_runtime = build_asupersync_runtime();
     let as_handle = as_runtime.handle();
@@ -67,26 +55,12 @@ fn bench_spawn_noop(c: &mut Criterion) {
             black_box(value);
         });
     });
-
-    let tokio_runtime = build_tokio_runtime();
-    c.bench_function("task_spawn/tokio_spawn_noop", |b| {
-        b.iter(|| {
-            let value = tokio_runtime.block_on(async {
-                tokio::spawn(async move { 1_u8 })
-                    .await
-                    .expect("tokio join should succeed")
-            });
-            black_box(value);
-        });
-    });
 }
 
 fn bench_region_batch(c: &mut Criterion) {
     let as_runtime = build_asupersync_runtime();
     let as_handle = as_runtime.handle();
     let as_cx = for_testing();
-    let tokio_runtime = build_tokio_runtime();
-
     let mut group = c.benchmark_group("task_spawn/region_batch");
     for fanout in FANOUT_SIZES {
         group.bench_with_input(
@@ -108,28 +82,6 @@ fn bench_region_batch(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("tokio_spawn_join_all", fanout),
-            &fanout,
-            |b, &n| {
-                b.iter(|| {
-                    let completed = tokio_runtime.block_on(async {
-                        let mut joins = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            joins.push(tokio::spawn(async move { 1_u8 }));
-                        }
-
-                        let mut completed = 0_usize;
-                        for join in joins {
-                            let _ = join.await.expect("tokio join should succeed");
-                            completed += 1;
-                        }
-                        completed
-                    });
-                    black_box(completed);
-                });
-            },
-        );
     }
     group.finish();
 }

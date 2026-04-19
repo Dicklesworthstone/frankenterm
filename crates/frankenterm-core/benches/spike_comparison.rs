@@ -1,4 +1,4 @@
-//! Criterion benchmarks comparing tokio vs asupersync for spike patterns.
+//! Criterion benchmarks for asupersync spike patterns.
 
 use std::future::ready;
 use std::hint::black_box;
@@ -13,72 +13,31 @@ use asupersync::runtime::RuntimeBuilder as AsupRuntimeBuilder;
 use asupersync::sync::{Mutex as AsupMutex, Semaphore as AsupSemaphore};
 use asupersync::{Budget, CancelKind, Cx, LabConfig, LabRuntime};
 use criterion::{Criterion, criterion_group, criterion_main};
-use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
-use tokio::sync::{Mutex as TokioMutex, Semaphore as TokioSemaphore, mpsc as tokio_mpsc};
-
 mod bench_common;
 
 const PAYLOAD: &[u8] = b"ft-asupersync-spike-payload";
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
-        name: "spike_comparison/unix_pdu/tokio",
-        budget: "tokio unix socket pdu baseline",
-    },
-    bench_common::BenchBudget {
         name: "spike_comparison/unix_pdu/asupersync",
         budget: "asupersync unix socket pdu baseline",
-    },
-    bench_common::BenchBudget {
-        name: "spike_comparison/two_phase_send/tokio",
-        budget: "tokio mpsc send/recv baseline",
     },
     bench_common::BenchBudget {
         name: "spike_comparison/two_phase_send/asupersync",
         budget: "asupersync reserve/send/recv baseline",
     },
     bench_common::BenchBudget {
-        name: "spike_comparison/pool_pattern/tokio",
-        budget: "tokio semaphore+mutex+timeout baseline",
-    },
-    bench_common::BenchBudget {
         name: "spike_comparison/pool_pattern/asupersync",
         budget: "asupersync semaphore+mutex+budget-timeout baseline",
-    },
-    bench_common::BenchBudget {
-        name: "spike_comparison/sleep_wakeup/tokio",
-        budget: "tokio timer sleep wake-up baseline",
     },
     bench_common::BenchBudget {
         name: "spike_comparison/sleep_wakeup/asupersync",
         budget: "asupersync LabRuntime virtual sleep wake-up baseline",
     },
     bench_common::BenchBudget {
-        name: "spike_comparison/select_race/tokio",
-        budget: "tokio select first-completion baseline",
-    },
-    bench_common::BenchBudget {
         name: "spike_comparison/select_race/asupersync",
         budget: "asupersync Select + Cx::race baseline",
     },
 ];
-
-async fn tokio_write_pdu(stream: &mut tokio::net::UnixStream, payload: &[u8]) {
-    let len = u32::try_from(payload.len()).expect("payload length fits");
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .expect("write header");
-    stream.write_all(payload).await.expect("write payload");
-}
-
-async fn tokio_read_pdu(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
-    let mut header = [0_u8; 4];
-    stream.read_exact(&mut header).await.expect("read header");
-    let len = u32::from_be_bytes(header) as usize;
-    let mut payload = vec![0_u8; len];
-    stream.read_exact(&mut payload).await.expect("read payload");
-    payload
-}
 
 async fn asup_write_pdu(stream: &mut AsupUnixStream, payload: &[u8]) {
     let len = u32::try_from(payload.len()).expect("payload length fits");
@@ -107,24 +66,9 @@ async fn asup_sleep_once(duration: Duration) {
 
 fn bench_unixstream_pdu(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/unix_pdu");
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
     let asup_rt = AsupRuntimeBuilder::current_thread()
         .build()
         .expect("build asupersync runtime");
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            tokio_rt.block_on(async {
-                let (mut a, mut b) = tokio::net::UnixStream::pair().expect("tokio stream pair");
-                tokio_write_pdu(&mut a, PAYLOAD).await;
-                let got = tokio_read_pdu(&mut b).await;
-                black_box(got);
-            });
-        });
-    });
 
     group.bench_function("asupersync", |b| {
         b.iter(|| {
@@ -142,24 +86,9 @@ fn bench_unixstream_pdu(c: &mut Criterion) {
 
 fn bench_two_phase_send(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/two_phase_send");
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
     let asup_rt = AsupRuntimeBuilder::current_thread()
         .build()
         .expect("build asupersync runtime");
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            tokio_rt.block_on(async {
-                let (tx, mut rx) = tokio_mpsc::channel(1);
-                tx.send(7_u32).await.expect("send");
-                let got = rx.recv().await.expect("recv");
-                black_box(got);
-            });
-        });
-    });
 
     group.bench_function("asupersync", |b| {
         b.iter(|| {
@@ -179,31 +108,9 @@ fn bench_two_phase_send(c: &mut Criterion) {
 
 fn bench_pool_pattern(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/pool_pattern");
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
     let asup_rt = AsupRuntimeBuilder::current_thread()
         .build()
         .expect("build asupersync runtime");
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            tokio_rt.block_on(async {
-                let sem = TokioSemaphore::new(1);
-                let pool = TokioMutex::new(vec![1_u32]);
-                let permit = sem.acquire().await.expect("acquire");
-                {
-                    let mut entries = pool.lock().await;
-                    entries.push(2_u32);
-                    black_box(entries.len());
-                }
-                let timed = tokio::time::timeout(Duration::from_nanos(1), sem.acquire()).await;
-                black_box(timed.is_err());
-                drop(permit);
-            });
-        });
-    });
 
     group.bench_function("asupersync", |b| {
         b.iter(|| {
@@ -230,18 +137,6 @@ fn bench_pool_pattern(c: &mut Criterion) {
 
 fn bench_sleep_wakeup(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/sleep_wakeup");
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            tokio_rt.block_on(async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            });
-        });
-    });
 
     group.bench_function("asupersync", |b| {
         b.iter(|| {
@@ -274,25 +169,9 @@ fn bench_sleep_wakeup(c: &mut Criterion) {
 
 fn bench_select_race(c: &mut Criterion) {
     let mut group = c.benchmark_group("spike_comparison/select_race");
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
     let asup_rt = AsupRuntimeBuilder::current_thread()
         .build()
         .expect("build asupersync runtime");
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            let winner = tokio_rt.block_on(async {
-                tokio::select! {
-                    left = async { 1_u8 } => left,
-                    right = async { 2_u8 } => right,
-                }
-            });
-            black_box(winner);
-        });
-    });
 
     group.bench_function("asupersync", |b| {
         b.iter(|| {

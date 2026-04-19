@@ -23,6 +23,7 @@
 //! | XLarge   | 10M        | ~70 days                               |
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use std::fs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -169,8 +170,8 @@ fn avg_content_size() -> f64 {
 }
 
 /// Runtime for async benchmarks.
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("build runtime")
@@ -228,13 +229,13 @@ fn bench_insert_throughput(c: &mut Criterion) {
             BenchmarkId::new("throughput", format!("{num_panes}p_{segs_per_pane}s")),
             &(num_panes, segs_per_pane),
             |b, &(panes, segs)| {
-                b.to_async(&rt).iter(|| async {
+                b.iter(|| rt.block_on(async {
                     let (_dir, db_path) = temp_db();
                     let storage = StorageHandle::new(&db_path).await.expect("create storage");
                     let elapsed = populate_multi_pane(&storage, panes, segs).await;
                     storage.shutdown().await.expect("shutdown");
                     elapsed
-                });
+                }));
             },
         );
     }
@@ -263,7 +264,7 @@ fn bench_db_growth(c: &mut Criterion) {
             BenchmarkId::new("size_per_segment", label),
             &(num_panes, segs_per_pane),
             |b, &(panes, segs)| {
-                b.to_async(&rt).iter(|| async {
+                b.iter(|| rt.block_on(async {
                     let (_dir, db_path) = temp_db();
                     let storage = StorageHandle::new(&db_path).await.expect("create storage");
                     populate_multi_pane(&storage, panes, segs).await;
@@ -277,7 +278,7 @@ fn bench_db_growth(c: &mut Criterion) {
 
                     storage.shutdown().await.expect("shutdown");
                     bytes_per_segment
-                });
+                }));
             },
         );
     }
@@ -318,29 +319,27 @@ fn bench_query_at_scale(c: &mut Criterion) {
 
         // Query benchmarks
         group.bench_function(BenchmarkId::new("simple_term", label), |b| {
-            b.to_async(&rt)
-                .iter(|| async { storage.search_with_options("cargo", opts.clone()).await });
+            b.iter(|| rt.block_on(async { storage.search_with_options("cargo", opts.clone()).await }));
         });
 
         group.bench_function(BenchmarkId::new("phrase", label), |b| {
-            b.to_async(&rt).iter(|| async {
+            b.iter(|| rt.block_on(async {
                 storage
                     .search_with_options("\"Running 5/5\"", opts.clone())
                     .await
-            });
+            }));
         });
 
         group.bench_function(BenchmarkId::new("boolean", label), |b| {
-            b.to_async(&rt).iter(|| async {
+            b.iter(|| rt.block_on(async {
                 storage
                     .search_with_options("error AND types", opts.clone())
                     .await
-            });
+            }));
         });
 
         group.bench_function(BenchmarkId::new("wildcard", label), |b| {
-            b.to_async(&rt)
-                .iter(|| async { storage.search_with_options("compil*", opts.clone()).await });
+            b.iter(|| rt.block_on(async { storage.search_with_options("compil*", opts.clone()).await }));
         });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
@@ -359,7 +358,7 @@ fn bench_retention_simulation(c: &mut Criterion) {
     // This tests the DELETE performance for old segments
 
     group.bench_function("delete_old_segments", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             let (_dir, db_path) = temp_db();
             let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
@@ -374,7 +373,7 @@ fn bench_retention_simulation(c: &mut Criterion) {
 
             storage.shutdown().await.expect("shutdown");
             elapsed
-        });
+        }));
     });
 
     group.finish();

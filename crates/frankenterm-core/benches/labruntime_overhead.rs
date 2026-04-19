@@ -60,10 +60,6 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         budget: "DPOR exploration over 10 seeds (empty body)",
     },
     bench_common::BenchBudget {
-        name: "lab_overhead/comparison/tokio_block_on",
-        budget: "tokio block_on with trivial future",
-    },
-    bench_common::BenchBudget {
         name: "lab_overhead/comparison/lab_block_on",
         budget: "LabRuntime run single task to completion",
     },
@@ -273,24 +269,11 @@ fn bench_exploration(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Comparison: tokio vs LabRuntime
+// Comparison: LabRuntime trivial completion
 // ---------------------------------------------------------------------------
 
 fn bench_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("lab_overhead/comparison");
-
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-
-    group.bench_function("tokio_block_on", |b| {
-        b.iter(|| {
-            tokio_rt.block_on(async {
-                black_box(42_u32);
-            });
-        });
-    });
 
     group.bench_function("lab_block_on", |b| {
         b.iter(|| {

@@ -24,24 +24,12 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         budget: "virtual-time sleep deadline delta for runtime_compat::sleep under LabRuntime",
     },
     bench_common::BenchBudget {
-        name: "timer_precision/sleep_latency/tokio",
-        budget: "paused-clock sleep deadline delta for tokio::time::sleep",
-    },
-    bench_common::BenchBudget {
         name: "timer_precision/deadline_accuracy/asupersync",
         budget: "budget deadline accuracy under synthetic timer load in LabRuntime",
     },
     bench_common::BenchBudget {
-        name: "timer_precision/deadline_accuracy/tokio",
-        budget: "timeout deadline accuracy under synthetic timer load with paused tokio time",
-    },
-    bench_common::BenchBudget {
         name: "timer_precision/create_cancel/asupersync",
         budget: "timer future creation and cancellation throughput for asupersync",
-    },
-    bench_common::BenchBudget {
-        name: "timer_precision/create_cancel/tokio",
-        budget: "timer future creation and cancellation throughput for tokio",
     },
 ];
 
@@ -73,25 +61,6 @@ fn run_asupersync_sleep_latency(ms: u64) -> u64 {
 
     let actual_nanos = runtime.now().as_nanos();
     actual_nanos.abs_diff(expected_nanos)
-}
-
-fn run_tokio_sleep_latency(rt: &tokio::runtime::Runtime, ms: u64) -> u128 {
-    let duration = duration_from_ms(ms);
-
-    rt.block_on(async move {
-        let start = tokio::time::Instant::now();
-        let sleeper = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            tokio::time::Instant::now()
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(duration).await;
-        tokio::task::yield_now().await;
-
-        let woke_at = sleeper.await.expect("tokio sleeper join");
-        woke_at.duration_since(start).abs_diff(duration).as_nanos()
-    })
 }
 
 fn run_asupersync_deadline_accuracy(ms: u64) -> u64 {
@@ -145,43 +114,7 @@ fn run_asupersync_deadline_accuracy(ms: u64) -> u64 {
     actual.as_nanos().abs_diff(expected.as_nanos())
 }
 
-fn run_tokio_deadline_accuracy(rt: &tokio::runtime::Runtime, ms: u64) -> u128 {
-    let duration = duration_from_ms(ms);
-
-    rt.block_on(async move {
-        let start = tokio::time::Instant::now();
-        let mut load_tasks = Vec::with_capacity(LOAD_TASKS);
-        for task_ix in 0..LOAD_TASKS {
-            let load_duration = Duration::from_millis((task_ix % 3) as u64);
-            load_tasks.push(tokio::spawn(async move {
-                tokio::time::sleep(load_duration).await;
-            }));
-        }
-
-        let deadline_task = tokio::spawn(async move {
-            let _ = tokio::time::timeout(duration, std::future::pending::<()>()).await;
-            tokio::time::Instant::now()
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(duration).await;
-        tokio::task::yield_now().await;
-
-        let observed = deadline_task.await.expect("tokio timeout join");
-        for task in load_tasks {
-            let _ = task.await;
-        }
-
-        observed.duration_since(start).abs_diff(duration).as_nanos()
-    })
-}
-
 fn bench_sleep_latency(c: &mut Criterion) {
-    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("build paused tokio benchmark runtime");
     let mut group = c.benchmark_group("timer_precision/sleep_latency");
 
     for &(deadline_ms, label) in DEADLINES_MS {
@@ -192,20 +125,12 @@ fn bench_sleep_latency(c: &mut Criterion) {
                 b.iter(|| black_box(run_asupersync_sleep_latency(ms)));
             },
         );
-        group.bench_with_input(BenchmarkId::new("tokio", label), &deadline_ms, |b, &ms| {
-            b.iter(|| black_box(run_tokio_sleep_latency(&tokio_runtime, ms)));
-        });
     }
 
     group.finish();
 }
 
 fn bench_deadline_accuracy(c: &mut Criterion) {
-    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("build paused tokio benchmark runtime");
     let mut group = c.benchmark_group("timer_precision/deadline_accuracy");
 
     for &(deadline_ms, label) in DEADLINES_MS {
@@ -216,9 +141,6 @@ fn bench_deadline_accuracy(c: &mut Criterion) {
                 b.iter(|| black_box(run_asupersync_deadline_accuracy(ms)));
             },
         );
-        group.bench_with_input(BenchmarkId::new("tokio", label), &deadline_ms, |b, &ms| {
-            b.iter(|| black_box(run_tokio_deadline_accuracy(&tokio_runtime, ms)));
-        });
     }
 
     group.finish();
@@ -232,17 +154,6 @@ fn bench_create_cancel_throughput(c: &mut Criterion) {
             let mut timers = Vec::with_capacity(TIMER_BATCH);
             for _ in 0..TIMER_BATCH {
                 timers.push(asupersync::time::sleep(Time::ZERO, Duration::from_secs(60)));
-            }
-            black_box(timers.len());
-            drop(timers);
-        });
-    });
-
-    group.bench_function("tokio", |b| {
-        b.iter(|| {
-            let mut timers = Vec::with_capacity(TIMER_BATCH);
-            for _ in 0..TIMER_BATCH {
-                timers.push(tokio::time::sleep(Duration::from_secs(60)));
             }
             black_box(timers.len());
             drop(timers);

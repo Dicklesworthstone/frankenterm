@@ -5,6 +5,7 @@
 //!   - **p50 < 10ms**, **p99 < 50ms** (hard cap: < 50ms for common queries)
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use std::time::SystemTime;
 use tempfile::TempDir;
@@ -106,8 +107,8 @@ fn generate_segment_content(i: usize) -> String {
 }
 
 /// Runtime to allow async in benchmarks.
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("build runtime")
@@ -153,37 +154,35 @@ fn bench_fts_small_db(c: &mut Criterion) {
 
     // Budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
+        b.iter(|| rt.block_on(async { storage.search_with_options("cargo", opts(10)).await }));
     });
 
     group.bench_function("phrase_search", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("\"mismatched types\"", opts(10))
                 .await
-        });
+        }));
     });
 
     group.bench_function("prefix_search", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("compil*", opts(10)).await });
+        b.iter(|| rt.block_on(async { storage.search_with_options("compil*", opts(10)).await }));
     });
 
     group.bench_function("boolean_search", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("error AND types", opts(10))
                 .await
-        });
+        }));
     });
 
     group.bench_function("no_match", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("nonexistent_term_xyz", opts(10))
                 .await
-        });
+        }));
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -205,21 +204,21 @@ fn bench_fts_medium_db(c: &mut Criterion) {
     });
 
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
+        b.iter(|| rt.block_on(async { storage.search_with_options("cargo", opts(10)).await }));
     });
 
     group.bench_function("phrase_search", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("\"test result\"", opts(10))
                 .await
-        });
+        }));
     });
 
     group.bench_function("common_term_high_results", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("Processing", opts(100)).await });
+        b.iter(|| {
+            rt.block_on(async { storage.search_with_options("Processing", opts(100)).await })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -242,29 +241,27 @@ fn bench_fts_large_db(c: &mut Criterion) {
 
     // These should still meet budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
+        b.iter(|| rt.block_on(async { storage.search_with_options("cargo", opts(10)).await }));
     });
 
     group.bench_function("phrase_search", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("\"expected i32\"", opts(10))
                 .await
-        });
+        }));
     });
 
     group.bench_function("common_term_limited", |b| {
-        b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("test", opts(10)).await });
+        b.iter(|| rt.block_on(async { storage.search_with_options("test", opts(10)).await }));
     });
 
     group.bench_function("rare_term", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| rt.block_on(async {
             storage
                 .search_with_options("\"Auto-compact\"", opts(10))
                 .await
-        });
+        }));
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -287,8 +284,7 @@ fn bench_fts_result_limits(c: &mut Criterion) {
     // Test how result limit affects performance
     for limit in [1, 10, 50, 100, 500] {
         group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &limit| {
-            b.to_async(&rt)
-                .iter(|| async { storage.search_with_options("status", opts(limit)).await });
+            b.iter(|| rt.block_on(async { storage.search_with_options("status", opts(limit)).await }));
         });
     }
 
