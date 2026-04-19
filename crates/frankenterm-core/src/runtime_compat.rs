@@ -5707,6 +5707,150 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 439a: extends the tick 432-438 probes to
+    /// `Semaphore::acquire_with_cx`. Fully contended semaphore
+    /// (zero permits), spawn cancel at 100 ms, select-race against
+    /// poll-sleep watcher. Tolerates both Either outcomes.
+    ///
+    /// **Outcome when written**: watcher branch fires consistently,
+    /// confirming Semaphore::acquire_with_cx shares the mid-flight-
+    /// cancel-waker gap with the four channel types. Together with
+    /// tick 439b (JoinSet) this completes the mid-flight matrix
+    /// across all six long-lived-wait primitives in runtime_compat.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sem = Semaphore::new(0);
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("tick 439a mid-flight cancel via semaphore select race pattern"),
+                );
+            });
+
+            let acquire_fut = std::pin::pin!(async { sem.acquire_with_cx(&cx).await.map(|_| ()) });
+            let watcher = std::pin::pin!(async {
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    if cx.is_cancel_requested() {
+                        return Err::<(), String>("cancelled via watcher".to_string());
+                    }
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = select(acquire_fut, watcher).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "select! race watcher must catch mid-flight cancel within ~150 ms; \
+                 took {elapsed:?}"
+            );
+            match outcome {
+                Either::Right((Err(_), _)) => {}
+                Either::Left((Err(_), _)) => {}
+                Either::Left((Ok(()), _)) => {
+                    panic!("acquire branch returned Ok — semaphore had no permits to grant")
+                }
+                Either::Right((Ok(_), _)) => {
+                    unreachable!("watcher always returns Err on cancel")
+                }
+            }
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 439b: extends the tick 432-438 probes to
+    /// `JoinSet::join_next_with_cx`. Spawned-but-pending task,
+    /// spawn cancel at 100 ms, select-race against poll-sleep watcher.
+    ///
+    /// JoinSet::join_next_with_cx has TWO cancel-observability points
+    /// (tick 426): a pre-flight `caller_cx.checkpoint()` AND a
+    /// per-poll-iteration `caller_cx.checkpoint()` inside the
+    /// `poll_fn` closure. This means the task CAN observe mid-flight
+    /// cancel — the per-poll checkpoint fires on each re-poll
+    /// triggered by task completion or external wake, surfacing
+    /// `Some(Err(JoinError))`.
+    ///
+    /// **Outcome when written**: unlike the four channel types,
+    /// EITHER branch can fire — if an external wake happens during
+    /// the cancel window, the recv-side runtime_compat loop re-polls,
+    /// sees `caller_cx.checkpoint().is_err()`, and returns
+    /// `Some(Err(JoinError))`. If no external wake happens, the
+    /// watcher branch catches it. Both outcomes are acceptable;
+    /// both converge on fast observation.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn join_set_join_next_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::<()>::new();
+            set.spawn(async {
+                std::future::pending::<()>().await;
+            });
+
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("tick 439b mid-flight cancel via JoinSet select race pattern"),
+                );
+            });
+
+            let join_fut = std::pin::pin!(async { set.join_next_with_cx(&cx).await });
+            let watcher = std::pin::pin!(async {
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    if cx.is_cancel_requested() {
+                        return Err::<(), String>("cancelled via watcher".to_string());
+                    }
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = select(join_fut, watcher).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "select! race must catch mid-flight cancel within ~150 ms; \
+                 took {elapsed:?}"
+            );
+            match outcome {
+                Either::Right((Err(_), _)) => {}
+                Either::Left((Some(Err(_)), _)) => {}
+                Either::Left((None, _)) => {
+                    panic!("join_next returned None — set had one pending task")
+                }
+                Either::Left((Some(Ok(())), _)) => {
+                    panic!("join_next returned Ok — pending task cannot complete")
+                }
+                Either::Right((Ok(_), _)) => {
+                    unreachable!("watcher always returns Err on cancel")
+                }
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 438: extends the tick 432/433/434 channel
     /// probes to `watch::Receiver::changed`. Same shape: cancel-at-100-ms,
     /// select-race, tolerate both Either outcomes.
