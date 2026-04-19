@@ -1,6 +1,7 @@
 use codec::{
-    CreateFloatingPane, ErrorResponse, GetCodecVersionResponse, GetTlsCredsResponse, Pdu,
-    SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle, UpdatePaneConstraints,
+    CreateFloatingPane, ErrorResponse, GetCodecVersion, GetCodecVersionResponse, GetTlsCreds,
+    GetTlsCredsResponse, Pdu, SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle,
+    UnitResponse, UpdatePaneConstraints,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -263,5 +264,20 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetTlsCredsResponse(payload));
+    }
+
+    #[test]
+    fn unit_response_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::UnitResponse(UnitResponse {}));
+    }
+
+    #[test]
+    fn get_codec_version_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::GetCodecVersion(GetCodecVersion {}));
+    }
+
+    #[test]
+    fn get_tls_creds_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::GetTlsCreds(GetTlsCreds {}));
     }
 }
