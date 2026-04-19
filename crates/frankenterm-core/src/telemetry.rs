@@ -765,11 +765,11 @@ impl TelemetryCollector {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_cx(&cx).await;
+            return self.run_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            self.run_inner().await;
+            self.run_legacy().await;
         }
     }
 
@@ -821,8 +821,13 @@ impl TelemetryCollector {
         }
     }
 
+    /// Explicit quarantine for legacy non-asupersync telemetry collection.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this helper once the workspace no longer supports
+    /// non-`asupersync-runtime` telemetry sampling.
     #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_inner(&self) {
+    async fn run_legacy(&self) {
         let interval = self.config.sample_interval.max(Duration::from_secs(1));
         let mut first_tick = true;
 
