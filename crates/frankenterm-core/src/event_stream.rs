@@ -528,6 +528,17 @@ impl EventWaiter {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
+            return self.wait_legacy(bus).await;
+        }
+    }
+
+    /// Explicit quarantine for legacy non-asupersync event waits.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this helper once the workspace no longer supports
+    /// non-`asupersync-runtime` event-stream waits.
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn wait_legacy(self, bus: &EventBus) -> WaitResult {
         let Self {
             condition,
             filter,
@@ -581,7 +592,6 @@ impl EventWaiter {
             Err(_) => WaitResult::Timeout {
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
-        }
         }
     }
 
