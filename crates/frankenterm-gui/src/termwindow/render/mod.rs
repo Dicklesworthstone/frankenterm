@@ -1000,7 +1000,7 @@ mod tests {
         resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
         should_use_reverse_video_cursor, update_next_frame_time,
     };
-    use config::{ConfigHandle, TextStyle};
+    use config::{BoldBrightening, ConfigHandle, TextStyle};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::hyperlink::Hyperlink;
@@ -1107,6 +1107,29 @@ mod tests {
             ),
             palette
                 .resolve_fg(ColorAttribute::PaletteIndex(9))
+                .to_linear()
+        );
+    }
+
+    #[test]
+    fn resolve_fg_color_attr_respects_disabled_bold_brightening() {
+        let mut attrs = CellAttributes::default();
+        attrs.set_intensity(Intensity::Bold);
+
+        let palette = ColorPalette::default();
+        let mut config = ConfigHandle::default_config();
+        config.bold_brightens_ansi_colors = BoldBrightening::No;
+
+        assert_eq!(
+            resolve_fg_color_attr(
+                &attrs,
+                ColorAttribute::PaletteIndex(1),
+                &palette,
+                &config,
+                &TextStyle::default(),
+            ),
+            palette
+                .resolve_fg(ColorAttribute::PaletteIndex(1))
                 .to_linear()
         );
     }

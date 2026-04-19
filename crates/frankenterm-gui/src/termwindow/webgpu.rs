@@ -251,11 +251,13 @@ impl WebGpuTexture {
 /// tightly packed RGBA8 pixels.
 fn padded_readback_bytes_per_row(width: u32) -> u32 {
     let unpadded = width.saturating_mul(4);
-    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     if unpadded == 0 {
         0
     } else {
-        unpadded.div_ceil(alignment) * alignment
+        let aligned = u64::from(unpadded).div_ceil(alignment) * alignment;
+        let max_aligned = (u64::from(u32::MAX) / alignment) * alignment;
+        aligned.min(max_aligned) as u32
     }
 }
 
@@ -958,6 +960,14 @@ mod tests {
         assert_eq!(padded_readback_bytes_per_row(1), 256);
         assert_eq!(padded_readback_bytes_per_row(64), 256);
         assert_eq!(padded_readback_bytes_per_row(65), 512);
+    }
+
+    #[test]
+    fn padded_readback_bytes_per_row_saturates_at_largest_aligned_u32() {
+        assert_eq!(
+            padded_readback_bytes_per_row(u32::MAX),
+            u32::MAX - (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1)
+        );
     }
 
     #[test]
