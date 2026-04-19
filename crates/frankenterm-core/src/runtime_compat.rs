@@ -5483,6 +5483,104 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 426: `JoinSet::join_next_with_cx` observes cx-cancel.
+    ///
+    /// Pins cx-cancel observation on the runtime_compat JoinSet
+    /// primitive. With a spawned task that never completes
+    /// (`pending::<()>().await`) and a pre-cancelled cx,
+    /// `set.join_next_with_cx(&cx).await` must return
+    /// `Some(Err(JoinError))` with a message containing
+    /// "join_next cancelled" rather than blocking indefinitely for
+    /// a task that will never complete.
+    ///
+    /// Cancel semantics surfaced by runtime_compat's own pre-flight:
+    ///
+    ///     if let Err(err) = caller_cx.checkpoint() {
+    ///         return Some(Err(JoinError::new(
+    ///             format!("aborted: join_next cancelled: {err}")
+    ///         )));
+    ///     }
+    ///
+    /// Unlike the channel/semaphore primitives which delegate their
+    /// cx-cancel observability to asupersync's own `poll_*`
+    /// short-circuit, `JoinSet::join_next_with_cx` is a
+    /// runtime_compat-owned primitive (it wraps a local Vec<JoinHandle>
+    /// rather than an asupersync primitive). The test guards against
+    /// regressions in the runtime_compat-level pre-flight +
+    /// per-poll-iteration checkpoint.
+    ///
+    /// Setup:
+    /// 1. Create a JoinSet.
+    /// 2. Spawn a task that blocks forever via `pending::<()>().await`.
+    /// 3. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 4. Wrap `set.join_next_with_cx(&cx)` in a 2 s outer safety-net
+    ///    timeout.
+    /// 5. Assert elapsed < 1 s AND `Some(Err(JoinError))` with message
+    ///    surfacing the cancel.
+    ///
+    /// `join_next_with_cx` also surfaces `JoinError::is_cancelled()`
+    /// as `true` via the "aborted" substring test — pins that check
+    /// too so downstream error-handling code can fold cx-cancel into
+    /// its abort path cleanly.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn join_set_join_next_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut set = task::JoinSet::<()>::new();
+            set.spawn(async {
+                std::future::pending::<()>().await;
+            });
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 426 pre-cancel JoinSet::join_next_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                set.join_next_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit JoinSet::join_next_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            match inner {
+                Some(Err(err)) => {
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("join_next cancelled"),
+                        "JoinError should surface join_next cancellation; got: {msg}"
+                    );
+                    assert!(
+                        err.is_cancelled(),
+                        "pre-cancelled cx must make JoinError::is_cancelled() return true; \
+                         msg: {msg}"
+                    );
+                }
+                Some(Ok(_)) => panic!(
+                    "pre-cancelled cx must surface Err(JoinError), not Ok — pending task \
+                     cannot complete"
+                ),
+                None => panic!(
+                    "pre-cancelled cx must surface Some(Err(JoinError)), not None — set \
+                     has one pending task"
+                ),
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 423: `watch::Receiver::changed(cx)` observes cx-cancel.
     ///
     /// Pins cx-cancel observation on the asupersync watch-channel
