@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ft-xbnl0.2.4 — Run all verification contract tests in sequence.
 #
-# Invokes the 5 filtered cargo test runs that collectively verify the
+# Invokes the 6 filtered cargo test runs that collectively verify the
 # ft-xbnl0.2.4 acceptance contract:
-#   1. HTTP client contract tests (21) — distributed_http_client_*
+#   1. HTTP client contract tests (34) — distributed_http_client_*
 #      Includes all this-session-added + pre-existing happy-path GET.
 #   2. TLS tests (~45) — tls_*
 #      Broader filter than `build_tls_` — catches bundle / server-name /
@@ -14,8 +14,9 @@
 #      Import scan + manifest scan + asupersync-dep positive guard.
 #   4. Metrics server cx-first family (3) — metrics_server_start_with_cx_*
 #      Pre-cancel / mid-flight-cancel / happy path.
-#   5. Web server cx pre-cancel (1) — web_server_with_cx_*
-#   6. runtime_compat primitive contracts (11) — _with_cx_observes_budget_deadline
+#   5. Web server cx pre-cancel + mid-flight (2) — web_server_with_cx_*
+#      Tick 323 pre-cancel + tick 417 mid-flight on run_web_server_with_cx.
+#   6. runtime_compat primitive contracts (22) — _with_cx_observes_budget_deadline
 #      + yield_now_with_cx + oneshot_recv_with_cx + broadcast_recv_with_cx
 #      + semaphore_acquire_ + mpsc_recv_with_cx + watch_changed_with_cx
 #      + join_set_join_next_with_cx
@@ -130,7 +131,7 @@ run_test "Run 4/6: Metrics server cx-first family" \
     --lib metrics_server_start_with_cx_ \
     -- --nocapture
 
-run_test "Run 5/6: Web server cx pre-cancel" \
+run_test "Run 5/6: Web server cx pre-cancel + mid-flight" \
     -p frankenterm-core \
     --features web,asupersync-runtime \
     --test web \

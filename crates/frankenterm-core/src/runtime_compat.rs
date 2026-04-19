@@ -5714,7 +5714,7 @@ mod tests {
                          msg: {msg}"
                     );
                 }
-                Some(Ok(_)) => panic!(
+                Some(Ok(())) => panic!(
                     "pre-cancelled cx must surface Err(JoinError), not Ok — pending task \
                      cannot complete"
                 ),
@@ -5848,7 +5848,7 @@ mod tests {
                 Either::Left((Ok(()), _)) => {
                     panic!("acquire branch returned Ok — semaphore had no permits to grant")
                 }
-                Either::Right((Ok(_), _)) => {
+                Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
                 }
             }
@@ -5928,7 +5928,7 @@ mod tests {
                 Either::Left((Some(Ok(())), _)) => {
                     panic!("join_next returned Ok — pending task cannot complete")
                 }
-                Either::Right((Ok(_), _)) => {
+                Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
                 }
             }
@@ -5969,7 +5969,7 @@ mod tests {
                 );
             });
 
-            let recv_fut = std::pin::pin!(async { rx.changed(&cx).await.map(|_| ()) });
+            let recv_fut = std::pin::pin!(async { rx.changed(&cx).await });
             let watcher = std::pin::pin!(async {
                 loop {
                     sleep(Duration::from_millis(50)).await;
@@ -5998,7 +5998,7 @@ mod tests {
                 Either::Left((Ok(()), _)) => {
                     panic!("recv branch returned Ok — no new value was published")
                 }
-                Either::Right((Ok(_), _)) => {
+                Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
                 }
             }
@@ -6074,7 +6074,7 @@ mod tests {
                 Either::Left((Ok(()), _)) => {
                     panic!("recv branch returned Ok — sender should not have published")
                 }
-                Either::Right((Ok(_), _)) => {
+                Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
                 }
             }
@@ -6153,7 +6153,7 @@ mod tests {
                 Either::Left((Ok(()), _)) => {
                     panic!("recv branch returned Ok — sender should not have fired")
                 }
-                Either::Right((Ok(_), _)) => {
+                Either::Right((Ok(()), _)) => {
                     unreachable!("watcher always returns Err on cancel")
                 }
             }
