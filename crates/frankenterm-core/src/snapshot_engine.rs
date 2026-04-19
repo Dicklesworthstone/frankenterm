@@ -28,7 +28,9 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::{Mutex, RwLock, mpsc, timeout, watch};
+use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::runtime_compat::timeout;
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
