@@ -18,6 +18,7 @@ use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
     PolicyEngine, PolicySurface,
 };
+#[cfg(test)]
 use crate::runtime_compat::RuntimeBuilder as CompatRuntimeBuilder;
 use crate::storage::{PaneReservation, StorageHandle};
 use crate::workflows::{
@@ -351,8 +352,7 @@ pub(super) async fn resolve_pane_capabilities(
 
     if let Some(storage) = storage {
         // ft-xbnl0.2.3 tick 258: cx-first reservation lookup.
-        let reservation_cx = crate::cx::Cx::current()
-            .unwrap_or_else(crate::cx::for_request);
+        let reservation_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         match storage
             .get_active_reservation_with_cx(&reservation_cx, pane_id)
             .await
@@ -507,8 +507,7 @@ pub(super) async fn record_mcp_audit(
         result: result.to_string(),
     };
     // ft-xbnl0.2.3 tick 258: cx-first MCP audit write.
-    let audit_cx = crate::cx::Cx::current()
-        .unwrap_or_else(crate::cx::for_request);
+    let audit_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     if let Err(e) = storage
         .record_audit_action_redacted_with_cx(&audit_cx, audit)
         .await
@@ -538,16 +537,20 @@ pub(super) fn record_mcp_audit_sync(
 
     // Spawn a background task to record audit — non-blocking, fire-and-forget
     std::thread::spawn(move || {
-        let rt = match CompatRuntimeBuilder::current_thread().build() {
+        let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(tool = %tool_name, error = %e, "Failed to create runtime for MCP audit");
+                tracing::warn!(
+                    tool = %tool_name,
+                    error = %e,
+                    "Failed to create native asupersync runtime for MCP audit"
+                );
                 return;
             }
         };
         rt.block_on(async {
             // ft-xbnl0.2.3 tick 304: cx-first MCP audit storage open (helpers).
-            let audit_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let audit_open_cx = crate::cx::for_request();
             if let Ok(storage) = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await {
                 record_mcp_audit(
                     &storage,
@@ -930,6 +933,25 @@ mod tests {
         })
     }
 
+    fn try_latest_audit_action(
+        db_path: &Path,
+        action_kind: &str,
+    ) -> Option<crate::storage::AuditActionRecord> {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.ok()?;
+            let mut rows = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    limit: Some(1),
+                    action_kind: Some(action_kind.to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .ok()?;
+            rows.pop()
+        })
+    }
+
     fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
         context
             .evidence
@@ -1021,6 +1043,43 @@ mod tests {
         assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
         assert_eq!(evidence(&context, "result"), Some("success"));
         assert_eq!(evidence(&context, "elapsed_ms"), Some("12"));
+    }
+
+    #[test]
+    fn mcp_helpers_record_mcp_audit_sync_bootstraps_native_runtime() {
+        let (_dir, db_path) = temp_db_path();
+
+        super::record_mcp_audit_sync(
+            &db_path,
+            "wa.rules_list",
+            &serde_json::json!({"secret":"redact-me"}),
+            true,
+            None,
+            21,
+        );
+
+        let mut audit = None;
+        for _ in 0..50 {
+            if let Some(row) = try_latest_audit_action(&db_path, "mcp.wa.rules_list") {
+                audit = Some(row);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let audit = audit.expect("missing audit row for mcp.wa.rules_list");
+        assert_eq!(audit.actor_kind, "mcp");
+        assert_eq!(audit.input_summary.as_deref(), Some("mcp:wa.rules_list"));
+        let context: DecisionContext = serde_json::from_str(
+            audit
+                .decision_context
+                .as_deref()
+                .expect("decision context should be recorded"),
+        )
+        .expect("decision context should parse");
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
+        assert_eq!(evidence(&context, "elapsed_ms"), Some("21"));
     }
 
     // ========================================================================
