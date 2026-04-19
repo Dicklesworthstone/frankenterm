@@ -506,6 +506,12 @@ impl RecoveryEngine {
         Fut: std::future::Future<Output = Result<T, E>>,
         C: Fn(&E) -> ProtocolErrorKind,
     {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.execute_with_cx(&cx, operation, classify).await;
+        }
+
         self.counters
             .total_operations
             .fetch_add(1, Ordering::Relaxed);
