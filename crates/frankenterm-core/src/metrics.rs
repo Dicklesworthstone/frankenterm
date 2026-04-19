@@ -467,7 +467,53 @@ impl MetricsServer {
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        #[cfg(feature = "asupersync-runtime")]
+        let join = {
+            let server_cx = crate::cx::for_request();
+            crate::runtime_compat::task::spawn_with_cx(&server_cx, move |accept_cx| async move {
+                let accept_poll_interval = Duration::from_millis(250);
+                loop {
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
 
+                    match crate::runtime_compat::timeout_with_cx(
+                        &accept_cx,
+                        accept_poll_interval,
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((socket, peer))) => {
+                            let collector = Arc::clone(&collector);
+                            let prefix = prefix.clone();
+                            crate::runtime_compat::task::spawn_with_cx(
+                                &accept_cx,
+                                move |conn_cx| async move {
+                                    if let Err(err) = handle_connection_with_cx(
+                                        &conn_cx, socket, &prefix, collector,
+                                    )
+                                    .await
+                                    {
+                                        debug!(
+                                            error = %err,
+                                            peer = %peer,
+                                            "Metrics connection failed"
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "Metrics listener accept failed");
+                        }
+                        Err(_) => {}
+                    }
+                }
+            })
+        };
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         let join = crate::runtime_compat::task::spawn(async move {
             let accept_poll_interval = Duration::from_millis(250);
             loop {
@@ -542,17 +588,15 @@ impl MetricsServer {
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        let task_cx = cx.clone();
-
-        let join = crate::runtime_compat::task::spawn(async move {
+        let join = crate::runtime_compat::task::spawn_with_cx(cx, move |accept_cx| async move {
             let accept_poll_interval = Duration::from_millis(250);
             loop {
-                if shutdown_flag.load(Ordering::SeqCst) || task_cx.is_cancel_requested() {
+                if shutdown_flag.load(Ordering::SeqCst) || accept_cx.is_cancel_requested() {
                     break;
                 }
 
                 match crate::runtime_compat::timeout_with_cx(
-                    &task_cx,
+                    &accept_cx,
                     accept_poll_interval,
                     listener.accept(),
                 )
@@ -561,15 +605,17 @@ impl MetricsServer {
                     Ok(Ok((socket, peer))) => {
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
-                        let conn_cx = task_cx.clone();
-                        crate::runtime_compat::task::spawn(async move {
-                            if let Err(err) =
-                                handle_connection_with_cx(&conn_cx, socket, &prefix, collector)
-                                    .await
-                            {
-                                debug!(error = %err, peer = %peer, "Metrics connection failed");
-                            }
-                        });
+                        crate::runtime_compat::task::spawn_with_cx(
+                            &accept_cx,
+                            move |conn_cx| async move {
+                                if let Err(err) =
+                                    handle_connection_with_cx(&conn_cx, socket, &prefix, collector)
+                                        .await
+                                {
+                                    debug!(error = %err, peer = %peer, "Metrics connection failed");
+                                }
+                            },
+                        );
                     }
                     Ok(Err(err)) => {
                         warn!(error = %err, "Metrics listener accept failed");
