@@ -283,6 +283,94 @@ fn pool_timeout_cascade_then_recovery_restores_capacity() {
     });
 }
 
+#[test]
+fn spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let cx = healthy_cx();
+        let cancelled = user_cancelled_cx();
+        let pool = Arc::new(MockPool::new(1));
+        let client = Arc::new(MockMuxClient::new());
+
+        client
+            .set_pane_content(&cx, 19, "spawn-with-cx".to_string())
+            .await
+            .expect("set content");
+
+        let held_conn = pool.acquire(&cx).await.expect("primary acquire");
+        let first = client.get_pane_text(&cx, 19).await.expect("first read");
+        assert_eq!(first, "spawn-with-cx");
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "primary checkout holds the only slot"
+        );
+
+        let blocked_pool = Arc::clone(&pool);
+        let blocked = frankenterm_core::runtime_compat::task::spawn_with_cx(
+            &cancelled,
+            move |child_cx| async move { blocked_pool.acquire(&child_cx).await },
+        )
+        .await
+        .expect("task join");
+        assert!(blocked.is_err(), "cancelled spawned acquire should fail");
+        let err = blocked.unwrap_err();
+        assert!(
+            err.contains("cancelled") || err.contains("semaphore") || err.contains("Cancelled"),
+            "error should indicate cancellation: {err}"
+        );
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "cancelled spawned acquire must not restore a permit while the primary checkout is held"
+        );
+        assert_eq!(
+            pool.total_acquired(),
+            1,
+            "cancelled spawned acquire must not count as a successful checkout"
+        );
+        assert_eq!(
+            client.request_count(),
+            1,
+            "cancelled spawned acquire should fail before issuing an extra mux request"
+        );
+
+        pool.release(&cx, held_conn).await.expect("release primary");
+
+        let recovery_pool = Arc::clone(&pool);
+        let recovery_client = Arc::clone(&client);
+        let recovered = frankenterm_core::runtime_compat::task::spawn_with_cx(
+            &cx,
+            move |child_cx| async move {
+                let conn = recovery_pool.acquire(&child_cx).await?;
+                let text = recovery_client.get_pane_text(&child_cx, 19).await?;
+                recovery_pool.release(&child_cx, conn).await?;
+                Ok::<_, String>(text)
+            },
+        )
+        .await
+        .expect("task join")
+        .expect("healthy retry should recover");
+
+        assert_eq!(recovered, "spawn-with-cx");
+        assert_eq!(
+            pool.total_acquired(),
+            2,
+            "only the two healthy acquires should count after spawned recovery"
+        );
+        assert_eq!(
+            client.request_count(),
+            2,
+            "healthy spawned retry should complete the next read"
+        );
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "spawned recovery path must leave the pool balanced"
+        );
+    });
+}
+
 // ===========================================================================
 // Section 3: MockMuxClient integration with Cx
 //
