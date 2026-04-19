@@ -594,6 +594,22 @@ pub mod mpsc {
 }
 
 /// Watch channel aliases for the active runtime.
+///
+/// Under asupersync the receiver's `changed(cx)` method observes
+/// **pre-cancel** on cx via the per-poll `cx.checkpoint()`
+/// short-circuit (pinned by `watch_changed_with_cx_observes_pre_cancel`,
+/// ft-xbnl0.2.4 tick 423).
+///
+/// Mid-flight cancel is not explicitly probed for watch (ticks
+/// 432/433/434 probed the three most-used channel types —
+/// mpsc/oneshot/broadcast — and all three shared the same
+/// no-cx-cancel-waker gap). Asupersync's watch receiver is designed
+/// the same way (per-poll checkpoint + external-only wake), so the
+/// same mid-flight gap is likely present. Callers needing mid-flight
+/// cancel observability on watch should preemptively apply the same
+/// `futures::future::select` race pattern used for mpsc/oneshot/broadcast
+/// in ticks 432/433/434 (and by `DistributedHttpClient::race_with_cx_cancel`,
+/// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 #[cfg(feature = "asupersync-runtime")]
 pub mod watch {
     pub use asupersync::channel::watch::{Receiver, RecvError, SendError, Sender, channel};
