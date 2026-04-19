@@ -1029,10 +1029,16 @@ where
             >,
         >,
 {
+    use futures::future::{Either, select};
+
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
             if cx.is_cancel_requested() {
                 return Err::<
                     asupersync::http::h1::types::Response,
@@ -1043,9 +1049,8 @@ where
     };
     let cancel_watcher = std::pin::pin!(cancel_watcher);
 
-    crate::runtime_compat::select! {
-        result = inner => result,
-        result = cancel_watcher => result,
+    match select(inner, cancel_watcher).await {
+        Either::Left((result, _)) | Either::Right((result, _)) => result,
     }
 }
 
