@@ -5646,6 +5646,96 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 432: documents and pins the caller-side
+    /// mid-flight cx-cancel pattern for `mpsc::Receiver::recv` —
+    /// `select!` race against a poll-based cx-cancel watcher.
+    ///
+    /// **Finding**: asupersync `mpsc::Receiver::recv(cx)` observes
+    /// pre-cancel via its per-poll `cx.checkpoint().is_err()`
+    /// short-circuit (pinned by tick 422) but does NOT register a
+    /// cx-cancel-waker. A recv that has already suspended on the
+    /// send-side waker will not wake when `cx.cancel_with(...)` fires
+    /// after the suspension. The test-worthy mid-flight cancel
+    /// pattern is therefore the same caller-side workaround that
+    /// `DistributedHttpClient` uses (tick 387 `race_with_cx_cancel`):
+    /// wrap the recv in a `select!` against a poll-sleep cancel
+    /// watcher.
+    ///
+    /// This test pins that pattern works, giving callers a template.
+    /// It also documents the underlying gap: if asupersync ever
+    /// registers cx-cancel-wakers on the recv path, the polling
+    /// watcher becomes redundant but remains correct.
+    ///
+    /// Shape:
+    /// - Create `(tx, mut rx) = mpsc::channel(4)` — keep `_tx` alive.
+    /// - Spawn task that cancels cx after 100 ms.
+    /// - Wrap `rx.recv(&cx)` in a `select!` against a poll-sleep
+    ///   watcher that returns `Err("cancelled")` when `cx.is_cancel_requested()`.
+    /// - Assert elapsed < 500 ms (the poll-sleep watcher catches the
+    ///   cancel within its 50 ms poll interval) AND Err.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = mpsc::channel::<u64>(4);
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("tick 432 mid-flight cancel via select race pattern"),
+                );
+            });
+
+            let recv_fut = std::pin::pin!(async { rx.recv(&cx).await.map(|_| ()) });
+            let watcher = std::pin::pin!(async {
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    if cx.is_cancel_requested() {
+                        return Err("cancelled via watcher");
+                    }
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = select(recv_fut, watcher).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "select! race watcher must catch mid-flight cancel within ~150 ms \
+                 (100 ms sleep + up to 50 ms poll); took {elapsed:?}"
+            );
+            match outcome {
+                Either::Right((Err(_), _recv_still_pending)) => {
+                    // Expected: watcher branch fired with cancel.
+                }
+                Either::Left((Ok(()), _)) => {
+                    panic!("recv branch returned Ok — sender should not have fired")
+                }
+                Either::Left((Err(err), _)) => {
+                    // Acceptable alternative: recv itself observed the cancel
+                    // (would mean asupersync gained cx-cancel-waker support).
+                    assert!(
+                        matches!(err, mpsc::RecvError::Cancelled),
+                        "if recv branch fires, it must be Cancelled; got: {err:?}"
+                    );
+                }
+                Either::Right((Ok(()), _)) => {
+                    unreachable!("watcher returns Err on cancel; Ok is not producible")
+                }
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 422: `mpsc::Receiver::recv(cx)` observes cx-cancel.
     ///
     /// Pins cx-cancel observation on the asupersync mpsc receiver — the
