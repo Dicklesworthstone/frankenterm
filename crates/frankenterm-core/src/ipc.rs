@@ -926,6 +926,7 @@ impl IpcServer {
     }
 
     /// Internal run method with context.
+    #[cfg(any(not(feature = "asupersync-runtime"), test))]
     async fn run_with_context(
         self,
         ctx: Arc<IpcHandlerContext>,
@@ -1156,6 +1157,7 @@ impl IpcServer {
 }
 
 #[cfg(unix)]
+#[cfg(any(not(feature = "asupersync-runtime"), test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -1305,6 +1307,7 @@ impl IpcServer {
 
 /// Handle a single client connection with full context.
 #[cfg(unix)]
+#[cfg(any(not(feature = "asupersync-runtime"), test))]
 async fn handle_client_with_context(
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
