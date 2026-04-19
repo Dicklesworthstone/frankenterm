@@ -4,6 +4,7 @@
 //! correlation ID semantics, redaction label ordering and restriction logic,
 //! health status worst-case aggregation, and causality link serialization.
 
+use frankenterm_core::tailer::SchedulerSnapshot;
 use frankenterm_core::unified_telemetry::*;
 use proptest::prelude::*;
 
@@ -48,6 +49,54 @@ fn arb_subsystem_layer() -> impl Strategy<Value = SubsystemLayer> {
         Just(SubsystemLayer::Runtime),
         Just(SubsystemLayer::Ingest),
     ]
+}
+
+fn arb_scheduler_snapshot() -> impl Strategy<Value = SchedulerSnapshot> {
+    (
+        any::<bool>(),
+        any::<u32>(),
+        any::<u64>(),
+        any::<u32>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<usize>(),
+    )
+        .prop_map(
+            |(
+                budget_active,
+                max_captures_per_sec,
+                max_bytes_per_sec,
+                captures_remaining,
+                bytes_remaining,
+                total_rate_limited,
+                total_byte_budget_exceeded,
+                total_throttle_events,
+                tracked_panes,
+            )| SchedulerSnapshot {
+                budget_active,
+                max_captures_per_sec,
+                max_bytes_per_sec,
+                captures_remaining,
+                bytes_remaining,
+                total_rate_limited,
+                total_byte_budget_exceeded,
+                total_throttle_events,
+                tracked_panes,
+            },
+        )
+}
+
+fn arb_redaction_meta() -> impl Strategy<Value = RedactionMeta> {
+    (
+        arb_redaction_label(),
+        prop::collection::vec("[a-z][a-z0-9_.-]{0,20}", 0..=4),
+    )
+        .prop_map(|(label, scrubbed_fields)| RedactionMeta {
+            label,
+            scrubbed_fields,
+        })
 }
 
 // =============================================================================
@@ -282,4 +331,112 @@ fn default_health_status_is_unknown() {
 #[test]
 fn schema_version_not_empty() {
     assert!(!SCHEMA_VERSION.is_empty());
+}
+
+// =============================================================================
+// Envelope builder + fleet aggregation
+// =============================================================================
+
+proptest! {
+    #[test]
+    fn envelope_builder_roundtrip_with_ingest_payload(
+        captured_at_ms in any::<u64>(),
+        sequence in any::<u64>(),
+        layer in arb_subsystem_layer(),
+        source in arb_telemetry_source(),
+        health in arb_health_status(),
+        redaction in arb_redaction_meta(),
+        trace_id in "[a-f0-9]{0,32}",
+        span_id in "[a-f0-9]{0,16}",
+        correlation in "[a-z0-9_-]{0,20}",
+        actor in proptest::option::of("[A-Za-z0-9_-]{1,20}"),
+        session in proptest::option::of("[A-Za-z0-9_-]{1,20}"),
+        pane_id in proptest::option::of(any::<u64>()),
+        snapshot in arb_scheduler_snapshot(),
+    ) {
+        let mut builder = EnvelopeBuilder::new(layer, captured_at_ms)
+            .sequence(sequence)
+            .trace(TraceContext::new(trace_id, span_id))
+            .correlation(correlation)
+            .source(source)
+            .redaction(redaction.clone())
+            .health(health);
+
+        if let Some(actor) = actor.clone() {
+            builder = builder.actor(actor);
+        }
+        if let Some(session) = session.clone() {
+            builder = builder.session(session);
+        }
+        if let Some(pane_id) = pane_id {
+            builder = builder.pane(pane_id);
+        }
+
+        let envelope = builder.build(SubsystemPayload::Ingest(IngestPayload {
+            snapshot: snapshot.clone(),
+        }));
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let back: TelemetryEnvelope = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(back.captured_at_ms, captured_at_ms);
+        prop_assert_eq!(back.sequence, sequence);
+        prop_assert_eq!(back.layer, layer);
+        prop_assert_eq!(back.source, source);
+        prop_assert_eq!(back.health, health);
+        prop_assert_eq!(back.redaction, redaction);
+        prop_assert_eq!(back.actor_id, actor);
+        prop_assert_eq!(back.session_id, session);
+        match back.payload {
+            SubsystemPayload::Ingest(payload) => {
+                let back_json = serde_json::to_value(&payload.snapshot).unwrap();
+                let expected_json = serde_json::to_value(&snapshot).unwrap();
+                prop_assert_eq!(back_json, expected_json);
+            }
+            other => prop_assert!(false, "expected ingest payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unified_snapshot_aggregates_health_and_redaction(
+        assembled_at_ms in any::<u64>(),
+        env1_health in arb_health_status(),
+        env2_health in arb_health_status(),
+        env1_redaction in arb_redaction_label(),
+        env2_redaction in arb_redaction_label(),
+        snapshot1 in arb_scheduler_snapshot(),
+        snapshot2 in arb_scheduler_snapshot(),
+    ) {
+        let env1 = EnvelopeBuilder::new(SubsystemLayer::Policy, assembled_at_ms)
+            .health(env1_health)
+            .redaction(RedactionMeta {
+                label: env1_redaction,
+                scrubbed_fields: vec![],
+            })
+            .build(SubsystemPayload::Ingest(IngestPayload { snapshot: snapshot1 }));
+
+        let env2 = EnvelopeBuilder::new(SubsystemLayer::Runtime, assembled_at_ms)
+            .health(env2_health)
+            .redaction(RedactionMeta {
+                label: env2_redaction,
+                scrubbed_fields: vec!["field".into()],
+            })
+            .build(SubsystemPayload::Ingest(IngestPayload { snapshot: snapshot2 }));
+
+        let snapshot = UnifiedFleetSnapshot::from_envelopes(
+            assembled_at_ms,
+            vec![env1, env2],
+            vec![],
+        );
+
+        prop_assert_eq!(snapshot.assembled_at_ms, assembled_at_ms);
+        prop_assert_eq!(snapshot.envelope_count(), 2);
+        prop_assert_eq!(snapshot.fleet_health, env1_health.worst(env2_health));
+        prop_assert_eq!(
+            snapshot.redaction_ceiling,
+            env1_redaction.max_restriction(env2_redaction)
+        );
+        prop_assert_eq!(snapshot.envelopes_for_layer(SubsystemLayer::Policy).len(), 1);
+        prop_assert_eq!(snapshot.envelopes_for_layer(SubsystemLayer::Runtime).len(), 1);
+    }
 }
