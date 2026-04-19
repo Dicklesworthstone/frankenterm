@@ -5483,6 +5483,65 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 421: `Semaphore::acquire_with_cx` observes cx-cancel.
+    ///
+    /// Pins the cx-cancel observation on the Semaphore acquire primitive.
+    /// With a zero-permit semaphore (no permits available, no releases
+    /// coming) and a pre-cancelled cx, `acquire_with_cx` must return
+    /// `Err(AcquireError::Cancelled)` promptly rather than blocking
+    /// indefinitely waiting for a permit that will never be released.
+    ///
+    /// Setup:
+    /// 1. Construct `Semaphore::new(0)` (fully contended).
+    /// 2. Pre-cancel a cx via `cx.cancel_with(User, ...)`.
+    /// 3. Wrap `sem.acquire_with_cx(&cx)` in a 2 s outer safety-net
+    ///    timeout (via separate live cx) so a non-observing primitive
+    ///    would block until the outer fires.
+    /// 4. Assert elapsed < 1 s AND `Err(AcquireError::Cancelled)`
+    ///    specifically (not `Closed` — the semaphore is not closed).
+    ///
+    /// Complements the oneshot + broadcast + yield_now cx-cancel tests
+    /// (ticks 418-420) with the semaphore concurrency primitive. Used
+    /// across the core for rate limiting and bounded-concurrency work
+    /// queues — pinning cx-cancel guards those call sites.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn semaphore_acquire_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sem = Semaphore::new(0);
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 421 pre-cancel Semaphore::acquire_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                sem.acquire_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit Semaphore::acquire_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                matches!(inner, Err(AcquireError::Cancelled)),
+                "pre-cancelled cx must yield AcquireError::Cancelled (not Closed / \
+                 PolledAfterCompletion); got: {inner:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 420: `broadcast_recv_with_cx` observes cx-cancel.
     ///
     /// Pins the cx-cancel observation on the broadcast receive primitive.
