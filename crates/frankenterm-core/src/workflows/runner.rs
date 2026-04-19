@@ -217,7 +217,7 @@ pub struct WorkflowRunner {
     /// Storage handle for persistence
     storage: Arc<crate::storage::StorageHandle>,
     /// Policy-gated injector for terminal input
-    injector: PolicyInjectorHandle,
+    injector: CxPolicyInjector,
     /// Optional replay capture adapter for decision provenance.
     replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
     /// Configuration
@@ -230,7 +230,7 @@ impl WorkflowRunner {
         engine: WorkflowEngine,
         lock_manager: Arc<PaneWorkflowLockManager>,
         storage: Arc<crate::storage::StorageHandle>,
-        injector: PolicyInjectorHandle,
+        injector: CxPolicyInjector,
         config: WorkflowRunnerConfig,
     ) -> Self {
         Self {
@@ -657,7 +657,11 @@ impl WorkflowRunner {
         }
 
         if let Some(adapter) = self.replay_capture.as_ref() {
-            self.injector.set_decision_capture(adapter.clone()).await;
+            let request_cx = crate::cx::for_request();
+            let injector_cx = cx.unwrap_or(&request_cx);
+            self.injector
+                .set_decision_capture(injector_cx, adapter.clone())
+                .await;
         }
 
         // Plan-first execution: generate ActionPlan if workflow supports it (wa-upg.2.3)
@@ -1404,9 +1408,12 @@ impl WorkflowRunner {
                         "Workflow requesting text injection"
                     );
 
+                    let request_cx = crate::cx::for_request();
+                    let injector_cx = cx.unwrap_or(&request_cx);
                     let send_result = self
                         .injector
                         .send_text(
+                            injector_cx,
                             pane_id,
                             &text,
                             crate::policy::ActorKind::Workflow,

@@ -86,11 +86,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::WeztermHandle>;
 #[derive(Clone)]
-pub(crate) struct PolicyInjectorHandle {
+pub struct CxPolicyInjector {
     inner: Arc<crate::runtime_compat::Mutex<PolicyInjector>>,
 }
 
-impl PolicyInjectorHandle {
+impl CxPolicyInjector {
     #[must_use]
     pub(crate) fn new(injector: PolicyInjector) -> Self {
         Self {
@@ -100,29 +100,21 @@ impl PolicyInjectorHandle {
 
     pub(crate) async fn set_decision_capture(
         &self,
+        cx: &crate::cx::Cx,
         adapter: crate::replay_capture::SharedCaptureAdapter,
     ) {
-        let mut injector = self.inner.lock().await;
+        #[cfg(feature = "asupersync-runtime")]
+        let mut injector = self.inner.lock_with_cx(cx).await;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let mut injector = {
+            let _ = cx;
+            self.inner.lock().await
+        };
         injector.set_decision_capture(adapter);
     }
 
     pub(crate) async fn send_text(
         &self,
-        pane_id: u64,
-        text: &str,
-        actor: ActorKind,
-        capabilities: &PaneCapabilities,
-        workflow_id: Option<&str>,
-    ) -> InjectionResult {
-        let mut injector = self.inner.lock().await;
-        injector
-            .send_text(pane_id, text, actor, capabilities, workflow_id)
-            .await
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
-    pub(crate) async fn send_text_with_cx(
-        &self,
         cx: &crate::cx::Cx,
         pane_id: u64,
         text: &str,
@@ -130,94 +122,96 @@ impl PolicyInjectorHandle {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        let mut injector = self.inner.lock_with_cx(cx).await;
-        injector
-            .send_text_with_cx(cx, pane_id, text, actor, capabilities, workflow_id)
-            .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let mut injector = self.inner.lock_with_cx(cx).await;
+            return injector
+                .send_text_with_cx(cx, pane_id, text, actor, capabilities, workflow_id)
+                .await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = cx;
+            let mut injector = self.inner.lock().await;
+            injector
+                .send_text(pane_id, text, actor, capabilities, workflow_id)
+                .await
+        }
     }
 
     pub(crate) async fn send_ctrl_c(
         &self,
-        pane_id: u64,
-        actor: ActorKind,
-        capabilities: &PaneCapabilities,
-        workflow_id: Option<&str>,
-    ) -> InjectionResult {
-        let mut injector = self.inner.lock().await;
-        injector
-            .send_ctrl_c(pane_id, actor, capabilities, workflow_id)
-            .await
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
-    pub(crate) async fn send_ctrl_c_with_cx(
-        &self,
         cx: &crate::cx::Cx,
         pane_id: u64,
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        let mut injector = self.inner.lock_with_cx(cx).await;
-        injector
-            .send_ctrl_c_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-            .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let mut injector = self.inner.lock_with_cx(cx).await;
+            return injector
+                .send_ctrl_c_with_cx(cx, pane_id, actor, capabilities, workflow_id)
+                .await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = cx;
+            let mut injector = self.inner.lock().await;
+            injector
+                .send_ctrl_c(pane_id, actor, capabilities, workflow_id)
+                .await
+        }
     }
 
     pub(crate) async fn send_ctrl_d(
         &self,
-        pane_id: u64,
-        actor: ActorKind,
-        capabilities: &PaneCapabilities,
-        workflow_id: Option<&str>,
-    ) -> InjectionResult {
-        let mut injector = self.inner.lock().await;
-        injector
-            .send_ctrl_d(pane_id, actor, capabilities, workflow_id)
-            .await
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
-    pub(crate) async fn send_ctrl_d_with_cx(
-        &self,
         cx: &crate::cx::Cx,
         pane_id: u64,
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        let mut injector = self.inner.lock_with_cx(cx).await;
-        injector
-            .send_ctrl_d_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-            .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let mut injector = self.inner.lock_with_cx(cx).await;
+            return injector
+                .send_ctrl_d_with_cx(cx, pane_id, actor, capabilities, workflow_id)
+                .await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = cx;
+            let mut injector = self.inner.lock().await;
+            injector
+                .send_ctrl_d(pane_id, actor, capabilities, workflow_id)
+                .await
+        }
     }
 
     pub(crate) async fn send_ctrl_z(
         &self,
-        pane_id: u64,
-        actor: ActorKind,
-        capabilities: &PaneCapabilities,
-        workflow_id: Option<&str>,
-    ) -> InjectionResult {
-        let mut injector = self.inner.lock().await;
-        injector
-            .send_ctrl_z(pane_id, actor, capabilities, workflow_id)
-            .await
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
-    pub(crate) async fn send_ctrl_z_with_cx(
-        &self,
         cx: &crate::cx::Cx,
         pane_id: u64,
         actor: ActorKind,
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        let mut injector = self.inner.lock_with_cx(cx).await;
-        injector
-            .send_ctrl_z_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-            .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let mut injector = self.inner.lock_with_cx(cx).await;
+            return injector
+                .send_ctrl_z_with_cx(cx, pane_id, actor, capabilities, workflow_id)
+                .await;
+        }
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let _ = cx;
+            let mut injector = self.inner.lock().await;
+            injector
+                .send_ctrl_z(pane_id, actor, capabilities, workflow_id)
+                .await
+        }
     }
 }
 
@@ -1372,7 +1366,7 @@ steps:
             let engine = WorkflowEngine::default();
             let lock_manager = Arc::new(PaneWorkflowLockManager::new());
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-            let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::strict(),
                 default_wezterm_handle(),
             ));
@@ -1452,7 +1446,7 @@ steps:
             let engine = WorkflowEngine::default();
             let lock_manager = Arc::new(PaneWorkflowLockManager::new());
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
-            let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::strict(),
                 default_wezterm_handle(),
             ));
@@ -4247,7 +4241,7 @@ steps:
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
 
         // Create mock injector (won't be called in this test)
-        let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
             crate::policy::PolicyEngine::permissive(),
             default_wezterm_handle(),
         ));
@@ -4337,7 +4331,7 @@ steps:
     fn workflow_runner_lock_prevents_concurrent_runs() {
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
             crate::policy::PolicyEngine::permissive(),
             default_wezterm_handle(),
         ));
@@ -4422,7 +4416,7 @@ steps:
     fn workflow_runner_find_by_name() {
         let engine = WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-        let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
             crate::policy::PolicyEngine::permissive(),
             default_wezterm_handle(),
         ));
@@ -4637,7 +4631,7 @@ steps:
             let engine = crate::policy::PolicyEngine::permissive();
             let client = default_wezterm_handle();
             let injector =
-                PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(engine, client));
+                CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(engine, client));
 
             let ctx_with_injector =
                 WorkflowContext::new(storage.clone(), 42, PaneCapabilities::default(), "exec-002")
@@ -5814,7 +5808,7 @@ steps:
         }
         let handle: crate::wezterm::WeztermHandle = Arc::new(mock);
 
-        let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
             crate::policy::PolicyEngine::permissive(),
             handle,
         ));
@@ -6121,7 +6115,7 @@ steps:
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
             let mock = crate::wezterm::MockWezterm::new();
             let handle: crate::wezterm::WeztermHandle = Arc::new(mock);
-            let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 handle,
             ));
@@ -6300,12 +6294,11 @@ steps:
             let lock_manager = Arc::new(PaneWorkflowLockManager::new());
             let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
             let wezterm: crate::wezterm::WeztermHandle = Arc::new(MockWezterm);
-            let injector =
-                PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::with_storage(
-                    crate::policy::PolicyEngine::permissive(),
-                    wezterm,
-                    storage.as_ref().clone(),
-                ));
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::with_storage(
+                crate::policy::PolicyEngine::permissive(),
+                wezterm,
+                storage.as_ref().clone(),
+            ));
 
             let runner = WorkflowRunner::new(
                 engine,
@@ -6547,7 +6540,7 @@ steps:
             let wezterm: crate::wezterm::WeztermHandle = Arc::new(
                 crate::wezterm::WeztermClient::with_socket("/tmp/wa-test-nonexistent.sock"),
             );
-            let injector = PolicyInjectorHandle::new(crate::policy::PolicyGatedInjector::new(
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
                 crate::policy::PolicyEngine::permissive(),
                 wezterm,
             ));

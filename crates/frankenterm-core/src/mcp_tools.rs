@@ -2112,7 +2112,7 @@ impl ToolHandler for WaWorkflowRunTool {
                 let lock_manager = Arc::new(PaneWorkflowLockManager::new());
                 let injector_engine =
                     build_policy_engine(&config, config.safety.require_prompt_active);
-                let injector = crate::workflows::PolicyInjectorHandle::new(
+                let injector = crate::workflows::CxPolicyInjector::new(
                     PolicyGatedInjector::with_storage(
                         injector_engine,
                         Arc::clone(&wezterm),
