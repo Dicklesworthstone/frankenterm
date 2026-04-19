@@ -441,6 +441,14 @@ harness = false
 name = "quantile_sketch_bench"
 harness = false
 
+[[bench]]
+name = "lfu_cache_bench"
+harness = false
+
+[[bench]]
+name = "quota_cost_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
