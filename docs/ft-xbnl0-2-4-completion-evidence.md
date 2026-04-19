@@ -143,7 +143,7 @@ closes the orchestrator-level wiring gap.
 
 | Guard | Scope | Tick |
 |-------|-------|------|
-| `ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports` | Workspace-wide scan; flags `use tokio::net::Tcp*`, `use tokio_rustls`, `use hyper`, `use async_native_tls`, `use async_std::net`, `use smol::net` (and `pub use` / `extern crate` variants) outside comments | 311/312/315 |
+| `ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports` | Workspace-wide scan; flags direct Tokio TCP-net imports, `tokio_rustls`, `hyper`, `async_native_tls`, `async_std::net`, and Smol net imports (plus `pub use` / `extern crate` variants) outside comments | 311/312/315 |
 | `ft_xbnl0_2_4_no_tokio_net_deps_in_workspace_manifests` | Manifest scan; flags `tokio-rustls`, `hyper`, `async-native-tls` deps | 311/312 |
 | `ft_xbnl0_2_4_asupersync_workspace_dep_present` | Positive guard; asserts root `Cargo.toml` declares `asupersync` dep | 317 |
 

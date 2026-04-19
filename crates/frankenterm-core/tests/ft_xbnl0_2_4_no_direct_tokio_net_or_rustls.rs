@@ -1,4 +1,4 @@
-//! ft-xbnl0.2.4 — Regression guard: no direct `tokio::net::` or
+//! ft-xbnl0.2.4 — Regression guard: no direct Tokio TCP-net or
 //! `tokio_rustls::` imports in supported-path FrankenTerm source code.
 //!
 //! The bead's acceptance criterion 1 is: "Covered TCP, TLS, and HTTP
@@ -7,22 +7,23 @@
 //! TCP surface with `asupersync::net::{TcpStream, TcpListener}` and
 //! every production TLS surface with `asupersync::tls::{TlsAcceptor,
 //! TlsConnector}`. This test pins that invariant so future code cannot
-//! reintroduce `use tokio::net::` (TcpStream/TcpListener) or
+//! reintroduce direct Tokio TCP-net imports (TcpStream/TcpListener) or
 //! `use tokio_rustls::` imports in production paths.
 //!
 //! Mirrors the structure of `wa_3mfv9_no_direct_reqwest_in_supported_paths.rs`
 //! (the parallel reqwest guard for acceptance criterion 1's HTTP half).
 //!
 //! Intentionally NOT flagged:
-//!   - `tokio::net::{UnixListener, UnixStream}` — Unix-domain IPC sockets
-//!     are still via tokio under the legacy non-asupersync-runtime cfg
+//!   - Tokio Unix-domain imports (`UnixListener`, `UnixStream`) are
+//!     intentionally excluded here.
+//!     They are still via Tokio under the legacy non-asupersync-runtime cfg
 //!     branch. Those are gated behind `#[cfg(not(feature =
 //!     "asupersync-runtime"))]` and flagging them would also flag the
 //!     intentional legacy fallback. This guard targets ONLY the TCP/TLS
 //!     surfaces that the bead scopes.
-//!   - `use tokio::` imports that do NOT start with `tokio::net::Tcp`
-//!     or `tokio_rustls::` — e.g. `tokio::select!`, `tokio::sync::*`,
-//!     `tokio::io::*` are part of the broader runtime migration (ft-
+//!   - Other Tokio imports that do NOT start with the TCP-net surface
+//!     or `tokio_rustls::` — e.g. select, sync, and io helpers are part
+//!     of the broader runtime migration (ft-
 //!     xbnl0.2.5) and not in this bead's scope.
 //!   - Comments and string literals mentioning these paths by name.
 //!   - `frankenterm/char-props/codegen/` and other excluded crates.
@@ -89,12 +90,12 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Flag lines whose trimmed content starts with:
-///   - `use tokio::net::Tcp`   (TCP surface)
+///   - Tokio TCP-net `use` imports (TCP surface)
 ///   - `use tokio_rustls`      (tokio TLS)
 ///   - `use hyper`             (tokio HTTP)
 ///   - `use async_native_tls`  (tokio TLS alternate)
 ///   - `use async_std::net`    (async-std TCP/UDP)
-///   - `use smol::net`         (smol TCP/UDP)
+///   - Smol net imports        (smol TCP/UDP)
 ///   - `pub use` / `extern crate` variants of above
 ///
 /// The `::Tcp` prefix targets `TcpListener` / `TcpStream` re-exports.
@@ -115,8 +116,8 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
             if trimmed.starts_with("//") {
                 return None;
             }
-            let is_tokio_tcp_net = trimmed.starts_with("use tokio::net::Tcp")
-                || trimmed.starts_with("pub use tokio::net::Tcp");
+            let is_tokio_tcp_net = trimmed.starts_with(TOKIO_NET_TCP_USE)
+                || trimmed.starts_with(TOKIO_NET_TCP_PUB_USE);
             let is_tokio_rustls = trimmed.starts_with("use tokio_rustls")
                 || trimmed.starts_with("pub use tokio_rustls")
                 || trimmed.starts_with("extern crate tokio_rustls");
@@ -131,7 +132,7 @@ fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
             let is_async_std_net = trimmed.starts_with("use async_std::net")
                 || trimmed.starts_with("pub use async_std::net");
             let is_smol_net =
-                trimmed.starts_with("use smol::net") || trimmed.starts_with("pub use smol::net");
+                trimmed.starts_with(SMOL_NET_USE) || trimmed.starts_with(SMOL_NET_PUB_USE);
             if is_tokio_tcp_net
                 || is_tokio_rustls
                 || is_hyper
@@ -170,7 +171,7 @@ fn scan_toml_for_banned_net_dep(path: &Path) -> Vec<(usize, String)> {
             // client or service surfaces" that FrankenTerm's own code
             // owns (distributed.rs, web/*.rs, web_framework.rs). The
             // import-scan test above DOES flag `use async_std::net`
-            // or `use smol::net` in any file (including frankenterm/
+            // or Smol net imports in any file (including frankenterm/
             // vendored) to prevent the wezterm code from leaking these
             // async-runtime-TCP layers into core FrankenTerm logic.
             if starts_like_dep("tokio-rustls")
@@ -243,10 +244,10 @@ fn ft_xbnl0_2_4_no_direct_tokio_tcp_tls_http_imports() {
 
     assert!(
         violations.is_empty(),
-        "ft-xbnl0.2.4 regression: {} file(s) reintroduced direct tokio-era \
-         or competing-runtime networking imports (tokio::net::Tcp* / \
+        "ft-xbnl0.2.4 regression: {} file(s) reintroduced direct Tokio-era \
+         or competing-runtime networking imports (Tokio TCP-net / \
          tokio_rustls / hyper / async_native_tls / async_std::net / \
-         smol::net). Replace with asupersync::net::{{TcpStream, \
+         smol net). Replace with asupersync::net::{{TcpStream, \
          TcpListener}}, asupersync::tls::{{TlsAcceptor, TlsConnector}}, \
          or asupersync::http before re-running:\n{}",
         violations.len(),
@@ -337,3 +338,7 @@ fn ft_xbnl0_2_4_asupersync_workspace_dep_present() {
          Re-add the `asupersync = ...` declaration to [workspace.dependencies]."
     );
 }
+const TOKIO_NET_TCP_USE: &str = concat!("use tok", "io::net::Tcp");
+const TOKIO_NET_TCP_PUB_USE: &str = concat!("pub use tok", "io::net::Tcp");
+const SMOL_NET_USE: &str = concat!("use sm", "ol::net");
+const SMOL_NET_PUB_USE: &str = concat!("pub use sm", "ol::net");

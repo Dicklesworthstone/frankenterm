@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-16T05:58:33Z",
+  "checked_at": "2026-04-19T16:25:02Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -31,7 +31,7 @@
       "counts": {
         "async_io::": 6,
         "smol::": 35,
-        "tokio::": 269
+        "tokio::": 201
       },
       "files": {
         "async_io::": [
@@ -47,18 +47,8 @@
           "frankenterm/ssh/src/lib.rs"
         ],
         "tokio::": [
-          "crates/frankenterm-core/benches/fts_query.rs",
           "crates/frankenterm-core/benches/ipc_throughput.rs",
-          "crates/frankenterm-core/benches/labruntime_overhead.rs",
           "crates/frankenterm-core/benches/mux_client_ops.rs",
-          "crates/frankenterm-core/benches/shard_routing.rs",
-          "crates/frankenterm-core/benches/sizing_benchmark.rs",
-          "crates/frankenterm-core/benches/spike_comparison.rs",
-          "crates/frankenterm-core/benches/storage_regression.rs",
-          "crates/frankenterm-core/benches/sync_primitives.rs",
-          "crates/frankenterm-core/benches/task_spawn.rs",
-          "crates/frankenterm-core/benches/test_execution.rs",
-          "crates/frankenterm-core/benches/timer_precision.rs",
           "crates/frankenterm-core/src/dependency_eradication.rs",
           "crates/frankenterm-core/src/forbidden_dep_guards.rs",
           "crates/frankenterm-core/src/manifest_dep_eradication.rs",
@@ -144,7 +134,7 @@
     "forbidden_token_counts": {
       "async_io::": 6,
       "smol::": 35,
-      "tokio::": 269
+      "tokio::": 201
     }
   }
 }

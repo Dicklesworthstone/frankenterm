@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-04-16T05:58:32Z",
+  "checked_at": "2026-04-19T16:25:01Z",
   "checks": [
     {
       "name": "contract_identity",
@@ -29,7 +29,7 @@
     },
     {
       "name": "source_quarantine_enforcement",
-      "quarantined_files": 66,
+      "quarantined_files": 56,
       "status": "passed"
     },
     {
@@ -73,6 +73,6 @@
       "wa-22x4r",
       "wa-2h1ha"
     ],
-    "source_files_quarantined": 66
+    "source_files_quarantined": 56
   }
 }
