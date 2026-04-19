@@ -87,6 +87,7 @@ mod mcp_tools;
 #[path = "mcp_types.rs"]
 mod mcp_types;
 
+use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 pub use mcp_bridge::{build_server, build_server_with_db, run_stdio_server};
 use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
 #[cfg(test)]
@@ -121,8 +122,6 @@ use mcp_types::{
     McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
     now_ms,
 };
-#[cfg(test)]
-use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 #[cfg(test)]
 use mcp_types::{
     EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData, McpMissionControlData,
