@@ -232,7 +232,6 @@ implicit_clone = "allow"
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde_json = "1.0.149"
 tantivy = "0.22"
-tokio = { version = "1.49.0", features = ["full"] }
 thiserror = "2.0.18"
 anyhow = "1.0.100"
 tracing = "0.1.44"
@@ -517,7 +516,7 @@ wasmtime = { version = "41", default-features = false, features = ["cranelift", 
 wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
 
 # Benchmarking
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = "0.5"
 
 # FastMCP (optional MCP server dependencies)
 asupersync = { version = "0.2.9" }
