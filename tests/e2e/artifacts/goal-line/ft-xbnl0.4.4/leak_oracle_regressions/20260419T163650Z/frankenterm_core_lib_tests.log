@@ -1,0 +1,394 @@
+  [2m2026-04-19T16:37:00.808778Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1153651 at ubuntu@38.242.134.66 (0 slots, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:289 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:01.515165Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankenterm (hash: 91964bcb678ad849)[0m
+    [2;3mat[0m rch/src/hook.rs:4645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:01.515282Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 55 roots[0m
+    [2;3mat[0m rch/src/hook.rs:4667 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:06.180066Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1153651...[0m
+    [2;3mat[0m rch/src/hook.rs:4691 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:06.180125Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm -> /data/projects/frankenterm on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:10.276279Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 4096ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:10.276359Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm -> /data/projects/frankenterm/crates/frankenterm on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:12.275357Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1998ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:12.275434Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm-alloc -> /data/projects/frankenterm/crates/frankenterm-alloc on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:14.404351Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2128ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:14.404416Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm-core -> /data/projects/frankenterm/crates/frankenterm-core on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:16.975616Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2571ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:16.975691Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm-gui -> /data/projects/frankenterm/crates/frankenterm-gui on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:19.013803Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2038ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:19.013891Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm-mux-server -> /data/projects/frankenterm/crates/frankenterm-mux-server on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:21.260691Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2246ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:21.260778Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/crates/frankenterm-mux-server-impl -> /data/projects/frankenterm/crates/frankenterm-mux-server-impl on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:23.424808Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2164ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:23.424940Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/async_ossl -> /data/projects/frankenterm/frankenterm/async_ossl on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:25.688817Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2263ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:25.688908Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/base91 -> /data/projects/frankenterm/frankenterm/base91 on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:28.071064Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2382ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:28.071130Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/bidi -> /data/projects/frankenterm/frankenterm/bidi on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:30.152676Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2081ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:30.152742Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/bintree -> /data/projects/frankenterm/frankenterm/bintree on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:32.108706Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1955ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:32.108811Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/blob-leases -> /data/projects/frankenterm/frankenterm/blob-leases on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:34.225485Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2116ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:34.225554Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/cell -> /data/projects/frankenterm/frankenterm/cell on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:36.308520Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2082ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:36.308589Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/char-props -> /data/projects/frankenterm/frankenterm/char-props on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:38.352523Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2043ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:38.352665Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/client -> /data/projects/frankenterm/frankenterm/client on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:40.713174Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2360ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:40.713249Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/codec -> /data/projects/frankenterm/frankenterm/codec on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:42.664671Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1951ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:42.664723Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/color-types -> /data/projects/frankenterm/frankenterm/color-types on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:44.827250Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2162ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:44.827317Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/config -> /data/projects/frankenterm/frankenterm/config on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:47.450335Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2623ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:47.450395Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/config/derive -> /data/projects/frankenterm/frankenterm/config/derive on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:49.555202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2104ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:49.555297Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/deps-fontconfig -> /data/projects/frankenterm/frankenterm/deps-fontconfig on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:51.561077Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2005ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:51.561210Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/deps-freetype -> /data/projects/frankenterm/frankenterm/deps-freetype on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:53.875597Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2314ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:53.875684Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/deps-harfbuzz -> /data/projects/frankenterm/frankenterm/deps-harfbuzz on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:56.111670Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2235ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:56.111727Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/dynamic -> /data/projects/frankenterm/frankenterm/dynamic on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:58.492776Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2381ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:37:58.492841Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/dynamic/derive -> /data/projects/frankenterm/frankenterm/dynamic/derive on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:00.741172Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2248ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:00.741291Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/env-bootstrap -> /data/projects/frankenterm/frankenterm/env-bootstrap on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:02.799276Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2057ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:02.799394Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/escape-parser -> /data/projects/frankenterm/frankenterm/escape-parser on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:05.525397Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2726ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:05.525480Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/filedescriptor -> /data/projects/frankenterm/frankenterm/filedescriptor on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:07.944630Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2419ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:07.944700Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/font -> /data/projects/frankenterm/frankenterm/font on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:10.387329Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2442ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:10.387418Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/frecency -> /data/projects/frankenterm/frankenterm/frecency on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:12.691373Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2303ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:12.691456Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/gui-subcommands -> /data/projects/frankenterm/frankenterm/gui-subcommands on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:14.840714Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2149ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:14.840786Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/input-types -> /data/projects/frankenterm/frankenterm/input-types on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:17.133473Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2292ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:17.133561Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/lfucache -> /data/projects/frankenterm/frankenterm/lfucache on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:19.393588Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2260ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:19.393645Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/lua-api-crates/mux-lua -> /data/projects/frankenterm/frankenterm/lua-api-crates/mux-lua on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:21.628231Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2234ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:21.628294Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/lua-api-crates/termwiz-funcs -> /data/projects/frankenterm/frankenterm/lua-api-crates/termwiz-funcs on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:24.097930Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2469ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:24.098030Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/lua-api-crates/url-funcs -> /data/projects/frankenterm/frankenterm/lua-api-crates/url-funcs on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:26.249993Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2151ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:26.250059Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/luahelper -> /data/projects/frankenterm/frankenterm/luahelper on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:28.888364Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2638ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:28.888450Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/mux -> /data/projects/frankenterm/frankenterm/mux on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:31.428062Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2539ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:31.428145Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/open-url -> /data/projects/frankenterm/frankenterm/open-url on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:33.699031Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2270ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:33.699109Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/procinfo -> /data/projects/frankenterm/frankenterm/procinfo on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:35.755018Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2055ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:35.755271Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/promise -> /data/projects/frankenterm/frankenterm/promise on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:38.078558Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2323ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:38.078641Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/pty -> /data/projects/frankenterm/frankenterm/pty on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:40.103752Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2025ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:40.103844Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/rangeset -> /data/projects/frankenterm/frankenterm/rangeset on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:42.416237Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2312ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:42.416480Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/ratelim -> /data/projects/frankenterm/frankenterm/ratelim on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:44.520762Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2104ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:44.520844Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/scripting -> /data/projects/frankenterm/frankenterm/scripting on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:46.858210Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2337ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:46.858354Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/ssh -> /data/projects/frankenterm/frankenterm/ssh on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:49.485858Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2627ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:49.485951Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/surface -> /data/projects/frankenterm/frankenterm/surface on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:51.794474Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:51.794549Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/tabout -> /data/projects/frankenterm/frankenterm/tabout on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:54.217543Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2422ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:54.217673Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/term -> /data/projects/frankenterm/frankenterm/term on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:56.876396Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2658ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:56.876479Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/termwiz -> /data/projects/frankenterm/frankenterm/termwiz on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:59.490513Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2614ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:38:59.491242Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/toast-notification -> /data/projects/frankenterm/frankenterm/toast-notification on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:03.588012Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 4096ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:03.588154Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/uds -> /data/projects/frankenterm/frankenterm/uds on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:06.842064Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3253ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:06.842328Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/umask -> /data/projects/frankenterm/frankenterm/umask on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:09.168004Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2325ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:09.168104Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/vtparse -> /data/projects/frankenterm/frankenterm/vtparse on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:11.117544Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1949ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:11.117731Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/frankenterm/window -> /data/projects/frankenterm/frankenterm/window on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:13.282275Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2164ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:13.282346Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/frankenterm/fuzz -> /data/projects/frankenterm/fuzz on vmi1153651[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:15.321949Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2039ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:15.322031Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 21502 files, 895655 bytes in 129106ms[0m
+    [2;3mat[0m rch/src/hook.rs:4848 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:16.992649Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env CARGO_TARGET_DIR=/tmp/ft-jemanuel-target cargo test -p frankenterm-core --lib ft_xbnl0_4_4_ -- --nocapture[0m
+    [2;3mat[0m rch/src/hook.rs:4875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-19T16:39:16.992720Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 1800[0m
+    [2;3mat[0m rch/src/transfer.rs:782 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '38.242.134.66' (ED25519) to the list of known hosts.
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /data/projects/frankenterm/fuzz/Cargo.toml
+workspace: /data/projects/frankenterm/Cargo.toml
+   Compiling tokio v1.50.0
+   Compiling criterion v0.7.0
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling tokio-native-tls v0.3.1
+   Compiling h2 v0.4.13
+   Compiling tower-http v0.6.8
+   Compiling hyper v1.9.0
+   Compiling hyper-util v0.1.20
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling hf-hub v0.4.3
+   Compiling fastembed v5.13.0
+   Compiling frankensearch-embed v0.1.3 (https://github.com/Dicklesworthstone/frankensearch?rev=7086d9646520e8c0d4908a88d0854a7f979f1580#7086d964)
+   Compiling frankensearch-fusion v0.1.0 (https://github.com/Dicklesworthstone/frankensearch?rev=7086d9646520e8c0d4908a88d0854a7f979f1580#7086d964)
+   Compiling frankensearch v0.1.0 (https://github.com/Dicklesworthstone/frankensearch?rev=7086d9646520e8c0d4908a88d0854a7f979f1580#7086d964)
+   Compiling frankenterm-core v0.1.0 (/data/projects/frankenterm/crates/frankenterm-core)
+error[E0432]: unresolved import `tokio`
+    --> crates/frankenterm-core/src/runtime_compat.rs:1419:9
+     |
+1419 | pub use tokio::select;
+     |         ^^^^^ use of unresolved module or unlinked crate `tokio`
+     |
+     = help: if you wanted to use a crate named `tokio`, use `cargo add tokio` to add it to your `Cargo.toml`
+
+warning: unused import: `STREAM_KEEPALIVE_SECS`
+ --> crates/frankenterm-core/src/web/sse.rs:8:51
+  |
+8 |     STREAM_CHANNEL_BUFFER, STREAM_DEFAULT_MAX_HZ, STREAM_KEEPALIVE_SECS,
+  |                                                   ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `timeout`
+  --> crates/frankenterm-core/src/web/sse.rs:14:56
+   |
+14 | use crate::runtime_compat::{mpsc, select, sleep, task, timeout};
+   |                                                        ^^^^^^^
+

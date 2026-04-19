@@ -1,0 +1,3 @@
+5429:    fn ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown() {
+5477:    fn ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles() {
+806:    fn ft_xbnl0_4_4_tick_keeps_watermarks_bounded_across_churn_cycles() {

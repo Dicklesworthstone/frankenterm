@@ -5426,6 +5426,120 @@ mod tests {
     }
 
     #[test]
+    fn ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown() {
+        let mut registry = PaneRegistry::new();
+
+        let mut pane1 = make_pane(1, "bash");
+        pane1.window_id = 10;
+        pane1.tab_id = 20;
+        pane1.workspace = Some("alpha".to_string());
+
+        let mut pane2 = make_pane(2, "vim");
+        pane2.window_id = 11;
+        pane2.tab_id = 21;
+        pane2.workspace = Some("beta".to_string());
+
+        registry.discovery_tick(vec![pane1, pane2]);
+
+        let metrics = RuntimeMetrics::default();
+        let heartbeats = HeartbeatRegistry::new();
+        heartbeats.record_discovery();
+        heartbeats.record_capture();
+        heartbeats.record_persistence();
+        heartbeats.record_maintenance();
+
+        let active_inventory = build_leak_risk_inventory(&registry, &metrics, &heartbeats);
+        assert_eq!(active_inventory.tracked_pane_entries, 2);
+        assert_eq!(active_inventory.observed_pane_count, 2);
+        assert_eq!(active_inventory.window_count, 2);
+        assert_eq!(active_inventory.tab_count, 2);
+        assert_eq!(active_inventory.workspace_count, 2);
+        assert_eq!(active_inventory.pane_arena_count, 2);
+
+        registry.discovery_tick(vec![]);
+
+        let baseline_inventory = build_leak_risk_inventory(&registry, &metrics, &heartbeats);
+        assert_eq!(baseline_inventory.tracked_pane_entries, 0);
+        assert_eq!(baseline_inventory.observed_pane_count, 0);
+        assert_eq!(baseline_inventory.window_count, 0);
+        assert_eq!(baseline_inventory.tab_count, 0);
+        assert_eq!(baseline_inventory.workspace_count, 0);
+        assert_eq!(baseline_inventory.pane_arena_count, 0);
+        assert_eq!(baseline_inventory.pane_arena_tracked_bytes, 0);
+        assert_eq!(baseline_inventory.pane_arena_peak_tracked_bytes, 0);
+        assert_eq!(
+            baseline_inventory.watchdog.overall,
+            Some(crate::watchdog::HealthStatus::Healthy)
+        );
+    }
+
+    #[test]
+    fn ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles() {
+        let mut cursors = HashMap::new();
+        let mut detection_contexts = HashMap::new();
+        let mut pane_activity_tracker = HashMap::new();
+
+        for cycle in 0_u64..32 {
+            let pane_id = cycle + 1;
+            cursors.insert(pane_id, PaneCursor::from_seq(pane_id, cycle + 1));
+            detection_contexts.insert(pane_id, DetectionContext::new());
+            pane_activity_tracker.insert(
+                pane_id,
+                PaneActivityState {
+                    last_seq: cycle as i64 + 1,
+                    last_output_at_ms: 10_000 + cycle,
+                    generation: 1,
+                    first_seen_at_ms: 10_000 + cycle,
+                },
+            );
+
+            let active_panes = HashSet::from([pane_id]);
+            let stats = compact_runtime_pane_state(
+                &mut cursors,
+                &mut detection_contexts,
+                &mut pane_activity_tracker,
+                &active_panes,
+            );
+
+            assert_eq!(cursors.len(), 1, "cursor map grew during cycle {cycle}");
+            assert_eq!(
+                detection_contexts.len(),
+                1,
+                "detection contexts grew during cycle {cycle}"
+            );
+            assert_eq!(
+                pane_activity_tracker.len(),
+                1,
+                "pane activity tracker grew during cycle {cycle}"
+            );
+            assert!(cursors.contains_key(&pane_id));
+            assert!(detection_contexts.contains_key(&pane_id));
+            assert!(pane_activity_tracker.contains_key(&pane_id));
+            assert!(
+                stats.cursors.removed_entries <= 1
+                    && stats.detection_contexts.removed_entries <= 1
+                    && stats.pane_activity_tracker.removed_entries <= 1,
+                "unexpected multi-entry growth during cycle {cycle}: {stats:?}"
+            );
+        }
+
+        let empty = HashSet::new();
+        let final_stats = compact_runtime_pane_state(
+            &mut cursors,
+            &mut detection_contexts,
+            &mut pane_activity_tracker,
+            &empty,
+        );
+
+        assert_eq!(final_stats.cursors.removed_entries, 1);
+        assert_eq!(final_stats.detection_contexts.removed_entries, 1);
+        assert_eq!(final_stats.pane_activity_tracker.removed_entries, 1);
+        assert!(cursors.is_empty());
+        assert!(detection_contexts.is_empty());
+        assert!(pane_activity_tracker.is_empty());
+    }
+
+    #[test]
     fn build_fleet_pressure_signals_tracks_manager_state() {
         let manager = BackpressureManager::new(BackpressureConfig::default());
         manager.pause_pane(5);

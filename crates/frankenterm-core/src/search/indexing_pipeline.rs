@@ -803,6 +803,40 @@ mod tests {
     }
 
     #[test]
+    fn ft_xbnl0_4_4_tick_keeps_watermarks_bounded_across_churn_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+
+        for cycle in 0_u64..8 {
+            let pane_id = cycle + 1;
+            let panes = vec![(
+                pane_id,
+                None,
+                make_lines(
+                    &[&format!("cycle-{cycle}")],
+                    1_000_i64 + cycle as i64 * 1_000,
+                    100,
+                ),
+            )];
+            pipeline.tick(&panes, 2_000 + cycle as i64 * 1_000, false, None);
+
+            assert_eq!(
+                pipeline.watermarks().len(),
+                1,
+                "watermarks should only retain the active pane during cycle {cycle}"
+            );
+            assert!(pipeline.watermark(pane_id).is_some());
+        }
+
+        let empty: Vec<(u64, Option<String>, Vec<ScrollbackLine>)> = Vec::new();
+        let report = pipeline.tick(&empty, 20_000, false, None);
+
+        assert_eq!(report.panes_processed, 0);
+        assert!(pipeline.watermarks().is_empty());
+    }
+
+    #[test]
     fn reset_pane_watermark_enables_reindex() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
