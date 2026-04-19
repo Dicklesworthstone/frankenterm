@@ -396,6 +396,12 @@ impl MemoryBudgetManager {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.run_with_cx(&cx, shutdown).await;
+        }
+
         let interval = std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
         let mut first_tick = true;
 
