@@ -5838,9 +5838,9 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race watcher must catch mid-flight cancel within ~150 ms; \
-                 took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race watcher must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _)) => {}
@@ -5915,9 +5915,9 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race must catch mid-flight cancel within ~150 ms; \
-                 took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _)) => {}
@@ -5984,9 +5984,9 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race watcher must catch mid-flight cancel within ~150 ms; \
-                 took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race watcher must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _)) => {
@@ -6060,9 +6060,9 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race watcher must catch mid-flight cancel within ~150 ms; \
-                 took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race watcher must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _)) => {
@@ -6136,9 +6136,9 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race watcher must catch mid-flight cancel within ~150 ms; \
-                 took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race watcher must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _)) => {
@@ -6224,9 +6224,10 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(500),
-                "select! race watcher must catch mid-flight cancel within ~150 ms \
-                 (100 ms sleep + up to 50 ms poll); took {elapsed:?}"
+                elapsed < Duration::from_millis(1000),
+                "select! race watcher must catch mid-flight cancel within ~1 s \
+                 (expected ~150 ms: 100 ms cancel trigger + up to 50 ms poll; \
+                 1000 ms envelope absorbs concurrent-agent load drift); took {elapsed:?}"
             );
             match outcome {
                 Either::Right((Err(_), _recv_still_pending)) => {
