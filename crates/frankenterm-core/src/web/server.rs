@@ -3,7 +3,7 @@
 //! Extracted from `web.rs` as part of Wave 4B migration (ft-1zej2).
 
 use super::{WebServerConfig, WebServerHandle, build_app};
-use crate::runtime_compat::{select, signal};
+use crate::runtime_compat::signal;
 use crate::web_framework::FrameworkWebRuntime;
 use crate::{Error, Result};
 use std::net::{SocketAddr, TcpStream};
@@ -105,7 +105,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 
     println!("ft web listening on http://{bound_addr}");
 
-    select! {
+    crate::runtime_compat::select! {
         result = runtime.join_handle_mut() => {
             runtime.finish(result).await?;
         }
@@ -140,7 +140,7 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
 
     println!("ft web listening on http://{bound_addr} (cx-first)");
 
-    select! {
+    crate::runtime_compat::select! {
         result = runtime.join_handle_mut() => {
             runtime.finish(result).await?;
         }
@@ -164,7 +164,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         let mut term = signal::unix::signal(SignalKind::terminate())
             .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
-        select! {
+        crate::runtime_compat::select! {
             _ = signal::ctrl_c() => {}
             _ = term.recv() => {}
         }
@@ -190,6 +190,8 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[cfg(all(unix, feature = "asupersync-runtime"))]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use crate::runtime_compat::signal::unix::SignalKind;
+    use futures::future::{Either, select};
+    use futures::pin_mut;
 
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
@@ -197,54 +199,67 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     let mut term = signal::unix::signal(SignalKind::terminate())
         .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
-    // Tick 194 (ft-xbnl0.2.3): inner poll-sleep now threads the
-    // caller's cx via sleep_with_cx. Previously the cancel-watcher
-    // loop used ambient `sleep()` which falls back to
-    // `Cx::current()` thread-local — if the web server runs under a
-    // different thread-local cx than the caller's explicit one, the
-    // timer was bound to the wrong cx. Under LabRuntime virtual
-    // time that meant cancel could land later than the operator
-    // intended.
+    // Tick 194 originally threaded the caller's cx into the
+    // poll-sleep via runtime_compat::sleep_with_cx. This slice drops
+    // that compat seam and binds the watcher directly to native
+    // asupersync budget_sleep using the caller's explicit cx.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
-                .await;
+            let _ = asupersync::time::budget_sleep(
+                cx,
+                std::time::Duration::from_millis(100),
+                asupersync::time::wall_now(),
+            )
+            .await;
         }
     };
+    let ctrl_c = signal::ctrl_c();
+    let term_recv = term.recv();
+    pin_mut!(ctrl_c, term_recv, cancel_fut);
 
-    select! {
-        _ = signal::ctrl_c() => {}
-        _ = term.recv() => {}
-        () = cancel_fut => {}
+    match select(select(ctrl_c, term_recv), cancel_fut).await {
+        Either::Left((Either::Left((result, _)), _)) => {
+            result.map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
+        }
+        Either::Left((Either::Right((_term, _)), _)) => {}
+        Either::Right(((), _)) => {}
     }
     Ok(())
 }
 
 #[cfg(all(not(unix), feature = "asupersync-runtime"))]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
+    use futures::future::{Either, select};
+    use futures::pin_mut;
+
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
 
-    // Tick 194 (ft-xbnl0.2.3): non-unix mirror of the poll-sleep
-    // cx-threading fix above.
+    // Non-unix mirror of the native budget_sleep watcher above.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
-                .await;
+            let _ = asupersync::time::budget_sleep(
+                cx,
+                std::time::Duration::from_millis(100),
+                asupersync::time::wall_now(),
+            )
+            .await;
         }
     };
+    let ctrl_c = signal::ctrl_c();
+    pin_mut!(ctrl_c, cancel_fut);
 
-    select! {
-        result = signal::ctrl_c() => {
+    match select(ctrl_c, cancel_fut).await {
+        Either::Left((result, _)) => {
             result.map_err(|e| Error::Runtime(format!("Ctrl+C handler failed: {e}")))?;
         }
-        _ = cancel_fut => {}
+        Either::Right(((), _)) => {}
     }
     Ok(())
 }
