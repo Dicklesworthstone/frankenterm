@@ -26,11 +26,13 @@ Tick 420: Run 6 extended to 6 after tick 420 (broadcast_recv_with_cx pre-cancel)
 Tick 421: Run 6 extended to 7 after tick 421 (Semaphore::acquire_with_cx pre-cancel) (94 tests total)
 Tick 422: Run 6 extended to 8 after tick 422 (mpsc::Receiver::recv pre-cancel) (95 tests total)
 Tick 423: Run 6 extended to 9 after tick 423 (watch::Receiver::changed pre-cancel) (96 tests total) — long-lived wait primitive cancel matrix complete
+Tick 426: Run 6 extended to 10 after tick 426 (JoinSet::join_next_with_cx pre-cancel) (97 tests total) — first runtime_compat-owned primitive in the matrix
+Tick 427: Run 6 extended to 13 after tick 427 (Semaphore::acquire_owned_with_cx pre-cancel + filter broadening picks up 2 pre-existing Semaphore happy-path tests) (100 tests total) — century milestone
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
 contract tests this session touches. Captured as an artifact so the bead
-owner can reference a concrete "96 of 96 passing at this commit" checkpoint
+owner can reference a concrete "100 of 100 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
@@ -120,8 +122,8 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel + mid-flight (Run 5) | 2 | 2/2 ok |
-| Runtime-primitive contracts (Run 6) | 9 | 9/9 ok |
-| **Subtotal** | **96** | **96/96 ok** |
+| Runtime-primitive contracts (Run 6) | 13 | 13/13 ok |
+| **Subtotal** | **100** | **100/100 ok** |
 
 Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
 tick 357).
@@ -235,9 +237,9 @@ timeout).
 
 ## Interpretation
 
-- All 96 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- All 100 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
 - Compile time after the initial cold build: 0.00s-1.19s per filtered run. All tests now complete in sub-second wall time after tick 387's ft-l9mxa fix (previously Run 1 was 10.02s because the tick-380 snapshot's outer timeout fired; now the inner cancel-watcher race surfaces the cancel in ~70ms).
-- The 34 + 45 + 3 + 3 + 2 + 9 = 96 count covers this-session deliverables AND 32 pre-existing TLS tests that the broadened tick-357 filter smoke-verifies as a side benefit.
+- The 34 + 45 + 3 + 3 + 2 + 13 = 100 count covers this-session deliverables AND 32 pre-existing TLS tests (tick-357 `tls_` broadening) plus 2 pre-existing Semaphore happy-path tests (tick-427 `semaphore_acquire_` broadening) that the widened filters smoke-verify as a side benefit.
 - Run 6 grew from 2 to 9 tests across ticks 418-423 pinning the
   long-lived-wait-primitive × cx-cancel matrix across all four
   channel types (oneshot/broadcast/mpsc/watch) + semaphore + yield.
