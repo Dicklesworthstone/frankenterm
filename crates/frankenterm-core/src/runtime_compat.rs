@@ -5483,6 +5483,67 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 422: `mpsc::Receiver::recv(cx)` observes cx-cancel.
+    ///
+    /// Pins cx-cancel observation on the asupersync mpsc receiver — the
+    /// final core channel primitive in the cancel-matrix. With live
+    /// senders (no disconnect), empty channel, and a pre-cancelled cx,
+    /// `rx.recv(&cx).await` must return `Err(RecvError::Cancelled)`
+    /// promptly.
+    ///
+    /// Unlike oneshot / broadcast which have runtime_compat wrappers,
+    /// mpsc is re-exported directly (`pub use asupersync::channel::mpsc`)
+    /// so the test exercises the asupersync primitive through the
+    /// runtime_compat module's public re-export. The cancel semantics
+    /// are surfaced by asupersync's `poll_recv` short-circuit:
+    /// `if cx.checkpoint().is_err() { Poll::Ready(Err(Cancelled)) }`.
+    ///
+    /// Setup:
+    /// 1. Create `(tx, rx) = mpsc::channel(4)` — keep `_tx` alive.
+    /// 2. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 3. Wrap `rx.recv(&cx)` in a 2 s outer safety-net timeout.
+    /// 4. Assert elapsed < 1 s AND `Err(RecvError::Cancelled)`.
+    ///
+    /// mpsc is heavily used across `ipc.rs` for shutdown signals and
+    /// subscription plumbing — pinning cx-cancel guards those patterns.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn mpsc_recv_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = mpsc::channel::<u64>(4);
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 422 pre-cancel mpsc::Receiver::recv test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                rx.recv(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit mpsc::Receiver::recv promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                matches!(inner, Err(mpsc::RecvError::Cancelled)),
+                "pre-cancelled cx must yield RecvError::Cancelled (not Disconnected / Empty); \
+                 got: {inner:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 421: `Semaphore::acquire_with_cx` observes cx-cancel.
     ///
     /// Pins the cx-cancel observation on the Semaphore acquire primitive.
