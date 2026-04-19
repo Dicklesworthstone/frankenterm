@@ -543,6 +543,11 @@ impl RustSdkTransport {
 
     /// Execute a contract command and decode the robot envelope into `T`.
     ///
+    /// When an ambient asupersync capability context is installed, prefer the
+    /// Cx-aware IPC path so SDK callers inherit transport cancellation without
+    /// needing an API break. Falls back to the legacy request path when no
+    /// ambient Cx exists.
+    ///
     /// # Errors
     /// Returns an explicit transport, payload-shape, or robot-mode error.
     pub async fn call<T: DeserializeOwned>(
@@ -551,6 +556,16 @@ impl RustSdkTransport {
         payload: serde_json::Value,
     ) -> Result<T, RustSdkTransportError> {
         let args = build_rust_sdk_ipc_args(command, &payload)?;
+        #[cfg(feature = "asupersync-runtime")]
+        if let Some(cx) = crate::cx::Cx::current() {
+            let response = self
+                .ipc
+                .call_rpc_with_cx(&cx, args, None)
+                .await
+                .map_err(RustSdkTransportError::Transport)?;
+            return decode_rust_sdk_response(response);
+        }
+
         let response = self
             .ipc
             .call_rpc(args, None)
