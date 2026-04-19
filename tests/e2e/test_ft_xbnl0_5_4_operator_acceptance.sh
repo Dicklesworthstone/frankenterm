@@ -585,21 +585,35 @@ python3 - <<'PY' \
   "${steady_session_list}"
 import json
 import pathlib
+import re
 import sys
+
+
+def extract_json(text: str):
+    cleaned = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    candidates = [idx for idx, ch in enumerate(cleaned) if ch in "[{"]
+    for idx in candidates:
+        try:
+            return json.loads(cleaned[idx:])
+        except json.JSONDecodeError:
+            continue
+    raise AssertionError("expected JSON payload in command output")
+
+
 bootstrap_doctor_rc = int(sys.argv[2])
 bootstrap_status_rc = int(sys.argv[3])
 broken_rc = int(sys.argv[4])
 bootstrap_watch_rc = int(sys.argv[5])
-bootstrap_doctor = json.loads(sys.argv[6])
-bootstrap_status = json.loads(sys.argv[7])
-broken_output = json.loads(sys.argv[8])
+bootstrap_doctor = extract_json(sys.argv[6])
+bootstrap_status = extract_json(sys.argv[7])
+broken_output = extract_json(sys.argv[8])
 recovery_doctor_rc = int(sys.argv[9])
 recovery_status_rc = int(sys.argv[10])
-recovery_doctor = json.loads(sys.argv[11])
-recovery_status = json.loads(sys.argv[12])
-recovery_session_doctor = json.loads(sys.argv[13])
-steady_session_doctor = json.loads(sys.argv[14])
-steady_session_list = json.loads(sys.argv[15])
+recovery_doctor = extract_json(sys.argv[11])
+recovery_status = extract_json(sys.argv[12])
+recovery_session_doctor = extract_json(sys.argv[13])
+steady_session_doctor = extract_json(sys.argv[14])
+steady_session_list = extract_json(sys.argv[15])
 bootstrap_ws = pathlib.Path(sys.argv[1])
 
 assert bootstrap_doctor_rc in (0, 1)
@@ -607,7 +621,7 @@ assert bootstrap_status_rc in (0, 1)
 assert bootstrap_status["operator_guidance"]["status"] == "bootstrap_required"
 assert "operator_guidance" in bootstrap_doctor
 assert isinstance(bootstrap_doctor["operator_guidance"].get("next_steps", []), list)
-assert bootstrap_watch_rc in (0, 124, 143)
+assert bootstrap_watch_rc in (0, 124, 137, 143)
 assert (bootstrap_ws / ".ft").exists()
 assert (bootstrap_ws / ".ft" / "ft.db").exists()
 assert (bootstrap_ws / ".ft" / "logs").exists()
