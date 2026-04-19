@@ -223,7 +223,8 @@ pub(super) async fn fetch_pane_state_from_ipc(
     pane_id: u64,
 ) -> std::result::Result<Option<IpcPaneState>, String> {
     let client = crate::ipc::IpcClient::new(socket_path);
-    match client.pane_state(pane_id).await {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    match client.pane_state_with_cx(&cx, pane_id).await {
         Ok(response) => {
             if !response.ok {
                 let detail = response
