@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::patterns::AgentType;
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::sharding::{
     AssignmentStrategy, ShardBackend, ShardId, ShardedWeztermClient, assign_pane_with_strategy,
 };
@@ -41,15 +42,15 @@ const AGENT_CYCLE: [AgentType; 4] = [
     AgentType::Unknown,
 ];
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+fn runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime for benchmark")
+        .expect("failed to build benchmark runtime")
 }
 
 fn build_sharded_handle(
-    rt: &tokio::runtime::Runtime,
+    rt: &Runtime,
     shard_count: usize,
     panes_per_shard: usize,
 ) -> (WeztermHandle, u64, u64) {
@@ -119,12 +120,14 @@ fn bench_cross_shard_routing_overhead(c: &mut Criterion) {
             BenchmarkId::new("direct_get_text", shards),
             &direct_probe_id,
             |b, &pane_id| {
-                b.to_async(&rt).iter(|| async {
-                    let text = direct
-                        .get_text(pane_id, false)
-                        .await
-                        .expect("direct get_text");
-                    black_box(text.len());
+                b.iter(|| {
+                    rt.block_on(async {
+                        let text = direct
+                            .get_text(pane_id, false)
+                            .await
+                            .expect("direct get_text");
+                        black_box(text.len());
+                    })
                 });
             },
         );
@@ -133,12 +136,14 @@ fn bench_cross_shard_routing_overhead(c: &mut Criterion) {
             BenchmarkId::new("sharded_get_text", shards),
             &global_probe_id,
             |b, &pane_id| {
-                b.to_async(&rt).iter(|| async {
-                    let text = sharded
-                        .get_text(pane_id, false)
-                        .await
-                        .expect("sharded get_text");
-                    black_box(text.len());
+                b.iter(|| {
+                    rt.block_on(async {
+                        let text = sharded
+                            .get_text(pane_id, false)
+                            .await
+                            .expect("sharded get_text");
+                        black_box(text.len());
+                    })
                 });
             },
         );
@@ -158,9 +163,11 @@ fn bench_list_all_panes_aggregation(c: &mut Criterion) {
         let (handle, _, _) = build_sharded_handle(&rt, shards, panes_per_shard);
         group.throughput(Throughput::Elements((shards * panes_per_shard) as u64));
         group.bench_with_input(BenchmarkId::new("list_panes", shards), &shards, |b, _| {
-            b.to_async(&rt).iter(|| async {
-                let panes = handle.list_panes().await.expect("list panes");
-                black_box(panes.len());
+            b.iter(|| {
+                rt.block_on(async {
+                    let panes = handle.list_panes().await.expect("list panes");
+                    black_box(panes.len());
+                })
             });
         });
     }

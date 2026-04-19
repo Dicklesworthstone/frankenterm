@@ -7,6 +7,8 @@
 //! - time helpers (`sleep`, `timeout`)
 //!
 //! The scaffold is expected to be removed once migration is complete.
+//! Remaining raw tokio-backed exports stay quarantined here on purpose; bead
+//! `wa-2h1ha.1` tracks shrinking this seam until direct tokio is gone entirely.
 
 use std::future::Future;
 use std::time::Duration;

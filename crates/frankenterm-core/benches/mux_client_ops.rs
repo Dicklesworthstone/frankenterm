@@ -10,23 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codec::{
-    CODEC_VERSION, GetCodecVersion, GetCodecVersionResponse, GetPaneRenderChanges,
-    GetPaneRenderChangesResponse, ListPanes, ListPanesResponse, Pdu, SendPaste, SetClientId,
-    UnitResponse, WriteToPane,
+    CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse, Pdu,
+    UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_compat::unix::AsyncWriteExt as CompatAsyncWriteExt;
 use frankenterm_core::runtime_compat::{
-    CompatRuntime, Mutex as CompatMutex, Runtime, RuntimeBuilder, io, task, timeout, unix,
+    Mutex as CompatMutex, Runtime, RuntimeBuilder, io, task, timeout, unix,
 };
 use frankenterm_core::vendored::{
     DirectMuxClient, DirectMuxClientConfig, SubscriptionConfig, subscribe_pane_output,
 };
-use mux::client::ClientId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
-use tokio::net::UnixStream as TokioUnixStream;
-use tokio::sync::{Mutex as TokioMutex, watch};
 
 mod bench_common;
 
@@ -36,40 +31,20 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         budget: "write_to_pane request encode+send path remains low-latency across payload sizes",
     },
     bench_common::BenchBudget {
-        name: "mux_client_ops/pdu_encode_write/tokio_baseline",
-        budget: "tokio-equivalent write_to_pane path stays within expected range",
-    },
-    bench_common::BenchBudget {
         name: "mux_client_ops/pdu_read_decode",
         budget: "list_panes response read+decode path stays bounded as payload grows",
-    },
-    bench_common::BenchBudget {
-        name: "mux_client_ops/pdu_read_decode/tokio_baseline",
-        budget: "tokio-equivalent list_panes read+decode path stays bounded",
     },
     bench_common::BenchBudget {
         name: "mux_client_ops/pdu_roundtrip",
         budget: "send_paste request/response round-trip stays stable and monotonic by payload",
     },
     bench_common::BenchBudget {
-        name: "mux_client_ops/pdu_roundtrip/tokio_baseline",
-        budget: "tokio-equivalent send_paste round-trip stays stable by payload",
-    },
-    bench_common::BenchBudget {
         name: "mux_client_ops/subscription_setup",
         budget: "pane subscription setup+cancel remains responsive without poller leaks",
     },
     bench_common::BenchBudget {
-        name: "mux_client_ops/subscription_setup/tokio_baseline",
-        budget: "tokio poller setup+cancel baseline remains responsive",
-    },
-    bench_common::BenchBudget {
         name: "mux_client_ops/render_changes_poll",
         budget: "direct client render-change polling stays low-latency across pane ids",
-    },
-    bench_common::BenchBudget {
-        name: "mux_client_ops/render_changes_poll/tokio_baseline",
-        budget: "tokio-equivalent render-change polling baseline stays bounded",
     },
 ];
 
@@ -84,13 +59,6 @@ fn compat_runtime() -> Runtime {
         .enable_all()
         .build()
         .expect("create compat runtime")
-}
-
-fn tokio_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("create tokio runtime")
 }
 
 fn socket_path(prefix: &str) -> PathBuf {
@@ -222,171 +190,8 @@ async fn connect_client(socket_path: &Path) -> DirectMuxClient {
         .expect("connect DirectMuxClient")
 }
 
-struct TokioMuxBaselineClient {
-    stream: TokioUnixStream,
-    read_buf: Vec<u8>,
-    serial: u64,
-}
-
-impl TokioMuxBaselineClient {
-    async fn connect(socket_path: &Path) -> Result<Self, String> {
-        let stream = TokioUnixStream::connect(socket_path)
-            .await
-            .map_err(|err| format!("connect tokio baseline stream: {err}"))?;
-        let mut client = Self {
-            stream,
-            read_buf: Vec::new(),
-            serial: 0,
-        };
-        client.handshake().await?;
-        Ok(client)
-    }
-
-    async fn handshake(&mut self) -> Result<(), String> {
-        let version = self
-            .request(Pdu::GetCodecVersion(GetCodecVersion {}))
-            .await?;
-        match version {
-            Pdu::GetCodecVersionResponse(payload) => {
-                if payload.codec_vers != CODEC_VERSION {
-                    return Err(format!(
-                        "codec mismatch: local {CODEC_VERSION} != remote {}",
-                        payload.codec_vers
-                    ));
-                }
-            }
-            other => {
-                return Err(format!(
-                    "unexpected codec version response: {}",
-                    other.pdu_name()
-                ));
-            }
-        }
-
-        let registered = self
-            .request(Pdu::SetClientId(SetClientId {
-                client_id: ClientId::new(),
-                is_proxy: false,
-            }))
-            .await?;
-        match registered {
-            Pdu::UnitResponse(_) => Ok(()),
-            other => Err(format!(
-                "unexpected set-client-id response: {}",
-                other.pdu_name()
-            )),
-        }
-    }
-
-    async fn request(&mut self, pdu: Pdu) -> Result<Pdu, String> {
-        self.serial = self.serial.saturating_add(1);
-        let serial = self.serial;
-        let mut encoded = Vec::new();
-        pdu.encode(&mut encoded, serial)
-            .map_err(|err| format!("encode request pdu: {err}"))?;
-        self.stream
-            .write_all(&encoded)
-            .await
-            .map_err(|err| format!("write request pdu: {err}"))?;
-        self.read_response(serial).await
-    }
-
-    async fn read_response(&mut self, expected_serial: u64) -> Result<Pdu, String> {
-        loop {
-            match codec::Pdu::stream_decode(&mut self.read_buf) {
-                Ok(Some(decoded)) => {
-                    if decoded.serial == expected_serial {
-                        return Ok(decoded.pdu);
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => return Err(format!("decode response pdu: {err}")),
-            }
-
-            let mut temp = [0_u8; 4096];
-            let read = self
-                .stream
-                .read(&mut temp)
-                .await
-                .map_err(|err| format!("read response bytes: {err}"))?;
-            if read == 0 {
-                return Err("mux socket disconnected while waiting for response".to_string());
-            }
-            self.read_buf.extend_from_slice(&temp[..read]);
-        }
-    }
-
-    async fn write_to_pane(&mut self, pane_id: u64, data: Vec<u8>) -> Result<(), String> {
-        let response = self
-            .request(Pdu::WriteToPane(WriteToPane {
-                pane_id: pane_id as usize,
-                data,
-            }))
-            .await?;
-        match response {
-            Pdu::UnitResponse(_) => Ok(()),
-            other => Err(format!(
-                "unexpected write_to_pane response: {}",
-                other.pdu_name()
-            )),
-        }
-    }
-
-    async fn list_panes(&mut self) -> Result<ListPanesResponse, String> {
-        let response = self.request(Pdu::ListPanes(ListPanes {})).await?;
-        match response {
-            Pdu::ListPanesResponse(payload) => Ok(payload),
-            other => Err(format!(
-                "unexpected list_panes response: {}",
-                other.pdu_name()
-            )),
-        }
-    }
-
-    async fn send_paste(&mut self, pane_id: u64, data: String) -> Result<(), String> {
-        let response = self
-            .request(Pdu::SendPaste(SendPaste {
-                pane_id: pane_id as usize,
-                data,
-            }))
-            .await?;
-        match response {
-            Pdu::UnitResponse(_) => Ok(()),
-            other => Err(format!(
-                "unexpected send_paste response: {}",
-                other.pdu_name()
-            )),
-        }
-    }
-
-    async fn get_pane_render_changes(
-        &mut self,
-        pane_id: u64,
-    ) -> Result<GetPaneRenderChangesResponse, String> {
-        let response = self
-            .request(Pdu::GetPaneRenderChanges(GetPaneRenderChanges {
-                pane_id: pane_id as usize,
-            }))
-            .await?;
-        match response {
-            Pdu::GetPaneRenderChangesResponse(payload) => Ok(payload),
-            other => Err(format!(
-                "unexpected get_pane_render_changes response: {}",
-                other.pdu_name()
-            )),
-        }
-    }
-}
-
-async fn connect_tokio_baseline(socket_path: &Path) -> TokioMuxBaselineClient {
-    TokioMuxBaselineClient::connect(socket_path)
-        .await
-        .expect("connect tokio baseline mux client")
-}
-
 fn bench_pdu_encode_write(c: &mut Criterion) {
     let compat_rt = compat_runtime();
-    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_encode_write");
 
     for &payload_size in &[64usize, 1024, 64 * 1024] {
@@ -400,9 +205,6 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
         ));
         let direct_client = Arc::new(CompatMutex::new(
             compat_rt.block_on(connect_client(&socket)),
-        ));
-        let tokio_baseline = Arc::new(TokioMutex::new(
-            tokio_rt.block_on(connect_tokio_baseline(&socket)),
         ));
         let payload = vec![b'x'; payload_size];
 
@@ -426,25 +228,6 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("tokio_baseline_write_to_pane", payload_size),
-            &payload_size,
-            |b, _| {
-                let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.iter(|| {
-                    let tokio_baseline = Arc::clone(&tokio_baseline);
-                    let data = payload.clone();
-                    tokio_rt.block_on(async move {
-                        let mut client = tokio_baseline.lock().await;
-                        client
-                            .write_to_pane(7, data)
-                            .await
-                            .expect("tokio baseline write_to_pane");
-                        black_box(());
-                    });
-                });
-            },
-        );
     }
 
     group.finish();
@@ -452,7 +235,6 @@ fn bench_pdu_encode_write(c: &mut Criterion) {
 
 fn bench_pdu_read_decode(c: &mut Criterion) {
     let compat_rt = compat_runtime();
-    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_read_decode");
 
     let cases = [
@@ -485,9 +267,6 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
         let direct_client = Arc::new(CompatMutex::new(
             compat_rt.block_on(connect_client(&socket)),
         ));
-        let tokio_baseline = Arc::new(TokioMutex::new(
-            tokio_rt.block_on(connect_tokio_baseline(&socket)),
-        ));
 
         group.throughput(Throughput::Bytes(approx_list_payload_bytes(cfg) as u64));
         group.bench_with_input(
@@ -505,24 +284,6 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("tokio_baseline_list_panes", label),
-            &label,
-            |b, _| {
-                let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.iter(|| {
-                    let tokio_baseline = Arc::clone(&tokio_baseline);
-                    tokio_rt.block_on(async move {
-                        let mut client = tokio_baseline.lock().await;
-                        let response = client
-                            .list_panes()
-                            .await
-                            .expect("tokio baseline list_panes");
-                        black_box(response.window_titles.len());
-                    });
-                });
-            },
-        );
     }
 
     group.finish();
@@ -530,7 +291,6 @@ fn bench_pdu_read_decode(c: &mut Criterion) {
 
 fn bench_pdu_roundtrip(c: &mut Criterion) {
     let compat_rt = compat_runtime();
-    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/pdu_roundtrip");
 
     for &payload_size in &[64usize, 1024, 64 * 1024] {
@@ -544,9 +304,6 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
         ));
         let direct_client = Arc::new(CompatMutex::new(
             compat_rt.block_on(connect_client(&socket)),
-        ));
-        let tokio_baseline = Arc::new(TokioMutex::new(
-            tokio_rt.block_on(connect_tokio_baseline(&socket)),
         ));
         let payload = "z".repeat(payload_size);
 
@@ -567,25 +324,6 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("tokio_baseline_send_paste", payload_size),
-            &payload_size,
-            |b, _| {
-                let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.iter(|| {
-                    let tokio_baseline = Arc::clone(&tokio_baseline);
-                    let text = payload.clone();
-                    tokio_rt.block_on(async move {
-                        let mut client = tokio_baseline.lock().await;
-                        client
-                            .send_paste(9, text)
-                            .await
-                            .expect("tokio baseline send_paste");
-                        black_box(());
-                    });
-                });
-            },
-        );
     }
 
     group.finish();
@@ -593,7 +331,6 @@ fn bench_pdu_roundtrip(c: &mut Criterion) {
 
 fn bench_subscription_setup(c: &mut Criterion) {
     let compat_rt = compat_runtime();
-    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/subscription_setup");
     let socket = socket_path("subscription");
     let _server = compat_rt.block_on(spawn_mock_mux_server(
@@ -627,53 +364,12 @@ fn bench_subscription_setup(c: &mut Criterion) {
             });
         });
     });
-    group.bench_function("tokio_baseline_setup_cancel", |b| {
-        b.iter(|| {
-            let socket = socket.clone();
-            tokio_rt.block_on(async move {
-                let client = connect_tokio_baseline(&socket).await;
-                let client = Arc::new(TokioMutex::new(client));
-                let (cancel_tx, mut cancel_rx) = watch::channel(false);
-                let poll_client = Arc::clone(&client);
-                let mut poller = tokio::spawn(async move {
-                    loop {
-                        if *cancel_rx.borrow() {
-                            break;
-                        }
-                        {
-                            let mut client = poll_client.lock().await;
-                            let _ = client.get_pane_render_changes(42).await;
-                        }
-                        tokio::select! {
-                            changed = cancel_rx.changed() => {
-                                if changed.is_err() {
-                                    break;
-                                }
-                            }
-                            () = tokio::time::sleep(Duration::from_millis(10)) => {}
-                        }
-                    }
-                });
-                let _ = cancel_tx.send(true);
-                match tokio::time::timeout(Duration::from_millis(250), &mut poller).await {
-                    Ok(join_result) => join_result.expect("tokio baseline poller join"),
-                    Err(_) => {
-                        poller.abort();
-                        let _ = poller.await;
-                        panic!("tokio baseline poller shutdown timed out");
-                    }
-                }
-                black_box(());
-            });
-        });
-    });
 
     group.finish();
 }
 
 fn bench_render_changes_poll(c: &mut Criterion) {
     let compat_rt = compat_runtime();
-    let tokio_rt = tokio_runtime();
     let mut group = c.benchmark_group("mux_client_ops/render_changes_poll");
     let socket = socket_path("render-changes");
     let _server = compat_rt.block_on(spawn_mock_mux_server(
@@ -685,9 +381,6 @@ fn bench_render_changes_poll(c: &mut Criterion) {
     ));
     let direct_client = Arc::new(CompatMutex::new(
         compat_rt.block_on(connect_client(&socket)),
-    ));
-    let tokio_baseline = Arc::new(TokioMutex::new(
-        tokio_rt.block_on(connect_tokio_baseline(&socket)),
     ));
 
     group.throughput(Throughput::Elements(1));
@@ -705,24 +398,6 @@ fn bench_render_changes_poll(c: &mut Criterion) {
                             .get_pane_render_changes(pane_id)
                             .await
                             .expect("get_pane_render_changes");
-                        black_box((response.pane_id, response.seqno));
-                    });
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("tokio_baseline_get_pane_render_changes", pane_id),
-            &pane_id,
-            |b, &pane_id| {
-                let tokio_baseline = Arc::clone(&tokio_baseline);
-                b.iter(|| {
-                    let tokio_baseline = Arc::clone(&tokio_baseline);
-                    tokio_rt.block_on(async move {
-                        let mut client = tokio_baseline.lock().await;
-                        let response = client
-                            .get_pane_render_changes(pane_id)
-                            .await
-                            .expect("tokio baseline get_pane_render_changes");
                         black_box((response.pane_id, response.seqno));
                     });
                 });
