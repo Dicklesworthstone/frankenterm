@@ -1,13 +1,21 @@
 use codec::{
-    CreateFloatingPane, Pdu, SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle,
-    UpdatePaneConstraints,
+    CreateFloatingPane, ErrorResponse, GetCodecVersionResponse, GetTlsCredsResponse, Pdu,
+    SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle, UpdatePaneConstraints,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
+use std::path::PathBuf;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn arb_path_buf() -> impl Strategy<Value = PathBuf> {
+    proptest::collection::vec("[a-zA-Z0-9._-]{1,12}", 1..=4).prop_map(|segments| {
+        let joined = format!("/{}", segments.join("/"));
+        PathBuf::from(joined)
+    })
 }
 
 fn arb_clipboard_selection() -> impl Strategy<Value = ClipboardSelection> {
@@ -95,6 +103,38 @@ fn arb_select_stack_pane() -> impl Strategy<Value = SelectStackPane> {
             tab_id,
             slot_index,
             pane_index,
+        }
+    })
+}
+
+fn arb_error_response() -> impl Strategy<Value = ErrorResponse> {
+    arb_small_string().prop_map(|reason| ErrorResponse { reason })
+}
+
+fn arb_get_codec_version_response() -> impl Strategy<Value = GetCodecVersionResponse> {
+    (
+        0usize..=4096,
+        arb_small_string(),
+        arb_path_buf(),
+        prop_oneof![Just(None), arb_path_buf().prop_map(Some),],
+    )
+        .prop_map(
+            |(codec_vers, version_string, executable_path, config_file_path)| {
+                GetCodecVersionResponse {
+                    codec_vers,
+                    version_string,
+                    executable_path,
+                    config_file_path,
+                }
+            },
+        )
+}
+
+fn arb_get_tls_creds_response() -> impl Strategy<Value = GetTlsCredsResponse> {
+    (arb_small_string(), arb_small_string()).prop_map(|(ca_cert_pem, client_cert_pem)| {
+        GetTlsCredsResponse {
+            ca_cert_pem,
+            client_cert_pem,
         }
     })
 }
@@ -187,5 +227,41 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SelectStackPane(payload));
+    }
+
+    #[test]
+    fn error_response_json_and_pdu_roundtrip(
+        payload in arb_error_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: ErrorResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::ErrorResponse(payload));
+    }
+
+    #[test]
+    fn get_codec_version_response_json_and_pdu_roundtrip(
+        payload in arb_get_codec_version_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetCodecVersionResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetCodecVersionResponse(payload));
+    }
+
+    #[test]
+    fn get_tls_creds_response_json_and_pdu_roundtrip(
+        payload in arb_get_tls_creds_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetTlsCredsResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetTlsCredsResponse(payload));
     }
 }
