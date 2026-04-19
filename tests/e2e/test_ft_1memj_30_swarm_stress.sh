@@ -185,9 +185,11 @@ scenario_successful_collection() {
   local mock_bin="${scenario_dir}/mock-bin"
   local stdout_file="${scenario_dir}/stdout.log"
   local log_path="${ROOT_DIR}/tests/e2e/logs/ft_1memj_30_swarm_stress_contract-success.jsonl"
+  local summary_path="${ROOT_DIR}/tests/e2e/artifacts/swarm_stress/contract-success/summary.json"
 
   mkdir -p "${scenario_dir}"
   rm -f "${log_path}"
+  rm -f "${summary_path}"
   write_success_rch "${mock_bin}"
 
   emit_log "running" "successful_collection" "mock_success" "none" "none" "${stdout_file}" "scripts/e2e_swarm_stress.sh"
@@ -206,6 +208,11 @@ scenario_successful_collection() {
     return 1
   fi
 
+  if [[ ! -f "${summary_path}" ]]; then
+    emit_log "failed" "successful_collection" "summary_assert" "missing_summary" "summary_not_found" "${stdout_file}" "expected swarm stress summary file"
+    return 1
+  fi
+
   if ! jq -s -e '
     ([.[] | select(.record_type == "swarm_metric")] | length) == 8 and
     ([.[] | select(.record_type == "suite_summary")] | length) == 1 and
@@ -214,6 +221,20 @@ scenario_successful_collection() {
     any(.[]; .record_type == "suite_event" and .decision_path == "suite_complete" and .outcome == "passed")
   ' "${log_path}" >/dev/null; then
     emit_log "failed" "successful_collection" "jq_assert" "unexpected_log_shape" "log_validation_failed" "${log_path}" "expected 8 metrics and suite summary"
+    return 1
+  fi
+
+  if ! jq -e '
+    (.schema_version == "ft.swarm_stress.summary.v1") and
+    (.profile == "smoke") and
+    (.tests_run == 8) and
+    (.pane_scales == [1,50,100,200]) and
+    (.metric_names | length == 8) and
+    (.artifacts.commands | endswith("/commands.txt")) and
+    (.artifacts.env | endswith("/env.txt")) and
+    (.artifacts.structured_log | endswith(".jsonl"))
+  ' "${summary_path}" >/dev/null; then
+    emit_log "failed" "successful_collection" "summary_assert" "unexpected_summary_shape" "summary_validation_failed" "${summary_path}" "expected smoke summary with artifact pointers"
     return 1
   fi
 }

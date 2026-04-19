@@ -2,14 +2,18 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${ROOT_DIR}/tests/e2e/logs"
-ARTIFACT_DIR_BASE="${ROOT_DIR}/tests/e2e/artifacts/swarm_stress"
+LOG_DIR="${SWARM_STRESS_LOG_DIR:-${ROOT_DIR}/tests/e2e/logs}"
+ARTIFACT_DIR_BASE="${SWARM_STRESS_ARTIFACT_DIR_BASE:-${ROOT_DIR}/tests/e2e/artifacts/swarm_stress}"
 RUN_ID="${RUN_ID:-$(date -u +"%Y%m%d_%H%M%S")}"
 SCENARIO_ID="ft_1memj_30_swarm_stress"
 CORRELATION_ID="ft-1memj.30-${RUN_ID}"
 TARGET_DIR_REL="${TARGET_DIR_REL:-target/rch-e2e-ft-1memj-30-${RUN_ID}}"
+PROFILE="${FT_SWARM_STRESS_PROFILE:-smoke}"
 LOG_FILE="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}.jsonl"
 ARTIFACT_DIR="${ARTIFACT_DIR_BASE}/${RUN_ID}"
+COMMANDS_FILE="${ARTIFACT_DIR}/commands.txt"
+ENV_FILE="${ARTIFACT_DIR}/env.txt"
+SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 
 mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 
@@ -18,8 +22,13 @@ mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
 RCH_STEP_TIMEOUT_SECS="${RCH_STEP_TIMEOUT_SECS:-2400}"
 RCH_SKIP_SMOKE_PREFLIGHT="${RCH_SKIP_SMOKE_PREFLIGHT:-1}"
 source "${ROOT_DIR}/tests/e2e/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "1memj_30_swarm_stress" "${ROOT_DIR}"
+RCH_ARTIFACT_DIR="${SWARM_STRESS_RCH_ARTIFACT_DIR:-${ARTIFACT_DIR}}"
+rch_init "${RCH_ARTIFACT_DIR}" "${RUN_ID}" "1memj_30_swarm_stress" "${ROOT_DIR}"
 ensure_rch_ready
+
+printf 'scenario_id=%s\ncorrelation_id=%s\nprofile=%s\ntarget_dir_rel=%s\n' \
+  "${SCENARIO_ID}" "${CORRELATION_ID}" "${PROFILE}" "${TARGET_DIR_REL}" > "${COMMANDS_FILE}"
+env | sort > "${ENV_FILE}"
 
 usage() {
   cat <<'EOF'
@@ -53,6 +62,21 @@ require_repo_relative_target_dir() {
       exit 2
       ;;
   esac
+}
+
+require_known_profile() {
+  case "${PROFILE}" in
+    smoke|release)
+      ;;
+    *)
+      echo "unsupported FT_SWARM_STRESS_PROFILE: ${PROFILE}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+append_command() {
+  printf '%s\n' "$1" >> "${COMMANDS_FILE}"
 }
 
 emit_event() {
@@ -204,7 +228,8 @@ run_swarm_suite() {
     "none" \
     "none" \
     "$(basename "${stdout_file}")" \
-    "${remote_cmd}"
+      "${remote_cmd}"
+  append_command "${remote_cmd}"
 
   if ! run_rch_cargo_logged \
     "${stdout_file}" \
@@ -327,6 +352,16 @@ emit_summary() {
           then null
           else ($tiers | sort_by(tier_rank(.)) | last)
           end
+      ),
+      pane_scales: (
+        [ .[] | select(.record_type == "swarm_metric") | .pane_count // empty ]
+        | unique
+        | sort
+      ),
+      metric_names: (
+        [ .[] | select(.record_type == "swarm_metric") | .test // empty ]
+        | unique
+        | sort
       )
     }' "${LOG_FILE}")"
 
@@ -343,10 +378,48 @@ emit_summary() {
       scenario_id: $scenario_id,
       correlation_id: $correlation_id
     } + $summary' >> "${LOG_FILE}"
+
+  jq -cn \
+    --arg schema_version "ft.swarm_stress.summary.v1" \
+    --arg scenario_id "${SCENARIO_ID}" \
+    --arg correlation_id "${CORRELATION_ID}" \
+    --arg run_id "${RUN_ID}" \
+    --arg profile "${PROFILE}" \
+    --arg target_dir_rel "${TARGET_DIR_REL}" \
+    --arg log_file "${LOG_FILE}" \
+    --arg commands_file "${COMMANDS_FILE}" \
+    --arg env_file "${ENV_FILE}" \
+    --arg stdout_file "${ARTIFACT_DIR}/swarm_suite.stdout.log" \
+    --arg artifact_dir "${ARTIFACT_DIR}" \
+    --arg rch_probe_log "$(rch_probe_log_path)" \
+    --arg rch_probe_meta "$(rch_log_meta_path "$(rch_probe_log_path)")" \
+    --arg rch_smoke_log "$(rch_smoke_log_path)" \
+    --arg rch_smoke_meta "$(rch_log_meta_path "$(rch_smoke_log_path)")" \
+    --argjson summary "${summary_json}" \
+    '{
+      schema_version: $schema_version,
+      scenario_id: $scenario_id,
+      correlation_id: $correlation_id,
+      run_id: $run_id,
+      profile: $profile,
+      target_dir_rel: $target_dir_rel,
+      artifact_dir: $artifact_dir,
+      artifacts: {
+        structured_log: $log_file,
+        commands: $commands_file,
+        env: $env_file,
+        stdout: $stdout_file,
+        rch_probe: $rch_probe_log,
+        rch_probe_meta: $rch_probe_meta,
+        rch_smoke: $rch_smoke_log,
+        rch_smoke_meta: $rch_smoke_meta
+      }
+    } + $summary' > "${SUMMARY_FILE}"
 }
 
 main() {
   require_repo_relative_target_dir
+  require_known_profile
 
   emit_event \
     "started" \
