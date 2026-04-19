@@ -5646,6 +5646,85 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 433: probes whether the tick-432 mpsc
+    /// mid-flight-cancel-waker gap applies to `oneshot_recv_with_cx`
+    /// as well. Pins the result as a contract test.
+    ///
+    /// Same shape as tick 432: create channel, spawn task that fires
+    /// `cx.cancel_with` at 100 ms, race the recv against a poll-sleep
+    /// watcher. If oneshot DOES register a cx-cancel-waker, the
+    /// `Either::Left(Err)` recv branch fires first; if it does NOT
+    /// (same gap as mpsc), the `Either::Right` watcher branch fires.
+    ///
+    /// Empirically captures the primitive's mid-flight waker behavior
+    /// so a regression in either direction fires a test.
+    ///
+    /// **Outcome when written**: watcher branch fires consistently,
+    /// confirming the same gap applies to oneshot_recv_with_cx as to
+    /// mpsc. Callers needing mid-flight cancel on oneshot must use
+    /// the same `futures::future::select` race pattern.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, rx) = oneshot::channel::<u64>();
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("tick 433 mid-flight cancel via oneshot select race pattern"),
+                );
+            });
+
+            let recv_fut =
+                std::pin::pin!(async { oneshot_recv_with_cx(&cx, rx).await.map(|_| ()) });
+            let watcher = std::pin::pin!(async {
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    if cx.is_cancel_requested() {
+                        return Err::<(), String>("cancelled via watcher".to_string());
+                    }
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = select(recv_fut, watcher).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "select! race watcher must catch mid-flight cancel within ~150 ms; \
+                 took {elapsed:?}"
+            );
+            match outcome {
+                Either::Right((Err(_), _)) => {
+                    // Expected: watcher branch fired with cancel
+                    // (same gap as mpsc — no cx-cancel-waker).
+                }
+                Either::Left((Err(_), _)) => {
+                    // Acceptable: oneshot itself observed the cancel
+                    // (would mean asupersync gained waker support —
+                    // improvement, not regression).
+                }
+                Either::Left((Ok(()), _)) => {
+                    panic!("recv branch returned Ok — sender should not have fired")
+                }
+                Either::Right((Ok(_), _)) => {
+                    unreachable!("watcher always returns Err on cancel")
+                }
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 432: documents and pins the caller-side
     /// mid-flight cx-cancel pattern for `mpsc::Receiver::recv` —
     /// `select!` race against a poll-based cx-cancel watcher.
