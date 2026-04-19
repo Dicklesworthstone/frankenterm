@@ -115,7 +115,7 @@ enum MpscRecvState<T> {
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         mpsc_recv_state_with_cx(rx, &cx).await
     }
 
@@ -680,6 +680,14 @@ impl IpcServer {
         socket_path: impl AsRef<Path>,
         permissions: Option<u32>,
     ) -> std::io::Result<Self> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return Self::bind_with_permissions_with_cx(&cx, socket_path, permissions).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let socket_path = socket_path.as_ref().to_path_buf();
 
         // Remove stale socket file if it exists
@@ -703,6 +711,7 @@ impl IpcServer {
             socket_path,
             listener,
         })
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind_with_permissions`].
