@@ -59,7 +59,6 @@ use crate::query_contract::{
     SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, parse_unified_search_query,
     to_storage_search_options,
 };
-use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::{EventQuery, PaneReservation, StorageHandle};
 use crate::wezterm::{
     PaneInfo, PaneWaiter, WaitOptions, WaitResult, WeztermHandleSource, default_wezterm_handle,
@@ -122,6 +121,8 @@ use mcp_types::{
     McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
     now_ms,
 };
+#[cfg(test)]
+use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 #[cfg(test)]
 use mcp_types::{
     EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData, McpMissionControlData,
@@ -618,16 +619,21 @@ fn record_mcp_audit_sync(
 
     // Spawn a background task to record audit — non-blocking, fire-and-forget
     std::thread::spawn(move || {
-        let rt = match CompatRuntimeBuilder::current_thread().build() {
+        let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(tool = %tool_name, error = %e, "Failed to create runtime for MCP audit");
+                tracing::warn!(
+                    tool = %tool_name,
+                    error = %e,
+                    "Failed to create native asupersync runtime for MCP audit"
+                );
                 return;
             }
         };
         rt.block_on(async {
-            // ft-xbnl0.2.3 tick 304: cx-first MCP audit storage open.
-            let audit_open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            // Detached audit persistence owns its own runtime, so it must
+            // bootstrap a fresh request-scoped capability context here.
+            let audit_open_cx = crate::cx::for_request();
             if let Ok(storage) = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await {
                 record_mcp_audit(
                     &storage,
@@ -1408,6 +1414,27 @@ mod tests {
         })
     }
 
+    fn try_latest_audit_action(
+        db_path: &Path,
+        action_kind: &str,
+    ) -> Option<crate::storage::AuditActionRecord> {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let rows = storage
+                .get_audit_actions(crate::storage::AuditQuery {
+                    limit: Some(1),
+                    action_kind: Some(action_kind.to_string()),
+                    ..crate::storage::AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            rows.into_iter().next()
+        })
+    }
+
     fn evidence<'a>(context: &'a DecisionContext, key: &str) -> Option<&'a str> {
         context
             .evidence
@@ -1494,6 +1521,51 @@ mod tests {
         assert_eq!(evidence(&context, "result"), Some("success"));
         assert_eq!(evidence(&context, "elapsed_ms"), Some("12"));
         assert!(evidence(&context, "error_code").is_none());
+    }
+
+    #[test]
+    fn record_mcp_audit_sync_bootstraps_native_runtime_for_mcp_feature() {
+        let (_dir, db_path) = temp_db_path();
+        let args = serde_json::json!({
+            "api_key": "sk-secret-123",
+            "pane_id": 7,
+            "command": "echo hi",
+        });
+        record_mcp_audit_sync(&db_path, "wa.rules_list", &args, true, None, 42);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let audit = loop {
+            if let Some(audit) = try_latest_audit_action(&db_path, "mcp.wa.rules_list") {
+                break audit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background MCP audit writer did not persist an audit row within 5 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+
+        assert_eq!(audit.actor_kind, "mcp");
+        let summary = audit
+            .input_summary
+            .as_deref()
+            .expect("audit summary should be recorded");
+        assert!(summary.contains("api_key"));
+        assert!(summary.contains("pane_id"));
+        assert!(!summary.contains("sk-secret-123"));
+
+        let context: DecisionContext = serde_json::from_str(
+            audit
+                .decision_context
+                .as_deref()
+                .expect("decision context should be recorded"),
+        )
+        .expect("decision context should parse");
+        assert_eq!(context.actor, ActorKind::Mcp);
+        assert_eq!(context.surface, PolicySurface::Mcp);
+        assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
+        assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
+        assert_eq!(evidence(&context, "elapsed_ms"), Some("42"));
     }
 
     #[test]
