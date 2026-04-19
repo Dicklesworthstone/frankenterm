@@ -18,6 +18,72 @@ where
     std::mem::drop(crate::runtime_compat::task::spawn_with_cx(cx, task));
 }
 
+fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+        "{label} cancelled: {err}"
+    )))
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn wait_duration_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    duration: Duration,
+    label: &str,
+) -> Result<(), crate::Error> {
+    if let Some(cx) = cx {
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            cx.checkpoint()
+                .map_err(|err| workflow_wait_aborted(label, err))?;
+
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+
+            let chunk = remaining.min(Duration::from_millis(50));
+            crate::runtime_compat::sleep_with_cx(cx, chunk)
+                .await
+                .map_err(|err| workflow_wait_aborted(label, err))?;
+        }
+    }
+
+    sleep(duration).await;
+    Ok(())
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+async fn wait_duration_maybe_cx(
+    _cx: Option<&crate::cx::Cx>,
+    duration: Duration,
+    _label: &str,
+) -> Result<(), crate::Error> {
+    sleep(duration).await;
+    Ok(())
+}
+
+async fn wait_condition_pause_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    condition: &WaitCondition,
+    timeout: Duration,
+    label: &str,
+) -> Result<(), crate::Error> {
+    match condition {
+        WaitCondition::PaneIdle {
+            idle_threshold_ms, ..
+        } => wait_duration_maybe_cx(cx, Duration::from_millis(*idle_threshold_ms), label).await,
+        WaitCondition::Pattern { .. }
+        | WaitCondition::TextMatch { .. }
+        | WaitCondition::External { .. } => wait_duration_maybe_cx(cx, timeout, label).await,
+        WaitCondition::StableTail { stable_for_ms, .. } => {
+            wait_duration_maybe_cx(cx, Duration::from_millis(*stable_for_ms), label).await
+        }
+        WaitCondition::Sleep { duration_ms } => {
+            wait_duration_maybe_cx(cx, Duration::from_millis(*duration_ms), label).await
+        }
+    }
+}
+
 // ============================================================================
 // WorkflowRunner - Event-driven workflow execution
 // ============================================================================
@@ -1325,32 +1391,50 @@ impl WorkflowRunner {
                         Duration::from_millis,
                     );
 
-                    // Simple wait implementation - in practice would use WaitConditionExecutor
-                    match &condition {
-                        WaitCondition::PaneIdle {
-                            idle_threshold_ms, ..
-                        } => {
-                            sleep(Duration::from_millis(*idle_threshold_ms)).await;
+                    if let Err(e) = wait_condition_pause_maybe_cx(
+                        cx,
+                        &condition,
+                        timeout,
+                        "workflow wait condition",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Workflow wait condition aborted"
+                        );
+                        if let crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                            reason,
+                        )) = e
+                        {
+                            self.lock_manager.release(pane_id, execution_id);
+                            record_workflow_terminal_action_maybe_cx(
+                                cx,
+                                &self.storage,
+                                &workflow_name,
+                                execution_id,
+                                pane_id,
+                                "workflow_aborted",
+                                "aborted",
+                                Some(&reason),
+                                Some(current_step),
+                                None,
+                                start_action_id,
+                            )
+                            .await;
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason,
+                                step_index: current_step,
+                                elapsed_ms: elapsed_ms(start_time),
+                            };
                         }
-                        WaitCondition::Pattern { .. } => {
-                            // Would use WaitConditionExecutor here
-                            sleep(timeout).await;
-                        }
-                        WaitCondition::StableTail { stable_for_ms, .. } => {
-                            // Would use WaitConditionExecutor here
-                            sleep(Duration::from_millis(*stable_for_ms)).await;
-                        }
-                        WaitCondition::TextMatch { .. } => {
-                            // Would use WaitConditionExecutor here
-                            sleep(timeout).await;
-                        }
-                        WaitCondition::Sleep { duration_ms } => {
-                            sleep(Duration::from_millis(*duration_ms)).await;
-                        }
-                        WaitCondition::External { .. } => {
-                            // Would wait for external signal
-                            sleep(timeout).await;
-                        }
+
+                        return WorkflowExecutionResult::Error {
+                            execution_id: Some(execution_id.to_string()),
+                            error: e.to_string(),
+                        };
                     }
 
                     // Continue to next step after wait
@@ -1466,28 +1550,50 @@ impl WorkflowRunner {
                                     Duration::from_millis,
                                 );
 
-                                // Simple wait implementation
-                                match &condition {
-                                    WaitCondition::PaneIdle {
-                                        idle_threshold_ms, ..
-                                    } => {
-                                        sleep(Duration::from_millis(*idle_threshold_ms)).await;
+                                if let Err(e) = wait_condition_pause_maybe_cx(
+                                    cx,
+                                    &condition,
+                                    timeout,
+                                    "workflow send-text verification wait",
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        execution_id,
+                                        error = %e,
+                                        "Workflow send-text wait aborted"
+                                    );
+                                    if let crate::Error::Workflow(
+                                        crate::error::WorkflowError::Aborted(reason),
+                                    ) = e
+                                    {
+                                        self.lock_manager.release(pane_id, execution_id);
+                                        record_workflow_terminal_action_maybe_cx(
+                                            cx,
+                                            &self.storage,
+                                            &workflow_name,
+                                            execution_id,
+                                            pane_id,
+                                            "workflow_aborted",
+                                            "aborted",
+                                            Some(&reason),
+                                            Some(current_step),
+                                            None,
+                                            start_action_id,
+                                        )
+                                        .await;
+                                        return WorkflowExecutionResult::Aborted {
+                                            execution_id: execution_id.to_string(),
+                                            reason,
+                                            step_index: current_step,
+                                            elapsed_ms: elapsed_ms(start_time),
+                                        };
                                     }
-                                    WaitCondition::Pattern { .. } => {
-                                        sleep(timeout).await;
-                                    }
-                                    WaitCondition::StableTail { stable_for_ms, .. } => {
-                                        sleep(Duration::from_millis(*stable_for_ms)).await;
-                                    }
-                                    WaitCondition::TextMatch { .. } => {
-                                        sleep(timeout).await;
-                                    }
-                                    WaitCondition::Sleep { duration_ms } => {
-                                        sleep(Duration::from_millis(*duration_ms)).await;
-                                    }
-                                    WaitCondition::External { .. } => {
-                                        sleep(timeout).await;
-                                    }
+
+                                    return WorkflowExecutionResult::Error {
+                                        execution_id: Some(execution_id.to_string()),
+                                        error: e.to_string(),
+                                    };
                                 }
                             }
 
@@ -3810,6 +3916,40 @@ mod tests {
                     "None aborted_at must be skipped: {json}"
                 );
                 assert!(json.contains("\"error_reason\":\"already_completed\""));
+            });
+        }
+
+        /// 7. Wait helpers used by `WaitFor` and `SendText(wait_for=...)`
+        ///    must surface a cancelled caller context as an aborted
+        ///    workflow result instead of falling back to an ambient
+        ///    sleep that ignores cancellation entirely.
+        #[test]
+        fn wait_condition_pause_observes_pre_cancelled_cx() {
+            crate::runtime_compat::run_async_test(async {
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("runner wait test pre-cancel"),
+                );
+
+                let err = wait_condition_pause_maybe_cx(
+                    Some(&cx),
+                    &WaitCondition::sleep(250),
+                    Duration::from_secs(1),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("pre-cancelled cx should abort wait helper");
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow wait condition cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected wait error: {other:?}"),
+                }
             });
         }
     }
