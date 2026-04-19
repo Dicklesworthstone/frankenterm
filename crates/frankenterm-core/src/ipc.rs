@@ -1023,11 +1023,8 @@ impl IpcServer {
             {
                 Ok(Ok((stream, _addr))) => {
                     let ctx = ctx.clone();
-                    let child_cx = cx.clone();
-                    connection_tasks.spawn(async move {
-                        if let Err(e) =
-                            handle_client_with_context_with_cx(child_cx, stream, ctx).await
-                        {
+                    connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
+                        if let Err(e) = handle_client_with_context_with_cx(child_cx, stream, ctx).await {
                             tracing::warn!(error = %e, "IPC client error");
                         }
                     });

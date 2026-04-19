@@ -1198,6 +1198,14 @@ pub mod task {
             self.handles.push(super::task::spawn(future));
         }
 
+        pub fn spawn_with_cx<F, Fut>(&mut self, cx: &crate::cx::Cx, task: F)
+        where
+            F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+            Fut: Future<Output = T> + Send + 'static,
+        {
+            self.handles.push(super::task::spawn_with_cx(cx, task));
+        }
+
         pub fn len(&self) -> usize {
             self.handles.len()
         }
@@ -4708,6 +4716,27 @@ mod tests {
                 (active == child_cx, crate::runtime_compat::current_runtime_handle().is_some())
             });
             let result = handle.await.expect("task should complete");
+            assert_eq!(result, (true, true));
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn joinset_spawn_with_cx_receives_explicit_context() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = crate::cx::for_testing();
+        rt.block_on(async move {
+            let mut set = task::JoinSet::new();
+            set.spawn_with_cx(&cx, |child_cx| async move {
+                let active = crate::cx::Cx::current().expect("installed child cx");
+                (active == child_cx, crate::runtime_compat::current_runtime_handle().is_some())
+            });
+
+            let result = set
+                .join_next_with_cx(&cx)
+                .await
+                .expect("task result")
+                .expect("join result");
             assert_eq!(result, (true, true));
         });
     }

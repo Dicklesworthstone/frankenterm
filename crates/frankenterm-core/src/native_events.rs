@@ -310,8 +310,7 @@ impl NativeEventListener {
             {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
-                    let child_cx = cx.clone();
-                    connection_tasks.spawn(async move {
+                    connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
                         if let Err(err) = handle_connection_with_cx(child_cx, stream, tx).await {
                             debug!(error = %err, "native event connection closed with error");
                         }
