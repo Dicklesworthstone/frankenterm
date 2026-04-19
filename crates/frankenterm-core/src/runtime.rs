@@ -19,6 +19,7 @@
 //! send/act APIs - it is purely passive.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
@@ -93,6 +94,19 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
     }
 }
 
+#[cfg(feature = "asupersync-runtime")]
+type RuntimeLoopCx = crate::cx::Cx;
+#[cfg(not(feature = "asupersync-runtime"))]
+type RuntimeLoopCx = ();
+
+#[cfg(feature = "asupersync-runtime")]
+fn runtime_loop_cx() -> RuntimeLoopCx {
+    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request)
+}
+
+#[cfg(not(feature = "asupersync-runtime"))]
+const fn runtime_loop_cx() -> RuntimeLoopCx {}
+
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
     #[cfg(feature = "asupersync-runtime")]
@@ -106,29 +120,66 @@ fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloa
     }
 }
 
-async fn recv_event<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
+async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
-        rx.recv(&cx).await.ok()
+        let _ = crate::runtime_compat::sleep_with_cx(runtime_cx, duration).await;
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
+        let _ = runtime_cx;
+        sleep(duration).await;
+    }
+}
+
+async fn runtime_timeout<F>(
+    runtime_cx: &RuntimeLoopCx,
+    duration: Duration,
+    future: F,
+) -> std::result::Result<F::Output, String>
+where
+    F: Future,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = runtime_cx;
+        timeout(duration, future).await
+    }
+}
+
+async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        rx.recv(runtime_cx).await.ok()
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = runtime_cx;
         rx.recv().await
     }
 }
 
 #[cfg(all(feature = "vendored", unix))]
-async fn send_runtime_channel<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
+async fn send_runtime_channel<T>(
+    runtime_cx: &RuntimeLoopCx,
+    tx: &mpsc::Sender<T>,
+    value: T,
+) -> bool {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
-        tx.send(&cx, value).await.is_ok()
+        tx.send(runtime_cx, value).await.is_ok()
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
+        let _ = runtime_cx;
         tx.send(value).await.is_ok()
     }
 }
@@ -1316,6 +1367,7 @@ impl ObservationRuntime {
         let metrics = Arc::clone(&self.metrics);
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
             let idle_enabled = subscriber.is_some();
             let mut last_activity = Instant::now();
@@ -1333,7 +1385,8 @@ impl ObservationRuntime {
                 let mut tick_only = true;
 
                 if let Some(sub) = subscriber.as_mut() {
-                    match timeout(
+                    match runtime_timeout(
+                        &loop_cx,
                         Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
                         sub.recv(),
                     )
@@ -1371,7 +1424,8 @@ impl ObservationRuntime {
                         Err(_elapsed) => {}
                     }
                 } else {
-                    sleep(Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS)).await;
+                    runtime_sleep(&loop_cx, Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS))
+                        .await;
                 }
 
                 if subscriber_closed {
@@ -1439,6 +1493,7 @@ impl ObservationRuntime {
         let initial_cache_gc_settings = self.config.gc;
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let mut retention_days = initial_retention_days;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut cache_gc_settings = initial_cache_gc_settings;
@@ -1468,7 +1523,7 @@ impl ObservationRuntime {
 
             loop {
                 if !first_tick {
-                    sleep(maintenance_interval).await;
+                    runtime_sleep(&loop_cx, maintenance_interval).await;
                 }
                 first_tick = false;
                 heartbeats.record_maintenance();
@@ -2003,6 +2058,7 @@ impl ObservationRuntime {
         let replay_capture = self.replay_capture.clone();
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let mut current_interval = initial_interval;
 
             loop {
@@ -2016,7 +2072,7 @@ impl ObservationRuntime {
                         break;
                     }
                     // Sleep in short bursts to remain responsive to shutdown signals
-                    sleep(Duration::from_millis(100)).await;
+                    runtime_sleep(&loop_cx, Duration::from_millis(100)).await;
                 }
 
                 // Check shutdown flag
@@ -2312,6 +2368,7 @@ impl ObservationRuntime {
         };
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
             let capture_tx_for_supervisor = capture_tx.clone();
             // Create tailer supervisor with budget enforcement
@@ -2477,6 +2534,7 @@ impl ObservationRuntime {
                                 let subscription_config = subscription_config.clone();
                                 let socket_path_for_task = socket_path.clone();
                                 let handle = task::spawn(async move {
+                                    let stream_task_cx = runtime_loop_cx();
                                     let exit_reason = run_vendored_streaming_capture(
                                         pane_id,
                                         subscription_pane_id,
@@ -2494,6 +2552,7 @@ impl ObservationRuntime {
                                         exit_reason
                                     };
                                     let _ = send_runtime_channel(
+                                        &stream_task_cx,
                                         &stream_exit_tx,
                                         StreamingTaskExit {
                                             pane_id,
@@ -2577,12 +2636,12 @@ impl ObservationRuntime {
 
                 if !poll_tasks.is_empty() {
                     if let Ok(Some((pane_id, outcome))) =
-                        timeout(wait_duration, poll_tasks.join_next()).await
+                        runtime_timeout(&loop_cx, wait_duration, poll_tasks.join_next()).await
                     {
                         supervisor.handle_poll_result(pane_id, outcome);
                     }
                 } else {
-                    sleep(wait_duration).await;
+                    runtime_sleep(&loop_cx, wait_duration).await;
                 }
             }
 
@@ -2612,6 +2671,7 @@ impl ObservationRuntime {
         let pane_filter = self.config.pane_filter.clone();
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let listener = match NativeEventListener::bind(socket_path.clone()).await {
                 Ok(listener) => {
                     info!(
@@ -2668,7 +2728,9 @@ impl ObservationRuntime {
                 }
 
                 let flush_wait = next_flush.saturating_duration_since(now);
-                match timeout(flush_wait, recv_event(&mut event_rx)).await {
+                match runtime_timeout(&loop_cx, flush_wait, recv_event(&loop_cx, &mut event_rx))
+                    .await
+                {
                     Ok(maybe_event) => {
                         let Some(event) = maybe_event else {
                             break;
@@ -2780,10 +2842,12 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             loop {
-                match timeout(
+                match runtime_timeout(
+                    &loop_cx,
                     Duration::from_millis(25),
-                    recv_event(&mut capture_ingress_rx),
+                    recv_event(&loop_cx, &mut capture_ingress_rx),
                 )
                 .await
                 {
@@ -2796,10 +2860,8 @@ impl ObservationRuntime {
                             }
 
                             // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                            let relay_cx =
-                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             if capture_ring_tx
-                                .send_with_cx(&relay_cx, event)
+                                .send_with_cx(&loop_cx, event)
                                 .await
                                 .is_err()
                             {
@@ -3273,15 +3335,14 @@ async fn run_vendored_streaming_capture(
     subscription_config: SubscriptionConfig,
     capture_tx: mpsc::Sender<CaptureEvent>,
 ) -> String {
-    #[cfg(feature = "asupersync-runtime")]
-    let cx = crate::cx::for_request();
+    let runtime_cx = runtime_loop_cx();
 
     let mut bridge = StreamingBridge::new();
     let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
     client_config.compression_mode = compression_mode;
 
     #[cfg(feature = "asupersync-runtime")]
-    let client = match DirectMuxClient::connect_with_cx(&cx, client_config).await {
+    let client = match DirectMuxClient::connect_with_cx(&runtime_cx, client_config).await {
         Ok(client) => client,
         Err(err) => {
             bridge.record_fallback();
@@ -3320,7 +3381,7 @@ async fn run_vendored_streaming_capture(
 
     loop {
         #[cfg(feature = "asupersync-runtime")]
-        let delta = subscription.next_with_cx(&cx).await;
+        let delta = subscription.next_with_cx(&runtime_cx).await;
 
         #[cfg(not(feature = "asupersync-runtime"))]
         let delta = subscription.next().await;
@@ -3336,7 +3397,7 @@ async fn run_vendored_streaming_capture(
 
         let segments = bridge.process_delta(delta);
         for segment in segments {
-            if !send_runtime_channel(&capture_tx, CaptureEvent { segment }).await {
+            if !send_runtime_channel(&runtime_cx, &capture_tx, CaptureEvent { segment }).await {
                 exit_reason = "capture ingress closed".to_string();
                 break;
             }
@@ -4389,7 +4450,8 @@ mod tests {
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
         #[cfg(all(feature = "vendored", unix))]
         {
-            let sent = send_runtime_channel(tx, value).await;
+            let loop_cx = runtime_loop_cx();
+            let sent = send_runtime_channel(&loop_cx, tx, value).await;
             assert!(sent, "test mpsc send should succeed");
         }
         #[cfg(not(all(feature = "vendored", unix)))]
@@ -4412,7 +4474,8 @@ mod tests {
     fn send_runtime_channel_reports_open_receiver() {
         run_async_test(async {
             let (tx, mut rx) = mpsc::channel(1);
-            assert!(send_runtime_channel(&tx, 11).await);
+            let loop_cx = runtime_loop_cx();
+            assert!(send_runtime_channel(&loop_cx, &tx, 11).await);
             assert_eq!(recv_mpsc(&mut rx).await, 11);
         });
     }
@@ -4423,7 +4486,8 @@ mod tests {
         run_async_test(async {
             let (tx, rx) = mpsc::channel::<u8>(1);
             drop(rx);
-            assert!(!send_runtime_channel(&tx, 7).await);
+            let loop_cx = runtime_loop_cx();
+            assert!(!send_runtime_channel(&loop_cx, &tx, 7).await);
         });
     }
 
