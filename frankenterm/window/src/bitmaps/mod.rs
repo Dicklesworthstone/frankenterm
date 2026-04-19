@@ -1,5 +1,6 @@
 use crate::color::{LinearRgba, SrgbaPixel};
 use crate::{Point, Rect, Size};
+use anyhow::{anyhow, ensure};
 use downcast_rs::{impl_downcast, Downcast};
 use glium::texture::SrgbTexture2d;
 use std::cell::RefCell;
@@ -22,7 +23,7 @@ pub trait Texture2d: Downcast {
     /// Copy the bits from the texture at the location specified by the rectangle
     /// into the bitmap image.
     /// The dimensions of the rectangle must match the source image
-    fn read(&self, rect: Rect, im: &mut dyn BitmapImage);
+    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) -> anyhow::Result<()>;
 
     /// Returns the width of the texture in pixels
     fn width(&self) -> usize;
@@ -42,6 +43,86 @@ pub trait Texture2d: Downcast {
     }
 }
 impl_downcast!(Texture2d);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureReadbackRequest {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn validate_texture_readback_request(
+    texture_width: usize,
+    texture_height: usize,
+    rect: Rect,
+    im: &dyn BitmapImage,
+) -> anyhow::Result<TextureReadbackRequest> {
+    ensure!(
+        rect.origin.x >= 0 && rect.origin.y >= 0,
+        "texture readback rect origin must be non-negative: {:?}",
+        rect
+    );
+    ensure!(
+        rect.size.width >= 0 && rect.size.height >= 0,
+        "texture readback rect size must be non-negative: {:?}",
+        rect
+    );
+
+    let width = rect.size.width as usize;
+    let height = rect.size.height as usize;
+    let (dest_width, dest_height) = im.image_dimensions();
+
+    ensure!(
+        (dest_width, dest_height) == (width, height),
+        "texture readback destination dimensions {}x{} do not match requested rect {}x{}",
+        dest_width,
+        dest_height,
+        width,
+        height
+    );
+
+    let left = rect.origin.x as usize;
+    let top = rect.origin.y as usize;
+    let right = left
+        .checked_add(width)
+        .ok_or_else(|| anyhow!("texture readback rect overflows width bounds: {:?}", rect))?;
+    let bottom = top
+        .checked_add(height)
+        .ok_or_else(|| anyhow!("texture readback rect overflows height bounds: {:?}", rect))?;
+
+    ensure!(
+        right <= texture_width && bottom <= texture_height,
+        "texture readback rect {:?} exceeds texture bounds {}x{}",
+        rect,
+        texture_width,
+        texture_height
+    );
+
+    Ok(TextureReadbackRequest {
+        left: left as u32,
+        top: top as u32,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
+fn copy_bitmap_readback(
+    source: &dyn BitmapImage,
+    request: TextureReadbackRequest,
+    dest: &mut dyn BitmapImage,
+) {
+    for row in 0..request.height as usize {
+        let src_y = request.top as usize + row;
+        let src = source.horizontal_pixel_range(
+            request.left as usize,
+            request.left as usize + request.width as usize,
+            src_y,
+        );
+        let dst = dest.horizontal_pixel_range_mut(0, request.width as usize, row);
+        dst.copy_from_slice(src);
+    }
+}
 
 impl Texture2d for SrgbTexture2d {
     fn write(&self, rect: Rect, im: &dyn BitmapImage) {
@@ -66,8 +147,10 @@ impl Texture2d for SrgbTexture2d {
         )
     }
 
-    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) {
-        unimplemented!();
+    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) -> anyhow::Result<()> {
+        Err(anyhow!(
+            "OpenGL texture readback is not exposed via Texture2d::read on SrgbTexture2d"
+        ))
     }
 
     fn width(&self) -> usize {
@@ -450,8 +533,11 @@ impl Texture2d for ImageTexture {
         image.draw_image(rect.origin, None, im);
     }
 
-    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) {
-        unimplemented!();
+    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) -> anyhow::Result<()> {
+        let image = self.image.borrow();
+        let request = validate_texture_readback_request(self.width(), self.height(), rect, im)?;
+        copy_bitmap_readback(&*image, request, im);
+        Ok(())
     }
 
     /// Returns the width of the texture in pixels
@@ -464,5 +550,68 @@ impl Texture2d for ImageTexture {
     fn height(&self) -> usize {
         let (_width, height) = self.image.borrow().image_dimensions();
         height
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_texture_readback_request, BitmapImage, Image, ImageTexture, Texture2d};
+    use crate::{Point, Rect, Size};
+
+    fn seed_image(width: usize, height: usize) -> Image {
+        let mut image = Image::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                *image.pixel_mut(x, y) = ((y * width + x) as u32) + 1;
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn image_texture_read_copies_requested_region() {
+        let texture = ImageTexture::new(4, 4);
+        *texture.image.borrow_mut() = seed_image(4, 4);
+
+        let mut dest = Image::new(2, 2);
+        texture
+            .read(Rect::new(Point::new(1, 1), Size::new(2, 2)), &mut dest)
+            .expect("readback should succeed");
+
+        assert_eq!(*dest.pixel(0, 0), 6);
+        assert_eq!(*dest.pixel(1, 0), 7);
+        assert_eq!(*dest.pixel(0, 1), 10);
+        assert_eq!(*dest.pixel(1, 1), 11);
+    }
+
+    #[test]
+    fn texture_readback_rejects_destination_size_mismatch() {
+        let texture = ImageTexture::new(4, 4);
+        let mut dest = Image::new(1, 2);
+        let err = texture
+            .read(Rect::new(Point::new(0, 0), Size::new(2, 2)), &mut dest)
+            .expect_err("mismatched destination dimensions should fail");
+
+        assert!(
+            err.to_string().contains("destination dimensions"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_texture_readback_request_rejects_out_of_bounds_rects() {
+        let dest = Image::new(2, 2);
+        let err = validate_texture_readback_request(
+            4,
+            4,
+            Rect::new(Point::new(3, 3), Size::new(2, 2)),
+            &dest,
+        )
+        .expect_err("out-of-bounds readback should fail");
+
+        assert!(
+            err.to_string().contains("exceeds texture bounds"),
+            "unexpected error: {err:#}"
+        );
     }
 }

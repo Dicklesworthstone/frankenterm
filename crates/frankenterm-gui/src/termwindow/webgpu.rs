@@ -2,14 +2,17 @@ use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use wgpu::util::DeviceExt;
-use window::bitmaps::Texture2d;
+use window::bitmaps::{Texture2d, validate_texture_readback_request};
 use window::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, WindowHandle,
 };
 use window::{BitmapImage, Dimensions, Rect, Window};
+
+const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -70,6 +73,7 @@ pub struct WebGpuTexture {
     texture: wgpu::Texture,
     width: u32,
     height: u32,
+    device: wgpu::Device,
     queue: Arc<wgpu::Queue>,
 }
 
@@ -109,8 +113,75 @@ impl Texture2d for WebGpuTexture {
         );
     }
 
-    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) {
-        unimplemented!();
+    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) -> anyhow::Result<()> {
+        let request = validate_texture_readback_request(self.width(), self.height(), rect, im)?;
+        if request.width == 0 || request.height == 0 {
+            return Ok(());
+        }
+
+        let bytes_per_row = padded_readback_bytes_per_row(request.width);
+        let buffer_size = bytes_per_row as u64 * request.height as u64;
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("WebGpuTexture readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("WebGpuTexture readback encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: request.left,
+                    y: request.top,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(request.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: request.width,
+                height: request.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = readback_buffer.slice(..buffer_size);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(WEBGPU_READBACK_TIMEOUT),
+            })
+            .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
+        receiver
+            .recv_timeout(WEBGPU_READBACK_TIMEOUT)
+            .map_err(|_| anyhow!("timed out waiting for webgpu readback mapping"))?
+            .map_err(|err| anyhow!("mapping webgpu readback buffer failed: {err:?}"))?;
+
+        let data = slice.get_mapped_range();
+        copy_padded_readback_to_image(&data, bytes_per_row as usize, im);
+        drop(data);
+        readback_buffer.unmap();
+        Ok(())
     }
 
     fn width(&self) -> usize {
@@ -158,7 +229,9 @@ impl WebGpuTexture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             label: Some("Texture Atlas"),
             view_formats: &view_formats,
         });
@@ -166,8 +239,35 @@ impl WebGpuTexture {
             texture,
             width,
             height,
+            device: state.device.clone(),
             queue: Arc::clone(&state.queue),
         })
+    }
+}
+
+fn padded_readback_bytes_per_row(width: u32) -> u32 {
+    let unpadded = width.saturating_mul(4);
+    let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    if unpadded == 0 {
+        0
+    } else {
+        unpadded.div_ceil(alignment) * alignment
+    }
+}
+
+fn copy_padded_readback_to_image(
+    padded_data: &[u8],
+    padded_bytes_per_row: usize,
+    dest: &mut dyn BitmapImage,
+) {
+    let (width, height) = dest.image_dimensions();
+    let unpadded_bytes_per_row = width * 4;
+
+    for row in 0..height {
+        let src_offset = row * padded_bytes_per_row;
+        let dst_offset = row * unpadded_bytes_per_row;
+        dest.pixel_data_slice_mut()[dst_offset..dst_offset + unpadded_bytes_per_row]
+            .copy_from_slice(&padded_data[src_offset..src_offset + unpadded_bytes_per_row]);
     }
 }
 
@@ -615,10 +715,12 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_surface_extent, resize_surface_extent, select_composite_alpha_mode,
-        select_surface_format, select_surface_view_formats, select_view_formats_for_format,
+        copy_padded_readback_to_image, initial_surface_extent, padded_readback_bytes_per_row,
+        resize_surface_extent, select_composite_alpha_mode, select_surface_format,
+        select_surface_view_formats, select_view_formats_for_format,
     };
     use window::Dimensions;
+    use window::bitmaps::{BitmapImage, Image};
 
     #[test]
     fn surface_format_prefers_srgb_variant() {
@@ -841,6 +943,31 @@ mod tests {
                 dpi: 96,
             }),
             (0, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn padded_readback_bytes_per_row_aligns_to_wgpu_requirement() {
+        assert_eq!(padded_readback_bytes_per_row(0), 0);
+        assert_eq!(padded_readback_bytes_per_row(1), 256);
+        assert_eq!(padded_readback_bytes_per_row(64), 256);
+        assert_eq!(padded_readback_bytes_per_row(65), 512);
+    }
+
+    #[test]
+    fn copy_padded_readback_to_image_strips_row_padding() {
+        let mut dest = Image::new(2, 2);
+        let padded = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        copy_padded_readback_to_image(&padded, 32, &mut dest);
+
+        assert_eq!(
+            dest.pixel_data_slice(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
     }
 }
