@@ -1,7 +1,7 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetCodecVersion, GetCodecVersionResponse, GetTlsCreds,
-    GetTlsCredsResponse, Pdu, SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle,
-    UnitResponse, UpdatePaneConstraints,
+    GetTlsCredsResponse, Pdu, RenameWorkspace, SelectStackPane, SendPaste, SetClipboard,
+    SetLayoutCycle, SetWindowWorkspace, UnitResponse, UpdatePaneConstraints, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -10,6 +10,10 @@ use std::path::PathBuf;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn arb_small_bytes() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(any::<u8>(), 0..128)
 }
 
 fn arb_path_buf() -> impl Strategy<Value = PathBuf> {
@@ -137,6 +141,26 @@ fn arb_get_tls_creds_response() -> impl Strategy<Value = GetTlsCredsResponse> {
             ca_cert_pem,
             client_cert_pem,
         }
+    })
+}
+
+fn arb_write_to_pane() -> impl Strategy<Value = WriteToPane> {
+    (0u64..=4096, arb_small_bytes()).prop_map(|(pane_id, data)| WriteToPane { pane_id, data })
+}
+
+fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
+    (arb_small_string(), arb_small_string()).prop_map(|(old_workspace, new_workspace)| {
+        RenameWorkspace {
+            old_workspace,
+            new_workspace,
+        }
+    })
+}
+
+fn arb_set_window_workspace() -> impl Strategy<Value = SetWindowWorkspace> {
+    (0u64..=4096, arb_small_string()).prop_map(|(window_id, workspace)| SetWindowWorkspace {
+        window_id,
+        workspace,
     })
 }
 
@@ -279,5 +303,41 @@ proptest! {
     #[test]
     fn get_tls_creds_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::GetTlsCreds(GetTlsCreds {}));
+    }
+
+    #[test]
+    fn write_to_pane_json_and_pdu_roundtrip(
+        payload in arb_write_to_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: WriteToPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::WriteToPane(payload));
+    }
+
+    #[test]
+    fn rename_workspace_json_and_pdu_roundtrip(
+        payload in arb_rename_workspace(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: RenameWorkspace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::RenameWorkspace(payload));
+    }
+
+    #[test]
+    fn set_window_workspace_json_and_pdu_roundtrip(
+        payload in arb_set_window_workspace(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetWindowWorkspace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetWindowWorkspace(payload));
     }
 }
