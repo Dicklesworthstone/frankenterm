@@ -2797,6 +2797,22 @@ mod tests {
         assert!(current_runtime_handle().is_none());
     }
 
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn run_async_test_clears_runtime_handle_tls() {
+        clear_runtime_handle();
+        run_async_test(async {
+            assert!(
+                current_runtime_handle().is_some(),
+                "block_on should install the ambient runtime handle inside the async body"
+            );
+        });
+        assert!(
+            current_runtime_handle().is_none(),
+            "run_async_test should clear the ambient runtime handle after the test body finishes"
+        );
+    }
+
     #[test]
     fn runtime_builder_multi_thread_builds() {
         let rt = RuntimeBuilder::multi_thread().build();
@@ -2839,7 +2855,17 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for async test");
-        runtime.block_on(future);
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        #[cfg(feature = "asupersync-runtime")]
+        clear_runtime_handle();
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]

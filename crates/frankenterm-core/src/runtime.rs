@@ -45,13 +45,13 @@ use crate::fleet_scrollback_coordinator::{
     CoordinatorConfig, FleetScrollbackCoordinator, SnapshotPaneScrollbackAccess,
 };
 use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::ingest::persist_captured_segment;
 #[cfg(feature = "asupersync-runtime")]
 use crate::ingest::persist_captured_segment_with_cx;
 use crate::ingest::{
     CapturedSegment, PaneCursor, PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
 };
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::ingest::persist_captured_segment;
 use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
@@ -59,9 +59,9 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
 #[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::task;
+use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -4435,7 +4435,17 @@ mod tests {
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for runtime tests");
-        runtime.block_on(future);
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        #[cfg(feature = "asupersync-runtime")]
+        crate::runtime_compat::clear_runtime_handle();
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// Like `run_async_test`, but runs the runtime on a dedicated thread so that
@@ -7658,7 +7668,9 @@ mod tests {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     // Simulate the discovery loop's 100ms short-burst sleep pattern
                     for _ in 0..5 {
-                        let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(100)).await;
+                        let _ =
+                            crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(100))
+                                .await;
                         iterations_task.fetch_add(1, Ordering::SeqCst);
                     }
                 })
@@ -7706,7 +7718,9 @@ mod tests {
                         if shutdown_flag_loop.load(Ordering::SeqCst) {
                             break;
                         }
-                        let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10)).await;
+                        let _ =
+                            crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10))
+                                .await;
                         ticks += 1;
                         assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
                     }
@@ -7720,7 +7734,8 @@ mod tests {
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
-                    let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
+                    let _ =
+                        crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     shutdown_flag_trigger.store(true, Ordering::SeqCst);
                 })
                 .expect("spawn trigger task");
@@ -7766,7 +7781,9 @@ mod tests {
                             let val = *lock.read().await;
                             let _ = val;
                             reads.fetch_add(1, Ordering::SeqCst);
-                            let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(5)).await;
+                            let _ =
+                                crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(5))
+                                    .await;
                         }
                         let _ = i;
                     })
@@ -7787,7 +7804,11 @@ mod tests {
                             *guard += 1;
                             writes.fetch_add(1, Ordering::SeqCst);
                             drop(guard);
-                            let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10)).await;
+                            let _ = crate::runtime_compat::sleep_with_cx(
+                                &cx,
+                                Duration::from_millis(10),
+                            )
+                            .await;
                         }
                     })
                     .expect("spawn writer");
@@ -7952,7 +7973,8 @@ mod tests {
                     // Send immediately (consumer should receive)
                     tx_send.send(&cx, 1).await.expect("send 1");
                     // Wait longer than timeout (consumer should timeout once)
-                    let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
+                    let _ =
+                        crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     tx_send.send(&cx, 2).await.expect("send 2");
                 })
                 .expect("spawn producer");
