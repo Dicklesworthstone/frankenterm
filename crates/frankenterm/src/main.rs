@@ -6952,8 +6952,8 @@ async fn record_read_search_policy_audit(
     };
 
     // ft-xbnl0.2.3 tick 237: cx-first storage write.
-    let storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     if let Err(e) = storage
         .record_audit_action_redacted_with_cx(&storage_cx, record)
         .await
@@ -7016,8 +7016,8 @@ async fn authorize_read_or_search_policy(
 
         let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
         // ft-xbnl0.2.3 tick 230: cx-first wezterm dispatch.
-        let cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         match wezterm.get_pane_with_cx(&cx, pane_id).await {
             Ok(pane_info) => {
                 let inferred_domain = pane_info.inferred_domain();
@@ -7349,8 +7349,8 @@ async fn resolve_inline_send_approval(
         };
 
         // ft-xbnl0.2.3 tick 274: cx-first approval consume.
-        let approval_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let approval_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         return match store
             .consume_with_context_with_cx(&approval_cx, code, input, Some(approval_context))
             .await
@@ -7367,8 +7367,8 @@ async fn resolve_inline_send_approval(
     }
 
     // ft-xbnl0.2.3 tick 274: cx-first approval issue.
-    let issue_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let issue_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let mut approval = store
         .issue_with_cx(&issue_cx, input, Some(summary.to_string()))
         .await
@@ -7484,9 +7484,12 @@ async fn evaluate_approve(
     let code_hash = frankenterm_core::approval::hash_allow_once_code(code);
 
     // ft-xbnl0.2.3 tick 246: cx-first storage read.
-    let storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
-    let token = match storage.get_approval_token_with_cx(&storage_cx, &code_hash).await {
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+    let token = match storage
+        .get_approval_token_with_cx(&storage_cx, &code_hash)
+        .await
+    {
         Ok(Some(t)) => t,
         Ok(None) => {
             return Err(RobotApproveError::new(
@@ -7628,8 +7631,7 @@ async fn fetch_pane_state_from_ipc(
     // ft-xbnl0.2.3 tick 227: route through pane_state_with_cx so the
     // IPC round-trip observes caller cancellation at the pre-read
     // checkpoint (tick 201) and the mpsc-reserve/response boundaries.
-    let cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match client.pane_state_with_cx(&cx, pane_id).await {
         Ok(response) => {
             if !response.ok {
@@ -8116,8 +8118,8 @@ async fn generate_workflow_plan(
         execution_id,
     );
     // ft-xbnl0.2.3 tick 235: cx-first storage read.
-    let storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     if let Ok(Some(record)) = storage.get_pane_with_cx(&storage_cx, pane_id).await {
         ctx.set_pane_meta(PaneMetadata {
             domain: Some(record.domain),
@@ -8388,8 +8390,8 @@ async fn restore_snapshot_checkpoint(
     );
 
     // ft-xbnl0.2.3 tick 268: cx-first session restore.
-    let restore_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let restore_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     restorer
         .restore_with_cx(&restore_cx, &session, &checkpoint, wezterm)
         .await
@@ -9042,8 +9044,7 @@ async fn execute_restart_workflow(
         frankenterm_core::wezterm::wezterm_handle_with_timeout(options.wezterm_timeout_secs);
 
     // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
-    let cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let panes = wezterm.list_panes_with_cx(&cx).await.map_err(|error| {
         RestartWorkflowAbort::new("preflight", format!("Failed to list panes: {error}"))
     })?;
@@ -9202,14 +9203,11 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
             ));
         }
         // ft-xbnl0.2.3 tick 283: cx-first mux-shutdown poll sleep.
-        let mux_stop_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
-        if frankenterm_core::runtime_compat::sleep_with_cx(
-            &mux_stop_cx,
-            Duration::from_millis(200),
-        )
-        .await
-        .is_err()
+        let mux_stop_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
+        if frankenterm_core::runtime_compat::sleep_with_cx(&mux_stop_cx, Duration::from_millis(200))
+            .await
+            .is_err()
         {
             return Err(anyhow::anyhow!(
                 "Cx cancelled while waiting for mux server shutdown"
@@ -9223,8 +9221,7 @@ async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> any
     let deadline = Instant::now() + timeout;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
     // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
-    let cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
 
     loop {
         match wezterm.list_panes_with_cx(&cx).await {
@@ -10701,8 +10698,8 @@ async fn load_runtime_health_snapshot(
         let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
         // ft-xbnl0.2.3 tick 227: status_with_cx routes through
         // send_request_with_id_with_cx — full cx-first IPC path.
-        let cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         if let Ok(response) = client.status_with_cx(&cx).await {
             if response.ok {
                 if let Some(data) = response.data {
@@ -10917,8 +10914,8 @@ async fn load_distributed_remote_panes(
 ) -> Result<Vec<frankenterm_core::storage::PaneRecord>, frankenterm_core::Error> {
     let db_path = db_path.to_string_lossy();
     // ft-xbnl0.2.3 tick 248/300: cx-first storage open + read (shared binding).
-    let storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage =
         frankenterm_core::storage::StorageHandle::new_with_cx(&storage_cx, &db_path).await?;
     let panes = storage.get_panes_with_cx(&storage_cx).await?;
@@ -11774,8 +11771,8 @@ async fn record_ipc_rpc_audit(
     // Clone handle under the outer mutex, then perform async I/O without holding the lock.
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
     // ft-xbnl0.2.3 tick 280: cx-first IPC RPC audit write.
-    let ipc_audit_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let ipc_audit_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     if let Err(e) = storage_handle
         .record_audit_action_redacted_with_cx(&ipc_audit_cx, audit)
         .await
@@ -12750,8 +12747,8 @@ async fn distributed_persist_payload(
     use frankenterm_core::wire_protocol::WirePayload;
 
     // ft-xbnl0.2.3 tick 277: cx-first distributed persistence path.
-    let persist_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let persist_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let canonical_sender = distributed_normalize_identity(sender);
     let sequence_scope = sequence_scope
         .map(ToOwned::to_owned)
@@ -12796,7 +12793,11 @@ async fn distributed_persist_payload(
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
+                if storage_handle
+                    .get_pane_with_cx(&persist_cx, remote_pane_id)
+                    .await?
+                    .is_none()
+                {
                     let ts = now_ms_i64();
                     distributed_upsert_pane(
                         &storage_handle,
@@ -12812,7 +12813,10 @@ async fn distributed_persist_payload(
                 }
 
                 if let Some(reason) = gap_reason {
-                    if let Some(gap) = storage_handle.record_gap_with_cx(&persist_cx, remote_pane_id, &reason).await? {
+                    if let Some(gap) = storage_handle
+                        .record_gap_with_cx(&persist_cx, remote_pane_id, &reason)
+                        .await?
+                    {
                         let _ = event_bus.publish(Event::GapDetected {
                             pane_id: gap.pane_id,
                             seq_before: gap.seq_before,
@@ -12878,7 +12882,11 @@ async fn distributed_persist_payload(
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
-                if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
+                if storage_handle
+                    .get_pane_with_cx(&persist_cx, remote_pane_id)
+                    .await?
+                    .is_none()
+                {
                     let ts = now_ms_i64();
                     distributed_upsert_pane(
                         &storage_handle,
@@ -12897,7 +12905,9 @@ async fn distributed_persist_payload(
                     "distributed_gap:{}:{}:{}",
                     gap.reason, gap.seq_before, gap.seq_after
                 );
-                if let Some(stored_gap) = storage_handle.record_gap_with_cx(&persist_cx, remote_pane_id, &reason).await?
+                if let Some(stored_gap) = storage_handle
+                    .record_gap_with_cx(&persist_cx, remote_pane_id, &reason)
+                    .await?
                 {
                     let _ = event_bus.publish(Event::GapDetected {
                         pane_id: stored_gap.pane_id,
@@ -12950,7 +12960,11 @@ async fn distributed_persist_payload(
             };
 
             let storage_handle = storage.lock().await.clone(); // ubs:ignore
-            if storage_handle.get_pane_with_cx(&persist_cx, remote_pane_id).await?.is_none() {
+            if storage_handle
+                .get_pane_with_cx(&persist_cx, remote_pane_id)
+                .await?
+                .is_none()
+            {
                 distributed_upsert_pane(
                     &storage_handle,
                     remote_pane_id,
@@ -12973,7 +12987,9 @@ async fn distributed_persist_payload(
                 None,
                 detected_at,
             );
-            let event_id = storage_handle.record_event_with_cx(&persist_cx, stored_event).await?;
+            let event_id = storage_handle
+                .record_event_with_cx(&persist_cx, stored_event)
+                .await?;
             drop(storage_handle);
 
             let _ = event_bus.publish(Event::PatternDetected {
@@ -13015,10 +13031,13 @@ async fn distributed_persist_pane_meta(
         .or_else(|| Some(format!("remote:{canonical_sender}:{}", meta.pane_id)));
 
     // ft-xbnl0.2.3 tick 277: cx-first distributed pane-meta persist.
-    let meta_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let meta_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
-    let is_new = storage_handle.get_pane_with_cx(&meta_cx, remote_pane_id).await?.is_none();
+    let is_new = storage_handle
+        .get_pane_with_cx(&meta_cx, remote_pane_id)
+        .await?
+        .is_none();
     distributed_upsert_pane(
         &storage_handle,
         remote_pane_id,
@@ -13062,8 +13081,8 @@ async fn distributed_handle_connection<S>(
     let mut handshake_line = String::new();
 
     // ft-xbnl0.2.3 tick 287: cx-first distributed handshake read timeout.
-    let handshake_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let handshake_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let handshake_size = match frankenterm_core::runtime_compat::timeout_with_cx(
         &handshake_cx,
         DISTRIBUTED_HANDSHAKE_TIMEOUT,
@@ -13380,8 +13399,8 @@ async fn spawn_distributed_listener(
 
     let task = frankenterm_core::runtime_compat::task::spawn(async move {
         // ft-xbnl0.2.3 tick 287: cx-first distributed listener accept timeout.
-        let accept_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let accept_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
@@ -13556,8 +13575,8 @@ async fn distributed_agent_should_skip_remote_pane(
 ) -> anyhow::Result<bool> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
     // ft-xbnl0.2.3 tick 277: cx-first distributed remote pane check.
-    let check_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let check_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let pane = storage_handle.get_pane_with_cx(&check_cx, pane_id).await?;
     Ok(matches!(
         pane.as_ref(),
@@ -13616,8 +13635,8 @@ async fn distributed_agent_seed_segment_cursors(
 ) -> anyhow::Result<()> {
     let storage_handle = storage.lock().await.clone(); // ubs:ignore
     // ft-xbnl0.2.3 tick 280: cx-first seed cursors.
-    let seed_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let seed_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let panes = storage_handle.get_panes_with_cx(&seed_cx).await?;
     for pane in panes {
         if !distributed_agent_local_pane(&pane) || cursors.contains_key(&pane.pane_id) {
@@ -14044,7 +14063,9 @@ async fn distributed_agent_stream_event(
                         // ft-xbnl0.2.3 tick 277: cx-first envelope pane-meta enrich.
                         let env_cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
-                        storage_handle.get_pane_with_cx(&env_cx, meta.pane_id).await?
+                        storage_handle
+                            .get_pane_with_cx(&env_cx, meta.pane_id)
+                            .await?
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
@@ -14069,7 +14090,9 @@ async fn distributed_agent_stream_event(
                         // ft-xbnl0.2.3 tick 277: cx-first envelope pane-meta enrich.
                         let env_cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
-                        storage_handle.get_pane_with_cx(&env_cx, meta.pane_id).await?
+                        storage_handle
+                            .get_pane_with_cx(&env_cx, meta.pane_id)
+                            .await?
                     };
                     if let Some(record) = pane_record {
                         *meta = distributed_agent_pane_meta(&record);
@@ -14122,8 +14145,8 @@ async fn distributed_agent_stream_session(
 
     let mut handshake_response = String::new();
     // ft-xbnl0.2.3 tick 287: cx-first agent handshake response read timeout.
-    let agent_handshake_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let agent_handshake_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match frankenterm_core::runtime_compat::timeout_with_cx(
         &agent_handshake_cx,
         DISTRIBUTED_HANDSHAKE_TIMEOUT,
@@ -14234,8 +14257,8 @@ async fn distributed_agent_stream_session(
         let now = Instant::now();
         let wait_duration = next_heartbeat.saturating_duration_since(now);
         // ft-xbnl0.2.3 tick 286: cx-first heartbeat timeout wait.
-        let heartbeat_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let heartbeat_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         match frankenterm_core::runtime_compat::timeout_with_cx(
             &heartbeat_cx,
             wait_duration,
@@ -14343,8 +14366,8 @@ async fn distributed_agent_sleep_with_shutdown(
     use std::sync::atomic::Ordering;
 
     // ft-xbnl0.2.3 tick 282: cx-first distributed agent shutdown-sleep.
-    let sleep_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let sleep_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let started = Instant::now();
     while started.elapsed() < duration {
         if shutdown_flag.load(Ordering::SeqCst) {
@@ -14566,8 +14589,8 @@ async fn run_distributed_agent(
         write_queue_size: config.storage.writer_queue_size as usize,
     };
     // ft-xbnl0.2.3 tick 299: cx-first distributed agent storage open.
-    let storage_open_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage_open_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage =
         StorageHandle::with_config_with_cx(&storage_open_cx, &db_path, storage_config).await?;
     tracing::info!(db_path = %db_path, "Distributed agent storage initialized");
@@ -15011,8 +15034,8 @@ async fn run_watcher(
     );
 
     // ft-xbnl0.2.3 tick 299: cx-first watch-runtime storage open.
-    let watch_storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let watch_storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let storage =
         StorageHandle::with_config_with_cx(&watch_storage_cx, &db_path, storage_config).await?;
     let lifecycle_event_id =
@@ -15225,8 +15248,8 @@ async fn run_watcher(
             write_queue_size: config.storage.writer_queue_size as usize,
         };
         // ft-xbnl0.2.3 tick 299: cx-first workflow storage open.
-        let wf_storage_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let wf_storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         let storage_for_workflows = Arc::new(
             StorageHandle::with_config_with_cx(&wf_storage_cx, &db_path, workflow_storage_config)
                 .await?,
@@ -15711,8 +15734,8 @@ async fn run_watcher(
         let wez =
             frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
         // ft-xbnl0.2.3 tick 288: cx-first shutdown list_panes + checkpoint.
-        let shutdown_snap_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let shutdown_snap_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         match wez.list_panes_with_cx(&shutdown_snap_cx).await {
             Ok(panes) if !panes.is_empty() => {
                 match engine
@@ -15892,8 +15915,8 @@ async fn run_saved_search_scheduler(
         let now = epoch_ms();
 
         // ft-xbnl0.2.3 tick 246: cx-first storage read.
-        let storage_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         let searches = match storage.list_saved_searches_with_cx(&storage_cx).await {
             Ok(searches) => searches,
             Err(err) => {
@@ -16100,7 +16123,10 @@ async fn run_saved_search_scheduler(
             // ft-xbnl0.2.3 tick 237: cx-first storage write.
             let storage_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            let event_id = match storage.record_event_with_cx(&storage_cx, stored_event).await {
+            let event_id = match storage
+                .record_event_with_cx(&storage_cx, stored_event)
+                .await
+            {
                 Ok(id) => id,
                 Err(err) => {
                     tracing::warn!(
@@ -16382,8 +16408,8 @@ async fn wait_for_shutdown(flag: Arc<std::sync::atomic::AtomicBool>) {
     use std::time::Duration;
 
     // ft-xbnl0.2.3 tick 289: cx-first shutdown-signal wait loop.
-    let wait_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let wait_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     while !flag.load(Ordering::SeqCst) {
         if frankenterm_core::runtime_compat::sleep_with_cx(&wait_cx, Duration::from_millis(250))
             .await
@@ -17380,8 +17406,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // ft-xbnl0.2.3 tick 231: cx-first.
                                 let cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
-                                let pane_info =
-                                    wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
+                                let pane_info = wezterm.get_pane_with_cx(&cx, pane_id).await.ok();
                                 let storage = frankenterm_core::storage::StorageHandle::new(
                                     &ctx.effective.paths.db_path,
                                 )
@@ -17654,9 +17679,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     polls,
                                                     is_regex: wait_for_regex,
                                                 });
-                                                verification_error = Some(format!(
-                                                    "wait-for cancelled ({reason})"
-                                                ));
+                                                verification_error =
+                                                    Some(format!("wait-for cancelled ({reason})"));
                                             }
                                             Err(e) => {
                                                 verification_error =
@@ -17799,14 +17823,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Ok(WaitResult::Cancelled { reason, polls }) => {
                                     // ambient wait_for should not return Cancelled; arm for
                                     // exhaustiveness after ft-xbnl0.2.3 added the variant.
-                                    let response = RobotResponse::<RobotWaitForData>::error_with_code(
-                                        ROBOT_ERR_TIMEOUT,
-                                        format!(
-                                            "Wait cancelled ({reason}) after {polls} polls"
-                                        ),
-                                        None,
-                                        elapsed_ms(start),
-                                    );
+                                    let response =
+                                        RobotResponse::<RobotWaitForData>::error_with_code(
+                                            ROBOT_ERR_TIMEOUT,
+                                            format!(
+                                                "Wait cancelled ({reason}) after {polls} polls"
+                                            ),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
                                     print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
@@ -18534,7 +18559,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // ft-xbnl0.2.3 tick 249: cx-first storage read.
                                 let reindex_panes_cx = frankenterm_core::cx::Cx::current()
                                     .unwrap_or_else(frankenterm_core::cx::for_request);
-                                let panes = match storage.get_panes_with_cx(&reindex_panes_cx).await {
+                                let panes = match storage.get_panes_with_cx(&reindex_panes_cx).await
+                                {
                                     Ok(panes) => panes,
                                     Err(err) => {
                                         let response = RobotResponse::<RobotSearchIndexReindexData>::error_with_code(
@@ -18863,14 +18889,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
 
-                                        if let Err(e) =
-                                            {
+                                        if let Err(e) = {
                                             // ft-xbnl0.2.3 tick 271: cx-first event note set.
                                             let note_cx = frankenterm_core::cx::Cx::current()
                                                 .unwrap_or_else(frankenterm_core::cx::for_request);
-                                            storage.set_event_note_with_cx(&note_cx, event_id, note, by.clone()).await
-                                        }
-                                        {
+                                            storage
+                                                .set_event_note_with_cx(
+                                                    &note_cx,
+                                                    event_id,
+                                                    note,
+                                                    by.clone(),
+                                                )
+                                                .await
+                                        } {
                                             let response = RobotResponse::<RobotEventMutationData>::error_with_code(
                                                 ROBOT_ERR_STORAGE,
                                                 format!("Failed to update note: {e}"),
@@ -19138,9 +19169,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             };
                                             // ft-xbnl0.2.3 tick 238: cx-first storage write.
                                             let storage_cx = frankenterm_core::cx::Cx::current()
-                                                .unwrap_or_else(
-                                                    frankenterm_core::cx::for_request,
-                                                );
+                                                .unwrap_or_else(frankenterm_core::cx::for_request);
                                             if let Err(e) = storage
                                                 .record_audit_action_redacted_with_cx(
                                                     &storage_cx,
@@ -19216,9 +19245,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             };
                                             // ft-xbnl0.2.3 tick 238: cx-first storage write.
                                             let storage_cx = frankenterm_core::cx::Cx::current()
-                                                .unwrap_or_else(
-                                                    frankenterm_core::cx::for_request,
-                                                );
+                                                .unwrap_or_else(frankenterm_core::cx::for_request);
                                             if let Err(e) = storage
                                                 .record_audit_action_redacted_with_cx(
                                                     &storage_cx,
@@ -19613,9 +19640,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // cross-crate cx-first migration matching the
                                         // pattern from ticks 224/225).
                                         let cx = frankenterm_core::cx::Cx::current()
-                                            .unwrap_or_else(
-                                                frankenterm_core::cx::for_request,
-                                            );
+                                            .unwrap_or_else(frankenterm_core::cx::for_request);
                                         let result = runner
                                             .run_workflow_with_cx(
                                                 &cx,
@@ -19884,10 +19909,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             Ok(Some(record)) => {
                                                 let (step_logs, latest_log) = if verbose > 0 {
                                                     match storage
-                                                        .get_step_logs_with_cx(
-                                                            &storage_cx,
-                                                            exec_id,
-                                                        )
+                                                        .get_step_logs_with_cx(&storage_cx, exec_id)
                                                         .await
                                                     {
                                                         Ok(logs) => {
@@ -19935,7 +19957,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 } else {
                                                     // ft-xbnl0.2.3 tick 249: cx-first storage read.
                                                     let latest = storage
-                                                        .get_latest_step_log_with_cx(&storage_cx, exec_id)
+                                                        .get_latest_step_log_with_cx(
+                                                            &storage_cx,
+                                                            exec_id,
+                                                        )
                                                         .await
                                                         .unwrap_or_default();
                                                     (None, latest)
@@ -20091,16 +20116,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let workflows_cx = frankenterm_core::cx::Cx::current()
                                             .unwrap_or_else(frankenterm_core::cx::for_request);
                                         let records = if active {
-                                            storage.find_incomplete_workflows_with_cx(&workflows_cx).await
+                                            storage
+                                                .find_incomplete_workflows_with_cx(&workflows_cx)
+                                                .await
                                         } else if let Some(pane_id) = pane {
                                             let query = frankenterm_core::storage::ExportQuery {
                                                 pane_id: Some(pane_id),
                                                 limit: Some(50),
                                                 ..Default::default()
                                             };
-                                            storage.export_workflows_with_cx(&workflows_cx, query).await
+                                            storage
+                                                .export_workflows_with_cx(&workflows_cx, query)
+                                                .await
                                         } else {
-                                            storage.find_incomplete_workflows_with_cx(&workflows_cx).await
+                                            storage
+                                                .find_incomplete_workflows_with_cx(&workflows_cx)
+                                                .await
                                         };
 
                                         match records {
@@ -22109,22 +22140,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let caut_cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     let caut = frankenterm_core::caut::CautClient::new();
-                                    let refresh_result = match caut.refresh_cx(&caut_cx, caut_service).await {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            let response =
-                                                RobotResponse::<RobotAccountsRefreshData>::error_with_code(
+                                    let refresh_result =
+                                        match caut.refresh_cx(&caut_cx, caut_service).await {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                let response = RobotResponse::<
+                                                    RobotAccountsRefreshData,
+                                                >::error_with_code(
                                                     "robot.caut_error",
                                                     format!("caut refresh failed: {e}"),
-                                                    Some(
-                                                        e.remediation().summary.to_string(),
-                                                    ),
+                                                    Some(e.remediation().summary.to_string()),
                                                     elapsed_ms(start),
                                                 );
-                                            print_robot_response(&response, format, stats)?;
-                                            return Ok(());
-                                        }
-                                    };
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
 
                                     // Open storage to persist refreshed data
                                     let db_path = layout.db_path.to_string_lossy();
@@ -22332,14 +22363,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let storage_cx = frankenterm_core::cx::Cx::current()
                                         .unwrap_or_else(frankenterm_core::cx::for_request);
                                     // Expire stale reservations first
-                                    if let Err(e) = storage
-                                        .expire_stale_reservations_with_cx(&storage_cx)
-                                        .await
+                                    if let Err(e) =
+                                        storage.expire_stale_reservations_with_cx(&storage_cx).await
                                     {
                                         tracing::warn!("Failed to expire stale reservations: {e}");
                                     }
 
-                                    match storage.list_active_reservations_with_cx(&storage_cx).await {
+                                    match storage
+                                        .list_active_reservations_with_cx(&storage_cx)
+                                        .await
+                                    {
                                         Ok(reservations) => {
                                             let total = reservations.len();
                                             let infos: Vec<RobotReservationInfo> = reservations
@@ -22874,11 +22907,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     if output_format.is_json() {
@@ -22900,56 +22934,58 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(frankenterm_core::cx::for_request);
             match command {
                 Some(SearchCommands::Fts { command }) => match command {
-                    FtsCommands::Verify => match storage.get_indexing_health_with_cx(&storage_cx).await {
-                        Ok(report) => {
-                            if output_format.is_json() {
-                                let payload = serde_json::json!({
-                                    "ok": true,
-                                    "report": report,
-                                    "version": frankenterm_core::VERSION,
-                                });
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                );
-                            } else {
-                                let status = if report.healthy {
-                                    "healthy"
+                    FtsCommands::Verify => {
+                        match storage.get_indexing_health_with_cx(&storage_cx).await {
+                            Ok(report) => {
+                                if output_format.is_json() {
+                                    let payload = serde_json::json!({
+                                        "ok": true,
+                                        "report": report,
+                                        "version": frankenterm_core::VERSION,
+                                    });
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                    );
                                 } else {
-                                    "unhealthy"
-                                };
-                                println!("FTS index health: {status}");
-                                println!("  Total segments: {}", report.total_segments);
-                                println!("  Total FTS rows: {}", report.total_fts_rows);
-                                println!("  Inconsistent panes: {}", report.inconsistent_panes);
-                                if !report.healthy || cli.verbose > 0 {
-                                    for pane in &report.panes {
-                                        if !pane.fts_consistent || cli.verbose > 0 {
-                                            println!(
-                                                "  Pane {}: segments={} fts_rows={} consistent={}",
-                                                pane.pane_id,
-                                                pane.segment_count,
-                                                pane.fts_row_count,
-                                                pane.fts_consistent
-                                            );
+                                    let status = if report.healthy {
+                                        "healthy"
+                                    } else {
+                                        "unhealthy"
+                                    };
+                                    println!("FTS index health: {status}");
+                                    println!("  Total segments: {}", report.total_segments);
+                                    println!("  Total FTS rows: {}", report.total_fts_rows);
+                                    println!("  Inconsistent panes: {}", report.inconsistent_panes);
+                                    if !report.healthy || cli.verbose > 0 {
+                                        for pane in &report.panes {
+                                            if !pane.fts_consistent || cli.verbose > 0 {
+                                                println!(
+                                                    "  Pane {}: segments={} fts_rows={} consistent={}",
+                                                    pane.pane_id,
+                                                    pane.segment_count,
+                                                    pane.fts_row_count,
+                                                    pane.fts_consistent
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "FTS verify failed: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: FTS verify failed: {e}");
+                            Err(e) => {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "FTS verify failed: {}", "version": "{}"}}"#,
+                                        e,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: FTS verify failed: {e}");
+                                }
+                                std::process::exit(1);
                             }
-                            std::process::exit(1);
                         }
-                    },
+                    }
                     FtsCommands::Rebuild => {
                         if !output_format.is_json() {
                             println!("Rebuilding FTS index...");
@@ -23040,7 +23076,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         eprint!("{}", format_search_lints_plain(&lints));
                     }
 
-                    match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
+                    match storage
+                        .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                        .await
+                    {
                         Ok(Some(_)) => {
                             if output_format.is_json() {
                                 println!(
@@ -23128,580 +23167,46 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let storage_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
                     match command {
-                    SavedSearchCommands::List => {
-                        match storage.list_saved_searches_with_cx(&storage_cx).await {
-                            Ok(searches) => {
-                                if output_format.is_json() {
-                                    let payload = serde_json::json!({
-                                        "ok": true,
-                                        "saved_searches": searches,
-                                        "total": searches.len(),
-                                        "version": frankenterm_core::VERSION,
-                                    });
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                    );
-                                } else {
-                                    print!("{}", format_saved_searches_plain(&searches));
-                                }
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to list saved searches: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    SavedSearchCommands::Run { name } => {
-                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        let now_ms_i64 = i64::try_from(now_ms()).unwrap_or(i64::MAX);
-
-                        let lints = frankenterm_core::storage::lint_fts_query(&saved.query);
-                        if search_lints_have_errors(&lints) {
-                            let summary = lints
-                                .iter()
-                                .find(|lint| {
-                                    lint.severity
-                                        == frankenterm_core::storage::SearchLintSeverity::Error
-                                })
-                                .map(|lint| lint.message.clone())
-                                .unwrap_or_else(|| "Invalid search query.".to_string());
-                            let stored_error = format!("Invalid search query: {summary}");
-                            if let Err(e) = storage
-                                .update_saved_search_run(
-                                    &saved.id,
-                                    now_ms_i64,
-                                    None,
-                                    Some(stored_error.clone()),
-                                )
-                                .await
-                            {
-                                tracing::warn!("Failed to update saved search run: {e}");
-                            }
-
-                            if output_format.is_json() {
-                                let payload = serde_json::json!({
-                                    "ok": false,
-                                    "error": "Invalid search query.",
-                                    "lint": lints,
-                                    "version": frankenterm_core::VERSION,
-                                });
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                );
-                            } else {
-                                eprintln!("Error: Invalid search query.");
-                                eprint!("{}", format_search_lints_plain(&lints));
-                            }
-                            std::process::exit(1);
-                        }
-                        if !lints.is_empty() && !output_format.is_json() {
-                            eprint!("{}", format_search_lints_plain(&lints));
-                        }
-
-                        let limit = if saved.limit > 0 {
-                            saved.limit as usize
-                        } else {
-                            frankenterm_core::storage::SAVED_SEARCH_DEFAULT_LIMIT as usize
-                        };
-                        let since = if saved.since_mode
-                            == frankenterm_core::storage::SAVED_SEARCH_SINCE_MODE_FIXED
-                        {
-                            saved.since_ms
-                        } else {
-                            saved.last_run_at
-                        };
-
-                        let options = frankenterm_core::storage::SearchOptions {
-                            limit: Some(limit),
-                            pane_id: saved.pane_id,
-                            since,
-                            until: None,
-                            include_snippets: Some(true),
-                            snippet_max_tokens: Some(30),
-                            highlight_prefix: Some(">>".to_string()),
-                            highlight_suffix: Some("<<".to_string()),
-                        };
-
-                        // ft-xbnl0.2.3 tick 245: cx-first storage search.
-                        let storage_cx = frankenterm_core::cx::Cx::current()
-                            .unwrap_or_else(frankenterm_core::cx::for_request);
-                        match storage
-                            .search_with_results_with_cx(&storage_cx, &saved.query, options)
-                            .await
-                        {
-                            Ok(results) => {
-                                if let Err(e) = storage
-                                    .update_saved_search_run(
-                                        &saved.id,
-                                        now_ms_i64,
-                                        Some(results.len() as i64),
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("Failed to update saved search run: {e}");
-                                }
-
-                                let ctx = RenderContext::new(output_format)
-                                    .verbose(cli.verbose)
-                                    .limit(limit);
-                                let output =
-                                    SearchResultRenderer::render(&results, &saved.query, &ctx);
-                                print!("{output}");
-                            }
-                            Err(e) => {
-                                let error_msg = format!("Search failed: {e}");
-                                if let Err(e) = storage
-                                    .update_saved_search_run(
-                                        &saved.id,
-                                        now_ms_i64,
-                                        None,
-                                        Some(error_msg.clone()),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("Failed to update saved search run: {e}");
-                                }
-
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Search failed: {e}");
-                                    if e.to_string().contains("fts5")
-                                        || e.to_string().contains("syntax")
-                                    {
-                                        eprintln!("Check your FTS query syntax.");
+                        SavedSearchCommands::List => {
+                            match storage.list_saved_searches_with_cx(&storage_cx).await {
+                                Ok(searches) => {
+                                    if output_format.is_json() {
+                                        let payload = serde_json::json!({
+                                            "ok": true,
+                                            "saved_searches": searches,
+                                            "total": searches.len(),
+                                            "version": frankenterm_core::VERSION,
+                                        });
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&payload)
+                                                .unwrap_or_default()
+                                        );
+                                    } else {
+                                        print!("{}", format_saved_searches_plain(&searches));
                                     }
                                 }
-                                std::process::exit(1);
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to list saved searches: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to list saved searches: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
                             }
                         }
-                    }
-                    SavedSearchCommands::Schedule { name, interval_ms } => {
-                        if interval_ms < 1000 {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "interval_ms must be >= 1000", "version": "{}"}}"#,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: interval_ms must be >= 1000");
-                            }
-                            std::process::exit(1);
-                        }
-
-                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        if let Err(e) = storage
-                            .update_saved_search_schedule(&saved.id, true, Some(interval_ms))
-                            .await
-                        {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to update schedule: {e}");
-                            }
-                            std::process::exit(1);
-                        }
-
-                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-                        if output_format.is_json() {
-                            let payload = serde_json::json!({
-                                "ok": true,
-                                "saved_search": updated,
-                                "version": frankenterm_core::VERSION,
-                            });
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                            );
-                        } else {
-                            println!("Scheduled saved search '{name}' every {interval_ms}ms.");
-                        }
-                    }
-                    SavedSearchCommands::Unschedule { name } => {
-                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        if let Err(e) = storage
-                            .update_saved_search_schedule(&saved.id, false, None)
-                            .await
-                        {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to update schedule: {e}");
-                            }
-                            std::process::exit(1);
-                        }
-
-                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-                        if output_format.is_json() {
-                            let payload = serde_json::json!({
-                                "ok": true,
-                                "saved_search": updated,
-                                "version": frankenterm_core::VERSION,
-                            });
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                            );
-                        } else {
-                            println!("Unscheduled saved search '{name}'.");
-                        }
-                    }
-                    SavedSearchCommands::Enable { name } => {
-                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        let interval = match saved.schedule_interval_ms {
-                            Some(v) => v,
-                            None => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search has no schedule interval; use 'ft search saved schedule'.", "version": "{}"}}"#,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Error: Saved search has no schedule interval; use 'ft search saved schedule'."
-                                    );
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        if let Err(e) = storage
-                            .update_saved_search_schedule(&saved.id, true, Some(interval))
-                            .await
-                        {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to update schedule: {e}");
-                            }
-                            std::process::exit(1);
-                        }
-
-                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-                        if output_format.is_json() {
-                            let payload = serde_json::json!({
-                                "ok": true,
-                                "saved_search": updated,
-                                "version": frankenterm_core::VERSION,
-                            });
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                            );
-                        } else {
-                            println!("Enabled scheduling for saved search '{name}'.");
-                        }
-                    }
-                    SavedSearchCommands::Disable { name } => {
-                        let saved = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-
-                        if let Err(e) = storage
-                            .update_saved_search_schedule(
-                                &saved.id,
-                                false,
-                                saved.schedule_interval_ms,
-                            )
-                            .await
-                        {
-                            if output_format.is_json() {
-                                println!(
-                                    r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
-                                    e,
-                                    frankenterm_core::VERSION
-                                );
-                            } else {
-                                eprintln!("Error: Failed to update schedule: {e}");
-                            }
-                            std::process::exit(1);
-                        }
-
-                        let updated = match storage.get_saved_search_by_name_with_cx(&storage_cx, &name).await {
-                            Ok(Some(search)) => search,
-                            Ok(None) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
-                                        name,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Saved search not found: {name}");
-                                }
-                                std::process::exit(1);
-                            }
-                            Err(e) => {
-                                if output_format.is_json() {
-                                    println!(
-                                        r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
-                                        e,
-                                        frankenterm_core::VERSION
-                                    );
-                                } else {
-                                    eprintln!("Error: Failed to load saved search: {e}");
-                                }
-                                std::process::exit(1);
-                            }
-                        };
-                        if output_format.is_json() {
-                            let payload = serde_json::json!({
-                                "ok": true,
-                                "saved_search": updated,
-                                "version": frankenterm_core::VERSION,
-                            });
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                            );
-                        } else {
-                            println!("Disabled scheduling for saved search '{name}'.");
-                        }
-                    }
-                    SavedSearchCommands::Delete { name } => {
-                        // ft-xbnl0.2.3 tick 239: cx-first storage write.
-                        let storage_cx = frankenterm_core::cx::Cx::current()
-                            .unwrap_or_else(frankenterm_core::cx::for_request);
-                        match storage.delete_saved_search_with_cx(&storage_cx, &name).await {
-                            Ok(deleted) => {
-                                if deleted == 0 {
+                        SavedSearchCommands::Run { name } => {
+                            let saved = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
                                     if output_format.is_json() {
                                         println!(
                                             r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
@@ -23713,12 +23218,50 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     }
                                     std::process::exit(1);
                                 }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            let now_ms_i64 = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+
+                            let lints = frankenterm_core::storage::lint_fts_query(&saved.query);
+                            if search_lints_have_errors(&lints) {
+                                let summary = lints
+                                    .iter()
+                                    .find(|lint| {
+                                        lint.severity
+                                            == frankenterm_core::storage::SearchLintSeverity::Error
+                                    })
+                                    .map(|lint| lint.message.clone())
+                                    .unwrap_or_else(|| "Invalid search query.".to_string());
+                                let stored_error = format!("Invalid search query: {summary}");
+                                if let Err(e) = storage
+                                    .update_saved_search_run(
+                                        &saved.id,
+                                        now_ms_i64,
+                                        None,
+                                        Some(stored_error.clone()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!("Failed to update saved search run: {e}");
+                                }
 
                                 if output_format.is_json() {
                                     let payload = serde_json::json!({
-                                        "ok": true,
-                                        "deleted": true,
-                                        "name": name,
+                                        "ok": false,
+                                        "error": "Invalid search query.",
+                                        "lint": lints,
                                         "version": frankenterm_core::VERSION,
                                     });
                                     println!(
@@ -23726,23 +23269,551 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         serde_json::to_string_pretty(&payload).unwrap_or_default()
                                     );
                                 } else {
-                                    println!("Deleted saved search '{name}'.");
+                                    eprintln!("Error: Invalid search query.");
+                                    eprint!("{}", format_search_lints_plain(&lints));
+                                }
+                                std::process::exit(1);
+                            }
+                            if !lints.is_empty() && !output_format.is_json() {
+                                eprint!("{}", format_search_lints_plain(&lints));
+                            }
+
+                            let limit = if saved.limit > 0 {
+                                saved.limit as usize
+                            } else {
+                                frankenterm_core::storage::SAVED_SEARCH_DEFAULT_LIMIT as usize
+                            };
+                            let since = if saved.since_mode
+                                == frankenterm_core::storage::SAVED_SEARCH_SINCE_MODE_FIXED
+                            {
+                                saved.since_ms
+                            } else {
+                                saved.last_run_at
+                            };
+
+                            let options = frankenterm_core::storage::SearchOptions {
+                                limit: Some(limit),
+                                pane_id: saved.pane_id,
+                                since,
+                                until: None,
+                                include_snippets: Some(true),
+                                snippet_max_tokens: Some(30),
+                                highlight_prefix: Some(">>".to_string()),
+                                highlight_suffix: Some("<<".to_string()),
+                            };
+
+                            // ft-xbnl0.2.3 tick 245: cx-first storage search.
+                            let storage_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            match storage
+                                .search_with_results_with_cx(&storage_cx, &saved.query, options)
+                                .await
+                            {
+                                Ok(results) => {
+                                    if let Err(e) = storage
+                                        .update_saved_search_run(
+                                            &saved.id,
+                                            now_ms_i64,
+                                            Some(results.len() as i64),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!("Failed to update saved search run: {e}");
+                                    }
+
+                                    let ctx = RenderContext::new(output_format)
+                                        .verbose(cli.verbose)
+                                        .limit(limit);
+                                    let output =
+                                        SearchResultRenderer::render(&results, &saved.query, &ctx);
+                                    print!("{output}");
+                                }
+                                Err(e) => {
+                                    let error_msg = format!("Search failed: {e}");
+                                    if let Err(e) = storage
+                                        .update_saved_search_run(
+                                            &saved.id,
+                                            now_ms_i64,
+                                            None,
+                                            Some(error_msg.clone()),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!("Failed to update saved search run: {e}");
+                                    }
+
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Search failed: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Search failed: {e}");
+                                        if e.to_string().contains("fts5")
+                                            || e.to_string().contains("syntax")
+                                        {
+                                            eprintln!("Check your FTS query syntax.");
+                                        }
+                                    }
+                                    std::process::exit(1);
                                 }
                             }
-                            Err(e) => {
+                        }
+                        SavedSearchCommands::Schedule { name, interval_ms } => {
+                            if interval_ms < 1000 {
                                 if output_format.is_json() {
                                     println!(
-                                        r#"{{"ok": false, "error": "Failed to delete saved search: {}", "version": "{}"}}"#,
+                                        r#"{{"ok": false, "error": "interval_ms must be >= 1000", "version": "{}"}}"#,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: interval_ms must be >= 1000");
+                                }
+                                std::process::exit(1);
+                            }
+
+                            let saved = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            if let Err(e) = storage
+                                .update_saved_search_schedule(&saved.id, true, Some(interval_ms))
+                                .await
+                            {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
                                         e,
                                         frankenterm_core::VERSION
                                     );
                                 } else {
-                                    eprintln!("Error: Failed to delete saved search: {e}");
+                                    eprintln!("Error: Failed to update schedule: {e}");
                                 }
                                 std::process::exit(1);
                             }
+
+                            let updated = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_search": updated,
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                println!("Scheduled saved search '{name}' every {interval_ms}ms.");
+                            }
                         }
-                    }
+                        SavedSearchCommands::Unschedule { name } => {
+                            let saved = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            if let Err(e) = storage
+                                .update_saved_search_schedule(&saved.id, false, None)
+                                .await
+                            {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                        e,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to update schedule: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+
+                            let updated = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_search": updated,
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                println!("Unscheduled saved search '{name}'.");
+                            }
+                        }
+                        SavedSearchCommands::Enable { name } => {
+                            let saved = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            let interval = match saved.schedule_interval_ms {
+                                Some(v) => v,
+                                None => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search has no schedule interval; use 'ft search saved schedule'.", "version": "{}"}}"#,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "Error: Saved search has no schedule interval; use 'ft search saved schedule'."
+                                        );
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            if let Err(e) = storage
+                                .update_saved_search_schedule(&saved.id, true, Some(interval))
+                                .await
+                            {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                        e,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to update schedule: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+
+                            let updated = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_search": updated,
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                println!("Enabled scheduling for saved search '{name}'.");
+                            }
+                        }
+                        SavedSearchCommands::Disable { name } => {
+                            let saved = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+
+                            if let Err(e) = storage
+                                .update_saved_search_schedule(
+                                    &saved.id,
+                                    false,
+                                    saved.schedule_interval_ms,
+                                )
+                                .await
+                            {
+                                if output_format.is_json() {
+                                    println!(
+                                        r#"{{"ok": false, "error": "Failed to update schedule: {}", "version": "{}"}}"#,
+                                        e,
+                                        frankenterm_core::VERSION
+                                    );
+                                } else {
+                                    eprintln!("Error: Failed to update schedule: {e}");
+                                }
+                                std::process::exit(1);
+                            }
+
+                            let updated = match storage
+                                .get_saved_search_by_name_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(Some(search)) => search,
+                                Ok(None) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                            name,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Saved search not found: {name}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to load saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to load saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
+                            if output_format.is_json() {
+                                let payload = serde_json::json!({
+                                    "ok": true,
+                                    "saved_search": updated,
+                                    "version": frankenterm_core::VERSION,
+                                });
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                );
+                            } else {
+                                println!("Disabled scheduling for saved search '{name}'.");
+                            }
+                        }
+                        SavedSearchCommands::Delete { name } => {
+                            // ft-xbnl0.2.3 tick 239: cx-first storage write.
+                            let storage_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            match storage
+                                .delete_saved_search_with_cx(&storage_cx, &name)
+                                .await
+                            {
+                                Ok(deleted) => {
+                                    if deleted == 0 {
+                                        if output_format.is_json() {
+                                            println!(
+                                                r#"{{"ok": false, "error": "Saved search not found: {}", "version": "{}"}}"#,
+                                                name,
+                                                frankenterm_core::VERSION
+                                            );
+                                        } else {
+                                            eprintln!("Error: Saved search not found: {name}");
+                                        }
+                                        std::process::exit(1);
+                                    }
+
+                                    if output_format.is_json() {
+                                        let payload = serde_json::json!({
+                                            "ok": true,
+                                            "deleted": true,
+                                            "name": name,
+                                            "version": frankenterm_core::VERSION,
+                                        });
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&payload)
+                                                .unwrap_or_default()
+                                        );
+                                    } else {
+                                        println!("Deleted saved search '{name}'.");
+                                    }
+                                }
+                                Err(e) => {
+                                    if output_format.is_json() {
+                                        println!(
+                                            r#"{{"ok": false, "error": "Failed to delete saved search: {}", "version": "{}"}}"#,
+                                            e,
+                                            frankenterm_core::VERSION
+                                        );
+                                    } else {
+                                        eprintln!("Error: Failed to delete saved search: {e}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
                     }
                 }
                 None if suggest => {
@@ -24383,11 +24454,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             PanesCommands::Bookmark { action } => {
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -24718,11 +24790,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         emit_error(
@@ -24933,8 +25006,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     polls,
                                     is_regex: wait_for_regex,
                                 });
-                                verification_error =
-                                    Some(format!("wait-for cancelled ({reason})"));
+                                verification_error = Some(format!("wait-for cancelled ({reason})"));
                             }
                             Err(e) => {
                                 verification_error = Some(format!("wait-for failed: {e}"));
@@ -25308,24 +25380,27 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     let db_path = layout.db_path.to_string_lossy();
-                    let storage =
-                        match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("Failed to open storage: {e}");
-                                return Ok(());
-                            }
-                        };
+                    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                        &frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request),
+                        &db_path,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to open storage: {e}");
+                            return Ok(());
+                        }
+                    };
 
                     // ft-xbnl0.2.3 tick 236: cx-first storage read.
                     let storage_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
-                    match storage.get_workflow_with_cx(&storage_cx, &execution_id).await {
+                    match storage
+                        .get_workflow_with_cx(&storage_cx, &execution_id)
+                        .await
+                    {
                         Ok(Some(record)) => {
                             println!("Workflow: {} ({})", record.workflow_name, record.id);
                             println!("Status: {}", record.status);
@@ -25474,6 +25549,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if health {
                 // Health check mode: JSON status including runtime health snapshot
                 let wezterm = frankenterm_core::wezterm::default_wezterm_handle();
+                let session_report = layout
+                    .db_path
+                    .exists()
+                    .then(|| {
+                        frankenterm_core::session_restore::session_doctor(
+                            layout.db_path.to_string_lossy().as_ref(),
+                        )
+                        .ok()
+                    })
+                    .flatten();
                 let mut payload = serde_json::json!({
                     "status": "ok",
                     "version": frankenterm_core::VERSION,
@@ -25554,8 +25639,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let snapshot = payload.clone();
                     attach_resize_dashboard_from_status_payload(&mut payload, &snapshot);
                 }
-                if let Some(crash) = frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir)
-                {
+                let latest_crash_bundle =
+                    frankenterm_core::crash::latest_crash_bundle(&layout.crash_dir);
+                if let Some(crash) = latest_crash_bundle.as_ref() {
                     let mut crash_info = serde_json::json!({
                         "bundle_path": crash.path.display().to_string(),
                     });
@@ -25572,6 +25658,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             serde_json::Value::String(manifest.created_at.clone());
                     }
                     payload["latest_crash"] = crash_info;
+                }
+                let watcher_error = payload
+                    .get("watcher_error")
+                    .and_then(serde_json::Value::as_str);
+                let workspace_bootstrap_pending = !layout.ft_dir.exists()
+                    || !layout.db_path.exists()
+                    || !layout.logs_dir.exists();
+                let operator_guidance = build_status_health_operator_guidance(
+                    payload
+                        .get("watcher_running")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    watcher_error,
+                    session_report.as_ref(),
+                    latest_crash_bundle.is_some(),
+                    workspace_bootstrap_pending,
+                );
+                payload["operator_guidance"] =
+                    serde_json::to_value(&operator_guidance).unwrap_or(serde_json::Value::Null);
+                if let Some(report) = session_report.as_ref() {
+                    let mut session_payload =
+                        serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+                    session_payload["operator_guidance"] =
+                        serde_json::to_value(build_session_recovery_guidance(report))
+                            .unwrap_or(serde_json::Value::Null);
+                    payload["session_recovery"] = session_payload;
                 }
                 println!(
                     "{}",
@@ -26048,11 +26160,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     die(
@@ -26093,11 +26206,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
 
                         if let Err(e) = {
-                                            // ft-xbnl0.2.3 tick 271: cx-first event note set.
-                                            let note_cx = frankenterm_core::cx::Cx::current()
-                                                .unwrap_or_else(frankenterm_core::cx::for_request);
-                                            storage.set_event_note_with_cx(&note_cx, event_id, note, by.clone()).await
-                                        } {
+                            // ft-xbnl0.2.3 tick 271: cx-first event note set.
+                            let note_cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            storage
+                                .set_event_note_with_cx(&note_cx, event_id, note, by.clone())
+                                .await
+                        } {
                             die(&format!("Failed to update note: {e}"), None);
                         }
 
@@ -26310,14 +26425,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // ft-xbnl0.2.3 tick 271: cx-first remove event label.
                             let rm_label_cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
-                            let removed =
-                                match storage
-                                    .remove_event_label_with_cx(&rm_label_cx, event_id, label.clone())
-                                    .await
-                                {
-                                    Ok(v) => v,
-                                    Err(e) => die(&format!("Failed to remove label: {e}"), None),
-                                };
+                            let removed = match storage
+                                .remove_event_label_with_cx(&rm_label_cx, event_id, label.clone())
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => die(&format!("Failed to remove label: {e}"), None),
+                            };
 
                             let input_summary =
                                 format!("ft events label {event_id} --remove {label}");
@@ -26469,7 +26583,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         let ann_cx = frankenterm_core::cx::Cx::current()
                             .unwrap_or_else(frankenterm_core::cx::for_request);
                         for event in display_events {
-                            match storage.get_event_annotations_with_cx(&ann_cx, event.id).await {
+                            match storage
+                                .get_event_annotations_with_cx(&ann_cx, event.id)
+                                .await
+                            {
                                 Ok(Some(annotations)) => {
                                     if annotations.triage_state.is_none()
                                         && annotations.note.is_none()
@@ -26599,11 +26716,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     die(
@@ -26962,11 +27080,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let output_format = resolve_prepare_output_format(&format);
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open database: {e}");
@@ -27227,20 +27346,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 } => {
                     let output_format = resolve_prepare_output_format(&format);
                     let db_path = layout.db_path.to_string_lossy();
-                    let storage =
-                        match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
-                            Ok(s) => std::sync::Arc::new(s),
-                            Err(e) => {
-                                eprintln!("Error: Failed to open database: {e}");
-                                eprintln!("Is the watcher running? Try: ft watch --foreground");
-                                std::process::exit(1);
-                            }
-                        };
+                    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                        &frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request),
+                        &db_path,
+                    )
+                    .await
+                    {
+                        Ok(s) => std::sync::Arc::new(s),
+                        Err(e) => {
+                            eprintln!("Error: Failed to open database: {e}");
+                            eprintln!("Is the watcher running? Try: ft watch --foreground");
+                            std::process::exit(1);
+                        }
+                    };
 
                     let workspace_id = layout.root.to_string_lossy().to_string();
                     let now = now_ms_i64();
@@ -27465,11 +27584,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }) => {
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {
                     eprintln!("Error: Failed to open database: {e}");
@@ -28129,11 +28249,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }) => {
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open database: {e}");
@@ -28346,11 +28467,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Error: Failed to open storage: {e}");
@@ -28482,11 +28604,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // Open storage handle
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         if output_format.is_json() {
@@ -28660,11 +28783,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     fail(&format!("Failed to open storage: {e}"));
@@ -28805,11 +28929,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(value) => Arc::new(value),
                 Err(err) => fail(&format!("Failed to open storage: {err}")),
             };
@@ -29049,11 +29174,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -29169,6 +29295,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Doctor { circuits, json }) => {
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
             let mut all_checks: Vec<DiagnosticCheck> = checks;
+            let session_report = layout
+                .db_path
+                .exists()
+                .then(|| {
+                    frankenterm_core::session_restore::session_doctor(
+                        layout.db_path.to_string_lossy().as_ref(),
+                    )
+                    .ok()
+                })
+                .flatten();
 
             let runtime_report = load_runtime_health_snapshot(&layout).await.map(|snapshot| {
                 frankenterm_core::runtime_health::report_from_health_snapshot(&snapshot)
@@ -29256,12 +29392,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 all_checks.extend(runtime_checks);
                 all_checks.push(crash_check);
+                let operator_guidance =
+                    build_doctor_operator_guidance(&all_checks, session_report.as_ref());
 
                 let mut result = serde_json::json!({
                     "ok": !has_errors,
                     "status": overall,
                     "version": env!("CARGO_PKG_VERSION"),
                     "checks": all_checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+                    "operator_guidance": operator_guidance,
                 });
 
                 if !circuit_checks.is_empty() {
@@ -29274,6 +29413,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     result["runtime_health"] =
                         serde_json::to_value(runtime_health).unwrap_or(serde_json::Value::Null);
                 }
+                if let Some(report) = session_report.as_ref() {
+                    let mut session_payload =
+                        serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+                    session_payload["operator_guidance"] =
+                        serde_json::to_value(build_session_recovery_guidance(report))
+                            .unwrap_or(serde_json::Value::Null);
+                    result["session_recovery"] = session_payload;
+                }
 
                 println!(
                     "{}",
@@ -29281,6 +29428,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 );
             } else {
                 // Plain text output
+                let mut doctor_checks = all_checks.clone();
+                doctor_checks.extend(runtime_checks.clone());
+                doctor_checks.push(crash_check.clone());
+                let operator_guidance =
+                    build_doctor_operator_guidance(&doctor_checks, session_report.as_ref());
+
                 println!("ft doctor - Running diagnostics...\n");
 
                 for check in &all_checks {
@@ -29352,14 +29505,33 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!();
                 if has_errors {
                     println!(
-                        "Diagnostics completed with errors. Fix issues above before using wa."
+                        "Diagnostics completed with errors. Fix issues above before using ft."
                     );
                 } else if has_warnings {
                     println!(
-                        "Diagnostics completed with warnings. wa should work but performance may be affected."
+                        "Diagnostics completed with warnings. ft should work but performance may be affected."
                     );
                 } else {
-                    println!("All checks passed! wa is ready to use.");
+                    println!("All checks passed! ft is ready to use.");
+                }
+
+                if let Some(report) = session_report.as_ref() {
+                    println!();
+                    println!("Session Recovery:");
+                    println!("  {}", build_session_recovery_guidance(report).summary);
+                }
+
+                println!();
+                print_operator_guidance(&operator_guidance);
+                if let Some(report) = session_report.as_ref() {
+                    let recovery_guidance = build_session_recovery_guidance(report);
+                    if recovery_guidance.status != "healthy"
+                        && recovery_guidance.status != "no_sessions"
+                    {
+                        println!();
+                        println!("Recovery entrypoint:");
+                        print_operator_guidance(&recovery_guidance);
+                    }
                 }
             }
 
@@ -29377,7 +29549,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     audit,
                     workflows,
                 } => {
-                    use frankenterm_core::diagnostic::{DiagnosticOptions, generate_bundle_with_cx};
+                    use frankenterm_core::diagnostic::{
+                        DiagnosticOptions, generate_bundle_with_cx,
+                    };
 
                     // Resolve output path
                     let output_path = output;
@@ -29401,20 +29575,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     };
 
                     let db_path = layout.db_path.to_string_lossy();
-                    let storage =
-                        match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("Error: Failed to open storage: {e}");
-                                eprintln!("Is the database initialized? Run 'ft watch' first.");
-                                std::process::exit(1);
-                            }
-                        };
+                    let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
+                        &frankenterm_core::cx::Cx::current()
+                            .unwrap_or_else(frankenterm_core::cx::for_request),
+                        &db_path,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Error: Failed to open storage: {e}");
+                            eprintln!("Is the database initialized? Run 'ft watch' first.");
+                            std::process::exit(1);
+                        }
+                    };
 
                     let opts = DiagnosticOptions {
                         event_limit: events,
@@ -29428,7 +29602,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     // ft-xbnl0.2.3 tick 252: cx-first diagnostic bundle.
                     let diag_cx = frankenterm_core::cx::Cx::current()
                         .unwrap_or_else(frankenterm_core::cx::for_request);
-                    match generate_bundle_with_cx(&diag_cx, &config, &layout, &storage, &opts).await {
+                    match generate_bundle_with_cx(&diag_cx, &config, &layout, &storage, &opts).await
+                    {
                         Ok(result) => {
                             eprintln!("Bundle generated: {}", result.output_path);
                             eprintln!("  Files:      {}", result.file_count);
@@ -31214,11 +31389,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // Open storage handle
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -31355,13 +31531,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 // Open storage for rate-limit check
                 let db_path = layout.db_path.to_string_lossy();
-                if let Ok(storage_check) =
-                    frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await
+                if let Ok(storage_check) = frankenterm_core::storage::StorageHandle::new_with_cx(
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
                 {
                     if let Ok(accounts) = storage_check.get_accounts_by_service(&service_key).await
                     {
@@ -31408,11 +31583,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // Persist refreshed data
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         die(
@@ -31479,11 +31655,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let service_key = canonical_accounts_service_key(&service);
                 let db_path = layout.db_path.to_string_lossy();
                 let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         die(
@@ -31632,11 +31809,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if needs_db {
                 let db_path = layout.db_path.to_string_lossy();
                 let storage_result = frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await;
+                    &frankenterm_core::cx::Cx::current()
+                        .unwrap_or_else(frankenterm_core::cx::for_request),
+                    &db_path,
+                )
+                .await;
 
                 match storage_result {
                     Ok(storage) => {
@@ -31670,8 +31847,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // ft-xbnl0.2.3 tick 244: cx-first storage read.
                             let storage_cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
-                            if let Ok(events) =
-                                storage.get_events_with_cx(&storage_cx, query).await
+                            if let Ok(events) = storage.get_events_with_cx(&storage_cx, query).await
                             {
                                 for event in &events {
                                     let is_muted = event
@@ -31995,11 +32171,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: Failed to open storage: {e}");
@@ -32197,11 +32374,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -32240,11 +32418,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     // Route through tracing, not raw eprintln (FTUI-03.2.a).
@@ -32287,11 +32466,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(%e, "Failed to open storage for TUI");
@@ -32342,11 +32522,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let db_path = layout.db_path.to_string_lossy();
             let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+                &frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request),
+                &db_path,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     if output_format.is_json() {
@@ -32686,7 +32867,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
 
                     let mock_event = Scenario::to_mock_event(event)?;
-                    mock.inject_with_cx(&inject_cx, event.pane, mock_event).await?;
+                    mock.inject_with_cx(&inject_cx, event.pane, mock_event)
+                        .await?;
 
                     if json {
                         let ev = serde_json::json!({
@@ -33023,11 +33205,11 @@ async fn handle_why_recent(
     // Open storage
     let db_path = layout.db_path.to_string_lossy();
     let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+        &frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request),
+        &db_path,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             if output_format.is_json() {
@@ -33061,8 +33243,8 @@ async fn handle_why_recent(
             ..Default::default()
         };
         // ft-xbnl0.2.3 tick 236: cx-first storage read.
-        let storage_cx = frankenterm_core::cx::Cx::current()
-            .unwrap_or_else(frankenterm_core::cx::for_request);
+        let storage_cx =
+            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
         match storage.get_audit_actions_with_cx(&storage_cx, query).await {
             Ok(actions) => {
                 if let Some(record) = actions.iter().find(|a| a.id == record_id) {
@@ -33108,8 +33290,8 @@ async fn handle_why_recent(
     };
 
     // ft-xbnl0.2.3 tick 236: cx-first storage read.
-    let storage_cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let storage_cx =
+        frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match storage.get_audit_actions_with_cx(&storage_cx, query).await {
         Ok(actions) => {
             if actions.is_empty() {
@@ -36334,11 +36516,11 @@ async fn resolve_real_tx_runtime(
 ) {
     let db_path = layout.db_path.to_string_lossy();
     let storage = match frankenterm_core::storage::StorageHandle::new_with_cx(
-                                    &frankenterm_core::cx::Cx::current()
-                                        .unwrap_or_else(frankenterm_core::cx::for_request),
-                                    &db_path,
-                                )
-                                .await {
+        &frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request),
+        &db_path,
+    )
+    .await
+    {
         Ok(storage) => storage,
         Err(err) => {
             return (
@@ -36353,8 +36535,7 @@ async fn resolve_real_tx_runtime(
 
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
     // ft-xbnl0.2.3 tick 234: cx-first.
-    let cx = frankenterm_core::cx::Cx::current()
-        .unwrap_or_else(frankenterm_core::cx::for_request);
+    let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
         Ok(_) => (Some((storage, wezterm)), None),
         Err(err) => (
@@ -39039,7 +39220,10 @@ async fn handle_snapshot_command(
             // ft-xbnl0.2.3 tick 273: cx-first snapshot capture (ft snapshot save).
             let snap_save_cx = frankenterm_core::cx::Cx::current()
                 .unwrap_or_else(frankenterm_core::cx::for_request);
-            match engine.capture_with_cx(&snap_save_cx, &panes, snap_trigger).await {
+            match engine
+                .capture_with_cx(&snap_save_cx, &panes, snap_trigger)
+                .await
+            {
                 Ok(result) => {
                     if format == "json" {
                         let resp = serde_json::json!({
@@ -39694,9 +39878,13 @@ async fn handle_session_command(
 
         SessionCommands::Doctor { format } => {
             let report = session_restore::session_doctor(&db_path)?;
+            let guidance = build_session_recovery_guidance(&report);
 
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let mut payload = serde_json::to_value(&report)?;
+                payload["operator_guidance"] =
+                    serde_json::to_value(&guidance).unwrap_or(serde_json::Value::Null);
+                println!("{}", serde_json::to_string_pretty(&payload)?);
                 return Ok(());
             }
 
@@ -39709,6 +39897,7 @@ async fn handle_session_command(
             println!("Orphaned states: {}", report.orphaned_pane_states);
             println!();
 
+            println!("{}", guidance.summary);
             if report.unclean_sessions > 0 {
                 println!(
                     "⚠ {} session(s) from unclean shutdown — run `ft watch` to restore.",
@@ -39724,6 +39913,8 @@ async fn handle_session_command(
             if report.unclean_sessions == 0 && report.orphaned_pane_states == 0 {
                 println!("✓ All healthy.");
             }
+            println!();
+            print_operator_guidance(&guidance);
         }
     }
 
@@ -41466,6 +41657,7 @@ where
 }
 
 /// Diagnostic result for a single check
+#[derive(Debug, Clone)]
 struct DiagnosticCheck {
     name: String,
     status: DiagnosticStatus,
@@ -41473,7 +41665,7 @@ struct DiagnosticCheck {
     recommendation: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum DiagnosticStatus {
     Ok,
     Warning,
@@ -41565,6 +41757,497 @@ impl DiagnosticStatus {
             Self::Warning => "warning",
             Self::Error => "error",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct OperatorNextStep {
+    label: String,
+    command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct OperatorGuidance {
+    status: String,
+    summary: String,
+    next_steps: Vec<OperatorNextStep>,
+}
+
+fn operator_next_step(label: impl Into<String>, command: impl Into<String>) -> OperatorNextStep {
+    OperatorNextStep {
+        label: label.into(),
+        command: command.into(),
+    }
+}
+
+fn push_unique_operator_step(
+    steps: &mut Vec<OperatorNextStep>,
+    label: impl Into<String>,
+    command: impl Into<String>,
+) {
+    let step = operator_next_step(label, command);
+    if !steps
+        .iter()
+        .any(|existing| existing.command == step.command)
+    {
+        steps.push(step);
+    }
+}
+
+fn print_operator_guidance(guidance: &OperatorGuidance) {
+    println!("Operator guidance [{}]", guidance.status);
+    println!("  {}", guidance.summary);
+    if !guidance.next_steps.is_empty() {
+        println!("  Next steps:");
+        for step in &guidance.next_steps {
+            println!("    - {}: {}", step.label, step.command);
+        }
+    }
+}
+
+fn diagnostic_check_named<'a>(
+    checks: &'a [DiagnosticCheck],
+    name: &str,
+) -> Option<&'a DiagnosticCheck> {
+    checks.iter().find(|check| check.name == name)
+}
+
+fn workspace_bootstrap_pending_from_checks(checks: &[DiagnosticCheck]) -> bool {
+    [".ft directory", "database", "logs directory"]
+        .into_iter()
+        .all(|name| {
+            diagnostic_check_named(checks, name).is_some_and(|check| {
+                check.status == DiagnosticStatus::Warning
+                    && check
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("does not exist"))
+            })
+        })
+}
+
+fn recommended_steps_from_checks(checks: &[DiagnosticCheck]) -> Vec<OperatorNextStep> {
+    let mut steps = Vec::new();
+    for check in checks.iter().filter(|check| {
+        matches!(
+            check.status,
+            DiagnosticStatus::Warning | DiagnosticStatus::Error
+        )
+    }) {
+        if let Some(recommendation) = check.recommendation.as_deref() {
+            push_unique_operator_step(
+                &mut steps,
+                format!("Resolve {}", check.name),
+                recommendation,
+            );
+        }
+        if steps.len() >= 4 {
+            break;
+        }
+    }
+    steps
+}
+
+fn build_session_recovery_guidance(
+    report: &frankenterm_core::session_restore::SessionDoctorReport,
+) -> OperatorGuidance {
+    let mut next_steps = Vec::new();
+
+    if report.unclean_sessions > 0 {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Start guided restore",
+            "ft watch --foreground",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect persisted sessions",
+            "ft session list -f json",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect checkpoints",
+            "ft snapshot list -f json",
+        );
+        return OperatorGuidance {
+            status: "recovery_required".to_string(),
+            summary: format!(
+                "{} unclean session(s) need recovery before you trust pane state.",
+                report.unclean_sessions
+            ),
+            next_steps,
+        };
+    }
+
+    if report.orphaned_pane_states > 0 {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Review detailed report",
+            "ft session doctor -f json",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect live sessions",
+            "ft session list -f json",
+        );
+        return OperatorGuidance {
+            status: "maintenance_recommended".to_string(),
+            summary: format!(
+                "{} orphaned pane state row(s) were found; clean them up after verifying the session inventory.",
+                report.orphaned_pane_states
+            ),
+            next_steps,
+        };
+    }
+
+    if report.total_sessions == 0 {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Start first watcher run",
+            "ft watch --foreground",
+        );
+        push_unique_operator_step(
+            &mut next_steps,
+            "Verify runtime health",
+            "ft status --health",
+        );
+        return OperatorGuidance {
+            status: "no_sessions".to_string(),
+            summary:
+                "No persisted session state exists yet; this is normal before the first watcher run."
+                    .to_string(),
+            next_steps,
+        };
+    }
+
+    push_unique_operator_step(
+        &mut next_steps,
+        "Check runtime health",
+        "ft status --health",
+    );
+    push_unique_operator_step(
+        &mut next_steps,
+        "Start or reconnect watcher",
+        "ft watch --foreground",
+    );
+    OperatorGuidance {
+        status: "healthy".to_string(),
+        summary: "Session persistence is healthy; no recovery action is required.".to_string(),
+        next_steps,
+    }
+}
+
+fn build_doctor_operator_guidance(
+    checks: &[DiagnosticCheck],
+    session_report: Option<&frankenterm_core::session_restore::SessionDoctorReport>,
+) -> OperatorGuidance {
+    if let Some(report) = session_report {
+        if report.unclean_sessions > 0 {
+            return build_session_recovery_guidance(report);
+        }
+    }
+
+    if workspace_bootstrap_pending_from_checks(checks) {
+        return OperatorGuidance {
+            status: "bootstrap_required".to_string(),
+            summary:
+                "Workspace state has not been bootstrapped yet. ft will create .ft/, logs, and the database on the first watcher start."
+                    .to_string(),
+            next_steps: vec![
+                operator_next_step("Start first watcher run", "ft watch --foreground"),
+                operator_next_step("Verify startup health", "ft status --health"),
+                operator_next_step("Capture machine-readable diagnostics", "ft doctor --json"),
+            ],
+        };
+    }
+
+    let has_errors = checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Error);
+    let has_warnings = checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Warning);
+    let mut next_steps = recommended_steps_from_checks(checks);
+
+    if has_errors {
+        if next_steps.is_empty() {
+            push_unique_operator_step(&mut next_steps, "Capture diagnostics", "ft doctor --json");
+        }
+        return OperatorGuidance {
+            status: "blocked".to_string(),
+            summary:
+                "One or more hard prerequisites are failing. Fix the reported errors before relying on ft."
+                    .to_string(),
+            next_steps,
+        };
+    }
+
+    if has_warnings {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Verify runtime health",
+            "ft status --health",
+        );
+        return OperatorGuidance {
+            status: "attention_required".to_string(),
+            summary:
+                "ft is partially ready, but you should clear the warnings below before long-running use."
+                    .to_string(),
+            next_steps,
+        };
+    }
+
+    OperatorGuidance {
+        status: "ready".to_string(),
+        summary: "This workspace is ready for the standard ft startup path.".to_string(),
+        next_steps: vec![
+            operator_next_step("Start watcher", "ft watch --foreground"),
+            operator_next_step("Verify health", "ft status --health"),
+            operator_next_step("Inspect panes", "ft robot --format toon state"),
+        ],
+    }
+}
+
+fn build_status_health_operator_guidance(
+    watcher_running: bool,
+    watcher_error: Option<&str>,
+    session_report: Option<&frankenterm_core::session_restore::SessionDoctorReport>,
+    latest_crash_bundle: bool,
+    workspace_bootstrap_pending: bool,
+) -> OperatorGuidance {
+    if let Some(report) = session_report {
+        if report.unclean_sessions > 0 {
+            return build_session_recovery_guidance(report);
+        }
+        if report.orphaned_pane_states > 0 {
+            return build_session_recovery_guidance(report);
+        }
+    }
+
+    if workspace_bootstrap_pending {
+        return OperatorGuidance {
+            status: "bootstrap_required".to_string(),
+            summary:
+                "This looks like a first-run workspace. Start the watcher once so ft can create its runtime state."
+                    .to_string(),
+            next_steps: vec![
+                operator_next_step("Start first watcher run", "ft watch --foreground"),
+                operator_next_step("Re-check health", "ft status --health"),
+                operator_next_step("Capture diagnostics", "ft doctor --json"),
+            ],
+        };
+    }
+
+    if watcher_running {
+        return OperatorGuidance {
+            status: "ready".to_string(),
+            summary:
+                "Watcher health is available. Use this snapshot as the standard operator entrypoint."
+                    .to_string(),
+            next_steps: vec![
+                operator_next_step("Inspect detailed diagnostics", "ft doctor"),
+                operator_next_step("Inspect panes", "ft robot --format toon state"),
+                operator_next_step("Inspect session state", "ft session doctor -f json"),
+            ],
+        };
+    }
+
+    let mut next_steps = vec![
+        operator_next_step("Run diagnostics", "ft doctor"),
+        operator_next_step("Retry watcher startup", "ft watch --foreground"),
+        operator_next_step("Inspect session state", "ft session doctor -f json"),
+    ];
+    if latest_crash_bundle {
+        push_unique_operator_step(
+            &mut next_steps,
+            "Inspect recent crash bundle",
+            "ft diag bundle --force",
+        );
+        return OperatorGuidance {
+            status: "watcher_restart_recommended".to_string(),
+            summary:
+                "The watcher is down and a recent crash bundle exists. Start with diagnostics before retrying startup."
+                    .to_string(),
+            next_steps,
+        };
+    }
+
+    if let Some(error) = watcher_error {
+        return OperatorGuidance {
+            status: "watcher_unreachable".to_string(),
+            summary: format!(
+                "The watcher is not reachable yet ({error}). Use the standard diagnostics and startup path."
+            ),
+            next_steps,
+        };
+    }
+
+    OperatorGuidance {
+        status: "watcher_stopped".to_string(),
+        summary:
+            "The watcher is not running. Start it, then re-run the health snapshot to validate the environment."
+                .to_string(),
+        next_steps,
+    }
+}
+
+#[cfg(test)]
+mod operator_guidance_tests {
+    use super::{
+        DiagnosticCheck, DiagnosticStatus, build_doctor_operator_guidance,
+        build_session_recovery_guidance, build_status_health_operator_guidance,
+        workspace_bootstrap_pending_from_checks,
+    };
+    use frankenterm_core::session_restore::SessionDoctorReport;
+
+    #[test]
+    fn bootstrap_pending_requires_all_runtime_paths_missing() {
+        let checks = vec![
+            DiagnosticCheck::warning(
+                ".ft directory",
+                "/tmp/ws/.ft does not exist",
+                "Will be created on first daemon start",
+            ),
+            DiagnosticCheck::warning(
+                "database",
+                "/tmp/ws/.ft/ft.db does not exist",
+                "Will be created on first daemon start",
+            ),
+            DiagnosticCheck::warning(
+                "logs directory",
+                "/tmp/ws/.ft/logs does not exist",
+                "Will be created on first daemon start",
+            ),
+        ];
+        assert!(workspace_bootstrap_pending_from_checks(&checks));
+    }
+
+    #[test]
+    fn doctor_guidance_prefers_bootstrap_path() {
+        let checks = vec![
+            DiagnosticCheck::warning(
+                ".ft directory",
+                "/tmp/ws/.ft does not exist",
+                "Will be created on first daemon start",
+            ),
+            DiagnosticCheck::warning(
+                "database",
+                "/tmp/ws/.ft/ft.db does not exist",
+                "Will be created on first daemon start",
+            ),
+            DiagnosticCheck::warning(
+                "logs directory",
+                "/tmp/ws/.ft/logs does not exist",
+                "Will be created on first daemon start",
+            ),
+        ];
+
+        let guidance = build_doctor_operator_guidance(&checks, None);
+        assert_eq!(guidance.status, "bootstrap_required");
+        assert!(guidance.summary.contains("bootstrapped"));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| step.command == "ft watch --foreground")
+        );
+    }
+
+    #[test]
+    fn doctor_guidance_uses_reported_recommendations_when_blocked() {
+        let checks = vec![
+            DiagnosticCheck::error(
+                "WezTerm CLI",
+                "wezterm not found",
+                "Install WezTerm from https://wezfurlong.org/wezterm/",
+            ),
+            DiagnosticCheck::warning(
+                "filesystem permissions",
+                "workspace not writable",
+                "Fix filesystem permissions before retrying",
+            ),
+        ];
+
+        let guidance = build_doctor_operator_guidance(&checks, None);
+        assert_eq!(guidance.status, "blocked");
+        assert!(guidance.next_steps.iter().any(|step| {
+            step.command == "Install WezTerm from https://wezfurlong.org/wezterm/"
+        }));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| { step.command == "Fix filesystem permissions before retrying" })
+        );
+    }
+
+    #[test]
+    fn session_recovery_guidance_prefers_unclean_restore_path() {
+        let report = SessionDoctorReport {
+            total_sessions: 3,
+            unclean_sessions: 2,
+            total_checkpoints: 4,
+            orphaned_pane_states: 0,
+            total_data_bytes: 8192,
+        };
+
+        let guidance = build_session_recovery_guidance(&report);
+        assert_eq!(guidance.status, "recovery_required");
+        assert!(guidance.summary.contains("unclean session"));
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| step.command == "ft watch --foreground")
+        );
+    }
+
+    #[test]
+    fn session_recovery_guidance_marks_empty_workspace_as_first_run() {
+        let report = SessionDoctorReport {
+            total_sessions: 0,
+            unclean_sessions: 0,
+            total_checkpoints: 0,
+            orphaned_pane_states: 0,
+            total_data_bytes: 0,
+        };
+
+        let guidance = build_session_recovery_guidance(&report);
+        assert_eq!(guidance.status, "no_sessions");
+        assert!(guidance.summary.contains("first watcher run"));
+    }
+
+    #[test]
+    fn status_health_guidance_prefers_recovery_over_bootstrap() {
+        let report = SessionDoctorReport {
+            total_sessions: 2,
+            unclean_sessions: 1,
+            total_checkpoints: 2,
+            orphaned_pane_states: 0,
+            total_data_bytes: 1024,
+        };
+
+        let guidance = build_status_health_operator_guidance(
+            false,
+            Some("ipc unavailable"),
+            Some(&report),
+            true,
+            true,
+        );
+        assert_eq!(guidance.status, "recovery_required");
+        assert!(
+            guidance
+                .next_steps
+                .iter()
+                .any(|step| { step.command == "ft session list -f json" })
+        );
+    }
+
+    #[test]
+    fn diagnostic_status_strings_remain_stable() {
+        assert_eq!(DiagnosticStatus::Ok.as_str(), "ok");
+        assert_eq!(DiagnosticStatus::Warning.as_str(), "warning");
+        assert_eq!(DiagnosticStatus::Error.as_str(), "error");
     }
 }
 
