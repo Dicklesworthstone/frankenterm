@@ -48,6 +48,19 @@ pub use fastmcp::{
     StdioTransport as FrameworkStdioTransport, ToolHandler as FrameworkToolHandler,
 };
 
+#[cfg(feature = "mcp")]
+#[allow(unused_imports)]
+pub(crate) fn framework_server_builder(name: &str, version: &str) -> FrameworkServerBuilder {
+    fastmcp::Server::new(name, version)
+}
+
+#[cfg(feature = "mcp")]
+#[allow(unused_imports)]
+pub(crate) fn run_framework_stdio_server(server: FrameworkServer) -> FrameworkMcpResult<()> {
+    let transport = FrameworkStdioTransport::stdio();
+    server.run_transport(transport)
+}
+
 #[cfg(feature = "mcp-client")]
 #[derive(Debug)]
 pub(crate) struct DiscoveredFrameworkServers {

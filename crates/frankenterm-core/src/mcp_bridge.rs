@@ -15,7 +15,9 @@ use super::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
 };
-use crate::mcp_framework::{FrameworkServer as Server, FrameworkStdioTransport as StdioTransport};
+use crate::mcp_framework::{
+    FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,7 +32,7 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
     let config = Arc::new(config.clone());
     let db_path = db_path.map(Arc::new);
 
-    let mut builder = Server::new("wezterm-automata", crate::VERSION)
+    let mut builder = framework_server_builder("wezterm-automata", crate::VERSION)
         .instructions("ft MCP server (robot parity). See docs/mcp-api-spec.md.")
         .on_startup(|| -> std::result::Result<(), std::io::Error> {
             tracing::info!("MCP server starting");
@@ -185,6 +187,6 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 /// need a direct `fastmcp` dependency.
 pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
     let server = build_server_with_db(config, db_path)?;
-    let transport = StdioTransport::stdio();
-    server.run_transport(transport)
+    run_framework_stdio_server(server)
+        .map_err(|err| crate::error::Error::Runtime(format!("MCP stdio server failed: {err}")))
 }

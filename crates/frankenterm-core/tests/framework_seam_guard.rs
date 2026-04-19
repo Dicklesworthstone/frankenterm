@@ -61,7 +61,11 @@ fn collect_named_files(root: &Path, file_name: &str) -> Vec<PathBuf> {
                 if path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| matches!(name, ".git" | "target"))
+                    .is_some_and(|name| {
+                        matches!(name, ".git" | "target")
+                            || name.starts_with(".cargo")
+                            || name.starts_with(".rustup")
+                    })
                 {
                     continue;
                 }
@@ -207,5 +211,37 @@ fn core_manifest_keeps_framework_dependencies_optional_and_cli_uses_feature_forw
         !non_comment_lines(&cli_manifest)
             .any(|(_, line)| line.contains("fastmcp") || line.contains("fastapi")),
         "CLI manifest must consume framework support only through frankenterm-core features"
+    );
+}
+
+#[test]
+fn mcp_stdio_transport_bootstrap_stays_centralized_to_framework_seam() {
+    let core_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bridge_path = core_root.join("src/mcp_bridge.rs");
+    let framework_path = core_root.join("src/mcp_framework.rs");
+
+    let bridge = fs::read_to_string(&bridge_path).unwrap_or_else(|err| {
+        panic!("failed to read {}: {err}", bridge_path.display());
+    });
+    let framework = fs::read_to_string(&framework_path).unwrap_or_else(|err| {
+        panic!("failed to read {}: {err}", framework_path.display());
+    });
+
+    assert!(
+        !bridge.contains("FrameworkStdioTransport")
+            && !bridge.contains("StdioTransport::stdio()")
+            && !bridge.contains("server.run_transport("),
+        "mcp_bridge.rs should route stdio transport wiring through mcp_framework.rs"
+    );
+    assert!(
+        bridge.contains("framework_server_builder(")
+            && bridge.contains("run_framework_stdio_server(server)"),
+        "mcp_bridge.rs should use framework_server_builder + run_framework_stdio_server helpers"
+    );
+    assert!(
+        framework.contains("fn framework_server_builder")
+            && framework.contains("fn run_framework_stdio_server")
+            && framework.contains("FrameworkStdioTransport::stdio()"),
+        "mcp_framework.rs must own the MCP stdio transport/bootstrap seam"
     );
 }
