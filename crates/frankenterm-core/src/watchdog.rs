@@ -382,9 +382,69 @@ pub fn spawn_watchdog(
     let internal_flag = Arc::clone(&internal_shutdown);
     let check_interval = config.check_interval;
 
+    #[cfg(feature = "asupersync-runtime")]
+    let task = {
+        let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        task::spawn_with_cx(&parent_cx, move |watchdog_cx| async move {
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
+                    info!("Watchdog: shutdown signal received");
+                    break;
+                }
+
+                if watchdog_cx.checkpoint().is_err() {
+                    info!("Watchdog: cancelled via cx");
+                    break;
+                }
+
+                let report = heartbeats.check_health(&config);
+
+                match report.overall {
+                    HealthStatus::Healthy => {
+                        // Everything fine — nothing to log at info level.
+                    }
+                    HealthStatus::Degraded => {
+                        for ch in report.unhealthy_components() {
+                            warn!(
+                                component = %ch.component,
+                                status = %ch.status,
+                                age_ms = ch.age_ms,
+                                threshold_ms = ch.threshold_ms,
+                                "Watchdog: component heartbeat is stale"
+                            );
+                        }
+                    }
+                    HealthStatus::Critical | HealthStatus::Hung => {
+                        for ch in report.unhealthy_components() {
+                            error!(
+                                component = %ch.component,
+                                status = %ch.status,
+                                age_ms = ch.age_ms,
+                                threshold_ms = ch.threshold_ms,
+                                "Watchdog: component heartbeat critically stale"
+                            );
+                        }
+
+                        // Dump full diagnostic report at error level.
+                        if let Ok(json) = serde_json::to_string_pretty(&report) {
+                            error!(diagnostic = %json, "Watchdog: diagnostic dump");
+                        }
+                    }
+                }
+
+                if crate::runtime_compat::sleep_with_cx(&watchdog_cx, check_interval)
+                    .await
+                    .is_err()
+                {
+                    info!("Watchdog: cancelled via cx");
+                    break;
+                }
+            }
+        })
+    };
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     let task = task::spawn(async move {
-        // ft-xbnl0.2.3 tick 293: cx-first watchdog monitor loop sleep.
-        let watchdog_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         loop {
             if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
                 info!("Watchdog: shutdown signal received");
@@ -419,29 +479,13 @@ pub fn spawn_watchdog(
                         );
                     }
 
-                    // Dump full diagnostic report at error level.
                     if let Ok(json) = serde_json::to_string_pretty(&report) {
                         error!(diagnostic = %json, "Watchdog: diagnostic dump");
                     }
                 }
             }
 
-            #[cfg(feature = "asupersync-runtime")]
-            {
-                // ft-xbnl0.2.3 tick 293: cx-first watchdog monitor loop sleep.
-                let watchdog_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                if crate::runtime_compat::sleep_with_cx(&watchdog_cx, check_interval)
-                    .await
-                    .is_err()
-                {
-                    info!("Watchdog: cancelled via cx");
-                    break;
-                }
-            }
-            #[cfg(not(feature = "asupersync-runtime"))]
-            {
-                crate::runtime_compat::sleep(check_interval).await;
-            }
+            crate::runtime_compat::sleep(check_interval).await;
         }
     });
 
@@ -796,77 +840,78 @@ pub fn spawn_mux_watchdog(
     let check_interval = config.check_interval;
     let failure_threshold = config.failure_threshold;
 
-    task::spawn(async move {
-        let mut watchdog = MuxWatchdog::new(config, wezterm);
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        task::spawn_with_cx(&parent_cx, move |mux_watchdog_cx| async move {
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
 
-        info!("Mux watchdog started");
+            info!("Mux watchdog started");
 
-        // ft-xbnl0.2.3 tick 293: cx-first mux watchdog loop sleep.
-        let mux_watchdog_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        loop {
-            if shutdown_flag.load(Ordering::SeqCst) {
-                info!("Mux watchdog shutting down");
-                break;
-            }
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    info!("Mux watchdog shutting down");
+                    break;
+                }
 
-            let sample = watchdog.check().await;
+                if mux_watchdog_cx.checkpoint().is_err() {
+                    info!("Mux watchdog: cancelled via cx");
+                    break;
+                }
 
-            match sample.status {
-                HealthStatus::Healthy => {
-                    if watchdog.total_checks % 10 == 0 {
-                        info!(
-                            ping_ms = sample.ping_latency_ms,
+                let sample = watchdog.check_cx(&mux_watchdog_cx).await;
+
+                match sample.status {
+                    HealthStatus::Healthy => {
+                        if watchdog.total_checks % 10 == 0 {
+                            info!(
+                                ping_ms = sample.ping_latency_ms,
+                                rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                                warning_count = sample.warning_count,
+                                warning_details = sample.watchdog_warnings.join(" | "),
+                                "Mux watchdog: healthy"
+                            );
+                        }
+                    }
+                    HealthStatus::Degraded => {
+                        warn!(
+                            consecutive_failures = watchdog.consecutive_failures,
                             rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            ping_ok = sample.ping_ok,
                             warning_count = sample.warning_count,
                             warning_details = sample.watchdog_warnings.join(" | "),
-                            "Mux watchdog: healthy"
+                            "Mux watchdog: degraded"
+                        );
+                        crate::degradation::enter_degraded(
+                            crate::degradation::Subsystem::WeztermCli,
+                            format!(
+                                "Mux health degraded: {} consecutive failures, warnings={}",
+                                watchdog.consecutive_failures, sample.warning_count
+                            ),
+                        );
+                    }
+                    HealthStatus::Critical | HealthStatus::Hung => {
+                        error!(
+                            consecutive_failures = watchdog.consecutive_failures,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            ping_ok = sample.ping_ok,
+                            threshold = failure_threshold,
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
+                            "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
+                        );
+                        crate::degradation::enter_degraded(
+                            crate::degradation::Subsystem::WeztermCli,
+                            format!(
+                                "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
+                                watchdog.consecutive_failures,
+                                sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
+                                sample.warning_count
+                            ),
                         );
                     }
                 }
-                HealthStatus::Degraded => {
-                    warn!(
-                        consecutive_failures = watchdog.consecutive_failures,
-                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                        ping_ok = sample.ping_ok,
-                        warning_count = sample.warning_count,
-                        warning_details = sample.watchdog_warnings.join(" | "),
-                        "Mux watchdog: degraded"
-                    );
-                    crate::degradation::enter_degraded(
-                        crate::degradation::Subsystem::WeztermCli,
-                        format!(
-                            "Mux health degraded: {} consecutive failures, warnings={}",
-                            watchdog.consecutive_failures, sample.warning_count
-                        ),
-                    );
-                }
-                HealthStatus::Critical | HealthStatus::Hung => {
-                    error!(
-                        consecutive_failures = watchdog.consecutive_failures,
-                        rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                        ping_ok = sample.ping_ok,
-                        threshold = failure_threshold,
-                        warning_count = sample.warning_count,
-                        warning_details = sample.watchdog_warnings.join(" | "),
-                        "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
-                    );
-                    crate::degradation::enter_degraded(
-                        crate::degradation::Subsystem::WeztermCli,
-                        format!(
-                            "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
-                            watchdog.consecutive_failures,
-                            sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
-                            sample.warning_count
-                        ),
-                    );
-                }
-            }
 
-            #[cfg(feature = "asupersync-runtime")]
-            {
-                // ft-xbnl0.2.3 tick 293: cx-first mux watchdog loop sleep.
-                let mux_watchdog_cx =
-                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 if crate::runtime_compat::sleep_with_cx(&mux_watchdog_cx, check_interval)
                     .await
                     .is_err()
@@ -875,12 +920,79 @@ pub fn spawn_mux_watchdog(
                     break;
                 }
             }
-            #[cfg(not(feature = "asupersync-runtime"))]
-            {
+        })
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        task::spawn(async move {
+            let mut watchdog = MuxWatchdog::new(config, wezterm);
+
+            info!("Mux watchdog started");
+
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    info!("Mux watchdog shutting down");
+                    break;
+                }
+
+                let sample = watchdog.check().await;
+
+                match sample.status {
+                    HealthStatus::Healthy => {
+                        if watchdog.total_checks % 10 == 0 {
+                            info!(
+                                ping_ms = sample.ping_latency_ms,
+                                rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                                warning_count = sample.warning_count,
+                                warning_details = sample.watchdog_warnings.join(" | "),
+                                "Mux watchdog: healthy"
+                            );
+                        }
+                    }
+                    HealthStatus::Degraded => {
+                        warn!(
+                            consecutive_failures = watchdog.consecutive_failures,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            ping_ok = sample.ping_ok,
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
+                            "Mux watchdog: degraded"
+                        );
+                        crate::degradation::enter_degraded(
+                            crate::degradation::Subsystem::WeztermCli,
+                            format!(
+                                "Mux health degraded: {} consecutive failures, warnings={}",
+                                watchdog.consecutive_failures, sample.warning_count
+                            ),
+                        );
+                    }
+                    HealthStatus::Critical | HealthStatus::Hung => {
+                        error!(
+                            consecutive_failures = watchdog.consecutive_failures,
+                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
+                            ping_ok = sample.ping_ok,
+                            threshold = failure_threshold,
+                            warning_count = sample.warning_count,
+                            warning_details = sample.watchdog_warnings.join(" | "),
+                            "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
+                        );
+                        crate::degradation::enter_degraded(
+                            crate::degradation::Subsystem::WeztermCli,
+                            format!(
+                                "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
+                                watchdog.consecutive_failures,
+                                sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
+                                sample.warning_count
+                            ),
+                        );
+                    }
+                }
+
                 crate::runtime_compat::sleep(check_interval).await;
             }
-        }
-    })
+        })
+    }
 }
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
