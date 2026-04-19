@@ -122,6 +122,10 @@ rcgen = { workspace = true }
 
 # Benchmarks
 [[bench]]
+name = "aggregator_merge"
+harness = false
+
+[[bench]]
 name = "pattern_detection"
 harness = false
 
@@ -416,6 +420,10 @@ harness = false
 
 [[bench]]
 name = "persistent_ds_bench"
+harness = false
+
+[[bench]]
+name = "stream_hash_bench"
 harness = false
 
 [[test]]
