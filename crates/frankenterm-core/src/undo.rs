@@ -12,7 +12,8 @@ use crate::policy::{PolicyEngine, PolicyGatedInjector};
 use crate::storage::{ActionHistoryQuery, ActionUndoRecord, StorageHandle};
 use crate::wezterm::WeztermHandle;
 use crate::workflows::{
-    PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner, WorkflowRunnerConfig,
+    PaneWorkflowLockManager, PolicyInjectorHandle, WorkflowEngine, WorkflowRunner,
+    WorkflowRunnerConfig,
 };
 use crate::{Error, Result};
 
@@ -695,12 +696,10 @@ impl UndoExecutor {
         let engine = WorkflowEngine::new(10);
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let policy = PolicyEngine::permissive();
-        let injector = Arc::new(crate::runtime_compat::Mutex::new(
-            PolicyGatedInjector::with_storage(
-                policy,
-                Arc::clone(&self.wezterm),
-                self.storage.as_ref().clone(),
-            ),
+        let injector = PolicyInjectorHandle::new(PolicyGatedInjector::with_storage(
+            policy,
+            Arc::clone(&self.wezterm),
+            self.storage.as_ref().clone(),
         ));
         WorkflowRunner::new(
             engine,
