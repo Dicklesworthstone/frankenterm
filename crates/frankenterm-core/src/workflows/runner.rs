@@ -15,14 +15,7 @@ where
     F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Some(handle) = crate::runtime_compat::current_runtime_handle() {
-        std::mem::drop(crate::cx::spawn_with_cx(&handle, cx, task));
-    } else {
-        let child_cx = cx.clone();
-        std::mem::drop(crate::runtime_compat::task::spawn(async move {
-            task(child_cx).await;
-        }));
-    }
+    std::mem::drop(crate::runtime_compat::task::spawn_with_cx(cx, task));
 }
 
 // ============================================================================

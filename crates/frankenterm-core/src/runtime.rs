@@ -57,7 +57,7 @@ use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
     RwLock, mpsc,
-    task::{self, JoinHandle},
+    task::JoinHandle,
     watch,
 };
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
@@ -161,8 +161,7 @@ where
 {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let child_cx = runtime_cx.clone();
-        task::spawn(async move { task_fn(child_cx).await })
+        crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]

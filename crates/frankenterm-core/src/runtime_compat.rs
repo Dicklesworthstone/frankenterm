@@ -1013,6 +1013,16 @@ pub mod task {
         tokio::spawn(future)
     }
 
+    pub fn spawn_with_cx<F, Fut, T>(_cx: &crate::cx::Cx, task: F) -> JoinHandle<T>
+    where
+        F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let child_cx = crate::cx::for_request();
+        tokio::spawn(async move { task(child_cx).await })
+    }
+
     /// Spawns blocking work on the runtime's dedicated blocking thread pool,
     /// returning a `JoinHandle` that can be awaited, aborted, or used in
     /// `select!`.
@@ -1348,6 +1358,32 @@ pub mod task {
         let wrapped = HandleContextFuture {
             handle: handle.clone(),
             future: Box::pin(future),
+        };
+        let inner = handle.spawn(wrapped);
+        JoinHandle {
+            inner: Box::pin(inner),
+            aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            abort_waker: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn spawn_with_cx<F, Fut, T>(cx: &crate::cx::Cx, task: F) -> JoinHandle<T>
+    where
+        F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let handle = super::ASUPERSYNC_HANDLE.with(|cell| {
+            let borrow = cell.borrow();
+            borrow
+                .as_ref()
+                .cloned()
+                .expect("task::spawn_with_cx called outside of Runtime::block_on context")
+        });
+        let child_cx = cx.clone();
+        let wrapped = HandleContextFuture {
+            handle: handle.clone(),
+            future: Box::pin(async move { task(child_cx).await }),
         };
         let inner = handle.spawn(wrapped);
         JoinHandle {
@@ -4641,6 +4677,21 @@ mod tests {
             let handle = task::spawn(async { String::from("from task") });
             let result = handle.await.expect("task should complete");
             assert_eq!(result, "from task");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn task_spawn_with_cx_receives_explicit_context() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = crate::cx::for_testing();
+        rt.block_on(async move {
+            let handle = task::spawn_with_cx(&cx, |child_cx| async move {
+                let active = crate::cx::Cx::current().expect("installed child cx");
+                (active == child_cx, crate::runtime_compat::current_runtime_handle().is_some())
+            });
+            let result = handle.await.expect("task should complete");
+            assert_eq!(result, (true, true));
         });
     }
 
