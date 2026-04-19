@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::cass::{
-    CassAgent, CassMessage, CassSearchHit, CassSearchResult, CassSession, CassSessionSummary,
-    CassStatus, parse_cass_timestamp_ms,
+    CassMessage, CassSearchHit, CassSearchResult, CassSession, CassSessionSummary,
+    parse_cass_timestamp_ms,
 };
 
 mod bench_common;
