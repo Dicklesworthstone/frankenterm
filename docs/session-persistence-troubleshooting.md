@@ -2,6 +2,8 @@
 
 This guide covers the most common snapshot/restore failure modes and how to diagnose them quickly.
 
+Session persistence is a shipped `ft` feature, but live snapshot/restore still depends on the current WezTerm-backed mux interop boundary. Start with `ft doctor`, `ft status --health`, and `ft session doctor` before assuming the failure is in the snapshot data itself.
+
 ## 1) `ft snapshot save`: “No panes found” / “Failed to list panes”
 
 **Symptoms**
@@ -11,13 +13,13 @@ This guide covers the most common snapshot/restore failure modes and how to diag
 
 **Likely causes**
 
-- The active compatibility backend bridge (current: WezTerm) isn’t running
+- The current live mux interop boundary (WezTerm today) isn’t running
 - `wezterm` CLI is not available in `PATH` or can’t talk to the mux server
 - Pane filters exclude everything
 
 **What to do**
 
-1) Verify backend bridge CLI (current: WezTerm):
+1) Verify the current mux interop CLI:
    ```bash
    wezterm cli list
    ```
@@ -40,21 +42,27 @@ This guide covers the most common snapshot/restore failure modes and how to diag
    ```bash
    ft watch
    ```
-2) For a direct/manual restore, list recent checkpoints and restore one explicitly:
+2) Re-check operator health surfaces:
+   ```bash
+   ft doctor
+   ft status --health
+   ft session doctor
+   ```
+3) For a direct/manual restore, list recent checkpoints and restore one explicitly:
    ```bash
    ft snapshot list --limit 10
    ft snapshot restore <checkpoint_id>
    ```
-3) If you only want the split/tab/window layout and do not want scrollback replay:
+4) If you only want the split/tab/window layout and do not want scrollback replay:
    ```bash
    ft snapshot restore <checkpoint_id> --layout-only
    ```
-4) Check whether ft sees unclean sessions:
+5) Check whether ft sees unclean sessions:
    ```bash
    ft session doctor
    ft session list
    ```
-5) Inspect the latest checkpoint for a session:
+6) Inspect the latest checkpoint for a session:
    ```bash
    ft session show <session_id>
    ```
