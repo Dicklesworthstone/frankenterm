@@ -455,6 +455,26 @@ impl Semaphore {
         self.acquire_with_cx(&cx).await
     }
 
+    /// Acquire a permit under an explicit `&Cx` (ft-xbnl0.2.x Cx-first
+    /// primitive). Preferred over [`acquire`](Self::acquire) when the
+    /// caller already threads `&Cx` through its public API.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Observes **pre-cancel**: a pre-cancelled cx returns
+    /// `Err(AcquireError::Cancelled)` promptly via asupersync's per-poll
+    /// `cx.checkpoint()` short-circuit (pinned by
+    /// `semaphore_acquire_with_cx_observes_pre_cancel`, ft-xbnl0.2.4
+    /// tick 421).
+    ///
+    /// Does NOT observe **mid-flight cancel**: asupersync's semaphore
+    /// acquire does not register a cx-cancel-waker for an already-
+    /// suspended acquire (pinned by
+    /// `semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern`,
+    /// tick 439a). Callers needing mid-flight cancel observability
+    /// must wrap in `futures::future::select` against a poll-sleep
+    /// watcher (same pattern as `DistributedHttpClient::race_with_cx_cancel`,
+    /// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
     pub async fn acquire_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -487,6 +507,21 @@ impl Semaphore {
         self.acquire_owned_with_cx(&cx).await
     }
 
+    /// Acquire a permit as `OwnedSemaphorePermit` under an explicit
+    /// `&Cx` — owned-permit companion to [`acquire_with_cx`]. Used
+    /// when the permit needs to cross an await boundary or be moved
+    /// into a spawned task.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Same as [`acquire_with_cx`]: observes pre-cancel (pinned by
+    /// `semaphore_acquire_owned_with_cx_observes_pre_cancel`, tick
+    /// 427); does NOT register a cx-cancel-waker for already-suspended
+    /// acquires. The tick-421/439a tests pin the borrow variant; the
+    /// tick-427 pre-cancel test pins the owned variant. Callers
+    /// needing mid-flight cancel observability should use the same
+    /// select-race pattern. See
+    /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
     pub async fn acquire_owned_with_cx(
         self: Arc<Self>,
         cx: &crate::cx::Cx,
@@ -1154,6 +1189,26 @@ pub mod task {
         /// named `cx`, so the outer capability context is bound
         /// as `caller_cx` to avoid name collision inside the
         /// poll body.
+        ///
+        /// # Cancellation semantics
+        ///
+        /// Observes **pre-cancel**: the pre-flight checkpoint fires
+        /// before any handle polling (pinned by
+        /// `join_set_join_next_with_cx_observes_pre_cancel`,
+        /// ft-xbnl0.2.4 tick 426). Returns
+        /// `Some(Err(JoinError { msg: "aborted: join_next cancelled: ..." }))`
+        /// — `JoinError::is_cancelled()` returns true so callers can
+        /// fold cancel into their abort path.
+        ///
+        /// Also observes **mid-flight cancel** on any external re-poll
+        /// (task completion, external wake) via the per-poll-iteration
+        /// `caller_cx.checkpoint()` inside the `poll_fn` closure — this
+        /// is the key distinction from the asupersync-delegated recv
+        /// primitives (mpsc/oneshot/broadcast/watch/Semaphore) which
+        /// require the caller-side select-race workaround for
+        /// mid-flight cancel. The tick-439b select-race test tolerates
+        /// either branch firing; both observe cancel fast. See
+        /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
         pub async fn join_next_with_cx(
             &mut self,
             caller_cx: &crate::cx::Cx,
