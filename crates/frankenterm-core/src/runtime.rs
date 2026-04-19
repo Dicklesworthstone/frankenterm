@@ -153,6 +153,25 @@ where
     }
 }
 
+fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
+where
+    F: FnOnce(RuntimeLoopCx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let child_cx = runtime_cx.clone();
+        task::spawn(async move { task_fn(child_cx).await })
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = runtime_cx;
+        task::spawn(async move { task_fn(()).await })
+    }
+}
+
 async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -1300,7 +1319,8 @@ impl ObservationRuntime {
                         None
                     };
 
-                    let handle = task::spawn(async move {
+                    let loop_cx = runtime_loop_cx();
+                    let handle = spawn_runtime_task(&loop_cx, move |_task_cx| async move {
                         engine
                             .run_periodic(shutdown_rx, move || {
                                 let wez = wezterm.clone();
@@ -1366,8 +1386,8 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let metrics = Arc::clone(&self.metrics);
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut subscriber = event_bus.as_ref().map(|bus| bus.subscribe());
             let idle_enabled = subscriber.is_some();
             let mut last_activity = Instant::now();
@@ -1492,8 +1512,8 @@ impl ObservationRuntime {
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
         let initial_cache_gc_settings = self.config.gc;
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut retention_days = initial_retention_days;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut cache_gc_settings = initial_cache_gc_settings;
@@ -2057,8 +2077,8 @@ impl ObservationRuntime {
         let wezterm = Arc::clone(&self.wezterm_handle);
         let replay_capture = self.replay_capture.clone();
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut current_interval = initial_interval;
 
             loop {
@@ -2363,8 +2383,8 @@ impl ObservationRuntime {
             capture_timeout: Duration::from_secs(2),
         };
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let source = Arc::new(WeztermHandleSource::new(wezterm_handle));
             let capture_tx_for_supervisor = capture_tx.clone();
             // Create tailer supervisor with budget enforcement
@@ -2529,8 +2549,10 @@ impl ObservationRuntime {
                                 let shutdown_flag = Arc::clone(&shutdown_flag);
                                 let subscription_config = subscription_config.clone();
                                 let socket_path_for_task = socket_path.clone();
-                                let handle = task::spawn(async move {
-                                    let stream_task_cx = runtime_loop_cx();
+                                let stream_task_cx = loop_cx.clone();
+                                let handle = spawn_runtime_task(
+                                    &stream_task_cx,
+                                    move |stream_task_cx| async move {
                                     let exit_reason = run_vendored_streaming_capture(
                                         pane_id,
                                         subscription_pane_id,
@@ -2556,7 +2578,8 @@ impl ObservationRuntime {
                                         },
                                     )
                                     .await;
-                                });
+                                    },
+                                );
                                 streaming_tasks.insert(pane_id, handle);
                             }
                         }
@@ -2666,8 +2689,8 @@ impl ObservationRuntime {
         let event_bus = self.event_bus.clone();
         let pane_filter = self.config.pane_filter.clone();
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let listener = match NativeEventListener::bind(socket_path.clone()).await {
                 Ok(listener) => {
                     info!(
@@ -2688,7 +2711,10 @@ impl ObservationRuntime {
 
             let (event_tx, mut event_rx) = mpsc::channel::<NativeEvent>(1024);
 
-            let accept_handle = task::spawn(listener.run(event_tx, Arc::clone(&shutdown_flag)));
+            let accept_shutdown_flag = Arc::clone(&shutdown_flag);
+            let accept_handle = spawn_runtime_task(&loop_cx, move |_accept_cx| {
+                listener.run(event_tx, accept_shutdown_flag)
+            });
 
             let mut coalescer = NativeOutputCoalescer::new(
                 NATIVE_OUTPUT_COALESCE_WINDOW_MS,
@@ -2839,8 +2865,8 @@ impl ObservationRuntime {
     ) -> JoinHandle<()> {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             loop {
                 match runtime_timeout(
                     &loop_cx,
@@ -2903,8 +2929,8 @@ impl ObservationRuntime {
         let patterns_root = self.config.patterns_root.clone();
         let registry = Arc::clone(&registry);
 
-        task::spawn(async move {
-            let loop_cx = runtime_loop_cx();
+        let loop_cx = runtime_loop_cx();
+        spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
 
             // Process events until producer is closed and the ring is drained.
