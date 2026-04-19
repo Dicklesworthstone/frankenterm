@@ -1905,7 +1905,10 @@ impl WorkflowRunner {
                                         replay_capture: self.replay_capture.clone(),
                                     };
 
-                                    crate::runtime_compat::task::spawn(async move {
+                                    let request_cx = crate::cx::for_request();
+                                    crate::runtime_compat::task::spawn_with_cx(
+                                        &request_cx,
+                                        move |_child_cx| async move {
                                         let result = runner
                                             .run_workflow(
                                                 pane_id,
@@ -1965,7 +1968,8 @@ impl WorkflowRunner {
                                                 );
                                             }
                                         }
-                                    });
+                                        },
+                                    );
                                 }
                             }
                             WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
