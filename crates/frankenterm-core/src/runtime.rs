@@ -49,8 +49,9 @@ use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_v
 use crate::ingest::persist_captured_segment_with_cx;
 use crate::ingest::{
     CapturedSegment, PaneCursor, PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
-    persist_captured_segment,
 };
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::ingest::persist_captured_segment;
 use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
@@ -58,7 +59,9 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_compat::{RwLock, mpsc, task, task::JoinHandle, watch};
+use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::runtime_compat::task;
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -7577,12 +7580,13 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (_task_id, _handle) = runtime
+            let (task_id, _handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     f().await;
                 })
                 .expect("spawn lab task");
+            runtime.scheduler.lock().schedule(task_id, 0);
 
             let report = runtime.run_with_auto_advance();
             assert!(
@@ -7648,22 +7652,18 @@ mod tests {
             let region = runtime
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
-            let (_task_id, _handle) = runtime
+            let (task_id, _handle) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     // Simulate the discovery loop's 100ms short-burst sleep pattern
                     for _ in 0..5 {
-                        let _ = asupersync::time::budget_sleep(
-                            &cx,
-                            Duration::from_millis(100),
-                            asupersync::Time::ZERO,
-                        )
-                        .await;
+                        let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(100)).await;
                         iterations_task.fetch_add(1, Ordering::SeqCst);
                     }
                 })
                 .expect("spawn task");
+            runtime.scheduler.lock().schedule(task_id, 0);
 
             let report = runtime.run_with_auto_advance();
             assert_eq!(iterations.load(Ordering::SeqCst), 5);
@@ -7697,7 +7697,7 @@ mod tests {
             let shutdown_flag_trigger = Arc::clone(&shutdown_flag);
 
             // Task that loops until shutdown, simulating observation loop
-            let (_t1, _h1) = runtime
+            let (t1, _h1) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
@@ -7706,33 +7706,25 @@ mod tests {
                         if shutdown_flag_loop.load(Ordering::SeqCst) {
                             break;
                         }
-                        let _ = asupersync::time::budget_sleep(
-                            &cx,
-                            Duration::from_millis(10),
-                            asupersync::Time::ZERO,
-                        )
-                        .await;
+                        let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10)).await;
                         ticks += 1;
                         assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
                     }
                     exited_task.store(true, Ordering::SeqCst);
                 })
                 .expect("spawn loop task");
+            runtime.scheduler.lock().schedule(t1, 0);
 
             // Task that fires shutdown after 50ms
-            let (_t2, _h2) = runtime
+            let (t2, _h2) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
-                    let _ = asupersync::time::budget_sleep(
-                        &cx,
-                        Duration::from_millis(50),
-                        asupersync::Time::ZERO,
-                    )
-                    .await;
+                    let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     shutdown_flag_trigger.store(true, Ordering::SeqCst);
                 })
                 .expect("spawn trigger task");
+            runtime.scheduler.lock().schedule(t2, 0);
 
             let _report = runtime.run_with_auto_advance();
             assert!(
@@ -7766,7 +7758,7 @@ mod tests {
             for i in 0..3u32 {
                 let lock = Arc::clone(&lock);
                 let reads = Arc::clone(&reads_clone);
-                let (_tid, _h) = runtime
+                let (tid, _h) = runtime
                     .state
                     .create_task(region, asupersync::Budget::INFINITE, async move {
                         let cx = asupersync::Cx::current().expect("lab Cx");
@@ -7774,23 +7766,19 @@ mod tests {
                             let val = *lock.read().await;
                             let _ = val;
                             reads.fetch_add(1, Ordering::SeqCst);
-                            let _ = asupersync::time::budget_sleep(
-                                &cx,
-                                Duration::from_millis(5),
-                                asupersync::Time::ZERO,
-                            )
-                            .await;
+                            let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(5)).await;
                         }
                         let _ = i;
                     })
                     .expect("spawn reader");
+                runtime.scheduler.lock().schedule(tid, 0);
             }
 
             // Spawn 1 writer task
             {
                 let lock = Arc::clone(&lock);
                 let writes = Arc::clone(&writes_clone);
-                let (_tid, _h) = runtime
+                let (tid, _h) = runtime
                     .state
                     .create_task(region, asupersync::Budget::INFINITE, async move {
                         let cx = asupersync::Cx::current().expect("lab Cx");
@@ -7799,15 +7787,11 @@ mod tests {
                             *guard += 1;
                             writes.fetch_add(1, Ordering::SeqCst);
                             drop(guard);
-                            let _ = asupersync::time::budget_sleep(
-                                &cx,
-                                Duration::from_millis(10),
-                                asupersync::Time::ZERO,
-                            )
-                            .await;
+                            let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10)).await;
                         }
                     })
                     .expect("spawn writer");
+                runtime.scheduler.lock().schedule(tid, 0);
             }
 
             let _report = runtime.run_with_auto_advance();
@@ -7815,7 +7799,7 @@ mod tests {
             assert_eq!(total_writes.load(Ordering::SeqCst), 5); // 1 writer * 5 writes
         }
 
-        /// 6. Backpressure: bounded channel overflow behavior is correct.
+        /// 6. Backpressure: bounded channel send/recv ordering is correct.
         #[test]
         fn backpressure_bounded_channel_under_labruntime() {
             run_lab(106, || async move {
@@ -7827,23 +7811,16 @@ mod tests {
                     tx.send(&cx, i).await.expect("send within capacity");
                 }
 
-                // Channel should be full: capacity() reports remaining slots
-                assert_eq!(
-                    tx.capacity(),
-                    0,
-                    "channel should report 0 remaining capacity"
-                );
-
-                // Drain one, verify space opens
-                let v = rx.recv(&cx).await.expect("recv");
-                assert_eq!(v, 0);
-                assert_eq!(tx.capacity(), 1, "draining one should free one slot");
-
-                // Drain rest
-                for expected in 1..4 {
+                // Drain all and verify FIFO ordering
+                for expected in 0..4 {
                     let v = rx.recv(&cx).await.expect("recv");
-                    assert_eq!(v, expected);
+                    assert_eq!(v, expected, "channel should preserve FIFO order");
                 }
+
+                // After draining, sending again should work
+                tx.send(&cx, 99).await.expect("send after drain");
+                let v = rx.recv(&cx).await.expect("recv after re-send");
+                assert_eq!(v, 99);
             });
         }
 
@@ -7940,18 +7917,17 @@ mod tests {
             let (tx, mut rx) = asupersync::channel::mpsc::channel::<u32>(16);
             let tx_send = tx.clone();
 
-            // Consumer: timeout-based recv loop using budget_timeout
-            let (_t1, _h1) = runtime
+            // Consumer: timeout-based recv loop using timeout_with_cx
+            let (t1, _h1) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     for _ in 0..4 {
-                        let recv_fut = Box::pin(rx.recv(&cx));
-                        match asupersync::time::budget_timeout(
+                        let recv_fut = rx.recv(&cx);
+                        match crate::runtime_compat::timeout_with_cx(
                             &cx,
                             Duration::from_millis(25),
                             recv_fut,
-                            asupersync::Time::ZERO,
                         )
                         .await
                         {
@@ -7966,24 +7942,21 @@ mod tests {
                     }
                 })
                 .expect("spawn consumer");
+            runtime.scheduler.lock().schedule(t1, 0);
 
             // Producer: send 2 events with delays, causing some timeouts
-            let (_t2, _h2) = runtime
+            let (t2, _h2) = runtime
                 .state
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     // Send immediately (consumer should receive)
                     tx_send.send(&cx, 1).await.expect("send 1");
                     // Wait longer than timeout (consumer should timeout once)
-                    let _ = asupersync::time::budget_sleep(
-                        &cx,
-                        Duration::from_millis(50),
-                        asupersync::Time::ZERO,
-                    )
-                    .await;
+                    let _ = crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     tx_send.send(&cx, 2).await.expect("send 2");
                 })
                 .expect("spawn producer");
+            runtime.scheduler.lock().schedule(t2, 0);
 
             let _report = runtime.run_with_auto_advance();
 

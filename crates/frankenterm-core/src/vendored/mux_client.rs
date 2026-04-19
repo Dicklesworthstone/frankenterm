@@ -9062,7 +9062,7 @@ mod tests {
 
                 let result = sub.next().await;
                 assert!(
-                    matches!(result, Some(PaneDelta::Gap { pane_id: 55, reason }) if reason == "lab-inherited-current-cx"),
+                    matches!(result, Some(PaneDelta::Gap { pane_id: 55, ref reason }) if reason == "lab-inherited-current-cx"),
                     "ambient subscription recv must inherit current cx, got {result:?}"
                 );
             });
