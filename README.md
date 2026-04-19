@@ -24,7 +24,7 @@ _Summary counts last verified against the current checkout on April 6, 2026: 54 
 cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
 ```
 
-`ft --version` should work immediately after install. `ft doctor` / `ft doctor --json` also run immediately, but current builds will report diagnostic errors on a fresh machine until the active compatibility backend bridge is available: WezTerm CLI installed in `PATH` and a reachable WezTerm GUI/mux for `wezterm cli list`.
+`ft --version` should work immediately after install. `ft doctor` / `ft doctor --json` also run immediately. Pane/session operations that talk to the live mux require the current interop boundary to be reachable: WezTerm CLI in `PATH` and a reachable WezTerm GUI/mux for `wezterm cli list`.
 
 </div>
 
@@ -36,13 +36,16 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 **The Solution**: `ft` is a **full terminal platform for agent swarms** with deep observability, deterministic eventing, policy-gated automation, and machine-native control surfaces (Robot Mode + MCP). It captures every byte of terminal output across every pane, detects state transitions via multi-pattern matching, triggers automated workflows in response, and exposes all of it through a JSON API built for AI-to-AI orchestration. The closest analogy is Kubernetes for terminal-based AI agents: observe, detect, react, audit.
 
-### Platform Direction
+### Platform Model
 
-`ft` is developed as a replacement-class terminal runtime for multi-agent systems, not a thin wrapper around another terminal. The architecture is actively expanding with:
+`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native: structured, cancel-correct, and centered on `Cx`-aware orchestration across watch, search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces.
 
-- Concepts learned from Ghostty and Zellij (session model, ergonomics, and runtime resilience)
-- Ground-up `ft` subsystems purpose-built for agent swarms (tiered scrollback, fleet memory, mission orchestration)
-- Targeted integrations and code adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/frankentui`
+Current implementation reality:
+
+- Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems.
+- `runtime_compat` remains as an audited boundary for runtime lifecycle, channel, time, and blocking semantics; it is not the product story.
+- Live pane/session interoperability is currently WezTerm-backed. Treat that as the present mux boundary, not as a claim that `ft` is "just a WezTerm wrapper".
+- Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
 ### Why Use ft?
 
@@ -112,6 +115,21 @@ $ ft tx show --include-contract
 ```
 
 Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets.
+
+## Supported Surface Matrix
+
+The project needs an honest status table, not migration-era hand-waving.
+
+| Surface | Current status | Notes |
+|---------|----------------|-------|
+| Watch / status / triage / doctor / reproduce | Supported | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints. |
+| Search / events / audit / workflows / mission / tx | Supported | Backed by local storage, policy, and workflow subsystems. |
+| Robot mode | Supported | Core families are implemented: state, get-text, send, wait-for, search, events, rules, workflows, agents, accounts, reservations, mission, tx, health, approvals, and the NTM-aligned families listed by `ft robot help --json`. |
+| Session persistence | Supported with backend prerequisite | Snapshots, session inspection, restore, and `ft session doctor` are implemented, but live restore still depends on the current WezTerm mux interop boundary. |
+| Web API / SSE | Supported behind `--features web` | `/health`, `/panes`, `/events`, `/search`, and `/stream/*` are implemented; this is more than "health only". |
+| Distributed mode | Supported with explicit limitations | Remote panes persist into the same DB and surface through status/search/state, but live `get-text` for distributed panes is intentionally unavailable. |
+| Semantic search | Optional | Enabled only when built/configured for embeddings. |
+| Browser auth tooling | Feature-gated | `ft auth` is real, but only in builds that include the browser feature and a usable browser stack. |
 
 ---
 
@@ -224,7 +242,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 Post-install expectations:
 - `ft --version` should succeed immediately.
 - `ft doctor` / `ft doctor --json` should emit diagnostics immediately.
-- On a clean host, doctor may report errors until the current WezTerm compatibility bridge is installed and running (`wezterm --version` and `wezterm cli list --format json` must succeed).
+- On a clean host, doctor may report backend-prerequisite errors until the current mux interop boundary is available (`wezterm --version` and `wezterm cli list --format json` must succeed).
 - `.ft`, logs, and the SQLite database are created on first daemon/watch startup if they do not already exist.
 
 ### From Source
@@ -264,7 +282,7 @@ cargo build -p frankenterm --release --all-features
 ### Requirements
 
 - **Rust nightly** (Rust 2024 edition — see `rust-toolchain.toml`)
-- **Compatibility backend bridge (current):** WezTerm CLI available for existing pane/session interop while native runtime coverage expands
+- **Current live mux interop boundary:** WezTerm CLI + reachable mux/GUI for pane discovery, live read/write, snapshot restore, and other backend-facing pane/session operations
 - **SQLite** (bundled via rusqlite — no system dependency)
 
 ---
@@ -288,10 +306,14 @@ ft setup font --apply
 FT_SKIP_BUNDLED_FONT_INSTALL=1 ft status
 ```
 
-### 2. Verify Terminal Backend Connectivity
+### 2. Verify First-Run Health
 
 ```bash
-# Compatibility backend check (current migration path)
+# Native diagnostics and health surfaces
+ft doctor
+ft status --health
+
+# Current live mux interop prerequisite
 wezterm cli list
 ```
 
@@ -382,7 +404,8 @@ ft stop                      # Stop running watcher
 
 ```bash
 ft status                    # Overview of observed panes
-ft show <pane_id>           # Detailed pane info
+ft status --health          # Health-only view with operator next steps
+ft show <pane_id>           # Detailed pane info for a live pane
 ft get-text <pane_id>       # Recent output from pane
 ```
 
@@ -524,10 +547,12 @@ ft session doctor            # Health check for session persistence
 ```bash
 ft config show               # Display current config
 ft config validate           # Check config syntax
-ft config reload             # Hot-reload config (SIGHUP)
+ft config set <key> <value>  # Update one config value
+ft config export             # Export effective config
 ```
 
 For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
+For the evidence model behind these support claims, see `docs/ft-xbnl0-verification-contract.md`.
 For GUI onboarding and WezTerm migration, see `docs/frankenterm-gui-user-guide.md`.
 
 ---
@@ -1060,22 +1085,22 @@ ft tx show --include-contract
 
 ## Limitations
 
-### What ft Doesn't Do (Yet)
+### What ft Doesn't Do Yet
 
-- **Complete backend independence**: Compatibility bridge still leans on WezTerm in current builds.
-- **Unified UX parity across all target backends**: Active migration area.
-- **GUI interaction**: Core focus is terminal/state orchestration, not arbitrary GUI automation.
-- **Production-grade multi-host federation**: Distributed mode exists, but hardening is still ongoing.
+- **Backend-free live pane interop**: current builds still depend on the WezTerm-backed mux boundary for live pane/session IO.
+- **Live remote-pane text reads in distributed mode**: remote panes are searchable and visible in state, but `get-text` is intentionally unavailable there.
+- **Arbitrary GUI automation**: the core product is terminal/state orchestration, not desktop automation.
+- **Green release gates across every finish-line lane**: the release-gate machinery exists, but the current gate status still depends on the latest artifact bundles.
 
 ### Known Limitations
 
 | Capability | Current State | Planned |
 |------------|---------------|---------|
-| Backend decoupling from compatibility bridge | In progress | Ongoing |
+| Live pane/session interop without WezTerm | Not shipped | Future backend work |
 | Browser automation (OAuth) | Feature-gated, partial | v0.2+ |
 | MCP server integration | Feature-gated (stdio) | v0.2+ |
-| Web dashboard | Feature-gated (health-only) | v0.3+ |
-| Multi-host federation | Early distributed mode | v2.0+ |
+| Web server + SSE | Feature-gated and shipped | Continued hardening |
+| Multi-host federation | Distributed mode shipped with explicit limitations | v2.0+ hardening |
 | Semantic search | Feature-gated (requires ML embeddings) | v0.2+ |
 
 ---

@@ -1,6 +1,13 @@
 # CLI Reference
 
 This reference is a concise, accurate snapshot of the current command surface.
+Use it as the command-truth companion to:
+
+- `docs/ft-xbnl0-verification-contract.md`
+- `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`
+- `docs/ft-xbnl0-4-6-completion-evidence.md`
+- `docs/ft-xbnl0-5-7-completion-evidence.md`
+
 Commands marked as feature-gated require building with the corresponding feature.
 
 ## Human CLI (implemented)
@@ -10,9 +17,9 @@ Commands marked as feature-gated require building with the corresponding feature
 ```bash
 ft watch [--foreground] [--auto-handle] [--poll-interval <ms>]
 ft stop [--force] [--timeout <secs>]
-ft status
+ft status [--health]
 ft list [--json]
-ft show <pane_id> [--output]        # stub (not yet implemented)
+ft show <pane_id> [--output]
 ft get-text <pane_id> [--tail <n>] [--escapes]
 ```
 
@@ -114,8 +121,10 @@ For explain-match traces and how to interpret robot `--trace` output, see
 
 ```bash
 ft doctor
+ft doctor --json
 ft diag bundle [--output <dir>] [--events <n>] [--audit <n>] [--workflows <n>]
-ft reproduce [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
+ft reproduce export [--kind <crash|manual>] [--out <dir>] [--format <text|json>]
+ft reproduce replay <bundle_dir> [--mode <full|policy|rules>]
 ```
 
 ### Web server and streaming API
@@ -199,7 +208,7 @@ ft export <segments|events|audit|workflows|sessions> [--pane-id <id>] [--since <
 ### Learning and auth
 
 ```bash
-ft learn [basics|events|workflows] [--status] [--reset]
+ft learn [<track>] [--status] [--achievements] [--reset] [--complete] [--skip]
 ft auth test <service> [--account <name>] [--headful]
 ft auth status <service> [--account <name>] [--all]
 ft auth bootstrap <service> [--account <name>]
@@ -207,7 +216,6 @@ ft auth bootstrap <service> [--account <name>]
 
 Notes:
 - `ft auth` requires the `browser` feature to enable Playwright-based flows.
-- `ft show` exists but is still a placeholder.
 
 ## Feature-gated commands
 
@@ -230,11 +238,19 @@ ft undo
 Robot mode uses a stable envelope and mirrors MCP schemas.
 
 ```bash
+ft robot help
+ft robot quick-start
 ft robot state [--include-text] [--tail <n>] [--escapes]
 ft robot get-text <pane_id>|--panes <id,id,...>|--all [--tail <n>] [--escapes]
 ft robot send <pane_id> "<text>" [--dry-run] [--wait-for "<pat>"] [--timeout-secs <n>]
 ft robot wait-for <pane_id> "<pat>" [--timeout-secs <n>] [--regex]
 ft robot search "<fts query>" [--pane <id>] [--since <epoch_ms>] [--until <epoch_ms>] [--limit <n>] [--snippets[=<true|false>]] [--mode <lexical|semantic|hybrid>]
+ft robot search-explain "<fts query>" [--pane <id>]
+ft robot search-index stats
+ft robot search-index reindex [--pane <id>] [--batch-size <n>] [--since <epoch_ms>] [--until <epoch_ms>]
+ft robot cass status
+ft robot cass search "<query>" [--agent <kind>] [--workspace <substr>] [--days <n>] [--limit <n>]
+ft robot cass view <source_path> <line_number> [--context-lines <n>]
 ft robot events [--unhandled] [--pane <id>] [--rule-id <id>] [--event-type <type>] [--triage-state <state>] [--label <label>]
 ft robot events annotate <event_id> --note "<text>" [--by <actor>]
 ft robot events annotate <event_id> --clear [--by <actor>]
@@ -254,21 +270,32 @@ ft robot rules test "<text>" [--trace] [--pack <name>]
 ft robot rules show <rule_id>
 ft robot rules lint [--pack <name>] [--fixtures] [--strict]
 
+ft robot agents list|running|detect|configure
+ft robot accounts list [--pick]
+ft robot accounts refresh
+ft robot reservations list|reserve|release
+ft robot mission state|decisions
+ft robot tx plan|run|rollback|show
+ft robot health
 ft robot approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
 ft robot why <code>
 
-ft robot reservations list
-ft robot reservations reserve <pane_id> [--ttl <secs>] --owner-id <id>
-ft robot reservations release <reservation_id>
-
-ft robot accounts list [--service <openai|anthropic|google>] [--pick]
-ft robot accounts refresh [--service <openai|anthropic|google>]
+ft robot checkpoint save|list|show|delete|rollback
+ft robot context status|rotate|history
+ft robot work claim|release|complete|list|ready|assign
+ft robot fleet status|scale|rebalance|agents
+ft robot profile list|show|apply|validate
 ```
 
 Examples:
 - `ft robot search "compilation failed" --mode lexical`
 - `ft robot search "compilation failed" --mode semantic`
 - `ft robot search "compilation failed" --mode hybrid`
+
+Notes:
+- `ft robot help --json` is the fastest machine-readable command inventory.
+- Distributed panes appear in `state`, `search`, and related persisted-data surfaces, but live `get-text` is intentionally unavailable for them.
+- Some NTM-aligned robot families are specialized machine surfaces; they are listed here because they ship, even when most humans stay on the higher-level human CLI.
 
 Policy/redaction:
 - `ft get-text`, `ft search`, `ft robot get-text`, and `ft robot search` are policy-gated read/query surfaces.

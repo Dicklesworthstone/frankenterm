@@ -114,7 +114,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 This project must use **asupersync** for async operations. The intended runtime model for the `frankenterm` CLI binary and `frankenterm-core` library is `Cx`-aware, structured, cancel-correct async built around asupersync.
 
-**Policy:** direct `tokio` usage is forbidden. Any remaining `tokio` references in manifests, `runtime_compat`, tests, benches, or comments are migration debt to remove, not an accepted runtime choice.
+**Policy:** direct `tokio` usage is forbidden. `runtime_compat` is an audited boundary for runtime lifecycle, channels, time, and blocking work; do not widen it casually, and do not describe it as the intended end-state architecture.
 
 ### Key Dependencies
 
@@ -221,11 +221,18 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ### Strategic Direction
 
-`ft` is not defined by WezTerm integration. The project direction is:
+`ft` is not defined by WezTerm integration. The intended architecture is an asupersync-native swarm runtime with `ft`-owned observability, policy, workflow, search, and robot/operator surfaces.
 
-- Replacement of legacy terminal workflows for swarm operations
-- Selective design inspiration from Ghostty and Zellij
-- Ground-up ft subsystems plus integration/adaptation from `/dp/asupersync`, `/dp/frankensqlite`, and `/frankentui`
+Current architecture reality:
+
+- The core runtime model is `Cx`-aware, structured, cancel-correct async built around asupersync.
+- `runtime_compat` is a deliberately constrained seam for explicit runtime/channel/time/blocking normalization.
+- The current live pane/session interop boundary is WezTerm-backed; treat that as an implementation boundary, not as the project identity.
+- Finish-line truth for support claims and verification lives in:
+  - `docs/ft-xbnl0-verification-contract.md`
+  - `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`
+  - `docs/ft-xbnl0-4-6-completion-evidence.md`
+  - `docs/ft-xbnl0-5-7-completion-evidence.md`
 
 ### Architecture
 
@@ -239,7 +246,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 │                     frankenterm-core                       │
 │  Pattern Engine │ Capture │ Workflows │ Policy │ Search    │
 ├────────────────────────────────────────────────────────────┤
-│      Backend Adapters (incl. current WezTerm bridge)       │
+│   Current mux interop boundary (WezTerm-backed today)      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -253,14 +260,14 @@ frankenterm/
 │   ├── frankenterm-core/             # Core library
 │   │   └── src/
 │   │       ├── runtime.rs            # Observation runtime orchestration
-│   │       ├── runtime_compat.rs     # Runtime migration seam; remaining quarantine adapters are being removed
+│   │       ├── runtime_compat.rs     # Audited runtime/channel/time/blocking boundary for asupersync-native code
 │   │       ├── ingest.rs             # Pane discovery + delta extraction
 │   │       ├── patterns.rs           # Pattern detection engine
 │   │       ├── events.rs             # Event bus and detection fanout
 │   │       ├── workflows/            # Workflow modules (engine/runner/lock/handlers/traits)
 │   │       ├── policy.rs             # Safety/access control
 │   │       ├── storage.rs            # SQLite + FTS5
-│   │       └── wezterm.rs            # Terminal backend adapter (current compatibility bridge)
+│   │       └── wezterm.rs            # Current live mux/pane interoperability adapter
 │   ├── frankenterm-gui/              # GUI binary crate
 │   ├── frankenterm-mux-server/       # Headless mux server binary crate
 │   ├── frankenterm-mux-server-impl/  # Shared mux-server implementation
@@ -285,7 +292,7 @@ frankenterm/
 |---------|------------------|----------------|
 | CLI command routing | `crates/frankenterm/src/main.rs` | Parses `Commands`/`RobotCommands` and dispatches watch/robot/workflow/mcp flows |
 | Runtime orchestration | `crates/frankenterm-core/src/runtime.rs` | Discovery, capture, persistence, maintenance task graph |
-| Runtime adapters | `crates/frankenterm-core/src/runtime_compat.rs` | Runtime/channel/net/time compatibility seam |
+| Runtime adapters | `crates/frankenterm-core/src/runtime_compat.rs` | Audited runtime/channel/time/blocking boundary used by shipped code paths |
 | Ingest and deltas | `crates/frankenterm-core/src/ingest.rs` | Pane discovery, overlap matching, explicit gap semantics |
 | Persistence and search | `crates/frankenterm-core/src/storage.rs` + `src/search/` | SQLite schema/migrations, FTS5, lexical/semantic/hybrid query paths |
 | Pattern detection | `crates/frankenterm-core/src/patterns.rs` | Rule packs, anchor/regex evaluation, dedupe context |
@@ -293,7 +300,7 @@ frankenterm/
 | Workflow runtime | `crates/frankenterm-core/src/workflows/` | Engine/runner/lock + workflow traits/handlers |
 | Policy gates | `crates/frankenterm-core/src/policy.rs` | Authorize/deny/require-approval decisions and rate limiting |
 | Robot/MCP schemas | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Machine-facing envelopes and MCP tool/resource contracts |
-| Backend bridge | `crates/frankenterm-core/src/wezterm.rs` | Compatibility adapter for backend discovery, read/write, and pane ops |
+| Backend bridge | `crates/frankenterm-core/src/wezterm.rs` | Current live mux/pane interoperability boundary for discovery, read/write, and pane ops |
 
 ### Quick Reference for AI Agents
 

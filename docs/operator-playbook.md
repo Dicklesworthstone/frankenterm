@@ -3,6 +3,11 @@
 This playbook is a pragmatic guide for keeping ft healthy during day-to-day use.
 It focuses on fast diagnosis, safe remediation, and actionable artifacts.
 
+Operator reality check:
+- `ft doctor`, `ft status --health`, `ft triage`, crash bundles, search, and the local evidence surfaces are native `ft` operator paths.
+- Live pane/session operations still rely on the current WezTerm-backed mux interop boundary.
+- Support and verification claims in this guide are anchored by `docs/ft-xbnl0-verification-contract.md`, `docs/ft-xbnl0-4-6-completion-evidence.md`, and `docs/ft-xbnl0-5-7-completion-evidence.md`.
+
 ## Quick start
 
 ```bash
@@ -19,6 +24,28 @@ Related guides:
 - For release posture and per-tier fallback defaults, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For exact knob meanings and safe starting ranges, use `docs/tuning-reference.md`.
 - For GUI-specific fleet operation, use `docs/frankenterm-gui-user-guide.md`.
+- For the supported-path honesty sweep, use `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`.
+
+---
+
+## First Run / Bootstrap
+
+Use this path on a fresh host or after any environment drift.
+
+```bash
+ft doctor
+ft doctor --json
+ft status --health
+wezterm cli list
+ft watch --foreground
+ft robot state
+```
+
+Interpretation:
+- `ft doctor` / `ft status --health` validate the local runtime, workspace, database, and operator guidance surfaces immediately.
+- `wezterm cli list` validates the current live mux interop boundary for pane/session operations.
+- `ft watch --foreground` is the fastest way to force first-run bootstrap of `.ft/`, logs, and the database while keeping diagnostics visible.
+- `ft robot state` confirms that the watcher plus live pane discovery path agree on what is observable.
 
 ---
 
