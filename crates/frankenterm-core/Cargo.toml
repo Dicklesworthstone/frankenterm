@@ -453,6 +453,10 @@ harness = false
 name = "quota_cost_ops"
 harness = false
 
+[[bench]]
+name = "cass_search_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
