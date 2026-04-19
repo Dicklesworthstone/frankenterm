@@ -375,6 +375,13 @@ read -r -d '' REMOTE_SCRIPT <<'EOF' || true
 set -euo pipefail
 
 : "${FT_BIN:?FT_BIN must point at a built ft binary}"
+if [[ -z "${TIMEOUT_BIN:-}" ]]; then
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  fi
+fi
 : "${TIMEOUT_BIN:?TIMEOUT_BIN must point at timeout or gtimeout}"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/ft-xbnl0-5-4.XXXXXX")"
@@ -433,7 +440,10 @@ set +e
 bootstrap_doctor="$(run_ft "${bootstrap_ws}" "${ok_bin}" doctor --json 2>&1)"
 bootstrap_doctor_rc=$?
 set -e
-bootstrap_status="$(run_ft "${bootstrap_ws}" "${ok_bin}" status --health -f json)"
+set +e
+bootstrap_status="$(run_ft "${bootstrap_ws}" "${ok_bin}" status --health -f json 2>&1)"
+bootstrap_status_rc=$?
+set -e
 
 set +e
 PATH="${ok_bin}:$PATH" "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 12 \
@@ -536,7 +546,10 @@ set +e
 recovery_doctor="$(run_ft "${recovery_ws}" "${ok_bin}" doctor --json 2>&1)"
 recovery_doctor_rc=$?
 set -e
-recovery_status="$(run_ft "${recovery_ws}" "${ok_bin}" status --health -f json)"
+set +e
+recovery_status="$(run_ft "${recovery_ws}" "${ok_bin}" status --health -f json 2>&1)"
+recovery_status_rc=$?
+set -e
 recovery_session_doctor="$(run_ft "${recovery_ws}" "${ok_bin}" session doctor -f json)"
 
 python3 - "${recovery_ws}" <<'PY'
@@ -557,11 +570,14 @@ steady_session_list="$(run_ft "${recovery_ws}" "${ok_bin}" session list -f json)
 python3 - <<'PY' \
   "${bootstrap_ws}" \
   "${bootstrap_doctor_rc}" \
+  "${bootstrap_status_rc}" \
   "${broken_rc}" \
   "${bootstrap_watch_rc}" \
   "${bootstrap_doctor}" \
   "${bootstrap_status}" \
   "${broken_output}" \
+  "${recovery_doctor_rc}" \
+  "${recovery_status_rc}" \
   "${recovery_doctor}" \
   "${recovery_status}" \
   "${recovery_session_doctor}" \
@@ -571,19 +587,23 @@ import json
 import pathlib
 import sys
 bootstrap_doctor_rc = int(sys.argv[2])
-broken_rc = int(sys.argv[3])
-bootstrap_watch_rc = int(sys.argv[4])
-bootstrap_doctor = json.loads(sys.argv[5])
-bootstrap_status = json.loads(sys.argv[6])
-broken_output = json.loads(sys.argv[7])
-recovery_doctor = json.loads(sys.argv[8])
-recovery_status = json.loads(sys.argv[9])
-recovery_session_doctor = json.loads(sys.argv[10])
-steady_session_doctor = json.loads(sys.argv[11])
-steady_session_list = json.loads(sys.argv[12])
+bootstrap_status_rc = int(sys.argv[3])
+broken_rc = int(sys.argv[4])
+bootstrap_watch_rc = int(sys.argv[5])
+bootstrap_doctor = json.loads(sys.argv[6])
+bootstrap_status = json.loads(sys.argv[7])
+broken_output = json.loads(sys.argv[8])
+recovery_doctor_rc = int(sys.argv[9])
+recovery_status_rc = int(sys.argv[10])
+recovery_doctor = json.loads(sys.argv[11])
+recovery_status = json.loads(sys.argv[12])
+recovery_session_doctor = json.loads(sys.argv[13])
+steady_session_doctor = json.loads(sys.argv[14])
+steady_session_list = json.loads(sys.argv[15])
 bootstrap_ws = pathlib.Path(sys.argv[1])
 
 assert bootstrap_doctor_rc in (0, 1)
+assert bootstrap_status_rc in (0, 1)
 assert bootstrap_status["operator_guidance"]["status"] == "bootstrap_required"
 assert "operator_guidance" in bootstrap_doctor
 assert isinstance(bootstrap_doctor["operator_guidance"].get("next_steps", []), list)
@@ -601,6 +621,8 @@ assert any(
 )
 
 assert recovery_doctor["operator_guidance"]["status"] == "recovery_required"
+assert recovery_doctor_rc in (0, 1)
+assert recovery_status_rc in (0, 1)
 assert recovery_status["operator_guidance"]["status"] == "recovery_required"
 assert recovery_session_doctor["operator_guidance"]["status"] == "recovery_required"
 assert steady_session_doctor["operator_guidance"]["status"] == "healthy"
@@ -611,6 +633,7 @@ payload = {
     "bootstrap": {
         "doctor_status": bootstrap_doctor.get("status"),
         "doctor_rc": bootstrap_doctor_rc,
+        "status_rc": bootstrap_status_rc,
         "doctor_guidance": bootstrap_doctor["operator_guidance"],
         "status_guidance": bootstrap_status["operator_guidance"],
         "watch_rc": bootstrap_watch_rc,
@@ -623,6 +646,8 @@ payload = {
         "operator_guidance": broken_output["operator_guidance"],
     },
     "incident_triage": {
+        "doctor_rc": recovery_doctor_rc,
+        "status_rc": recovery_status_rc,
         "doctor_guidance": recovery_doctor["operator_guidance"],
         "status_guidance": recovery_status["operator_guidance"],
         "session_guidance": recovery_session_doctor["operator_guidance"],
