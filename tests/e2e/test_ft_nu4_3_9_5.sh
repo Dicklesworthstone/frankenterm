@@ -10,7 +10,7 @@ SCENARIO_ID="ft_nu4_3_9_5_dogfood_capture"
 CORRELATION_ID="ft-nu4.3.9.5-${RUN_ID}"
 LOG_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}.jsonl"
 SUMMARY_FILE="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_summary.json"
-TARGET_DIR="target-rch-ft-nu4-3-9-5-${RUN_ID}"
+TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/ft-$(whoami)-target}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
 rch_init "${LOG_DIR}" "${RUN_ID}" "nu4_3_9_5"
@@ -314,25 +314,134 @@ if ! jq -e '.ok == true' "${CAPTURE_JSON}" >/dev/null; then
     "ft robot get-text returned ok=false"
 fi
 
+CAPTURE_TEXT="$(jq -r '.data.text // ""' "${CAPTURE_JSON}")"
+if [[ -z "${CAPTURE_TEXT}" ]]; then
+  fail_now \
+    "live_capture" \
+    "capture_text_extract" \
+    "captured_text_empty" \
+    "capture_text_missing" \
+    "$(basename "${CAPTURE_JSON}")" \
+    "ft robot get-text returned an empty text payload"
+fi
+
 emit_log \
   "passed" \
   "live_capture" \
-  "capture_detect_verify" \
-  "live_capture_ready_for_fixture_extraction" \
+  "capture_only" \
+  "live_capture_collected" \
   "none" \
   "$(basename "${CAPTURE_JSON}")" \
   "captured pane_id=${PANE_ID} for dogfood fixture extraction"
+
+RULES_JSON="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_rules_test.json"
+if ! ft robot --format json rules test "${CAPTURE_TEXT}" \
+  > "${RULES_JSON}" 2>"${RULES_JSON}.stderr"; then
+  fail_now \
+    "live_detection" \
+    "ft_robot_rules_test" \
+    "rules_test_failed" \
+    "robot_rules_test_failed" \
+    "$(basename "${RULES_JSON}.stderr")" \
+    "Failed to evaluate live capture against the detection rules"
+fi
+
+if ! jq -e '.ok == true' "${RULES_JSON}" >/dev/null; then
+  fail_now \
+    "live_detection" \
+    "ft_robot_rules_test_parse" \
+    "rules_test_not_ok" \
+    "robot_rules_test_payload_invalid" \
+    "$(basename "${RULES_JSON}")" \
+    "ft robot rules test returned ok=false"
+fi
+
+MATCH_COUNT="$(jq -r '.data.match_count // 0' "${RULES_JSON}")"
+if [[ "${MATCH_COUNT}" == "0" ]]; then
+  fail_now \
+    "live_detection" \
+    "rule_match_filter" \
+    "no_rules_matched_live_capture" \
+    "no_detection_matches" \
+    "$(basename "${RULES_JSON}")" \
+    "No detection rules matched the captured pane tail"
+fi
+
+MATCHED_RULE_ID=""
+MATCHED_WORKFLOW=""
+MATCHED_AGENT_TYPE=""
+MATCHED_EVENT_TYPE=""
+MATCHED_SEVERITY=""
+MATCHED_RULE_DETAIL_JSON="${LOG_DIR}/ft_nu4_3_9_5_${RUN_ID}_matched_rule.json"
+
+while IFS= read -r rule_id; do
+  [[ -z "${rule_id}" ]] && continue
+
+  if ! ft robot --format json rules show "${rule_id}" \
+    > "${MATCHED_RULE_DETAIL_JSON}" 2>"${MATCHED_RULE_DETAIL_JSON}.stderr"; then
+    continue
+  fi
+
+  if ! jq -e '.ok == true' "${MATCHED_RULE_DETAIL_JSON}" >/dev/null 2>&1; then
+    continue
+  fi
+
+  workflow="$(jq -r '.data.workflow // empty' "${MATCHED_RULE_DETAIL_JSON}")"
+  case "${workflow}" in
+    handle_compaction|handle_usage_limits|handle_claude_code_limits|handle_auth_required)
+      MATCHED_RULE_ID="${rule_id}"
+      MATCHED_WORKFLOW="${workflow}"
+      MATCHED_AGENT_TYPE="$(jq -r '.data.agent_type // "unknown"' "${MATCHED_RULE_DETAIL_JSON}")"
+      MATCHED_EVENT_TYPE="$(jq -r '.data.event_type // "unknown"' "${MATCHED_RULE_DETAIL_JSON}")"
+      MATCHED_SEVERITY="$(jq -r '.data.severity // "unknown"' "${MATCHED_RULE_DETAIL_JSON}")"
+      break
+      ;;
+  esac
+done < <(jq -r '.data.matches[].rule_id' "${RULES_JSON}")
+
+if [[ -z "${MATCHED_RULE_ID}" ]]; then
+  fail_now \
+    "live_detection" \
+    "workflow_resolution" \
+    "no_dogfood_workflow_match" \
+    "workflow_not_verified" \
+    "$(basename "${RULES_JSON}")" \
+    "Rules matched, but none resolved to handle_compaction, handle_usage_limits, handle_claude_code_limits, or handle_auth_required"
+fi
+
+DETECTION_SUMMARY="pane_id=${PANE_ID} rule_id=${MATCHED_RULE_ID} workflow=${MATCHED_WORKFLOW} agent_type=${MATCHED_AGENT_TYPE} event_type=${MATCHED_EVENT_TYPE} severity=${MATCHED_SEVERITY}"
+
+emit_log \
+  "passed" \
+  "live_detection" \
+  "capture_detect_verify" \
+  "live_detection_workflow_verified" \
+  "none" \
+  "$(basename "${MATCHED_RULE_DETAIL_JSON}")" \
+  "${DETECTION_SUMMARY}"
 
 jq -cn \
   --arg run_id "${RUN_ID}" \
   --arg outcome "passed" \
   --arg pane_id "${PANE_ID}" \
   --arg capture_artifact "$(basename "${CAPTURE_JSON}")" \
+  --arg rules_artifact "$(basename "${RULES_JSON}")" \
+  --arg matched_rule_artifact "$(basename "${MATCHED_RULE_DETAIL_JSON}")" \
+  --arg matched_rule_id "${MATCHED_RULE_ID}" \
+  --arg matched_workflow "${MATCHED_WORKFLOW}" \
+  --arg matched_agent_type "${MATCHED_AGENT_TYPE}" \
+  --arg matched_event_type "${MATCHED_EVENT_TYPE}" \
   '{
     run_id: $run_id,
     outcome: $outcome,
     pane_id: ($pane_id | tonumber),
-    capture_artifact: $capture_artifact
+    capture_artifact: $capture_artifact,
+    rules_artifact: $rules_artifact,
+    matched_rule_artifact: $matched_rule_artifact,
+    matched_rule_id: $matched_rule_id,
+    matched_workflow: $matched_workflow,
+    matched_agent_type: $matched_agent_type,
+    matched_event_type: $matched_event_type
   }' > "${SUMMARY_FILE}"
 
 emit_log \

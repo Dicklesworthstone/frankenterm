@@ -32,9 +32,11 @@ Live capture workflow (`ft-nu4.3.9.5`)
 2) The gate enforces:
    - `rch` worker availability before any cargo invocation.
    - `rch`-only execution for `cargo test -p frankenterm-core --test pattern_corpus`.
+   - isolated cargo artifacts via `CARGO_TARGET_DIR=/tmp/ft-$(whoami)-target` unless explicitly overridden.
    - live capture prerequisites (`ft`, `wezterm`, reachable mux, and an active pane).
+   - live detection proof: the captured pane tail must produce a rule match whose rule resolves to `handle_compaction`, `handle_usage_limits`, `handle_claude_code_limits`, or `handle_auth_required`.
 3) If prerequisites are missing, the script fails fast and writes a structured JSONL reason code in `tests/e2e/logs/`.
-4) If capture succeeds, promote the captured text into a sanitized dogfood fixture and add/update:
+4) If capture and workflow verification succeed, promote the captured text into a sanitized dogfood fixture and add/update:
    - `<name>.txt`
    - `<name>.expect.json`
    - `<name>.meta.json`
