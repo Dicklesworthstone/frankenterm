@@ -1,9 +1,9 @@
-use crate::Dimensions;
 use crate::color::LinearRgba;
 use crate::glyphcache::LoadState;
 use crate::quad::{QuadAllocator, QuadTrait};
 use crate::termwindow::RenderState;
 use crate::utilsprites::RenderMetrics;
+use crate::Dimensions;
 use anyhow::Context;
 use config::{
     BackgroundHorizontalAlignment, BackgroundLayer, BackgroundRepeat, BackgroundSize,
@@ -247,6 +247,34 @@ pub struct LoadedBackgroundLayer {
     pub def: BackgroundLayer,
 }
 
+fn resolve_generated_background_axis(size: BackgroundSize, context: DimensionContext) -> u32 {
+    (match size {
+        // Generated sources don't have an intrinsic image size to preserve, so
+        // `contain`/`cover` both mean "fill the available background area".
+        BackgroundSize::Contain | BackgroundSize::Cover => context.pixel_max,
+        BackgroundSize::Dimension(d) => d.evaluate_as_pixels(context),
+    }) as u32
+}
+
+fn resolve_generated_background_size(
+    width: BackgroundSize,
+    height: BackgroundSize,
+    h_context: DimensionContext,
+    v_context: DimensionContext,
+    radial_gradient: bool,
+) -> (u32, u32) {
+    let mut width = resolve_generated_background_axis(width, h_context);
+    let mut height = resolve_generated_background_axis(height, v_context);
+
+    if radial_gradient {
+        let size = width.min(height);
+        width = size;
+        height = size;
+    }
+
+    (width, height)
+}
+
 fn load_background_layer(
     layer: &BackgroundLayer,
     dimensions: &Dimensions,
@@ -265,28 +293,13 @@ fn load_background_layer(
 
     let data = match &layer.source {
         BackgroundSource::Gradient(g) => {
-            let mut width = match layer.width {
-                BackgroundSize::Dimension(d) => d.evaluate_as_pixels(h_context),
-                unsup => anyhow::bail!(
-                    "{unsup:?} is not implemented for background gradients. \
-                     Use e.g. `width = '100%'` instead"
-                ),
-            } as u32;
-            let mut height = match layer.height {
-                BackgroundSize::Dimension(d) => d.evaluate_as_pixels(v_context),
-                unsup => anyhow::bail!(
-                    "{unsup:?} is not implemented for background gradients. \
-                     Use e.g. `height = '100%'` instead"
-                ),
-            } as u32;
-
-            if matches!(g.orientation, GradientOrientation::Radial { .. }) {
-                // To simplify the math, we compute a perfect circle
-                // for the radial gradient, and let the texture sampler
-                // perturb it to fill the window
-                width = width.min(height);
-                height = height.min(width);
-            }
+            let (width, height) = resolve_generated_background_size(
+                layer.width,
+                layer.height,
+                h_context,
+                v_context,
+                matches!(g.orientation, GradientOrientation::Radial { .. }),
+            );
 
             CachedGradient::load(g, width, height)?
         }
@@ -297,20 +310,13 @@ fn load_background_layer(
             // So we make a square texture in the ballpark of the window
             // surface.
             // It's not ideal.
-            let width = match layer.width {
-                BackgroundSize::Dimension(d) => d.evaluate_as_pixels(h_context),
-                unsup => anyhow::bail!(
-                    "{unsup:?} is not implemented for background color. \
-                     Use e.g. `width = '100%'` instead"
-                ),
-            } as u32;
-            let height = match layer.height {
-                BackgroundSize::Dimension(d) => d.evaluate_as_pixels(v_context),
-                unsup => anyhow::bail!(
-                    "{unsup:?} is not implemented for background color. \
-                     Use e.g. `height = '100%'` instead"
-                ),
-            } as u32;
+            let (width, height) = resolve_generated_background_size(
+                layer.width,
+                layer.height,
+                h_context,
+                v_context,
+                false,
+            );
 
             let size = width.min(height);
 
@@ -584,5 +590,70 @@ impl crate::TermWindow {
         }
 
         Ok(emitted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::Dimension;
+
+    fn context(pixel_max: f32, pixel_cell: f32) -> DimensionContext {
+        DimensionContext {
+            dpi: 96.0,
+            pixel_max,
+            pixel_cell,
+        }
+    }
+
+    #[test]
+    fn gui_visual_placeholder_generated_background_cover_and_contain_fill_available_space() {
+        let h_context = context(640.0, 16.0);
+        let v_context = context(480.0, 24.0);
+
+        assert_eq!(
+            resolve_generated_background_size(
+                BackgroundSize::Contain,
+                BackgroundSize::Cover,
+                h_context,
+                v_context,
+                false,
+            ),
+            (640, 480)
+        );
+    }
+
+    #[test]
+    fn gui_visual_placeholder_generated_background_dimensions_keep_explicit_units() {
+        let h_context = context(640.0, 16.0);
+        let v_context = context(480.0, 24.0);
+
+        assert_eq!(
+            resolve_generated_background_size(
+                BackgroundSize::Dimension(Dimension::Percent(0.5)),
+                BackgroundSize::Dimension(Dimension::Cells(2.0)),
+                h_context,
+                v_context,
+                false,
+            ),
+            (320, 48)
+        );
+    }
+
+    #[test]
+    fn gui_visual_placeholder_radial_generated_backgrounds_stay_square() {
+        let h_context = context(640.0, 16.0);
+        let v_context = context(480.0, 24.0);
+
+        assert_eq!(
+            resolve_generated_background_size(
+                BackgroundSize::Cover,
+                BackgroundSize::Dimension(Dimension::Pixels(300.0)),
+                h_context,
+                v_context,
+                true,
+            ),
+            (300, 300)
+        );
     }
 }

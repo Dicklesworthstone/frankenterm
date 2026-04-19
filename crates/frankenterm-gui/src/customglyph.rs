@@ -1,12 +1,12 @@
 use crate::glyphcache::{GlyphCache, SizedBlockKey};
 use crate::utilsprites::RenderMetrics;
-use ::window::bitmaps::atlas::Sprite;
-use ::window::color::SrgbaPixel;
 use config::DimensionContext;
 use std::ops::Range;
 use termwiz::surface::CursorShape;
 use tiny_skia::{BlendMode, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 use wezterm_font::units::{IntPixelLength, PixelLength};
+use window::bitmaps::atlas::Sprite;
+use window::color::SrgbaPixel;
 use window::{BitmapImage, Image, Point, Rect, Size};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -158,7 +158,11 @@ impl BlockCoord {
         /// For interior points, adjust so that we get the middle of the row;
         /// in AA modes with 1px wide strokes this gives better results.
         fn hint(v: f32) -> f32 {
-            if v.fract() == 0. { v - 0.5 } else { v }
+            if v.fract() == 0. {
+                v - 0.5
+            } else {
+                v
+            }
         }
         match self {
             Self::Zero => 0.,
@@ -672,6 +676,44 @@ impl PolyStyle {
         }
     }
 }
+
+const DIAGONAL_FILL_DOWN_RIGHT: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(1, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(1, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(3, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(3, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(5, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(5, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::Frac(1, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(1, 6)),
+        PolyCommand::MoveTo(BlockCoord::Frac(3, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(3, 6)),
+        PolyCommand::MoveTo(BlockCoord::Frac(5, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(5, 6)),
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
+
+const DIAGONAL_FILL_DOWN_LEFT: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(1, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(5, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(3, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(3, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(5, 6)),
+        PolyCommand::LineTo(BlockCoord::Frac(1, 6), BlockCoord::Zero),
+        PolyCommand::MoveTo(BlockCoord::Frac(5, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(1, 6)),
+        PolyCommand::MoveTo(BlockCoord::Frac(3, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(3, 6)),
+        PolyCommand::MoveTo(BlockCoord::Frac(1, 6), BlockCoord::One),
+        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(5, 6)),
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Outline,
+}];
 
 impl BlockKey {
     pub fn filter_out_synthetic(glyphs: &mut Vec<char>) {
@@ -4351,157 +4393,9 @@ impl BlockKey {
             // [🮗] HEAVY HORIZONTAL FILL
             0x1fb97 => Self::Blocks(&[Block::HorizontalBlock(2, 4), Block::HorizontalBlock(6, 8)]),
             // [🮘] UPPER LEFT TO LOWER RIGHT FILL
-            // NOTE: This is a quick placeholder which doesn't scale correctly
-            0x1fb98 => Self::Poly(&[
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(1, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(1, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(3, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(3, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(5, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(5, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(7, 10)),
-                        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(1, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Frac(9, 10)),
-                        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(3, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(1, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(5, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(3, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(7, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(5, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::One, BlockCoord::Frac(9, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-            ]),
+            0x1fb98 => Self::Poly(DIAGONAL_FILL_DOWN_RIGHT),
             // [🮙] UPPER RIGHT TO LOWER LEFT FILL
-            // NOTE: This is a quick placeholder which doesn't scale correctly
-            0x1fb99 => Self::Poly(&[
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(1, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(5, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(3, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(3, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(5, 10)),
-                        PolyCommand::LineTo(BlockCoord::Frac(1, 6), BlockCoord::Zero),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(7, 10)),
-                        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(1, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Frac(9, 10)),
-                        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(3, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(5, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(5, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(3, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(7, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-                Poly {
-                    path: &[
-                        PolyCommand::MoveTo(BlockCoord::Frac(1, 6), BlockCoord::One),
-                        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Frac(9, 10)),
-                        PolyCommand::Close,
-                    ],
-                    intensity: BlockAlpha::Full,
-                    style: PolyStyle::OutlineThin,
-                },
-            ]),
+            0x1fb99 => Self::Poly(DIAGONAL_FILL_DOWN_LEFT),
             // [🮚] UPPER AND LOWER TRIANGULAR HALF BLOCK
             0x1fb9a => Self::Triangles(Triangle::UPPER | Triangle::LOWER, BlockAlpha::Full),
             // [🮛] LEFT AND RIGHT TRIANGULAR HALF BLOCK
@@ -6029,4 +5923,29 @@ fn fill_rect(buffer: &mut Image, x: Range<f32>, y: Range<f32>, intensity: BlockA
         Transform::identity(),
         None,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_visual_placeholder_diagonal_fill_glyphs_use_scalable_outline_paths() {
+        let down_right = BlockKey::from_char('\u{1fb98}').expect("diagonal fill glyph");
+        let down_left = BlockKey::from_char('\u{1fb99}').expect("diagonal fill glyph");
+
+        let BlockKey::Poly(polys) = down_right else {
+            panic!("expected poly glyph for U+1FB98");
+        };
+        assert_eq!(polys, DIAGONAL_FILL_DOWN_RIGHT);
+        assert_eq!(polys[0].style, PolyStyle::Outline);
+        assert_eq!(polys[0].path.len(), 12);
+
+        let BlockKey::Poly(polys) = down_left else {
+            panic!("expected poly glyph for U+1FB99");
+        };
+        assert_eq!(polys, DIAGONAL_FILL_DOWN_LEFT);
+        assert_eq!(polys[0].style, PolyStyle::Outline);
+        assert_eq!(polys[0].path.len(), 12);
+    }
 }
