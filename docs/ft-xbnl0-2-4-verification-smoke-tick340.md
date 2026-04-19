@@ -33,11 +33,13 @@ Tick 430: Run 6 extended to 16 after tick 430 (Command::output_with_cx pre-spawn
 Tick 432: Run 6 extended to 17 after tick 432 (mpsc::Receiver::recv mid-flight cancel via select-race pattern, documents cx-cancel-waker gap) (104 tests total)
 Tick 433: Run 6 extended to 18 after tick 433 (oneshot_recv_with_cx mid-flight cancel probe, confirms gap generalises) (105 tests total)
 Tick 434: Run 6 extended to 19 after tick 434 (broadcast_recv_with_cx mid-flight cancel probe, confirms gap on third channel type) (106 tests total)
+Tick 438: Run 6 extended to 20 after tick 438 (watch::Receiver::changed mid-flight cancel probe, confirms gap on fourth channel type) (107 tests total)
+Tick 439: Run 6 extended to 22 after tick 439 (Semaphore::acquire_with_cx + JoinSet::join_next_with_cx mid-flight probes complete the matrix) (109 tests total)
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
 contract tests this session touches. Captured as an artifact so the bead
-owner can reference a concrete "106 of 106 passing at this commit" checkpoint
+owner can reference a concrete "109 of 109 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
@@ -127,8 +129,8 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
 | Web server cx pre-cancel + mid-flight (Run 5) | 2 | 2/2 ok |
-| Runtime-primitive contracts (Run 6) | 19 | 19/19 ok |
-| **Subtotal** | **106** | **106/106 ok** |
+| Runtime-primitive contracts (Run 6) | 22 | 22/22 ok |
+| **Subtotal** | **109** | **109/109 ok** |
 
 Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
 tick 357).
@@ -260,20 +262,24 @@ outer safety-net timeout).
 
 ## Interpretation
 
-- All 106 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- All 109 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
 - Compile time after the initial cold build: 0.00s-1.19s per filtered run. All tests now complete in sub-second wall time after tick 387's ft-l9mxa fix (previously Run 1 was 10.02s because the tick-380 snapshot's outer timeout fired; now the inner cancel-watcher race surfaces the cancel in ~70ms).
-- The 34 + 45 + 3 + 3 + 2 + 19 = 106 count covers this-session deliverables AND 32 pre-existing TLS tests (tick-357 `tls_` broadening), 2 pre-existing Semaphore happy-path tests (tick-427 `semaphore_acquire_` broadening), and 1 pre-existing Command::output mid-flight cancel test (tick-430 `command_output_with_cx` broadening) that the widened filters smoke-verify as a side benefit.
-- Run 6 grew from 2 to 19 tests across ticks 418-434. Ticks 418-430
+- The 34 + 45 + 3 + 3 + 2 + 22 = 109 count covers this-session deliverables AND 32 pre-existing TLS tests (tick-357 `tls_` broadening), 2 pre-existing Semaphore happy-path tests (tick-427 `semaphore_acquire_` broadening), and 1 pre-existing Command::output mid-flight cancel test (tick-430 `command_output_with_cx` broadening) that the widened filters smoke-verify as a side benefit.
+- Run 6 grew from 2 to 22 tests across ticks 418-439. Ticks 418-430
   (16 tests) pin the primitive × cx-cancel **pre-cancel** matrix.
-  Ticks 432/433/434 (3 tests) document a newly-discovered gap in
-  **mid-flight** cancel: asupersync recv primitives (mpsc / oneshot /
-  broadcast) observe pre-cancel but do NOT register cx-cancel-wakers,
-  so an already-suspended recv won't wake when cx is cancelled. The
-  tests pin the caller-side select-race workaround pattern (same
-  as tick-387's `DistributedHttpClient::race_with_cx_cancel` fix for
-  ft-l9mxa) — wrap the recv in `futures::future::select` against a
+  Ticks 432-439 (6 tests) document a universal gap in **mid-flight**
+  cancel observation across all six asupersync-backed long-lived
+  wait primitives (mpsc, oneshot, broadcast, watch, Semaphore,
+  JoinSet). Asupersync recv/acquire primitives observe pre-cancel
+  but do NOT register cx-cancel-wakers, so an already-suspended
+  recv won't wake when cx is cancelled. The tests pin the caller-side
+  select-race workaround (same as tick-387
+  `DistributedHttpClient::race_with_cx_cancel` fix for ft-l9mxa) —
+  wrap the primitive in `futures::future::select` against a
   poll-sleep watcher. Cancel surfaces within ~150 ms (100 ms trigger
-  delay + up to 50 ms poll interval).
+  delay + up to 50 ms poll interval). JoinSet is the exception
+  thanks to its runtime_compat-owned per-poll checkpoint (tick 426);
+  its mid-flight test tolerates either branch.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)
