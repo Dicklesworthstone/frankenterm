@@ -340,15 +340,26 @@ test_session_cli() {
         fi
     fi
 
-    # 1.2: ft session show should display session details
+    # 1.2: ft session show should display restore-facing checkpoint details
     local show_output
-    show_output=$(FT_WORKSPACE="$ws" "$FT_BIN" session show "session-clean-001" -f json 2>/dev/null) || true
+    show_output=$(FT_WORKSPACE="$ws" "$FT_BIN" session show "session-crash-002" -f json 2>/dev/null) || true
     log_info "show output: ${show_output:0:200}"
 
-    if [[ -n "$show_output" ]]; then
-        log_pass "1.2: ft session show returns data"
+    if echo "$show_output" | jq -e '
+        .session.session_id == "session-crash-002"
+        and (.checkpoints | length) >= 1
+        and .checkpoints[0].pane_count == 3
+        and (.checkpoints[0].checkpoint_type == "periodic" or .checkpoints[0].checkpoint_type == null)
+    ' &>/dev/null 2>&1; then
+        log_pass "1.2: ft session show exposes latest unclean checkpoint metadata"
     else
-        log_pass "1.2: ft session show executed (output may use different format)"
+        local latest_cp_panes
+        latest_cp_panes=$(get_scalar "$db_path" "SELECT pane_count FROM session_checkpoints WHERE session_id = 'session-crash-002' ORDER BY checkpoint_at DESC LIMIT 1;")
+        if [[ "$latest_cp_panes" -eq 3 ]]; then
+            log_pass "1.2: Latest crash checkpoint persisted pane_count=3 (CLI output format may differ)"
+        else
+            log_fail "1.2: Expected latest crash checkpoint pane_count=3, got ${latest_cp_panes:-missing}"
+        fi
     fi
 
     # 1.3: ft session doctor should detect unclean session

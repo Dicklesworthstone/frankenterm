@@ -17,6 +17,7 @@ use frankenterm_core::config::SnapshotConfig;
 use frankenterm_core::session_pane_state::{
     AgentMetadata, PaneStateSnapshot, ProcessInfo, TerminalState,
 };
+use frankenterm_core::session_restore::{find_unclean_sessions, load_latest_checkpoint, show_session};
 use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
 use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
@@ -201,6 +202,46 @@ fn full_pipeline_capture_persist_query_cleanup() {
             .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(total_pane_states, 7); // 3 + 4
+    });
+}
+
+#[test]
+fn restore_queries_follow_newest_unclean_checkpoint() {
+    run_async_test(async {
+        let (_tmp, db_path) = setup_test_db();
+        let engine = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+
+        let startup_panes = vec![make_pane_simple(0), make_pane_simple(1)];
+        let startup = engine
+            .capture(&startup_panes, SnapshotTrigger::Startup)
+            .await
+            .unwrap();
+
+        let periodic_panes = vec![make_pane_simple(0), make_pane_simple(1), make_pane_simple(2)];
+        let periodic = engine
+            .capture(&periodic_panes, SnapshotTrigger::Periodic)
+            .await
+            .unwrap();
+
+        let candidates = find_unclean_sessions(db_path.as_str()).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, startup.session_id);
+
+        let latest = load_latest_checkpoint(db_path.as_str(), &startup.session_id)
+            .unwrap()
+            .expect("latest checkpoint");
+        assert_eq!(latest.checkpoint_id, periodic.checkpoint_id);
+        assert_eq!(latest.pane_count, 3);
+        assert_eq!(latest.pane_states.len(), 3);
+
+        let (session, checkpoints) = show_session(db_path.as_str(), &startup.session_id).unwrap();
+        assert_eq!(session.session_id, startup.session_id);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(session.last_checkpoint_at, Some(checkpoints[0].checkpoint_at));
+        assert_eq!(candidates[0].last_checkpoint_at, Some(checkpoints[0].checkpoint_at));
+        assert_eq!(checkpoints[0].id, periodic.checkpoint_id);
+        assert_eq!(checkpoints[0].pane_count, 3);
+        assert_eq!(checkpoints[1].id, startup.checkpoint_id);
     });
 }
 
