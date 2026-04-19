@@ -18,6 +18,96 @@ This contract applies to:
 - **E2E tests** (`scripts/e2e_test.sh`)
 - **Benchmarks** (`cargo bench`)
 
+### Profile: Placeholder-Remediation Harnesses (`ft-akx00`)
+
+The `ft-akx00` placeholder-remediation program uses a narrower, bead-scoped
+verification profile layered on top of the generic contract above. These
+harnesses live under `tests/e2e/test_ft_akx00_*` and write evidence to:
+
+```text
+artifacts/placeholder-remediation/<bead_id>/<scenario_id>/<run_id>/
+```
+
+Every `ft-akx00` run directory must contain, at minimum:
+
+- `commands.txt` with exact reproduction commands in execution order
+- `env.txt` with run identity, platform, working directory, and target-dir data
+- `structured.log` in JSON-lines format
+- `stdout.txt`
+- `stderr.txt`
+- `summary.json`
+
+When a harness uses `tests/e2e/lib_rch_guards.sh`, the same directory must also
+retain:
+
+- `*.rch_probe.log`
+- `*.rch_smoke.log`
+- sibling `*.rch_meta.json` metadata for every saved `rch` log
+
+These bead-scoped harnesses are step-oriented rather than module-log-oriented,
+so their structured rows do not need the repo-wide `level` and `target` fields.
+Instead, they must emit the bead/surface fields below so a future maintainer can
+audit one run without reconstructing chat history.
+
+### Required `ft-akx00` Structured Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | ISO 8601 | UTC timestamp for the step row |
+| `bead_id` | string | Owning bead, e.g. `ft-akx00.6.2` |
+| `scenario_id` | string | Stable scenario or surface slug |
+| `surface` | string | Human-readable subsystem under test |
+| `step` | string | Stable step name within the harness |
+| `status` | string | `started`, `passed`, `failed`, or `skipped` |
+| `duration_ms` | integer | Measured step duration in milliseconds |
+| `correlation_id` | string | Stable run-level identifier shared across rows |
+| `backend` | string | Verification backend, typically `rch` or `local-shell` |
+| `platform` | string | `uname`-style platform identity |
+| `artifact_dir` | string | Absolute artifact directory for this run |
+| `redaction` | string | `none`, `partial`, or `full` |
+| `message` | string | Human-readable detail for the step result |
+
+Optional fields are encouraged when relevant:
+
+- `command` for exact shell or cargo invocations
+- `reason_code` for stable failure classification
+- `artifact` when one step produces a primary evidence file
+
+### `ft-akx00` Structured Row Example
+
+```json
+{
+  "timestamp": "2026-04-19T14:40:00Z",
+  "bead_id": "ft-akx00.6.2",
+  "scenario_id": "backend_resize_framebuffer",
+  "surface": "window-backends",
+  "step": "window_windows_target_check",
+  "status": "failed",
+  "duration_ms": 18432,
+  "correlation_id": "ft-akx00.6.2-20260419T144000Z",
+  "backend": "rch",
+  "platform": "Darwin 24.4.0 arm64",
+  "artifact_dir": "/abs/path/artifacts/placeholder-remediation/ft-akx00.6.2/backend_resize_framebuffer/20260419T144000Z",
+  "redaction": "none",
+  "message": "/abs/path/.../window_windows_target_check.log",
+  "reason_code": "RCH-CROSS-CC-MISSING-WINDOWS"
+}
+```
+
+### Reproduction Command Requirements
+
+`commands.txt` is normative evidence for the placeholder-remediation program.
+Each harness must append:
+
+- the `ensure_rch_ready` invocation, including whether smoke preflight was
+  skipped
+- every material local shell command
+- every `rch exec -- ...` command exactly as launched
+
+If a failure can only be understood from metadata, `summary.json` must point to
+the corresponding `*.rch_meta.json` sidecar rather than relying on a prose-only
+closing note.
+
 ---
 
 ## Log Levels and Usage

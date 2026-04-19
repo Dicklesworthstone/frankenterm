@@ -138,6 +138,12 @@ rch_write_meta_json() {
         --arg wrapper_exit_code "${wrapper_exit_code}" \
         --arg failure_reason_code "${failure_reason_code}" \
         --arg failure_reason_detail "${failure_reason_detail}" \
+        --arg repo_root "${_RCH_REPO_ROOT}" \
+        --arg smoke_target_dir "${_RCH_SMOKE_TARGET_DIR}" \
+        --arg timeout_bin "${TIMEOUT_BIN}" \
+        --arg step_timeout_secs "${RCH_STEP_TIMEOUT_SECS}" \
+        --arg smoke_timeout_secs "${RCH_SMOKE_TIMEOUT_SECS}" \
+        --arg rch_skip_smoke_preflight_requested "${RCH_SKIP_SMOKE_PREFLIGHT}" \
         --argjson probe_worker_ids "${probe_worker_ids_json}" \
         --argjson skipped_smoke_preflight "${skipped_smoke_preflight}" \
         --argjson reachable_workers_detected "${reachable_workers_detected}" \
@@ -154,6 +160,12 @@ rch_write_meta_json() {
           wrapper_exit_code: (if $wrapper_exit_code == "" then null else ($wrapper_exit_code | tonumber) end),
           failure_reason_code: (if $failure_reason_code == "" then null else $failure_reason_code end),
           failure_reason_detail: (if $failure_reason_detail == "" then null else $failure_reason_detail end),
+          repo_root: (if $repo_root == "" then null else $repo_root end),
+          smoke_target_dir: (if $smoke_target_dir == "" then null else $smoke_target_dir end),
+          timeout_bin: (if $timeout_bin == "" then null else $timeout_bin end),
+          step_timeout_secs: (if $step_timeout_secs == "" then null else ($step_timeout_secs | tonumber) end),
+          smoke_timeout_secs: (if $smoke_timeout_secs == "" then null else ($smoke_timeout_secs | tonumber) end),
+          rch_skip_smoke_preflight_requested: (if $rch_skip_smoke_preflight_requested == "" then null else ($rch_skip_smoke_preflight_requested == "1") end),
           skipped_smoke_preflight: $skipped_smoke_preflight,
           reachable_workers_detected: $reachable_workers_detected,
           fail_open_detected: $fail_open_detected,

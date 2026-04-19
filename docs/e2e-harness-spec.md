@@ -191,6 +191,63 @@ Failure cases MUST include artifact kinds:
 - `frame_histogram`
 - `failure_signature`
 
+## Bead-Scoped Verification Profile
+
+Some programs in this repository use bead-scoped harnesses instead of the
+general `scripts/e2e_test.sh` entrypoint. The `ft-akx00` placeholder-remediation
+lane is the canonical example.
+
+Those harnesses must follow all of the generic artifact rules above, plus these
+additional constraints:
+
+1. Artifact root:
+   `artifacts/placeholder-remediation/<bead_id>/<scenario_id>/<run_id>/`
+2. Required files in every run directory:
+   `commands.txt`, `env.txt`, `structured.log`, `stdout.txt`, `stderr.txt`,
+   `summary.json`
+3. Required remote-execution evidence when `rch` is used:
+   probe and smoke logs from `tests/e2e/lib_rch_guards.sh`, plus sibling
+   `*.rch_meta.json` files for every saved `rch` log
+4. `summary.json` must include:
+   overall status, `bead_id`, `scenario_id`, `correlation_id`, artifact paths,
+   and totals or per-step outcomes
+5. `structured.log` must use the step-oriented JSONL profile documented in
+   `docs/test-logging-contract.md`
+6. Closing notes and bead comments must cite absolute paths to the run
+   directory, `summary.json`, and `structured.log`
+
+### Placeholder-Remediation Suite Map
+
+The `ft-akx00` program should use stable harness naming so future implementers
+do not invent ad hoc script names per bead.
+
+| Track | Surface | Harness Prefix | Artifact Root |
+|-------|---------|----------------|---------------|
+| `ft-akx00.2.*` | machine-control, client, workspace, SDK | `tests/e2e/test_ft_akx00_2_*` | `artifacts/placeholder-remediation/ft-akx00.2.x/<scenario>/<run_id>` |
+| `ft-akx00.3.*` | operator startup, restart, backup, restore | `tests/e2e/test_ft_akx00_3_*` | `artifacts/placeholder-remediation/ft-akx00.3.x/<scenario>/<run_id>` |
+| `ft-akx00.4.*` | connector and search surfaces | `tests/e2e/test_ft_akx00_4_*` | `artifacts/placeholder-remediation/ft-akx00.4.x/<scenario>/<run_id>` |
+| `ft-akx00.5.*` | policy, approvals, safety, audit | `tests/e2e/test_ft_akx00_5_*` | `artifacts/placeholder-remediation/ft-akx00.5.x/<scenario>/<run_id>` |
+| `ft-akx00.6.*` | rendering, resize, framebuffer, image paths | `tests/e2e/test_ft_akx00_6_*` | `artifacts/placeholder-remediation/ft-akx00.6.x/<scenario>/<run_id>` |
+| `ft-akx00.7.*` | mux, SSH, SFTP, remote transport | `tests/e2e/test_ft_akx00_7_*` | `artifacts/placeholder-remediation/ft-akx00.7.x/<scenario>/<run_id>` |
+
+The scenario portion of the path should describe the user-facing capability,
+such as `backend_resize_framebuffer`, not a vague implementation label.
+
+### Placeholder-Remediation Redaction and Evidence Rules
+
+Placeholder-remediation closures are incomplete unless their artifacts also make
+the following explicit:
+
+- whether redaction was `none`, `partial`, or `full`
+- which step produced the primary failure artifact
+- exact reproduction commands in `commands.txt`
+- whether `RCH_SKIP_SMOKE_PREFLIGHT=1` was used, and if so, that the first
+  material remote cargo step still ran through `run_rch_cargo_logged`
+
+When a harness narrows scope instead of implementing behavior, the run bundle
+must include an audit step proving the unsupported path is now explicit in code
+or docs instead of silently left as a placeholder.
+
 ---
 
 ## Self-Check Mode
