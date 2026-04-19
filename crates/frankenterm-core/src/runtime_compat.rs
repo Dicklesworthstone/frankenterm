@@ -1774,7 +1774,8 @@ pub mod process {
             let watcher_cancel = Arc::clone(&cancel);
             let watcher_done_inner = Arc::clone(&watcher_done);
             let watcher_cx = cx.clone();
-            let watcher_handle = super::task::spawn(async move {
+            let watcher_spawn_cx = watcher_cx.clone();
+            let watcher_handle = super::task::spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
                 while !watcher_done_inner.load(Ordering::SeqCst) {
                     if watcher_cx.is_cancel_requested() {
                         watcher_cancel.store(true, Ordering::SeqCst);
