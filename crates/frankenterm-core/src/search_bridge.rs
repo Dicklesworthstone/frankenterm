@@ -325,8 +325,7 @@ impl SearchBridge {
         // not leak it past the call.
         watcher_done.store(true, Ordering::Release);
         if let Some(handle) = watcher_handle {
-            handle.thread().unpark();
-            let _ = handle.join();
+            let _ = handle.await;
         }
 
         result
@@ -617,7 +616,10 @@ fn spawn_cancellation_thread(
 fn spawn_asupersync_cancellation_watcher(
     cx: crate::cx::Cx,
     cancellation: BridgeCancellationToken,
-) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
+) -> (
+    Arc<AtomicBool>,
+    Option<crate::runtime_compat::task::JoinHandle<()>>,
+) {
     let done = Arc::new(AtomicBool::new(false));
     // If the asupersync Cx is already cancelled at entry, propagate once
     // and skip the watcher thread entirely.
@@ -631,17 +633,17 @@ fn spawn_asupersync_cancellation_watcher(
         return (done, None);
     }
 
-    let done_for_thread = Arc::clone(&done);
-    let handle = std::thread::spawn(move || {
-        while !done_for_thread.load(Ordering::Acquire) {
-            if cx.is_cancel_requested() {
+    let done_for_task = Arc::clone(&done);
+    let handle = crate::runtime_compat::task::spawn_with_cx(&cx, move |watcher_cx| async move {
+        while !done_for_task.load(Ordering::Acquire) {
+            if watcher_cx.is_cancel_requested() {
                 cancellation.cancel();
                 break;
             }
             if cancellation.is_cancelled() {
                 break;
             }
-            std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
+            let _ = crate::runtime_compat::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
         }
     });
 
