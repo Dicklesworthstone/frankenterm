@@ -5707,6 +5707,67 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 427: `Semaphore::acquire_owned_with_cx` observes cx-cancel.
+    ///
+    /// Companion to tick 421's borrow-variant test. The owned variant
+    /// (used by call sites that need to pass a permit across an await
+    /// boundary or into a spawned task) takes `self: Arc<Self>` and
+    /// returns `OwnedSemaphorePermit` instead of `SemaphorePermit<'_>`.
+    /// The cancel contract is the same: pre-cancelled cx on a
+    /// zero-permit semaphore must yield `Err(AcquireError::Cancelled)`
+    /// promptly, not block indefinitely.
+    ///
+    /// Setup (mirrors tick 421):
+    /// 1. Construct `Arc::new(Semaphore::new(0))` — fully contended.
+    /// 2. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 3. Wrap `sem.clone().acquire_owned_with_cx(&cx)` in a 2 s outer
+    ///    safety-net timeout.
+    /// 4. Assert elapsed < 1 s AND `Err(AcquireError::Cancelled)`
+    ///    specifically.
+    ///
+    /// Pinning both variants together guards against a regression
+    /// where only one path picks up a future cx-cancel-observability
+    /// change in asupersync (the two delegate to different asupersync
+    /// acquire entry points: `Semaphore::acquire(cx, n)` vs
+    /// `OwnedSemaphorePermit::acquire(Arc<Semaphore>, cx, n)`).
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn semaphore_acquire_owned_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let sem = std::sync::Arc::new(Semaphore::new(0));
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 427 pre-cancel Semaphore::acquire_owned_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                sem.clone().acquire_owned_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit Semaphore::acquire_owned_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                matches!(inner, Err(AcquireError::Cancelled)),
+                "pre-cancelled cx must yield AcquireError::Cancelled (not Closed / \
+                 PolledAfterCompletion); got: {inner:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 421: `Semaphore::acquire_with_cx` observes cx-cancel.
     ///
     /// Pins the cx-cancel observation on the Semaphore acquire primitive.
