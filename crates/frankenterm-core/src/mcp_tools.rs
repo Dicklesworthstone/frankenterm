@@ -13,7 +13,6 @@ use crate::mcp_framework::{
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 use crate::policy::PolicySurface;
-#[cfg(test)]
 use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
