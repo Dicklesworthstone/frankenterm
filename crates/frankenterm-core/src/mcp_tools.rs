@@ -13,6 +13,8 @@ use crate::mcp_framework::{
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 use crate::policy::PolicySurface;
+#[cfg(test)]
+use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
@@ -34,12 +36,12 @@ use super::mcp_types::{
 use super::{
     AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
     CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
-    CassViewResult, CautClient, CautService, CompatRuntime, CompatRuntimeBuilder, Config,
-    DecisionContext, EventQuery, HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction,
-    HandleGeminiQuota, HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits,
-    InjectionResult, MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY,
-    MCP_ERR_INVALID_ARGS, MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY,
-    MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
+    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery,
+    HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
+    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
+    MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE,
+    MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
     PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter,
     PaneWorkflowLockManager, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
     PolicyInput, SearchQueryDefaults, SearchQueryInput, StorageHandle, UnifiedSearchMode,
