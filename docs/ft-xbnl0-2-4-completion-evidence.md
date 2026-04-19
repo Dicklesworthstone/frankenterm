@@ -278,19 +278,20 @@ pre-flight. Ticks 328 (`timeout_with_cx`) + 331 (`sleep_with_cx`).
 ### 3a. Consolidated one-shot (recommended for local smoke)
 
 Since tick 347 the repo contains `scripts/check_ft_xbnl0_2_4.sh` which
-runs all 5 filtered cargo test groups in sequence. Use this when you
+runs all 6 filtered cargo test groups in sequence. Use this when you
 want a single-exit-code yes/no for the whole verification surface:
 
 ```bash
 ./scripts/check_ft_xbnl0_2_4.sh
 ```
 
-The script handles `CC`/`CXX`/`CARGO_TARGET_DIR` defaults internally
-(see tick 355 / 370). On a warm target dir, finishes in a few seconds;
-cold build ~90s. Final output line is the aggregate:
+The script handles `CC`/`CXX`/`CARGO_TARGET_DIR` defaults internally.
+Its default target dir now matches the current swarm convention:
+`/tmp/ft-$(whoami)-target`. On a warm target dir, it finishes in a few
+seconds; cold build is much longer. Final output line is the aggregate:
 
 ```
-  ft-xbnl0.2.4 — all 5 runs PASS (77 tests)
+  ft-xbnl0.2.4 — all 6 runs PASS (109 tests)
 ```
 
 ### 3b. Fork-bypass wrapper (when you need to pin specific flags)
@@ -305,9 +306,8 @@ escape hatch (used throughout this session's tick-by-tick authoring):
    `CXX=/opt/homebrew/opt/llvm/bin/clang++` (the `cc` shell alias maps to
    Claude Code, not the C compiler — builds with native deps like
    `aws-lc-sys` fail without this).
-3. Exports `CARGO_TARGET_DIR=/tmp/ft-rusticmaple-target` (isolated from
-   other agents holding locks on `/Volumes/USB_NVME/cargo-target` or
-   `target/`).
+3. Exports `CARGO_TARGET_DIR=/tmp/ft-$(whoami)-target` (isolated from
+   other agents and consistent with the current swarm convention).
 4. `execvpe` replaces the child process with `cargo`.
 
 Example wrapper (`/tmp/ft-cargo-test-*.py`):
@@ -322,7 +322,7 @@ os.setsid()
 env = os.environ.copy()
 env["CC"] = "/opt/homebrew/opt/llvm/bin/clang"
 env["CXX"] = "/opt/homebrew/opt/llvm/bin/clang++"
-env["CARGO_TARGET_DIR"] = "/tmp/ft-rusticmaple-target"
+env["CARGO_TARGET_DIR"] = "/tmp/ft-jemanuel-target"
 os.chdir("/Users/jemanuel/projects/frankenterm")
 os.execvpe("cargo", [
     "cargo", "test",
@@ -344,7 +344,7 @@ Per the shared verification contract ([ft-xbnl0-verification-contract.md](ft-xbn
 ### 4a. One-shot check script (local smoke)
 
 Since tick 347 there is a consolidated verification script that runs all
-five test groups in sequence with a single exit code:
+six test groups in sequence with a single exit code:
 
 ```bash
 rch workers probe --all --json                                         # capacity proof
@@ -359,34 +359,41 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (109 tests)`.
-Exit 0 iff all 109 tests pass.
+output. By default it uses `/tmp/ft-$(whoami)-target`; callers can
+still override that by exporting `CARGO_TARGET_DIR` first. Final summary
+line: `ft-xbnl0.2.4 — all 6 runs PASS (109 tests)`. Exit 0 iff all
+109 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-check \
+export CARGO_TARGET_DIR=/tmp/ft-$(whoami)-target
+
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo check -p frankenterm-core --features distributed,asupersync-runtime --all-targets
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-clippy \
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo clippy --no-deps -p frankenterm-core --features distributed,asupersync-runtime --all-targets -- -D warnings
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-test-distributed \
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo test -p frankenterm-core --features distributed \
     --lib distributed::tests:: -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-test-metrics \
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo test -p frankenterm-core --features asupersync-runtime \
     --lib metrics_server_start_with_cx -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-test-web \
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo test -p frankenterm-core --features web,asupersync-runtime \
     --test web web_server_with_cx -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0.2.4-test-guards \
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo test -p frankenterm-core \
     --test ft_xbnl0_2_4_no_direct_tokio_net_or_rustls -- --nocapture
-rch exec -- cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo fmt --check
 ```
 
-Each command's output should be captured into
-`target/rch-ft-xbnl0.2.4-<purpose>/rch-logs/` along with exit code and
-elapsed time (see artifact contract in the shared verification spec §"Level C").
+Each command's output should be captured into a bead-scoped artifact
+directory (for example `/tmp/ft-xbnl0.2.4-rch-artifacts-<timestamp>/`)
+along with exit code and elapsed time (see artifact contract in the
+shared verification spec §"Level C"). The isolated `/tmp/ft-$(whoami)-target`
+build dir is for compilation outputs; logs should live alongside it, not
+inside the repo's shared `target/`.
 
 ---
 
@@ -419,7 +426,7 @@ These items have been verified in-session and are durable evidence:
 ### 6.1 Closer to decide
 
 - [ ] `cargo clippy -D warnings` workspace-wide — see §6.1.1 (ft-jqvg5 open, 17 errors all in other agents' files).
-- [ ] Save Level-C artifact bundle per shared verification contract. Recommended: copy `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/*.log` (7 files covering all 6 groups at tick-393 88/88 baseline) + `/tmp/ft-xbnl0.2.4-rch-artifacts-tick447/*.log` (ticks 447-450 warm re-verify bundle: Run 6 22/22 at tick 449, Run 5 2/2 at tick 450, completing the 109/109 remote match) into a closure-timestamped dir under `target/rch-ft-xbnl0.2.4-closure/`.
+- [ ] Save Level-C artifact bundle per shared verification contract. Recommended: copy `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/*.log` (7 files covering all 6 groups at tick-393 88/88 baseline) + `/tmp/ft-xbnl0.2.4-rch-artifacts-tick447/*.log` (ticks 447-450 warm re-verify bundle: Run 6 22/22 at tick 449, Run 5 2/2 at tick 450, completing the 109/109 remote match) into a closure-timestamped dir under `/tmp/ft-xbnl0.2.4-rch-artifacts-closure/`.
 - [ ] Closing note cites this document, the smoke artifact, and the rch-attempt doc (3 mutually-coherent docs) rather than re-summarizing the 200+ tick comments.
 
 ### 6.1 Notes on adjacent gate findings unrelated to this bead

@@ -57,10 +57,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-# Each agent should use a unique target dir to avoid lock contention
-# with other concurrently-running agents. Default is a project-scoped
-# dir; override with CARGO_TARGET_DIR_OVERRIDE for agent-specific use.
-: "${CARGO_TARGET_DIR:=${CARGO_TARGET_DIR_OVERRIDE:-target/ft-xbnl0.2.4-check}}"
+# Each agent should use an isolated /tmp target dir to avoid lock
+# contention with other concurrently-running agents. This matches the
+# current swarm convention (`export CARGO_TARGET_DIR=/tmp/ft-$(whoami)-target`).
+# Override with CARGO_TARGET_DIR or CARGO_TARGET_DIR_OVERRIDE when a
+# caller needs a different location.
+: "${CARGO_TARGET_DIR:=${CARGO_TARGET_DIR_OVERRIDE:-/tmp/ft-$(whoami)-target}}"
 export CARGO_TARGET_DIR
 
 # The `cc` shell alias on this dev machine maps to Claude Code rather

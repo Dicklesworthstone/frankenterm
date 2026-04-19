@@ -5,14 +5,13 @@
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use futures::future;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pemfile::{certs, private_key};
 use std::io;
-use std::sync::Arc;
 
 const THROUGHPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -51,21 +50,20 @@ fn tls_materials(mtls: bool) -> io::Result<(TlsAcceptor, TlsConnector)> {
         .with_single_cert(server_chain, server_key.clone_key())
         .map_err(to_io)?;
 
-    let client_cfg = ClientConfig::builder_with_protocol_versions(&versions)
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let client_builder =
+        ClientConfig::builder_with_protocol_versions(&versions).with_root_certificates(roots);
 
-    let acceptor = TlsAcceptor::new(Arc::new(server_cfg));
-    let connector = if mtls {
+    let acceptor = TlsAcceptor::new(server_cfg);
+    let client_cfg = if mtls {
         let client_chain = load_cert_chain(CLIENT_CERT)?;
         let client_key = load_private_key(CLIENT_KEY)?;
-        let cfg = client_cfg
+        client_builder
             .with_client_auth_cert(client_chain, client_key.clone_key())
-            .map_err(to_io)?;
-        TlsConnector::new(Arc::new(cfg))
+            .map_err(to_io)?
     } else {
-        TlsConnector::new(Arc::new(client_cfg))
+        client_builder.with_no_client_auth()
     };
+    let connector = TlsConnector::new(client_cfg);
 
     Ok((acceptor, connector))
 }
@@ -134,7 +132,7 @@ fn bench_tcp_throughput(c: &mut Criterion) {
                 let client = async move {
                     let mut stream = TcpStream::connect(addr).await.unwrap();
                     stream.write_all(&payload).await.unwrap();
-                    let _ = stream.shutdown(asupersync::net::Shutdown::Both);
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                 };
 
                 future::join(server, client).await;
