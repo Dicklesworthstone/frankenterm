@@ -259,6 +259,13 @@ fn initial_surface_extent(dimensions: Dimensions) -> (u32, u32) {
     )
 }
 
+fn resize_surface_extent(dimensions: Dimensions) -> (u32, u32) {
+    (
+        dimensions.pixel_width.min(u32::MAX as usize) as u32,
+        dimensions.pixel_height.min(u32::MAX as usize) as u32,
+    )
+}
+
 fn select_composite_alpha_mode(
     alpha_modes: &[wgpu::CompositeAlphaMode],
 ) -> wgpu::CompositeAlphaMode {
@@ -593,8 +600,9 @@ impl WebGpuState {
         }
         *self.dimensions.borrow_mut() = dims;
         let mut config = self.config.borrow_mut();
-        config.width = dims.pixel_width as u32;
-        config.height = dims.pixel_height as u32;
+        let (width, height) = resize_surface_extent(dims);
+        config.width = width;
+        config.height = height;
         if config.width > 0 && config.height > 0 {
             // Avoid reconfiguring with a 0 sized surface, as webgpu will
             // panic in that case
@@ -607,8 +615,8 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_surface_extent, select_composite_alpha_mode, select_surface_format,
-        select_surface_view_formats, select_view_formats_for_format,
+        initial_surface_extent, resize_surface_extent, select_composite_alpha_mode,
+        select_surface_format, select_surface_view_formats, select_view_formats_for_format,
     };
     use window::Dimensions;
 
@@ -797,6 +805,42 @@ mod tests {
                 dpi: 96,
             }),
             (1, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn resize_surface_extent_preserves_zero_dimensions() {
+        assert_eq!(
+            resize_surface_extent(Dimensions {
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            }),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn resize_surface_extent_clamps_large_dimensions_to_u32_max() {
+        assert_eq!(
+            resize_surface_extent(Dimensions {
+                pixel_width: usize::MAX,
+                pixel_height: usize::MAX,
+                dpi: 96,
+            }),
+            (u32::MAX, u32::MAX)
+        );
+    }
+
+    #[test]
+    fn resize_surface_extent_clamps_each_axis_independently() {
+        assert_eq!(
+            resize_surface_extent(Dimensions {
+                pixel_width: 0,
+                pixel_height: usize::MAX,
+                dpi: 96,
+            }),
+            (0, u32::MAX)
         );
     }
 }
