@@ -167,7 +167,7 @@ else
 fi
 
 TEST_COUNT=$(grep -c '#\[test\]' "${TEST_FILE}" || true)
-if [[ "${TEST_COUNT}" -ge 19 ]]; then
+if [[ "${TEST_COUNT}" -ge 20 ]]; then
   record_structural_pass "integration_test_count" "sufficient" "${STRUCTURAL_FILE}" "count=${TEST_COUNT}"
 else
   record_structural_fail "integration_test_count" "insufficient" "E_TESTS" "${STRUCTURAL_FILE}" "count=${TEST_COUNT}"
@@ -189,6 +189,12 @@ if rg -q 'spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers'
   record_structural_pass "spawn_with_cx_recovery_test_presence" "present" "${STRUCTURAL_FILE}"
 else
   record_structural_fail "spawn_with_cx_recovery_test_presence" "missing" "E_SPAWN_WITH_CX" "${STRUCTURAL_FILE}"
+fi
+
+if rg -q 'spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers' "${TEST_FILE}"; then
+  record_structural_pass "spawn_with_cx_timeout_recovery_test_presence" "present" "${STRUCTURAL_FILE}"
+else
+  record_structural_fail "spawn_with_cx_timeout_recovery_test_presence" "missing" "E_SPAWN_WITH_CX_TIMEOUT" "${STRUCTURAL_FILE}"
 fi
 
 FAULT_REFS=$(rg -c 'SimulatedNetwork|fault|hostile|recovery' "${TEST_FILE}" || true)
@@ -235,6 +241,11 @@ run_rch_phase \
   "spawn_with_cx_recovery_targeted" \
   "cargo test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers -- --test-threads=1" \
   test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers -- --test-threads=1
+
+run_rch_phase \
+  "spawn_with_cx_timeout_recovery_targeted" \
+  "cargo test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers -- --test-threads=1" \
+  test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers -- --test-threads=1
 
 echo ""
 echo "=== Phase 3: Full mux migration completion suite ==="
