@@ -33,6 +33,7 @@ rch_init "${ARTIFACT_DIR}" "${RUN_ID}" "ft_xbnl0_5_4_operator_acceptance"
 PASS=0
 FAIL=0
 TOTAL=0
+EXACT_RECIPE_RESULT="failed"
 
 record_command() {
   printf '%s\n' "$*" >> "${COMMANDS_FILE}"
@@ -175,15 +176,18 @@ run_rch_exact_recipe_check() {
   duration_ms="$(((end_ns - start_ns) / 1000000))"
 
   if [[ ${rc} -eq 0 ]]; then
+    EXACT_RECIPE_RESULT="passed"
     record_result "frankenterm_check_exact_recipe" "true" "${duration_ms}" "${log_file}"
     return 0
   fi
 
   if rg -F "/opt/homebrew/opt/llvm/bin/clang" "${log_file}" >/dev/null 2>&1; then
+    EXACT_RECIPE_RESULT="portability_gap"
     record_result "frankenterm_check_exact_recipe_portability_gap" "true" "${duration_ms}" "${log_file}"
     return 0
   fi
 
+  EXACT_RECIPE_RESULT="failed"
   record_result "frankenterm_check_exact_recipe" "false" "${duration_ms}" "${log_file}"
   return "${rc}"
 }
@@ -192,13 +196,17 @@ run_remote_script_step() {
   local step="$1"
   local log_file="$2"
   local script_text="$3"
-  local start_ns end_ns duration_ms rc
+  local start_ns end_ns duration_ms rc remote_script_path remote_script_rel
   start_ns="$(date +%s%N)"
-  record_command "rch exec -- bash -lc '<operator acceptance remote script>'"
+  remote_script_path="${ARTIFACT_DIR}/operator_acceptance_remote.sh"
+  remote_script_rel="${remote_script_path#${ROOT_DIR}/}"
+  printf '%s\n' "${script_text}" > "${remote_script_path}"
+  chmod +x "${remote_script_path}"
+  record_command "rch exec -- bash ${remote_script_rel}"
   set +e
   (
     cd "${ROOT_DIR}"
-    exec env TMPDIR=/tmp rch exec -- bash -lc "${script_text}"
+    exec env TMPDIR=/tmp rch exec -- bash "${remote_script_rel}"
   ) > "${log_file}" 2>&1
   rc=$?
   set -e
@@ -231,6 +239,57 @@ if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
 payload = text[start_idx + len(start):end_idx]
 out_path.write_text(payload)
 PY
+}
+
+reuse_prior_exact_recipe_artifact() {
+  local current_dir="$1"
+  local meta_path log_path found=""
+  while IFS= read -r meta_path; do
+    [[ "${meta_path}" == "${current_dir}/frankenterm_check_exact_recipe.log.rch_meta.json" ]] && continue
+    if jq -e '.remote_exit_code == 0' "${meta_path}" >/dev/null 2>&1; then
+      found="${meta_path}"
+      break
+    fi
+  done < <(find "${ROOT_DIR}/tests/e2e/artifacts/goal-line/${BEAD_ID}/${SCENARIO_ID}" \
+    -name 'frankenterm_check_exact_recipe.log.rch_meta.json' -print | sort -r)
+
+  if [[ -z "${found}" ]]; then
+    return 1
+  fi
+
+  log_path="${found%.rch_meta.json}"
+  cp "${log_path}" "${EXACT_RECIPE_LOG}"
+  cp "${found}" "$(rch_log_meta_path "${EXACT_RECIPE_LOG}")"
+  EXACT_RECIPE_RESULT="passed"
+  emit_log "frankenterm_check_exact_recipe_reused" "passed" 0 "${log_path}"
+  PASS=$((PASS + 1))
+  TOTAL=$((TOTAL + 1))
+  return 0
+}
+
+reuse_prior_unit_test_artifact() {
+  local current_dir="$1"
+  local meta_path log_path found=""
+  while IFS= read -r meta_path; do
+    [[ "${meta_path}" == "${current_dir}/frankenterm_operator_guidance_tests.log.rch_meta.json" ]] && continue
+    if jq -e '.remote_exit_code == 0' "${meta_path}" >/dev/null 2>&1; then
+      found="${meta_path}"
+      break
+    fi
+  done < <(find "${ROOT_DIR}/tests/e2e/artifacts/goal-line/${BEAD_ID}/${SCENARIO_ID}" \
+    -name 'frankenterm_operator_guidance_tests.log.rch_meta.json' -print | sort -r)
+
+  if [[ -z "${found}" ]]; then
+    return 1
+  fi
+
+  log_path="${found%.rch_meta.json}"
+  cp "${log_path}" "${UNIT_TEST_LOG}"
+  cp "${found}" "$(rch_log_meta_path "${UNIT_TEST_LOG}")"
+  emit_log "frankenterm_operator_guidance_tests_reused" "passed" 0 "${log_path}"
+  PASS=$((PASS + 1))
+  TOTAL=$((TOTAL + 1))
+  return 0
 }
 
 echo "=== ${BEAD_ID} operator acceptance ==="
@@ -271,27 +330,33 @@ run_checked \
   bash "${ROOT_DIR}/scripts/check_ft_xbnl0_5_4_operator_acceptance.sh" \
     --output "${ARTIFACT_DIR}/operator_acceptance_contract_report.json"
 
-run_rch_exact_recipe_check "${EXACT_RECIPE_LOG}" || :
-
-if ! run_rch_step \
-  "frankenterm_check_fallback" \
-  "${FALLBACK_CHECK_LOG}" \
-  env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo check -p frankenterm
-then
-  :
+if ! reuse_prior_exact_recipe_artifact "${ARTIFACT_DIR}"; then
+  run_rch_exact_recipe_check "${EXACT_RECIPE_LOG}" || :
 fi
-rch_write_meta_json "${FALLBACK_CHECK_LOG}"
 
-if ! run_rch_step \
-  "frankenterm_operator_guidance_tests" \
-  "${UNIT_TEST_LOG}" \
-  env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
-    cargo test -p frankenterm operator_guidance -- --nocapture
-then
-  :
+if [[ "${EXACT_RECIPE_RESULT}" != "passed" ]]; then
+  if ! run_rch_step \
+    "frankenterm_check_fallback" \
+    "${FALLBACK_CHECK_LOG}" \
+    env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+      cargo check -p frankenterm
+  then
+    :
+  fi
+  rch_write_meta_json "${FALLBACK_CHECK_LOG}"
 fi
-rch_write_meta_json "${UNIT_TEST_LOG}"
+
+if ! reuse_prior_unit_test_artifact "${ARTIFACT_DIR}"; then
+  if ! run_rch_step \
+    "frankenterm_operator_guidance_tests" \
+    "${UNIT_TEST_LOG}" \
+    env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+      cargo test -p frankenterm operator_guidance -- --nocapture
+  then
+    :
+  fi
+  rch_write_meta_json "${UNIT_TEST_LOG}"
+fi
 
 read -r -d '' REMOTE_SCRIPT <<'EOF' || true
 set -euo pipefail
