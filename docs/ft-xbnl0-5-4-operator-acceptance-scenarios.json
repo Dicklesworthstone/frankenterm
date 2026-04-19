@@ -1,0 +1,123 @@
+{
+  "bead_id": "ft-xbnl0.5.4",
+  "title": "Operator acceptance scenarios from fresh install through recovery",
+  "scenario_groups": [
+    {
+      "id": "OA-01",
+      "slug": "clean_bootstrap",
+      "surface": "first_run",
+      "claim": "A clean workspace exposes explicit bootstrap guidance and can be bootstrapped through the product path.",
+      "commands": [
+        "ft doctor --json",
+        "ft status --health -f json",
+        "ft watch --foreground"
+      ],
+      "success_criteria": [
+        "status --health classifies the workspace as bootstrap_required before any runtime state exists",
+        "doctor remains machine-readable and points at the bootstrap path even if other backend checks are still degraded",
+        "the first watch run creates .ft/, .ft/logs, and the database under the workspace"
+      ],
+      "failure_criteria": [
+        "status --health reports a generic error without first-run guidance",
+        "doctor output stops being machine-readable or hides the next-step commands",
+        "the watch bootstrap path does not create the runtime directories and database"
+      ],
+      "evidence_mode": "deterministic_harness"
+    },
+    {
+      "id": "OA-02",
+      "slug": "broken_environment_diagnosis",
+      "surface": "doctor",
+      "claim": "A broken backend environment is diagnosed through actionable doctor output rather than silent failure.",
+      "commands": [
+        "ft doctor --json"
+      ],
+      "success_criteria": [
+        "doctor exits non-zero",
+        "the WezTerm CLI check is marked as an error",
+        "operator guidance status is blocked with a concrete remediation step"
+      ],
+      "failure_criteria": [
+        "doctor succeeds despite a broken backend bridge",
+        "the output lacks a concrete remediation command or install hint"
+      ],
+      "evidence_mode": "deterministic_harness"
+    },
+    {
+      "id": "OA-03",
+      "slug": "incident_triage_entry",
+      "surface": "doctor_status_session_doctor",
+      "claim": "The standard incident entry path routes through the new diagnostic surfaces and points operators at recovery commands.",
+      "commands": [
+        "ft doctor --json",
+        "ft status --health -f json",
+        "ft session doctor -f json"
+      ],
+      "success_criteria": [
+        "all three surfaces classify the seeded incident as recovery_required",
+        "the next-step commands point at watch, session list, or snapshot inspection"
+      ],
+      "failure_criteria": [
+        "any surface hides the unclean-session condition",
+        "recovery guidance does not include a concrete next step"
+      ],
+      "evidence_mode": "deterministic_harness"
+    },
+    {
+      "id": "OA-04",
+      "slug": "return_to_steady_state",
+      "surface": "session_recovery",
+      "claim": "After the incident state is repaired, session persistence returns to a healthy classification.",
+      "commands": [
+        "ft session doctor -f json",
+        "ft session list -f json"
+      ],
+      "success_criteria": [
+        "session doctor reports healthy after the unclean marker is cleared",
+        "session inventory remains queryable after the repair"
+      ],
+      "failure_criteria": [
+        "session doctor continues to report recovery_required after the repair",
+        "session inventory becomes unreadable or inconsistent"
+      ],
+      "evidence_mode": "deterministic_harness"
+    },
+    {
+      "id": "OA-05",
+      "slug": "operator_story_cross_checks",
+      "surface": "playbooks_and_release_gates",
+      "claim": "The finish-line operator story is anchored by retained large-fleet tuning and release-gate evidence instead of chat-only narrative.",
+      "commands": [
+        "bash scripts/check_ft_xbnl0_5_3_blessed_tuning_profiles.sh --output docs/ft-xbnl0-5-3-blessed-tuning-validation.json",
+        "bash scripts/check_ft_xbnl0_4_6_release_gates.sh --output /tmp/ft-xbnl0-4-6-eval.json"
+      ],
+      "success_criteria": [
+        "the blessed tuning package is still validated",
+        "the release-gate evaluator remains reproducible with stored artifacts"
+      ],
+      "failure_criteria": [
+        "operator guidance references stale or missing artifacts",
+        "the cross-check commands cannot be replayed from repository state"
+      ],
+      "evidence_mode": "borrowed_evidence"
+    }
+  ],
+  "required_refs": {
+    "verification_contract": "docs/ft-xbnl0-verification-contract.md",
+    "operator_playbook": "docs/operator-playbook.md",
+    "first_run_recovery_impl": "docs/ft-xbnl0-5-7-completion-evidence.md",
+    "blessed_tuning_playbook": "docs/ft-xbnl0-5-3-blessed-tuning-playbook.md",
+    "release_gate_evidence": "docs/ft-xbnl0-4-6-completion-evidence.md",
+    "scenario_harness": "tests/e2e/test_ft_xbnl0_5_4_operator_acceptance.sh",
+    "scenario_validator": "scripts/check_ft_xbnl0_5_4_operator_acceptance.sh"
+  },
+  "exact_verification_commands": [
+    "bash scripts/check_ft_xbnl0_5_4_operator_acceptance.sh --output docs/ft-xbnl0-5-4-operator-acceptance-validation.json",
+    "bash tests/e2e/test_ft_xbnl0_5_4_operator_acceptance.sh",
+    "CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ CARGO_TARGET_DIR=/tmp/ft-cod2-target rch exec -- cargo check -p frankenterm"
+  ],
+  "remaining_gaps": [
+    "Live pane control and long-haul swarm activity still cross the WezTerm-backed mux boundary; this bundle treats those as evidence-backed operator paths, not pure local mocks.",
+    "The macOS-specific clang recipe is retained exactly because the user requested it, but Linux RCH workers may fail before Rust compilation if that toolchain path is absent."
+  ]
+}
