@@ -56,9 +56,9 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 use crate::runtime_compat::{
-    RwLock, mpsc, sleep,
+    RwLock, mpsc,
     task::{self, JoinHandle},
-    timeout, watch,
+    watch,
 };
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
@@ -129,7 +129,7 @@ async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         let _ = runtime_cx;
-        sleep(duration).await;
+        crate::runtime_compat::sleep(duration).await;
     }
 }
 
@@ -149,7 +149,7 @@ where
     #[cfg(not(feature = "asupersync-runtime"))]
     {
         let _ = runtime_cx;
-        timeout(duration, future).await
+        crate::runtime_compat::timeout(duration, future).await
     }
 }
 
@@ -1577,10 +1577,8 @@ impl ObservationRuntime {
                         }
                         // Also purge old audit actions
                         // ft-xbnl0.2.3 tick 251: cx-first retention purge.
-                        let purge_cx =
-                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                         if let Err(e) = storage
-                            .purge_audit_actions_before_with_cx(&purge_cx, cutoff_ms)
+                            .purge_audit_actions_before_with_cx(&loop_cx, cutoff_ms)
                             .await
                         {
                             error!(error = %e, "Audit purge failed");
@@ -2130,11 +2128,9 @@ impl ObservationRuntime {
 
                             // Check if pane exists in storage to recover stable UUID
                             // ft-xbnl0.2.3 tick 251: cx-first storage in pane-setup block.
-                            let pane_setup_cx =
-                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             let stable_uuid = {
                                 let result = storage
-                                    .get_pane_with_cx(&pane_setup_cx, pane_id)
+                                    .get_pane_with_cx(&loop_cx, pane_id)
                                     .await
                                     .unwrap_or_else(|e| {
                                         warn!(pane_id, error = %e, "Failed to check storage for existing pane");
@@ -2172,9 +2168,7 @@ impl ObservationRuntime {
                             // Upsert pane in storage
                             // ft-xbnl0.2.3 tick 251: cx-first upsert (reuse pane_setup_cx).
                             let record = entry.to_pane_record();
-                            if let Err(e) =
-                                storage.upsert_pane_with_cx(&pane_setup_cx, record).await
-                            {
+                            if let Err(e) = storage.upsert_pane_with_cx(&loop_cx, record).await {
                                 error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
                             }
 
@@ -2183,7 +2177,7 @@ impl ObservationRuntime {
                                 // Initialize cursor from storage to resume capture
                                 // ft-xbnl0.2.3 tick 251: cx-first max_seq (reuse pane_setup_cx).
                                 let max_seq = storage
-                                    .get_max_seq_with_cx(&pane_setup_cx, pane_id)
+                                    .get_max_seq_with_cx(&loop_cx, pane_id)
                                     .await
                                     .unwrap_or(None);
 
@@ -2906,6 +2900,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&registry);
 
         task::spawn(async move {
+            let loop_cx = runtime_loop_cx();
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
 
             // Process events until producer is closed and the ring is drained.
@@ -2947,9 +2942,8 @@ impl ObservationRuntime {
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
-                let persist_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 match persist_captured_segment_with_cx(
-                    &persist_cx,
+                    &loop_cx,
                     &storage,
                     &bounded_segment,
                     max_persist_segment_bytes,
@@ -2989,10 +2983,8 @@ impl ObservationRuntime {
 
                         if let Some(ref manager) = recording {
                             // ft-xbnl0.2.3 tick 265: cx-first recording segment write.
-                            let recording_seg_cx =
-                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             if let Err(err) = manager
-                                .record_segment_with_cx(&recording_seg_cx, &event.segment)
+                                .record_segment_with_cx(&loop_cx, &event.segment)
                                 .await
                             {
                                 warn!(
@@ -3075,13 +3067,11 @@ impl ObservationRuntime {
 
                             // Persist each detection as an event
                             // ft-xbnl0.2.3 tick 265: cx-first recording detection loop (shared cx).
-                            let recording_det_cx =
-                                crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                             for detection in detections {
                                 if let Some(ref manager) = recording {
                                     if let Err(err) = manager
                                         .record_event_with_cx(
-                                            &recording_det_cx,
+                                            &loop_cx,
                                             pane_id,
                                             &detection,
                                             captured_at,
@@ -3104,9 +3094,7 @@ impl ObservationRuntime {
                                 );
 
                                 // ft-xbnl0.2.3 tick 251: cx-first event record.
-                                let event_cx =
-                                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                                match storage.record_event_with_cx(&event_cx, stored_event).await {
+                                match storage.record_event_with_cx(&loop_cx, stored_event).await {
                                     Ok(event_id) => {
                                         metrics.events_recorded.increment();
 
@@ -3368,7 +3356,7 @@ async fn run_vendored_streaming_capture(
 
     #[cfg(feature = "asupersync-runtime")]
     let mut subscription = subscribe_pane_output_with_inherited_cx(
-        &cx,
+        &runtime_cx,
         client,
         subscription_pane_id,
         subscription_config.clone(),
@@ -3946,7 +3934,8 @@ impl RuntimeHandle {
 
         // Wait for tasks with timeout
         let shutdown_timeout = Duration::from_secs(5);
-        let join_result = timeout(shutdown_timeout, async {
+        let shutdown_cx = runtime_loop_cx();
+        let join_result = runtime_timeout(&shutdown_cx, shutdown_timeout, async {
             let _ = self.discovery.await;
             let _ = self.capture.await;
             let _ = self.relay.await;
