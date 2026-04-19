@@ -15467,6 +15467,8 @@ async fn run_watcher(
     let ipc_handle = if config.ipc.enabled {
         #[cfg(unix)]
         {
+            let ipc_cx = frankenterm_core::cx::Cx::current()
+                .unwrap_or_else(frankenterm_core::cx::for_request);
             let ipc_auth = if config.ipc.tokens.is_empty() {
                 None
             } else {
@@ -15479,7 +15481,8 @@ async fn run_watcher(
                 config_path_buf.clone(),
                 Arc::clone(&shared_storage),
             ));
-            match frankenterm_core::ipc::IpcServer::bind_with_permissions(
+            match frankenterm_core::ipc::IpcServer::bind_with_permissions_with_cx(
+                &ipc_cx,
                 &layout.ipc_socket_path,
                 Some(config.ipc.permissions),
             )
@@ -15490,9 +15493,11 @@ async fn run_watcher(
                     let event_bus = Arc::clone(&event_bus);
                     let registry = Arc::clone(&handle.registry);
                     let search_config = config.search.clone();
+                    let ipc_task_cx = ipc_cx.clone();
                     let ipc_task = frankenterm_core::runtime_compat::task::spawn(async move {
                         server
-                            .run_with_registry_auth_rpc_and_search_config(
+                            .run_with_registry_auth_rpc_and_search_config_with_cx(
+                                &ipc_task_cx,
                                 event_bus,
                                 registry,
                                 ipc_auth,
