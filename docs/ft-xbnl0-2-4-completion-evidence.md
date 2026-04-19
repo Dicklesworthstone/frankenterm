@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 5 service-boundary cx contract tests + 13 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) — total 100/100 |
+| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 5 service-boundary cx contract tests + 16 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) — total 103/103 |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -152,9 +152,9 @@ in manifests for vendored ex-WezTerm crates (`frankenterm/ssh`, `frankenterm/cod
 `frankenterm/lua-api-crates/mux-lua`) that predate the FrankenTerm async
 migration. The import-scan still flags leakage INTO FrankenTerm core logic.
 
-### 2.6 Primitive contract tests (`runtime_compat` — ticks 382/383 + 418-427)
+### 2.6 Primitive contract tests (`runtime_compat` — ticks 382/383 + 418-430)
 
-Ticks 382-427 landed runtime-level tests pinning the full
+Ticks 382-430 landed runtime-level tests pinning the full
 primitive × signal-kind matrix. Both the budget-observation claim
 recorded in §2.5 and the direct-cx-cancel claim for every
 long-lived wait primitive under asupersync are now pinned.
@@ -172,26 +172,33 @@ long-lived wait primitive under asupersync are now pinned.
 | `watch::Receiver::changed(cx)`      | Pre-cancelled cx → RecvError::Cancelled     | `watch_changed_with_cx_observes_pre_cancel`         | 423  |
 | `JoinSet::join_next_with_cx`        | Pre-cancelled cx → Some(Err(JoinError))     | `join_set_join_next_with_cx_observes_pre_cancel`    | 426  |
 | `Semaphore::acquire_owned_with_cx`  | Pre-cancelled cx → AcquireError::Cancelled  | `semaphore_acquire_owned_with_cx_observes_pre_cancel` | 427  |
+| `unix::next_line_with_cx`           | Pre-cancelled cx → io::ErrorKind::Interrupted | `unix_next_line_with_cx_observes_pre_cancel`     | 429  |
+| `Command::output_with_cx`           | Pre-spawn gate: pre-cancel → io::ErrorKind::Interrupted (pre-spawn) | `command_output_with_cx_observes_pre_cancel_pre_spawn` | 430  |
 
-Plus two pre-existing `Semaphore` happy-path tests caught by the
-tick-427 filter broadening (`semaphore_acquire_` picks up both
-`semaphore_acquire_all_permits_then_release` and
-`semaphore_acquire_decrements_permits`) — bonus smoke coverage
-without additional authoring.
+Plus three pre-existing tests caught by filter broadening at ticks
+427 (`semaphore_acquire_`) and 430 (`command_output_with_cx`) —
+bonus smoke coverage without additional authoring:
+- `semaphore_acquire_all_permits_then_release`
+- `semaphore_acquire_decrements_permits`
+- `process_command_output_with_cx_cancellation_surfaces_as_interrupted`
+  (pre-existing `Command::output_with_cx` **mid-flight** cancel test
+  from the ft-xbnl0.2.3 era — complements tick 430's pre-spawn gate
+  test to pin both cancel-observability points on `output_with_cx`)
 
 The budget tests (382/383) use `Budget::with_deadline(Time::ZERO)`
 (budget already elapsed) and assert prompt `Err` return. The
-cancel tests (418-427) pre-cancel cx and wrap the primitive in a
+cancel tests (418-430) pre-cancel cx and wrap the primitive in a
 2 s outer safety-net timeout so a non-observing primitive would
 block until the outer fires, making the failure loud. All
-observed cancel latencies are under 10 ms. Two cancel sources
+observed cancel latencies are under 20 ms. Two cancel sources
 are covered:
 - **asupersync-delegated** (oneshot / broadcast / mpsc / watch /
   Semaphore borrow & owned): asupersync's `poll_*` short-circuit
   via `cx.checkpoint().is_err()`.
-- **runtime_compat-owned** (yield_now / JoinSet::join_next):
-  runtime_compat's own pre-flight + per-poll `cx.checkpoint()`
-  guards since these wrap local state rather than delegating to
+- **runtime_compat-owned** (yield_now / JoinSet::join_next /
+  unix::next_line / Command::output pre-spawn): runtime_compat's
+  own pre-flight + per-poll `cx.checkpoint()` guards since these
+  wrap local state rather than delegating to
   an asupersync primitive.
 
 ### 2.5 Primitive documentation (`runtime_compat::{timeout_with_cx, sleep_with_cx}`)
@@ -292,8 +299,8 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (100 tests)`.
-Exit 0 iff all 100 tests pass.
+output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (103 tests)`.
+Exit 0 iff all 103 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
@@ -344,7 +351,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 These items have been verified in-session and are durable evidence:
 
 - [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
-- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 100 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 13 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→13 across ticks 418-427 to pin the long-lived-wait-primitive × cx-cancel matrix (yield_now / oneshot / broadcast / semaphore borrow+owned / mpsc / watch / JoinSet) plus pre-existing Semaphore happy-path tests caught by a broadened filter at tick 427.
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 103 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 16 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→16 across ticks 418-430 to pin the primitive × cx-cancel matrix — long-lived wait primitives (yield_now / oneshot / broadcast / semaphore borrow+owned / mpsc / watch / JoinSet) plus seam-level primitives (unix::next_line / Command::output pre-spawn + mid-flight), plus pre-existing Semaphore happy-path + Command::output mid-flight cancel tests caught by broadened filters at ticks 427/430.
 - [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec (tick 393). 83/83 remote PASS. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` — recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
 - [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
 - [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.
