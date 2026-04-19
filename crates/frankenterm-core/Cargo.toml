@@ -446,6 +446,10 @@ name = "lfu_cache_bench"
 harness = false
 
 [[bench]]
+name = "interval_tree_bench"
+harness = false
+
+[[bench]]
 name = "quota_cost_ops"
 harness = false
 
