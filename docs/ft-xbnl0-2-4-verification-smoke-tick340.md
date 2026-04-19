@@ -199,11 +199,12 @@ cx signal for the web server bind/orchestration path.
 cargo test -p frankenterm-core --features asupersync-runtime --lib \
     -- _with_cx_observes_budget_deadline yield_now_with_cx \
        oneshot_recv_with_cx broadcast_recv_with_cx \
-       semaphore_acquire_with_cx mpsc_recv_with_cx watch_changed_with_cx
+       semaphore_acquire_ mpsc_recv_with_cx watch_changed_with_cx \
+       join_set_join_next_with_cx
 ```
 
 ```
-running 9 tests
+running 13 tests
 test sleep_with_cx_observes_budget_deadline ... ok
 test timeout_with_cx_observes_budget_deadline ... ok
 test yield_now_with_cx_observes_cx_cancel_checkpoint ... ok
@@ -211,40 +212,52 @@ test yield_now_with_cx_yields_on_live_cx ... ok
 test oneshot_recv_with_cx_observes_pre_cancel ... ok
 test broadcast_recv_with_cx_observes_pre_cancel ... ok
 test semaphore_acquire_with_cx_observes_pre_cancel ... ok
+test semaphore_acquire_owned_with_cx_observes_pre_cancel ... ok
+test semaphore_acquire_all_permits_then_release ... ok         # pre-existing, picked up by filter
+test semaphore_acquire_decrements_permits ... ok               # pre-existing, picked up by filter
 test mpsc_recv_with_cx_observes_pre_cancel ... ok
 test watch_changed_with_cx_observes_pre_cancel ... ok
+test join_set_join_next_with_cx_observes_pre_cancel ... ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 25622 filtered out; finished in 0.02s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 25620 filtered out; finished in 0.03s
 ```
 
 Pins both halves of the primitive × signal-kind matrix:
 
-| Primitive                      | Budget deadline | Direct cancel    |
-|--------------------------------|-----------------|------------------|
-| sleep_with_cx                  | ✓ tick 382      | ✗ documented     |
-| timeout_with_cx                | ✓ tick 383      | ✗ documented     |
-| yield_now_with_cx              | (n/a)           | ✓ tick 418       |
-| oneshot_recv_with_cx           | (transitive)    | ✓ tick 419       |
-| broadcast_recv_with_cx         | (transitive)    | ✓ tick 420       |
-| Semaphore::acquire_with_cx     | (transitive)    | ✓ tick 421       |
-| mpsc::Receiver::recv           | (transitive)    | ✓ tick 422       |
-| watch::Receiver::changed       | (transitive)    | ✓ tick 423       |
+| Primitive                          | Budget deadline | Direct cancel    |
+|------------------------------------|-----------------|------------------|
+| sleep_with_cx                      | ✓ tick 382      | ✗ documented     |
+| timeout_with_cx                    | ✓ tick 383      | ✗ documented     |
+| yield_now_with_cx                  | (n/a)           | ✓ tick 418       |
+| oneshot_recv_with_cx               | (transitive)    | ✓ tick 419       |
+| broadcast_recv_with_cx             | (transitive)    | ✓ tick 420       |
+| Semaphore::acquire_with_cx         | (transitive)    | ✓ tick 421       |
+| mpsc::Receiver::recv               | (transitive)    | ✓ tick 422       |
+| watch::Receiver::changed           | (transitive)    | ✓ tick 423       |
+| JoinSet::join_next_with_cx         | (n/a)           | ✓ tick 426       |
+| Semaphore::acquire_owned_with_cx   | (transitive)    | ✓ tick 427       |
 
-Every long-lived wait primitive under asupersync short-circuits on a
-pre-cancelled cx via its `cx.checkpoint()?` pre-guard and returns a
-`Cancelled` variant in < 10 ms (verified under a 2 s outer safety-net
-timeout).
+Every long-lived wait primitive short-circuits on a pre-cancelled cx
+via a `cx.checkpoint()` guard (either asupersync's `poll_*` short-
+circuit for delegated primitives or runtime_compat's own pre-flight
++ per-poll guard for locally-owned primitives like JoinSet and
+yield_now) and returns a `Cancelled` variant in < 10 ms (verified
+under a 2 s outer safety-net timeout).
 
 ## Interpretation
 
 - All 100 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
 - Compile time after the initial cold build: 0.00s-1.19s per filtered run. All tests now complete in sub-second wall time after tick 387's ft-l9mxa fix (previously Run 1 was 10.02s because the tick-380 snapshot's outer timeout fired; now the inner cancel-watcher race surfaces the cancel in ~70ms).
 - The 34 + 45 + 3 + 3 + 2 + 13 = 100 count covers this-session deliverables AND 32 pre-existing TLS tests (tick-357 `tls_` broadening) plus 2 pre-existing Semaphore happy-path tests (tick-427 `semaphore_acquire_` broadening) that the widened filters smoke-verify as a side benefit.
-- Run 6 grew from 2 to 9 tests across ticks 418-423 pinning the
-  long-lived-wait-primitive × cx-cancel matrix across all four
-  channel types (oneshot/broadcast/mpsc/watch) + semaphore + yield.
-  All honour pre-cancelled cx with RecvError::Cancelled /
-  AcquireError::Cancelled in under 10 ms.
+- Run 6 grew from 2 to 13 tests across ticks 418-427 pinning the
+  long-lived-wait-primitive × cx-cancel matrix. Two cancel sources
+  are covered: asupersync-delegated (oneshot/broadcast/mpsc/watch +
+  Semaphore borrow & owned, all via `poll_*` `cx.checkpoint().is_err()`
+  short-circuit) and runtime_compat-owned (yield_now + JoinSet, via
+  pre-flight + per-poll `cx.checkpoint()` guards on local state).
+  All pre-cancel tests return in under 10 ms with the appropriate
+  `RecvError::Cancelled` / `AcquireError::Cancelled` / `JoinError`
+  variant.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)
