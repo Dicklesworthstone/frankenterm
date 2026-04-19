@@ -193,14 +193,23 @@ verify_artifact_contract() {
     return 0
   fi
 
-  python3 - "${logs_dir}" <<'PY' > /tmp/_ft_xbnl0_5_2_art.json
+  python3 - "${logs_dir}" "${MANIFEST}" <<'PY' > /tmp/_ft_xbnl0_5_2_art.json
 import json
 import re
 import sys
 from pathlib import Path
 
 logs = Path(sys.argv[1])
-required_summary_keys = ["scenario", "outcome", "artifact_dir", "structured_log"]
+manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+artifact_contract = manifest.get("artifact_contract", {})
+required_summary_keys = artifact_contract.get(
+    "summary_json_required_keys",
+    ["scenario", "bead_id", "run_id", "correlation_id", "outcome", "artifact_dir", "structured_log"],
+)
+required_structured_fields = artifact_contract.get(
+    "structured_log_required_fields",
+    ["timestamp", "component", "scenario_id", "correlation_id", "decision_path", "outcome"],
+)
 # Group run directories by scenario prefix (everything before the trailing
 # _YYYYMMDD_HHMMSS timestamp). Only inspect the newest run per scenario —
 # older runs might be stale from interrupted local debug sessions and
@@ -250,6 +259,54 @@ for scenario, run_dir in sorted(latest_per_scenario.items()):
         missing.append(
             {"scenario": scenario, "run_dir": str(run_dir), "missing_keys": absent_keys}
         )
+        continue
+
+    try:
+        lines = structured.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        missing.append(
+            {"scenario": scenario, "run_dir": str(run_dir), "error": f"structured.log unreadable: {e}"}
+        )
+        continue
+
+    entry_count = 0
+    for line_no, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        entry_count += 1
+        try:
+            entry = json.loads(line)
+        except Exception as e:
+            missing.append(
+                {
+                    "scenario": scenario,
+                    "run_dir": str(run_dir),
+                    "structured_log_line": line_no,
+                    "error": f"structured.log line is not valid JSON: {e}",
+                }
+            )
+            break
+
+        absent_fields = [field for field in required_structured_fields if field not in entry]
+        if absent_fields:
+            missing.append(
+                {
+                    "scenario": scenario,
+                    "run_dir": str(run_dir),
+                    "structured_log_line": line_no,
+                    "missing_structured_fields": absent_fields,
+                }
+            )
+            break
+
+    if entry_count == 0:
+        missing.append(
+            {
+                "scenario": scenario,
+                "run_dir": str(run_dir),
+                "missing": "structured.log entries",
+            }
+        )
 
 print(
     json.dumps(
@@ -257,6 +314,8 @@ print(
             "inspected": len(latest_per_scenario),
             "missing": missing,
             "policy": "latest-run-per-scenario",
+            "required_summary_keys": required_summary_keys,
+            "required_structured_log_fields": required_structured_fields,
         },
         sort_keys=True,
     )

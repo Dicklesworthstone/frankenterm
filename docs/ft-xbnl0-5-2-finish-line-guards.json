@@ -65,7 +65,7 @@
     "summary": "Contributors can run the full finish-line guard sweep locally before submitting a PR.",
     "commands": [
       "bash scripts/check_finish_line_guards.sh",
-      "cargo test -p frankenterm-core --lib ft_xbnl0_5_2_finish_line_guards"
+      "cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards -- --nocapture"
     ]
   },
   "artifact_contract": {

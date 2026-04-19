@@ -164,4 +164,35 @@ fn ci_binding_points_to_expected_workflow() {
         workflow.contains("check_finish_line_guards.sh"),
         "CI workflow must invoke the composition script"
     );
+    assert!(
+        workflow.contains("ft_xbnl0_5_2_finish_line_guards"),
+        "CI workflow must exercise the ft-xbnl0.5.2 integration test surface"
+    );
+}
+
+#[test]
+fn local_contributor_path_points_to_real_guard_commands() {
+    let manifest_path = workspace_root().join("docs/ft-xbnl0-5-2-finish-line-guards.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let commands = parsed["local_contributor_path"]["commands"]
+        .as_array()
+        .expect("local_contributor_path.commands must be an array");
+    let command_strings: Vec<&str> = commands
+        .iter()
+        .map(|value| value.as_str().expect("command entries must be strings"))
+        .collect();
+
+    assert!(
+        command_strings
+            .iter()
+            .any(|command| command.contains("bash scripts/check_finish_line_guards.sh")),
+        "local contributor path must include the composition script entrypoint"
+    );
+    assert!(
+        command_strings.iter().any(|command| {
+            command.contains("cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards")
+        }),
+        "local contributor path must point at the real ft_xbnl0_5_2_finish_line_guards integration test"
+    );
 }
