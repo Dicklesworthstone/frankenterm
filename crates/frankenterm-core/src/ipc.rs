@@ -809,9 +809,25 @@ impl IpcServer {
         self,
         event_bus: Arc<EventBus>,
         auth: Option<IpcAuth>,
-        mut shutdown_rx: mpsc::Receiver<()>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            // ft-xbnl0.2.3: keep a single request-rooted Cx for the
+            // server lifetime, then immediately hand off to the
+            // explicit-Cx loop. This avoids manufacturing a fresh
+            // request Cx for every shutdown poll in the ambient path.
+            let cx = crate::cx::for_request();
+            self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
+                .await;
+            return;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let mut shutdown_rx = shutdown_rx;
+        #[cfg(not(feature = "asupersync-runtime"))]
         let ctx = Arc::new(IpcHandlerContext::with_auth(event_bus, None, auth));
+        #[cfg(not(feature = "asupersync-runtime"))]
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
 
@@ -821,13 +837,25 @@ impl IpcServer {
         event_bus: Arc<EventBus>,
         registry: Arc<RwLock<PaneRegistry>>,
         auth: Option<IpcAuth>,
-        mut shutdown_rx: mpsc::Receiver<()>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
+                .await;
+            return;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let mut shutdown_rx = shutdown_rx;
+        #[cfg(not(feature = "asupersync-runtime"))]
         let ctx = Arc::new(IpcHandlerContext::with_auth(
             event_bus,
             Some(registry),
             auth,
         ));
+        #[cfg(not(feature = "asupersync-runtime"))]
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
 
@@ -859,8 +887,27 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         rpc_handler: Option<IpcRpcHandler>,
         search_config: Option<SearchConfig>,
-        mut shutdown_rx: mpsc::Receiver<()>,
+        shutdown_rx: mpsc::Receiver<()>,
     ) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::for_request();
+            self.run_with_registry_auth_rpc_and_search_config_with_cx(
+                &cx,
+                event_bus,
+                registry,
+                auth,
+                rpc_handler,
+                search_config,
+                shutdown_rx,
+            )
+            .await;
+            return;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        let mut shutdown_rx = shutdown_rx;
+        #[cfg(not(feature = "asupersync-runtime"))]
         let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_and_search_config(
             event_bus,
             Some(registry),
@@ -868,6 +915,7 @@ impl IpcServer {
             rpc_handler,
             search_config,
         ));
+        #[cfg(not(feature = "asupersync-runtime"))]
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
 
@@ -2608,6 +2656,32 @@ mod tests {
             assert!(
                 !socket_path.exists(),
                 "socket file should be removed after clean shutdown"
+            );
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn ipc_server_run_with_auth_legacy_entry_exits_cleanly_on_shutdown() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("run-auth-legacy.sock");
+
+            let server = IpcServer::bind(&socket_path).await.expect("bind");
+            let event_bus = Arc::new(EventBus::new(16));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let handle = crate::runtime_compat::task::spawn(async move {
+                server.run_with_auth(event_bus, None, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(20)).await;
+            send_shutdown(&shutdown_tx).await;
+            let _ = handle.await;
+
+            assert!(
+                !socket_path.exists(),
+                "legacy run_with_auth entry should remove the socket on shutdown"
             );
         });
     }

@@ -214,8 +214,20 @@ impl NativeEventListener {
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            // ft-xbnl0.2.3: route the legacy entry point through the
+            // explicit-Cx accept loop so the listener keeps a single
+            // request-rooted cancellation chain for its full lifetime.
+            let cx = crate::cx::for_request();
+            self.run_with_cx(&cx, event_tx, shutdown_flag).await;
+            return;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         let mut connection_tasks = JoinSet::new();
 
+        #[cfg(not(feature = "asupersync-runtime"))]
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 break;
@@ -244,6 +256,7 @@ impl NativeEventListener {
             }
         }
 
+        #[cfg(not(feature = "asupersync-runtime"))]
         while let Some(join_result) = connection_tasks.join_next().await {
             if let Err(err) = join_result {
                 debug!(error = %err, "native event connection task failed during shutdown");
@@ -530,10 +543,18 @@ async fn dispatch_event_with_timeout(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::for_request();
+        return dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await;
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     // Native asupersync reserve/commit path. The `native-wezterm` feature
     // requires `asupersync-runtime` (wa-k0tk5); there is no longer a tokio
     // fallback branch.
     let reserve_cx = crate::cx::for_request();
+    #[cfg(not(feature = "asupersync-runtime"))]
     match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
         Ok(Ok(permit)) => {
             permit.send(event);
@@ -1557,6 +1578,29 @@ mod tests {
                 &tx,
                 pane_destroyed_event(2),
                 Duration::from_millis(10),
+            )
+            .await;
+
+            assert_eq!(outcome, EventDispatchOutcome::Backpressure);
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn dispatch_event_with_timeout_with_precancelled_cx_reports_backpressure() {
+        run_async_test(async {
+            let (tx, _rx) = mpsc::channel(1);
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-xbnl0.2.3 dispatch cancel"),
+            );
+
+            let outcome = dispatch_event_with_timeout_with_cx(
+                &cx,
+                &tx,
+                pane_destroyed_event(3),
+                Duration::from_millis(20),
             )
             .await;
 
