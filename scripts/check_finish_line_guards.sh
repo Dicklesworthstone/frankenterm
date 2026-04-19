@@ -18,6 +18,18 @@ DEFAULT_OUT="${ROOT_DIR}/docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
 OUT_PATH="${DEFAULT_OUT}"
 VERBOSE=0
 
+# Keep local cargo-based finish-line guards off any globally-exported shared
+# target dir. By default we force the current swarm convention here and let a
+# bead-specific override opt out explicitly if needed.
+: "${FT_XBNL0_5_2_CARGO_TARGET_DIR:=/tmp/ft-$(whoami)-target}"
+export CARGO_TARGET_DIR="${FT_XBNL0_5_2_CARGO_TARGET_DIR}"
+
+# On macOS, prefer the system OpenSSL unless the caller explicitly overrides.
+# This avoids flaky vendored openssl-src temp-dir collisions during guard runs.
+if [[ "$(uname -s)" == "Darwin" && -z "${OPENSSL_NO_VENDOR:-}" ]]; then
+  export OPENSSL_NO_VENDOR=1
+fi
+
 usage() {
   cat <<'USAGE'
 Usage: check_finish_line_guards.sh [options]
@@ -167,8 +179,10 @@ run_cargo_test_guard() {
     --arg test "${test_name}" \
     --arg target "${test_target}" \
     --arg rc "${rc}" \
+    --arg cargo_target_dir "${CARGO_TARGET_DIR}" \
+    --arg openssl_no_vendor "${OPENSSL_NO_VENDOR:-}" \
     --arg log_tail "$(tail -20 "${log_file}" | head -c 4000)" \
-    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), log_tail: $log_tail}')"
+    '{test_name: $test, test_target: $target, exit_code: ($rc | tonumber), cargo_target_dir: $cargo_target_dir, openssl_no_vendor: (if $openssl_no_vendor == "" then null else $openssl_no_vendor end), log_tail: $log_tail}')"
 
   rm -f "${log_file}"
 

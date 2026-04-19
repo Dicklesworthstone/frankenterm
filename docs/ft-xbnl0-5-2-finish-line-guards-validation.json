@@ -1,9 +1,9 @@
 {
   "contract_id": "ft.xbnl0.5.2.finish_line_guards.v1",
   "bead_id": "ft-xbnl0.5.2",
-  "checked_at": "2026-04-16T05:58:32Z",
+  "checked_at": "2026-04-19T16:47:27Z",
   "status": "passed",
-  "manifest_path": "/dp/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
+  "manifest_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards.json",
   "guards": [
     {
       "guard_id": "no_runtime_regression",
@@ -31,11 +31,15 @@
     },
     {
       "guard_id": "fake_sdk_capability_contract",
-      "outcome": "skipped",
-      "reason_code": "skip_via_FT_XBNL0_5_2_SKIP_CARGO_TEST",
+      "outcome": "passed",
+      "reason_code": "cargo_test_passed",
       "detail": {
         "test_name": "ft_xbnl0_3_6_only_rust_sdk_target_is_finish_line_supported",
-        "skip_reason": "FT_XBNL0_5_2_SKIP_CARGO_TEST=1 set — contributor must run cargo test manually or in a shell without the rch hook intercepting."
+        "test_target": "-p frankenterm-core --lib",
+        "exit_code": 0,
+        "cargo_target_dir": "/tmp/ft-jemanuel-target",
+        "openssl_no_vendor": "1",
+        "log_tail": "warning: profiles for the non root package will be ignored, specify profiles at the workspace root:\npackage:   /Users/jemanuel/projects/frankenterm/fuzz/Cargo.toml\nworkspace: /Users/jemanuel/projects/frankenterm/Cargo.toml\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s\n     Running unittests src/lib.rs (/tmp/ft-jemanuel-target/debug/deps/frankenterm_core-c5a1ee8c6df755a6)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25655 filtered out; finished in 0.00s"
       }
     },
     {
@@ -45,7 +49,24 @@
       "detail": {
         "inspected": 2,
         "missing": [],
-        "policy": "latest-run-per-scenario"
+        "policy": "latest-run-per-scenario",
+        "required_structured_log_fields": [
+          "timestamp",
+          "component",
+          "scenario_id",
+          "correlation_id",
+          "decision_path",
+          "outcome"
+        ],
+        "required_summary_keys": [
+          "scenario",
+          "bead_id",
+          "run_id",
+          "correlation_id",
+          "outcome",
+          "artifact_dir",
+          "structured_log"
+        ]
       }
     }
   ]
