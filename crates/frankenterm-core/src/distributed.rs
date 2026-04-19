@@ -1034,8 +1034,8 @@ where
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            asupersync::time::sleep(
-                asupersync::time::wall_now(),
+            let _ = crate::runtime_compat::sleep_with_cx(
+                cx,
                 std::time::Duration::from_millis(50),
             )
             .await;

@@ -199,19 +199,14 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     let mut term = signal::unix::signal(SignalKind::terminate())
         .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
-    // Tick 194 originally threaded the caller's cx into the
-    // poll-sleep via runtime_compat::sleep_with_cx. This slice drops
-    // that compat seam and binds the watcher directly to native
-    // asupersync budget_sleep using the caller's explicit cx.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = asupersync::time::budget_sleep(
+            let _ = crate::runtime_compat::sleep_with_cx(
                 cx,
                 std::time::Duration::from_millis(100),
-                asupersync::time::wall_now(),
             )
             .await;
         }
@@ -238,16 +233,14 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("web shutdown wait cancelled: {err}")))?;
 
-    // Non-unix mirror of the native budget_sleep watcher above.
     let cancel_fut = async {
         loop {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = asupersync::time::budget_sleep(
+            let _ = crate::runtime_compat::sleep_with_cx(
                 cx,
                 std::time::Duration::from_millis(100),
-                asupersync::time::wall_now(),
             )
             .await;
         }
