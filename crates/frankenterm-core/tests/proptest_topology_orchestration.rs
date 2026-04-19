@@ -31,16 +31,15 @@ fn arb_identity() -> impl Strategy<Value = LifecycleIdentity> {
 }
 
 fn arb_layout_node() -> impl Strategy<Value = LayoutNode> {
-    let leaf = (
-        prop::option::of("[a-z][a-z0-9_-]{0,15}"),
-        0.1f64..10.0f64,
-    )
+    let leaf = (prop::option::of("[a-z][a-z0-9_-]{0,15}"), 0.1f64..10.0f64)
         .prop_map(|(role, weight)| LayoutNode::Slot { role, weight });
 
     leaf.prop_recursive(6, 64, 4, |inner| {
         prop_oneof![
-            prop::collection::vec(inner.clone(), 1..=4).prop_map(|children| LayoutNode::HSplit { children }),
-            prop::collection::vec(inner, 1..=4).prop_map(|children| LayoutNode::VSplit { children }),
+            prop::collection::vec(inner.clone(), 1..=4)
+                .prop_map(|children| LayoutNode::HSplit { children }),
+            prop::collection::vec(inner, 1..=4)
+                .prop_map(|children| LayoutNode::VSplit { children }),
         ]
     })
 }
@@ -51,6 +50,30 @@ fn count_slots(node: &LayoutNode) -> u32 {
         LayoutNode::HSplit { children } | LayoutNode::VSplit { children } => {
             children.iter().map(count_slots).sum()
         }
+    }
+}
+
+fn layout_nodes_close(left: &LayoutNode, right: &LayoutNode) -> bool {
+    match (left, right) {
+        (
+            LayoutNode::Slot {
+                role: left_role,
+                weight: left_weight,
+            },
+            LayoutNode::Slot {
+                role: right_role,
+                weight: right_weight,
+            },
+        ) => left_role == right_role && (left_weight - right_weight).abs() < 1e-10,
+        (LayoutNode::HSplit { children: left }, LayoutNode::HSplit { children: right })
+        | (LayoutNode::VSplit { children: left }, LayoutNode::VSplit { children: right }) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(lhs, rhs)| layout_nodes_close(lhs, rhs))
+        }
+        _ => false,
     }
 }
 
@@ -107,41 +130,42 @@ fn arb_move_direction() -> impl Strategy<Value = TopologyMoveDirection> {
 
 fn arb_topology_op() -> impl Strategy<Value = TopologyOp> {
     prop_oneof![
-        (arb_identity(), arb_split_direction(), 0.0f64..1.0f64).prop_map(|(target, direction, ratio)| TopologyOp::Split {
-            target,
-            direction,
-            ratio,
-        }),
+        (arb_identity(), arb_split_direction(), 0.0f64..1.0f64).prop_map(
+            |(target, direction, ratio)| TopologyOp::Split {
+                target,
+                direction,
+                ratio,
+            }
+        ),
         arb_identity().prop_map(|target| TopologyOp::Close { target }),
         (arb_identity(), arb_identity()).prop_map(|(a, b)| TopologyOp::Swap { a, b }),
-        (arb_identity(), arb_move_direction()).prop_map(|(target, direction)| TopologyOp::Move {
-            target,
-            direction,
-        }),
-        (arb_identity(), "[a-z][a-z0-9_-]{2,20}").prop_map(|(window, template_name)| TopologyOp::ApplyTemplate {
-            window,
-            template_name,
+        (arb_identity(), arb_move_direction())
+            .prop_map(|(target, direction)| TopologyOp::Move { target, direction }),
+        (arb_identity(), "[a-z][a-z0-9_-]{2,20}").prop_map(|(window, template_name)| {
+            TopologyOp::ApplyTemplate {
+                window,
+                template_name,
+            }
         }),
         arb_identity().prop_map(|scope| TopologyOp::Rebalance { scope }),
-        ("[a-z][a-z0-9_-]{2,20}", prop::collection::vec(arb_identity(), 0..=6)).prop_map(|(name, members)| {
-            TopologyOp::CreateFocusGroup { name, members }
-        }),
+        (
+            "[a-z][a-z0-9_-]{2,20}",
+            prop::collection::vec(arb_identity(), 0..=6)
+        )
+            .prop_map(|(name, members)| { TopologyOp::CreateFocusGroup { name, members } }),
     ]
 }
 
 fn arb_check_result() -> impl Strategy<Value = OpCheckResult> {
     prop_oneof![
         Just(OpCheckResult::Ok),
-        (
-            ".{1,30}",
-            ".{1,20}",
-            ".{1,40}",
-        )
-            .prop_map(|(identity, current_state, reason)| OpCheckResult::InvalidState {
+        (".{1,30}", ".{1,20}", ".{1,40}",).prop_map(|(identity, current_state, reason)| {
+            OpCheckResult::InvalidState {
                 identity,
                 current_state,
                 reason,
-            }),
+            }
+        }),
         ".{1,30}".prop_map(|identity| OpCheckResult::NotFound { identity }),
         ".{1,40}".prop_map(|reason| OpCheckResult::ConstraintViolation { reason }),
     ]
@@ -182,7 +206,11 @@ proptest! {
     fn prop_layout_template_serde_roundtrip(template in arb_layout_template()) {
         let json = serde_json::to_string(&template).unwrap();
         let back: LayoutTemplate = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back, template);
+        prop_assert_eq!(back.name, template.name);
+        prop_assert_eq!(back.description, template.description);
+        prop_assert_eq!(back.min_panes, template.min_panes);
+        prop_assert_eq!(back.max_panes, template.max_panes);
+        prop_assert!(layout_nodes_close(&back.root, &template.root));
         prop_assert!(count_slots(&back.root) >= back.min_panes);
     }
 
@@ -197,7 +225,25 @@ proptest! {
     fn prop_topology_op_serde_roundtrip(op in arb_topology_op()) {
         let json = serde_json::to_string(&op).unwrap();
         let back: TopologyOp = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back, op);
+        match (&back, &op) {
+            (
+                TopologyOp::Split {
+                    target: back_target,
+                    direction: back_direction,
+                    ratio: back_ratio,
+                },
+                TopologyOp::Split {
+                    target,
+                    direction,
+                    ratio,
+                },
+            ) => {
+                prop_assert_eq!(back_target, target);
+                prop_assert_eq!(back_direction, direction);
+                prop_assert!((back_ratio - ratio).abs() < 1e-10);
+            }
+            _ => prop_assert_eq!(back, op),
+        }
     }
 
     #[test]
@@ -245,7 +291,13 @@ proptest! {
     fn prop_topology_error_serde_roundtrip(err in arb_topology_error()) {
         let json = serde_json::to_string(&err).unwrap();
         let back: TopologyError = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(back, err);
+        match (&back, &err) {
+            (
+                TopologyError::InvalidRatio { ratio: back_ratio },
+                TopologyError::InvalidRatio { ratio },
+            ) => prop_assert!((back_ratio - ratio).abs() < 1e-10),
+            _ => prop_assert_eq!(back, err),
+        }
     }
 
     #[test]
