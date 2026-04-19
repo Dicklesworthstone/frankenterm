@@ -181,11 +181,12 @@ You can silence a specific detection rule via pack overrides:
 disabled_rules = ["core.codex:usage_reached"]
 ```
 
-Apply changes and reload if needed:
+Apply changes, then restart the watcher if you need the updated rules live immediately:
 
 ```bash
 ft config validate
-ft config reload
+ft stop
+ft watch
 ```
 
 Note: Disabling rules prevents those detections from firing entirely.

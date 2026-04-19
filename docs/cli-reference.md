@@ -179,10 +179,11 @@ Behavior notes:
 ```bash
 ft setup [--list-hosts] [--dry-run] [--apply]
 ft setup local
-ft setup remote <host> [--yes] [--install-wa]
+ft setup remote <host> [--yes] [--install-ft]
 ft setup config
 ft setup patch [--remove]
 ft setup shell [--remove] [--shell <bash|zsh|fish>]
+ft setup font [--force] [--dir <path>]
 
 ft config init [--force]
 ft config validate [--strict]
