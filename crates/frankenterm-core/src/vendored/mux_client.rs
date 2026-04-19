@@ -5022,6 +5022,54 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn prop_subscription_poll_delay_respects_fast_and_slow_bounds(
+            poll_ms in 1u64..5_000,
+            min_ms in 0u64..5_000,
+            saw_dirty_output in any::<bool>()
+        ) {
+            let config = SubscriptionConfig {
+                poll_interval: Duration::from_millis(poll_ms),
+                min_poll_interval: Duration::from_millis(min_ms),
+                channel_capacity: 8,
+            };
+
+            let delay = subscription_poll_delay(&config, saw_dirty_output);
+            let expected_fast = Duration::from_millis(min_ms).min(Duration::from_millis(poll_ms));
+
+            if saw_dirty_output {
+                prop_assert_eq!(delay, expected_fast);
+            } else {
+                prop_assert_eq!(delay, Duration::from_millis(poll_ms));
+            }
+
+            prop_assert!(delay <= Duration::from_millis(poll_ms));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_total_dirty_rows_matches_saturating_span_sum(
+            ranges in prop::collection::vec((-128isize..128, -128isize..128), 0..64)
+        ) {
+            let ranges: Vec<std::ops::Range<isize>> =
+                ranges.into_iter().map(|(start, end)| start..end).collect();
+
+            let expected = ranges.iter().fold(0usize, |acc, range| {
+                let span = if range.end > range.start {
+                    range.end - range.start
+                } else {
+                    0
+                };
+                let span_usize = usize::try_from(span).unwrap_or(usize::MAX);
+                acc.saturating_add(span_usize)
+            });
+
+            prop_assert_eq!(total_dirty_rows(&ranges), expected);
+        }
+    }
+
     #[test]
     fn default_config_has_sane_timeouts() {
         let config = DirectMuxClientConfig::default();
