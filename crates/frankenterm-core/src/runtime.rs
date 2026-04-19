@@ -45,8 +45,11 @@ use crate::fleet_scrollback_coordinator::{
     CoordinatorConfig, FleetScrollbackCoordinator, SnapshotPaneScrollbackAccess,
 };
 use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
+#[cfg(feature = "asupersync-runtime")]
+use crate::ingest::persist_captured_segment_with_cx;
 use crate::ingest::{
-    PaneCursor, PaneRegistry, bounded_segment_for_persistence, persist_captured_segment_with_cx,
+    CapturedSegment, PaneCursor, PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
+    persist_captured_segment,
 };
 use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
@@ -55,11 +58,7 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_compat::{
-    RwLock, mpsc,
-    task::JoinHandle,
-    watch,
-};
+use crate::runtime_compat::{RwLock, mpsc, task, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -106,6 +105,24 @@ fn runtime_loop_cx() -> RuntimeLoopCx {
 
 #[cfg(not(feature = "asupersync-runtime"))]
 const fn runtime_loop_cx() -> RuntimeLoopCx {}
+
+async fn persist_captured_segment_for_runtime(
+    runtime_cx: &RuntimeLoopCx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+) -> Result<PersistedCapture> {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
+        let _ = runtime_cx;
+        persist_captured_segment(storage, captured, max_segment_bytes).await
+    }
+}
 
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
@@ -1443,8 +1460,11 @@ impl ObservationRuntime {
                         Err(_elapsed) => {}
                     }
                 } else {
-                    runtime_sleep(&loop_cx, Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS))
-                        .await;
+                    runtime_sleep(
+                        &loop_cx,
+                        Duration::from_secs(SNAPSHOT_TRIGGER_BRIDGE_TICK_SECS),
+                    )
+                    .await;
                 }
 
                 if subscriber_closed {
@@ -1890,13 +1910,12 @@ impl ObservationRuntime {
                         reg.observed_pane_ids()
                     };
                     let observed_pane_count = observed_pane_ids.len();
-                    let tiered_scrollback_fetch =
-                        collect_pane_tiered_scrollback_summaries(
-                            &loop_cx,
-                            &wezterm_handle,
-                            &observed_pane_ids,
-                        )
-                        .await;
+                    let tiered_scrollback_fetch = collect_pane_tiered_scrollback_summaries(
+                        &loop_cx,
+                        &wezterm_handle,
+                        &observed_pane_ids,
+                    )
+                    .await;
                     let (fleet_pane_infos, fleet_pane_snapshots) = {
                         let reg = registry.read().await;
                         let cur = cursors.read().await;
@@ -2552,31 +2571,31 @@ impl ObservationRuntime {
                                 let handle = spawn_runtime_task(
                                     &stream_task_cx,
                                     move |stream_task_cx| async move {
-                                    let exit_reason = run_vendored_streaming_capture(
-                                        pane_id,
-                                        subscription_pane_id,
-                                        socket_path_for_task,
-                                        vendored_mux_compression,
-                                        subscription_config,
-                                        capture_tx,
-                                    )
-                                    .await;
-                                    let final_reason = if shutdown_flag.load(Ordering::SeqCst)
-                                        && exit_reason == "capture ingress closed"
-                                    {
-                                        "shutdown".to_string()
-                                    } else {
-                                        exit_reason
-                                    };
-                                    let _ = send_runtime_channel(
-                                        &stream_task_cx,
-                                        &stream_exit_tx,
-                                        StreamingTaskExit {
+                                        let exit_reason = run_vendored_streaming_capture(
                                             pane_id,
-                                            reason: final_reason,
-                                        },
-                                    )
-                                    .await;
+                                            subscription_pane_id,
+                                            socket_path_for_task,
+                                            vendored_mux_compression,
+                                            subscription_config,
+                                            capture_tx,
+                                        )
+                                        .await;
+                                        let final_reason = if shutdown_flag.load(Ordering::SeqCst)
+                                            && exit_reason == "capture ingress closed"
+                                        {
+                                            "shutdown".to_string()
+                                        } else {
+                                            exit_reason
+                                        };
+                                        let _ = send_runtime_channel(
+                                            &stream_task_cx,
+                                            &stream_exit_tx,
+                                            StreamingTaskExit {
+                                                pane_id,
+                                                reason: final_reason,
+                                            },
+                                        )
+                                        .await;
                                     },
                                 );
                                 streaming_tasks.insert(pane_id, handle);
@@ -2883,11 +2902,7 @@ impl ObservationRuntime {
                             }
 
                             // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                            if capture_ring_tx
-                                .send_with_cx(&loop_cx, event)
-                                .await
-                                .is_err()
-                            {
+                            if capture_ring_tx.send_with_cx(&loop_cx, event).await.is_err() {
                                 debug!("Capture relay: persistence ring closed");
                                 return;
                             }
@@ -2971,7 +2986,7 @@ impl ObservationRuntime {
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
-                match persist_captured_segment_with_cx(
+                match persist_captured_segment_for_runtime(
                     &loop_cx,
                     &storage,
                     &bounded_segment,
@@ -4406,7 +4421,7 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{sleep, CompatRuntime};
+    use crate::runtime_compat::{CompatRuntime, sleep};
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 

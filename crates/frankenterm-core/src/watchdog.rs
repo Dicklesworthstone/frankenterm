@@ -426,13 +426,21 @@ pub fn spawn_watchdog(
                 }
             }
 
-            // Use the dual-runtime sleep helper during the runtime migration.
-            if crate::runtime_compat::sleep_with_cx(&watchdog_cx, check_interval)
-                .await
-                .is_err()
+            #[cfg(feature = "asupersync-runtime")]
             {
-                info!("Watchdog: cancelled via cx");
-                break;
+                // ft-xbnl0.2.3 tick 293: cx-first watchdog monitor loop sleep.
+                let watchdog_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                if crate::runtime_compat::sleep_with_cx(&watchdog_cx, check_interval)
+                    .await
+                    .is_err()
+                {
+                    info!("Watchdog: cancelled via cx");
+                    break;
+                }
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                crate::runtime_compat::sleep(check_interval).await;
             }
         }
     });
@@ -854,13 +862,22 @@ pub fn spawn_mux_watchdog(
                 }
             }
 
-            // Use the dual-runtime sleep helper during the runtime migration.
-            if crate::runtime_compat::sleep_with_cx(&mux_watchdog_cx, check_interval)
-                .await
-                .is_err()
+            #[cfg(feature = "asupersync-runtime")]
             {
-                info!("Mux watchdog: cancelled via cx");
-                break;
+                // ft-xbnl0.2.3 tick 293: cx-first mux watchdog loop sleep.
+                let mux_watchdog_cx =
+                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                if crate::runtime_compat::sleep_with_cx(&mux_watchdog_cx, check_interval)
+                    .await
+                    .is_err()
+                {
+                    info!("Mux watchdog: cancelled via cx");
+                    break;
+                }
+            }
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                crate::runtime_compat::sleep(check_interval).await;
             }
         }
     })
