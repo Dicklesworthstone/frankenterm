@@ -708,6 +708,12 @@ impl EventSubscriber {
     /// - `RecvError::Closed` if the event bus was dropped
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.recv_cx(&cx).await;
+        }
+
         match crate::runtime_compat::broadcast_recv(&mut self.receiver).await {
             Ok(event) => Ok(event),
             Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
