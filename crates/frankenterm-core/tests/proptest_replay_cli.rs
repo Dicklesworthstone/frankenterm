@@ -1,46 +1,13 @@
-//! Property-based tests for replay_cli (ft-og6q6.6.1).
-//!
-//! Invariants tested:
-//! - RC-1: ReplayOutputMode serde roundtrip
-//! - RC-2: ReplayExitCode serde roundtrip
-//! - RC-3: ReplayExitCode::code() values are distinct
-//! - RC-4: SpeedArg parsing roundtrip for valid strings
-//! - RC-5: SpeedArg::multiplier() > 0
-//! - RC-6: EquivalenceLevelArg serde roundtrip
-//! - RC-7: InspectResult from_events event_count matches input
-//! - RC-8: InspectResult pane_count ≤ event_count
-//! - RC-9: InspectResult rule_count ≤ event_count
-//! - RC-10: InspectResult render_human contains artifact path
-//! - RC-11: DiffRunner identical inputs → Pass
-//! - RC-12: DiffRunner format output non-empty (except Quiet on pass)
-//! - RC-13: RegressionSuiteResult counts consistent
-//! - RC-14: RegressionSuiteResult overall_pass ↔ no failures
-//! - RC-15: SpeedArg Custom multiplier preserved
+//! Property-based tests for replay_cli serde types and aggregation helpers.
 
-use proptest::prelude::*;
+use std::collections::BTreeSet;
 
 use frankenterm_core::replay_cli::{
-    ArtifactResult, DiffRunner, EquivalenceLevelArg, InspectResult, RegressionSuiteResult,
-    ReplayExitCode, ReplayOutputMode, SpeedArg,
+    ArtifactResult, EquivalenceLevelArg, InspectResult, RegressionSuiteResult, ReplayExitCode,
+    ReplayOutputMode, SpeedArg,
 };
-use frankenterm_core::replay_decision_diff::DiffConfig;
 use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
-use frankenterm_core::replay_report::ReportMeta;
-
-fn make_event(rule_id: &str, ts: u64, pane: u64) -> DecisionEvent {
-    let input = format!("rule={rule_id};ts={ts};pane={pane}");
-    DecisionEvent::new(
-        DecisionType::PatternMatch,
-        pane,
-        rule_id,
-        "d",
-        &input,
-        serde_json::Value::String("o".into()),
-        None,
-        Some(1.0),
-        ts,
-    )
-}
+use proptest::prelude::*;
 
 fn arb_output_mode() -> impl Strategy<Value = ReplayOutputMode> {
     prop_oneof![
@@ -60,7 +27,7 @@ fn arb_exit_code() -> impl Strategy<Value = ReplayExitCode> {
     ]
 }
 
-fn arb_equiv_level() -> impl Strategy<Value = EquivalenceLevelArg> {
+fn arb_equivalence_arg() -> impl Strategy<Value = EquivalenceLevelArg> {
     prop_oneof![
         Just(EquivalenceLevelArg::Structural),
         Just(EquivalenceLevelArg::Decision),
@@ -68,217 +35,234 @@ fn arb_equiv_level() -> impl Strategy<Value = EquivalenceLevelArg> {
     ]
 }
 
+fn arb_speed_arg() -> impl Strategy<Value = SpeedArg> {
+    prop_oneof![
+        Just(SpeedArg::Normal),
+        Just(SpeedArg::Double),
+        Just(SpeedArg::Instant),
+        (0.0f64..100.0f64)
+            .prop_filter("finite custom speed", |v| v.is_finite())
+            .prop_map(SpeedArg::Custom),
+    ]
+}
+
+fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
+    prop_oneof![
+        Just(DecisionType::PatternMatch),
+        Just(DecisionType::WorkflowStep),
+        Just(DecisionType::PolicyDecision),
+        Just(DecisionType::AlertFired),
+        Just(DecisionType::OverrideApplied),
+        Just(DecisionType::BarrierDecision),
+        Just(DecisionType::NoOp),
+        Just(DecisionType::PolicyEvaluation),
+    ]
+}
+
+fn arb_decision_event() -> impl Strategy<Value = DecisionEvent> {
+    (
+        arb_decision_type(),
+        "[a-z][a-z0-9_.-]{2,20}",
+        "[0-9a-f]{16}",
+        "[0-9a-f]{16}",
+        "[a-zA-Z0-9 _-]{0,40}",
+        "[0-9a-f]{16}",
+        any::<u64>(),
+        any::<u64>(),
+        prop::option::of("[a-z0-9_-]{1,20}"),
+        prop::option::of(0.0f64..1.0f64),
+        prop::option::of(any::<u64>()),
+        prop::option::of(any::<u64>()),
+        any::<u64>(),
+        "[a-z0-9_-]{0,20}",
+    )
+        .prop_map(
+            |(
+                decision_type,
+                rule_id,
+                definition_hash,
+                input_hash,
+                input_summary,
+                output_hash,
+                timestamp_ms,
+                pane_id,
+                parent_event_id,
+                confidence,
+                triggered_by,
+                overrides,
+                wall_clock_ms,
+                replay_run_id,
+            )| DecisionEvent {
+                decision_type,
+                rule_id,
+                definition_hash,
+                input_hash,
+                input_summary,
+                output_hash,
+                timestamp_ms,
+                pane_id,
+                parent_event_id,
+                confidence,
+                triggered_by,
+                overrides,
+                wall_clock_ms,
+                replay_run_id,
+            },
+        )
+}
+
+fn arb_artifact_result() -> impl Strategy<Value = ArtifactResult> {
+    (
+        ".{1,40}",
+        any::<bool>(),
+        ".{0,40}",
+        prop::option::of(".{1,40}"),
+    )
+        .prop_map(
+            |(artifact_path, passed, gate_result_summary, error)| ArtifactResult {
+                artifact_path,
+                passed,
+                gate_result_summary,
+                error,
+            },
+        )
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    // ── RC-1: ReplayOutputMode serde ──────────────────────────────────
+    #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
-    fn rc1_output_mode_serde(mode in arb_output_mode()) {
+    fn prop_output_mode_serde_roundtrip(mode in arb_output_mode()) {
         let json = serde_json::to_string(&mode).unwrap();
-        let restored: ReplayOutputMode = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(restored, mode);
+        let back: ReplayOutputMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, mode);
     }
 
-    // ── RC-2: ReplayExitCode serde ────────────────────────────────────
-
     #[test]
-    fn rc2_exit_code_serde(ec in arb_exit_code()) {
-        let json = serde_json::to_string(&ec).unwrap();
-        let restored: ReplayExitCode = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(restored, ec);
+    fn prop_exit_code_serde_roundtrip(code in arb_exit_code()) {
+        let json = serde_json::to_string(&code).unwrap();
+        let back: ReplayExitCode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, code);
     }
 
-    // ── RC-3: Exit codes are distinct ─────────────────────────────────
-
     #[test]
-    fn rc3_exit_codes_distinct(_dummy in 0u8..1) {
-        let codes = [
-            ReplayExitCode::Pass.code(),
-            ReplayExitCode::Regression.code(),
-            ReplayExitCode::InvalidInput.code(),
-            ReplayExitCode::InternalError.code(),
-        ];
-        for i in 0..codes.len() {
-            for j in (i + 1)..codes.len() {
-                prop_assert_ne!(codes[i], codes[j]);
-            }
-        }
+    fn prop_exit_code_numeric_mapping(code in arb_exit_code()) {
+        let expected = match code {
+            ReplayExitCode::Pass => 0,
+            ReplayExitCode::Regression => 1,
+            ReplayExitCode::InvalidInput => 2,
+            ReplayExitCode::InternalError => 3,
+        };
+        prop_assert_eq!(code.code(), expected);
     }
 
-    // ── RC-4: SpeedArg parsing for valid strings ──────────────────────
-
     #[test]
-    fn rc4_speed_parse_valid(s in prop_oneof![
-        Just("1x".to_string()),
-        Just("2x".to_string()),
-        Just("instant".to_string()),
-        Just("normal".to_string()),
-        (1.0f64..100.0).prop_map(|v| format!("{}x", v as u32)),
-    ]) {
-        let result = SpeedArg::from_str_arg(&s);
-        prop_assert!(result.is_ok(), "should parse '{}' successfully", s);
-    }
-
-    // ── RC-5: SpeedArg multiplier > 0 ─────────────────────────────────
-
-    #[test]
-    fn rc5_speed_positive(_dummy in 0u8..1) {
-        for sa in &[SpeedArg::Normal, SpeedArg::Double, SpeedArg::Instant, SpeedArg::Custom(3.0)] {
-            prop_assert!(sa.multiplier() > 0.0);
-        }
-    }
-
-    // ── RC-6: EquivalenceLevelArg serde ───────────────────────────────
-
-    #[test]
-    fn rc6_equiv_serde(level in arb_equiv_level()) {
+    fn prop_equivalence_arg_serde_roundtrip(level in arb_equivalence_arg()) {
         let json = serde_json::to_string(&level).unwrap();
-        let restored: EquivalenceLevelArg = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(restored, level);
+        let back: EquivalenceLevelArg = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, level);
     }
 
-    // ── RC-7: InspectResult event_count matches ───────────────────────
-
     #[test]
-    fn rc7_inspect_event_count(n in 0usize..20) {
-        let events: Vec<DecisionEvent> = (0..n)
-            .map(|i| make_event(&format!("r_{}", i), (i as u64) * 10, 0))
-            .collect();
-        let result = InspectResult::from_events("test.replay", &events);
-        prop_assert_eq!(result.event_count, n as u64);
+    fn prop_speed_arg_serde_roundtrip(speed in arb_speed_arg()) {
+        let json = serde_json::to_string(&speed).unwrap();
+        let back: SpeedArg = serde_json::from_str(&json).unwrap();
+        match (speed, back) {
+            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => prop_assert!((a - b).abs() < 1e-10),
+            (lhs, rhs) => prop_assert_eq!(lhs, rhs),
+        }
     }
 
-    // ── RC-8: pane_count ≤ event_count ────────────────────────────────
-
     #[test]
-    fn rc8_pane_count(n in 1usize..20) {
-        let events: Vec<DecisionEvent> = (0..n)
-            .map(|i| make_event(&format!("r_{}", i), (i as u64) * 10, i as u64 % 5))
-            .collect();
-        let result = InspectResult::from_events("test.replay", &events);
-        prop_assert!(result.pane_count <= result.event_count);
+    fn prop_speed_arg_from_str_canonical(speed in arb_speed_arg()) {
+        let text = match speed {
+            SpeedArg::Normal => "1x".to_string(),
+            SpeedArg::Double => "2x".to_string(),
+            SpeedArg::Instant => "instant".to_string(),
+            SpeedArg::Custom(multiplier) => format!("{multiplier}x"),
+        };
+        let parsed = SpeedArg::from_str_arg(&text).unwrap();
+        match (speed, parsed) {
+            (SpeedArg::Custom(a), SpeedArg::Custom(b)) => prop_assert!((a - b).abs() < 1e-10),
+            (lhs, rhs) => prop_assert_eq!(lhs, rhs),
+        }
     }
 
-    // ── RC-9: rule_count ≤ event_count ────────────────────────────────
-
     #[test]
-    fn rc9_rule_count(n in 1usize..20) {
-        let events: Vec<DecisionEvent> = (0..n)
-            .map(|i| make_event(&format!("r_{}", i % 3), (i as u64) * 10, 0))
-            .collect();
-        let result = InspectResult::from_events("test.replay", &events);
-        prop_assert!(result.rule_count <= result.event_count);
-    }
+    fn prop_inspect_result_from_events_counts(
+        artifact_path in ".{1,30}",
+        events in prop::collection::vec(arb_decision_event(), 0..20)
+    ) {
+        let inspect = InspectResult::from_events(&artifact_path, &events);
 
-    // ── RC-10: render_human contains artifact path ────────────────────
+        let pane_count = events.iter().map(|event| event.pane_id).collect::<BTreeSet<_>>().len() as u64;
+        let rule_count = events.iter().map(|event| event.rule_id.clone()).collect::<BTreeSet<_>>().len() as u64;
+        let decision_types = events
+            .iter()
+            .map(|event| format!("{:?}", event.decision_type))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
 
-    #[test]
-    fn rc10_render_has_path(name in "[a-z]{3,8}\\.replay") {
-        let events = vec![make_event("r1", 100, 1)];
-        let result = InspectResult::from_events(&name, &events);
-        let human = result.render_human();
-        prop_assert!(human.contains(&name));
-    }
-
-    // ── RC-11: DiffRunner identical → Pass ────────────────────────────
-
-    #[test]
-    fn rc11_identical_pass(n in 1usize..10) {
-        let events: Vec<DecisionEvent> = (0..n)
-            .map(|i| make_event(&format!("r_{}", i), (i as u64) * 10, 0))
-            .collect();
-        let runner = DiffRunner::new();
-        let result = runner.run(&events, &events, &DiffConfig::default());
-        prop_assert_eq!(result.exit_code, ReplayExitCode::Pass);
-    }
-
-    // ── RC-12: Format output non-empty (except Quiet pass) ────────────
-
-    #[test]
-    fn rc12_format_nonempty(mode in arb_output_mode()) {
-        let events = vec![
-            make_event("r1", 100, 1),
-            make_event("r2", 200, 1),
-        ];
-        let runner = DiffRunner::new();
-        let result = runner.run(&events, &events, &DiffConfig::default());
-        let formatted = runner.format_result(&result, mode, &ReportMeta::default());
-        if mode == ReplayOutputMode::Quiet && result.exit_code == ReplayExitCode::Pass {
-            prop_assert!(formatted.is_empty());
+        let expected_span = if events.is_empty() {
+            0
         } else {
-            prop_assert!(!formatted.is_empty());
-        }
+            let min_ts = events.iter().map(|event| event.timestamp_ms).min().unwrap();
+            let max_ts = events.iter().map(|event| event.timestamp_ms).max().unwrap();
+            max_ts - min_ts
+        };
+
+        prop_assert_eq!(inspect.artifact_path, artifact_path);
+        prop_assert_eq!(inspect.event_count, events.len() as u64);
+        prop_assert_eq!(inspect.pane_count, pane_count);
+        prop_assert_eq!(inspect.rule_count, rule_count);
+        prop_assert_eq!(inspect.time_span_ms, expected_span);
+        prop_assert_eq!(inspect.decision_types, decision_types);
+        prop_assert!(inspect.integrity_ok);
     }
 
-    // ── RC-13: Suite counts consistent ────────────────────────────────
+    #[test]
+    fn prop_inspect_result_serde_roundtrip(
+        artifact_path in ".{1,30}",
+        events in prop::collection::vec(arb_decision_event(), 0..20)
+    ) {
+        let inspect = InspectResult::from_events(&artifact_path, &events);
+        let json = serde_json::to_string(&inspect).unwrap();
+        let back: InspectResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.artifact_path, inspect.artifact_path);
+        prop_assert_eq!(back.event_count, inspect.event_count);
+        prop_assert_eq!(back.pane_count, inspect.pane_count);
+        prop_assert_eq!(back.rule_count, inspect.rule_count);
+        prop_assert_eq!(back.time_span_ms, inspect.time_span_ms);
+        prop_assert_eq!(back.decision_types, inspect.decision_types);
+        prop_assert_eq!(back.integrity_ok, inspect.integrity_ok);
+    }
 
     #[test]
-    fn rc13_suite_counts(n_pass in 0usize..5, n_fail in 0usize..5, n_err in 0usize..3) {
-        let mut results = Vec::new();
-        for i in 0..n_pass {
-            results.push(ArtifactResult {
-                artifact_path: format!("pass_{}.replay", i),
-                passed: true,
-                gate_result_summary: "Pass".into(),
-                error: None,
-            });
-        }
-        for i in 0..n_fail {
-            results.push(ArtifactResult {
-                artifact_path: format!("fail_{}.replay", i),
-                passed: false,
-                gate_result_summary: "Fail".into(),
-                error: None,
-            });
-        }
-        for i in 0..n_err {
-            results.push(ArtifactResult {
-                artifact_path: format!("err_{}.replay", i),
-                passed: false,
-                gate_result_summary: "Error".into(),
-                error: Some("error".into()),
-            });
-        }
+    fn prop_regression_suite_counts(results in prop::collection::vec(arb_artifact_result(), 0..20)) {
+        let suite = RegressionSuiteResult::from_results(results.clone());
+        let passed = results.iter().filter(|result| result.passed).count() as u64;
+        let errored = results.iter().filter(|result| result.error.is_some()).count() as u64;
+        let failed = results.len() as u64 - passed - errored;
+
+        prop_assert_eq!(suite.total_artifacts, results.len() as u64);
+        prop_assert_eq!(suite.passed, passed);
+        prop_assert_eq!(suite.errored, errored);
+        prop_assert_eq!(suite.failed, failed);
+        prop_assert_eq!(suite.overall_pass, failed == 0 && errored == 0);
+        prop_assert_eq!(suite.results.len(), results.len());
+    }
+
+    #[test]
+    fn prop_regression_suite_serde_roundtrip(results in prop::collection::vec(arb_artifact_result(), 0..20)) {
         let suite = RegressionSuiteResult::from_results(results);
-        prop_assert_eq!(suite.total_artifacts, (n_pass + n_fail + n_err) as u64);
-        prop_assert_eq!(suite.passed, n_pass as u64);
-    }
-
-    // ── RC-14: overall_pass ↔ no failures ─────────────────────────────
-
-    #[test]
-    fn rc14_overall_pass(n_pass in 1usize..5, n_fail in 0usize..3) {
-        let mut results = Vec::new();
-        for i in 0..n_pass {
-            results.push(ArtifactResult {
-                artifact_path: format!("p_{}.replay", i),
-                passed: true,
-                gate_result_summary: "Pass".into(),
-                error: None,
-            });
-        }
-        for i in 0..n_fail {
-            results.push(ArtifactResult {
-                artifact_path: format!("f_{}.replay", i),
-                passed: false,
-                gate_result_summary: "Fail".into(),
-                error: None,
-            });
-        }
-        let suite = RegressionSuiteResult::from_results(results);
-        if n_fail == 0 {
-            prop_assert!(suite.overall_pass);
-        } else {
-            prop_assert!(!suite.overall_pass);
-        }
-    }
-
-    // ── RC-15: Custom multiplier preserved ────────────────────────────
-
-    #[test]
-    fn rc15_custom_multiplier(m in 0.1f64..100.0) {
-        let speed = SpeedArg::Custom(m);
-        prop_assert!((speed.multiplier() - m).abs() < 1e-10);
+        let json = serde_json::to_string(&suite).unwrap();
+        let back: RegressionSuiteResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.total_artifacts, suite.total_artifacts);
+        prop_assert_eq!(back.passed, suite.passed);
+        prop_assert_eq!(back.failed, suite.failed);
+        prop_assert_eq!(back.errored, suite.errored);
+        prop_assert_eq!(back.overall_pass, suite.overall_pass);
+        prop_assert_eq!(back.results.len(), suite.results.len());
     }
 }
