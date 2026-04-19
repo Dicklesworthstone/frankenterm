@@ -142,10 +142,22 @@ pub enum BackendImpl {
     Egl(Rc<crate::egl::GlState>),
 }
 
+/// Match the WGL/EGL framebuffer contract: invalid driver-reported sizes collapse
+/// to zero, while oversized drawable dimensions saturate rather than wrap.
+fn normalize_backing_dimension(dimension: f64) -> u32 {
+    if dimension.is_nan() || dimension <= 0.0 {
+        0
+    } else if !dimension.is_finite() || dimension >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        dimension as u32
+    }
+}
+
 fn backing_dimensions_from_rect(backing_frame: NSRect) -> (u32, u32) {
     (
-        backing_frame.size.width.max(0.0) as u32,
-        backing_frame.size.height.max(0.0) as u32,
+        normalize_backing_dimension(backing_frame.size.width),
+        normalize_backing_dimension(backing_frame.size.height),
     )
 }
 
@@ -163,7 +175,7 @@ impl BackendImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::backing_dimensions_from_rect;
+    use super::{backing_dimensions_from_rect, normalize_backing_dimension};
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
@@ -185,6 +197,28 @@ mod tests {
                 NSSize::new(-3.0, 27.0),
             )),
             (0, 27)
+        );
+    }
+
+    #[test]
+    fn normalize_backing_dimension_clamps_invalid_and_oversized_values() {
+        assert_eq!(normalize_backing_dimension(f64::NAN), 0);
+        assert_eq!(normalize_backing_dimension(f64::NEG_INFINITY), 0);
+        assert_eq!(normalize_backing_dimension(f64::INFINITY), u32::MAX);
+        assert_eq!(
+            normalize_backing_dimension(u32::MAX as f64 + 1024.0),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn backing_dimensions_from_rect_clamp_each_axis_independently() {
+        assert_eq!(
+            backing_dimensions_from_rect(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(f64::INFINITY, -7.0),
+            )),
+            (u32::MAX, 0)
         );
     }
 }
