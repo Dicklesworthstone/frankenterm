@@ -43,7 +43,7 @@ use crate::fleet_memory_controller::{FleetMemoryConfig, PaneScrollbackInfo};
 use crate::fleet_scrollback_coordinator::{
     CoordinatorConfig, FleetScrollbackCoordinator, SnapshotPaneScrollbackAccess,
 };
-use crate::gc::{CacheGcSettings, compact_u64_map, should_vacuum};
+use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
 use crate::ingest::{
     PaneCursor, PaneRegistry, bounded_segment_for_persistence, persist_captured_segment_with_cx,
 };
@@ -1565,19 +1565,20 @@ impl ObservationRuntime {
                         reg.observed_pane_ids().into_iter().collect()
                     };
 
-                    let cursor_gc = {
+                    let RuntimePaneStateCompaction {
+                        cursors: cursor_gc,
+                        detection_contexts: context_gc,
+                        pane_activity_tracker: activity_gc,
+                    } = {
                         let mut cursors_guard = cursors.write().await;
-                        compact_u64_map(&mut cursors_guard, &active_panes)
-                    };
-
-                    let context_gc = {
                         let mut contexts_guard = detection_contexts.write().await;
-                        compact_u64_map(&mut contexts_guard, &active_panes)
-                    };
-
-                    let activity_gc = {
                         let mut tracker_guard = pane_activity_tracker.write().await;
-                        compact_u64_map(&mut tracker_guard, &active_panes)
+                        compact_runtime_pane_state(
+                            &mut cursors_guard,
+                            &mut contexts_guard,
+                            &mut tracker_guard,
+                            &active_panes,
+                        )
                     };
 
                     let mut page_count = 0_i64;
@@ -1992,6 +1993,7 @@ impl ObservationRuntime {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
+        let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
@@ -2205,6 +2207,37 @@ impl ObservationRuntime {
                             debug!(
                                 pane_id = pane_id,
                                 "Restarted observing pane (new generation)"
+                            );
+                        }
+
+                        let active_panes: HashSet<u64> = {
+                            let reg = registry.read().await;
+                            reg.observed_pane_ids().into_iter().collect()
+                        };
+                        let RuntimePaneStateCompaction {
+                            cursors: cursor_gc,
+                            detection_contexts: context_gc,
+                            pane_activity_tracker: activity_gc,
+                        } = {
+                            let mut cursors_guard = cursors.write().await;
+                            let mut contexts_guard = detection_contexts.write().await;
+                            let mut tracker_guard = pane_activity_tracker.write().await;
+                            compact_runtime_pane_state(
+                                &mut cursors_guard,
+                                &mut contexts_guard,
+                                &mut tracker_guard,
+                                &active_panes,
+                            )
+                        };
+                        if cursor_gc.removed_entries > 0
+                            || context_gc.removed_entries > 0
+                            || activity_gc.removed_entries > 0
+                        {
+                            debug!(
+                                cursor_removed = cursor_gc.removed_entries,
+                                context_removed = context_gc.removed_entries,
+                                pane_activity_removed = activity_gc.removed_entries,
+                                "Discovery tick compacted unobserved runtime pane state"
                             );
                         }
 
@@ -3396,6 +3429,26 @@ struct PaneActivityState {
     last_output_at_ms: u64,
     generation: u32,
     first_seen_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePaneStateCompaction {
+    cursors: CacheCompactionStats,
+    detection_contexts: CacheCompactionStats,
+    pane_activity_tracker: CacheCompactionStats,
+}
+
+fn compact_runtime_pane_state(
+    cursors: &mut HashMap<u64, PaneCursor>,
+    detection_contexts: &mut HashMap<u64, DetectionContext>,
+    pane_activity_tracker: &mut HashMap<u64, PaneActivityState>,
+    active_panes: &HashSet<u64>,
+) -> RuntimePaneStateCompaction {
+    RuntimePaneStateCompaction {
+        cursors: compact_u64_map(cursors, active_panes),
+        detection_contexts: compact_u64_map(detection_contexts, active_panes),
+        pane_activity_tracker: compact_u64_map(pane_activity_tracker, active_panes),
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -5320,6 +5373,56 @@ mod tests {
         assert_eq!(second.last_activity_by_pane.len(), 1);
         assert_eq!(tracker.len(), 1);
         assert!(!tracker.contains_key(&2));
+    }
+
+    #[test]
+    fn ft_xbnl0_4_3_runtime_state_compaction_drops_unobserved_panes() {
+        let mut cursors = HashMap::from([
+            (1_u64, PaneCursor::from_seq(1, 4)),
+            (2_u64, PaneCursor::from_seq(2, 9)),
+        ]);
+        let mut detection_contexts = HashMap::from([
+            (1_u64, DetectionContext::new()),
+            (2_u64, DetectionContext::new()),
+        ]);
+        let mut pane_activity_tracker = HashMap::from([
+            (
+                1_u64,
+                PaneActivityState {
+                    last_seq: 4,
+                    last_output_at_ms: 1_000,
+                    generation: 1,
+                    first_seen_at_ms: 1_000,
+                },
+            ),
+            (
+                2_u64,
+                PaneActivityState {
+                    last_seq: 9,
+                    last_output_at_ms: 2_000,
+                    generation: 1,
+                    first_seen_at_ms: 2_000,
+                },
+            ),
+        ]);
+        let active_panes = HashSet::from([1_u64]);
+
+        let stats = compact_runtime_pane_state(
+            &mut cursors,
+            &mut detection_contexts,
+            &mut pane_activity_tracker,
+            &active_panes,
+        );
+
+        assert_eq!(stats.cursors.removed_entries, 1);
+        assert_eq!(stats.detection_contexts.removed_entries, 1);
+        assert_eq!(stats.pane_activity_tracker.removed_entries, 1);
+        assert!(cursors.contains_key(&1));
+        assert!(!cursors.contains_key(&2));
+        assert!(detection_contexts.contains_key(&1));
+        assert!(!detection_contexts.contains_key(&2));
+        assert!(pane_activity_tracker.contains_key(&1));
+        assert!(!pane_activity_tracker.contains_key(&2));
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //!   Persisted IndexedDocument + updated watermark
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -243,6 +243,18 @@ impl ContentIndexingPipeline {
         }
     }
 
+    fn prune_missing_pane_watermarks(
+        &mut self,
+        pane_content: &[(u64, Option<String>, Vec<ScrollbackLine>)],
+    ) {
+        let active_panes: HashSet<u64> = pane_content
+            .iter()
+            .map(|(pane_id, _, _)| *pane_id)
+            .collect();
+        self.watermarks
+            .retain(|pane_id, _| active_panes.contains(pane_id));
+    }
+
     /// Run one indexing tick across the given pane content.
     ///
     /// Each entry in `pane_content` is `(pane_id, session_id, scrollback_lines)`.
@@ -257,6 +269,7 @@ impl ContentIndexingPipeline {
         cass_hashes: Option<&dyn super::indexing::CassContentHashProvider>,
     ) -> PipelineTickReport {
         self.total_ticks += 1;
+        self.prune_missing_pane_watermarks(pane_content);
 
         // Check skip conditions.
         if self.state == PipelineState::Stopped {
@@ -765,6 +778,28 @@ mod tests {
         let removed = pipeline.remove_pane(42);
         assert!(removed.is_some());
         assert!(pipeline.watermark(42).is_none());
+    }
+
+    #[test]
+    fn ft_xbnl0_4_3_tick_prunes_missing_pane_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+
+        let first = vec![
+            (1_u64, None, make_lines(&["hello"], 1000, 100)),
+            (2_u64, None, make_lines(&["world"], 1000, 100)),
+        ];
+        pipeline.tick(&first, 2000, false, None);
+        assert!(pipeline.watermark(1).is_some());
+        assert!(pipeline.watermark(2).is_some());
+
+        let second = vec![(1_u64, None, make_lines(&["again"], 3000, 100))];
+        pipeline.tick(&second, 4000, false, None);
+
+        assert!(pipeline.watermark(1).is_some());
+        assert!(pipeline.watermark(2).is_none());
+        assert_eq!(pipeline.watermarks().len(), 1);
     }
 
     #[test]
