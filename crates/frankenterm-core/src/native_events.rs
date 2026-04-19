@@ -219,7 +219,7 @@ impl NativeEventListener {
             // ft-xbnl0.2.3: route the legacy entry point through the
             // explicit-Cx accept loop so the listener keeps a single
             // request-rooted cancellation chain for its full lifetime.
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_cx(&cx, event_tx, shutdown_flag).await;
             return;
         }
@@ -545,7 +545,7 @@ async fn dispatch_event_with_timeout(
 ) -> EventDispatchOutcome {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await;
     }
 

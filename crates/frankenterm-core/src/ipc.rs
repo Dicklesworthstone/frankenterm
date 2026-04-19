@@ -817,7 +817,7 @@ impl IpcServer {
             // server lifetime, then immediately hand off to the
             // explicit-Cx loop. This avoids manufacturing a fresh
             // request Cx for every shutdown poll in the ambient path.
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
                 .await;
             return;
@@ -841,7 +841,7 @@ impl IpcServer {
     ) {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
                 .await;
             return;
@@ -891,7 +891,7 @@ impl IpcServer {
     ) {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_registry_auth_rpc_and_search_config_with_cx(
                 &cx,
                 event_bus,
@@ -1156,7 +1156,7 @@ impl IpcServer {
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return shutdown_signal_pending_with_cx(shutdown_rx, &cx).await;
     }
 
