@@ -9,6 +9,22 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+#[cfg(feature = "asupersync-runtime")]
+fn spawn_runner_child_with_cx<F, Fut>(cx: &crate::cx::Cx, task: F)
+where
+    F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(handle) = crate::runtime_compat::current_runtime_handle() {
+        std::mem::drop(crate::cx::spawn_with_cx(&handle, cx, task));
+    } else {
+        let child_cx = cx.clone();
+        std::mem::drop(crate::runtime_compat::task::spawn(async move {
+            task(child_cx).await;
+        }));
+    }
+}
+
 // ============================================================================
 // WorkflowRunner - Event-driven workflow execution
 // ============================================================================
@@ -2106,8 +2122,7 @@ impl WorkflowRunner {
                                         replay_capture: self.replay_capture.clone(),
                                     };
 
-                                    let child_cx = cx.clone();
-                                    crate::runtime_compat::task::spawn(async move {
+                                    spawn_runner_child_with_cx(cx, move |child_cx| async move {
                                         let result = runner
                                             .run_workflow_with_cx(
                                                 &child_cx,
