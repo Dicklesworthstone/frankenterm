@@ -37,6 +37,13 @@ pub fn allowed_raw_runtime_files() -> Vec<&'static str> {
     vec!["runtime_compat.rs", "cx.rs"]
 }
 
+/// Returns the only raw tokio runtime-builder constructors still permitted by
+/// the migration contract.
+#[must_use]
+pub fn allowed_raw_tokio_runtime_builder_apis() -> &'static [&'static str] {
+    crate::runtime_compat::RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1
+}
+
 // =============================================================================
 // Serialisable surface API entry
 // =============================================================================
@@ -335,6 +342,25 @@ mod tests {
     fn allowed_raw_runtime_files_includes_cx() {
         let files = allowed_raw_runtime_files();
         assert!(files.contains(&"cx.rs"), "cx.rs must be in allowed list");
+    }
+
+    // -------------------------------------------------------------------------
+    // 2b. allowed_raw_tokio_runtime_builder_apis_match_contract
+    // -------------------------------------------------------------------------
+    #[test]
+    fn allowed_raw_tokio_runtime_builder_apis_match_contract() {
+        let apis = allowed_raw_tokio_runtime_builder_apis();
+        assert_eq!(
+            apis,
+            crate::runtime_compat::RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1
+        );
+        assert_eq!(
+            apis,
+            &[
+                "tokio::runtime::Builder::new_current_thread",
+                "tokio::runtime::Builder::new_multi_thread",
+            ]
+        );
     }
 
     // -------------------------------------------------------------------------

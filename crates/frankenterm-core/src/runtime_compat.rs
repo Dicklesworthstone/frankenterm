@@ -46,7 +46,7 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
     SurfaceContractEntry {
         api: "RuntimeBuilder",
         disposition: SurfaceDisposition::Keep,
-        rationale: "Canonical runtime bootstrap seam shared by CLI/watch/test harnesses.",
+        rationale: "Canonical runtime bootstrap seam shared by CLI/watch/test harnesses; the last raw tokio builder constructors stay quarantined inside this wrapper until the fallback backend is retired.",
         replacement: None,
     },
     SurfaceContractEntry {
@@ -153,6 +153,18 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
         rationale: "Tokio-only signal shim is transitional and should be removed after native runtime integration.",
         replacement: Some("asupersync-native signal handling"),
     },
+];
+
+/// Explicit inventory of the raw tokio runtime-builder constructors that
+/// remain intentionally quarantined inside `RuntimeBuilder`.
+///
+/// The migration contract allows these call-sites only in the
+/// `#[cfg(not(feature = \"asupersync-runtime\"))]` fallback builder path. Any
+/// additional `tokio::runtime::Builder::*` constructor is a regression that
+/// should fail the surface guard tests.
+pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[
+    "tokio::runtime::Builder::new_current_thread",
+    "tokio::runtime::Builder::new_multi_thread",
 ];
 
 #[cfg(feature = "asupersync-runtime")]
@@ -2227,6 +2239,8 @@ pub struct RuntimeBuilder {
 impl RuntimeBuilder {
     #[must_use]
     pub fn current_thread() -> Self {
+        // Raw tokio runtime constructors stay quarantined here until wa-e34d9
+        // retires the fallback backend entirely.
         let mut inner = tokio::runtime::Builder::new_current_thread();
         inner.enable_all();
         Self {
@@ -2237,6 +2251,8 @@ impl RuntimeBuilder {
 
     #[must_use]
     pub fn multi_thread() -> Self {
+        // Raw tokio runtime constructors stay quarantined here until wa-e34d9
+        // retires the fallback backend entirely.
         let mut inner = tokio::runtime::Builder::new_multi_thread();
         inner.enable_all();
         Self {

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankenterm_core::runtime_compat_surface_guard::allowed_raw_runtime_files;
+use frankenterm_core::runtime_compat_surface_guard::{
+    allowed_raw_runtime_files, allowed_raw_tokio_runtime_builder_apis,
+};
 
 fn collect_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -154,6 +156,34 @@ fn runtime_compat_helper_shims_do_not_reappear_in_production_surfaces() {
         violations.is_empty(),
         "runtime_compat helper shims must not be reintroduced into production call sites:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn runtime_builder_tokio_fallback_stays_explicitly_quarantined() {
+    let workspace_root = workspace_root();
+    let runtime_compat =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs"))
+            .expect("failed to read runtime_compat.rs");
+
+    let allowed_apis = allowed_raw_tokio_runtime_builder_apis();
+    for api in allowed_apis {
+        assert_eq!(
+            runtime_compat.matches(api).count(),
+            1,
+            "runtime_compat.rs must keep exactly one quarantined use of {api}"
+        );
+    }
+
+    assert_eq!(
+        runtime_compat.matches("tokio::runtime::Builder::").count(),
+        allowed_apis.len(),
+        "runtime_compat.rs must not grow additional raw tokio runtime builder constructors"
+    );
+    assert!(
+        runtime_compat
+            .contains("Raw tokio runtime constructors stay quarantined here until wa-e34d9"),
+        "runtime_compat.rs must document the remaining raw tokio builder quarantine"
     );
 }
 
