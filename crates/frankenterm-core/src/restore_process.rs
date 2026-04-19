@@ -190,11 +190,11 @@ impl ProcessLauncher {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.execute_cx(&cx, plans).await
+            return self.execute_cx(&cx, plans).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-            self.execute_inner(plans).await
+            self.execute_legacy(plans).await
         }
     }
 
@@ -267,9 +267,13 @@ impl ProcessLauncher {
         report
     }
 
-    /// Non-asupersync fallback for execute.
+    /// Explicit quarantine for legacy non-asupersync process relaunch.
+    ///
+    /// Owner: `ft-xbnl0.2.5`.
+    /// Removal path: drop this helper once the workspace no longer supports
+    /// non-`asupersync-runtime` restore execution.
     #[cfg(not(feature = "asupersync-runtime"))]
-    async fn execute_inner(&self, plans: &[ProcessPlan]) -> LaunchReport {
+    async fn execute_legacy(&self, plans: &[ProcessPlan]) -> LaunchReport {
         let mut report = LaunchReport::default();
         let delay = Duration::from_millis(self.config.launch_delay_ms);
 
@@ -280,14 +284,14 @@ impl ProcessLauncher {
 
             let result = match &plan.action {
                 LaunchAction::LaunchShell { shell, cwd } => {
-                    self.launch_shell(plan.new_pane_id, shell, cwd).await
+                    self.launch_shell_legacy(plan.new_pane_id, shell, cwd).await
                 }
                 LaunchAction::LaunchAgent {
                     command,
                     cwd,
                     agent_type,
                 } => {
-                    self.launch_agent(plan.new_pane_id, command, cwd, agent_type)
+                    self.launch_agent_legacy(plan.new_pane_id, command, cwd, agent_type)
                         .await
                 }
                 LaunchAction::Skip { reason } => {
@@ -331,7 +335,7 @@ impl ProcessLauncher {
         report
     }
 
-    /// Shared result recording logic used by both execute_cx and execute_inner.
+    /// Shared result recording logic used by both execute_cx and execute_legacy.
     #[allow(clippy::unused_self)]
     fn record_result(
         &self,
@@ -565,7 +569,12 @@ impl ProcessLauncher {
 
     /// Send shell launch commands to a pane.
     #[cfg(not(feature = "asupersync-runtime"))]
-    async fn launch_shell(&self, pane_id: u64, shell: &str, cwd: &Path) -> Result<(), String> {
+    async fn launch_shell_legacy(
+        &self,
+        pane_id: u64,
+        shell: &str,
+        cwd: &Path,
+    ) -> Result<(), String> {
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
             .send_text(pane_id, &cd_cmd)
@@ -613,7 +622,7 @@ impl ProcessLauncher {
 
     /// Send agent launch command to a pane.
     #[cfg(not(feature = "asupersync-runtime"))]
-    async fn launch_agent(
+    async fn launch_agent_legacy(
         &self,
         pane_id: u64,
         command: &str,
