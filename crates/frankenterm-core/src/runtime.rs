@@ -1871,11 +1871,13 @@ impl ObservationRuntime {
                         reg.observed_pane_ids()
                     };
                     let observed_pane_count = observed_pane_ids.len();
-                    let tiered_scrollback_fetch = collect_pane_tiered_scrollback_summaries(
-                        &wezterm_handle,
-                        &observed_pane_ids,
-                    )
-                    .await;
+                    let tiered_scrollback_fetch =
+                        collect_pane_tiered_scrollback_summaries(
+                            &loop_cx,
+                            &wezterm_handle,
+                            &observed_pane_ids,
+                        )
+                        .await;
                     let (fleet_pane_infos, fleet_pane_snapshots) = {
                         let reg = registry.read().await;
                         let cur = cursors.read().await;
@@ -2778,6 +2780,7 @@ impl ObservationRuntime {
                                 }
 
                                 handle_native_event(
+                                    &loop_cx,
                                     event,
                                     &capture_tx,
                                     &cursors,
@@ -2790,6 +2793,7 @@ impl ObservationRuntime {
                             }
                             _ => {
                                 handle_native_event(
+                                    &loop_cx,
                                     event,
                                     &capture_tx,
                                     &cursors,
@@ -3153,6 +3157,7 @@ impl ObservationRuntime {
 
 #[cfg(feature = "native-wezterm")]
 async fn handle_native_event(
+    runtime_cx: &RuntimeLoopCx,
     event: NativeEvent,
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
@@ -3242,12 +3247,11 @@ async fn handle_native_event(
             };
 
             // ft-xbnl0.2.3 tick 251: cx-first native-event pane upsert.
-            let native_event_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if let Err(err) = storage.upsert_pane_with_cx(&native_event_cx, record).await {
+            if let Err(err) = storage.upsert_pane_with_cx(runtime_cx, record).await {
                 warn!(pane_id, error = %err, "Failed to upsert pane from native event");
             }
             let max_seq = storage
-                .get_max_seq_with_cx(&native_event_cx, pane_id)
+                .get_max_seq_with_cx(runtime_cx, pane_id)
                 .await
                 .unwrap_or(None);
 
@@ -3698,16 +3702,15 @@ fn record_pane_tiered_scrollback_summary_result(
 }
 
 async fn collect_pane_tiered_scrollback_summaries(
+    runtime_cx: &RuntimeLoopCx,
     wezterm_handle: &WeztermHandle,
     pane_ids: &[u64],
 ) -> PaneTieredScrollbackFetch {
     let mut fetch = PaneTieredScrollbackFetch::default();
 
-    // ft-xbnl0.2.3 tick 266: cx-first tiered scrollback summary collection.
-    let summary_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     for &pane_id in pane_ids {
         let result = wezterm_handle
-            .pane_tiered_scrollback_summary_with_cx(&summary_cx, pane_id)
+            .pane_tiered_scrollback_summary_with_cx(runtime_cx, pane_id)
             .await;
         record_pane_tiered_scrollback_summary_result(&mut fetch, pane_id, result);
     }
