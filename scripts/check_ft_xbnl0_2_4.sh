@@ -30,6 +30,7 @@
 #      Semaphore::acquire_owned_with_cx pre-cancel test (tick 427).
 #      The semaphore filter is `semaphore_acquire_` so it catches both
 #      borrow and owned variants.
+#      unix::next_line_with_cx pre-cancel test (tick 429).
 #
 # Exit code 0 on all passing; non-zero on any failure.
 #
@@ -133,7 +134,7 @@ run_test "Run 6/6: runtime_compat primitive contracts (budget + cancel observati
     -p frankenterm-core \
     --features asupersync-runtime \
     --lib \
-    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx broadcast_recv_with_cx semaphore_acquire_ mpsc_recv_with_cx watch_changed_with_cx join_set_join_next_with_cx
+    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx broadcast_recv_with_cx semaphore_acquire_ mpsc_recv_with_cx watch_changed_with_cx join_set_join_next_with_cx unix_next_line_with_cx
 
 echo
 echo "=============================================================="

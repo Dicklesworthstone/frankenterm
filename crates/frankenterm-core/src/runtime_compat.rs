@@ -5707,6 +5707,104 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 429: `unix::next_line_with_cx` observes pre-cancel
+    /// via its `cx.checkpoint()` pre-flight.
+    ///
+    /// `next_line_with_cx` is a seam-level cx-first primitive: it gates
+    /// entry to the underlying `lines.next()` wait with a
+    /// `cx.checkpoint()` folded into `io::ErrorKind::Interrupted`.
+    /// The underlying asupersync stream does NOT itself observe cx on
+    /// each poll — the pre-flight is the sole cancel-observability
+    /// point. This test pins that pre-flight:
+    ///
+    ///     cx.checkpoint().map_err(|err| io::Error::new(
+    ///         io::ErrorKind::Interrupted,
+    ///         format!("next_line cancelled: {err}"),
+    ///     ))?;
+    ///
+    /// Setup:
+    /// 1. Bind a UnixListener at a tempdir socket path.
+    /// 2. Spawn a task that accepts and holds the connection open
+    ///    without writing (reader will pend forever on new data).
+    /// 3. Connect a client UnixStream, wrap in BufReader + lines().
+    /// 4. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 5. Wrap `next_line_with_cx(&cx, &mut lines)` in 2 s outer
+    ///    safety-net timeout.
+    /// 6. Assert elapsed < 1 s AND Err with ErrorKind::Interrupted and
+    ///    message containing "next_line cancelled".
+    ///
+    /// `next_line_with_cx` is used across `ipc.rs` for shutdown-aware
+    /// line-reading loops — pinning cx-cancel guards those patterns
+    /// against regressions in the seam.
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn unix_next_line_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("tick429.sock");
+            let listener = unix::bind(&socket_path).await.expect("bind");
+
+            // Accept and hold the connection open, never writing.
+            // 1 s hold is plenty for the sub-10-ms cancel assertion.
+            let _accept_task = task::spawn(async move {
+                let _held = listener.accept().await;
+                sleep(Duration::from_secs(1)).await;
+                drop(_held);
+            });
+
+            let client = unix::connect(&socket_path).await.expect("connect");
+            let reader = unix::buffered(client);
+            let mut lines = unix::lines(reader);
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 429 pre-cancel unix::next_line_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                unix::next_line_with_cx(&cx, &mut lines),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit unix::next_line_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire");
+            match inner {
+                Err(err) => {
+                    assert_eq!(
+                        err.kind(),
+                        std::io::ErrorKind::Interrupted,
+                        "pre-cancel must fold into io::ErrorKind::Interrupted; got {:?}",
+                        err.kind()
+                    );
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("next_line cancelled"),
+                        "error message should surface seam-level cancellation; got: {msg}"
+                    );
+                }
+                Ok(val) => panic!(
+                    "pre-cancelled cx must surface Err, not Ok({val:?}) — reader has no data"
+                ),
+            }
+
+            // _accept_task will be aborted when the runtime drops.
+            drop(lines);
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 427: `Semaphore::acquire_owned_with_cx` observes cx-cancel.
     ///
     /// Companion to tick 421's borrow-variant test. The owned variant
