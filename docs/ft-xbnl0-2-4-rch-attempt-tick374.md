@@ -133,8 +133,20 @@ target-dir strategy (tick 393).
 | TLS tests | 45 | **45/45 PASS** | **116s (fully warm)** | 393 |
 | Metrics server cx-family | 3 | **3/3 PASS** | 114s | 393 |
 | Web server cx pre-cancel | 1 | **1/1 PASS** | 122s | 393 |
-| runtime_compat primitive | 2 | **2/2 PASS** | 113s | 393 |
-| **Total** | **88** | **88/88 PASS remotely** | | |
+| runtime_compat primitive | 2 → 22 | **2/2 PASS** (tick 393) → **22/22 PASS** (tick 449, expanded across ticks 418-439) | 113s (cold-to-warm, 2 tests) / **184s** (tick 449 warm re-verify with 22 tests after ticks 418-439) | 393 + **449** |
+| **Total** | **88 → 108** | **88/88 PASS remotely (tick 413)** → **108/109 remote verified** (tick 449 re-verify of Run 6 only; Run 1-5 still at tick-413 counts) | | |
+
+**Ticks 418-439 added 20 new primitive tests (see
+`verification-smoke-tick340.md` growth log); tick 449 re-ran the
+Run 6 filter remotely on vmi1149989 against the warm target dir
+from tick 447's partial cold compile and captured 22/22 PASS remote
+in 184s wall. Together with the tick-413 snapshot (86/86 across the
+other five groups), 108/109 total local tests have remote Level-C
+evidence. The remaining 1 test (Run 5 `web_server_with_cx_mid_flight_cancel_exits_cleanly`
+added tick 417) is pending remote re-verification — the Run 5 group
+re-run requires the `web` + `asupersync-runtime` feature graph which
+wasn't in tick 447's partial warm target dir, so it would be a
+separate rch invocation.**
 
 **All 88 ft-xbnl0.2.4 tests have remote Level-C evidence.** Post
 tick-413 re-verification, the remote count matches the local
