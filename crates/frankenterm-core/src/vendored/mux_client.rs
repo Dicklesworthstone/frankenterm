@@ -216,38 +216,52 @@ impl std::fmt::Debug for DirectMuxClient {
 
 impl DirectMuxClient {
     pub async fn connect(config: DirectMuxClientConfig) -> Result<Self, DirectMuxError> {
-        let socket_path = resolve_socket_path(&config)?;
-        if !socket_path.exists() {
-            return Err(DirectMuxError::SocketNotFound(socket_path));
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            // Keep the ambient entry point for compatibility, but route the
+            // actual transport work through the explicit-Cx path so connect,
+            // handshake, and timeout boundaries inherit the caller's runtime
+            // budget/cancellation context instead of open-coding a fresh one.
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return Self::connect_with_cx(&cx, config).await;
         }
 
-        let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
-        tracing::debug!(
-            socket_path = %socket_path.display(),
-            configured_compression_mode = ?config.compression_mode,
-            preferred_compression_mode = ?preferred_mode,
-            "connecting direct mux client"
-        );
-        match Self::connect_with_mode(socket_path.clone(), config.clone(), preferred_mode).await {
-            Ok(client) => Ok(client),
-            Err(err)
-                if should_auto_fallback_to_always(
-                    config.compression_mode,
-                    preferred_mode,
-                    &err,
-                ) =>
-            {
-                tracing::warn!(
-                    socket_path = %socket_path.display(),
-                    preferred_compression_mode = ?preferred_mode,
-                    fallback_compression_mode = ?CompressionMode::Always,
-                    error_kind = ?err.protocol_error_kind(),
-                    error = %err,
-                    "retrying direct mux connection with compression fallback"
-                );
-                Self::connect_with_mode(socket_path, config, CompressionMode::Always).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let socket_path = resolve_socket_path(&config)?;
+            if !socket_path.exists() {
+                return Err(DirectMuxError::SocketNotFound(socket_path));
             }
-            Err(err) => Err(err),
+
+            let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
+            tracing::debug!(
+                socket_path = %socket_path.display(),
+                configured_compression_mode = ?config.compression_mode,
+                preferred_compression_mode = ?preferred_mode,
+                "connecting direct mux client"
+            );
+            match Self::connect_with_mode(socket_path.clone(), config.clone(), preferred_mode).await
+            {
+                Ok(client) => Ok(client),
+                Err(err)
+                    if should_auto_fallback_to_always(
+                        config.compression_mode,
+                        preferred_mode,
+                        &err,
+                    ) =>
+                {
+                    tracing::warn!(
+                        socket_path = %socket_path.display(),
+                        preferred_compression_mode = ?preferred_mode,
+                        fallback_compression_mode = ?CompressionMode::Always,
+                        error_kind = ?err.protocol_error_kind(),
+                        error = %err,
+                        "retrying direct mux connection with compression fallback"
+                    );
+                    Self::connect_with_mode(socket_path, config, CompressionMode::Always).await
+                }
+                Err(err) => Err(err),
+            }
         }
     }
 
@@ -376,6 +390,7 @@ impl DirectMuxClient {
         Ok(client)
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn connect_with_mode(
         socket_path: PathBuf,
         config: DirectMuxClientConfig,
@@ -986,6 +1001,7 @@ impl DirectMuxClient {
         .await
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn verify_codec_version(&mut self) -> Result<GetCodecVersionResponse, DirectMuxError> {
         let response = self
             .send_request(Pdu::GetCodecVersion(GetCodecVersion {}))
@@ -1034,6 +1050,7 @@ impl DirectMuxClient {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn register_client(&mut self) -> Result<UnitResponse, DirectMuxError> {
         let client_id = ClientId::new();
         let response = self
@@ -1188,7 +1205,9 @@ impl DirectMuxClient {
         pipeline_timeout: Duration,
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
-        timeout(
+        checkpoint_mux_cx(cx, self.connection_id, "batch_wait")?;
+        crate::runtime_compat::timeout_with_cx(
+            cx,
             pipeline_timeout,
             self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
         )
@@ -1742,7 +1761,8 @@ impl DirectMuxClient {
 
             checkpoint_mux_cx(cx, self.connection_id, "response_read_wait")?;
             let mut temp = vec![0u8; 4096];
-            let read = match timeout(
+            let read = match crate::runtime_compat::timeout_with_cx(
+                cx,
                 self.config.read_timeout,
                 unix_stream_read_with_cx(cx, &mut self.stream, &mut temp),
             )
@@ -2082,6 +2102,11 @@ async fn run_subscription_loop(
     let mut last_seqno: Option<u64> = None;
 
     loop {
+        if cx.checkpoint().is_err() {
+            pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+            break;
+        }
+
         if cancel_requested(&mut cancel_rx) {
             pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
             break;
@@ -2152,16 +2177,23 @@ async fn run_subscription_loop(
         };
 
         let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
-        if let Ok(changed_ok) = timeout(
+        match crate::runtime_compat::timeout_with_cx(
+            cx,
             wait_interval,
             wait_for_cancel_change_with_cx(cx, &mut cancel_rx),
         )
         .await
         {
-            if !changed_ok || cancel_requested(&mut cancel_rx) {
+            Ok(changed_ok) if !changed_ok || cancel_requested(&mut cancel_rx) => {
                 pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
                 break;
             }
+            Ok(_) => {}
+            Err(_) if cx.checkpoint().is_err() => {
+                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
+                break;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -2410,25 +2442,25 @@ pub fn subscribe_pane_output(
     pane_id: u64,
     config: SubscriptionConfig,
 ) -> PaneOutputSubscription {
-    let (tx, rx) = mpsc::channel(config.channel_capacity);
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-
     #[cfg(feature = "asupersync-runtime")]
-    let task = {
+    {
         let cx = crate::cx::for_request();
-        let handle = inherited_subscription_runtime_handle();
-        spawn_subscription_task_with_cx(&handle, &cx, client, pane_id, config, tx, cancel_rx)
-    };
+        return subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config);
+    }
 
     #[cfg(not(feature = "asupersync-runtime"))]
-    let task = task::spawn(async move {
-        run_subscription_loop(client, pane_id, config, tx, cancel_rx).await;
-    });
+    {
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = task::spawn(async move {
+            run_subscription_loop(client, pane_id, config, tx, cancel_rx).await;
+        });
 
-    PaneOutputSubscription {
-        receiver: rx,
-        cancel: cancel_tx,
-        task: Some(task),
+        PaneOutputSubscription {
+            receiver: rx,
+            cancel: cancel_tx,
+            task: Some(task),
+        }
     }
 }
 
