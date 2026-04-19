@@ -2018,4 +2018,269 @@ mod tests {
         let d2 = d.clone();
         assert_eq!(d, d2);
     }
+
+    // ── Interleaved multi-agent ordering + rollback (wa-nu4.4.3.3) ──
+
+    #[test]
+    fn aggregator_rollback_restores_previous_snapshot() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        // Ingest two messages from agent-a.
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e1, now);
+        let snapshot_after_1 = agg.agent_session_snapshot("agent-a");
+
+        let e2 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e2, now + 10);
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(2));
+        assert_eq!(agg.total_accepted(), 2);
+
+        // Rollback to snapshot after message 1.
+        agg.rollback_accepted("agent-a", snapshot_after_1);
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+        assert_eq!(agg.total_accepted(), 1);
+    }
+
+    #[test]
+    fn aggregator_rollback_to_none_removes_agent() {
+        let mut agg = Aggregator::new(10);
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e1, 1000);
+        assert_eq!(agg.agent_count(), 1);
+
+        // Rollback to None removes the agent entirely.
+        agg.rollback_accepted("agent-a", None);
+        assert_eq!(agg.agent_count(), 0);
+        assert_eq!(agg.agent_last_seq("agent-a"), None);
+        assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
+    fn aggregator_rollback_then_reingest_works() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        let e1 = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e1, now);
+        let snap = agg.agent_session_snapshot("agent-a");
+
+        let e2 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e2, now + 10);
+
+        // Rollback seq 2.
+        agg.rollback_accepted("agent-a", snap);
+
+        // Re-ingest with seq 2 should succeed again.
+        let e2_retry = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope_at(e2_retry, now + 20).unwrap();
+        assert!(matches!(result, IngestResult::Accepted(_)));
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(2));
+    }
+
+    #[test]
+    fn aggregator_interleaved_multi_agent_preserves_per_agent_ordering() {
+        let mut agg = Aggregator::new(64);
+        let now = 1_000i64;
+
+        // Simulate 5 agents each sending 20 messages, interleaved round-robin.
+        let agent_count = 5;
+        let msgs_per_agent = 20u64;
+        let mut expected_seqs = vec![0u64; agent_count];
+
+        for msg_idx in 0..msgs_per_agent {
+            for agent_idx in 0..agent_count {
+                let sender = format!("agent-{agent_idx}");
+                let seq = msg_idx + 1; // 1-based seq
+                let envelope = WireEnvelope::new(
+                    seq,
+                    &sender,
+                    WirePayload::Gap(sample_gap()),
+                );
+                let result = agg.ingest_envelope_at(envelope, now + (msg_idx as i64) * 100).unwrap();
+                assert!(
+                    matches!(result, IngestResult::Accepted(_)),
+                    "agent-{agent_idx} seq {seq} should be accepted"
+                );
+                expected_seqs[agent_idx] = seq;
+            }
+        }
+
+        // Verify each agent's last_seq is correct.
+        for agent_idx in 0..agent_count {
+            let sender = format!("agent-{agent_idx}");
+            assert_eq!(agg.agent_last_seq(&sender), Some(msgs_per_agent));
+        }
+        assert_eq!(agg.agent_count(), agent_count);
+        assert_eq!(agg.total_accepted(), (agent_count as u64) * msgs_per_agent);
+        assert_eq!(agg.total_rejected(), 0);
+    }
+
+    #[test]
+    fn aggregator_interleaved_with_gaps_and_duplicates() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        // Agent A: 1, 3, 5 (gaps between seqs)
+        // Agent B: 1, 1, 2 (duplicate at seq 1)
+        // Agent C: 10 (high starting seq)
+        let messages: Vec<(&str, u64, bool)> = vec![
+            ("a", 1, true),   // accepted
+            ("b", 1, true),   // accepted
+            ("a", 3, true),   // accepted (gap is ok, just monotonic)
+            ("b", 1, false),  // duplicate
+            ("c", 10, true),  // accepted (high seq ok for first msg)
+            ("a", 5, true),   // accepted
+            ("b", 2, true),   // accepted
+            ("a", 3, false),  // duplicate (already seen 5)
+            ("c", 9, false),  // duplicate (already seen 10)
+        ];
+
+        for (sender, seq, should_accept) in messages {
+            let envelope = WireEnvelope::new(
+                seq,
+                sender,
+                WirePayload::Gap(sample_gap()),
+            );
+            let result = agg.ingest_envelope_at(envelope, now).unwrap();
+            if should_accept {
+                assert!(
+                    matches!(result, IngestResult::Accepted(_)),
+                    "{sender} seq {seq} should be accepted"
+                );
+            } else {
+                assert!(
+                    matches!(result, IngestResult::Duplicate { .. }),
+                    "{sender} seq {seq} should be duplicate"
+                );
+            }
+        }
+
+        assert_eq!(agg.agent_last_seq("a"), Some(5));
+        assert_eq!(agg.agent_last_seq("b"), Some(2));
+        assert_eq!(agg.agent_last_seq("c"), Some(10));
+        assert_eq!(agg.total_accepted(), 6);
+    }
+
+    #[test]
+    fn aggregator_capacity_eviction_interleaved_with_stale_pruning() {
+        // Capacity=2, stale_after=100ms. Three agents compete for 2 slots.
+        // prune_stale_agents retains sessions where (now - last_seen) < stale_after.
+        let mut agg = Aggregator::with_stale_after(2, 100);
+
+        // Agent A at t=0
+        let e_a = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        assert!(matches!(agg.ingest_envelope_at(e_a, 0).unwrap(), IngestResult::Accepted(_)));
+
+        // Agent B at t=60 (will still be fresh at t=150 since 150-60=90 < 100)
+        let e_b = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        assert!(matches!(agg.ingest_envelope_at(e_b, 60).unwrap(), IngestResult::Accepted(_)));
+
+        // Agent C at t=150 — agent-a is stale (last_seen=0, 150-0=150 >= 100)
+        // agent-b is fresh (last_seen=60, 150-60=90 < 100)
+        // Prune agent-a, accept agent-c.
+        let e_c = WireEnvelope::new(1, "agent-c", WirePayload::Gap(sample_gap()));
+        assert!(matches!(agg.ingest_envelope_at(e_c, 150).unwrap(), IngestResult::Accepted(_)));
+
+        assert_eq!(agg.agent_count(), 2);
+        assert_eq!(agg.agent_last_seq("agent-a"), None);
+        assert_eq!(agg.agent_last_seq("agent-b"), Some(1));
+        assert_eq!(agg.agent_last_seq("agent-c"), Some(1));
+    }
+
+    #[test]
+    fn aggregator_snapshot_roundtrip_preserves_all_fields() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        // Send 3 messages, 1 duplicate.
+        let e1 = WireEnvelope::new(1, "agent-snap", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e1, now);
+        let e2 = WireEnvelope::new(2, "agent-snap", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(e2, now + 10);
+        let dup = WireEnvelope::new(1, "agent-snap", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(dup, now + 20);
+
+        let snap = agg.agent_session_snapshot("agent-snap").unwrap();
+
+        // Wipe and restore from snapshot.
+        agg.rollback_accepted("agent-snap", None);
+        assert_eq!(agg.agent_count(), 0);
+
+        agg.rollback_accepted("agent-snap", Some(snap));
+        // After restore, agent should have seq=2 and next ingest of seq=2 should be dup.
+        let e2_again = WireEnvelope::new(2, "agent-snap", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope_at(e2_again, now + 30).unwrap();
+        assert!(matches!(result, IngestResult::Duplicate { .. }));
+
+        // seq=3 should be accepted.
+        let e3 = WireEnvelope::new(3, "agent-snap", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope_at(e3, now + 40).unwrap();
+        assert!(matches!(result, IngestResult::Accepted(_)));
+    }
+
+    #[test]
+    fn aggregator_rollback_does_not_affect_other_agents() {
+        let mut agg = Aggregator::new(10);
+        let now = 1_000i64;
+
+        let ea = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(ea, now);
+        let eb = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(eb, now);
+
+        let snap_a = agg.agent_session_snapshot("agent-a");
+
+        let ea2 = WireEnvelope::new(2, "agent-a", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(ea2, now + 10);
+        let eb2 = WireEnvelope::new(2, "agent-b", WirePayload::Gap(sample_gap()));
+        let _ = agg.ingest_envelope_at(eb2, now + 10);
+
+        // Rollback only agent-a.
+        agg.rollback_accepted("agent-a", snap_a);
+
+        // agent-a rolled back to seq=1.
+        assert_eq!(agg.agent_last_seq("agent-a"), Some(1));
+        // agent-b unaffected, still at seq=2.
+        assert_eq!(agg.agent_last_seq("agent-b"), Some(2));
+    }
+
+    #[test]
+    fn aggregator_concurrent_style_burst_from_many_agents() {
+        // Simulate a burst: 20 agents each send 50 messages as fast as possible.
+        // Verify no cross-contamination between agent state.
+        let mut agg = Aggregator::new(64);
+        let now = 1_000i64;
+        let agent_count = 20usize;
+        let msgs = 50u64;
+
+        for seq in 1..=msgs {
+            for a in 0..agent_count {
+                let sender = format!("agent-{a}");
+                let envelope = WireEnvelope::new(
+                    seq,
+                    &sender,
+                    WirePayload::PaneDelta(PaneDelta {
+                        pane_id: a as u64,
+                        seq,
+                        content: format!("data-{a}-{seq}"),
+                        content_len: format!("data-{a}-{seq}").len(),
+                        captured_at_ms: now,
+                    }),
+                );
+                let result = agg.ingest_envelope_at(envelope, now + seq as i64).unwrap();
+                assert!(matches!(result, IngestResult::Accepted(_)));
+            }
+        }
+
+        assert_eq!(agg.agent_count(), agent_count);
+        assert_eq!(agg.total_accepted(), (agent_count as u64) * msgs);
+        for a in 0..agent_count {
+            assert_eq!(
+                agg.agent_last_seq(&format!("agent-{a}")),
+                Some(msgs),
+                "agent-{a} should have last_seq={msgs}"
+            );
+        }
+    }
 }
