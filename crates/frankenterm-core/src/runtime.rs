@@ -4406,7 +4406,7 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_compat::{sleep, CompatRuntime};
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 
