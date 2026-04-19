@@ -581,6 +581,59 @@ mod tests {
         mgr.release(1, "e2");
     }
 
+    #[test]
+    fn ft_xbnl0_4_4_workflow_lock_table_returns_to_baseline_after_storm_cycles() {
+        let mgr = PaneWorkflowLockManager::new();
+
+        for cycle in 0_u64..12 {
+            for pane_id in 0_u64..4 {
+                let result = mgr
+                    .try_acquire_with_limit(
+                        pane_id,
+                        "workflow-storm",
+                        &format!("storm-{cycle}-{pane_id}"),
+                        4,
+                    )
+                    .expect("storm cycle should stay within global lock limit");
+                assert!(
+                    result.is_acquired(),
+                    "pane {pane_id} should acquire during storm cycle {cycle}"
+                );
+            }
+
+            assert_eq!(
+                mgr.active_count(),
+                4,
+                "lock table grew unexpectedly during storm cycle {cycle}"
+            );
+
+            for pane_id in 0_u64..2 {
+                assert!(
+                    mgr.release(pane_id, &format!("storm-{cycle}-{pane_id}")),
+                    "pane {pane_id} should release cleanly during storm cycle {cycle}"
+                );
+            }
+
+            for pane_id in 2_u64..4 {
+                let released = mgr
+                    .force_release(pane_id)
+                    .expect("force release should recover leaked storm locks");
+                assert_eq!(released.pane_id, pane_id);
+                assert_eq!(released.execution_id, format!("storm-{cycle}-{pane_id}"));
+            }
+
+            assert_eq!(
+                mgr.active_count(),
+                0,
+                "lock table failed to return to baseline after storm cycle {cycle}"
+            );
+            assert!(
+                mgr.active_locks().is_empty(),
+                "active lock table retained entries after storm cycle {cycle}"
+            );
+        }
+    }
+
     // ========================================================================
     // PaneLockInfo serde
     // ========================================================================

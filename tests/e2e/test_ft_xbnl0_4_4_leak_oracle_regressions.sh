@@ -158,10 +158,12 @@ run_checked \
     "${AUDIT_LOG}" \
     bash -lc "
         set -euo pipefail
-        rg -n 'ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown|ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles' \
+        rg -n 'ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown|ft_xbnl0_4_4_leak_inventory_stays_bounded_across_reconnect_cycles|ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles' \
             '${ROOT_DIR}/crates/frankenterm-core/src/runtime.rs'
         rg -n 'ft_xbnl0_4_4_tick_keeps_watermarks_bounded_across_churn_cycles' \
             '${ROOT_DIR}/crates/frankenterm-core/src/search/indexing_pipeline.rs'
+        rg -n 'ft_xbnl0_4_4_workflow_lock_table_returns_to_baseline_after_storm_cycles' \
+            '${ROOT_DIR}/crates/frankenterm-core/src/workflows/lock.rs'
     "
 
 FMT_LOG="${ARTIFACT_DIR}/rustfmt_check.log"
@@ -170,7 +172,15 @@ run_checked \
     "${FMT_LOG}" \
     rustfmt --edition 2024 --check \
         "${ROOT_DIR}/crates/frankenterm-core/src/runtime.rs" \
-        "${ROOT_DIR}/crates/frankenterm-core/src/search/indexing_pipeline.rs"
+        "${ROOT_DIR}/crates/frankenterm-core/src/search/indexing_pipeline.rs" \
+        "${ROOT_DIR}/crates/frankenterm-core/src/workflows/lock.rs"
+
+TARGET_PREP_LOG="${ARTIFACT_DIR}/remote_target_dir_prepare.log"
+run_rch_step \
+    "remote_target_dir_prepare" \
+    "${TARGET_PREP_LOG}" \
+    mkdir -p "${REMOTE_TARGET_DIR}/debug/deps"
+rch_write_meta_json "${TARGET_PREP_LOG}"
 
 LIB_TEST_LOG="${ARTIFACT_DIR}/frankenterm_core_lib_tests.log"
 run_rch_step \
@@ -204,6 +214,8 @@ jq -cn \
     --arg rch_smoke_meta "$(rch_log_meta_path "$(rch_smoke_log_path)")" \
     --arg audit_log "${AUDIT_LOG}" \
     --arg fmt_log "${FMT_LOG}" \
+    --arg target_prep_log "${TARGET_PREP_LOG}" \
+    --arg target_prep_meta "$(rch_log_meta_path "${TARGET_PREP_LOG}")" \
     --arg lib_test_log "${LIB_TEST_LOG}" \
     --arg lib_test_meta "$(rch_log_meta_path "${LIB_TEST_LOG}")" \
     --arg check_log "${CHECK_LOG}" \
@@ -232,6 +244,8 @@ jq -cn \
         rch_smoke_meta: $rch_smoke_meta,
         source_audit: $audit_log,
         rustfmt_check: $fmt_log,
+        remote_target_dir_prepare: $target_prep_log,
+        remote_target_dir_prepare_meta: $target_prep_meta,
         frankenterm_core_lib_tests: $lib_test_log,
         frankenterm_core_lib_tests_meta: $lib_test_meta,
         frankenterm_core_lib_check: $check_log,

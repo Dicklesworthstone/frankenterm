@@ -5474,6 +5474,67 @@ mod tests {
     }
 
     #[test]
+    fn ft_xbnl0_4_4_leak_inventory_stays_bounded_across_reconnect_cycles() {
+        let mut registry = PaneRegistry::new();
+        let metrics = RuntimeMetrics::default();
+        let heartbeats = HeartbeatRegistry::new();
+        heartbeats.record_discovery();
+        heartbeats.record_capture();
+        heartbeats.record_persistence();
+        heartbeats.record_maintenance();
+
+        for cycle in 0_u64..16 {
+            let mut pane = make_pane(7, "ssh-reconnect");
+            pane.window_id = 100 + cycle;
+            pane.tab_id = 200 + cycle;
+            pane.workspace = Some(format!("cycle-{cycle}"));
+
+            registry.discovery_tick(vec![pane]);
+
+            let active_inventory = build_leak_risk_inventory(&registry, &metrics, &heartbeats);
+            assert_eq!(
+                active_inventory.tracked_pane_entries, 1,
+                "tracked pane entries grew during reconnect cycle {cycle}"
+            );
+            assert_eq!(
+                active_inventory.observed_pane_count, 1,
+                "observed pane count grew during reconnect cycle {cycle}"
+            );
+            assert_eq!(
+                active_inventory.window_count, 1,
+                "window count grew during reconnect cycle {cycle}"
+            );
+            assert_eq!(
+                active_inventory.tab_count, 1,
+                "tab count grew during reconnect cycle {cycle}"
+            );
+            assert_eq!(
+                active_inventory.workspace_count, 1,
+                "workspace count grew during reconnect cycle {cycle}"
+            );
+            assert_eq!(
+                active_inventory.pane_arena_count, 1,
+                "pane arena count grew during reconnect cycle {cycle}"
+            );
+
+            registry.discovery_tick(vec![]);
+
+            let baseline_inventory = build_leak_risk_inventory(&registry, &metrics, &heartbeats);
+            assert_eq!(
+                baseline_inventory.tracked_pane_entries, 0,
+                "tracked pane entries failed to return to baseline after reconnect cycle {cycle}"
+            );
+            assert_eq!(baseline_inventory.observed_pane_count, 0);
+            assert_eq!(baseline_inventory.window_count, 0);
+            assert_eq!(baseline_inventory.tab_count, 0);
+            assert_eq!(baseline_inventory.workspace_count, 0);
+            assert_eq!(baseline_inventory.pane_arena_count, 0);
+            assert_eq!(baseline_inventory.pane_arena_tracked_bytes, 0);
+            assert_eq!(baseline_inventory.pane_arena_peak_tracked_bytes, 0);
+        }
+    }
+
+    #[test]
     fn ft_xbnl0_4_4_runtime_state_compaction_stays_bounded_across_churn_cycles() {
         let mut cursors = HashMap::new();
         let mut detection_contexts = HashMap::new();
