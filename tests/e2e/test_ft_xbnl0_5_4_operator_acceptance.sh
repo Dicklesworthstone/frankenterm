@@ -17,6 +17,7 @@ STDOUT_FILE="${ARTIFACT_DIR}/stdout.txt"
 STDERR_FILE="${ARTIFACT_DIR}/stderr.txt"
 SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 REMOTE_TARGET_DIR="/tmp/ft-cod2-target"
+LOCAL_FT_BIN="${REMOTE_TARGET_DIR}/debug/ft"
 EXACT_RECIPE_LOG="${ARTIFACT_DIR}/frankenterm_check_exact_recipe.log"
 FALLBACK_CHECK_LOG="${ARTIFACT_DIR}/frankenterm_check_fallback.log"
 UNIT_TEST_LOG="${ARTIFACT_DIR}/frankenterm_operator_guidance_tests.log"
@@ -196,22 +197,25 @@ run_remote_script_step() {
   local step="$1"
   local log_file="$2"
   local script_text="$3"
-  local start_ns end_ns duration_ms rc remote_script_path remote_script_rel
+  local start_ns end_ns duration_ms rc remote_script_path
   start_ns="$(date +%s%N)"
   remote_script_path="${ARTIFACT_DIR}/operator_acceptance_remote.sh"
-  remote_script_rel="${remote_script_path#${ROOT_DIR}/}"
   printf '%s\n' "${script_text}" > "${remote_script_path}"
   chmod +x "${remote_script_path}"
-  record_command "rch exec -- bash ${remote_script_rel}"
+  record_command "FT_BIN=${LOCAL_FT_BIN} bash ${remote_script_path}"
   set +e
   (
     cd "${ROOT_DIR}"
-    exec env TMPDIR=/tmp rch exec -- bash "${remote_script_rel}"
+    exec env TMPDIR=/tmp FT_BIN="${LOCAL_FT_BIN}" TIMEOUT_BIN="${TIMEOUT_BIN:-}" bash "${remote_script_path}"
   ) > "${log_file}" 2>&1
   rc=$?
   set -e
-  check_rch_fallback "${log_file}"
-  rch_write_meta_json "${log_file}" "${rc}"
+  jq -cn \
+    --arg log_file "${log_file}" \
+    --arg ft_bin "${LOCAL_FT_BIN}" \
+    --argjson exit_code "${rc}" \
+    '{mode:"local_ft_bin", log_file:$log_file, ft_bin:$ft_bin, exit_code:$exit_code}' \
+    > "$(rch_log_meta_path "${log_file}")"
   end_ns="$(date +%s%N)"
   duration_ms="$(((end_ns - start_ns) / 1000000))"
   if [[ ${rc} -eq 0 ]]; then
@@ -358,12 +362,20 @@ if ! reuse_prior_unit_test_artifact "${ARTIFACT_DIR}"; then
   rch_write_meta_json "${UNIT_TEST_LOG}"
 fi
 
+if [[ -z "${TIMEOUT_BIN:-}" ]]; then
+  resolve_timeout_bin
+fi
+if [[ -z "${TIMEOUT_BIN:-}" ]]; then
+  echo "timeout or gtimeout is required" >&2
+  exit 2
+fi
+test -x "${LOCAL_FT_BIN}"
+
 read -r -d '' REMOTE_SCRIPT <<'EOF' || true
 set -euo pipefail
 
-ROOT_DIR="$(pwd)"
-export CARGO_TARGET_DIR="/tmp/ft-cod2-target"
-mkdir -p "${CARGO_TARGET_DIR}"
+: "${FT_BIN:?FT_BIN must point at a built ft binary}"
+: "${TIMEOUT_BIN:?TIMEOUT_BIN must point at timeout or gtimeout}"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/ft-xbnl0-5-4.XXXXXX")"
 bootstrap_ws="${tmpdir}/bootstrap"
@@ -409,7 +421,7 @@ run_ft() {
   local workspace="$1"
   local path_prefix="$2"
   shift 2
-  PATH="${path_prefix}:$PATH" FT_WORKSPACE="${workspace}" cargo run -q -p frankenterm -- "$@"
+  PATH="${path_prefix}:$PATH" "${FT_BIN}" --workspace "${workspace}" "$@"
 }
 
 set +e
@@ -421,8 +433,8 @@ bootstrap_doctor="$(run_ft "${bootstrap_ws}" "${ok_bin}" doctor --json)"
 bootstrap_status="$(run_ft "${bootstrap_ws}" "${ok_bin}" status --health -f json)"
 
 set +e
-PATH="${ok_bin}:$PATH" FT_WORKSPACE="${bootstrap_ws}" timeout --signal=TERM --kill-after=5 12 \
-  cargo run -q -p frankenterm -- watch --foreground >/dev/null 2>&1
+PATH="${ok_bin}:$PATH" "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 12 \
+  "${FT_BIN}" --workspace "${bootstrap_ws}" watch --foreground >/dev/null 2>&1
 bootstrap_watch_rc=$?
 set -e
 
