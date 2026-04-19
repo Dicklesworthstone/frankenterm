@@ -16,7 +16,7 @@ pub enum ReleaseDecision {
 }
 
 /// A single gate check result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseGateCheck {
     /// Stable check identifier.
     pub gate_id: String,
@@ -35,7 +35,7 @@ pub struct ReleaseGateCheck {
 }
 
 /// Overall release gate report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseGateReport {
     /// Final release decision.
     pub decision: ReleaseDecision,
@@ -191,7 +191,7 @@ impl ReleaseGatePolicy {
 }
 
 /// Leak-oracle evidence status.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeakEvidenceStatus {
     /// Whether a summary artifact was found.
     pub summary_present: bool,

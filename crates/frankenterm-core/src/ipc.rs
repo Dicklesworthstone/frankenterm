@@ -829,7 +829,6 @@ impl IpcServer {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
                 .await;
-            return;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -853,7 +852,6 @@ impl IpcServer {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
                 .await;
-            return;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -911,7 +909,6 @@ impl IpcServer {
                 shutdown_rx,
             )
             .await;
-            return;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]

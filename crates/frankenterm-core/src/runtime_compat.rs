@@ -1025,13 +1025,14 @@ pub mod task {
         tokio::spawn(future)
     }
 
-    pub fn spawn_with_cx<F, Fut, T>(_cx: &crate::cx::Cx, task: F) -> JoinHandle<T>
+    pub fn spawn_with_cx<C, F, Fut, T>(cx: &C, task: F) -> JoinHandle<T>
     where
-        F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
+        C: Clone + Send + 'static,
+        F: FnOnce(C) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let child_cx = crate::cx::for_request();
+        let child_cx = cx.clone();
         tokio::spawn(async move { task(child_cx).await })
     }
 
@@ -1795,15 +1796,16 @@ pub mod process {
             let watcher_done_inner = Arc::clone(&watcher_done);
             let watcher_cx = cx.clone();
             let watcher_spawn_cx = watcher_cx.clone();
-            let watcher_handle = super::task::spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
-                while !watcher_done_inner.load(Ordering::SeqCst) {
-                    if watcher_cx.is_cancel_requested() {
-                        watcher_cancel.store(true, Ordering::SeqCst);
-                        return;
+            let watcher_handle =
+                super::task::spawn_with_cx(&watcher_spawn_cx, move |_child_cx| async move {
+                    while !watcher_done_inner.load(Ordering::SeqCst) {
+                        if watcher_cx.is_cancel_requested() {
+                            watcher_cancel.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        let _ = super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL).await;
                     }
-                    let _ = super::sleep_with_cx(&watcher_cx, PROCESS_POLL_INTERVAL).await;
-                }
-            });
+                });
 
             let result =
                 super::spawn_blocking(move || run_output_command(program, args, envs, cancel))
@@ -4720,7 +4722,10 @@ mod tests {
                 crate::runtime_compat::current_runtime_handle().is_some()
             });
             let has_handle = handle.await.expect("task should complete");
-            assert!(has_handle, "runtime handle should be available in spawned task");
+            assert!(
+                has_handle,
+                "runtime handle should be available in spawned task"
+            );
         });
     }
 
@@ -4745,7 +4750,10 @@ mod tests {
                 .await
                 .expect("task result")
                 .expect("join result");
-            assert!(has_handle, "runtime handle should be available in spawned task");
+            assert!(
+                has_handle,
+                "runtime handle should be available in spawned task"
+            );
         });
     }
 

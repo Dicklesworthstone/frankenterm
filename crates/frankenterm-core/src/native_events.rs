@@ -221,7 +221,6 @@ impl NativeEventListener {
             // request-rooted cancellation chain for its full lifetime.
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_cx(&cx, event_tx, shutdown_flag).await;
-            return;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]

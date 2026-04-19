@@ -2445,7 +2445,7 @@ pub fn subscribe_pane_output(
     #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_request();
-        return subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config);
+        subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config)
     }
 
     #[cfg(not(feature = "asupersync-runtime"))]

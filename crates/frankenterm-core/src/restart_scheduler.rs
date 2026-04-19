@@ -131,7 +131,7 @@ impl ActivityProfile {
     pub fn update(&mut self, hour: u32, activity: f64) {
         let idx = (hour % 24) as usize;
         let a = self.alpha;
-        self.hourly_activity[idx] = a * activity + (1.0 - a) * self.hourly_activity[idx];
+        self.hourly_activity[idx] = (1.0 - a).mul_add(self.hourly_activity[idx], a * activity);
         self.observations += 1;
     }
 
