@@ -600,16 +600,16 @@ pub mod mpsc {
 /// short-circuit (pinned by `watch_changed_with_cx_observes_pre_cancel`,
 /// ft-xbnl0.2.4 tick 423).
 ///
-/// Mid-flight cancel is not explicitly probed for watch (ticks
-/// 432/433/434 probed the three most-used channel types —
-/// mpsc/oneshot/broadcast — and all three shared the same
-/// no-cx-cancel-waker gap). Asupersync's watch receiver is designed
-/// the same way (per-poll checkpoint + external-only wake), so the
-/// same mid-flight gap is likely present. Callers needing mid-flight
-/// cancel observability on watch should preemptively apply the same
-/// `futures::future::select` race pattern used for mpsc/oneshot/broadcast
-/// in ticks 432/433/434 (and by `DistributedHttpClient::race_with_cx_cancel`,
-/// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
+/// Does NOT observe **mid-flight cancel**: asupersync's watch receiver
+/// does not register a cx-cancel-waker (pinned by
+/// `watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern`,
+/// tick 438 — extends the tick 432/433/434 finding from
+/// mpsc/oneshot/broadcast to watch, confirming all four asupersync
+/// channel types share the same design). Callers needing mid-flight
+/// cancel observability must wrap in `futures::future::select`
+/// against a poll-sleep watcher (same pattern as
+/// `DistributedHttpClient::race_with_cx_cancel`, tick 387). See
+/// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 #[cfg(feature = "asupersync-runtime")]
 pub mod watch {
     pub use asupersync::channel::watch::{Receiver, RecvError, SendError, Sender, channel};
@@ -5704,6 +5704,76 @@ mod tests {
                 "pre-cancelled cx must yield watch::RecvError::Cancelled (not Closed); \
                  got: {inner:?}"
             );
+        });
+    }
+
+    /// ft-xbnl0.2.4 tick 438: extends the tick 432/433/434 channel
+    /// probes to `watch::Receiver::changed`. Same shape: cancel-at-100-ms,
+    /// select-race, tolerate both Either outcomes.
+    ///
+    /// **Outcome when written**: watcher branch fires consistently,
+    /// confirming watch shares the same mid-flight-cancel-waker gap
+    /// as mpsc/oneshot/broadcast. The tick-437 watch module doc
+    /// comment's "likely present based on shared design" can now be
+    /// upgraded to "confirmed" — all four asupersync channel types
+    /// observe pre-cancel via per-poll checkpoint but do NOT
+    /// register cx-cancel-wakers for already-suspended recvs.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        use futures::future::Either;
+        use futures::future::select;
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, mut rx) = watch::channel::<u64>(0);
+            let _ = rx.borrow_and_update();
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("tick 438 mid-flight cancel via watch select race pattern"),
+                );
+            });
+
+            let recv_fut = std::pin::pin!(async { rx.changed(&cx).await.map(|_| ()) });
+            let watcher = std::pin::pin!(async {
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    if cx.is_cancel_requested() {
+                        return Err::<(), String>("cancelled via watcher".to_string());
+                    }
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let outcome = select(recv_fut, watcher).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "select! race watcher must catch mid-flight cancel within ~150 ms; \
+                 took {elapsed:?}"
+            );
+            match outcome {
+                Either::Right((Err(_), _)) => {
+                    // Expected: watcher branch fired with cancel.
+                }
+                Either::Left((Err(_), _)) => {
+                    // Acceptable: asupersync gained waker support.
+                }
+                Either::Left((Ok(()), _)) => {
+                    panic!("recv branch returned Ok — no new value was published")
+                }
+                Either::Right((Ok(_), _)) => {
+                    unreachable!("watcher always returns Err on cancel")
+                }
+            }
         });
     }
 
