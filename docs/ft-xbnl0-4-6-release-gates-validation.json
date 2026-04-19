@@ -1,0 +1,85 @@
+{
+  "checked_at": "2026-04-19T19:20:09Z",
+  "checks": [
+    {
+      "blocking": true,
+      "detail": {
+        "action": "Run the ft-xbnl0.4.4 leak-oracle harness and capture a passing summary.json bundle.",
+        "artifact_root": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.4",
+        "summary_path": null
+      },
+      "gate_id": "REL-01-leak-oracle",
+      "name": "Leak behavior",
+      "reason_code": "leak_gate_missing_summary",
+      "status": "failed"
+    },
+    {
+      "blocking": true,
+      "detail": {
+        "action": "Repair the permanent finish-line guards before using the release decision.",
+        "guard_report": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards-validation.json",
+        "guard_status": "passed"
+      },
+      "gate_id": "REL-02-guard-surface",
+      "name": "Permanent guard surface",
+      "reason_code": "guard_surface_passed",
+      "status": "passed"
+    },
+    {
+      "blocking": true,
+      "detail": {
+        "action": "Regenerate the smoke/release soak matrix until the wrapper summary is passed and the nested summaries agree.",
+        "missing_nested_summaries": [],
+        "pane_scales": [
+          1,
+          50,
+          100,
+          200
+        ],
+        "release_consistent": true,
+        "release_cycles": 3,
+        "smoke_cycles": 1,
+        "wrapper_status": "passed",
+        "wrapper_summary": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix/20260419T125312Z/summary.json"
+      },
+      "gate_id": "REL-03-soak-confidence",
+      "name": "Soak confidence",
+      "reason_code": "soak_confidence_passed",
+      "status": "passed"
+    },
+    {
+      "blocking": true,
+      "detail": {
+        "action": "Reduce cost or tune the runtime/workload until RSS, duration, and backpressure expectations hold.",
+        "highest_backpressure_tiers": [
+          "Black"
+        ],
+        "max_duration_s": 3.785115519,
+        "max_duration_s_budget": 3.0,
+        "max_peak_rss_mb": 32.0,
+        "metric_counts": [
+          8
+        ],
+        "peak_rss_mb": 16.607958793640137,
+        "required_backpressure_tiers": [
+          "Black"
+        ],
+        "required_metric_count": 8,
+        "wrapper_summary": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix/20260419T125312Z/summary.json"
+      },
+      "gate_id": "REL-04-performance-budget",
+      "name": "Performance budget",
+      "reason_code": "performance_budget_failed",
+      "status": "failed"
+    }
+  ],
+  "policy_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-4-6-release-gates.json",
+  "repo_root": "/Users/jemanuel/projects/frankenterm",
+  "status": "failed",
+  "summary": {
+    "blocking_failed": 2,
+    "guard_report": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards-validation.json",
+    "latest_leak_summary": null,
+    "latest_soak_wrapper_summary": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix/20260419T125312Z/summary.json"
+  }
+}

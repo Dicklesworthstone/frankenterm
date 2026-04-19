@@ -1,0 +1,55 @@
+{
+  "contract_id": "ft.xbnl0.4.6.release_gates.v1",
+  "version": "1.0.0",
+  "bead_id": "ft-xbnl0.4.6",
+  "last_updated": "2026-04-19",
+  "description": "Blocking release-readiness policy for the ft-xbnl0 finish line. The evaluator in scripts/check_ft_xbnl0_4_6_release_gates.sh consumes this file to turn leak evidence, permanent guards, soak confidence, and runtime performance budgets into stable go/no-go checks.",
+  "artifact_roots": {
+    "leak_oracle_root": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.4/leak_oracle_regressions",
+    "soak_matrix_root": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix",
+    "guard_report": "docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
+  },
+  "thresholds": {
+    "required_pane_scales": [1, 50, 100, 200],
+    "required_metric_count": 8,
+    "min_smoke_cycles": 1,
+    "min_release_cycles": 3,
+    "max_peak_rss_mb": 32.0,
+    "max_duration_s": 3.0,
+    "required_backpressure_tiers": ["Black"]
+  },
+  "gate_map": [
+    {
+      "gate_id": "REL-01-leak-oracle",
+      "name": "Leak behavior",
+      "blocking": true,
+      "upstream_bead": "ft-xbnl0.4.4",
+      "source": "latest leak-oracle summary.json under artifact_roots.leak_oracle_root",
+      "failure_action": "Run the ft-xbnl0.4.4 leak-oracle harness and save a passing summary bundle."
+    },
+    {
+      "gate_id": "REL-02-guard-surface",
+      "name": "Permanent guard surface",
+      "blocking": true,
+      "upstream_bead": "ft-xbnl0.5.2",
+      "source": "artifact_roots.guard_report",
+      "failure_action": "Repair the permanent finish-line guards before trusting release-readiness."
+    },
+    {
+      "gate_id": "REL-03-soak-confidence",
+      "name": "Soak confidence",
+      "blocking": true,
+      "upstream_bead": "ft-xbnl0.4.5",
+      "source": "latest swarm soak wrapper summary.json under artifact_roots.soak_matrix_root",
+      "failure_action": "Regenerate the smoke/release soak matrix until the wrapper summary passes and nested summaries agree."
+    },
+    {
+      "gate_id": "REL-04-performance-budget",
+      "name": "Performance budget",
+      "blocking": true,
+      "upstream_bead": "ft-xbnl0.4.5",
+      "source": "nested smoke/release summaries referenced by the latest soak wrapper summary",
+      "failure_action": "Reduce runtime cost or tune the workload until RSS, duration, and backpressure budgets hold."
+    }
+  ]
+}

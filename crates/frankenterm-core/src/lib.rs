@@ -318,6 +318,7 @@ pub mod replay_mcp;
 pub mod replay_merge;
 pub mod replay_performance;
 pub mod replay_post_incident;
+pub mod release_readiness_gates;
 pub mod replay_provenance;
 pub mod replay_remediation;
 pub mod replay_report;
