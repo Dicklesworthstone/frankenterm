@@ -414,6 +414,10 @@ harness = false
 name = "entropy_scheduler_bench"
 harness = false
 
+[[bench]]
+name = "persistent_ds_bench"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
