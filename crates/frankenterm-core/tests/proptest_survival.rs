@@ -1,6 +1,6 @@
 //! Property-based tests for survival/hazard model invariants.
 //!
-//! Bead: wa-wiwt
+//! Beads: wa-wiwt, wa-1igc
 //!
 //! Validates:
 //! 1. Baseline hazard non-negative: h₀(t) ≥ 0 for all t, k, λ
@@ -17,6 +17,10 @@
 //! 12. Observation count tracks: n observations → count = n
 //! 13. Action thresholds ordered: None < IncreaseSnapshot < Immediate < Alert
 //! 14. Covariate dot product: X·β consistency
+//! 15. score_components: all outputs in [0,1], monotonicity, product invariant
+//! 16. recommend: manual→None, empty→None, horizon/cooldown filtering,
+//!     auto-execute threshold, advisory never auto-executes
+//! 17. ActivityProfile: clamping, EWMA convergence, hour independence
 
 use proptest::prelude::*;
 
@@ -1391,5 +1395,447 @@ proptest! {
         let scheduler = RestartScheduler::new(RestartSchedulerConfig::default());
         prop_assert!(scheduler.last_restart_at().is_none(),
             "fresh scheduler should have no last restart");
+    }
+}
+
+// =============================================================================
+// RestartScheduler::score_components behavioral invariants (wa-1igc)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_score_components_all_in_unit_range(
+        cfg in arb_restart_config(),
+        hazard in 0.0_f64..10.0,
+        activity in -0.5_f64..1.5,
+        elapsed_secs in proptest::option::of(0_u64..500_000),
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let elapsed = elapsed_secs.map(std::time::Duration::from_secs);
+        let bd = scheduler.score_components(hazard, activity, elapsed);
+        prop_assert!((0.0..=1.0).contains(&bd.hazard_urgency),
+            "hazard_urgency {} not in [0,1]", bd.hazard_urgency);
+        prop_assert!((0.0..=1.0).contains(&bd.activity_minimum),
+            "activity_minimum {} not in [0,1]", bd.activity_minimum);
+        prop_assert!((0.0..=1.0).contains(&bd.recency_penalty),
+            "recency_penalty {} not in [0,1]", bd.recency_penalty);
+        prop_assert!((0.0..=1.0).contains(&bd.score),
+            "score {} not in [0,1]", bd.score);
+    }
+
+    #[test]
+    fn prop_score_components_higher_hazard_higher_urgency(
+        cfg in arb_restart_config(),
+        h_lo in 0.0_f64..5.0,
+        h_delta in 0.01_f64..5.0,
+        activity in 0.0_f64..1.0,
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let h_hi = h_lo + h_delta;
+        let bd_lo = scheduler.score_components(h_lo, activity, None);
+        let bd_hi = scheduler.score_components(h_hi, activity, None);
+        // Sigmoid is strictly monotonically increasing, so higher hazard → higher urgency
+        prop_assert!(bd_hi.hazard_urgency >= bd_lo.hazard_urgency - f64::EPSILON,
+            "higher hazard ({}) should yield >= urgency ({} vs {})",
+            h_hi, bd_hi.hazard_urgency, bd_lo.hazard_urgency);
+    }
+
+    #[test]
+    fn prop_score_components_lower_activity_higher_minimum(
+        cfg in arb_restart_config(),
+        a_lo in 0.0_f64..0.49,
+        a_hi in 0.51_f64..1.0,
+        hazard in 0.0_f64..5.0,
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let bd_lo_act = scheduler.score_components(hazard, a_lo, None);
+        let bd_hi_act = scheduler.score_components(hazard, a_hi, None);
+        // Lower activity means higher activity_minimum (prefer low-activity windows)
+        prop_assert!(bd_lo_act.activity_minimum >= bd_hi_act.activity_minimum - f64::EPSILON,
+            "lower activity ({}) should yield >= activity_minimum ({} vs {})",
+            a_lo, bd_lo_act.activity_minimum, bd_hi_act.activity_minimum);
+    }
+
+    #[test]
+    fn prop_score_components_no_elapsed_means_full_recency(
+        cfg in arb_restart_config(),
+        hazard in 0.0_f64..5.0,
+        activity in 0.0_f64..1.0,
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let bd = scheduler.score_components(hazard, activity, None);
+        // No last restart → recency_penalty = 1.0 (no penalty)
+        prop_assert!((bd.recency_penalty - 1.0).abs() < 1e-10,
+            "no elapsed should give recency_penalty=1.0, got {}", bd.recency_penalty);
+    }
+
+    #[test]
+    fn prop_score_components_zero_elapsed_near_zero_recency(
+        cfg in arb_restart_config(),
+        hazard in 0.0_f64..5.0,
+        activity in 0.0_f64..1.0,
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let bd = scheduler.score_components(hazard, activity, Some(std::time::Duration::ZERO));
+        // Just restarted → recency_penalty ≈ 0 (too soon to restart again)
+        prop_assert!(bd.recency_penalty < 0.01,
+            "zero elapsed should give recency_penalty near 0, got {}", bd.recency_penalty);
+    }
+
+    #[test]
+    fn prop_score_components_longer_elapsed_higher_recency(
+        cfg in arb_restart_config(),
+        hazard in 0.0_f64..5.0,
+        activity in 0.0_f64..1.0,
+        short_secs in 60_u64..3600,
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let long_secs = short_secs + 36000; // +10 hours
+        let bd_short = scheduler.score_components(
+            hazard, activity, Some(std::time::Duration::from_secs(short_secs)));
+        let bd_long = scheduler.score_components(
+            hazard, activity, Some(std::time::Duration::from_secs(long_secs)));
+        // Longer since last restart → higher recency_penalty (more urgently needs restart)
+        prop_assert!(bd_long.recency_penalty >= bd_short.recency_penalty - f64::EPSILON,
+            "longer elapsed should yield >= recency_penalty ({} vs {})",
+            bd_long.recency_penalty, bd_short.recency_penalty);
+    }
+
+    #[test]
+    fn prop_score_is_product_of_components(
+        cfg in arb_restart_config(),
+        hazard in 0.0_f64..10.0,
+        activity in 0.0_f64..1.0,
+        elapsed_secs in proptest::option::of(0_u64..500_000),
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let elapsed = elapsed_secs.map(std::time::Duration::from_secs);
+        let bd = scheduler.score_components(hazard, activity, elapsed);
+        let expected = (bd.hazard_urgency * bd.activity_minimum * bd.recency_penalty)
+            .clamp(0.0, 1.0);
+        prop_assert!((bd.score - expected).abs() < 1e-10,
+            "score {} should equal urgency*minimum*penalty clamped = {}",
+            bd.score, expected);
+    }
+}
+
+// =============================================================================
+// RestartScheduler::recommend behavioral invariants (wa-1igc)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_recommend_manual_mode_returns_none(
+        hazard_threshold in 0.1_f64..2.0,
+        forecast_count in 1_usize..5,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Manual,
+            hazard_threshold,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let forecast: Vec<HazardForecastPoint> = (0..forecast_count)
+            .map(|i| HazardForecastPoint {
+                offset_minutes: (i as u32 + 1) * 60,
+                hazard_rate: 0.9,
+                predicted_activity: Some(0.1),
+            })
+            .collect();
+        let rec = scheduler.recommend(now, &forecast);
+        prop_assert!(rec.is_none(),
+            "Manual mode should always return None, got {:?}", rec);
+    }
+
+    #[test]
+    fn prop_recommend_empty_forecast_returns_none(
+        cfg in arb_restart_config(),
+    ) {
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let rec = scheduler.recommend(now, &[]);
+        prop_assert!(rec.is_none(),
+            "empty forecast should always return None");
+    }
+
+    #[test]
+    fn prop_recommend_selects_highest_score(
+        hazard_threshold in 0.5_f64..1.5,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            hazard_threshold,
+            cooldown_hours: 0.001, // near-zero cooldown so nothing is filtered
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        // Create two candidates: one with high hazard+low activity (should score higher)
+        // and one with low hazard+high activity
+        let forecast = vec![
+            HazardForecastPoint {
+                offset_minutes: 60,
+                hazard_rate: 0.1, // low hazard
+                predicted_activity: Some(0.9), // high activity
+            },
+            HazardForecastPoint {
+                offset_minutes: 120,
+                hazard_rate: 5.0, // high hazard
+                predicted_activity: Some(0.1), // low activity
+            },
+        ];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            // The high-hazard, low-activity candidate should win
+            prop_assert_eq!(rec.offset_minutes, 120,
+                "should select offset=120 (high hazard, low activity), got {}", rec.offset_minutes);
+        }
+        // It's OK if recommend returns None for some threshold configs
+    }
+
+    #[test]
+    fn prop_recommend_respects_horizon(
+        horizon in 60_u32..480,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            schedule_horizon_minutes: horizon,
+            cooldown_hours: 0.001,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        // Only candidate is beyond horizon
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: horizon + 100,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.1),
+        }];
+        let rec = scheduler.recommend(now, &forecast);
+        prop_assert!(rec.is_none(),
+            "candidate beyond horizon should be filtered out");
+    }
+
+    #[test]
+    fn prop_recommend_cooldown_filters_recent_restart(
+        cooldown_hours in 1.0_f64..24.0,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            cooldown_hours,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let mut scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        // Record restart 1 minute ago
+        let recent = now - std::time::Duration::from_secs(60);
+        scheduler.record_restart(recent);
+        // Candidate at 30 minutes (well within cooldown)
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 30,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.1),
+        }];
+        let rec = scheduler.recommend(now, &forecast);
+        prop_assert!(rec.is_none(),
+            "candidate within cooldown should be filtered: cooldown={}h", cooldown_hours);
+    }
+
+    #[test]
+    fn prop_recommend_automatic_execute_when_above_threshold(
+        min_score in 0.01_f64..0.5,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Automatic { min_score },
+            hazard_threshold: 0.3,
+            cooldown_hours: 0.001,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        // High hazard, low activity → should produce high score
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 60,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.05),
+        }];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            if rec.breakdown.score >= min_score {
+                prop_assert!(rec.should_execute_automatically,
+                    "score {} >= min_score {} → should_execute_automatically",
+                    rec.breakdown.score, min_score);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_recommend_advisory_never_auto_executes(
+        hazard_threshold in 0.1_f64..1.0,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            hazard_threshold,
+            cooldown_hours: 0.001,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 60,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.05),
+        }];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            prop_assert!(!rec.should_execute_automatically,
+                "Advisory mode should never auto-execute");
+        }
+    }
+
+    #[test]
+    fn prop_recommend_warning_precedes_schedule(
+        warning_minutes in 5_u32..60,
+    ) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            advance_warning_minutes: warning_minutes,
+            cooldown_hours: 0.001,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 120,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.1),
+        }];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            if let Some(warning_ts) = rec.warning_epoch_secs {
+                prop_assert!(warning_ts < rec.scheduled_for_epoch_secs,
+                    "warning ({}) should precede schedule ({})",
+                    warning_ts, rec.scheduled_for_epoch_secs);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_recommend_snapshot_matches_schedule_when_enabled(_dummy in 0..1u8) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            pre_restart_snapshot: true,
+            cooldown_hours: 0.001,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 120,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.1),
+        }];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            prop_assert_eq!(rec.snapshot_epoch_secs, Some(rec.scheduled_for_epoch_secs),
+                "snapshot_epoch_secs should match scheduled_for when enabled");
+        }
+    }
+
+    #[test]
+    fn prop_recommend_no_snapshot_when_disabled(_dummy in 0..1u8) {
+        let cfg = RestartSchedulerConfig {
+            mode: RestartMode::Advisory,
+            pre_restart_snapshot: false,
+            cooldown_hours: 0.001,
+            schedule_horizon_minutes: 2880,
+            ..RestartSchedulerConfig::default()
+        };
+        let scheduler = RestartScheduler::new(cfg);
+        let now = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let forecast = vec![HazardForecastPoint {
+            offset_minutes: 120,
+            hazard_rate: 5.0,
+            predicted_activity: Some(0.1),
+        }];
+        if let Some(rec) = scheduler.recommend(now, &forecast) {
+            prop_assert!(rec.snapshot_epoch_secs.is_none(),
+                "snapshot_epoch_secs should be None when disabled");
+        }
+    }
+}
+
+// =============================================================================
+// ActivityProfile behavioral invariants (wa-1igc)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_activity_profile_clamping_extreme_values(
+        alpha in 0.01_f64..0.99,
+        hour in 0_u8..24,
+        extreme in prop_oneof![-100.0_f64..(-0.01), 1.01_f64..100.0],
+    ) {
+        let mut profile = ActivityProfile::new(alpha, 0.5);
+        profile.update_hour(hour, extreme);
+        let predicted = profile.predict_hour(hour);
+        prop_assert!((0.0..=1.0).contains(&predicted),
+            "predicted activity after extreme input {} should be clamped to [0,1], got {}",
+            extreme, predicted);
+    }
+
+    #[test]
+    fn prop_activity_profile_ewma_converges_toward_sample(
+        alpha in 0.1_f64..0.9,
+        hour in 0_u8..24,
+        target in 0.0_f64..1.0,
+    ) {
+        let mut profile = ActivityProfile::new(alpha, 0.5);
+        // Feed same value repeatedly — EWMA should converge toward it
+        for _ in 0..50 {
+            profile.update_hour(hour, target);
+        }
+        let predicted = profile.predict_hour(hour);
+        prop_assert!((predicted - target).abs() < 0.05,
+            "after 50 updates with value {}, prediction should converge, got {}",
+            target, predicted);
+    }
+
+    #[test]
+    fn prop_activity_profile_independent_hours(
+        alpha in 0.01_f64..0.99,
+        hour_a in 0_u8..12,
+        hour_b in 12_u8..24,
+        val_a in 0.0_f64..0.3,
+        val_b in 0.7_f64..1.0,
+    ) {
+        let mut profile = ActivityProfile::new(alpha, 0.5);
+        profile.update_hour(hour_a, val_a);
+        profile.update_hour(hour_b, val_b);
+        let pred_a = profile.predict_hour(hour_a);
+        let pred_b = profile.predict_hour(hour_b);
+        // Hours should be independent — a low update on hour_a shouldn't affect hour_b
+        prop_assert!((pred_a - val_a).abs() < 0.01,
+            "hour_a prediction {} should be near val_a {}", pred_a, val_a);
+        prop_assert!((pred_b - val_b).abs() < 0.01,
+            "hour_b prediction {} should be near val_b {}", pred_b, val_b);
     }
 }
