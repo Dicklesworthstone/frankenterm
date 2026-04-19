@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 2 service-boundary cx contract tests + 2 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) |
+| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 5 service-boundary cx contract tests + 9 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) — total 96/96 |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -128,12 +128,16 @@ covered instead via the `build_tls_server_name` invalid-host path.
 
 | Surface | Contract | Test | Tick |
 |---------|----------|------|------|
+| Metrics server accept loop | Pre-cancelled cx refuses to bind | `metrics_server_start_with_cx_pre_cancelled_refuses_to_bind` (`src/metrics.rs`) | 321 |
 | Metrics server accept loop | Mid-flight cx-cancel terminates loop without shutdown flag | `metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop` (`src/metrics.rs`) | 322 |
+| Metrics server accept loop | Happy path serves request | `metrics_server_start_with_cx_happy_path_serves_request` (`src/metrics.rs`) | 320 |
 | Web server bind | Pre-cancelled cx refuses to bind | `web_server_with_cx_pre_cancelled_refuses_to_bind` (`tests/web.rs`) | 323 |
+| Web server orchestration | Mid-flight cx-cancel → graceful shutdown → Ok(()) | `web_server_with_cx_mid_flight_cancel_exits_cleanly` (`tests/web.rs`) | 417 |
 
-Together with pre-existing happy-path tests on both, three cx signal timings
-are pinned: pre-start, mid-flight, and happy for service boundaries —
-matching what the HTTP client side (§2.1) already has.
+Covers all three cx signal timings (pre-start, mid-flight, happy) on the
+two bead-scoped service boundaries. HTTP client side (§2.1) already has
+matching three-timing coverage — tick 417's web-server mid-flight test
+closes the orchestrator-level wiring gap.
 
 ### 2.4 Regression guards (`crates/frankenterm-core/tests/ft_xbnl0_2_4_no_direct_tokio_net_or_rustls.rs`)
 
@@ -148,21 +152,32 @@ in manifests for vendored ex-WezTerm crates (`frankenterm/ssh`, `frankenterm/cod
 `frankenterm/lua-api-crates/mux-lua`) that predate the FrankenTerm async
 migration. The import-scan still flags leakage INTO FrankenTerm core logic.
 
-### 2.6 Primitive contract tests (`runtime_compat` — ticks 382/383)
+### 2.6 Primitive contract tests (`runtime_compat` — ticks 382/383 + 418-423)
 
-Ticks 382/383 landed runtime-level tests pinning the doc claims
-recorded in §2.5:
+Ticks 382-423 landed runtime-level tests pinning the full
+primitive × signal-kind matrix. Both the budget-observation claim
+recorded in §2.5 and the direct-cx-cancel claim for every
+long-lived wait primitive under asupersync are now pinned.
 
-| Contract | Test name | Tick |
-|----------|-----------|------|
-| `sleep_with_cx` observes cx budget deadline | `sleep_with_cx_observes_budget_deadline` | 382 |
-| `timeout_with_cx` observes cx budget deadline | `timeout_with_cx_observes_budget_deadline` | 383 |
+| Primitive                     | Contract                              | Test name                                          | Tick |
+|-------------------------------|---------------------------------------|----------------------------------------------------|------|
+| `sleep_with_cx`               | Budget deadline observed              | `sleep_with_cx_observes_budget_deadline`           | 382  |
+| `timeout_with_cx`             | Budget deadline observed              | `timeout_with_cx_observes_budget_deadline`         | 383  |
+| `yield_now_with_cx`           | Pre-cancelled cx → Err via checkpoint | `yield_now_with_cx_observes_cx_cancel_checkpoint`  | 418  |
+| `yield_now_with_cx`           | Live cx → Ok (happy path)             | `yield_now_with_cx_yields_on_live_cx`              | 418  |
+| `oneshot_recv_with_cx`        | Pre-cancelled cx → Err                | `oneshot_recv_with_cx_observes_pre_cancel`         | 419  |
+| `broadcast_recv_with_cx`      | Pre-cancelled cx → Err                | `broadcast_recv_with_cx_observes_pre_cancel`       | 420  |
+| `Semaphore::acquire_with_cx`  | Pre-cancelled cx → AcquireError::Cancelled | `semaphore_acquire_with_cx_observes_pre_cancel` | 421  |
+| `mpsc::Receiver::recv(cx)`    | Pre-cancelled cx → RecvError::Cancelled    | `mpsc_recv_with_cx_observes_pre_cancel`        | 422  |
+| `watch::Receiver::changed(cx)` | Pre-cancelled cx → RecvError::Cancelled   | `watch_changed_with_cx_observes_pre_cancel`    | 423  |
 
-Both use `Budget::with_deadline(Time::ZERO)` (budget already
-elapsed at construction) and assert that the primitive returns
-`Err` promptly rather than blocking for the full requested
-duration. A future regression removing the `budget_*` short-circuit
-in asupersync would fire both tests.
+The budget tests (382/383) use `Budget::with_deadline(Time::ZERO)`
+(budget already elapsed) and assert prompt `Err` return. The
+cancel tests (418-423) pre-cancel cx and wrap the primitive in a
+2 s outer safety-net timeout so a non-observing primitive would
+block until the outer fires, making the failure loud. All
+observed cancel latencies are under 10 ms — asupersync's
+`cx.checkpoint()?` short-circuit fires on the very first poll.
 
 ### 2.5 Primitive documentation (`runtime_compat::{timeout_with_cx, sleep_with_cx}`)
 
@@ -262,8 +277,8 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (88 tests)`.
-Exit 0 iff all 88 tests pass.
+output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (96 tests)`.
+Exit 0 iff all 96 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
@@ -314,7 +329,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 These items have been verified in-session and are durable evidence:
 
 - [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
-- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 88 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 1 web + 2 primitive). Confirmed at every post-tick run.
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 96 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 9 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→9 across ticks 418-423 to pin the long-lived-wait-primitive × cx-cancel matrix (yield_now / oneshot / broadcast / semaphore / mpsc / watch).
 - [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec (tick 393). 83/83 remote PASS. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` — recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
 - [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
 - [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.
