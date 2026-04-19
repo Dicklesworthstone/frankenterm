@@ -31,6 +31,13 @@
 #      The semaphore filter is `semaphore_acquire_` so it catches both
 #      borrow and owned variants.
 #      unix::next_line_with_cx pre-cancel test (tick 429).
+#      Command::output_with_cx pre-spawn pre-cancel test (tick 430).
+#      The command_output_with_cx filter also picks up the pre-existing
+#      mid-flight cancel test
+#      (process_command_output_with_cx_cancellation_surfaces_as_interrupted)
+#      as bonus coverage — together they pin both cancel-observability
+#      points on Command::output_with_cx (pre-spawn gate + mid-flight
+#      cx→AtomicBool watcher).
 #
 # Exit code 0 on all passing; non-zero on any failure.
 #
@@ -134,7 +141,7 @@ run_test "Run 6/6: runtime_compat primitive contracts (budget + cancel observati
     -p frankenterm-core \
     --features asupersync-runtime \
     --lib \
-    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx broadcast_recv_with_cx semaphore_acquire_ mpsc_recv_with_cx watch_changed_with_cx join_set_join_next_with_cx unix_next_line_with_cx
+    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx broadcast_recv_with_cx semaphore_acquire_ mpsc_recv_with_cx watch_changed_with_cx join_set_join_next_with_cx unix_next_line_with_cx command_output_with_cx
 
 echo
 echo "=============================================================="

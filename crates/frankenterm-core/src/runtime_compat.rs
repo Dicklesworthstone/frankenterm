@@ -5707,6 +5707,92 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 430: `Command::output_with_cx` observes pre-cancel
+    /// at the pre-spawn `cx.checkpoint()` gate.
+    ///
+    /// `output_with_cx` has two cancel-observability points:
+    /// 1. Pre-spawn `cx.checkpoint()` → `Err(ErrorKind::Interrupted)`
+    ///    with message "process command cancelled pre-spawn: ..." before
+    ///    any child process is forked.
+    /// 2. Mid-flight via a spawned cx→`Arc<AtomicBool>` watcher bridging
+    ///    caller-cx cancellation into the `run_output_command` worker's
+    ///    cancel flag (polled at `PROCESS_POLL_INTERVAL`).
+    ///
+    /// This test pins the pre-spawn gate: pre-cancelled cx must cause
+    /// `output_with_cx` to return Err BEFORE any child process is
+    /// created. That's the strongest guarantee — the caller-side cancel
+    /// prevents process-resource leakage, not just fast exit from a
+    /// running child.
+    ///
+    /// Setup:
+    /// 1. Build `Command::new("sleep")` with arg `"30"` (never spawned —
+    ///    pre-flight gates before fork).
+    /// 2. Pre-cancel cx via `cx.cancel_with(User, ...)`.
+    /// 3. Wrap `cmd.output_with_cx(&cx)` in 2 s outer safety-net.
+    /// 4. Assert elapsed < 500 ms AND Err with
+    ///    `ErrorKind::Interrupted` and message containing "pre-spawn".
+    ///
+    /// Used across the core for running external tools (ft status,
+    /// pgrep, sysctl on macOS) under cx control — pinning the pre-spawn
+    /// gate guards against regressions where a cancelled cx still
+    /// spawns and then immediately kills the child (observable as
+    /// wasted forks, zombie handles, or audit-log churn).
+    #[cfg(all(feature = "asupersync-runtime", unix))]
+    #[test]
+    fn command_output_with_cx_observes_pre_cancel_pre_spawn() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut cmd = process::Command::new("sleep");
+            cmd.arg("30");
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 430 pre-cancel Command::output_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                cmd.output_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "pre-cancelled cx must short-circuit Command::output_with_cx pre-spawn; \
+                 took {elapsed:?} (outer 2s timeout likely fired, or a child was spawned \
+                 and then killed which would be a worse-case regression)"
+            );
+            let inner = result.expect("outer timeout must not fire");
+            match inner {
+                Err(err) => {
+                    assert_eq!(
+                        err.kind(),
+                        std::io::ErrorKind::Interrupted,
+                        "pre-cancel must fold into io::ErrorKind::Interrupted; got {:?}",
+                        err.kind()
+                    );
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("pre-spawn"),
+                        "error message should surface the pre-spawn gate specifically \
+                         (distinct from mid-flight cancel); got: {msg}"
+                    );
+                }
+                Ok(output) => panic!(
+                    "pre-cancelled cx must surface Err, not Ok({output:?}) — a spawned \
+                     child process for a cancelled cx would be a regression"
+                ),
+            }
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 429: `unix::next_line_with_cx` observes pre-cancel
     /// via its `cx.checkpoint()` pre-flight.
     ///
