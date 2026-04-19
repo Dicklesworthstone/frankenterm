@@ -87,6 +87,7 @@ mod mcp_tools;
 #[path = "mcp_types.rs"]
 mod mcp_types;
 
+#[cfg(test)]
 use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 pub use mcp_bridge::{build_server, build_server_with_db, run_stdio_server};
 use mcp_middleware::{AuditedToolHandler, FormatAwareToolHandler};
