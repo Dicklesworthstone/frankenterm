@@ -1,7 +1,8 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetCodecVersion, GetCodecVersionResponse, GetTlsCreds,
-    GetTlsCredsResponse, Pdu, RenameWorkspace, SelectStackPane, SendPaste, SetClipboard,
-    SetLayoutCycle, SetWindowWorkspace, UnitResponse, UpdatePaneConstraints, WriteToPane,
+    GetTlsCredsResponse, Pdu, RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace,
+    SetClipboard, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -162,6 +163,19 @@ fn arb_set_window_workspace() -> impl Strategy<Value = SetWindowWorkspace> {
         window_id,
         workspace,
     })
+}
+
+fn arb_set_active_workspace() -> impl Strategy<Value = SetActiveWorkspace> {
+    arb_small_string().prop_map(|workspace| SetActiveWorkspace { workspace })
+}
+
+fn arb_tab_title_changed() -> impl Strategy<Value = TabTitleChanged> {
+    (0u64..=4096, arb_small_string()).prop_map(|(tab_id, title)| TabTitleChanged { tab_id, title })
+}
+
+fn arb_window_title_changed() -> impl Strategy<Value = WindowTitleChanged> {
+    (0u64..=4096, arb_small_string())
+        .prop_map(|(window_id, title)| WindowTitleChanged { window_id, title })
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
@@ -339,5 +353,41 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SetWindowWorkspace(payload));
+    }
+
+    #[test]
+    fn set_active_workspace_json_and_pdu_roundtrip(
+        payload in arb_set_active_workspace(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetActiveWorkspace = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetActiveWorkspace(payload));
+    }
+
+    #[test]
+    fn tab_title_changed_json_and_pdu_roundtrip(
+        payload in arb_tab_title_changed(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: TabTitleChanged = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::TabTitleChanged(payload));
+    }
+
+    #[test]
+    fn window_title_changed_json_and_pdu_roundtrip(
+        payload in arb_window_title_changed(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: WindowTitleChanged = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::WindowTitleChanged(payload));
     }
 }
