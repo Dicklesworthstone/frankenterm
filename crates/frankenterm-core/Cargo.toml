@@ -426,6 +426,10 @@ harness = false
 name = "stream_hash_bench"
 harness = false
 
+[[bench]]
+name = "hyperloglog_bench"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
