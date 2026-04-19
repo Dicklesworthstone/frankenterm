@@ -1,4 +1,7 @@
-use codec::{CreateFloatingPane, Pdu, SetClipboard, UpdatePaneConstraints};
+use codec::{
+    CreateFloatingPane, Pdu, SelectStackPane, SendPaste, SetClipboard, SetLayoutCycle,
+    UpdatePaneConstraints,
+};
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
@@ -71,6 +74,31 @@ fn arb_update_pane_constraints() -> impl Strategy<Value = UpdatePaneConstraints>
         })
 }
 
+fn arb_layout_names() -> impl Strategy<Value = Vec<String>> {
+    proptest::collection::vec(arb_small_string(), 0..8)
+}
+
+fn arb_send_paste() -> impl Strategy<Value = SendPaste> {
+    (0u64..=4096, arb_small_string()).prop_map(|(pane_id, data)| SendPaste { pane_id, data })
+}
+
+fn arb_set_layout_cycle() -> impl Strategy<Value = SetLayoutCycle> {
+    (0u64..=4096, arb_layout_names()).prop_map(|(tab_id, layout_names)| SetLayoutCycle {
+        tab_id,
+        layout_names,
+    })
+}
+
+fn arb_select_stack_pane() -> impl Strategy<Value = SelectStackPane> {
+    (0u64..=4096, 0usize..=128, 0usize..=128).prop_map(|(tab_id, slot_index, pane_index)| {
+        SelectStackPane {
+            tab_id,
+            slot_index,
+            pane_index,
+        }
+    })
+}
+
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, serial).unwrap();
@@ -123,5 +151,41 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::UpdatePaneConstraints(payload));
+    }
+
+    #[test]
+    fn send_paste_json_and_pdu_roundtrip(
+        payload in arb_send_paste(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SendPaste = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SendPaste(payload));
+    }
+
+    #[test]
+    fn set_layout_cycle_json_and_pdu_roundtrip(
+        payload in arb_set_layout_cycle(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetLayoutCycle = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetLayoutCycle(payload));
+    }
+
+    #[test]
+    fn select_stack_pane_json_and_pdu_roundtrip(
+        payload in arb_select_stack_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SelectStackPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SelectStackPane(payload));
     }
 }
