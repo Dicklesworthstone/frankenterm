@@ -62,36 +62,44 @@ fn arb_decision_type() -> impl Strategy<Value = DecisionType> {
 fn arb_decision_event() -> impl Strategy<Value = DecisionEvent> {
     (
         arb_decision_type(),
-        "[a-z][a-z0-9_.-]{2,20}",
-        "[0-9a-f]{16}",
-        "[0-9a-f]{16}",
-        "[a-zA-Z0-9 _-]{0,40}",
-        "[0-9a-f]{16}",
-        any::<u64>(),
-        any::<u64>(),
-        prop::option::of("[a-z0-9_-]{1,20}"),
-        prop::option::of(0.0f64..1.0f64),
-        prop::option::of(any::<u64>()),
-        prop::option::of(any::<u64>()),
-        any::<u64>(),
-        "[a-z0-9_-]{0,20}",
+        (
+            "[a-z][a-z0-9_.-]{2,20}",
+            "[0-9a-f]{16}",
+            "[0-9a-f]{16}",
+            "[a-zA-Z0-9 _-]{0,40}",
+            "[0-9a-f]{16}",
+            any::<u64>(),
+            any::<u64>(),
+        ),
+        (
+            prop::option::of("[a-z0-9_-]{1,20}"),
+            prop::option::of(0.0f64..1.0f64),
+            prop::option::of(any::<u64>()),
+            prop::option::of(any::<u64>()),
+            any::<u64>(),
+            "[a-z0-9_-]{0,20}",
+        ),
     )
         .prop_map(
             |(
                 decision_type,
-                rule_id,
-                definition_hash,
-                input_hash,
-                input_summary,
-                output_hash,
-                timestamp_ms,
-                pane_id,
-                parent_event_id,
-                confidence,
-                triggered_by,
-                overrides,
-                wall_clock_ms,
-                replay_run_id,
+                (
+                    rule_id,
+                    definition_hash,
+                    input_hash,
+                    input_summary,
+                    output_hash,
+                    timestamp_ms,
+                    pane_id,
+                ),
+                (
+                    parent_event_id,
+                    confidence,
+                    triggered_by,
+                    overrides,
+                    wall_clock_ms,
+                    replay_run_id,
+                ),
             )| DecisionEvent {
                 decision_type,
                 rule_id,
@@ -243,7 +251,10 @@ proptest! {
         let suite = RegressionSuiteResult::from_results(results.clone());
         let passed = results.iter().filter(|result| result.passed).count() as u64;
         let errored = results.iter().filter(|result| result.error.is_some()).count() as u64;
-        let failed = results.len() as u64 - passed - errored;
+        let failed = results
+            .iter()
+            .filter(|result| !result.passed && result.error.is_none())
+            .count() as u64;
 
         prop_assert_eq!(suite.total_artifacts, results.len() as u64);
         prop_assert_eq!(suite.passed, passed);

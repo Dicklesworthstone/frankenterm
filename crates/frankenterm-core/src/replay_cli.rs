@@ -367,7 +367,10 @@ impl RegressionSuiteResult {
         let total = results.len() as u64;
         let passed = results.iter().filter(|r| r.passed).count() as u64;
         let errored = results.iter().filter(|r| r.error.is_some()).count() as u64;
-        let failed = total - passed - errored;
+        let failed = results
+            .iter()
+            .filter(|r| !r.passed && r.error.is_none())
+            .count() as u64;
         let overall_pass = failed == 0 && errored == 0;
         Self {
             total_artifacts: total,
