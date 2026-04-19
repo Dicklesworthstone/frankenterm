@@ -74,6 +74,15 @@ map to:
 No supported-path `unimplemented!()` exists outside the inventory
 exclusions or the open finish-line owners. No anonymous fake remains.
 
+The other renderer honesty gap that previously sat under
+`ft-xbnl0.3.5` was GUI image decode/bootstrap failure handling in
+`crates/frankenterm-gui/src/glyphcache.rs`. That path used to swap in
+`ImageDataType::placeholder()` and let supported inline/background image
+paths look "loaded" even when decode bootstrap had already failed. The
+finish-line closeout now returns `LoadState::Failed` instead and the GUI
+callers skip drawing those quads, so corrupt or unsupported image data
+is rendered as explicitly unavailable rather than as a fake success.
+
 Static caller analysis (`rg 'fn read\(&self, .* Rect, .* BitmapImage\)'`
 plus `rg '\.read\(.*BitmapImage|texture\.read\('`) finds zero callers of
 `Texture2d::read` in the workspace, which is consistent with the
@@ -167,12 +176,12 @@ production null object. No widening required.
 
 ## Residual Risks
 
-1. `ft-xbnl0.3.5` (rendering / window-backend truth) is still open and
-   carries the four `ft-akx00.6.{1,2,3,5}` blockers identified in the
-   inventory. The texture-readback `unimplemented!()` sites in
-   `bitmaps/mod.rs` and `webgpu.rs` will be revisited by `ft-xbnl0.3.5`'s
-   closing pass; the sweep documents that they remain owned and
-   tracked, not silently fake.
+1. The remaining `ft-xbnl0.3.5` rendering/backend gap is texture
+   readback only: the `Texture2d::read` sites in `bitmaps/mod.rs` and
+   `webgpu.rs` still belong to `ft-akx00.6.3`. Other previously tracked
+   rendering blockers (`ft-akx00.6.1`, `.6.2`, `.6.5`) are now closed,
+   and the GUI image decode/bootstrap path has been narrowed honestly to
+   an explicit failed-load state rather than a placeholder render.
 2. The non-Rust SDK templates remain template-only. If the supported
    matrix is ever widened to Python, TypeScript, or Go, the
    `is_fully_supported` gate must flip and the regression test must be

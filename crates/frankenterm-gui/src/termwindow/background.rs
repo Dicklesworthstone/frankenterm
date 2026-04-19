@@ -1,9 +1,9 @@
+use crate::Dimensions;
 use crate::color::LinearRgba;
 use crate::glyphcache::LoadState;
 use crate::quad::{QuadAllocator, QuadTrait};
 use crate::termwindow::RenderState;
 use crate::utilsprites::RenderMetrics;
-use crate::Dimensions;
 use anyhow::Context;
 use config::{
     BackgroundHorizontalAlignment, BackgroundLayer, BackgroundRepeat, BackgroundSize,
@@ -438,7 +438,7 @@ impl crate::TermWindow {
         )?;
         self.update_next_frame_time(next_due);
 
-        if load_state == LoadState::Loading {
+        if load_state != LoadState::Loaded {
             return Ok(false);
         }
 

@@ -178,6 +178,8 @@ impl Texture2d for WebGpuTexture {
             .map_err(|err| anyhow!("mapping webgpu readback buffer failed: {err:?}"))?;
 
         let data = slice.get_mapped_range();
+        // wgpu requires 256-byte row alignment for copy-to-buffer, but the
+        // BitmapImage contract is tightly packed RGBA bytes.
         copy_padded_readback_to_image(&data, bytes_per_row as usize, im);
         drop(data);
         readback_buffer.unmap();
@@ -245,6 +247,8 @@ impl WebGpuTexture {
     }
 }
 
+/// Compute the aligned row pitch required by wgpu copy-to-buffer readback for
+/// tightly packed RGBA8 pixels.
 fn padded_readback_bytes_per_row(width: u32) -> u32 {
     let unpadded = width.saturating_mul(4);
     let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -255,6 +259,8 @@ fn padded_readback_bytes_per_row(width: u32) -> u32 {
     }
 }
 
+/// Strip per-row readback padding and populate the destination image with
+/// tightly packed RGBA bytes.
 fn copy_padded_readback_to_image(
     padded_data: &[u8],
     padded_bytes_per_row: usize,

@@ -471,12 +471,15 @@ impl crate::TermWindow {
             padding.next_power_of_two()
         };
 
-        let (sprite, next_due, _load_state) = gl_state
+        let (sprite, next_due, load_state) = gl_state
             .glyph_cache
             .borrow_mut()
             .cached_image(image.image_data(), Some(padding), self.allow_images)
             .context("cached_image")?;
         self.update_next_frame_time(next_due);
+        if load_state != crate::glyphcache::LoadState::Loaded {
+            return Ok(());
+        }
         let width = sprite.coords.size.width;
         let height = sprite.coords.size.height;
 

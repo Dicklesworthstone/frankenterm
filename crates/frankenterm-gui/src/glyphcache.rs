@@ -48,6 +48,7 @@ fn report_frame_error<S: Into<String>>(message: S) {
 pub enum LoadState {
     Loading,
     Loaded,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -382,11 +383,11 @@ struct FrameState {
 
 impl FrameState {
     fn new(rx: Receiver<DecodedFrame>) -> Self {
-        const BLACK_SIZE: usize = 8;
-        static BLACK: LazyLock<BlobLease> = LazyLock::new(|| {
+        const TRANSPARENT_SIZE: usize = 1;
+        static TRANSPARENT: LazyLock<BlobLease> = LazyLock::new(|| {
             let mut data = vec![];
-            for _ in 0..BLACK_SIZE * BLACK_SIZE {
-                data.extend_from_slice(&[0, 0, 0, 0xff]);
+            for _ in 0..TRANSPARENT_SIZE * TRANSPARENT_SIZE {
+                data.extend_from_slice(&[0, 0, 0, 0x00]);
             }
             BlobManager::store(&data).unwrap()
         });
@@ -395,9 +396,9 @@ impl FrameState {
             source: FrameSource::Decoder(rx),
             frames: vec![],
             current_frame: DecodedFrame {
-                lease: BLACK.clone(),
-                width: BLACK_SIZE,
-                height: BLACK_SIZE,
+                lease: TRANSPARENT.clone(),
+                width: TRANSPARENT_SIZE,
+                height: TRANSPARENT_SIZE,
                 duration: Duration::from_millis(0),
             },
             load_state: LoadState::Loading,
@@ -421,6 +422,7 @@ impl FrameState {
                 Err(RecvTimeoutError::Disconnected) => {
                     self.source = FrameSource::FrameIndex(0);
                     log::warn!("image decoder thread terminated");
+                    self.load_state = LoadState::Failed;
                     self.current_frame.duration = Duration::from_secs(86400);
                     self.frames.push(self.current_frame.clone());
                 }
@@ -443,6 +445,7 @@ impl FrameState {
                     self.source = FrameSource::FrameIndex(0);
                     if self.frames.is_empty() {
                         log::warn!("image decoder thread terminated");
+                        self.load_state = LoadState::Failed;
                         self.current_frame.duration = Duration::from_secs(86400);
                         self.frames.push(self.current_frame.clone());
                         false
@@ -489,16 +492,18 @@ pub struct DecodedImage {
     current_frame: RefCell<usize>,
     image: Arc<ImageData>,
     frames: RefCell<Option<FrameState>>,
+    load_state: LoadState,
 }
 
 impl DecodedImage {
-    fn placeholder() -> Self {
-        let image = ImageData::with_data(ImageDataType::placeholder());
+    fn failed() -> Self {
+        let image = ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![0, 0, 0, 0]));
         Self {
             frame_start: RefCell::new(Instant::now()),
             current_frame: RefCell::new(0),
             image: Arc::new(image),
             frames: RefCell::new(None),
+            load_state: LoadState::Failed,
         }
     }
 
@@ -509,10 +514,11 @@ impl DecodedImage {
                 current_frame: RefCell::new(0),
                 image: Arc::clone(image_data),
                 frames: RefCell::new(Some(FrameState::new(rx))),
+                load_state: LoadState::Loading,
             },
             Err(err) => {
                 log::error!("failed to start FrameDecoder: {err:#}");
-                Self::placeholder()
+                Self::failed()
             }
         }
     }
@@ -526,7 +532,7 @@ impl DecodedImage {
                 Ok(lease) => Self::start_frame_decoder(lease, image_data),
                 Err(err) => {
                     log::error!("Unable to move file data to blob manager: {err:#}");
-                    Self::placeholder()
+                    Self::failed()
                 }
             },
             ImageDataType::AnimRgba8 { durations, .. } => {
@@ -541,6 +547,7 @@ impl DecodedImage {
                     current_frame: RefCell::new(current_frame),
                     image: Arc::clone(image_data),
                     frames: RefCell::new(None),
+                    load_state: LoadState::Loaded,
                 }
             }
 
@@ -549,6 +556,7 @@ impl DecodedImage {
                 current_frame: RefCell::new(0),
                 image: Arc::clone(image_data),
                 frames: RefCell::new(None),
+                load_state: LoadState::Loaded,
             },
         }
     }
@@ -916,14 +924,14 @@ impl GlyphCache {
         match &*handle.h {
             ImageDataType::Rgba8 { hash, .. } => {
                 if let Some(sprite) = frame_cache.get(hash) {
-                    return Ok((sprite.clone(), None, LoadState::Loaded));
+                    return Ok((sprite.clone(), None, decoded.load_state));
                 }
                 let sprite = atlas
                     .allocate_with_padding(&handle, padding, scale_down)
                     .context("atlas.allocate_with_padding")?;
                 frame_cache.insert(*hash, sprite.clone());
 
-                return Ok((sprite, None, LoadState::Loaded));
+                return Ok((sprite, None, decoded.load_state));
             }
             ImageDataType::AnimRgba8 {
                 hashes,
@@ -971,7 +979,7 @@ impl GlyphCache {
                 let hash = hashes[*decoded_current_frame];
 
                 if let Some(sprite) = frame_cache.get(&hash) {
-                    return Ok((sprite.clone(), next, LoadState::Loaded));
+                    return Ok((sprite.clone(), next, decoded.load_state));
                 }
 
                 let sprite = atlas
@@ -986,7 +994,7 @@ impl GlyphCache {
                         *decoded_frame_start
                             + durations[*decoded_current_frame].max(min_frame_duration),
                     ),
-                    LoadState::Loaded,
+                    decoded.load_state,
                 ));
             }
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
@@ -1054,6 +1062,7 @@ impl GlyphCache {
                                 "frame data is corrupted: expected size {expected_byte_size} but have {}",
                                 data.len()
                             ));
+                            frames.load_state = LoadState::Failed;
                             vec![0u8; expected_byte_size]
                         } else {
                             data
@@ -1061,6 +1070,7 @@ impl GlyphCache {
                     }
                     Err(err) => {
                         report_frame_error(format!("frame data error: {err:#}"));
+                        frames.load_state = LoadState::Failed;
                         vec![0u8; expected_byte_size]
                     }
                 };
@@ -1380,6 +1390,7 @@ impl GlyphCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::termwindow::render::paint::AllowImage;
 
     fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
         config::use_test_configuration();
@@ -1471,5 +1482,47 @@ mod tests {
         assert_eq!(cache.block_glyphs.len(), 1);
         assert_eq!(first.coords, second.coords);
         assert!(Rc::ptr_eq(&first.texture, &second.texture));
+    }
+
+    #[test]
+    fn gui_visual_placeholder_invalid_encoded_image_loads_as_failed() {
+        let image = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0x00, 0x01, 0x02, 0x03,
+        ])));
+
+        let decoded = DecodedImage::load(&image);
+
+        assert_eq!(decoded.load_state, LoadState::Failed);
+        assert!(decoded.frames.borrow().is_none());
+
+        match &*decoded.image.data() {
+            ImageDataType::Rgba8 {
+                width,
+                height,
+                data,
+                ..
+            } => {
+                assert_eq!((*width, *height), (1, 1));
+                assert_eq!(data.as_slice(), &[0, 0, 0, 0]);
+            }
+            other => panic!("expected transparent fallback image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gui_visual_placeholder_cached_image_reports_failed_for_invalid_encodings() {
+        let (mut cache, _) = test_glyph_cache();
+        let image = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
+            0xde, 0xad, 0xbe, 0xef,
+        ])));
+
+        let (sprite, next_due, load_state) = cache
+            .cached_image(&image, Some(1), AllowImage::Yes)
+            .unwrap();
+
+        assert_eq!(load_state, LoadState::Failed);
+        assert!(next_due.is_none());
+        assert_eq!(sprite.coords.size.width, 1);
+        assert_eq!(sprite.coords.size.height, 1);
     }
 }

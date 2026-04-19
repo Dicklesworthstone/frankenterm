@@ -20,9 +20,18 @@ pub trait Texture2d: Downcast {
     /// The dimensions of the rectangle must match the source image
     fn write(&self, rect: Rect, im: &dyn BitmapImage);
 
+    /// Returns whether this texture implementation exposes synchronous CPU
+    /// readback through [`Texture2d::read`].
+    fn supports_readback(&self) -> bool {
+        true
+    }
+
     /// Copy the bits from the texture at the location specified by the rectangle
     /// into the bitmap image.
-    /// The dimensions of the rectangle must match the source image
+    ///
+    /// Readback is tightly packed into the destination image with no row padding.
+    /// Implementations return an error when readback is unsupported or when the
+    /// requested rectangle/destination image cannot be satisfied.
     fn read(&self, rect: Rect, im: &mut dyn BitmapImage) -> anyhow::Result<()>;
 
     /// Returns the width of the texture in pixels
@@ -44,6 +53,13 @@ pub trait Texture2d: Downcast {
 }
 impl_downcast!(Texture2d);
 
+fn unsupported_texture_readback_error(texture_kind: &str) -> anyhow::Error {
+    anyhow!("{texture_kind} does not expose synchronous Texture2d::read CPU readback")
+}
+
+/// A validated, tightly packed CPU-readback request expressed in source-texture
+/// coordinates. The destination bitmap is expected to have the same dimensions
+/// as `width` x `height`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureReadbackRequest {
     pub left: u32,
@@ -147,10 +163,12 @@ impl Texture2d for SrgbTexture2d {
         )
     }
 
+    fn supports_readback(&self) -> bool {
+        false
+    }
+
     fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) -> anyhow::Result<()> {
-        Err(anyhow!(
-            "OpenGL texture readback is not exposed via Texture2d::read on SrgbTexture2d"
-        ))
+        Err(unsupported_texture_readback_error("SrgbTexture2d"))
     }
 
     fn width(&self) -> usize {
@@ -555,7 +573,10 @@ impl Texture2d for ImageTexture {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_texture_readback_request, BitmapImage, Image, ImageTexture, Texture2d};
+    use super::{
+        unsupported_texture_readback_error, validate_texture_readback_request, BitmapImage, Image,
+        ImageTexture, Texture2d,
+    };
     use crate::{Point, Rect, Size};
 
     fn seed_image(width: usize, height: usize) -> Image {
@@ -585,6 +606,16 @@ mod tests {
     }
 
     #[test]
+    fn image_texture_read_allows_empty_capture() {
+        let texture = ImageTexture::new(4, 4);
+        let mut dest = Image::new(0, 0);
+
+        texture
+            .read(Rect::new(Point::new(2, 2), Size::new(0, 0)), &mut dest)
+            .expect("empty readback should succeed");
+    }
+
+    #[test]
     fn texture_readback_rejects_destination_size_mismatch() {
         let texture = ImageTexture::new(4, 4);
         let mut dest = Image::new(1, 2);
@@ -611,6 +642,16 @@ mod tests {
 
         assert!(
             err.to_string().contains("exceeds texture bounds"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn unsupported_texture_readback_error_is_explicit() {
+        let err = unsupported_texture_readback_error("SrgbTexture2d");
+        assert!(
+            err.to_string()
+                .contains("does not expose synchronous Texture2d::read"),
             "unexpected error: {err:#}"
         );
     }
