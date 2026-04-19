@@ -1,0 +1,22 @@
+[tuning.runtime]
+output_coalesce_window_ms = 25
+output_coalesce_max_delay_ms = 125
+output_coalesce_max_bytes = 131072
+resize_watchdog_warning_ms = 1500
+resize_watchdog_critical_ms = 5000
+storage_lock_wait_warn_ms = 10.0
+storage_lock_hold_warn_ms = 60.0
+state_detection_max_age_secs = 180
+
+[tuning.backpressure]
+warn_ratio = 0.70
+
+[tuning.patterns]
+max_seen_keys = 750
+max_tail_size_bytes = 2048
+bloom_false_positive_rate = 0.02
+
+[tuning.search]
+default_limit = 20
+max_limit = 500
+tantivy_writer_memory_bytes = 20000000

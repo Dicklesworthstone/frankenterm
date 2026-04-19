@@ -15,6 +15,7 @@ ft robot events --limit 20
 If something needs attention, follow the relevant flow below.
 
 Related guides:
+- For blessed 10, 50, and 200+ pane profiles plus exact validation commands, use `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md`.
 - For release posture and per-tier fallback defaults, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For exact knob meanings and safe starting ranges, use `docs/tuning-reference.md`.
 - For GUI-specific fleet operation, use `docs/frankenterm-gui-user-guide.md`.

@@ -6,7 +6,8 @@ This reference is for operators tuning live fleets. The ranges below are startin
 
 Before you tune a live deployment:
 
-- For current rollout posture, hardware-tier defaults, and fallback guidance, start with `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
+- For blessed 10, 50, and 200+ pane starting profiles with exact commands, evidence citations, and escalation rules, start with `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md`.
+- For current rollout posture, hardware-tier defaults, and fallback guidance, use `docs/resize-user-facing-release-tuning-guidance-wa-1u90p.8.5.md`.
 - For incident triage and rollback flow, use `docs/operator-playbook.md`.
 - Treat this file as the knob-level reference, not the release-posture document.
 

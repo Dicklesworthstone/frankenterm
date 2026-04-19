@@ -1,0 +1,83 @@
+{
+  "contract_id": "ft.xbnl0.5.3.blessed_tuning.v1",
+  "version": "1.0.0",
+  "bead_id": "ft-xbnl0.5.3",
+  "last_updated": "2026-04-19",
+  "status": "published_but_not_release_clear",
+  "description": "Evidence-backed blessed tuning overlays and operator playbook for 10, 50, and 200 plus pane fleets. These profiles are intended for controlled operation and diagnostics, not as a claim that the finish-line release gates are green.",
+  "inputs": {
+    "tuning_reference": "docs/tuning-reference.md",
+    "operator_playbook": "docs/operator-playbook.md",
+    "verification_contract": "docs/ft-xbnl0-verification-contract.md",
+    "release_gates_policy": "docs/ft-xbnl0-4-6-release-gates.json",
+    "release_gates_validation": "docs/ft-xbnl0-4-6-release-gates-validation.json",
+    "soak_matrix_summary": "tests/e2e/artifacts/goal-line/ft-xbnl0.4.5/swarm_soak_matrix/20260419T125312Z/summary.json"
+  },
+  "global_thresholds": {
+    "required_pane_scales": [
+      1,
+      50,
+      100,
+      200
+    ],
+    "release_gate_max_duration_s": 3.0,
+    "release_gate_max_peak_rss_mb": 32.0,
+    "required_backpressure_tier": "Black",
+    "observed_release_duration_s": 3.785115519,
+    "observed_release_peak_rss_mb": 16.607958793640137
+  },
+  "validation_entrypoints": {
+    "profile_contract_check": "scripts/check_ft_xbnl0_5_3_blessed_tuning_profiles.sh",
+    "profile_e2e_harness": "tests/e2e/test_ft_xbnl0_5_3_blessed_tuning_profiles.sh",
+    "profile_cli_flow": [
+      "ft config profile list --json --path <workspace>/ft.toml",
+      "ft config profile diff <profile> --path <workspace>/ft.toml",
+      "ft config profile apply <profile> --path <workspace>/ft.toml",
+      "ft config validate --path <workspace>/ft.toml",
+      "ft config show --json --path <workspace>/ft.toml",
+      "ft config profile rollback --yes --path <workspace>/ft.toml"
+    ],
+    "live_diagnostics": [
+      "ft status --health | jq '.health.backpressure_tier'",
+      "ft status --health | jq '{capture:.health.capture_queue_depth, write:.health.write_queue_depth}'",
+      "ft status --health | jq '.health.ingest_lag_max_ms'",
+      "ft doctor --json",
+      "ft robot events --limit 20"
+    ]
+  },
+  "profiles": [
+    {
+      "name": "fleet_10",
+      "pane_class": "10 panes",
+      "path": "fixtures/e2e/blessed_tuning_profiles/fleet_10.toml",
+      "objective": "Prefer low-latency capture and fast operator feedback on small local swarms.",
+      "support_posture": "Blessed for day-to-day use. Changes remain bounded by the release-gate contract and should be rolled back on repeated warning-tier diagnostics.",
+      "escalation": [
+        "If health.ingest_lag_max_ms stays above 5000 for three checks, move back to default config and follow docs/operator-playbook.md.",
+        "If health.backpressure_tier reaches Red or Black, stop local tuning and capture doctor/status artifacts before retrying."
+      ]
+    },
+    {
+      "name": "fleet_50",
+      "pane_class": "50 panes",
+      "path": "fixtures/e2e/blessed_tuning_profiles/fleet_50.toml",
+      "objective": "Match the verified 50-pane soak class while keeping the default runtime shape recognizable to operators.",
+      "support_posture": "This is the baseline blessed profile because the 50-pane soak lane is part of the passing ft-xbnl0.4.5 matrix.",
+      "escalation": [
+        "If queue depth grows across three checks without recovering, step back to default config or fleet_10 before attempting more tuning.",
+        "If leak or doctor surfaces degrade, stop at this profile and wait for ft-xbnl0.4.4 evidence to be green before promoting further."
+      ]
+    },
+    {
+      "name": "fleet_200_plus",
+      "pane_class": "200 plus panes",
+      "path": "fixtures/e2e/blessed_tuning_profiles/fleet_200_plus.toml",
+      "objective": "Bias for stability, bounded queue growth, and diagnostics visibility during large-fleet runs.",
+      "support_posture": "Blessed only for controlled operation. The 200-pane release soak exercised the required backpressure tier but still exceeded the 3.0s duration budget, so this profile is not a release-promotion claim.",
+      "escalation": [
+        "If health.backpressure_tier reaches Black outside planned stress windows, stop the run and capture status plus doctor bundles immediately.",
+        "If release-gate duration or leak evidence regresses, keep this profile in operator-only mode and do not roll it into a final closure recommendation."
+      ]
+    }
+  ]
+}

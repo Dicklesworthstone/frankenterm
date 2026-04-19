@@ -293,6 +293,11 @@ Required evidence:
 - permanent guards or audits exercised in CI-friendly or doctor-friendly form
 - exact remote commands or non-Cargo checks used to validate the guardrails
 
+Canonical entrypoints for this row:
+- `docs/ft-xbnl0-5-3-blessed-tuning-playbook.md`
+- `scripts/check_ft_xbnl0_5_3_blessed_tuning_profiles.sh`
+- `tests/e2e/test_ft_xbnl0_5_3_blessed_tuning_profiles.sh`
+
 Failure diagnostics must show where docs still describe migration-era behavior or where a guard fails to catch a known forbidden pattern.
 
 ### Row 9: Operator Diagnostics And First-Run Recovery

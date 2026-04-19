@@ -1,0 +1,37 @@
+[tuning.runtime]
+output_coalesce_window_ms = 100
+output_coalesce_max_delay_ms = 400
+output_coalesce_max_bytes = 524288
+telemetry_percentile_window = 2048
+resize_watchdog_warning_ms = 4000
+resize_watchdog_critical_ms = 16000
+resize_watchdog_stalled_limit = 3
+storage_lock_wait_warn_ms = 30.0
+storage_lock_hold_warn_ms = 150.0
+cursor_snapshot_memory_warn_bytes = 134217728
+state_detection_max_age_secs = 600
+
+[tuning.backpressure]
+warn_ratio = 0.65
+
+[tuning.patterns]
+max_seen_keys = 8000
+max_tail_size_bytes = 4096
+bloom_false_positive_rate = 0.005
+
+[tuning.policy]
+max_tracked_panes = 1024
+max_events_per_pane = 96
+cost_tracker_max_panes = 2048
+
+[tuning.search]
+default_limit = 100
+max_limit = 2500
+tantivy_writer_memory_bytes = 150000000
+
+[tuning.web]
+default_list_limit = 100
+max_list_limit = 1000
+stream_default_max_hz = 20
+stream_scan_limit = 512
+stream_scan_max_pages = 12
