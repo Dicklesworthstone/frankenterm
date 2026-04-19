@@ -1,0 +1,136 @@
+{
+  "bead_id": "ft-xbnl0.5.5",
+  "bundle_version": 1,
+  "generated_on": "2026-04-19",
+  "bundle_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-5-final-closure-bundle.md",
+  "completion_evidence_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-5-completion-evidence.md",
+  "contract_path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-verification-contract.md",
+  "status": {
+    "closure_bundle": "passed",
+    "operator_acceptance": "passed",
+    "guard_surface": "passed",
+    "release_candidate": "blocked"
+  },
+  "upstream_evidence": [
+    {
+      "bead_id": "ft-xbnl0.5.2",
+      "kind": "guard_validation",
+      "status": "passed",
+      "path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
+    },
+    {
+      "bead_id": "ft-xbnl0.5.3",
+      "kind": "completion_evidence",
+      "status": "passed",
+      "path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-3-completion-evidence.md"
+    },
+    {
+      "bead_id": "ft-xbnl0.4.6",
+      "kind": "release_gate_summary",
+      "status": "passed",
+      "path": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/summary.json"
+    },
+    {
+      "bead_id": "ft-xbnl0.4.6",
+      "kind": "release_gate_repo_eval",
+      "status": "failed",
+      "path": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/release_gate_repo_eval.json"
+    },
+    {
+      "bead_id": "ft-xbnl0.5.4",
+      "kind": "operator_acceptance",
+      "status": "passed",
+      "path": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.5.4/operator_acceptance/20260419T205125Z/summary.json"
+    },
+    {
+      "bead_id": "ft-xbnl0.5.7",
+      "kind": "completion_evidence",
+      "status": "passed",
+      "path": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-7-completion-evidence.md"
+    }
+  ],
+  "remaining_risks": [
+    {
+      "risk_id": "REL-01",
+      "severity": "blocking",
+      "title": "Leak-oracle summary missing",
+      "source": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/release_gate_repo_eval.json",
+      "required_action": "Run the ft-xbnl0.4.4 leak-oracle harness and retain a passing summary.json bundle."
+    },
+    {
+      "risk_id": "REL-04",
+      "severity": "blocking",
+      "title": "Performance budget exceeded",
+      "source": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/release_gate_repo_eval.json",
+      "required_action": "Reduce runtime cost or tune the workload until max_duration_s is at or below 3.0."
+    },
+    {
+      "risk_id": "RCH-CLANG-PATH",
+      "severity": "medium",
+      "title": "Exact macOS clang recipe is not worker-portable",
+      "source": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.5.4/operator_acceptance/20260419T205125Z/summary.json",
+      "required_action": "Record the exact requested recipe and also run a worker-native fallback rch lane."
+    },
+    {
+      "risk_id": "WEZTERM-BRIDGE",
+      "severity": "medium",
+      "title": "Operator story still crosses the WezTerm-backed mux bridge",
+      "source": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-4-operator-acceptance-scenarios.md",
+      "required_action": "Keep the current support contract honest; do not describe the operator path as backend-independent."
+    }
+  ],
+  "diagnostic_surfaces": [
+    "ft doctor --json",
+    "ft status --health -f json",
+    "ft session doctor -f json",
+    "ft watch --foreground",
+    "ft session list -f json",
+    "ft snapshot list -f json"
+  ],
+  "release_candidate_checklist": [
+    {
+      "check_id": "contract_anchor",
+      "status": "passed",
+      "evidence": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-verification-contract.md"
+    },
+    {
+      "check_id": "guard_surface",
+      "status": "passed",
+      "evidence": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-2-finish-line-guards-validation.json"
+    },
+    {
+      "check_id": "tuning_package",
+      "status": "passed",
+      "evidence": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-3-completion-evidence.md"
+    },
+    {
+      "check_id": "operator_acceptance",
+      "status": "passed",
+      "evidence": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.5.4/operator_acceptance/20260419T205125Z/summary.json"
+    },
+    {
+      "check_id": "first_run_recovery_guidance",
+      "status": "passed",
+      "evidence": "/Users/jemanuel/projects/frankenterm/docs/ft-xbnl0-5-7-completion-evidence.md"
+    },
+    {
+      "check_id": "leak_oracle_gate",
+      "status": "blocked",
+      "evidence": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/release_gate_repo_eval.json"
+    },
+    {
+      "check_id": "performance_budget_gate",
+      "status": "blocked",
+      "evidence": "/Users/jemanuel/projects/frankenterm/tests/e2e/artifacts/goal-line/ft-xbnl0.4.6/release_gates/20260419T192421Z/release_gate_repo_eval.json"
+    }
+  ],
+  "mission_acceptance": {
+    "evaluation_ready_without_chat_history": true,
+    "operator_story_accepted": true,
+    "release_candidate_accepted": false,
+    "release_blockers": [
+      "REL-01-leak-oracle",
+      "REL-04-performance-budget"
+    ]
+  }
+}
