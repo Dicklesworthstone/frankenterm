@@ -236,7 +236,9 @@ fn b04_oneshot_channel_single_delivery() {
 
         tx.send(42).expect("oneshot send should succeed");
 
-        let value = rx.await.expect("oneshot recv should succeed");
+        let value = runtime_compat::oneshot_recv(rx)
+            .await
+            .expect("oneshot recv should succeed");
         assert_eq!(value, 42);
 
         emit_behavioral_log("b04", "ABC-CHN-001", "oneshot_delivery", "pass");
@@ -591,7 +593,7 @@ fn b17_oneshot_recv_after_sender_drop_error() {
         let (tx, rx) = runtime_compat::oneshot::channel::<u32>();
         drop(tx);
 
-        let result = rx.await;
+        let result = runtime_compat::oneshot_recv(rx).await;
         assert!(
             result.is_err(),
             "oneshot recv after sender drop must error (ABC-ERR-001)"
@@ -2179,7 +2181,10 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
             .await
             .expect("shutdown should finish after cancellation");
 
-        let closed = runtime_compat::timeout(Duration::from_millis(500), closed_rx)
+        let closed = runtime_compat::timeout(
+            Duration::from_millis(500),
+            runtime_compat::oneshot_recv(closed_rx),
+        )
             .await
             .expect("server should observe connection close after cancellation");
         closed.expect("server close signal should complete");
@@ -2331,7 +2336,10 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
             .await
             .expect("shutdown should finish after cancelled startup");
 
-        let closed = runtime_compat::timeout(Duration::from_millis(500), closed_rx)
+        let closed = runtime_compat::timeout(
+            Duration::from_millis(500),
+            runtime_compat::oneshot_recv(closed_rx),
+        )
             .await
             .expect("server should observe connection close after shutdown");
         closed.expect("server close signal should complete");
