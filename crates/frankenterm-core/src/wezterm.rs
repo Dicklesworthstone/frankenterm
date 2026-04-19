@@ -5007,6 +5007,7 @@ mod tests {
                                 assert!(polls >= 2, "expected at least two polls");
                             }
                             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
                         }
                         return;
                     }
@@ -5021,6 +5022,7 @@ mod tests {
                     assert!(polls >= 2, "expected at least two polls");
                 }
                 WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+                WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
             }
         });
     }
@@ -5055,6 +5057,7 @@ mod tests {
                                 assert!(last_tail_hash.is_some());
                             }
                             WaitResult::Matched { .. } => panic!("unexpected match"),
+                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
                         }
                         return;
                     }
@@ -5074,6 +5077,7 @@ mod tests {
                     assert!(last_tail_hash.is_some());
                 }
                 WaitResult::Matched { .. } => panic!("unexpected match"),
+                WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
             }
         });
     }
@@ -5794,6 +5798,7 @@ mod tests {
                                 assert!(polls <= 3);
                             }
                             WaitResult::Matched { .. } => panic!("unexpected match"),
+                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
                         }
                         return;
                     }
