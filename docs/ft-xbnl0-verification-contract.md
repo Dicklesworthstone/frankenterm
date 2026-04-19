@@ -273,6 +273,12 @@ Required evidence:
 - benchmark or measured workload outputs stored in the run bundle
 - gating logic that fails when the budget is exceeded
 
+Canonical release-gate entrypoints for this row:
+- policy contract: `docs/ft-xbnl0-4-6-release-gates.json`
+- deterministic gate harness: `tests/e2e/test_ft_xbnl0_4_6_release_gates.sh`
+
+Release-readiness beads should consume those artifacts directly instead of restating private threshold tables in their own notes.
+
 Failure diagnostics must report the exact metric, threshold, observed value, and recommended next inspection path.
 
 ### Row 8: Docs, Guards, And Operator Playbooks

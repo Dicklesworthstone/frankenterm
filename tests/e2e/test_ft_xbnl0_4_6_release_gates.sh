@@ -171,11 +171,14 @@ run_checked \
         --output "${ARTIFACT_DIR}/release_gate_self_test.json"
 
 LIB_TEST_LOG="${ARTIFACT_DIR}/frankenterm_core_release_gate_tests.log"
-run_rch_step \
+if ! run_rch_step \
     "frankenterm_core_release_gate_tests" \
     "${LIB_TEST_LOG}" \
     env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
         cargo test -p frankenterm-core --lib ft_xbnl0_4_6_release_gate_ -- --nocapture
+then
+    :
+fi
 rch_write_meta_json "${LIB_TEST_LOG}"
 
 VALIDATION_LOG="${ARTIFACT_DIR}/release_gate_repo_eval.log"

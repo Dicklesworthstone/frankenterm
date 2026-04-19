@@ -22,6 +22,7 @@
     {
       "gate_id": "REL-01-leak-oracle",
       "name": "Leak behavior",
+      "category": "reliability",
       "blocking": true,
       "upstream_bead": "ft-xbnl0.4.4",
       "source": "latest leak-oracle summary.json under artifact_roots.leak_oracle_root",
@@ -30,6 +31,7 @@
     {
       "gate_id": "REL-02-guard-surface",
       "name": "Permanent guard surface",
+      "category": "guard surface",
       "blocking": true,
       "upstream_bead": "ft-xbnl0.5.2",
       "source": "artifact_roots.guard_report",
@@ -38,6 +40,7 @@
     {
       "gate_id": "REL-03-soak-confidence",
       "name": "Soak confidence",
+      "category": "soak confidence",
       "blocking": true,
       "upstream_bead": "ft-xbnl0.4.5",
       "source": "latest swarm soak wrapper summary.json under artifact_roots.soak_matrix_root",
@@ -46,6 +49,7 @@
     {
       "gate_id": "REL-04-performance-budget",
       "name": "Performance budget",
+      "category": "performance",
       "blocking": true,
       "upstream_bead": "ft-xbnl0.4.5",
       "source": "nested smoke/release summaries referenced by the latest soak wrapper summary",
