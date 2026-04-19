@@ -392,3 +392,10 @@ warning: unused import: `timeout`
 14 | use crate::runtime_compat::{mpsc, select, sleep, task, timeout};
    |                                                        ^^^^^^^
 
+For more information about this error, try `rustc --explain E0432`.
+warning: `frankenterm-core` (lib test) generated 2 warnings
+error: could not compile `frankenterm-core` (lib test) due to 1 previous error; 2 warnings emitted
+  [2m2026-04-19T16:50:24.308380Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=101 in 667320ms[0m
+    [2;3mat[0m rch/src/hook.rs:4996 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1153651 failed (exit 101)
