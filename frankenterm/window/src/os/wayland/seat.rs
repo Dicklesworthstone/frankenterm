@@ -87,7 +87,9 @@ impl SeatHandler for WaylandState {
             Capability::Pointer => {
                 if self.seat_bindings.clear_pointer_if_matches(&seat.id()) {
                     log::trace!("Lost pointer capability for seat {:?}", seat.id());
-                    self.pointer.take();
+                    if let Some(pointer) = self.pointer.take() {
+                        pointer.release();
+                    }
                 }
             }
             Capability::Touch => {
@@ -113,7 +115,9 @@ impl SeatHandler for WaylandState {
         }
 
         if cleanup.pointer {
-            self.pointer.take();
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
         }
 
         if cleanup.data_device {

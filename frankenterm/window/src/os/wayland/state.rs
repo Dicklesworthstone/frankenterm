@@ -225,6 +225,56 @@ mod tests {
         let cleanup = bindings.clear_removed_seat(&10_u32);
         assert_eq!(cleanup, RemovedSeatCleanup::default());
     }
+
+    #[test]
+    fn rebinding_keyboard_and_pointer_keeps_the_new_seat_active() {
+        let mut bindings = SeatBindings::default();
+        bindings.note_keyboard(1_u32);
+        bindings.note_pointer(1_u32);
+
+        bindings.note_keyboard(2_u32);
+        bindings.note_pointer(2_u32);
+
+        assert!(!bindings.clear_keyboard_if_matches(&1_u32));
+        assert!(!bindings.clear_pointer_if_matches(&1_u32));
+
+        let cleanup = bindings.clear_removed_seat(&2_u32);
+        assert_eq!(
+            cleanup,
+            RemovedSeatCleanup {
+                keyboard: true,
+                pointer: true,
+                data_device: false,
+                primary_selection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rebinding_selection_devices_clears_only_the_latest_owner() {
+        let mut bindings = SeatBindings::default();
+        bindings.note_data_device(3_u32);
+        bindings.note_primary_selection(3_u32);
+
+        bindings.note_data_device(4_u32);
+        bindings.note_primary_selection(4_u32);
+
+        assert_eq!(
+            bindings.clear_removed_seat(&3_u32),
+            RemovedSeatCleanup::default()
+        );
+
+        let cleanup = bindings.clear_removed_seat(&4_u32);
+        assert_eq!(
+            cleanup,
+            RemovedSeatCleanup {
+                keyboard: false,
+                pointer: false,
+                data_device: true,
+                primary_selection: true,
+            }
+        );
+    }
 }
 
 impl ProvidesRegistryState for WaylandState {
