@@ -15,11 +15,12 @@
 #   4. Metrics server cx-first family (3) — metrics_server_start_with_cx_*
 #      Pre-cancel / mid-flight-cancel / happy path.
 #   5. Web server cx pre-cancel (1) — web_server_with_cx_*
-#   6. runtime_compat primitive contracts (5) — _with_cx_observes_budget_deadline
-#      + yield_now_with_cx + oneshot_recv_with_cx
+#   6. runtime_compat primitive contracts (6) — _with_cx_observes_budget_deadline
+#      + yield_now_with_cx + oneshot_recv_with_cx + broadcast_recv_with_cx
 #      sleep_with_cx + timeout_with_cx budget-observation tests (ticks
 #      382/383), yield_now_with_cx cancel-checkpoint + happy-path tests
-#      (tick 418), oneshot_recv_with_cx pre-cancel test (tick 419).
+#      (tick 418), oneshot_recv_with_cx pre-cancel test (tick 419),
+#      broadcast_recv_with_cx pre-cancel test (tick 420).
 #
 # Exit code 0 on all passing; non-zero on any failure.
 #
@@ -123,7 +124,7 @@ run_test "Run 6/6: runtime_compat primitive contracts (budget + cancel observati
     -p frankenterm-core \
     --features asupersync-runtime \
     --lib \
-    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx
+    -- --nocapture _with_cx_observes_budget_deadline yield_now_with_cx oneshot_recv_with_cx broadcast_recv_with_cx
 
 echo
 echo "=============================================================="

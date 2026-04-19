@@ -5483,6 +5483,69 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.4 tick 420: `broadcast_recv_with_cx` observes cx-cancel.
+    ///
+    /// Pins the cx-cancel observation on the broadcast receive primitive.
+    /// With live senders (no disconnect) and no published messages but a
+    /// pre-cancelled cx, `broadcast_recv_with_cx` must return Err promptly
+    /// rather than blocking indefinitely waiting for a publish that is not
+    /// coming.
+    ///
+    /// Setup:
+    /// 1. Create `(tx, _rx_keepalive)` broadcast channel (capacity 4).
+    /// 2. Subscribe a second receiver `rx`.
+    /// 3. Keep `_tx` and `_rx_keepalive` alive (no disconnect; receiver
+    ///    does NOT see Err(Closed)).
+    /// 4. Pre-cancel the cx.
+    /// 5. Wrap `broadcast_recv_with_cx(&cx, &mut rx)` in a 2 s outer
+    ///    safety-net timeout so a non-observing primitive would block
+    ///    until the outer fires, making the failure loud.
+    /// 6. Assert elapsed < 1 s AND Err returned.
+    ///
+    /// Completes the core channel-primitive cancel matrix alongside
+    /// tick 419's `oneshot_recv_with_cx` test. Broadcast receivers are
+    /// used throughout the event fanout path
+    /// (`crates/frankenterm-core/src/events.rs`) — pinning cx-cancel
+    /// here guards against regressions in the async fanout plumbing.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_recv_with_cx_observes_pre_cancel() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, _rx_keepalive) = broadcast::channel::<u64>(4);
+            let mut rx = _tx.subscribe();
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("tick 420 pre-cancel broadcast_recv_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = timeout_with_cx(
+                &crate::cx::for_request(),
+                Duration::from_secs(2),
+                broadcast_recv_with_cx(&cx, &mut rx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit broadcast_recv_with_cx promptly; \
+                 took {elapsed:?} (outer 2s timeout likely fired)"
+            );
+            let inner = result.expect("outer timeout must not fire with cx-cancel observation");
+            assert!(
+                inner.is_err(),
+                "pre-cancelled cx must cause broadcast_recv_with_cx to return Err, got: {inner:?}"
+            );
+        });
+    }
+
     /// ft-xbnl0.2.4 tick 419: `oneshot_recv_with_cx` observes cx-cancel.
     ///
     /// Pins the cx-cancel observation on the oneshot receive primitive.
