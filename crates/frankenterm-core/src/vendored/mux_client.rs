@@ -2528,6 +2528,22 @@ mod tests {
         decode_u64_leb128_prefix(bytes).map(|length| (length & COMPRESSED_MASK) != 0)
     }
 
+    fn encode_u64_leb128(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -5019,6 +5035,37 @@ mod tests {
             let file = tempfile::NamedTempFile::new().expect("temp file");
             std::fs::write(file.path(), payload).expect("write temp file");
             prop_assert!(!is_local_unix_socket(file.path()));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_decode_u64_leb128_prefix_roundtrips(
+            value in any::<u64>(),
+            suffix in prop::collection::vec(any::<u8>(), 0..32)
+        ) {
+            let mut encoded = encode_u64_leb128(value);
+            encoded.extend_from_slice(&suffix);
+            prop_assert_eq!(decode_u64_leb128_prefix(&encoded), Some(value));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_frame_marked_compressed_tracks_high_bit(
+            payload_len in 0u64..(1u64 << 63),
+            compressed in any::<bool>(),
+            suffix in prop::collection::vec(any::<u8>(), 0..16)
+        ) {
+            let header = if compressed {
+                payload_len | COMPRESSED_MASK
+            } else {
+                payload_len
+            };
+            let mut encoded = encode_u64_leb128(header);
+            encoded.extend_from_slice(&suffix);
+
+            prop_assert_eq!(frame_marked_compressed(&encoded), Some(compressed));
         }
     }
 
