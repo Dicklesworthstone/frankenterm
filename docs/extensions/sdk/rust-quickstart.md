@@ -89,9 +89,8 @@ entry = "main.wasm"
 [permissions]
 environment = ["TERM"]
 
-[[hooks]]
-event = "config.reload"
-handler = "on_reload"
+[hooks]
+"config.reload" = "on_reload"
 ```
 
 ### 5. Build and package
@@ -105,7 +104,7 @@ zip my-ext.ftx extension.toml main.wasm
 ### 6. Install
 
 ```bash
-frankenterm extension install my-ext.ftx
+ft ext install my-ext.ftx
 ```
 
 ## Testing locally

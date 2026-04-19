@@ -18,33 +18,31 @@ In `extension.toml`:
 [permissions]
 network = false
 pane_access = false
-filesystem_read = ["~/.config/frankenterm/"]
-filesystem_write = ["~/.local/share/my-ext/"]
+filesystem = ["read:~/.config/frankenterm/", "write:~/.local/share/my-ext/"]
 environment = ["TERM", "COLORTERM", "HOME", "XDG_*"]
 ```
 
 ## Permission types
 
-### filesystem_read
+### filesystem
 
-List of path prefixes the extension may read. The sandbox checks that
-the requested path starts with one of the declared prefixes.
+List of path prefixes the extension may access. Use `read:` or `write:`
+prefixes to distinguish access modes. Bare paths (without a prefix) are
+treated as read-only. The sandbox checks that the requested path starts
+with one of the declared prefixes.
 
 ```toml
-filesystem_read = [
-    "~/.config/frankenterm/",
-    "/etc/frankenterm/",
+filesystem = [
+    "read:~/.config/frankenterm/",
+    "read:/etc/frankenterm/",
+    "write:~/.local/share/my-ext/",
 ]
 ```
 
-### filesystem_write
-
-List of path prefixes the extension may write to.
+A bare path without a prefix is equivalent to `read:`:
 
 ```toml
-filesystem_write = [
-    "~/.local/share/my-ext/",
-]
+filesystem = ["~/.config/frankenterm/"]  # read-only access
 ```
 
 ### environment
@@ -109,7 +107,7 @@ for entry in trail.recent(10) {
 ## Security recommendations
 
 1. **Request minimal permissions.** Only ask for what you need.
-2. **Use specific paths.** `filesystem_read = ["/"]` will raise red flags.
+2. **Use specific paths.** `filesystem = ["/"]` will raise red flags.
 3. **Avoid `pane_access`** unless your extension specifically needs
    terminal output (it can contain sensitive data).
 4. **Avoid `network = true`** unless your extension needs outbound

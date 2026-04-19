@@ -55,7 +55,7 @@ audit trail. Common causes:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `read access denied: /etc/foo` | Path not in `filesystem_read` | Add path prefix to manifest |
+| `read access denied: /etc/foo` | Path not in `filesystem` | Add `read:` path prefix to manifest |
 | `env var denied: SECRET_KEY` | Var not in `environment` list | Add var name or pattern |
 | `network access denied` | `network = false` | Set `network = true` |
 | `pane access denied` | `pane_access = false` | Set `pane_access = true` |
@@ -80,17 +80,17 @@ Check extension state via the CLI:
 
 ```bash
 # List all extensions with state
-frankenterm extension list
+ft ext list
 
 # Show details for one extension
-frankenterm extension show my-ext
+ft ext info my-ext
 ```
 
 States:
 
 - **Installed**: On disk, waiting to be loaded
 - **Loaded**: Active and responding to events
-- **Disabled**: User disabled; re-enable with `frankenterm extension enable`
+- **Disabled**: User disabled; re-enable with `ft ext enable`
 - **Error(msg)**: Failed to load; check the error message
 
 ## Testing WASM extensions
@@ -119,7 +119,7 @@ For full integration testing, install the extension in a test
 FrankenTerm instance:
 
 ```bash
-frankenterm extension install my-ext.ftx
+ft ext install my-ext.ftx
 RUST_LOG=debug frankenterm
 # Trigger the event your extension handles
 # Check logs for expected output

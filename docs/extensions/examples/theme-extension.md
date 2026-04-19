@@ -29,7 +29,7 @@ entry = "noop.lua"
 [permissions]
 # No permissions needed for a theme-only extension
 
-[extension.asset_themes]
+[assets]
 themes = ["assets/colors.toml"]
 ```
 
@@ -77,7 +77,7 @@ white = "#ffffff"
 ```bash
 cd dracula-plus
 zip -r ../dracula-plus.ftx extension.toml assets/ noop.lua
-frankenterm extension install ../dracula-plus.ftx
+ft ext install ../dracula-plus.ftx
 ```
 
 Then in your `frankenterm.toml`:

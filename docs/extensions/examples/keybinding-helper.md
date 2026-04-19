@@ -30,9 +30,8 @@ entry = "main.wasm"
 network = false
 pane_access = false
 
-[[hooks]]
-event = "key.pressed"
-handler = "on_key"
+[hooks]
+"key.pressed" = "on_key"
 ```
 
 ## Cargo.toml

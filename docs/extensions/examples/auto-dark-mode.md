@@ -31,9 +31,8 @@ environment = ["COLORFGBG", "TERM_PROGRAM"]
 network = false
 pane_access = false
 
-[[hooks]]
-event = "config.reload"
-handler = "check_dark_mode"
+[hooks]
+"config.reload" = "check_dark_mode"
 ```
 
 ## Cargo.toml
@@ -107,5 +106,5 @@ cd auto-dark-mode
 cargo build --target wasm32-wasip1 --release
 cp target/wasm32-wasip1/release/auto_dark_mode.wasm main.wasm
 zip auto-dark-mode.ftx extension.toml main.wasm
-frankenterm extension install auto-dark-mode.ftx
+ft ext install auto-dark-mode.ftx
 ```

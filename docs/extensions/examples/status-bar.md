@@ -31,13 +31,9 @@ environment = ["USER", "HOSTNAME", "PWD"]
 network = false
 pane_access = false
 
-[[hooks]]
-event = "pane.focus"
-handler = "on_pane_focus"
-
-[[hooks]]
-event = "window.focus"
-handler = "on_window_focus"
+[hooks]
+"pane.focus" = "on_pane_focus"
+"window.focus" = "on_window_focus"
 ```
 
 ## Cargo.toml
@@ -126,5 +122,5 @@ cd status-bar
 cargo build --target wasm32-wasip1 --release
 cp target/wasm32-wasip1/release/status_bar_info.wasm main.wasm
 zip status-bar-info.ftx extension.toml main.wasm
-frankenterm extension install status-bar-info.ftx
+ft ext install status-bar-info.ftx
 ```

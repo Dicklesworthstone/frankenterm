@@ -53,9 +53,8 @@ end)
 Or declare handlers in the manifest and define named functions:
 
 ```toml
-[[hooks]]
-event = "config.reload"
-handler = "on_reload"
+[hooks]
+"config.reload" = "on_reload"
 ```
 
 ```lua

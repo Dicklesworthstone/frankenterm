@@ -26,26 +26,16 @@ type = "lua"
 entry = "main.lua"
 
 [permissions]
-filesystem_write = ["~/.local/share/frankenterm/logs/"]
+filesystem = ["write:~/.local/share/frankenterm/logs/"]
 pane_access = false
 network = false
 environment = ["HOME"]
 
-[[hooks]]
-event = "pane.created"
-handler = "on_pane_event"
-
-[[hooks]]
-event = "pane.closed"
-handler = "on_pane_event"
-
-[[hooks]]
-event = "tab.created"
-handler = "on_tab_event"
-
-[[hooks]]
-event = "tab.closed"
-handler = "on_tab_event"
+[hooks]
+"pane.created" = "on_pane_event"
+"pane.closed" = "on_pane_event"
+"tab.created" = "on_tab_event"
+"tab.closed" = "on_tab_event"
 ```
 
 ## main.lua
@@ -77,7 +67,7 @@ end
 ```bash
 cd session-logger
 zip -r ../session-logger.ftx extension.toml main.lua
-frankenterm extension install ../session-logger.ftx
+ft ext install ../session-logger.ftx
 ```
 
 Log output appears at `~/.local/share/frankenterm/logs/session.log`:

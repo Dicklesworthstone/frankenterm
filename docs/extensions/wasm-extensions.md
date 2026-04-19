@@ -79,9 +79,8 @@ extern "C" {
 Each hook declared in the manifest maps to an exported function:
 
 ```toml
-[[hooks]]
-event = "config.reload"
-handler = "on_reload"
+[hooks]
+"config.reload" = "on_reload"
 ```
 
 ```rust

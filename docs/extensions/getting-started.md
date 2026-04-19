@@ -38,13 +38,11 @@ entry = "main.wasm"
 [permissions]
 network = false
 pane_access = false
-filesystem_read = []
-filesystem_write = []
+filesystem = []
 environment = []
 
-[[hooks]]
-event = "config.reload"
-handler = "on_reload"
+[hooks]
+"config.reload" = "on_reload"
 ```
 
 ### Manifest fields
@@ -56,10 +54,12 @@ handler = "on_reload"
 | `description` | no | Short summary |
 | `authors` | no | Author list |
 | `license` | no | SPDX identifier |
+| `homepage` | no | Project URL |
+| `min_frankenterm_version` | no | Minimum FrankenTerm version required |
 | `engine.type` | yes | `"wasm"`, `"lua"`, or `"both"` |
 | `engine.entry` | yes | Entry file path relative to package root |
 | `permissions.*` | no | Security policy (see [permissions.md](permissions.md)) |
-| `hooks` | no | Event-to-handler bindings |
+| `hooks` | no | Event-to-handler bindings (key = event, value = handler function) |
 
 ## Step 2: Write the extension (WASM/Rust)
 
@@ -133,13 +133,13 @@ top level (not nested in a subdirectory).
 
 ```bash
 # Install from .ftx file
-frankenterm extension install hello-world.ftx
+ft ext install hello-world.ftx
 
 # Verify installation
-frankenterm extension list
+ft ext list
 
 # Enable (extensions are enabled on install by default)
-frankenterm extension enable hello-world
+ft ext enable hello-world
 ```
 
 Extensions are installed to:
