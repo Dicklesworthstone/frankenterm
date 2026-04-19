@@ -108,7 +108,7 @@ impl WorkflowContext {
 
     /// Set the policy-gated injector for terminal actions
     #[must_use]
-    pub fn with_injector(mut self, injector: CxPolicyInjector) -> Self {
+    pub(crate) fn with_injector(mut self, injector: CxPolicyInjector) -> Self {
         self.injector = Some(injector);
         self
     }

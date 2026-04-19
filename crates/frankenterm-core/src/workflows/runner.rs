@@ -226,7 +226,7 @@ pub struct WorkflowRunner {
 
 impl WorkflowRunner {
     /// Create a new workflow runner.
-    pub fn new(
+    pub(crate) fn new(
         engine: WorkflowEngine,
         lock_manager: Arc<PaneWorkflowLockManager>,
         storage: Arc<crate::storage::StorageHandle>,
