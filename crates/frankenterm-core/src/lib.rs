@@ -336,6 +336,7 @@ pub mod resize_crash_forensics;
 pub mod resize_invariants;
 pub mod resize_memory_controls;
 pub mod resize_scheduler;
+pub mod restart_scheduler;
 pub mod restore_layout;
 pub mod restore_process;
 pub mod restore_scrollback;
