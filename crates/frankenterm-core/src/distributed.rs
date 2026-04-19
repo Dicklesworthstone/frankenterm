@@ -989,6 +989,33 @@ impl DistributedHttpClient {
 /// Polling interval (50 ms) trades responsiveness against the cost of
 /// waking up per cycle. 50 ms matches the observed shutdown-flag poll
 /// cadence elsewhere in this crate.
+///
+/// # Canonical pattern for mid-flight cx-cancel observability
+///
+/// This helper is the original instance of a pattern that was later
+/// found (ft-xbnl0.2.4 ticks 432-439) to apply to ALL six asupersync-
+/// backed long-lived wait primitives in `runtime_compat`
+/// (mpsc/oneshot/broadcast/watch/Semaphore plus JoinSet's
+/// asupersync-delegated code paths): the primitives observe pre-cancel
+/// via their per-poll `cx.checkpoint()` short-circuit but do NOT
+/// register cx-cancel-wakers, so an already-suspended primitive will
+/// not wake when `cx.cancel_with(...)` fires.
+///
+/// The `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
+/// (tick 432), `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
+/// (tick 433), `broadcast_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
+/// (tick 434), `watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern`
+/// (tick 438), and `semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern`
+/// (tick 439a) tests all replicate this helper's shape with
+/// `futures::future::select` against a 50 ms poll-sleep watcher.
+///
+/// A non-HTTP-specific generic version of this helper is intentionally
+/// NOT factored out — the cancel-error variant differs per primitive
+/// (`ClientError::Cancelled` here, `RecvError::Cancelled` /
+/// `AcquireError::Cancelled` elsewhere), and the current caller
+/// surfaces this level of specificity cleanly. See
+/// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1 for the full
+/// finding writeup and caller-pattern code template.
 #[cfg(feature = "distributed")]
 async fn race_with_cx_cancel<F>(
     cx: &asupersync::cx::Cx,
