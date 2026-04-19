@@ -21,7 +21,7 @@ locally with isolated target dirs.
 |---|-----------|----------|
 | 1 | TCP, TLS, HTTP surfaces no longer require direct Tokio-era crates | **3 regression guards** (§2.3) |
 | 2 | Temporary compat boundary isolated and named | `runtime_compat` module; positive dep guard (§2.3, `asupersync_workspace_dep_present`) |
-| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 5 service-boundary cx contract tests + 16 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) — total 103/103 |
+| 3 | Verification covers correctness + basic performance non-regression | **34 HTTP client contract tests + 12 TLS contract tests + 5 service-boundary cx contract tests + 19 primitive contract tests** (§2.1, §2.2, §2.3, §2.6) — total 106/106 |
 | 4 | Completion evidence records exact remote commands + artifacts | **This document** + per-tick bead comments |
 | 5 | Shared verification contract (unit + integration + rch commands) | Unit coverage broad; rch commands recorded in §4a + 4b; **deterministic check script** at `scripts/check_ft_xbnl0_2_4.sh` (tick 347) |
 
@@ -201,6 +201,57 @@ are covered:
   wrap local state rather than delegating to
   an asupersync primitive.
 
+#### 2.6.1 Mid-flight cancel pattern (ticks 432/433/434)
+
+The pre-cancel tests above verify the `cx.checkpoint()` short-circuit
+fires on ENTRY to the recv / acquire. Mid-flight cancel — firing
+`cx.cancel_with(...)` AFTER the primitive has already suspended —
+is a separate contract. Investigation during ticks 432/433/434
+revealed a gap: asupersync's recv primitives check cancel via their
+`poll_*` short-circuit on every re-poll, but do NOT register
+cx-cancel-wakers. An already-suspended recv will not re-poll when
+cx is cancelled, so the cancel never surfaces.
+
+This matches the earlier ft-l9mxa finding on the HTTP client (tick
+380 discovered, tick 387 fixed via `race_with_cx_cancel`). The
+finding is now captured explicitly at the primitive level.
+
+| Primitive                 | Pre-cancel short-circuit | Mid-flight waker | Caller pattern |
+|---------------------------|--------------------------|------------------|----------------|
+| mpsc::Receiver::recv      | ✓ tick 422               | ✗ (tick 432)     | tick 432 test  |
+| oneshot_recv_with_cx      | ✓ tick 419               | ✗ (tick 433)     | tick 433 test  |
+| broadcast_recv_with_cx    | ✓ tick 420               | ✗ (tick 434)     | tick 434 test  |
+
+**Caller workaround** (universal): wrap the recv in
+`futures::future::select` against a poll-sleep cancel watcher:
+
+```rust
+let recv_fut = std::pin::pin!(rx.recv(&cx));
+let watcher = std::pin::pin!(async {
+    loop {
+        sleep_with_cx(&cx, Duration::from_millis(50)).await;
+        if cx.is_cancel_requested() {
+            return Err("cancelled");
+        }
+    }
+});
+let outcome = futures::future::select(recv_fut, watcher).await;
+```
+
+The watcher branch catches cancel within its poll interval
+(~50 ms typical), matching the tick-387
+`DistributedHttpClient::race_with_cx_cancel` pattern. Each test's
+match-arm structure tolerates a future asupersync improvement that
+registers cx-cancel-wakers on the recv path — if/when that lands,
+the tests continue passing (the recv branch fires instead of the
+watcher branch).
+
+**Not probed** (tick scope): watch::Receiver::changed,
+Semaphore::acquire_with_cx/_owned, JoinSet::join_next_with_cx.
+The pattern is likely consistent across all asupersync recv/wait
+primitives; the three channel probes above (mpsc/oneshot/broadcast)
+establish the finding sufficiently.
+
 ### 2.5 Primitive documentation (`runtime_compat::{timeout_with_cx, sleep_with_cx}`)
 
 Both `timeout_with_cx` and `sleep_with_cx` observe cx **budget
@@ -299,8 +350,8 @@ rch workers probe --all --json                                         # capacit
 
 The script handles `CC/CXX` + `CARGO_TARGET_DIR` defaults internally
 and prints `[PASS]`/`[FAIL] — N tests` labels per run for grep-able
-output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (103 tests)`.
-Exit 0 iff all 103 tests pass.
+output. Final summary line: `ft-xbnl0.2.4 — all 6 runs PASS (106 tests)`.
+Exit 0 iff all 106 tests pass.
 
 ### 4b. Individual commands (when you need to isolate a failure group)
 
@@ -351,7 +402,7 @@ elapsed time (see artifact contract in the shared verification spec §"Level C")
 These items have been verified in-session and are durable evidence:
 
 - [x] `rch workers probe --all --json` shows reachable workers (tick 373 — 6 Contabo VPS hosts green).
-- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 103 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 16 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→16 across ticks 418-430 to pin the primitive × cx-cancel matrix — long-lived wait primitives (yield_now / oneshot / broadcast / semaphore borrow+owned / mpsc / watch / JoinSet) plus seam-level primitives (unix::next_line / Command::output pre-spawn + mid-flight), plus pre-existing Semaphore happy-path + Command::output mid-flight cancel tests caught by broadened filters at ticks 427/430.
+- [x] **Local smoke**: `./scripts/check_ft_xbnl0_2_4.sh` exits 0 with all 106 tests passing (34 HTTP + 45 TLS + 3 guards + 3 metrics + 2 web + 19 primitive). Confirmed at every post-tick run. Run 5 web grew 1→2 at tick 417 (`run_web_server_with_cx` mid-flight cancel); Run 6 primitive grew 2→19 across ticks 418-434: the first 16 pin the primitive × cx-cancel matrix (long-lived wait primitives + seam-level primitives + pre-existing bonus tests from filter broadening), the latest 3 (ticks 432/433/434) document a newly-discovered gap where asupersync recv primitives (mpsc / oneshot / broadcast) do NOT register cx-cancel-wakers — they observe pre-cancel via per-poll `cx.checkpoint()` but an already-suspended recv won't wake when cx is cancelled afterward. The select-race caller pattern (same as tick-387 `DistributedHttpClient::race_with_cx_cancel` fix for ft-l9mxa) is the universal workaround.
 - [x] **Full Level-C remote evidence**: all 6 test groups verified on `vmi1149989` via rch exec (tick 393). 83/83 remote PASS. Captured logs at `/tmp/ft-xbnl0.2.4-rch-artifacts-tick374/` — recipe to reproduce in [ft-xbnl0-2-4-rch-attempt-tick374.md](ft-xbnl0-2-4-rch-attempt-tick374.md) §"Command recipe for full Level-C capture".
 - [x] **`cargo test --lib distributed::tests::` broader filter**: 154/154 ok (tick 362 verified locally, re-confirmed at HEAD by the tick-392 HTTP rch run which used a broader filter and saw all 29 HTTP tests plus pre-existing tests pass).
 - [x] `cargo fmt --check` is clean for files touched this session (`distributed.rs`, `metrics.rs`, `tests/web.rs`) — tick 355 formatted them pre-emptively.
