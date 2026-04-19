@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -111,9 +112,10 @@ fastembed = { version = "5.11", optional = true }
 rmp-serde = { version = "1.3", optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 proptest = "1.8.0"
 tempfile = "3.23.0"
-criterion = "0.7.0"
+criterion = { version = "0.7.0", features = ["async_tokio"] }
 loom = "0.7"
 rcgen = { workspace = true }
 
@@ -433,6 +435,10 @@ harness = false
 
 [[bench]]
 name = "token_bucket_bench"
+harness = false
+
+[[bench]]
+name = "quantile_sketch_bench"
 harness = false
 
 [[test]]
