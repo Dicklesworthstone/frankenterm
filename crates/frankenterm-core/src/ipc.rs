@@ -2464,7 +2464,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle()
+            crate::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2526,7 +2526,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle()
+            crate::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

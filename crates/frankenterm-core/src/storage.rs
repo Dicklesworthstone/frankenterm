@@ -11274,7 +11274,7 @@ impl SemanticBudgetState {
             self.ewma_semantic_latency_ms = latency_ms as f64;
         } else {
             self.ewma_semantic_latency_ms =
-                alpha * latency_ms as f64 + (1.0 - alpha) * self.ewma_semantic_latency_ms;
+                (1.0 - alpha).mul_add(self.ewma_semantic_latency_ms, alpha * latency_ms as f64);
         }
 
         let latency_limit = self.config.max_semantic_latency_ms;
@@ -15472,9 +15472,9 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> Option<f32> {
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
+        dot = x.mul_add(y, dot);
+        norm_a = x.mul_add(x, norm_a);
+        norm_b = y.mul_add(y, norm_b);
     }
 
     let denom = norm_a.sqrt() * norm_b.sqrt();

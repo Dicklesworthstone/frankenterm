@@ -280,7 +280,7 @@ fn external_cause_probability(evidence: &ExternalCauseEvidence) -> f64 {
     weight_sum += 0.3;
 
     // Other panes also slow → correlated external cause
-    score += evidence.other_panes_slow_fraction * 0.3;
+    score = evidence.other_panes_slow_fraction.mul_add(0.3, score);
     weight_sum += 0.3;
 
     // PTY not producing → external cause (nothing to throttle)
@@ -290,7 +290,7 @@ fn external_cause_probability(evidence: &ExternalCauseEvidence) -> f64 {
     weight_sum += 0.25;
 
     // High IO wait → disk-bound
-    score += evidence.io_wait_fraction * 0.15;
+    score = evidence.io_wait_fraction.mul_add(0.15, score);
     weight_sum += 0.15;
 
     (score / weight_sum).clamp(0.0, 1.0)

@@ -516,14 +516,13 @@ pub fn evaluate_operation(
 
     // Startup check.
     let startup_pass = match (contract.startup_max_ms, current.startup_ms) {
-        (Some(max), Some(actual)) => {
-            if actual > max {
-                reasons.push(format!("startup {}ms exceeds maximum {}ms", actual, max));
-                false
-            } else {
-                true
-            }
+        (Some(max), Some(actual))
+            if actual > max =>
+        {
+            reasons.push(format!("startup {}ms exceeds maximum {}ms", actual, max));
+            false
         }
+        (Some(_), Some(_)) => true,
         _ => true,
     };
 

@@ -2802,9 +2802,9 @@ impl WorkflowRunner {
     ///
     /// Tick 183: all 3 storage calls (get_workflow + upsert_workflow
     /// + record_usage_metric) route through their cx-first siblings.
-    /// Keeps the "metric-write failure is warn-only" contract — the
-    /// metric write uses `if let Err` on the cx-first path same as
-    /// legacy, so a cx-cancelled metric write logs-and-continues.
+    ///   Keeps the "metric-write failure is warn-only" contract — the
+    ///   metric write uses `if let Err` on the cx-first path same as
+    ///   legacy, so a cx-cancelled metric write logs-and-continues.
     #[cfg(feature = "asupersync-runtime")]
     async fn fail_execution_with_cx(
         &self,

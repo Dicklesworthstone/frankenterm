@@ -572,7 +572,7 @@ fn shannon_entropy(probs: &[f64; PaneState::COUNT]) -> f64 {
     let mut h = 0.0;
     for &p in probs {
         if p > 0.0 {
-            h -= p * p.log2();
+            h = p.mul_add(-p.log2(), h);
         }
     }
     h.max(0.0)

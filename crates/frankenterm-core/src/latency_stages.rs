@@ -8537,7 +8537,7 @@ impl EProcessDetector {
         let delta = value - self.mean;
         self.mean += delta / n;
         let delta2 = value - self.mean;
-        self.m2 += delta * delta2;
+        self.m2 = delta.mul_add(delta2, self.m2);
 
         // Compute likelihood ratio based on e-process kind
         let lr = self.compute_likelihood_ratio(value);
@@ -9101,7 +9101,7 @@ impl PolicyController {
         for (action_idx, loss_slot) in all_losses.iter_mut().enumerate() {
             let mut el = 0.0;
             for (state_idx, &pi) in p.iter().enumerate() {
-                el += pi * self.config.loss_matrix[state_idx * 4 + action_idx];
+                el = pi.mul_add(self.config.loss_matrix[state_idx * 4 + action_idx], el);
             }
             *loss_slot = el;
         }

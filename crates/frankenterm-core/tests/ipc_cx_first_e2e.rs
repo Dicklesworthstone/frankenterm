@@ -114,7 +114,7 @@ fn ipc_cx_first_bind_run_ping_shutdown_roundtrip() {
         // Shutdown via the legacy shutdown channel — must be honored
         // even though the accept loop is cx-driven.
         let _ = frankenterm_core::runtime_compat::mpsc_send(&shutdown_tx, ()).await;
-        let _ = frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
+        frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out")
             .expect("server task");
@@ -161,7 +161,7 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
             Some("ft-xbnl0.2.3 e2e cx cancel"),
         );
 
-        let _ = frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
+        frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out after cx cancel")
             .expect("server task");

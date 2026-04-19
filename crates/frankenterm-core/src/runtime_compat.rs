@@ -5838,7 +5838,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race watcher must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
@@ -5915,7 +5915,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
@@ -5984,7 +5984,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race watcher must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
@@ -6060,7 +6060,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race watcher must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
@@ -6136,7 +6136,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race watcher must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms; 1000 ms envelope absorbs load drift); took {elapsed:?}"
             );
@@ -6224,7 +6224,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(1000),
+                elapsed < Duration::from_secs(1),
                 "select! race watcher must catch mid-flight cancel within ~1 s \
                  (expected ~150 ms: 100 ms cancel trigger + up to 50 ms poll; \
                  1000 ms envelope absorbs concurrent-agent load drift); took {elapsed:?}"

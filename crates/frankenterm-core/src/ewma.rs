@@ -95,7 +95,7 @@ impl Ewma {
             1.0 - 0.5_f64.powf(dt / self.half_life_ms)
         };
 
-        self.value = alpha * value + (1.0 - alpha) * self.value;
+        self.value = (1.0 - alpha).mul_add(self.value, alpha * value);
         self.last_time_ms = time_ms;
     }
 
@@ -194,7 +194,7 @@ impl EwmaWithVariance {
 
             let deviation_sq = (value - old_mean).powi(2);
             if self.variance_initialized {
-                self.variance = alpha * deviation_sq + (1.0 - alpha) * self.variance;
+                self.variance = (1.0 - alpha).mul_add(self.variance, alpha * deviation_sq);
             } else {
                 self.variance = deviation_sq;
                 self.variance_initialized = true;

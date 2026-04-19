@@ -558,7 +558,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let tmp =
-                std::env::temp_dir().join(format!("ft_test_ctx_{}_{}.db", std::process::id(), id,));
+                std::env::temp_dir().join(format!("ft_test_ctx_{}_{}.db", std::process::id(), id));
             Arc::new(StorageHandle::new(tmp.to_str().unwrap()).await.unwrap())
         })
     }

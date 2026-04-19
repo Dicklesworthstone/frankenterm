@@ -382,7 +382,7 @@ impl SemanticAnomalyDetector {
         }
 
         let diff = distance - self.mean_distance;
-        self.mean_distance += self.config.variance_alpha * diff;
+        self.mean_distance = self.config.variance_alpha.mul_add(diff, self.mean_distance);
         self.variance = (1.0 - self.config.variance_alpha)
             * (self.config.variance_alpha * diff).mul_add(diff, self.variance);
 

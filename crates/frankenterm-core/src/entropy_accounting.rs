@@ -182,7 +182,7 @@ fn compute_entropy_from_counts(counts: &[u64; 256], total: u64) -> f64 {
     for &count in counts {
         if count > 0 {
             let p = count as f64 / total_f;
-            h -= p * p.log2();
+            h = p.mul_add(-p.log2(), h);
         }
     }
     // Clamp to valid range [0, 8].

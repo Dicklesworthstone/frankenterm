@@ -1495,7 +1495,7 @@ mod tests {
             );
         });
         drop(runtime);
-        let _ = std::panic::catch_unwind(|| crate::runtime_compat::clear_runtime_handle());
+        let _ = std::panic::catch_unwind(crate::runtime_compat::clear_runtime_handle);
     }
 
     // ========================================================================

@@ -7339,9 +7339,7 @@ mod tests {
                         )
                         .await;
                         ticks += 1;
-                        if ticks > 1000 {
-                            panic!("loop did not terminate via shutdown flag");
-                        }
+                        assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
                     }
                     exited_task.store(true, Ordering::SeqCst);
                 })

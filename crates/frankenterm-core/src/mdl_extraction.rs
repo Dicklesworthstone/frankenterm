@@ -380,7 +380,7 @@ impl MdlExtractor {
                     let ratio_improvement =
                         1.0 - (score.compressed_len as f64 / full_score.compressed_len as f64);
                     // Blend reduction ratio and compression improvement.
-                    (reduction * 0.6 + ratio_improvement.max(0.0) * 0.4).clamp(0.0, 1.0)
+                    ratio_improvement.max(0.0).mul_add(0.4, reduction * 0.6).clamp(0.0, 1.0)
                 } else {
                     reduction
                 };

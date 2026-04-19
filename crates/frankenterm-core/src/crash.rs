@@ -1309,7 +1309,7 @@ pub fn replay_incident_bundle(
                                 .segment_count
                                 .map_or_else(|| "unknown".to_string(), |v| v.to_string());
                             let detail =
-                                format!("schema_version={sv}, events={ec}, segments={sc}",);
+                                format!("schema_version={sv}, events={ec}, segments={sc}");
                             checks.push(ReplayCheck {
                                 name: "db_metadata_valid".to_string(),
                                 passed: true,

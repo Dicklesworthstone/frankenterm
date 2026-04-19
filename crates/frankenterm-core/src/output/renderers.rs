@@ -2949,7 +2949,7 @@ impl TimelineRenderer {
 
             // Pane label
             let agent_label = event.pane_info.agent_type.as_deref().unwrap_or("unknown");
-            let pane_label = format!("Pane {} ({})", event.pane_info.pane_id, agent_label,);
+            let pane_label = format!("Pane {} ({})", event.pane_info.pane_id, agent_label);
 
             // Event line
             let mut line = format!(
@@ -3030,7 +3030,7 @@ impl TimelineRenderer {
 
             // Vertical connector between events
             if i < events.len() - 1 {
-                output.push_str(&format!("          {}\n", style.dim("\u{2502}"),));
+                output.push_str(&format!("          {}\n", style.dim("\u{2502}")));
             }
         }
 

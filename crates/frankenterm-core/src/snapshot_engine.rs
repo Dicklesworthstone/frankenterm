@@ -2374,7 +2374,7 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_millis(2_000),
+                elapsed < Duration::from_secs(2),
                 "mid-flight cx-cancel should cut the scheduler within 2s \
                  (cx threading upgrade should avoid the 30s interval wait), took {elapsed:?}"
             );

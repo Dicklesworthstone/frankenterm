@@ -711,9 +711,9 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
     for (&x, &y) in a.iter().zip(b.iter()) {
         let x64 = f64::from(x);
         let y64 = f64::from(y);
-        dot += x64 * y64;
-        norm_a += x64 * x64;
-        norm_b += y64 * y64;
+        dot = x64.mul_add(y64, dot);
+        norm_a = x64.mul_add(x64, norm_a);
+        norm_b = y64.mul_add(y64, norm_b);
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
     if denom <= f64::EPSILON {

@@ -2684,7 +2684,7 @@ fn render_triage_view(
                 }
                 if row < wf_end {
                     let step_line =
-                        format!("    Step {} | started {}", wf.progress_label, wf.started_at,);
+                        format!("    Step {} | started {}", wf.progress_label, wf.started_at);
                     write_styled(frame, 0, row, &step_line, CellStyle::new().dim());
                     let slen = step_line.len() as u16;
                     if slen < width {
@@ -2695,7 +2695,7 @@ fn render_triage_view(
                 }
                 if let Some(ref error) = wf.error {
                     if row < wf_end {
-                        let err_line = format!("    ERROR: {}", truncate_str(error, 60),);
+                        let err_line = format!("    ERROR: {}", truncate_str(error, 60));
                         write_styled(frame, 0, row, &err_line, CellStyle::new().bold());
                         let elen = err_line.len() as u16;
                         if elen < width {
@@ -3310,7 +3310,7 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
     if row < max_row {
         let title = truncate_str(&modal.title, inner_w as usize);
         let pad = inner_w.saturating_sub(title.len() as u16);
-        let line = format!("\u{2502}{title}{}\u{2502}", " ".repeat(pad as usize),);
+        let line = format!("\u{2502}{title}{}\u{2502}", " ".repeat(pad as usize));
         write_styled(frame, x0, row, &line, CellStyle::new().bold());
         row += 1;
     }
@@ -3330,14 +3330,14 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
         }
         let text = truncate_str(line_text, inner_w as usize);
         let pad = inner_w.saturating_sub(text.len() as u16);
-        let line = format!("\u{2502}{text}{}\u{2502}", " ".repeat(pad as usize),);
+        let line = format!("\u{2502}{text}{}\u{2502}", " ".repeat(pad as usize));
         write_styled(frame, x0, row, &line, CellStyle::new());
         row += 1;
     }
 
     // Fill remaining body area with blank rows.
     while row < max_row.saturating_sub(1) {
-        let blank = format!("\u{2502}{}\u{2502}", " ".repeat(inner_w as usize),);
+        let blank = format!("\u{2502}{}\u{2502}", " ".repeat(inner_w as usize));
         write_styled(frame, x0, row, &blank, CellStyle::new());
         row += 1;
     }
@@ -3351,14 +3351,14 @@ fn render_modal_overlay(frame: &mut ftui::Frame, width: u16, height: u16, modal:
         };
         let hint_text = truncate_str(hint, inner_w as usize);
         let pad = inner_w.saturating_sub(hint_text.len() as u16);
-        let line = format!("\u{2502}{hint_text}{}\u{2502}", " ".repeat(pad as usize),);
+        let line = format!("\u{2502}{hint_text}{}\u{2502}", " ".repeat(pad as usize));
         write_styled(frame, x0, row, &line, CellStyle::new().dim());
         row += 1;
     }
 
     // -- Bottom border --
     if row <= y0 + modal_h {
-        let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_w as usize),);
+        let bottom = format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_w as usize));
         write_styled(frame, x0, row, &bottom, CellStyle::new().bold());
     }
 }
@@ -3430,8 +3430,7 @@ fn write_styled(frame: &mut ftui::Frame, col: u16, row: u16, text: &str, style: 
 
     let flags = style.to_cell_flags();
 
-    let mut x = col;
-    for ch in text.chars() {
+    for (x, ch) in (col..).zip(text.chars()) {
         if x >= w {
             break;
         }
@@ -3439,7 +3438,6 @@ fn write_styled(frame: &mut ftui::Frame, col: u16, row: u16, text: &str, style: 
             cell.content = ftui::render::cell::CellContent::from_char(ch);
             cell.attrs = ftui::CellAttrs::new(flags, 0);
         }
-        x += 1;
     }
 }
 

@@ -160,7 +160,7 @@ impl KalmanFilter {
         let s = p_pred + self.r; // Innovation variance
         let k = p_pred / s; // Kalman gain
 
-        self.x += k * innovation;
+        self.x = k.mul_add(innovation, self.x);
         self.p = (1.0 - k) * p_pred;
 
         // Ensure P stays positive (numerical safety)

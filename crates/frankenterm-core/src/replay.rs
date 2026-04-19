@@ -936,19 +936,19 @@ pub fn export_asciinema<W: std::io::Write>(
                 })?;
                 event_count += 1;
             }
-            FrameType::Resize => {
-                if frame.payload.len() >= 4 {
-                    let c = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
-                    let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
-                    let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
-                    let line = serde_json::to_string(&event).map_err(|e| {
-                        crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
-                    })?;
-                    writeln!(writer, "{line}").map_err(|e| {
-                        crate::Error::Runtime(format!("Failed to write cast event: {e}"))
-                    })?;
-                    event_count += 1;
-                }
+            FrameType::Resize
+                if frame.payload.len() >= 4 =>
+            {
+                let c = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
+                let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
+                let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
+                let line = serde_json::to_string(&event).map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to serialize cast event: {e}"))
+                })?;
+                writeln!(writer, "{line}").map_err(|e| {
+                    crate::Error::Runtime(format!("Failed to write cast event: {e}"))
+                })?;
+                event_count += 1;
             }
             FrameType::Marker => {
                 // Emit markers as comments (non-standard but harmless)

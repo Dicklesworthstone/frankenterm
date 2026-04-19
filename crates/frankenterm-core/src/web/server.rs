@@ -218,7 +218,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     select! {
         _ = signal::ctrl_c() => {}
         _ = term.recv() => {}
-        _ = cancel_fut => {}
+        () = cancel_fut => {}
     }
     Ok(())
 }

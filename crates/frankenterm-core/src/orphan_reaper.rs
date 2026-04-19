@@ -205,9 +205,9 @@ pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
 /// - Per-kill checkpoint between iterations lets a cancelled
 ///   caller stop partway through killing a long list of stale
 ///   processes, returning a partial report.
-/// Scan errors and individual kill errors are captured in the
-/// report (not short-circuited) so the caller always gets a
-/// coherent snapshot of what did get reaped.
+///   Scan errors and individual kill errors are captured in the
+///   report (not short-circuited) so the caller always gets a
+///   coherent snapshot of what did get reaped.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
     scan_and_reap_with_cx(cx, max_age_seconds).await

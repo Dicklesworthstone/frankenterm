@@ -436,8 +436,7 @@ impl RenderSurface for RatatuiSurface<'_> {
         }
         // Write characters one at a time, clipping at width
         let max_x = self.area.x + self.area.width;
-        let mut col = abs_x;
-        for ch in text.chars() {
+        for (col, ch) in (abs_x..).zip(text.chars()) {
             if col >= max_x {
                 break;
             }
@@ -447,7 +446,6 @@ impl RenderSurface for RatatuiSurface<'_> {
             {
                 cell.set_char(ch).set_style(ratatui_style);
             }
-            col += 1;
         }
     }
 

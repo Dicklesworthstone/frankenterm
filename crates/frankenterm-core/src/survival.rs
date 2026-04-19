@@ -1103,7 +1103,7 @@ impl SurvivalModel {
 
         // Gradient step for betas
         for (beta, grad) in params.beta.iter_mut().zip(grad_beta.iter()) {
-            *beta += lr * *grad;
+            *beta = lr.mul_add(*grad, *beta);
         }
 
         // Update shape and scale in log-space to maintain positivity

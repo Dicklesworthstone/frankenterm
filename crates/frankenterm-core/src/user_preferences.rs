@@ -642,9 +642,9 @@ pub fn rank_correlation(a: &[f64], b: &[f64]) -> f64 {
     for i in 0..n {
         let da = rank_a[i] - mean_a;
         let db = rank_b[i] - mean_b;
-        cov += da * db;
-        var_a += da * da;
-        var_b += db * db;
+        cov = da.mul_add(db, cov);
+        var_a = da.mul_add(da, var_a);
+        var_b = db.mul_add(db, var_b);
     }
 
     if var_a < 1e-15 || var_b < 1e-15 {
@@ -740,7 +740,7 @@ fn generate_trajectories(
                     let f = extract_features(&obs_base, a);
                     let mut r = 0.0;
                     for i in 0..theta.len().min(NUM_FEATURES) {
-                        r += theta[i] * f[i];
+                        r = theta[i].mul_add(f[i], r);
                     }
                     r
                 })

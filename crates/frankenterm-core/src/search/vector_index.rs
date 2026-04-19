@@ -86,19 +86,19 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
     for i in 0..chunks {
         let base = i * 8;
-        sum0 += a[base] * b[base];
-        sum1 += a[base + 1] * b[base + 1];
-        sum2 += a[base + 2] * b[base + 2];
-        sum3 += a[base + 3] * b[base + 3];
-        sum4 += a[base + 4] * b[base + 4];
-        sum5 += a[base + 5] * b[base + 5];
-        sum6 += a[base + 6] * b[base + 6];
-        sum7 += a[base + 7] * b[base + 7];
+        sum0 = a[base].mul_add(b[base], sum0);
+        sum1 = a[base + 1].mul_add(b[base + 1], sum1);
+        sum2 = a[base + 2].mul_add(b[base + 2], sum2);
+        sum3 = a[base + 3].mul_add(b[base + 3], sum3);
+        sum4 = a[base + 4].mul_add(b[base + 4], sum4);
+        sum5 = a[base + 5].mul_add(b[base + 5], sum5);
+        sum6 = a[base + 6].mul_add(b[base + 6], sum6);
+        sum7 = a[base + 7].mul_add(b[base + 7], sum7);
     }
 
     let mut tail = 0.0f32;
     for i in (chunks * 8)..n {
-        tail += a[i] * b[i];
+        tail = a[i].mul_add(b[i], tail);
     }
     (sum0 + sum1) + (sum2 + sum3) + (sum4 + sum5) + (sum6 + sum7) + tail
 }

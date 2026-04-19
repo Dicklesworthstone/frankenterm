@@ -24,15 +24,12 @@ fn submit_selected_hooks(
     let plan = ViewportReflowPlanner::plan(input);
     let hooks = plan.scheduling_hooks();
     let mut submitted = Vec::new();
-    let mut seq = base_seq;
-
-    for hook in hooks.iter().filter(|h| h.selected_for_frame) {
+    for (seq, hook) in (base_seq..).zip(hooks.iter().filter(|h| h.selected_for_frame)) {
         let intent = hook.to_resize_intent(pane_id, seq, submitted_at_ms);
         let outcome = scheduler.submit_intent(intent);
         if let SubmitOutcome::Accepted { .. } = outcome {
             submitted.push((seq, hook.work_units));
         }
-        seq += 1;
     }
     submitted
 }

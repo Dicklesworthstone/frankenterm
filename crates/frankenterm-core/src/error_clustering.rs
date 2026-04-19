@@ -391,8 +391,8 @@ impl ErrorClusterer {
         }
 
         root_map
-            .into_iter()
-            .filter_map(|(root, _members)| {
+            .into_keys()
+            .filter_map(|root| {
                 self.cluster_meta.get(&root).map(|meta| ClusterInfo {
                     cluster_id: root,
                     size: meta.size,

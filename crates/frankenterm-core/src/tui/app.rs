@@ -249,20 +249,20 @@ impl<Q: QueryClient> App<Q> {
     fn handle_panes_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_pane_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if filtered_len > 0 {
-                    self.view_state.selected_index =
-                        (self.view_state.selected_index + 1) % filtered_len;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if filtered_len > 0 =>
+            {
+                self.view_state.selected_index =
+                    (self.view_state.selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if filtered_len > 0 {
-                    self.view_state.selected_index = self
-                        .view_state
-                        .selected_index
-                        .checked_sub(1)
-                        .unwrap_or(filtered_len - 1);
-                }
+            KeyCode::Up | KeyCode::Char('k')
+                if filtered_len > 0 =>
+            {
+                self.view_state.selected_index = self
+                    .view_state
+                    .selected_index
+                    .checked_sub(1)
+                    .unwrap_or(filtered_len - 1);
             }
             KeyCode::Char('u') => {
                 self.view_state.panes_unhandled_only = !self.view_state.panes_unhandled_only;
@@ -342,20 +342,20 @@ impl<Q: QueryClient> App<Q> {
     fn handle_events_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_event_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if filtered_len > 0 {
-                    self.view_state.events_selected_index =
-                        (self.view_state.events_selected_index + 1) % filtered_len;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if filtered_len > 0 =>
+            {
+                self.view_state.events_selected_index =
+                    (self.view_state.events_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if filtered_len > 0 {
-                    self.view_state.events_selected_index = self
-                        .view_state
-                        .events_selected_index
-                        .checked_sub(1)
-                        .unwrap_or(filtered_len - 1);
-                }
+            KeyCode::Up | KeyCode::Char('k')
+                if filtered_len > 0 =>
+            {
+                self.view_state.events_selected_index = self
+                    .view_state
+                    .events_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(filtered_len - 1);
             }
             KeyCode::Char('u') => {
                 self.view_state.events_unhandled_only = !self.view_state.events_unhandled_only;
@@ -380,21 +380,20 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the triage view
     fn handle_triage_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.view_state.triage_items.is_empty() {
-                    self.view_state.triage_selected_index = (self.view_state.triage_selected_index
-                        + 1)
-                        % self.view_state.triage_items.len();
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if !self.view_state.triage_items.is_empty() =>
+            {
+                self.view_state.triage_selected_index = (self.view_state.triage_selected_index + 1)
+                    % self.view_state.triage_items.len();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if !self.view_state.triage_items.is_empty() {
-                    self.view_state.triage_selected_index = self
-                        .view_state
-                        .triage_selected_index
-                        .checked_sub(1)
-                        .unwrap_or(self.view_state.triage_items.len() - 1);
-                }
+            KeyCode::Up | KeyCode::Char('k')
+                if !self.view_state.triage_items.is_empty() =>
+            {
+                self.view_state.triage_selected_index = self
+                    .view_state
+                    .triage_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(self.view_state.triage_items.len() - 1);
             }
             KeyCode::Enter | KeyCode::Char('a') => {
                 self.queue_triage_action(0);
@@ -402,14 +401,14 @@ impl<Q: QueryClient> App<Q> {
             KeyCode::Char('m') => {
                 self.mute_selected_event();
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e')
+                if !self.view_state.workflows.is_empty() =>
+            {
                 // Toggle expand/collapse for workflow progress
-                if !self.view_state.workflows.is_empty() {
-                    if self.view_state.triage_expanded.is_some() {
-                        self.view_state.triage_expanded = None;
-                    } else {
-                        self.view_state.triage_expanded = Some(0);
-                    }
+                if self.view_state.triage_expanded.is_some() {
+                    self.view_state.triage_expanded = None;
+                } else {
+                    self.view_state.triage_expanded = Some(0);
                 }
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -435,21 +434,23 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.search_phase_detail =
                     Some(format!("fast-only mode {mode} (Ctrl+F to toggle)"));
             }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.view_state.saved_searches.is_empty() {
-                    self.view_state.saved_search_selected_index =
-                        (self.view_state.saved_search_selected_index + 1)
-                            % self.view_state.saved_searches.len();
-                }
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.view_state.saved_searches.is_empty() =>
+            {
+                self.view_state.saved_search_selected_index =
+                    (self.view_state.saved_search_selected_index + 1)
+                        % self.view_state.saved_searches.len();
             }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.view_state.saved_searches.is_empty() {
-                    self.view_state.saved_search_selected_index = self
-                        .view_state
-                        .saved_search_selected_index
-                        .checked_sub(1)
-                        .unwrap_or(self.view_state.saved_searches.len() - 1);
-                }
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !self.view_state.saved_searches.is_empty() =>
+            {
+                self.view_state.saved_search_selected_index = self
+                    .view_state
+                    .saved_search_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(self.view_state.saved_searches.len() - 1);
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(saved) = self
@@ -525,20 +526,20 @@ impl<Q: QueryClient> App<Q> {
     fn handle_history_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_history_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if filtered_len > 0 {
-                    self.view_state.history_selected_index =
-                        (self.view_state.history_selected_index + 1) % filtered_len;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if filtered_len > 0 =>
+            {
+                self.view_state.history_selected_index =
+                    (self.view_state.history_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if filtered_len > 0 {
-                    self.view_state.history_selected_index = self
-                        .view_state
-                        .history_selected_index
-                        .checked_sub(1)
-                        .unwrap_or(filtered_len - 1);
-                }
+            KeyCode::Up | KeyCode::Char('k')
+                if filtered_len > 0 =>
+            {
+                self.view_state.history_selected_index = self
+                    .view_state
+                    .history_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(filtered_len - 1);
             }
             KeyCode::Char('u') => {
                 self.view_state.history_undoable_only = !self.view_state.history_undoable_only;
@@ -565,26 +566,26 @@ impl<Q: QueryClient> App<Q> {
     fn handle_timeline_key(&mut self, key: KeyEvent) {
         let timeline_len = self.view_state.timeline_rows.len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if timeline_len > 0 {
-                    self.view_state.timeline_selected_index =
-                        (self.view_state.timeline_selected_index + 1) % timeline_len;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if timeline_len > 0 =>
+            {
+                self.view_state.timeline_selected_index =
+                    (self.view_state.timeline_selected_index + 1) % timeline_len;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if timeline_len > 0 {
-                    self.view_state.timeline_selected_index = self
-                        .view_state
-                        .timeline_selected_index
-                        .checked_sub(1)
-                        .unwrap_or(timeline_len - 1);
-                }
+            KeyCode::Up | KeyCode::Char('k')
+                if timeline_len > 0 =>
+            {
+                self.view_state.timeline_selected_index = self
+                    .view_state
+                    .timeline_selected_index
+                    .checked_sub(1)
+                    .unwrap_or(timeline_len - 1);
             }
-            KeyCode::Char('+' | '=') => {
-                if self.view_state.timeline_zoom < 5 {
-                    self.view_state.timeline_zoom += 1;
-                    self.refresh_timeline_data();
-                }
+            KeyCode::Char('+' | '=')
+                if self.view_state.timeline_zoom < 5 =>
+            {
+                self.view_state.timeline_zoom += 1;
+                self.refresh_timeline_data();
             }
             KeyCode::Char('-') => {
                 let next_zoom = self.view_state.timeline_zoom.saturating_sub(1);

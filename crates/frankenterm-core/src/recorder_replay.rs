@@ -964,10 +964,10 @@ impl ReplayScheduler {
         if self.config.skip_empty {
             match &event.payload {
                 RecorderEventPayload::IngressText { text, .. }
-                | RecorderEventPayload::EgressOutput { text, .. } => {
-                    if text.is_empty() {
-                        return false;
-                    }
+                | RecorderEventPayload::EgressOutput { text, .. }
+                    if text.is_empty() =>
+                {
+                    return false;
                 }
                 _ => {}
             }

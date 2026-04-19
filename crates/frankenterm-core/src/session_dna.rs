@@ -227,7 +227,7 @@ impl SessionDnaBuilder {
             // Active period
             self.active_time_s += elapsed_s;
             self.line_count += lines;
-            self.line_length_sum += avg_line_length as f64 * lines as f64;
+            self.line_length_sum = (avg_line_length as f64).mul_add(lines as f64, self.line_length_sum);
             self.dna.total_lines += lines;
 
             // Update running entropy (weighted average)
@@ -382,7 +382,7 @@ impl FeatureNormalizer {
             let delta = feat - self.mean[i];
             self.mean[i] += delta / n;
             let delta2 = feat - self.mean[i];
-            self.m2[i] += delta * delta2;
+            self.m2[i] = delta.mul_add(delta2, self.m2[i]);
         }
     }
 
@@ -428,9 +428,9 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     let mut norm_b = 0.0;
 
     for i in 0..a.len().min(b.len()) {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+        dot = a[i].mul_add(b[i], dot);
+        norm_a = a[i].mul_add(a[i], norm_a);
+        norm_b = b[i].mul_add(b[i], norm_b);
     }
 
     let denom = norm_a.sqrt() * norm_b.sqrt();
@@ -447,7 +447,7 @@ pub fn l2_distance(a: &[f64], b: &[f64]) -> f64 {
     let mut sum = 0.0;
     for i in 0..a.len().min(b.len()) {
         let d = a[i] - b[i];
-        sum += d * d;
+        sum = d.mul_add(d, sum);
     }
     sum.sqrt()
 }
@@ -691,7 +691,7 @@ impl PcaModel {
             for i in 0..RAW_FEATURE_DIM {
                 let ci = row[i] - means[i];
                 for j in i..RAW_FEATURE_DIM {
-                    cov[i][j] += ci * (row[j] - means[j]);
+                    cov[i][j] = ci.mul_add(row[j] - means[j], cov[i][j]);
                 }
             }
         }
@@ -722,7 +722,7 @@ impl PcaModel {
             // Deflate.
             for i in 0..RAW_FEATURE_DIM {
                 for j in 0..RAW_FEATURE_DIM {
-                    cov[i][j] -= eigenvalue * eigenvector[i] * eigenvector[j];
+                    cov[i][j] = (eigenvalue * eigenvector[i]).mul_add(-eigenvector[j], cov[i][j]);
                 }
             }
             components.push(eigenvector.to_vec());
@@ -748,7 +748,7 @@ impl PcaModel {
             .map(|component| {
                 let mut dot = 0.0;
                 for i in 0..RAW_FEATURE_DIM {
-                    dot += (features[i] - self.feature_means[i]) * component[i];
+                    dot = (features[i] - self.feature_means[i]).mul_add(component[i], dot);
                 }
                 dot
             })
@@ -794,7 +794,7 @@ fn pca_power_iteration(matrix: &[Vec<f64>], max_iter: usize) -> (f64, [f64; RAW_
         let mut w = [0.0f64; RAW_FEATURE_DIM];
         for i in 0..d {
             for j in 0..d {
-                w[i] += matrix[i][j] * v[j];
+                w[i] = matrix[i][j].mul_add(v[j], w[i]);
             }
         }
 

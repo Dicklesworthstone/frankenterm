@@ -222,7 +222,7 @@ pub fn transfer_entropy(
         let cond_marginal = p_y_next_y_cur / p_y_cur;
 
         if cond_joint > 0.0 && cond_marginal > 0.0 {
-            te += p_joint * (cond_joint / cond_marginal).log2();
+            te = p_joint.mul_add((cond_joint / cond_marginal).log2(), te);
         }
     }
 
