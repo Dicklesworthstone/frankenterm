@@ -541,6 +541,18 @@ pub use tokio::sync::{
 };
 
 /// MPSC channel aliases for the active runtime.
+///
+/// Under asupersync the receiver's `recv(cx)` method observes
+/// **pre-cancel** on cx via the per-poll `cx.checkpoint()`
+/// short-circuit (pinned by `mpsc_recv_with_cx_observes_pre_cancel`,
+/// ft-xbnl0.2.4 tick 422) but does NOT register a cx-cancel-waker.
+/// An already-suspended recv will NOT wake when `cx.cancel_with(...)`
+/// fires afterward (pinned by
+/// `mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
+/// tick 432). Callers needing mid-flight cancel must wrap in
+/// `futures::future::select` against a poll-sleep watcher (same
+/// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick
+/// 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 #[cfg(feature = "asupersync-runtime")]
 pub mod mpsc {
     pub use asupersync::channel::mpsc::{
@@ -2411,6 +2423,24 @@ pub async fn broadcast_recv<T: Clone>(
 /// (ft-xbnl0.2.2 Cx-first helper). Prefer this over [`broadcast_recv`] in
 /// call graphs that already thread `&Cx` so cancellation flows cleanly
 /// through the broadcast boundary.
+///
+/// # Cancellation semantics
+///
+/// Observes **pre-cancel**: if `cx` is cancelled before this is called,
+/// or if it is cancelled and something external re-wakes the recv
+/// (e.g. a send), the `cx.checkpoint()` short-circuit inside asupersync's
+/// `poll_recv` returns `Err(RecvError::Cancelled)` (pinned by
+/// `broadcast_recv_with_cx_observes_pre_cancel`, ft-xbnl0.2.4 tick 420).
+///
+/// Does NOT observe **mid-flight cancel**: asupersync's broadcast
+/// receiver does not register a cx-cancel-waker. A recv that has
+/// already suspended on the send-side waker will NOT wake when
+/// `cx.cancel_with(...)` fires afterward (pinned by
+/// `broadcast_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
+/// tick 434). Callers needing mid-flight cancel observability must
+/// wrap this call in `futures::future::select` against a poll-sleep
+/// watcher (same pattern as `DistributedHttpClient::race_with_cx_cancel`,
+/// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn broadcast_recv_with_cx<T: Clone>(
     cx: &crate::cx::Cx,
@@ -2496,6 +2526,21 @@ pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
 /// `.recv()` method instead of being pulled from thread-local state so
 /// cancellation, budget, and virtual time all propagate through the
 /// caller's capability context.
+///
+/// # Cancellation semantics
+///
+/// Observes **pre-cancel**: pre-cancelled cx returns Err promptly via
+/// asupersync's `poll_recv` `cx.checkpoint()` short-circuit (pinned
+/// by `oneshot_recv_with_cx_observes_pre_cancel`, tick 419).
+///
+/// Does NOT observe **mid-flight cancel**: asupersync's oneshot
+/// receiver does not register a cx-cancel-waker. An already-suspended
+/// recv will NOT wake when `cx.cancel_with(...)` fires afterward
+/// (pinned by `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`,
+/// tick 433). Callers needing mid-flight cancel must wrap in
+/// `futures::future::select` against a poll-sleep watcher (same
+/// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick 387).
+/// See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
 #[cfg(feature = "asupersync-runtime")]
 pub async fn oneshot_recv_with_cx<T>(
     cx: &crate::cx::Cx,
