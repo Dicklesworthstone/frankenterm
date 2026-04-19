@@ -19,11 +19,18 @@ Tick 401: HTTP extended to 31 after tick 400 (URL percent-encoding pass-through)
 Tick 403: HTTP extended to 32 after tick 402 (chunked transfer-encoding response) (86 tests total)
 Tick 405: HTTP extended to 33 after tick 404 (HTTP/1.0 response decoding) (87 tests total)
 Tick 409: HTTP extended to 34 after tick 408 (race_with_cx_cancel isolated unit test; renamed to distributed_http_client_race_with_cx_cancel_* to match check-script filter) (88 tests total)
+Tick 417: Run 5 web extended to 2 after tick 417 (run_web_server_with_cx mid-flight cancel) (89 tests total)
+Tick 418: Run 6 runtime_compat extended to 4 after tick 418 (yield_now_with_cx cancel-checkpoint + happy-path) (91 tests total)
+Tick 419: Run 6 extended to 5 after tick 419 (oneshot_recv_with_cx pre-cancel) (92 tests total)
+Tick 420: Run 6 extended to 6 after tick 420 (broadcast_recv_with_cx pre-cancel) (93 tests total)
+Tick 421: Run 6 extended to 7 after tick 421 (Semaphore::acquire_with_cx pre-cancel) (94 tests total)
+Tick 422: Run 6 extended to 8 after tick 422 (mpsc::Receiver::recv pre-cancel) (95 tests total)
+Tick 423: Run 6 extended to 9 after tick 423 (watch::Receiver::changed pre-cancel) (96 tests total) — long-lived wait primitive cancel matrix complete
 Bead: ft-xbnl0.2.4
 
 This is a single-run verification snapshot consolidating all ft-xbnl0.2.4
 contract tests this session touches. Captured as an artifact so the bead
-owner can reference a concrete "88 of 88 passing at this commit" checkpoint
+owner can reference a concrete "96 of 96 passing at this commit" checkpoint
 without re-running every per-tick filter.
 
 ## Recipe
@@ -112,9 +119,9 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | TLS tests (Run 2) | 45 | 45/45 ok |
 | Regression guards (Run 3) | 3 | 3/3 ok |
 | Metrics server cx-family (Run 4) | 3 | 3/3 ok |
-| Web server cx pre-cancel (Run 5) | 1 | 1/1 ok |
-| Runtime-primitive contracts (Run 6) | 2 | 2/2 ok |
-| **Subtotal** | **88** | **88/88 ok** |
+| Web server cx pre-cancel + mid-flight (Run 5) | 2 | 2/2 ok |
+| Runtime-primitive contracts (Run 6) | 9 | 9/9 ok |
+| **Subtotal** | **96** | **96/96 ok** |
 
 Captured via `scripts/check_ft_xbnl0_2_4.sh` (tick 347, filter broadened
 tick 357).
@@ -173,19 +180,69 @@ cargo test -p frankenterm-core --features web,asupersync-runtime --test web web_
 ```
 
 ```
-running 1 test
+running 2 tests
 test web_tests::web_server_with_cx_pre_cancelled_refuses_to_bind ... ok
+test web_tests::web_server_with_cx_mid_flight_cancel_exits_cleanly ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.30s
 ```
 
-Tick 323's pre-cancel contract for the web server bind path.
+Tick 323's pre-cancel contract + tick 417's mid-flight cx-cancel
+contract for `run_web_server_with_cx` — pins both timings of the
+cx signal for the web server bind/orchestration path.
+
+### Run 6 — runtime_compat primitive contracts (budget + cancel matrix)
+
+```
+cargo test -p frankenterm-core --features asupersync-runtime --lib \
+    -- _with_cx_observes_budget_deadline yield_now_with_cx \
+       oneshot_recv_with_cx broadcast_recv_with_cx \
+       semaphore_acquire_with_cx mpsc_recv_with_cx watch_changed_with_cx
+```
+
+```
+running 9 tests
+test sleep_with_cx_observes_budget_deadline ... ok
+test timeout_with_cx_observes_budget_deadline ... ok
+test yield_now_with_cx_observes_cx_cancel_checkpoint ... ok
+test yield_now_with_cx_yields_on_live_cx ... ok
+test oneshot_recv_with_cx_observes_pre_cancel ... ok
+test broadcast_recv_with_cx_observes_pre_cancel ... ok
+test semaphore_acquire_with_cx_observes_pre_cancel ... ok
+test mpsc_recv_with_cx_observes_pre_cancel ... ok
+test watch_changed_with_cx_observes_pre_cancel ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 25622 filtered out; finished in 0.02s
+```
+
+Pins both halves of the primitive × signal-kind matrix:
+
+| Primitive                      | Budget deadline | Direct cancel    |
+|--------------------------------|-----------------|------------------|
+| sleep_with_cx                  | ✓ tick 382      | ✗ documented     |
+| timeout_with_cx                | ✓ tick 383      | ✗ documented     |
+| yield_now_with_cx              | (n/a)           | ✓ tick 418       |
+| oneshot_recv_with_cx           | (transitive)    | ✓ tick 419       |
+| broadcast_recv_with_cx         | (transitive)    | ✓ tick 420       |
+| Semaphore::acquire_with_cx     | (transitive)    | ✓ tick 421       |
+| mpsc::Receiver::recv           | (transitive)    | ✓ tick 422       |
+| watch::Receiver::changed       | (transitive)    | ✓ tick 423       |
+
+Every long-lived wait primitive under asupersync short-circuits on a
+pre-cancelled cx via its `cx.checkpoint()?` pre-guard and returns a
+`Cancelled` variant in < 10 ms (verified under a 2 s outer safety-net
+timeout).
 
 ## Interpretation
 
-- All 88 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
+- All 96 tests that land in the ft-xbnl0.2.4 verification surfaces pass together at HEAD. The contract set is self-consistent (no test conflicts with another's assumptions).
 - Compile time after the initial cold build: 0.00s-1.19s per filtered run. All tests now complete in sub-second wall time after tick 387's ft-l9mxa fix (previously Run 1 was 10.02s because the tick-380 snapshot's outer timeout fired; now the inner cancel-watcher race surfaces the cancel in ~70ms).
-- The 34 + 45 + 3 + 3 + 1 + 2 = 88 count covers this-session deliverables AND 32 pre-existing TLS tests that the broadened tick-357 filter smoke-verifies as a side benefit.
+- The 34 + 45 + 3 + 3 + 2 + 9 = 96 count covers this-session deliverables AND 32 pre-existing TLS tests that the broadened tick-357 filter smoke-verifies as a side benefit.
+- Run 6 grew from 2 to 9 tests across ticks 418-423 pinning the
+  long-lived-wait-primitive × cx-cancel matrix across all four
+  channel types (oneshot/broadcast/mpsc/watch) + semaphore + yield.
+  All honour pre-cancelled cx with RecvError::Cancelled /
+  AcquireError::Cancelled in under 10 ms.
 - The evidence and the observable reality agree — no stale or missing
   entries in either direction.
 - The ft-kfkyi security follow-up (3xx transparent redirect following)
