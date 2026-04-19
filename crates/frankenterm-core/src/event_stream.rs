@@ -520,6 +520,14 @@ impl EventWaiter {
     /// Subscribes to the bus and blocks until the condition is met or
     /// timeout expires. Returns the matching event or timeout result.
     pub async fn wait(self, bus: &EventBus) -> WaitResult {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.wait_with_cx(&cx, bus).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let Self {
             condition,
             filter,
@@ -573,6 +581,7 @@ impl EventWaiter {
             Err(_) => WaitResult::Timeout {
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
+        }
         }
     }
 
