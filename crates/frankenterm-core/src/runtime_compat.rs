@@ -228,6 +228,23 @@ impl<T> Mutex<T> {
     /// reports an acquire error. The panic surface is preserved
     /// because changing it would break callers that rely on the legacy
     /// `lock().await` infallible contract.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Distinct contract from the channel / semaphore primitives
+    /// pinned by ft-xbnl0.2.4 ticks 418-439: instead of returning
+    /// an `Err` variant on cancel, `Mutex::lock_with_cx` **panics**
+    /// on any underlying acquire error (including cx-cancel). This is
+    /// an intentional infallible-contract preservation — callers
+    /// originally written against `Mutex::lock()` (no fallible return)
+    /// continue to work without Result-threading. If the caller needs
+    /// to observe cancel cleanly, use the recv/acquire primitives
+    /// instead (see `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1
+    /// for the surface map). Mid-flight cancel observability while
+    /// holding the guard is equivalent to the broader asupersync
+    /// mid-flight gap documented in §2.6.1 — callers needing it
+    /// must apply the select-race pattern around the critical
+    /// section's awaits rather than around the lock acquire itself.
     pub async fn lock_with_cx(&self, cx: &crate::cx::Cx) -> MutexGuard<'_, T> {
         let guard = self
             .inner
@@ -287,6 +304,12 @@ impl<T> RwLock<T> {
     /// threads `&Cx` through its public API. Same panic surface as
     /// [`read`](Self::read) — "runtime_compat rwlock read failed" —
     /// preserved for infallible-contract callers.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Same panic-on-cancel contract as [`Mutex::lock_with_cx`]. See
+    /// that method's doc for the rationale and for the recv/acquire
+    /// alternatives that surface cancel as `Err` cleanly.
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read_with_cx(&self, cx: &crate::cx::Cx) -> RwLockReadGuard<'_, T> {
         let guard = self
@@ -309,6 +332,12 @@ impl<T> RwLock<T> {
     /// Preferred over [`write`](Self::write) when the call site already
     /// threads `&Cx`. Same panic surface as [`write`](Self::write) —
     /// "runtime_compat rwlock write failed".
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Same panic-on-cancel contract as [`Mutex::lock_with_cx`] and
+    /// [`RwLock::read_with_cx`]. See Mutex::lock_with_cx doc for the
+    /// rationale.
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write_with_cx(&self, cx: &crate::cx::Cx) -> RwLockWriteGuard<'_, T> {
         let guard = self
