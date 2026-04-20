@@ -61,17 +61,26 @@ fn arb_pane_entry() -> impl Strategy<Value = PaneEntry> {
         any::<bool>(),                                           // is_zoomed_pane
     );
     let position_and_meta = (
-        arb_small_string(),                                          // workspace
-        0usize..=4096,                                               // cursor_x
-        -10_000isize..=10_000isize,                                  // physical_top
-        0usize..=4096,                                               // top_row
-        0usize..=4096,                                               // left_col
-        prop_oneof![Just(None), arb_small_string().prop_map(Some)],  // tty_name
+        arb_small_string(),                                         // workspace
+        0usize..=4096,                                              // cursor_x
+        -10_000isize..=10_000isize,                                 // physical_top
+        0usize..=4096,                                              // top_row
+        0usize..=4096,                                              // left_col
+        prop_oneof![Just(None), arb_small_string().prop_map(Some)], // tty_name
     );
     (ids_and_content, position_and_meta).prop_map(
         |(
-            (window_id, tab_id, pane_id, title, size, working_dir,
-             alt_screen_active, is_active_pane, is_zoomed_pane),
+            (
+                window_id,
+                tab_id,
+                pane_id,
+                title,
+                size,
+                working_dir,
+                alt_screen_active,
+                is_active_pane,
+                is_zoomed_pane,
+            ),
             (workspace, cursor_x, physical_top, top_row, left_col, tty_name),
         )| PaneEntry {
             window_id,
@@ -94,6 +103,38 @@ fn arb_pane_entry() -> impl Strategy<Value = PaneEntry> {
             tty_name,
         },
     )
+}
+
+fn fixture_pane_entry(
+    window_id: usize,
+    tab_id: usize,
+    pane_id: usize,
+    cols: usize,
+    rows: usize,
+) -> PaneEntry {
+    PaneEntry {
+        window_id,
+        tab_id,
+        pane_id,
+        title: format!("pane-{pane_id}"),
+        size: frankenterm_term::TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            dpi: 96,
+        },
+        working_dir: None,
+        alt_screen_active: false,
+        is_active_pane: pane_id == 1,
+        is_zoomed_pane: false,
+        workspace: "serde-fixture".to_string(),
+        cursor_pos: StableCursorPosition::default(),
+        physical_top: 0,
+        top_row: 0,
+        left_col: 0,
+        tty_name: Some(format!("/tmp/pane-{pane_id}.tty")),
+    }
 }
 
 fn arb_pane_node() -> impl Strategy<Value = PaneNode> {
@@ -164,7 +205,14 @@ fn arb_split_direction_and_size() -> impl Strategy<Value = SplitDirectionAndSize
 fn arb_layout_arrangement() -> impl Strategy<Value = LayoutArrangement> {
     let leaf = any::<bool>().prop_map(|is_main| LayoutArrangement::Slot { is_main });
     leaf.prop_recursive(4, 32, 2, |inner| {
-        (arb_split_direction(), 0.0f64..=1.0f64, inner.clone(), inner).prop_map(
+        // [br-ft-qzunb] Generate ratios as fractions of 10_000 so every
+        // value is of the form n/10_000 and survives a serde_json decimal
+        // roundtrip bit-for-bit. Arbitrary f64 in [0.0, 1.0] loses a
+        // trailing digit of mantissa under JSON's shortest-decimal encoding
+        // (ryu) for most values (e.g. 0.10814827875804041 → 0.1081482787580404),
+        // which breaks prop_assert_eq! on the exact-equality comparison.
+        let ratio = (0u32..=10_000u32).prop_map(|n| f64::from(n) / 10_000.0);
+        (arb_split_direction(), ratio, inner.clone(), inner).prop_map(
             |(direction, ratio, first, second)| LayoutArrangement::Split {
                 direction,
                 ratio,
@@ -253,4 +301,53 @@ proptest! {
         let back: SwapLayout = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
+}
+
+#[test]
+fn pane_node_json_roundtrip_preserves_nested_split_tree() {
+    let value = PaneNode::Split {
+        left: Box::new(PaneNode::Leaf(fixture_pane_entry(7, 11, 1, 80, 12))),
+        right: Box::new(PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(fixture_pane_entry(7, 11, 2, 39, 12))),
+            right: Box::new(PaneNode::Leaf(fixture_pane_entry(7, 11, 3, 40, 12))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: frankenterm_term::TerminalSize {
+                    rows: 12,
+                    cols: 39,
+                    pixel_width: 390,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                second: frankenterm_term::TerminalSize {
+                    rows: 12,
+                    cols: 40,
+                    pixel_width: 400,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+            },
+        }),
+        node: SplitDirectionAndSize {
+            direction: SplitDirection::Vertical,
+            first: frankenterm_term::TerminalSize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 240,
+                dpi: 96,
+            },
+            second: frankenterm_term::TerminalSize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 240,
+                dpi: 96,
+            },
+        },
+    };
+
+    let json = serde_json::to_string(&value).unwrap();
+    let back: PaneNode = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, value);
 }
