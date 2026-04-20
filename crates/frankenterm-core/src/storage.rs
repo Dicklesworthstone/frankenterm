@@ -9636,6 +9636,25 @@ impl StorageHandle {
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<i64> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .insert_session_checkpoint_with_cx(
+                    &cx,
+                    session_id,
+                    checkpoint_type,
+                    state_hash,
+                    pane_count,
+                    total_bytes,
+                    metadata_json,
+                    pane_states,
+                )
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::InsertSessionCheckpoint {
@@ -9651,6 +9670,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
