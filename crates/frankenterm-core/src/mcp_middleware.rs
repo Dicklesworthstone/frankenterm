@@ -211,6 +211,7 @@ mod tests {
         extract_mcp_output_format, parse_mcp_output_format,
     };
     use crate::mcp_framework::FrameworkContent as Content;
+    use proptest::prelude::*;
 
     // ========================================================================
     // McpOutputFormat Tests
@@ -434,5 +435,80 @@ mod tests {
 
         let result = encode_mcp_contents(vec![], McpOutputFormat::Toon).unwrap();
         assert!(result.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_parse_mcp_output_format_normalizes_case_and_whitespace(
+            use_toon in any::<bool>(),
+            leading_ws in "[ \t\n]{0,4}",
+            trailing_ws in "[ \t\n]{0,4}",
+            upper in any::<bool>(),
+        ) {
+            let base = if use_toon { "toon" } else { "json" };
+            let token = if upper {
+                base.to_ascii_uppercase()
+            } else {
+                let mut chars = base.chars();
+                let first = chars.next().unwrap().to_ascii_uppercase();
+                format!("{first}{}", chars.as_str())
+            };
+            let raw = format!("{leading_ws}{token}{trailing_ws}");
+            let expected = if use_toon {
+                McpOutputFormat::Toon
+            } else {
+                McpOutputFormat::Json
+            };
+
+            prop_assert_eq!(parse_mcp_output_format(&raw), Some(expected));
+        }
+
+        #[test]
+        fn prop_extract_mcp_output_format_removes_only_format_key(
+            use_toon in any::<bool>(),
+            pane_id in any::<u64>(),
+            dry_run in any::<bool>(),
+        ) {
+            let mut args = serde_json::json!({
+                "pane_id": pane_id,
+                "dry_run": dry_run,
+                "format": if use_toon { "toon" } else { "json" },
+            });
+
+            let extracted = extract_mcp_output_format(&mut args).expect("format should parse");
+            let expected = if use_toon {
+                McpOutputFormat::Toon
+            } else {
+                McpOutputFormat::Json
+            };
+
+            prop_assert_eq!(extracted, expected);
+            prop_assert!(args.get("format").is_none());
+            prop_assert_eq!(args["pane_id"].as_u64(), Some(pane_id));
+            prop_assert_eq!(args["dry_run"].as_bool(), Some(dry_run));
+        }
+
+        #[test]
+        fn prop_augment_tool_schema_preserves_existing_properties(
+            existing_key in "[A-Za-z_][A-Za-z0-9_]{0,12}",
+        ) {
+            prop_assume!(existing_key != "format");
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    existing_key.clone(): {"type": "integer"}
+                }
+            });
+
+            augment_tool_schema_with_format(&mut schema);
+
+            let properties = schema["properties"].as_object().expect("properties object");
+            prop_assert!(properties.contains_key(&existing_key));
+            prop_assert!(properties.contains_key("format"));
+            prop_assert_eq!(properties[&existing_key]["type"].as_str(), Some("integer"));
+            prop_assert_eq!(properties["format"]["type"].as_str(), Some("string"));
+        }
     }
 }
