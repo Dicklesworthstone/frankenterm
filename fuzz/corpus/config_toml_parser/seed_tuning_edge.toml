@@ -1,0 +1,15 @@
+[wa.tuning.runtime]
+tick_interval_ms = 1
+max_concurrent_panes = 1
+task_queue_depth = 0
+
+[wa.tuning.compression]
+level = 22
+threshold_bytes = 0
+dictionary_size = 0
+
+[wa.tuning.backpressure]
+green_threshold = 0
+yellow_threshold = 0
+red_threshold = 0
+hysteresis_ms = 0

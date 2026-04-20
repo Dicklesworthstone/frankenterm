@@ -968,4 +968,36 @@ mod tests {
             batch_output.metrics.logical_lines
         );
     }
+
+    /// Validate all fuzz corpus seeds don't panic and produce sane output.
+    #[test]
+    fn fuzz_corpus_seeds_no_panic() {
+        let seeds: &[&[u8]] = &[
+            // Truecolor with dangling ESC at end
+            b"\x1b[38;2;255;0;128mTruecolor\x1b[0m \x1b[48;5;196m256col\x1b[0m\x1b",
+            // Multi-byte UTF-8 mixed with ANSI
+            b"\x1b[1m\xe4\xb8\xad\xe6\x96\x87\x1b[0m \xf0\x9f\x9a\x80 A\xcc\x81\n",
+            // Trigger keywords
+            b"ERROR: disk full\n\x1b[33mwarning\x1b[0m: unused var\n   Compiling foo v0.1\ntest result: FAILED. 3 passed; 1 failed\n",
+            // Newline/escape interleave
+            b"\n\n\n\x1b[\n\x1b[31m\n\x1b[0m\n\n\x1b[1;2;3;4;5;6;7;8;9m\n\x1b",
+            // Long SGR param sequence
+            b"\x1b[0;1;2;3;4;5;7;8;9;21;53;38;2;100;200;50;48;2;10;20;30mSTYLED\x1b[0m",
+            // OSC with BEL and ST terminators
+            b"\x1b]0;Window Title\x07\x1b]8;;https://example.com\x1b\\Link\x1b]8;;\x1b\\\n",
+            // DCS/APC/SOS/PM sequences
+            b"\x1bP+q544d\x1b\\\x1b_APC content\x1b\\\x1bX SOS \x1b\\\x1b^ PM \x1b\\\n",
+            // Binary noise mixed with valid escapes
+            b"\xff\xfe\x80\x1b[32m\x00\x01\x02OK\x1b[0m\xff\xc0\n",
+        ];
+
+        for (i, seed) in seeds.iter().enumerate() {
+            let output = quick_scan(seed);
+            assert_eq!(
+                output.input_bytes,
+                seed.len() as u64,
+                "seed {i}: input_bytes mismatch"
+            );
+        }
+    }
 }

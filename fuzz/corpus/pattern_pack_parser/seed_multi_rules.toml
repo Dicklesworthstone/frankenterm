@@ -1,0 +1,29 @@
+name = "test:multi"
+version = "1.0.0"
+
+[[rules]]
+id = "err.panic"
+agent_type = "any"
+event_type = "error"
+severity = "critical"
+anchors = ["panic", "PANIC", "thread.*panicked"]
+regex = "(?i)panic|thread '.*' panicked"
+description = "Rust panic detection"
+
+[[rules]]
+id = "warn.deprecation"
+agent_type = "npm"
+event_type = "warning"
+severity = "warning"
+anchors = ["deprecated", "DEPRECATED"]
+regex = "(?:npm WARN|WARN) deprecated"
+description = "NPM deprecation warnings"
+
+[[rules]]
+id = "prog.download"
+agent_type = "any"
+event_type = "progress"
+severity = "info"
+anchors = ["Downloading", "downloading"]
+regex = "[Dd]ownloading .+ \\(\\d+(\\.\\d+)? [KMG]i?B\\)"
+description = "Download progress"
