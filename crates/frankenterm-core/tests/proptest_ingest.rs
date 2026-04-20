@@ -18,8 +18,9 @@ use frankenterm_core::ingest::{
     ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig, OverflowPolicy,
     PaneCursor, PaneFingerprint, PanePriorityOverride, ShellState, StreamChannel,
     StreamChannelConfig, StreamEvent, StreamIngester, StreamIngesterTelemetrySnapshot,
-    detect_alt_screen_changes, generate_pane_uuid,
+    PersistedCapture, detect_alt_screen_changes, generate_pane_uuid,
 };
+use frankenterm_core::storage::{Gap, Segment};
 use frankenterm_core::wezterm::PaneInfo;
 
 // =============================================================================
@@ -89,6 +90,58 @@ fn arb_content() -> impl Strategy<Value = String> {
 /// Arbitrary reason string for Ignored / Gap.
 fn arb_reason() -> impl Strategy<Value = String> {
     "[a-z_]{1,30}"
+}
+
+fn arb_storage_segment() -> impl Strategy<Value = Segment> {
+    (
+        0i64..1_000_000,
+        arb_pane_id(),
+        0u64..1_000_000,
+        arb_content(),
+        prop::option::of("[0-9a-f]{8,64}"),
+        arb_timestamp(),
+    )
+        .prop_map(|(id, pane_id, seq, content, content_hash, captured_at)| Segment {
+            id,
+            pane_id,
+            seq,
+            content_len: content.len(),
+            content,
+            content_hash,
+            captured_at,
+        })
+}
+
+fn arb_persisted_capture() -> impl Strategy<Value = PersistedCapture> {
+    arb_storage_segment().prop_flat_map(|segment| {
+        let pane_id = segment.pane_id;
+        let seq = segment.seq;
+        let segment_for_gap = segment.clone();
+        prop_oneof![
+            Just(PersistedCapture {
+                segment: segment.clone(),
+                gap: None,
+            }),
+            (
+                0i64..1_000_000,
+                0u64..=seq,
+                seq..=seq.saturating_add(64),
+                arb_reason(),
+                arb_timestamp(),
+            )
+                .prop_map(move |(id, seq_before, seq_after, reason, detected_at)| PersistedCapture {
+                    segment: segment_for_gap.clone(),
+                    gap: Some(Gap {
+                        id,
+                        pane_id,
+                        seq_before,
+                        seq_after,
+                        reason,
+                        detected_at,
+                    }),
+                }),
+        ]
+    })
 }
 
 /// Arbitrary priority value.
@@ -1103,5 +1156,64 @@ proptest! {
         let is_observed = decision.is_observed();
         prop_assert!(!is_observed);
         prop_assert_eq!(decision.ignore_reason(), Some(reason.as_str()));
+    }
+
+    // ── IN-63: OutputCache stats hit_rate reflects observed hit/miss counts ──
+
+    #[test]
+    fn in63_output_cache_stats_hit_rate_consistent(
+        pane_id in arb_pane_id(),
+        first in "[a-z]{1,24}",
+        second in "[a-z]{1,24}",
+    ) {
+        let mut cache = OutputCache::with_defaults();
+        let _ = cache.is_new(pane_id, &first);
+        let _ = cache.is_new(pane_id, &first);
+        let _ = cache.is_new(pane_id, &second);
+
+        let stats = cache.stats();
+        let total = stats.hits + stats.misses;
+        let expected_rate = if total == 0 {
+            0.0
+        } else {
+            stats.hits as f64 / total as f64
+        };
+
+        prop_assert_eq!(stats.hits, 1);
+        prop_assert_eq!(stats.misses, 2);
+        prop_assert!((stats.hit_rate - expected_rate).abs() < f64::EPSILON);
+        prop_assert!(stats.pane_entries <= 1);
+    }
+
+    // ── IN-64: PersistedCapture clone preserves segment/gap payloads ─────────
+
+    #[test]
+    fn in64_persisted_capture_clone_preserves_fields(
+        persisted in arb_persisted_capture(),
+    ) {
+        proptest::prop_assume!(persisted.segment.content.len() == persisted.segment.content_len);
+        let cloned = persisted.clone();
+
+        prop_assert_eq!(cloned.segment.id, persisted.segment.id);
+        prop_assert_eq!(cloned.segment.pane_id, persisted.segment.pane_id);
+        prop_assert_eq!(cloned.segment.seq, persisted.segment.seq);
+        prop_assert_eq!(cloned.segment.content, persisted.segment.content);
+        prop_assert_eq!(cloned.segment.content_len, persisted.segment.content_len);
+        prop_assert_eq!(cloned.segment.content_hash, persisted.segment.content_hash);
+        prop_assert_eq!(cloned.segment.captured_at, persisted.segment.captured_at);
+        match (&cloned.gap, &persisted.gap) {
+            (Some(cloned_gap), Some(gap)) => {
+                prop_assert_eq!(cloned_gap.id, gap.id);
+                prop_assert_eq!(cloned_gap.pane_id, gap.pane_id);
+                prop_assert_eq!(cloned_gap.seq_before, gap.seq_before);
+                prop_assert_eq!(cloned_gap.seq_after, gap.seq_after);
+                prop_assert_eq!(&cloned_gap.reason, &gap.reason);
+                prop_assert_eq!(cloned_gap.detected_at, gap.detected_at);
+                prop_assert_eq!(gap.pane_id, persisted.segment.pane_id);
+                prop_assert!(gap.seq_after >= gap.seq_before);
+            }
+            (None, None) => {}
+            _ => prop_assert!(false, "gap presence changed across clone"),
+        }
     }
 }
