@@ -588,6 +588,7 @@ mod tests {
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkResourceHandler as ResourceHandler,
     };
+    use proptest::prelude::*;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -833,6 +834,65 @@ mod tests {
                 "Resource {} missing version",
                 def.uri
             );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_tool_output_as_resource_preserves_uri_and_first_text(
+            uri in "wa://[A-Za-z0-9/_-]{1,32}",
+            first in "[A-Za-z0-9 _.,:/{}\\[\\]\"]{1,64}",
+            second in "[A-Za-z0-9 _.,:/{}\\[\\]\"]{1,64}",
+        ) {
+            let contents = vec![
+                Content::Text { text: first.clone() },
+                Content::Text { text: second },
+            ];
+            let result = tool_output_as_resource(&uri, contents).expect("resource output");
+
+            prop_assert_eq!(result.len(), 1);
+            prop_assert_eq!(&result[0].uri, &uri);
+            prop_assert_eq!(result[0].mime_type.as_deref(), Some("application/json"));
+            prop_assert_eq!(result[0].text.as_deref(), Some(first.as_str()));
+            prop_assert!(result[0].blob.is_none());
+        }
+
+        #[test]
+        fn prop_envelope_as_resource_preserves_success_payload(
+            uri in "wa://[A-Za-z0-9/_-]{1,32}",
+            data in "[A-Za-z0-9 _.,:/-]{1,64}",
+            elapsed_ms in any::<u64>(),
+        ) {
+            let envelope = McpEnvelope::success(data.clone(), elapsed_ms);
+            let result = envelope_as_resource(&uri, envelope).expect("envelope resource");
+            let parsed: serde_json::Value =
+                serde_json::from_str(result[0].text.as_ref().expect("text payload")).expect("json");
+
+            prop_assert_eq!(&result[0].uri, &uri);
+            prop_assert_eq!(parsed["ok"].as_bool(), Some(true));
+            prop_assert_eq!(parsed["data"].as_str(), Some(data.as_str()));
+            prop_assert_eq!(parsed["elapsed_ms"].as_u64(), Some(elapsed_ms));
+            prop_assert_eq!(parsed["mcp_version"].as_str(), Some("v1"));
+        }
+
+        #[test]
+        fn prop_template_resources_keep_json_contract(service in "[A-Za-z0-9_-]{1,24}") {
+            let db = db_path();
+            let accounts = WaAccountsByServiceTemplateResource::new(Arc::clone(&db));
+            let events = WaEventsTemplateResource::new(db);
+
+            let accounts_template = accounts.template().expect("accounts template");
+            let events_template = events.template().expect("events template");
+
+            prop_assert_eq!(accounts_template.uri_template, "wa://accounts/{service}");
+            prop_assert_eq!(events_template.uri_template, "wa://events/{limit}");
+            prop_assert_eq!(accounts_template.mime_type.as_deref(), Some("application/json"));
+            prop_assert_eq!(events_template.mime_type.as_deref(), Some("application/json"));
+            prop_assert!(accounts_template.tags.contains(&"accounts".to_string()));
+            prop_assert!(events_template.tags.contains(&"events".to_string()));
+            prop_assert!(!service.is_empty());
         }
     }
 }
