@@ -16,6 +16,7 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+use frankenterm_core::agent_provider::AgentProvider;
 use frankenterm_core::caut::{
     CautAccountUsage, CautClient, CautError, CautRefresh, CautService, CautUsage,
 };
@@ -198,6 +199,29 @@ fn arb_caut_error() -> impl Strategy<Value = CautError> {
     ]
 }
 
+fn arb_caut_service() -> impl Strategy<Value = CautService> {
+    prop_oneof![
+        Just(CautService::OpenAI),
+        Just(CautService::Anthropic),
+        Just(CautService::Google),
+    ]
+}
+
+fn arb_service_alias() -> impl Strategy<Value = (String, CautService)> {
+    prop_oneof![
+        Just(("openai".to_string(), CautService::OpenAI)),
+        Just(("codex".to_string(), CautService::OpenAI)),
+        Just(("chatgpt".to_string(), CautService::OpenAI)),
+        Just(("gpt-4".to_string(), CautService::OpenAI)),
+        Just(("anthropic".to_string(), CautService::Anthropic)),
+        Just(("claude".to_string(), CautService::Anthropic)),
+        Just(("claude-code".to_string(), CautService::Anthropic)),
+        Just(("google".to_string(), CautService::Google)),
+        Just(("gemini".to_string(), CautService::Google)),
+        Just(("gemini-cli".to_string(), CautService::Google)),
+    ]
+}
+
 // =============================================================================
 // CautService tests
 // =============================================================================
@@ -232,6 +256,41 @@ proptest! {
     fn caut_service_debug_contains_openai(_seed in 0u32..1000) {
         let debug = format!("{:?}", CautService::OpenAI);
         prop_assert!(debug.contains("OpenAI"), "Debug must contain OpenAI, got: {}", debug);
+    }
+
+    #[test]
+    fn caut_service_cli_aliases_parse(
+        alias_and_expected in arb_service_alias(),
+    ) {
+        let (alias, expected) = alias_and_expected;
+        let parsed = CautService::from_cli_input(&alias);
+        prop_assert_eq!(parsed, Some(expected), "alias {} should parse to {:?}", alias, expected);
+    }
+
+    #[test]
+    fn caut_service_provider_mapping_roundtrip(
+        service in arb_caut_service(),
+    ) {
+        let provider = service.provider_hint();
+        let reparsed = CautService::from_provider(&provider);
+        prop_assert_eq!(reparsed, Some(service), "provider_hint/from_provider should roundtrip");
+
+        let expected_arg = match service {
+            CautService::OpenAI => "codex",
+            CautService::Anthropic => "claude",
+            CautService::Google => "gemini",
+        };
+        prop_assert_eq!(service.provider_arg(), expected_arg, "provider_arg mismatch");
+    }
+
+    #[test]
+    fn caut_service_unknown_provider_aliases_map_when_supported(
+        alias_and_expected in arb_service_alias(),
+    ) {
+        let (alias, expected) = alias_and_expected;
+        let provider = AgentProvider::Unknown(alias.clone());
+        let reparsed = CautService::from_provider(&provider);
+        prop_assert_eq!(reparsed, Some(expected), "unknown provider alias {} should map", alias);
     }
 }
 
