@@ -11169,6 +11169,14 @@ impl StorageHandle {
     /// Returns the token record if found, regardless of whether it's expired or consumed.
     /// Use this for validation and dry-run checks.
     pub async fn get_approval_token(&self, code_hash: &str) -> Result<Option<ApprovalTokenRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_approval_token_with_cx(&cx, code_hash).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let code_hash = code_hash.to_string();
 
@@ -11180,6 +11188,7 @@ impl StorageHandle {
             query_approval_token_by_hash(&conn, &code_hash)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token`].
@@ -11192,7 +11201,17 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_approval_token cancelled: {err}"))
         })?;
-        self.get_approval_token(code_hash).await
+        let db_path = Arc::clone(&self.db_path);
+        let code_hash = code_hash.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_approval_token_by_hash(&conn, &code_hash)
+        })
+        .await
     }
 
     /// Get the maximum sequence number for a pane (to resume capture).
