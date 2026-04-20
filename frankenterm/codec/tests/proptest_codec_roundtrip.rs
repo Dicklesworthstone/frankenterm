@@ -3,8 +3,9 @@ use codec::{
     GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
     LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize,
     SelectStackPane, SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabTitleChanged, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow, TabResized,
+    TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::ClientId;
@@ -283,6 +284,15 @@ fn arb_tab_title_changed() -> impl Strategy<Value = TabTitleChanged> {
 fn arb_window_title_changed() -> impl Strategy<Value = WindowTitleChanged> {
     (0u64..=4096, arb_small_string())
         .prop_map(|(window_id, title)| WindowTitleChanged { window_id, title })
+}
+
+fn arb_tab_added_to_window() -> impl Strategy<Value = TabAddedToWindow> {
+    (0u64..=4096, 0u64..=4096)
+        .prop_map(|(tab_id, window_id)| TabAddedToWindow { tab_id, window_id })
+}
+
+fn arb_tab_resized() -> impl Strategy<Value = TabResized> {
+    (0u64..=4096).prop_map(|tab_id| TabResized { tab_id })
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
@@ -564,6 +574,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SetPaneZoomed(payload));
+    }
+
+    #[test]
+    fn tab_added_to_window_json_and_pdu_roundtrip(
+        payload in arb_tab_added_to_window(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: TabAddedToWindow = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::TabAddedToWindow(payload));
+    }
+
+    #[test]
+    fn tab_resized_json_and_pdu_roundtrip(
+        payload in arb_tab_resized(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: TabResized = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::TabResized(payload));
     }
 
     #[test]
