@@ -16,3 +16,4 @@ frankenterm-dynamic.workspace = true
 [dev-dependencies]
 ordered-float.workspace = true
 mlua = { workspace = true, features = ["vendored", "lua54", "send"] }
+proptest = "1.8.0"

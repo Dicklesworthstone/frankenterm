@@ -1,6 +1,7 @@
 use super::*;
 use frankenterm_dynamic::{FromDynamic, ToDynamic, Value as DynValue};
 use ordered_float::OrderedFloat;
+use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 fn lua() -> mlua::Lua {
@@ -714,6 +715,23 @@ enum DemoAction {
     NeedsArgs { name: String },
 }
 
+fn arb_small_string() -> impl Strategy<Value = String> {
+    proptest::collection::vec(any::<char>(), 0..24).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn arb_demo_struct() -> impl Strategy<Value = DemoStruct> {
+    arb_small_string().prop_map(|name| DemoStruct { name })
+}
+
+fn arb_demo_action() -> impl Strategy<Value = DemoAction> {
+    prop_oneof![
+        Just(DemoAction::Quit),
+        (arb_small_string(), any::<bool>())
+            .prop_map(|(label, flag)| { DemoAction::Defaultable(DemoArgs { label, flag }) }),
+        arb_small_string().prop_map(|name| DemoAction::NeedsArgs { name }),
+    ]
+}
+
 #[derive(Clone)]
 struct PlainUserData;
 impl mlua::UserData for PlainUserData {}
@@ -798,6 +816,27 @@ fn impl_lua_conversion_dynamic_roundtrip_for_struct() {
     assert_eq!(parsed, original);
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn proptest_demo_struct_lua_roundtrip(original in arb_demo_struct()) {
+        let l = lua();
+        let lua_value = to_lua(&l, original.clone()).unwrap();
+        let parsed: DemoStruct = from_lua(lua_value).unwrap();
+        prop_assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn proptest_demo_action_lua_roundtrip(original in arb_demo_action()) {
+        let l = lua();
+        install_demo_enum(&l);
+        let lua_value = to_lua(&l, original.clone()).unwrap();
+        let parsed: DemoAction = from_lua(lua_value).unwrap();
+        prop_assert_eq!(parsed, original);
+    }
+}
+
 #[test]
 fn userdata_wezterm_to_dynamic_success_path() {
     let l = lua();
@@ -840,9 +879,10 @@ fn userdata_wezterm_to_dynamic_error_path() {
     .unwrap();
 
     let err = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("error calling __wezterm_to_dynamic"));
+    assert!(
+        err.to_string()
+            .contains("error calling __wezterm_to_dynamic")
+    );
 }
 
 #[test]
