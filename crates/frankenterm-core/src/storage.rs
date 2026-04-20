@@ -8258,8 +8258,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("count_events_by_tier cancelled: {err}"))
         })?;
-        self.count_events_by_tier(before_ts, severities, event_types, handled)
-            .await
+        let db_path = Arc::clone(&self.db_path);
+        let severities = severities.to_vec();
+        let event_types = event_types.to_vec();
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
+        })
+        .await
     }
 
     /// Count audit_actions older than a cutoff (read-path).
