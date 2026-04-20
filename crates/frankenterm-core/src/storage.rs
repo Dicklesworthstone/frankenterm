@@ -9759,6 +9759,16 @@ impl StorageHandle {
 
     /// Mark a session as cleanly shut down.
     pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .mark_session_shutdown_clean_with_cx(&cx, session_id)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::MarkSessionShutdownClean {
@@ -9768,6 +9778,7 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
