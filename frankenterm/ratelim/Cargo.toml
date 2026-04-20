@@ -7,3 +7,6 @@ publish = false
 [dependencies]
 config.workspace = true
 governor.workspace = true
+
+[dev-dependencies]
+proptest = "1.8.0"

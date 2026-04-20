@@ -86,3 +86,41 @@ impl RateLimiter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn expected_fresh_admit(capacity: u32, mut amount: u32) -> u32 {
+        loop {
+            if amount == 0 {
+                return 0;
+            }
+            if amount <= capacity {
+                return amount;
+            }
+            amount /= 2;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn fresh_limiter_halves_to_largest_immediately_admissible_chunk(
+            capacity in 1u32..=256,
+            amount in 0u32..=4096,
+        ) {
+            let mut limiter = RateLimiter::new(move |_| capacity);
+            let admitted = limiter.admit_check(amount).expect("fresh limiter should admit");
+            prop_assert_eq!(admitted, expected_fresh_admit(capacity, amount));
+        }
+    }
+
+    #[test]
+    fn zero_amount_admit_check_returns_zero() {
+        let mut limiter = RateLimiter::new(|_| 8);
+        assert_eq!(limiter.admit_check(0).unwrap(), 0);
+    }
+}
