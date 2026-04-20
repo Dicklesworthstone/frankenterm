@@ -1566,4 +1566,312 @@ mod tests {
             assert_eq!(format!("{:?}", status.state), "Closed");
         });
     }
+
+    // ========================================================================
+    // Cx-first LabRuntime retry tests (ft-xbnl0.2.5 coverage)
+    // ========================================================================
+
+    /// Helper: run a closure inside a LabRuntime task.
+    #[cfg(feature = "asupersync-runtime")]
+    fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(seed)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(100_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                f().await;
+            })
+            .expect("spawn lab task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+    }
+
+    /// Pre-cancelled cx returns Cancelled immediately from with_retry_cx
+    /// without invoking the operation closure at all.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_cx_pre_cancelled_returns_cancelled() {
+        let invoked = Arc::new(AtomicU32::new(0));
+        let invoked_task = Arc::clone(&invoked);
+
+        run_lab(0xCA0C_E100, move || async move {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel retry test"),
+            );
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let result = with_retry_cx(&cx, &policy, || {
+                invoked_task.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(42) }
+            })
+            .await;
+            assert!(result.is_err(), "pre-cancelled cx must return error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("cancelled"),
+                "error must mention cancellation: {err_msg}"
+            );
+        });
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "operation must not be invoked when cx is pre-cancelled"
+        );
+    }
+
+    /// with_retry_outcome_cx cancel after first attempt: the operation fails
+    /// once, then cx is cancelled before the next attempt boundary check,
+    /// so the retry loop returns Cancelled instead of continuing.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_outcome_cx_cancel_after_first_attempt_returns_cancelled() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_task = Arc::clone(&attempts);
+        let got_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let got_cancelled_task = Arc::clone(&got_cancelled);
+
+        run_lab(0xCA0C_E200, move || async move {
+            let cx = crate::cx::for_request();
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(10),
+            };
+
+            let cancel_cx = cx.clone();
+            let outcome = with_retry_outcome_cx(&cx, &policy, || {
+                let n = attempts_task.fetch_add(1, Ordering::SeqCst);
+                let ccx = cancel_cx.clone();
+                async move {
+                    if n == 0 {
+                        // First attempt: fail, then cancel cx so next
+                        // attempt-boundary check sees cancellation.
+                        ccx.cancel_with(
+                            crate::outcome::CancelKind::User,
+                            Some("cancel after first attempt"),
+                        );
+                    }
+                    Err::<u32, _>(Error::Runtime(format!("attempt {n} fail")))
+                }
+            })
+            .await;
+
+            if let Err(Error::Cancelled(_)) = &outcome.result {
+                got_cancelled_task.store(true, Ordering::SeqCst);
+            }
+        });
+        assert!(
+            got_cancelled.load(Ordering::SeqCst),
+            "retry must surface Cancelled when cx cancelled after first attempt"
+        );
+        // Exactly 1 attempt: the operation fires once, cancels cx, then
+        // either the backoff sleep or the next attempt-boundary check
+        // returns Cancelled.
+        let a = attempts.load(Ordering::SeqCst);
+        assert!(
+            a == 1,
+            "expected exactly 1 attempt before cancel surfaces, got {a}"
+        );
+    }
+
+    /// with_retry_and_circuit_cx returns CircuitOpen when circuit is open,
+    /// without invoking the operation.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_and_circuit_cx_open_circuit_returns_circuit_open() {
+        let invoked = Arc::new(AtomicU32::new(0));
+        let invoked_task = Arc::clone(&invoked);
+
+        run_lab(0xC1AC_0001, move || async move {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+            let cx = crate::cx::for_request();
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
+            // Trip the circuit by recording failures
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(2, 1, Duration::from_secs(300)));
+            circuit.record_failure();
+            circuit.record_failure();
+            assert!(!circuit.allow(), "circuit must be open after 2 failures");
+
+            let result = with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || {
+                invoked_task.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(99) }
+            })
+            .await;
+
+            assert!(result.is_err(), "open circuit must return error");
+            let err_msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                err_msg.contains("CircuitOpen"),
+                "error must be CircuitOpen: {err_msg}"
+            );
+        });
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "operation must not be invoked when circuit is open"
+        );
+    }
+
+    /// with_retry_and_circuit_cx pre-cancelled cx returns Cancelled and
+    /// records a failure on the circuit breaker.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_and_circuit_cx_pre_cancelled_returns_cancelled() {
+        run_lab(0xC1AC_0002, || async move {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel circuit retry"),
+            );
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(5, 1, Duration::from_secs(60)));
+
+            let result = with_retry_and_circuit_cx(&cx, &policy, &mut circuit, || async {
+                Ok::<_, Error>(42)
+            })
+            .await;
+
+            assert!(result.is_err(), "pre-cancelled cx must return error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("cancelled"),
+                "error must mention cancellation: {err_msg}"
+            );
+        });
+    }
+
+    /// with_smart_retry_cx pre-cancelled cx returns Cancelled immediately.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_smart_retry_cx_pre_cancelled_returns_cancelled() {
+        let invoked = Arc::new(AtomicU32::new(0));
+        let invoked_task = Arc::clone(&invoked);
+
+        run_lab(0x50A0_7001, move || async move {
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel smart retry"),
+            );
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let result = with_smart_retry_cx(&cx, &policy, || {
+                invoked_task.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(42) }
+            })
+            .await;
+
+            assert!(result.is_err(), "pre-cancelled cx must return error");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("cancelled"),
+                "error must mention cancellation: {err_msg}"
+            );
+        });
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "smart retry must not invoke operation when cx is pre-cancelled"
+        );
+    }
+
+    /// with_retry_outcome_cx succeeds on first attempt under LabRuntime
+    /// and reports attempts=1 with Ok result.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_outcome_cx_first_try_success() {
+        run_lab(0xF105_7000, || async move {
+            let cx = crate::cx::for_request();
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(50),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
+            let outcome =
+                with_retry_outcome_cx(&cx, &policy, || async { Ok::<_, Error>(777) }).await;
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.result.unwrap(), 777);
+            assert_eq!(outcome.attempts, 1, "first-try success should report 1 attempt");
+        });
+    }
+
+    /// with_retry_outcome_cx exhausts max_attempts and returns last error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn with_retry_outcome_cx_exhausts_retries() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_task = Arc::clone(&attempts);
+
+        run_lab(0xE00A_0001, move || async move {
+            let cx = crate::cx::for_request();
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(20),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(3),
+            };
+            let outcome = with_retry_outcome_cx(&cx, &policy, || {
+                attempts_task.fetch_add(1, Ordering::SeqCst);
+                async { Err::<u32, _>(Error::Runtime("always fail".into())) }
+            })
+            .await;
+            assert!(outcome.result.is_err());
+            assert_eq!(outcome.attempts, 3, "must exhaust all 3 attempts");
+        });
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "operation must be invoked exactly 3 times"
+        );
+    }
 }
