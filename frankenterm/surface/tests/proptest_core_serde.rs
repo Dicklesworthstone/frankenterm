@@ -183,3 +183,27 @@ fn surface_add_change_advances_seqno_and_marks_dirty_since_prior_seq() {
     assert!(surface.has_changes(0));
     assert!(!surface.has_changes(1));
 }
+
+#[test]
+fn surface_resize_without_pending_changes_keeps_seqno_stable() {
+    let mut surface = Surface::new(2, 1);
+
+    surface.resize(5, 4);
+
+    assert_eq!(surface.dimensions(), (5, 4));
+    assert_eq!(surface.current_seqno(), 0);
+    assert!(!surface.has_changes(0));
+}
+
+#[test]
+fn surface_resize_with_pending_changes_invalidates_change_log_and_bumps_seqno() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+
+    surface.resize(5, 4);
+
+    assert_eq!(surface.dimensions(), (5, 4));
+    assert_eq!(surface.current_seqno(), 2);
+    assert!(surface.has_changes(1));
+    assert!(!surface.has_changes(2));
+}
