@@ -8729,6 +8729,14 @@ impl StorageHandle {
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
     pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_pane_indexing_stats_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8737,6 +8745,7 @@ impl StorageHandle {
             get_pane_indexing_stats_sync(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_indexing_stats`].
@@ -8748,7 +8757,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_pane_indexing_stats cancelled: {err}"))
         })?;
-        self.get_pane_indexing_stats().await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_pane_indexing_stats_sync(&conn)
+        })
+        .await
     }
 
     /// Get a full indexing health report (per-pane stats + FTS integrity).
