@@ -1,8 +1,9 @@
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, ErrorResponse,
     GetClientList, GetCodecVersion, GetCodecVersionResponse, GetPaneDirection,
-    GetPaneDirectionResponse, GetPaneRenderChanges, GetTlsCreds, GetTlsCredsResponse, KillPane,
-    ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
+    GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderableDimensions,
+    GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
+    LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
     RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane, SendPaste, SetActiveWorkspace,
     SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
     SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
@@ -12,6 +13,7 @@ use codec::{
 use config::keyassignment::PaneDirection;
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::ClientId;
+use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -310,6 +312,55 @@ fn arb_activate_pane_direction() -> impl Strategy<Value = ActivatePaneDirection>
 
 fn arb_get_pane_render_changes() -> impl Strategy<Value = GetPaneRenderChanges> {
     (0u64..=4096).prop_map(|pane_id| GetPaneRenderChanges { pane_id })
+}
+
+fn arb_get_pane_renderable_dimensions() -> impl Strategy<Value = GetPaneRenderableDimensions> {
+    (0u64..=4096).prop_map(|pane_id| GetPaneRenderableDimensions { pane_id })
+}
+
+fn arb_get_pane_renderable_dimensions_response()
+-> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
+    (
+        0u64..=4096,
+        any::<bool>(),
+        any::<bool>(),
+        0usize..=4096,
+        0usize..=4096,
+        0usize..=4096,
+        0u32..=960,
+    )
+        .prop_map(
+            |(
+                pane_id,
+                reverse_video,
+                tiering_enabled,
+                cols,
+                viewport_rows,
+                scrollback_rows,
+                dpi,
+            )| {
+                let cursor_position = StableCursorPosition::default();
+                let dimensions = RenderableDimensions {
+                    cols,
+                    viewport_rows,
+                    scrollback_rows,
+                    dpi,
+                    reverse_video,
+                    ..RenderableDimensions::default()
+                };
+                let tiered_scrollback_status = Some(PaneTieredScrollbackStatus {
+                    tiering_enabled,
+                    ..PaneTieredScrollbackStatus::default()
+                });
+
+                GetPaneRenderableDimensionsResponse {
+                    pane_id,
+                    cursor_position,
+                    dimensions,
+                    tiered_scrollback_status,
+                }
+            },
+        )
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -791,6 +842,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChanges(payload));
+    }
+
+    #[test]
+    fn get_pane_renderable_dimensions_json_and_pdu_roundtrip(
+        payload in arb_get_pane_renderable_dimensions(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneRenderableDimensions = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneRenderableDimensions(payload));
+    }
+
+    #[test]
+    fn get_pane_renderable_dimensions_response_json_and_pdu_roundtrip(
+        payload in arb_get_pane_renderable_dimensions_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneRenderableDimensionsResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneRenderableDimensionsResponse(payload));
     }
 
     #[test]
