@@ -1,11 +1,12 @@
 use codec::{
-    AdjustPaneSize, CreateFloatingPane, CycleStack, ErrorResponse, GetClientList, GetCodecVersion,
-    GetCodecVersionResponse, GetPaneDirection, GetPaneDirectionResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
-    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane,
-    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, ErrorResponse,
+    GetClientList, GetCodecVersion, GetCodecVersionResponse, GetPaneDirection,
+    GetPaneDirectionResponse, GetPaneRenderChanges, GetTlsCreds, GetTlsCredsResponse, KillPane,
+    ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
+    RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane, SendPaste, SetActiveWorkspace,
+    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
+    SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
+    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
     WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::PaneDirection;
@@ -300,6 +301,15 @@ fn arb_adjust_pane_size() -> impl Strategy<Value = AdjustPaneSize> {
             amount,
         }
     })
+}
+
+fn arb_activate_pane_direction() -> impl Strategy<Value = ActivatePaneDirection> {
+    (0u64..=4096, arb_pane_direction())
+        .prop_map(|(pane_id, direction)| ActivatePaneDirection { pane_id, direction })
+}
+
+fn arb_get_pane_render_changes() -> impl Strategy<Value = GetPaneRenderChanges> {
+    (0u64..=4096).prop_map(|pane_id| GetPaneRenderChanges { pane_id })
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -757,6 +767,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::RemoveFloatingPane(payload));
+    }
+
+    #[test]
+    fn activate_pane_direction_json_and_pdu_roundtrip(
+        payload in arb_activate_pane_direction(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: ActivatePaneDirection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::ActivatePaneDirection(payload));
+    }
+
+    #[test]
+    fn get_pane_render_changes_json_and_pdu_roundtrip(
+        payload in arb_get_pane_render_changes(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneRenderChanges = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChanges(payload));
     }
 
     #[test]
