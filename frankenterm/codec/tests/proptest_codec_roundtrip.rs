@@ -1,22 +1,24 @@
+use chrono::TimeZone;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
-    ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse, GetPaneDirection,
-    GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderableDimensions,
+    ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
+    GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderableDimensions,
     GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
     LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
-    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SelectStackPane,
-    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
+    SelectStackPane, SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
+    SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout,
+    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
-use mux::client::ClientId;
+use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
@@ -254,6 +256,30 @@ fn arb_set_client_id() -> impl Strategy<Value = SetClientId> {
     })
 }
 
+fn arb_client_info() -> impl Strategy<Value = ClientInfo> {
+    (
+        arb_client_id(),
+        0i64..=4_102_444_800,
+        prop::option::of(arb_small_string()),
+        0i64..=4_102_444_800,
+        prop::option::of(0u64..=4096),
+    )
+        .prop_map(
+            |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| ClientInfo {
+                client_id: Arc::new(client_id),
+                connected_at: chrono::Utc.timestamp_opt(connected_at, 0).unwrap(),
+                active_workspace,
+                last_input: chrono::Utc.timestamp_opt(last_input, 0).unwrap(),
+                focused_pane_id,
+            },
+        )
+}
+
+fn arb_get_client_list_response() -> impl Strategy<Value = GetClientListResponse> {
+    proptest::collection::vec(arb_client_info(), 0..=8)
+        .prop_map(|clients| GetClientListResponse { clients })
+}
+
 fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
     (0u64..=4096, any::<bool>())
         .prop_map(|(pane_id, is_alive)| LivenessResponse { pane_id, is_alive })
@@ -459,6 +485,30 @@ fn arb_search_scrollback_request() -> impl Strategy<Value = SearchScrollbackRequ
         })
 }
 
+fn arb_search_result() -> impl Strategy<Value = mux::pane::SearchResult> {
+    (
+        any::<i64>(),
+        0usize..=1024,
+        any::<i64>(),
+        0usize..=1024,
+        0usize..=1024,
+    )
+        .prop_map(
+            |(start_y, start_x, end_y, end_x, match_id)| mux::pane::SearchResult {
+                start_y,
+                start_x,
+                end_y,
+                end_x,
+                match_id,
+            },
+        )
+}
+
+fn arb_search_scrollback_response() -> impl Strategy<Value = SearchScrollbackResponse> {
+    proptest::collection::vec(arb_search_result(), 0..=16)
+        .prop_map(|results| SearchScrollbackResponse { results })
+}
+
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, serial).unwrap();
@@ -642,6 +692,18 @@ proptest! {
     #[test]
     fn get_client_list_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::GetClientList(GetClientList {}));
+    }
+
+    #[test]
+    fn get_client_list_response_json_and_pdu_roundtrip(
+        payload in arb_get_client_list_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetClientListResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetClientListResponse(payload));
     }
 
     #[test]
@@ -930,6 +992,18 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SearchScrollbackRequest(payload));
+    }
+
+    #[test]
+    fn search_scrollback_response_json_and_pdu_roundtrip(
+        payload in arb_search_scrollback_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SearchScrollbackResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SearchScrollbackResponse(payload));
     }
 
     #[test]
