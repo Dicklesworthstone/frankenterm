@@ -1,12 +1,13 @@
 use codec::{
-    CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
-    GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
-    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize,
-    SelectStackPane, SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow, TabResized,
-    TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    AdjustPaneSize, CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion,
+    GetCodecVersionResponse, GetPaneDirection, GetPaneDirectionResponse, GetTlsCreds,
+    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, PaneFocused, PaneRemoved, Pdu,
+    Ping, Pong, RenameWorkspace, Resize, SelectStackPane, SendPaste, SetActiveWorkspace,
+    SetClientId, SetClipboard, SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace,
+    TabAddedToWindow, TabResized, TabTitleChanged, UnitResponse, UpdatePaneConstraints,
+    WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
+use config::keyassignment::PaneDirection;
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::ClientId;
 use mux::tab::FloatingPaneRect;
@@ -253,6 +254,32 @@ fn arb_set_pane_zoomed() -> impl Strategy<Value = SetPaneZoomed> {
             containing_tab_id,
             pane_id,
             zoomed,
+        }
+    })
+}
+
+fn arb_pane_direction() -> impl Strategy<Value = PaneDirection> {
+    prop_oneof![
+        Just(PaneDirection::Up),
+        Just(PaneDirection::Down),
+        Just(PaneDirection::Left),
+        Just(PaneDirection::Right),
+        Just(PaneDirection::Next),
+        Just(PaneDirection::Prev),
+    ]
+}
+
+fn arb_get_pane_direction() -> impl Strategy<Value = GetPaneDirection> {
+    (0u64..=4096, arb_pane_direction())
+        .prop_map(|(pane_id, direction)| GetPaneDirection { pane_id, direction })
+}
+
+fn arb_adjust_pane_size() -> impl Strategy<Value = AdjustPaneSize> {
+    (0u64..=4096, arb_pane_direction(), 0usize..=256).prop_map(|(pane_id, direction, amount)| {
+        AdjustPaneSize {
+            pane_id,
+            direction,
+            amount,
         }
     })
 }
@@ -598,6 +625,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::TabResized(payload));
+    }
+
+    #[test]
+    fn get_pane_direction_json_and_pdu_roundtrip(
+        payload in arb_get_pane_direction(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneDirection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneDirection(payload));
+    }
+
+    #[test]
+    fn adjust_pane_size_json_and_pdu_roundtrip(
+        payload in arb_adjust_pane_size(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: AdjustPaneSize = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::AdjustPaneSize(payload));
     }
 
     #[test]
