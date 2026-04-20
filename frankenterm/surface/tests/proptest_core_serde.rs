@@ -163,3 +163,23 @@ fn surface_new_starts_with_visible_cursor_and_empty_title() {
     assert_eq!(surface.cursor_visibility(), CursorVisibility::Visible);
     assert_eq!(surface.title(), "");
 }
+
+#[test]
+fn surface_new_starts_at_seqno_zero_with_no_pending_changes() {
+    let surface = Surface::new(5, 3);
+
+    assert_eq!(surface.current_seqno(), 0);
+    assert!(!surface.has_changes(0));
+}
+
+#[test]
+fn surface_add_change_advances_seqno_and_marks_dirty_since_prior_seq() {
+    let mut surface = Surface::new(2, 1);
+
+    let prior = surface.add_change(Change::Text("x".to_string()));
+
+    assert_eq!(prior, 0);
+    assert_eq!(surface.current_seqno(), 1);
+    assert!(surface.has_changes(0));
+    assert!(!surface.has_changes(1));
+}
