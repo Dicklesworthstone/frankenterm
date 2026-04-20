@@ -482,6 +482,10 @@ required-features = ["asupersync-runtime"]
 name = "event_dedup"
 harness = false
 
+[[bench]]
+name = "bloom_filter_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
