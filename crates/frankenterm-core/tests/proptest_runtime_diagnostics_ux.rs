@@ -445,3 +445,47 @@ fn covered_classes_matches_template_count() {
     let catalog = DiagnosticCatalog::standard();
     assert_eq!(catalog.covered_classes().len(), catalog.count());
 }
+
+proptest! {
+    #[test]
+    fn standard_templates_have_unique_error_codes(_dummy in 0u8..1) {
+        let templates = frankenterm_core::runtime_diagnostics_ux::standard_diagnostic_templates();
+        let mut codes = std::collections::BTreeSet::new();
+        for template in &templates {
+            prop_assert!(
+                codes.insert(template.error_code.clone()),
+                "duplicate error code found: {}",
+                template.error_code
+            );
+        }
+        prop_assert_eq!(codes.len(), templates.len());
+    }
+
+    #[test]
+    fn standard_templates_remediation_steps_are_strictly_ordered(_dummy in 0u8..1) {
+        let templates = frankenterm_core::runtime_diagnostics_ux::standard_diagnostic_templates();
+        for template in &templates {
+            for (idx, step) in template.remediation_steps.iter().enumerate() {
+                prop_assert_eq!(
+                    step.step,
+                    (idx as u32) + 1,
+                    "template {:?} has non-canonical step numbering",
+                    template.failure_class
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standard_catalog_robot_safe_commands_match_template_filter(fc in arb_failure_class()) {
+        let catalog = DiagnosticCatalog::standard();
+        let template = catalog.lookup(&fc).unwrap();
+        let expected: Vec<String> = template
+            .remediation_steps
+            .iter()
+            .filter(|step| step.robot_safe)
+            .filter_map(|step| step.command.clone())
+            .collect();
+        prop_assert_eq!(catalog.robot_safe_commands(&fc), expected);
+    }
+}
