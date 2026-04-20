@@ -3940,6 +3940,90 @@ mod tests {
             });
         }
 
+        // ================================================================
+        // Wait helper coverage (commit 3503a151)
+        // ================================================================
+
+        /// workflow_wait_aborted formats "{label} cancelled: {err}"
+        #[test]
+        fn wait_aborted_error_format() {
+            let err = workflow_wait_aborted("my-label", "some reason");
+            match err {
+                crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                    assert_eq!(reason, "my-label cancelled: some reason");
+                }
+                other => panic!("expected Workflow(Aborted), got: {other:?}"),
+            }
+        }
+
+        /// wait_duration_maybe_cx with cx=None completes after sleep.
+        #[test]
+        fn wait_duration_no_cx_completes() {
+            run_async_test(async {
+                let result =
+                    wait_duration_maybe_cx(None, Duration::from_millis(1), "test-no-cx").await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// wait_duration_maybe_cx with zero duration returns immediately.
+        #[test]
+        fn wait_duration_zero_returns_immediately() {
+            run_async_test(async {
+                let result =
+                    wait_duration_maybe_cx(None, Duration::ZERO, "test-zero").await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// wait_condition_pause_maybe_cx dispatches Sleep variant correctly.
+        #[test]
+        fn wait_condition_sleep_no_cx() {
+            run_async_test(async {
+                let cond = WaitCondition::sleep(1);
+                let result = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(1),
+                    "test-sleep",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// wait_condition_pause_maybe_cx dispatches PaneIdle variant correctly.
+        #[test]
+        fn wait_condition_pane_idle_no_cx() {
+            run_async_test(async {
+                let cond = WaitCondition::pane_idle(1);
+                let result = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(1),
+                    "test-idle",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
+        /// wait_condition_pause_maybe_cx dispatches StableTail variant correctly.
+        #[test]
+        fn wait_condition_stable_tail_no_cx() {
+            run_async_test(async {
+                let cond = WaitCondition::stable_tail(1);
+                let result = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(1),
+                    "test-tail",
+                )
+                .await;
+                assert!(result.is_ok());
+            });
+        }
+
         /// 7. Wait helpers used by `WaitFor` and `SendText(wait_for=...)`
         ///    must surface a cancelled caller context as an aborted
         ///    workflow result instead of falling back to an ambient
