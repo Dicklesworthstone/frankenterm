@@ -5852,6 +5852,7 @@ impl WriteCommandSender {
     }
 }
 
+/// Thread-safe handle to the storage writer and its backing database.
 #[derive(Clone)]
 pub struct StorageHandle {
     /// Sender for write commands

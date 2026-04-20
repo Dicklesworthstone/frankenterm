@@ -1,6 +1,7 @@
 //! Core embedding trait and types.
 use std::fmt;
 
+/// Errors that can occur during text embedding.
 #[derive(Debug)]
 pub enum EmbedError {
     ModelNotFound(String),
@@ -39,6 +40,7 @@ impl From<std::io::Error> for EmbedError {
     }
 }
 
+/// Quality tier of an embedder backend, from fast hashing to full neural inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbedderTier {
     Hash,
@@ -56,6 +58,7 @@ impl fmt::Display for EmbedderTier {
     }
 }
 
+/// Metadata describing an embedder: its name, output dimension, and quality tier.
 #[derive(Debug, Clone)]
 pub struct EmbedderInfo {
     pub name: String,
@@ -63,6 +66,7 @@ pub struct EmbedderInfo {
     pub tier: EmbedderTier,
 }
 
+/// Trait for converting text into fixed-dimension vector embeddings.
 pub trait Embedder: Send + Sync {
     fn info(&self) -> EmbedderInfo;
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError>;

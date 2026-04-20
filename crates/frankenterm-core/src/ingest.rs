@@ -1372,6 +1372,7 @@ pub struct CapturedSegment {
     pub captured_at: i64,
 }
 
+/// Whether a captured segment is a differential delta or a full gap snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedSegmentKind {
     /// Delta extracted from overlap

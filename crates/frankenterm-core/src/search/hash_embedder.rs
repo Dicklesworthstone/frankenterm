@@ -4,6 +4,7 @@ use super::embedder::{EmbedError, Embedder, EmbedderInfo, EmbedderTier};
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
+/// FNV-1a feature-hashing embedder that maps character n-grams to a fixed-size vector.
 #[derive(Debug, Clone)]
 pub struct HashEmbedder {
     dimension: usize,

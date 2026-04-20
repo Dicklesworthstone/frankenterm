@@ -20,6 +20,7 @@ use super::FusedResult;
 
 // ── Error type ──────────────────────────────────────────────────────────
 
+/// Errors that can occur when reranking search results against a query.
 #[derive(Debug)]
 pub enum RerankError {
     ModelError(String),
