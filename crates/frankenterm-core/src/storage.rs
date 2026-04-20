@@ -8583,6 +8583,14 @@ impl StorageHandle {
 
     /// Get a single notification by ID.
     pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_notification_with_cx(&cx, id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8591,6 +8599,7 @@ impl StorageHandle {
             get_notification_sync(&conn, id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_notification`].
@@ -8602,7 +8611,14 @@ impl StorageHandle {
     ) -> Result<NotificationHistoryRecord> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
-        self.get_notification(id).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_notification_sync(&conn, id)
+        })
+        .await
     }
 
     /// Current write queue depth (pending commands waiting for the writer thread).
