@@ -5,13 +5,13 @@ use codec::{
     GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
-    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize,
-    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendPaste, SerializedLines,
-    SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane,
+    MovePaneToNewTabResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane,
+    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
+    SendPaste, SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
+    SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SwapToLayout,
+    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -281,6 +281,22 @@ fn arb_client_info() -> impl Strategy<Value = ClientInfo> {
 fn arb_get_client_list_response() -> impl Strategy<Value = GetClientListResponse> {
     proptest::collection::vec(arb_client_info(), 0..=8)
         .prop_map(|clients| GetClientListResponse { clients })
+}
+
+fn arb_move_pane_to_new_tab_response() -> impl Strategy<Value = MovePaneToNewTabResponse> {
+    (0u64..=4096, 0u64..=4096)
+        .prop_map(|(tab_id, window_id)| MovePaneToNewTabResponse { tab_id, window_id })
+}
+
+fn arb_spawn_response() -> impl Strategy<Value = SpawnResponse> {
+    (0u64..=4096, 0u64..=4096, 0u64..=4096, arb_terminal_size()).prop_map(
+        |(tab_id, pane_id, window_id, size)| SpawnResponse {
+            tab_id,
+            pane_id,
+            window_id,
+            size,
+        },
+    )
 }
 
 fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
@@ -782,6 +798,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetClientListResponse(payload));
+    }
+
+    #[test]
+    fn move_pane_to_new_tab_response_json_and_pdu_roundtrip(
+        payload in arb_move_pane_to_new_tab_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: MovePaneToNewTabResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::MovePaneToNewTabResponse(payload));
+    }
+
+    #[test]
+    fn spawn_response_json_and_pdu_roundtrip(
+        payload in arb_spawn_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SpawnResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SpawnResponse(payload));
     }
 
     #[test]
