@@ -141,6 +141,7 @@ mod tests {
     use crate::cass::CassError;
     use crate::caut::CautError;
     use crate::error::{Error, WeztermError};
+    use proptest::prelude::*;
 
     // ========================================================================
     // Error Code Constants
@@ -378,5 +379,48 @@ mod tests {
         let (code, hint) = map_cass_error(&err);
         assert_eq!(code, MCP_ERR_CASS);
         assert!(hint.is_some());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_mcp_tool_error_from_caut_timeout_aligns_with_mapper(timeout_secs in any::<u64>()) {
+            let err = CautError::Timeout { timeout_secs };
+            let message = err.to_string();
+            let (code, hint) = map_caut_error(&err);
+            let tool_err = McpToolError::from_caut_error(err);
+
+            prop_assert_eq!(tool_err.code, code);
+            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.hint, hint);
+            prop_assert_eq!(tool_err.code, MCP_ERR_TIMEOUT);
+        }
+
+        #[test]
+        fn prop_mcp_tool_error_from_cass_timeout_aligns_with_mapper(timeout_secs in any::<u64>()) {
+            let err = CassError::Timeout { timeout_secs };
+            let message = err.to_string();
+            let (code, hint) = map_cass_error(&err);
+            let tool_err = McpToolError::from_cass_error(err);
+
+            prop_assert_eq!(tool_err.code, code);
+            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.hint, hint);
+            prop_assert_eq!(tool_err.code, MCP_ERR_TIMEOUT);
+        }
+
+        #[test]
+        fn prop_mcp_tool_error_from_error_aligns_with_mapper_for_pane_not_found(pane_id in any::<u64>()) {
+            let err = Error::Wezterm(WeztermError::PaneNotFound(pane_id));
+            let message = err.to_string();
+            let (code, hint) = map_mcp_error(&err);
+            let tool_err = McpToolError::from_error(err);
+
+            prop_assert_eq!(tool_err.code, code);
+            prop_assert_eq!(tool_err.message, message);
+            prop_assert_eq!(tool_err.hint, hint);
+            prop_assert_eq!(tool_err.code, MCP_ERR_PANE_NOT_FOUND);
+        }
     }
 }
