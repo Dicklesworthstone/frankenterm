@@ -76,7 +76,7 @@ fn bimodal_values(n: usize) -> Vec<f64> {
         let v = if r < 0.5 {
             100.0 + r * 40.0
         } else {
-            900.0 + (r - 0.5) * 40.0
+            (r - 0.5).mul_add(40.0, 900.0)
         };
         out.push(v);
     }

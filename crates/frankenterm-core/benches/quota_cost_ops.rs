@@ -63,7 +63,7 @@ fn populate_tracker(pane_count: usize, budget_count: usize) -> CostTracker {
     let budgets: Vec<BudgetThreshold> = (0..budget_count)
         .map(|i| {
             let agent_type = agent_type_at(i).to_string();
-            BudgetThreshold::new(agent_type, 50.0 + i as f64 * 10.0, 0.8)
+            BudgetThreshold::new(agent_type, (i as f64).mul_add(10.0, 50.0), 0.8)
         })
         .collect();
 
@@ -275,7 +275,7 @@ fn bench_quota_gate_evaluate(c: &mut Criterion) {
                 },
                 budget_limit_usd: 100.0,
                 current_cost_usd: 85.0 + i as f64,
-                usage_fraction: 0.85 + i as f64 * 0.01,
+                usage_fraction: (i as f64).mul_add(0.01, 0.85),
             })
             .collect();
         let signals = QuotaSignals {

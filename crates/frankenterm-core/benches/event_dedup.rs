@@ -75,7 +75,7 @@ fn bench_check_new_keys(c: &mut Criterion) {
             |b, &count| {
                 let keys: Vec<String> = (0..count).map(|i| format!("key-{i}")).collect();
                 b.iter_batched(
-                    || EventDeduplicator::new(),
+                    EventDeduplicator::new,
                     |mut dedup| {
                         for key in &keys {
                             black_box(dedup.check(key));

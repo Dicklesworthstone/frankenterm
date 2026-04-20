@@ -127,7 +127,7 @@ fn bench_cross_shard_routing_overhead(c: &mut Criterion) {
                             .await
                             .expect("direct get_text");
                         black_box(text.len());
-                    })
+                    });
                 });
             },
         );
@@ -143,7 +143,7 @@ fn bench_cross_shard_routing_overhead(c: &mut Criterion) {
                             .await
                             .expect("sharded get_text");
                         black_box(text.len());
-                    })
+                    });
                 });
             },
         );
@@ -167,7 +167,7 @@ fn bench_list_all_panes_aggregation(c: &mut Criterion) {
                 rt.block_on(async {
                     let panes = handle.list_panes().await.expect("list panes");
                     black_box(panes.len());
-                })
+                });
             });
         });
     }

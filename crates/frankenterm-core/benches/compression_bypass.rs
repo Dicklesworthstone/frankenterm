@@ -173,7 +173,7 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
 
     match timeout(Duration::from_secs(1), &mut server).await {
         Ok(join_result) => {
-            join_result.map_err(|err| format!("handshake server join failed: {err}"))?
+            join_result.map_err(|err| format!("handshake server join failed: {err}"))?;
         }
         Err(_) => {
             server.abort();
@@ -211,7 +211,7 @@ async fn connect_with_auto_fallback() -> Result<(), String> {
 
     match timeout(Duration::from_secs(1), &mut server).await {
         Ok(join_result) => {
-            join_result.map_err(|err| format!("fallback server join failed: {err}"))?
+            join_result.map_err(|err| format!("fallback server join failed: {err}"))?;
         }
         Err(_) => {
             server.abort();

@@ -110,7 +110,7 @@ proptest! {
         prop_assert_eq!(batch.len(), texts.len());
         for (embedding, text) in batch.iter().zip(texts.iter()) {
             prop_assert_eq!(embedding.len(), dimension);
-            prop_assert!(embedding.iter().all(|value| *value == text.len() as f32));
+            prop_assert!(embedding.iter().all(|value| (*value - text.len() as f32).abs() < f32::EPSILON));
         }
     }
 }

@@ -151,6 +151,7 @@ fn f64_close(a: f64, b: f64) -> bool {
     if a.is_nan() && b.is_nan() {
         return true;
     }
+    #[allow(clippy::float_cmp)]
     if a == b {
         return true;
     }
@@ -272,7 +273,7 @@ proptest! {
     #[test]
     fn hazard_urgency_bounded(rate in unit_f64(), threshold in unit_f64()) {
         let u = hazard_urgency(rate, threshold);
-        prop_assert!(u >= 0.0 && u <= 1.0, "urgency out of bounds: {}", u);
+        prop_assert!((0.0..=1.0).contains(&u), "urgency out of bounds: {}", u);
     }
 
     #[test]
@@ -286,13 +287,13 @@ proptest! {
     #[test]
     fn activity_minimum_bounded(activity in finite_f64()) {
         let am = activity_minimum(activity);
-        prop_assert!(am >= 0.0 && am <= 1.0, "activity_minimum out of bounds: {}", am);
+        prop_assert!((0.0..=1.0).contains(&am), "activity_minimum out of bounds: {}", am);
     }
 
     #[test]
     fn recency_penalty_bounded(hours in positive_f64(), cooldown in positive_f64()) {
         let p = recency_penalty(hours, cooldown);
-        prop_assert!(p >= 0.0 && p <= 1.0, "recency_penalty out of bounds: {}", p);
+        prop_assert!((0.0..=1.0).contains(&p), "recency_penalty out of bounds: {}", p);
     }
 
     #[test]

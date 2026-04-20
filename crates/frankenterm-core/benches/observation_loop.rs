@@ -13,7 +13,7 @@
 #![cfg(feature = "asupersync-runtime")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat;
+use frankenterm_core::runtime_compat::{self, CompatRuntime};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -91,7 +91,7 @@ fn bench_multi_channel_select(c: &mut Criterion) {
                         }
 
                         // Poll each channel (simulating select across N channels)
-                        for (_, rx) in channels.iter_mut() {
+                        for (_, rx) in &mut channels {
                             let val = rx.recv(&cx).await.expect("recv");
                             black_box(val);
                         }

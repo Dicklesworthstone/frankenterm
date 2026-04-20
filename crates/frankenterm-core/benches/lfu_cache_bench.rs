@@ -71,7 +71,7 @@ fn zipf_accesses(n: usize, total_keys: u64) -> Vec<u64> {
             .wrapping_add(1442695040888963407);
         let r = (state >> 33) as f64 / u32::MAX as f64;
         // Power-law: small keys much more likely
-        let key = (r.powf(2.0) * total_keys as f64) as u64;
+        let key = (r.powi(2) * total_keys as f64) as u64;
         out.push(key);
     }
     out

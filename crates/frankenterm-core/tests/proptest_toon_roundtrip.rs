@@ -97,8 +97,6 @@ fn json_values_equivalent(a: &Value, b: &Value) -> bool {
             let yf = y.as_f64().unwrap_or(f64::NAN);
             if xf.is_nan() && yf.is_nan() {
                 true
-            } else if xf == yf {
-                true
             } else {
                 // Use relative tolerance for large values, absolute for small
                 let abs_diff = (xf - yf).abs();
@@ -554,7 +552,7 @@ mod edge_cases {
                 "results": (0..50).map(|i| json!({
                     "segment_id": 10000 + i,
                     "pane_id": i % 8,
-                    "score": 0.95 - (i as f64 * 0.01),
+                    "score": (i as f64).mul_add(-0.01, 0.95),
                     "snippet": format!("error[E0308]: mismatched types at line {}", i * 10 + 1),
                 })).collect::<Vec<_>>()
             },
@@ -567,11 +565,10 @@ mod edge_cases {
         let toon_tokens = estimate_tokens(&toon_str);
 
         // For a 50-result search, we should see meaningful savings
-        let savings_pct = if json_tokens > 0 {
-            100 - (toon_tokens * 100 / json_tokens)
-        } else {
-            0
-        };
+        let savings_pct = (toon_tokens * 100)
+            .checked_div(json_tokens)
+            .map(|ratio| 100 - ratio)
+            .unwrap_or(0);
         assert!(
             savings_pct > 10,
             "expected >10% token savings for search results, got {savings_pct}% \

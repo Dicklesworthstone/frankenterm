@@ -137,6 +137,7 @@ fn gate_inputs_strategy() -> impl Strategy<Value = ReleaseGateInputs> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::float_cmp)]
 fn f64_close(a: f64, b: f64) -> bool {
     if a == b {
         return true;

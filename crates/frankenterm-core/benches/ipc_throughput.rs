@@ -17,7 +17,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer};
 use frankenterm_core::runtime_compat::unix as compat_unix;
-use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder, mpsc, task};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder, mpsc, task};
 
 mod bench_common;
 

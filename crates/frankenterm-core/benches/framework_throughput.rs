@@ -183,7 +183,7 @@ impl McpBenchHarness {
             .tool(BenchEchoTool)
             .build();
         let server_join = thread::spawn(move || {
-            let _ = server.run_transport_returning(server_transport);
+            server.run_transport_returning(server_transport);
         });
 
         let mut client =

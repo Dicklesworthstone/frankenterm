@@ -10,7 +10,10 @@
 //! to not introduce observable latency when instrumenting the input pipeline.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frankenterm_core::input_latency::*;
+use frankenterm_core::input_latency::{
+    InputLatencyBudget, InputLatencyCollector, InputLatencyMeasurement, InputLatencyStage,
+    Percentile, evaluate_budget, generate_report,
+};
 use std::hint::black_box;
 
 mod bench_common;

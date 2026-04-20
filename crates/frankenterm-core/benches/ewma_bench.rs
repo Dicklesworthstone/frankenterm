@@ -47,8 +47,8 @@ fn noisy_metric(n: usize) -> Vec<(f64, u64)> {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let noise = ((state >> 33) as f64 / u32::MAX as f64) * 20.0 - 10.0;
-        let value = 100.0 + (i as f64) * 0.01 + noise;
+        let noise = ((state >> 33) as f64 / u32::MAX as f64).mul_add(20.0, -10.0);
+        let value = (i as f64).mul_add(0.01, 100.0) + noise;
         let time_ms = (i as u64) * 100; // 100ms intervals
         out.push((value, time_ms));
     }
@@ -64,7 +64,7 @@ fn irregular_timestamps(n: usize) -> Vec<u64> {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let interval = 10 + (state >> 58) as u64 * 10; // 10-650ms jitter
+        let interval = 10 + (state >> 58) * 10; // 10-650ms jitter
         t += interval;
         out.push(t);
     }

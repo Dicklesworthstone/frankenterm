@@ -9,7 +9,7 @@
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     RecorderStorage,

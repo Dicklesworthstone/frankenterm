@@ -5,7 +5,7 @@
 //!   - **p50 < 10ms**, **p99 < 50ms** (hard cap: < 50ms for common queries)
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use std::time::SystemTime;
 use tempfile::TempDir;

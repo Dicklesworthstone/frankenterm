@@ -69,7 +69,7 @@ fn tls_materials(mtls: bool) -> io::Result<(TlsAcceptor, TlsConnector)> {
 }
 
 fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 fn bench_tls_handshake(c: &mut Criterion) {
@@ -135,7 +135,7 @@ fn bench_tcp_throughput(c: &mut Criterion) {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 };
 
-                future::join(server, client).await;
+                Box::pin(future::join(server, client)).await;
             });
         });
     });
@@ -179,7 +179,7 @@ fn bench_tls_throughput(c: &mut Criterion) {
                     tls.shutdown().await.unwrap();
                 };
 
-                future::join(server, client).await;
+                Box::pin(future::join(server, client)).await;
             });
         });
     });

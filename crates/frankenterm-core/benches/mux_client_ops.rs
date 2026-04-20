@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use frankenterm_core::runtime_compat::CompatRuntime;
+
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse, Pdu,
     UnitResponse,

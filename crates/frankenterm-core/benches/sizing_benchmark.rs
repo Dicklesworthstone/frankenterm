@@ -23,7 +23,7 @@
 //! | XLarge   | 10M        | ~70 days                               |
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use std::fs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

@@ -2089,7 +2089,7 @@ mod tests {
         let mut expected_seqs = vec![0u64; agent_count];
 
         for msg_idx in 0..msgs_per_agent {
-            for agent_idx in 0..agent_count {
+            for (agent_idx, expected_seq) in expected_seqs.iter_mut().enumerate() {
                 let sender = format!("agent-{agent_idx}");
                 let seq = msg_idx + 1; // 1-based seq
                 let envelope = WireEnvelope::new(
@@ -2102,7 +2102,7 @@ mod tests {
                     matches!(result, IngestResult::Accepted(_)),
                     "agent-{agent_idx} seq {seq} should be accepted"
                 );
-                expected_seqs[agent_idx] = seq;
+                *expected_seq = seq;
             }
         }
 

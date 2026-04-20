@@ -21,17 +21,13 @@ fn workspace_root() -> PathBuf {
 }
 
 fn skip_if_prereqs_missing() -> Option<&'static str> {
-    for tool in ["python3", "jq", "bash"] {
-        if Command::new(tool)
+    ["python3", "jq", "bash"].into_iter().find(|&tool| {
+        Command::new(tool)
             .arg("--version")
             .output()
             .map(|out| !out.status.success())
             .unwrap_or(true)
-        {
-            return Some(tool);
-        }
-    }
-    None
+    })
 }
 
 #[test]

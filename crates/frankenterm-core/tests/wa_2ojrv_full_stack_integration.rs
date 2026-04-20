@@ -25,7 +25,6 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use asupersync::Budget;
 use common::fixtures::{
@@ -322,7 +321,7 @@ fn wa_2ojrv_s5_mid_operation_cancellation() {
             let received = Arc::new(AtomicU64::new(0));
 
             // Producer: emits until cancelled.
-            let mut cancel_rx_prod = cancel_rx.clone();
+            let cancel_rx_prod = cancel_rx.clone();
             let (prod_id, _ph) = runtime
                 .state
                 .create_task(region, Budget::INFINITE, async move {

@@ -59,7 +59,7 @@ fn make_search_hit(i: usize) -> CassSearchHit {
             i * 10 + 5
         )),
         timestamp: Some(format!("2026-04-{:02}T12:00:00Z", (i % 28) + 1)),
-        score: Some(0.95 - (i as f64 * 0.003)),
+        score: Some((i as f64).mul_add(-0.003, 0.95)),
         extra: HashMap::new(),
     }
 }
@@ -200,13 +200,13 @@ fn bench_hint_format(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("hits", hit_count),
             &hits,
-            |b, hits| {
+            |b, hit_list| {
                 b.iter(|| {
-                    let hints: Vec<String> = hits
+                    let hint_count = hit_list
                         .iter()
                         .filter_map(|h| format_hit_as_hint(black_box(h)))
-                        .collect();
-                    black_box(hints.len());
+                        .count();
+                    black_box(hint_count);
                 });
             },
         );

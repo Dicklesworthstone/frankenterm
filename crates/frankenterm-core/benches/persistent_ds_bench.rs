@@ -404,7 +404,7 @@ fn bench_persistent_map_lookup(c: &mut Criterion) {
                     |(m, keys)| {
                         let mut found = 0u64;
                         for k in &keys {
-                            if m.get(k).is_some() {
+                            if m.contains_key(k) {
                                 found += 1;
                             }
                         }

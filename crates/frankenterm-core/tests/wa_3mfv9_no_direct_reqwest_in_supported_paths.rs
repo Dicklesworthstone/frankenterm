@@ -107,9 +107,10 @@ fn scan_file_for_reqwest_use(path: &Path) -> Vec<(usize, String)> {
         .enumerate()
         .filter_map(|(idx, line)| {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("use reqwest") || trimmed.starts_with("pub use reqwest") {
-                Some((idx + 1, line.to_string()))
-            } else if trimmed.starts_with("extern crate reqwest") {
+            if trimmed.starts_with("use reqwest")
+                || trimmed.starts_with("pub use reqwest")
+                || trimmed.starts_with("extern crate reqwest")
+            {
                 Some((idx + 1, line.to_string()))
             } else {
                 None

@@ -63,7 +63,7 @@ fn bursty_traffic(n: usize) -> Vec<(u32, u64)> {
         // Cost: 1-5 tokens
         let cost = 1 + ((state >> 60) as u32 % 5);
         // Inter-arrival: 1-200ms (bursty)
-        let interval = 1 + (state >> 50) as u64 % 200;
+        let interval = 1 + (state >> 50) % 200;
         t += interval;
         out.push((cost, t));
     }
