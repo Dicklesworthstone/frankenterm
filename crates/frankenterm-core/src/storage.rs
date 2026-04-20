@@ -10565,16 +10565,25 @@ impl StorageHandle {
     ///
     /// Returns true if released, false if not found or already released.
     pub async fn release_reservation(&self, reservation_id: i64) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::ReleaseReservation {
-                reservation_id,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.release_reservation_with_cx(&cx, reservation_id).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::ReleaseReservation {
+                    reservation_id,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`release_reservation`].
