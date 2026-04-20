@@ -292,7 +292,10 @@ pub struct WorkflowRunner {
 
 impl WorkflowRunner {
     /// Create a new workflow runner.
-    pub(crate) fn new(
+    ///
+    /// This stays public because the ft CLI and other integration surfaces
+    /// construct runners directly around a shared engine/storage/injector set.
+    pub fn new(
         engine: WorkflowEngine,
         lock_manager: Arc<PaneWorkflowLockManager>,
         storage: Arc<crate::storage::StorageHandle>,

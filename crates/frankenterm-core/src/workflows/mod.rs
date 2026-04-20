@@ -91,8 +91,10 @@ pub struct CxPolicyInjector {
 }
 
 impl CxPolicyInjector {
+    /// Wrap a policy-gated injector in the Cx-aware workflow adapter used by
+    /// cross-crate callers such as the ft CLI.
     #[must_use]
-    pub(crate) fn new(injector: PolicyInjector) -> Self {
+    pub fn new(injector: PolicyInjector) -> Self {
         Self {
             inner: Arc::new(crate::runtime_compat::Mutex::new(injector)),
         }
