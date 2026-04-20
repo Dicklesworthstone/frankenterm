@@ -314,7 +314,7 @@ impl RecordingManager {
     ) -> Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .start_recording_with_cx(&cx, pane_id, path, started_at_ms)
                 .await;
@@ -363,7 +363,7 @@ impl RecordingManager {
     pub async fn stop_recording(&self, pane_id: u64) -> Result<Option<RecorderStats>> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.stop_recording_with_cx(&cx, pane_id).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -397,7 +397,7 @@ impl RecordingManager {
     pub async fn record_segment(&self, segment: &CapturedSegment) -> Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_segment_with_cx(&cx, segment).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -460,7 +460,7 @@ impl RecordingManager {
     ) -> Result<()> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
                 .await;
