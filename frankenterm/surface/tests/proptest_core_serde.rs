@@ -282,3 +282,19 @@ fn get_changes_from_zero_returns_non_empty_repaint_and_current_seqno() {
     assert_eq!(next_seq, seq);
     assert!(!changes.is_empty());
 }
+
+#[test]
+fn surface_new_screen_chars_to_string_is_space_padded_grid() {
+    let surface = Surface::new(2, 2);
+
+    assert_eq!(surface.screen_chars_to_string(), "  \n  \n");
+}
+
+#[test]
+fn add_change_text_updates_screen_chars_to_string() {
+    let mut surface = Surface::new(3, 1);
+
+    surface.add_change(Change::Text("hi".to_string()));
+
+    assert_eq!(surface.screen_chars_to_string(), "hi \n");
+}
