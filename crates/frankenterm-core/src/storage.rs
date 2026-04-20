@@ -7708,16 +7708,25 @@ impl StorageHandle {
 
     /// Purge usage metrics older than a cutoff timestamp.
     pub async fn purge_usage_metrics(&self, before_ts: i64) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::PurgeUsageMetrics {
-                before_ts,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.purge_usage_metrics_with_cx(&cx, before_ts).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::PurgeUsageMetrics {
+                    before_ts,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_usage_metrics`].
@@ -7730,7 +7739,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("purge_usage_metrics cancelled: {err}"))
         })?;
-        self.purge_usage_metrics(before_ts).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PurgeUsageMetrics {
+                    before_ts,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Query usage metrics with filters (read-only, uses read connection).
