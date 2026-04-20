@@ -2,7 +2,7 @@
 
 use frankenterm_surface::hyperlink::Rule;
 use frankenterm_surface::{
-    Change, CursorShape, CursorVisibility, DirtyRect, LineAttribute, Position,
+    Change, CursorShape, CursorVisibility, DirtyRect, LineAttribute, Position, Surface,
 };
 use proptest::prelude::*;
 
@@ -145,4 +145,21 @@ fn cursor_shape_is_blinking_matches_variant_class() {
 #[test]
 fn cursor_visibility_default_is_visible() {
     assert_eq!(CursorVisibility::default(), CursorVisibility::Visible);
+}
+
+#[test]
+fn surface_new_sets_dimensions_and_cursor_origin() {
+    let surface = Surface::new(13, 7);
+
+    assert_eq!(surface.dimensions(), (13, 7));
+    assert_eq!(surface.cursor_position(), (0, 0));
+}
+
+#[test]
+fn surface_new_starts_with_visible_cursor_and_empty_title() {
+    let surface = Surface::new(4, 2);
+
+    assert_eq!(surface.cursor_shape(), None);
+    assert_eq!(surface.cursor_visibility(), CursorVisibility::Visible);
+    assert_eq!(surface.title(), "");
 }
