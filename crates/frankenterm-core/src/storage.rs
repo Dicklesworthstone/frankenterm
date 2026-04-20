@@ -10103,6 +10103,14 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.search_with_results_with_cx(&cx, query, options).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let query = query.to_string();
 
@@ -10114,6 +10122,7 @@ impl StorageHandle {
             search_fts_with_snippets(&conn, &query, &options)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_results`].
@@ -10127,7 +10136,17 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("search_with_results cancelled: {err}"))
         })?;
-        self.search_with_results(query, options).await
+        let db_path = Arc::clone(&self.db_path);
+        let query = query.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            search_fts_with_snippets(&conn, &query, &options)
+        })
+        .await
     }
 
     // =========================================================================
