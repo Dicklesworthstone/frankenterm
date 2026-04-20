@@ -11260,6 +11260,14 @@ impl StorageHandle {
 
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_panes_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -11270,6 +11278,7 @@ impl StorageHandle {
             query_panes(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_panes`].
@@ -11277,7 +11286,16 @@ impl StorageHandle {
     pub async fn get_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_panes cancelled: {err}")))?;
-        self.get_panes().await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_panes(&conn)
+        })
+        .await
     }
 
     /// Get a specific pane
