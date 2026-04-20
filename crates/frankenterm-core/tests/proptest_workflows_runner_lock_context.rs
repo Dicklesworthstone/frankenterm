@@ -33,6 +33,10 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
                 }
             }
         ),
+        (1usize..100, 1usize..100).prop_map(|(active, limit)| {
+            let active = active.max(limit);
+            WorkflowStartResult::ConcurrencyLimitReached { active, limit }
+        }),
         "[a-z ]{5,30}".prop_map(|error| WorkflowStartResult::Error { error }),
     ]
 }
@@ -202,6 +206,18 @@ proptest! {
     }
 
     #[test]
+    fn workflow_start_result_concurrency_limit_has_no_execution_id(
+        active in 1usize..100,
+        limit in 1usize..100
+    ) {
+        let active = active.max(limit);
+        let val = WorkflowStartResult::ConcurrencyLimitReached { active, limit };
+        prop_assert!(!val.is_started());
+        prop_assert!(!val.is_locked());
+        prop_assert!(val.execution_id().is_none());
+    }
+
+    #[test]
     fn workflow_execution_result_completed_has_execution_id(
         execution_id in "[a-z0-9]{8,16}",
         elapsed_ms in 0u64..120_000,
@@ -254,6 +270,19 @@ proptest! {
     fn workflow_start_result_serializes_with_type_tag(val in arb_workflow_start_result()) {
         let json = serde_json::to_string(&val).unwrap();
         prop_assert!(json.contains("\"type\":"));
+    }
+
+    #[test]
+    fn workflow_start_result_concurrency_limit_roundtrip(
+        active in 1usize..100,
+        limit in 1usize..100
+    ) {
+        let active = active.max(limit);
+        let val = WorkflowStartResult::ConcurrencyLimitReached { active, limit };
+        let json = serde_json::to_string(&val).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(json, json2);
     }
 
     #[test]
