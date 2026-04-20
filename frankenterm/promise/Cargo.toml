@@ -21,3 +21,6 @@ default = []
 
 # Opt-in: use asupersync runtime for `promise::spawn::block_on`.
 async-asupersync = ["dep:asupersync"]
+
+[dev-dependencies]
+proptest = "1.8.0"
