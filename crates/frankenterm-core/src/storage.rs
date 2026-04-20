@@ -9332,6 +9332,14 @@ impl StorageHandle {
 
     /// Insert a prepared plan preview for later commit
     pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.insert_prepared_plan_with_cx(&cx, record).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::InsertPreparedPlan {
@@ -9342,6 +9350,7 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_prepared_plan`].
