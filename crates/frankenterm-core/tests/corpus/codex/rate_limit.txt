@@ -1,0 +1,1 @@
+Error 429: Too Many Requests from upstream provider. Please wait 30 seconds and retry.

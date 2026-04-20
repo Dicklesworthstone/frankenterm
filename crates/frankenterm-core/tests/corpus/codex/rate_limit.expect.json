@@ -1,0 +1,13 @@
+[
+  {
+    "rule_id": "codex.rate_limit.detected",
+    "agent_type": "codex",
+    "event_type": "rate_limit.detected",
+    "severity": "critical",
+    "confidence": 0.95,
+    "extracted": {
+      "retry_after": "30 seconds"
+    },
+    "matched_text": "wait 30 seconds"
+  }
+]
