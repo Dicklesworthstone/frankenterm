@@ -1635,6 +1635,32 @@ impl ToolHandler for WaEventsTool {
             }
         };
 
+        // Enforce the input schema's advertised `"limit": { "minimum": 1,
+        // "maximum": 1000 }` bounds at the server. The tool schema is a
+        // contract with the client, but many MCP clients don't validate
+        // tool inputs against the schema before sending — a malicious
+        // or buggy caller can otherwise send `limit: 0` (silent no-op)
+        // or `limit: u64::MAX` (memory-pressure vector: the downstream
+        // `storage.get_events_with_cx` query and the subsequent
+        // `Vec::with_capacity(events.len())` both scale with the limit).
+        const LIMIT_MIN: usize = 1;
+        const LIMIT_MAX: usize = 1000;
+        if params.limit < LIMIT_MIN || params.limit > LIMIT_MAX {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "limit must be in {LIMIT_MIN}..={LIMIT_MAX} (got {})",
+                    params.limit
+                ),
+                Some(format!(
+                    "The wa.events tool schema declares limit ∈ [{LIMIT_MIN}, {LIMIT_MAX}]; \
+                     clamp your request or omit the field to use the default (20)."
+                )),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
         let db_path = Arc::clone(&self.db_path);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
