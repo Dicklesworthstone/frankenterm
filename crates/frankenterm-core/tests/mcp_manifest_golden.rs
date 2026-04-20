@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
-//!     --no-default-features --features mcp,asupersync-runtime
+//!     --no-default-features --features mcp,tokio-runtime
 //! ```
 //!
 //! The golden lives at `tests/fixtures/mcp_manifest.json` relative to the
@@ -29,7 +29,8 @@ use serde_json::{Map, Value, json};
 /// MCP server. The manifest is a BTree-sorted JSON `Object` so that its
 /// serialized form is canonical.
 fn capture_manifest(db_path: Option<PathBuf>) -> Value {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let server =
+        build_server_with_db(&Config::default(), db_path).expect("build MCP server");
 
     let mut tools: Vec<Value> = server
         .tools()
@@ -39,7 +40,9 @@ fn capture_manifest(db_path: Option<PathBuf>) -> Value {
             entry.insert("name".to_string(), Value::String(tool.name));
             entry.insert(
                 "description".to_string(),
-                tool.description.map(Value::String).unwrap_or(Value::Null),
+                tool.description
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
             );
             entry.insert("input_schema".to_string(), tool.input_schema);
             entry.insert(
@@ -131,7 +134,9 @@ fn canonicalize(value: &Value) -> Value {
             }
             Value::Object(out)
         }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(canonicalize).collect())
+        }
         other => other.clone(),
     }
 }
@@ -159,16 +164,13 @@ fn mcp_manifest_matches_golden_without_db() {
     // Freeze: the always-on (no-db) tool set must be a non-empty strict
     // subset of the full manifest. We don't commit a second golden; we
     // just assert structural properties that cannot drift silently.
-    let tools = manifest
-        .get("tools")
-        .and_then(Value::as_array)
-        .expect("tools");
-    assert!(
-        !tools.is_empty(),
-        "no-db MCP server must expose at least one tool"
-    );
+    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
+    assert!(!tools.is_empty(), "no-db MCP server must expose at least one tool");
     for tool in tools {
-        let name = tool.get("name").and_then(Value::as_str).expect("tool name");
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("tool name");
         assert!(
             name.starts_with("wa.") || name.starts_with("frankenterm.") || name.contains('_'),
             "unexpected tool name shape (no-db variant): {name}"
@@ -183,7 +185,9 @@ fn mcp_manifest_matches_golden_with_db() {
     // Use a fixed path for the manifest capture. The tool handlers only
     // record the path; they do not open the DB during registration, so
     // the file need not exist.
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-golden-fixture.sqlite3"));
+    let db_path = Some(PathBuf::from(
+        "/tmp/ft-mcp-manifest-golden-fixture.sqlite3",
+    ));
 
     let manifest = capture_manifest(db_path);
     let actual = pretty_canonical(&manifest);
@@ -218,7 +222,7 @@ fn mcp_manifest_matches_golden_with_db() {
              expected: {}\n  actual:   {}\n\n\
              If intentional, regenerate with:\n  \
              UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
-             --no-default-features --features mcp,asupersync-runtime",
+             --no-default-features --features mcp,tokio-runtime",
             golden.display(),
             actual_path.display()
         );
@@ -231,10 +235,7 @@ fn mcp_manifest_capture_is_deterministic() {
     let first = pretty_canonical(&capture_manifest(db_path.clone()));
     let second = pretty_canonical(&capture_manifest(db_path.clone()));
     let third = pretty_canonical(&capture_manifest(db_path));
-    assert_eq!(
-        first, second,
-        "manifest must be deterministic across captures"
-    );
+    assert_eq!(first, second, "manifest must be deterministic across captures");
     assert_eq!(
         second, third,
         "manifest must remain deterministic across repeated captures"
@@ -245,10 +246,7 @@ fn mcp_manifest_capture_is_deterministic() {
 fn mcp_manifest_tool_names_are_unique() {
     let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-unique.sqlite3"));
     let manifest = capture_manifest(db_path);
-    let tools = manifest
-        .get("tools")
-        .and_then(Value::as_array)
-        .expect("tools");
+    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
     let mut names: Vec<&str> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -265,9 +263,7 @@ fn mcp_manifest_tool_names_are_unique() {
 
 #[test]
 fn mcp_manifest_resource_uris_are_unique() {
-    let db_path = Some(PathBuf::from(
-        "/tmp/ft-mcp-manifest-resource-unique.sqlite3",
-    ));
+    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-resource-unique.sqlite3"));
     let manifest = capture_manifest(db_path);
     let resources = manifest
         .get("resources")
@@ -306,14 +302,16 @@ fn mcp_manifest_resource_uris_are_unique() {
 
 #[test]
 fn mcp_manifest_tool_input_schemas_are_objects() {
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-schema-shape.sqlite3"));
+    let db_path = Some(PathBuf::from(
+        "/tmp/ft-mcp-manifest-schema-shape.sqlite3",
+    ));
     let manifest = capture_manifest(db_path);
-    let tools = manifest
-        .get("tools")
-        .and_then(Value::as_array)
-        .expect("tools");
+    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
     for tool in tools {
-        let name = tool.get("name").and_then(Value::as_str).expect("tool name");
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("tool name");
         let schema = tool.get("input_schema").expect("input_schema");
         assert!(
             schema.is_object(),

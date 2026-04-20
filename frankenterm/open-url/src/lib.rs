@@ -64,7 +64,7 @@ pub fn open_with(url: &str, app: &str) {
     std::thread::spawn(move || {
         let args = open_with_args(&url, &app);
 
-        let mut cmd = std::process::Command::new(args[0]);
+        let mut cmd = std::process::Command::new(&args[0]);
         cmd.args(&args[1..]);
 
         let _ = cmd.status();
