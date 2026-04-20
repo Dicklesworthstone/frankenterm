@@ -8820,6 +8820,14 @@ impl StorageHandle {
     ///
     /// Returns a result describing what was synced.
     pub async fn sync_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.sync_fts_with_cx(&cx, config).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8828,6 +8836,7 @@ impl StorageHandle {
             sync_fts_on_startup(&conn, &config)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`sync_fts`].
@@ -8839,7 +8848,14 @@ impl StorageHandle {
     ) -> Result<FtsSyncResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
-        self.sync_fts(config).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            sync_fts_on_startup(&conn, &config)
+        })
+        .await
     }
 
     /// Perform a full FTS rebuild regardless of current state.
