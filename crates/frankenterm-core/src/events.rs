@@ -866,10 +866,22 @@ impl EventDeduplicator {
                     suppressed_count: entry.count - 1,
                 };
             }
-            // Window expired: reset as new occurrence
+            // Window expired: reset as new occurrence.
+            // Refresh the insertion_order position so the next capacity
+            // eviction pass treats this key as freshly inserted, not as
+            // the same stale slot from its original insertion. Without
+            // this refresh, a reset entry retains its old insertion_order
+            // position and can be evicted by the next N novel-key checks
+            // (where N is its distance from the front), which would then
+            // cause a follow-up check of the same key within its reset
+            // window to spuriously return `New` instead of `Duplicate`.
             entry.count = 1;
             entry.first_seen = now;
             entry.last_seen = now;
+            if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
+                self.insertion_order.remove(pos);
+            }
+            self.insertion_order.push_back(key.to_string());
             return DedupeVerdict::New;
         }
 
@@ -2198,6 +2210,53 @@ mod tests {
         dedup.clear();
         assert!(dedup.is_empty());
         assert_eq!(dedup.check("a"), DedupeVerdict::New);
+    }
+
+    // Regression: window-expired reset must refresh insertion_order so the
+    // entry is not a first-in-line eviction candidate despite being freshly
+    // re-activated. Without the refresh, the reset entry stays at its
+    // original insertion_order position and gets evicted by the next few
+    // novel-key checks; a follow-up check of the same key within its reset
+    // window then spuriously returns `New` instead of `Duplicate`.
+    #[test]
+    fn dedup_window_reset_refreshes_insertion_order_against_capacity_eviction() {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_millis(20), 3);
+
+        // Seed "a" at position 0 of insertion_order, then fill to capacity.
+        dedup.check("a");
+        dedup.check("b");
+        dedup.check("c");
+        assert_eq!(dedup.len(), 3);
+
+        // Let "a"'s window expire.
+        std::thread::sleep(Duration::from_millis(25));
+
+        // Resetting "a" returns New (window expired) AND should move it to
+        // the back of the eviction queue. Before the fix, "a" stayed at
+        // position 0 and was the next victim.
+        assert_eq!(dedup.check("a"), DedupeVerdict::New);
+
+        // Insert a novel key: capacity is full so one entry gets evicted.
+        // After the fix, the oldest live entry is "b" (not "a"), so "b"
+        // is evicted and "a" survives.
+        dedup.check("d");
+        assert_eq!(dedup.len(), 3);
+
+        // A follow-up check of "a" within its reset window must still see
+        // it as Duplicate. Before the fix, "a" had been evicted by the
+        // novel-key eviction pass and this returned New.
+        match dedup.check("a") {
+            DedupeVerdict::Duplicate { suppressed_count } => {
+                assert_eq!(suppressed_count, 1);
+            }
+            other => panic!(
+                "reset-then-check must return Duplicate after insertion_order \
+                 refresh; got {other:?}"
+            ),
+        }
+
+        // "b" (the original second-inserted key) should have been evicted.
+        assert_eq!(dedup.check("b"), DedupeVerdict::New);
     }
 
     // ---- NotificationCooldown tests ----

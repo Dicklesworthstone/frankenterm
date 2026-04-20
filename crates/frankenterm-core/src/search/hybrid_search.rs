@@ -61,6 +61,13 @@ pub struct FusedResult {
     pub semantic_rank: Option<usize>,
 }
 
+fn rrf_component_score(rank: usize, k: u32, weight: f32) -> f32 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    weight / (k as f32 + rank as f32 + 1.0)
+}
+
 fn dedupe_ranked_hits(items: &[(u64, f32)]) -> Vec<(u64, f32)> {
     let mut seen = HashSet::with_capacity(items.len());
     let mut deduped = Vec::with_capacity(items.len());
