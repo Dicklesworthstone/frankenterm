@@ -10689,13 +10689,22 @@ impl StorageHandle {
 
     /// Get the active reservation for a pane (read-only).
     pub async fn get_active_reservation(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
-        let db_path = self.db_path.clone();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-            get_active_reservation_sync(&conn, pane_id)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_active_reservation_with_cx(&cx, pane_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = self.db_path.clone();
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str())
+                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+                get_active_reservation_sync(&conn, pane_id)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_reservation`].
@@ -10708,7 +10717,13 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_active_reservation cancelled: {err}"))
         })?;
-        self.get_active_reservation(pane_id).await
+        let db_path = self.db_path.clone();
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_active_reservation_sync(&conn, pane_id)
+        })
+        .await
     }
 
     /// Get the active reservation for a pane using a synchronous read path.
