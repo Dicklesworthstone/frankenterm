@@ -2,15 +2,15 @@ use chrono::TimeZone;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
     ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetImageCell, GetLines, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
-    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
-    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize,
-    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendPaste,
-    SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    GetImageCell, GetLines, GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse,
+    GetPaneRenderChanges, GetPaneRenderChangesResponse, GetPaneRenderableDimensions,
+    GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
+    LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
+    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
+    SelectStackPane, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard,
+    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace,
+    SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -539,6 +539,41 @@ fn arb_get_image_cell() -> impl Strategy<Value = GetImageCell> {
         })
 }
 
+fn arb_get_lines_response() -> impl Strategy<Value = GetLinesResponse> {
+    (0u64..=4096).prop_map(|pane_id| GetLinesResponse {
+        pane_id,
+        lines: SerializedLines::default(),
+    })
+}
+
+fn arb_get_pane_render_changes_response() -> impl Strategy<Value = GetPaneRenderChangesResponse> {
+    (
+        0u64..=4096,
+        any::<bool>(),
+        any::<bool>(),
+        arb_small_string(),
+        any::<usize>(),
+    )
+        .prop_map(
+            |(pane_id, mouse_grabbed, alt_screen_active, title, seqno)| {
+                GetPaneRenderChangesResponse {
+                    pane_id,
+                    mouse_grabbed,
+                    alt_screen_active,
+                    cursor_position: StableCursorPosition::default(),
+                    dimensions: RenderableDimensions::default(),
+                    tiered_scrollback_status: None,
+                    dirty_lines: vec![],
+                    title,
+                    working_dir: None,
+                    bonus_lines: SerializedLines::default(),
+                    input_serial: None,
+                    seqno,
+                }
+            },
+        )
+}
+
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, serial).unwrap();
@@ -1058,6 +1093,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetImageCell(payload));
+    }
+
+    #[test]
+    fn get_lines_response_json_and_pdu_roundtrip(
+        payload in arb_get_lines_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetLinesResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetLinesResponse(payload));
+    }
+
+    #[test]
+    fn get_pane_render_changes_response_json_and_pdu_roundtrip(
+        payload in arb_get_pane_render_changes_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneRenderChangesResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChangesResponse(payload));
     }
 
     #[test]
