@@ -7206,19 +7206,36 @@ impl StorageHandle {
         last_result_count: Option<i64>,
         last_error: Option<String>,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpdateSavedSearchRun {
-                id: id.to_string(),
-                last_run_at,
-                last_result_count,
-                last_error,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .update_saved_search_run_with_cx(
+                    &cx,
+                    id,
+                    last_run_at,
+                    last_result_count,
+                    last_error,
+                )
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpdateSavedSearchRun {
+                    id: id.to_string(),
+                    last_run_at,
+                    last_result_count,
+                    last_error,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_run`].
@@ -7259,18 +7276,29 @@ impl StorageHandle {
         enabled: bool,
         schedule_interval_ms: Option<i64>,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpdateSavedSearchSchedule {
-                id: id.to_string(),
-                enabled,
-                schedule_interval_ms,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .update_saved_search_schedule_with_cx(&cx, id, enabled, schedule_interval_ms)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpdateSavedSearchSchedule {
+                    id: id.to_string(),
+                    enabled,
+                    schedule_interval_ms,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_schedule`].
@@ -7304,16 +7332,25 @@ impl StorageHandle {
 
     /// Delete a saved search by name. Returns number of rows deleted.
     pub async fn delete_saved_search(&self, name: &str) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::DeleteSavedSearch {
-                name: name.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.delete_saved_search_with_cx(&cx, name).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::DeleteSavedSearch {
+                    name: name.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_saved_search`].
