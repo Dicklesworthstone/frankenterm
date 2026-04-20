@@ -10926,6 +10926,14 @@ impl StorageHandle {
     ///
     /// Returns a map from pane_id to the most recent segment captured_at timestamp.
     pub async fn get_last_activity_by_pane(&self) -> Result<std::collections::HashMap<u64, i64>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_last_activity_by_pane_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -10936,6 +10944,7 @@ impl StorageHandle {
             query_last_activity_by_pane(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_last_activity_by_pane`].
@@ -10947,7 +10956,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_last_activity_by_pane cancelled: {err}"))
         })?;
-        self.get_last_activity_by_pane().await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_last_activity_by_pane(&conn)
+        })
+        .await
     }
 
     /// Query audit actions with filters
