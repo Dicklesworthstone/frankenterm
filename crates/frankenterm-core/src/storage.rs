@@ -7463,16 +7463,25 @@ impl StorageHandle {
 
     /// Insert a pane bookmark. Returns the row ID.
     pub async fn insert_pane_bookmark(&self, record: PaneBookmarkRecord) -> Result<i64> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertPaneBookmark {
-                record,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.insert_pane_bookmark_with_cx(&cx, record).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertPaneBookmark {
+                    record,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_pane_bookmark`].
@@ -7502,16 +7511,25 @@ impl StorageHandle {
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
     pub async fn delete_pane_bookmark(&self, alias: &str) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::DeletePaneBookmark {
-                alias: alias.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.delete_pane_bookmark_with_cx(&cx, alias).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::DeletePaneBookmark {
+                    alias: alias.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_pane_bookmark`].
