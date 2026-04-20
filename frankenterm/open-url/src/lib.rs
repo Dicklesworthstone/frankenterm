@@ -3,23 +3,48 @@
 // <https://github.com/Byron/open-rs>
 
 #[cfg(not(windows))]
+fn open_url_candidates(url: &str) -> Vec<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![vec!["/usr/bin/open".to_string(), url.to_string()]]
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![
+            vec!["xdg-open".to_string(), url.to_string()],
+            vec!["gio".to_string(), "open".to_string(), url.to_string()],
+            vec!["gnome-open".to_string(), url.to_string()],
+            vec!["kde-open".to_string(), url.to_string()],
+            vec!["wslview".to_string(), url.to_string()],
+        ]
+    }
+}
+
+#[cfg(not(windows))]
+fn open_with_args(url: &str, app: &str) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            "/usr/bin/open".to_string(),
+            "-a".to_string(),
+            app.to_string(),
+            url.to_string(),
+        ]
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![app.to_string(), url.to_string()]
+    }
+}
+
+#[cfg(not(windows))]
 pub fn open_url(url: &str) {
     let url = url.to_string();
     std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        let candidates: &[&[&str]] = &[&["/usr/bin/open", &url]];
-
-        #[cfg(not(target_os = "macos"))]
-        let candidates: &[&[&str]] = &[
-            &["xdg-open", &url],
-            &["gio", "open", &url] as &[_],
-            &["gnome-open", &url],
-            &["kde-open", &url],
-            &["wslview", &url],
-        ];
-
-        for candidate in candidates {
-            let mut cmd = std::process::Command::new(candidate[0]);
+        for candidate in open_url_candidates(&url) {
+            let mut cmd = std::process::Command::new(&candidate[0]);
             cmd.args(&candidate[1..]);
 
             if let Ok(status) = cmd.status() {
@@ -37,11 +62,7 @@ pub fn open_with(url: &str, app: &str) {
     let app = app.to_string();
 
     std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        let args: &[&str] = &["/usr/bin/open", "-a", &app, &url];
-
-        #[cfg(not(target_os = "macos"))]
-        let args: &[&str] = &[&app, &url];
+        let args = open_with_args(&url, &app);
 
         let mut cmd = std::process::Command::new(args[0]);
         cmd.args(&args[1..]);
@@ -97,4 +118,51 @@ pub fn open_url(url: &str) {
 #[cfg(windows)]
 pub fn open_with(url: &str, app: &str) {
     shell_execute(url.to_string(), Some(app.to_string()));
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_small_string() -> impl Strategy<Value = String> {
+        proptest::collection::vec(any::<char>(), 0..24)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn open_url_candidates_preserve_requested_url(url in arb_small_string()) {
+            let candidates = open_url_candidates(&url);
+            prop_assert!(!candidates.is_empty());
+            for candidate in candidates {
+                prop_assert_eq!(candidate.last().map(String::as_str), Some(url.as_str()));
+            }
+        }
+
+        #[test]
+        fn open_with_args_preserve_app_and_url(
+            url in arb_small_string(),
+            app in arb_small_string(),
+        ) {
+            let args = open_with_args(&url, &app);
+
+            #[cfg(target_os = "macos")]
+            {
+                prop_assert_eq!(args, vec![
+                    "/usr/bin/open".to_string(),
+                    "-a".to_string(),
+                    app,
+                    url,
+                ]);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                prop_assert_eq!(args, vec![app, url]);
+            }
+        }
+    }
 }

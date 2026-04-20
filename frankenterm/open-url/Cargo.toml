@@ -8,3 +8,6 @@ publish = false
 
 [dependencies]
 winapi = {workspace=true, features=["shellapi"]}
+
+[dev-dependencies]
+proptest = "1.8.0"
