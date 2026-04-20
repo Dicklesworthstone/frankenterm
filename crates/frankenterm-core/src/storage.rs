@@ -6097,17 +6097,26 @@ impl StorageHandle {
     /// Indicates a discontinuity in capture for the given pane.
     /// Returns `None` if the gap was skipped (e.g. at start of stream).
     pub async fn record_gap(&self, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::RecordGap {
-                pane_id,
-                reason: reason.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.record_gap_with_cx(&cx, pane_id, reason).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::RecordGap {
+                    pane_id,
+                    reason: reason.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_gap`].
