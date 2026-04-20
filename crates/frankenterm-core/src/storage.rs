@@ -10238,6 +10238,16 @@ impl StorageHandle {
         embedder_id: &str,
         limit: usize,
     ) -> Result<Vec<i64>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .get_unembedded_segments_with_cx(&cx, embedder_id, limit)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
@@ -10266,6 +10276,7 @@ impl StorageHandle {
             Ok(ids)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_unembedded_segments`].
@@ -10279,7 +10290,34 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_unembedded_segments cancelled: {err}"))
         })?;
-        self.get_unembedded_segments(embedder_id, limit).await
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.id FROM output_segments s
+                     LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
+                     WHERE se.segment_id IS NULL
+                     ORDER BY s.id ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
+
+            let ids: Vec<i64> = stmt
+                .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(ids)
+        })
+        .await
     }
 
     /// Get the embedding for a specific segment.
