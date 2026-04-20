@@ -7581,6 +7581,14 @@ impl StorageHandle {
 
     /// List pane bookmarks filtered by tag.
     pub async fn list_pane_bookmarks_by_tag(&self, tag: &str) -> Result<Vec<PaneBookmarkRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.list_pane_bookmarks_by_tag_with_cx(&cx, tag).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
         Self::spawn_blocking_storage(move || {
@@ -7590,6 +7598,7 @@ impl StorageHandle {
             list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks_by_tag`].
@@ -7602,7 +7611,15 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("list_pane_bookmarks_by_tag cancelled: {err}"))
         })?;
-        self.list_pane_bookmarks_by_tag(tag).await
+        let db_path = Arc::clone(&self.db_path);
+        let tag = tag.to_string();
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            list_pane_bookmarks_by_tag_sync(&conn, &tag)
+        })
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_segments_before`].
