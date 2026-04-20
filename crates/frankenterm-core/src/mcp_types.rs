@@ -945,6 +945,9 @@ pub(super) struct CapabilityResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PaneFilterRule;
+    use crate::storage::PaneRecord;
+    use crate::wezterm::PaneInfo;
 
     // ========================================================================
     // now_ms Tests
@@ -1832,6 +1835,139 @@ mod tests {
             prop_assert_eq!(p.since, since);
             prop_assert_eq!(p.until, until);
             prop_assert_eq!(p.snippets, snippets);
+        }
+
+        // 39. McpEnvelope success helper
+        #[test]
+        fn prop_mcp_envelope_success_coherence(
+            data in arb_string(),
+            elapsed_ms in any::<u64>(),
+        ) {
+            let envelope = McpEnvelope::success(data.clone(), elapsed_ms);
+            prop_assert!(envelope.ok);
+            prop_assert_eq!(envelope.data.as_deref(), Some(data.as_str()));
+            prop_assert!(envelope.error.is_none());
+            prop_assert!(envelope.error_code.is_none());
+            prop_assert!(envelope.hint.is_none());
+            prop_assert_eq!(envelope.elapsed_ms, elapsed_ms);
+            prop_assert_eq!(envelope.version, crate::VERSION);
+            prop_assert_eq!(envelope.mcp_version, MCP_VERSION);
+            prop_assert!(envelope.now > 0);
+        }
+
+        // 40. McpEnvelope error helper
+        #[test]
+        fn prop_mcp_envelope_error_coherence(
+            code in arb_string(),
+            msg in arb_string(),
+            hint in arb_opt_string(),
+            elapsed_ms in any::<u64>(),
+        ) {
+            let envelope = McpEnvelope::<()>::error(&code, msg.clone(), hint.clone(), elapsed_ms);
+            prop_assert!(!envelope.ok);
+            prop_assert!(envelope.data.is_none());
+            prop_assert_eq!(envelope.error.as_deref(), Some(msg.as_str()));
+            prop_assert_eq!(envelope.error_code.as_deref(), Some(code.as_str()));
+            prop_assert_eq!(envelope.hint, hint);
+            prop_assert_eq!(envelope.elapsed_ms, elapsed_ms);
+            prop_assert_eq!(envelope.version, crate::VERSION);
+            prop_assert_eq!(envelope.mcp_version, MCP_VERSION);
+            prop_assert!(envelope.now > 0);
+        }
+
+        // 41. McpPaneState::from_pane_record
+        #[test]
+        fn prop_pane_state_from_pane_record_preserves_fields(
+            pane_id in any::<u64>(),
+            pane_uuid in arb_opt_string(),
+            domain in arb_string(),
+            window_id in proptest::option::of(any::<u64>()),
+            tab_id in proptest::option::of(any::<u64>()),
+            title in arb_opt_string(),
+            cwd in arb_opt_string(),
+            tty_name in arb_opt_string(),
+            first_seen_at in any::<i64>(),
+            last_seen_at in any::<i64>(),
+            observed in any::<bool>(),
+            ignore_reason in arb_opt_string(),
+            last_decision_at in proptest::option::of(any::<i64>()),
+        ) {
+            let record = PaneRecord {
+                pane_id,
+                pane_uuid: pane_uuid.clone(),
+                domain: domain.clone(),
+                window_id,
+                tab_id,
+                title: title.clone(),
+                cwd: cwd.clone(),
+                tty_name,
+                first_seen_at,
+                last_seen_at,
+                observed,
+                ignore_reason: ignore_reason.clone(),
+                last_decision_at,
+            };
+
+            let state = McpPaneState::from_pane_record(&record);
+            prop_assert_eq!(state.pane_id, pane_id);
+            prop_assert_eq!(state.pane_uuid, pane_uuid);
+            prop_assert_eq!(state.domain, domain);
+            prop_assert_eq!(state.tab_id, tab_id.unwrap_or(0));
+            prop_assert_eq!(state.window_id, window_id.unwrap_or(0));
+            prop_assert_eq!(state.title, title);
+            prop_assert_eq!(state.cwd, cwd);
+            prop_assert_eq!(state.observed, observed);
+            prop_assert_eq!(state.ignore_reason, ignore_reason);
+        }
+
+        // 42. McpPaneState::from_pane_info filter handling
+        #[test]
+        fn prop_pane_state_from_pane_info_tracks_filter_decision(
+            pane_id in any::<u64>(),
+            tab_id in any::<u64>(),
+            window_id in any::<u64>(),
+            title in arb_opt_string(),
+            cwd in arb_opt_string(),
+        ) {
+            let info = PaneInfo {
+                pane_id,
+                tab_id,
+                window_id,
+                domain_id: None,
+                domain_name: Some("local".to_string()),
+                workspace: None,
+                size: None,
+                rows: None,
+                cols: None,
+                title: title.clone(),
+                cwd: cwd.clone(),
+                tty_name: None,
+                cursor_x: None,
+                cursor_y: None,
+                cursor_visibility: None,
+                left_col: None,
+                top_row: None,
+                is_active: false,
+                is_zoomed: false,
+                extra: std::collections::HashMap::new(),
+            };
+
+            let observed = McpPaneState::from_pane_info(&info, &PaneFilterConfig::default());
+            prop_assert!(observed.observed);
+            prop_assert!(observed.ignore_reason.is_none());
+            prop_assert_eq!(observed.pane_id, pane_id);
+            prop_assert_eq!(observed.tab_id, tab_id);
+            prop_assert_eq!(observed.window_id, window_id);
+
+            let filter = PaneFilterConfig {
+                include: Vec::new(),
+                exclude: vec![PaneFilterRule::new("block-local").with_domain("local")],
+            };
+            let ignored = McpPaneState::from_pane_info(&info, &filter);
+            prop_assert!(!ignored.observed);
+            prop_assert_eq!(ignored.ignore_reason.as_deref(), Some("block-local"));
+            prop_assert_eq!(ignored.title, title);
+            prop_assert_eq!(ignored.cwd, cwd);
         }
     }
 
