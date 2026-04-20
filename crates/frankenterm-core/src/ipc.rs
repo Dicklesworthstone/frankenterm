@@ -926,7 +926,7 @@ impl IpcServer {
     }
 
     /// Internal run method with context.
-    #[cfg(any(not(feature = "asupersync-runtime"), test))]
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn run_with_context(
         self,
         ctx: Arc<IpcHandlerContext>,
@@ -1307,7 +1307,7 @@ impl IpcServer {
 
 /// Handle a single client connection with full context.
 #[cfg(unix)]
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn handle_client_with_context(
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,

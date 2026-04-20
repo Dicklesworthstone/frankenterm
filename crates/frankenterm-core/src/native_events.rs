@@ -411,7 +411,7 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
     }
 }
 
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn handle_connection(
     stream: UnixStream,
     event_tx: mpsc::Sender<NativeEvent>,
@@ -529,7 +529,7 @@ fn event_metadata(event: &NativeEvent) -> (&'static str, u64) {
     }
 }
 
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn dispatch_event(
     event_tx: &mpsc::Sender<NativeEvent>,
     event: NativeEvent,
