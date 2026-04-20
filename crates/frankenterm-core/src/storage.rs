@@ -8990,6 +8990,23 @@ impl StorageHandle {
         pane_id: Option<u64>,
         action_fingerprint: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .consume_approval_token_with_cx(
+                    &cx,
+                    code_hash,
+                    workspace_id,
+                    action_kind,
+                    pane_id,
+                    action_fingerprint,
+                )
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::ConsumeApprovalToken {
@@ -9004,6 +9021,7 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
