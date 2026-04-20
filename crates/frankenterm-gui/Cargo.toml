@@ -126,6 +126,7 @@ windows = { workspace = true, features = [
 [dev-dependencies]
 benchmarking = "0.4.13"
 k9.workspace = true
+proptest = "1.8.0"
 
 # NOTE: Workspace lints intentionally omitted - vendored GUI code carries
 # upstream style that does not conform to our pedantic clippy profile.

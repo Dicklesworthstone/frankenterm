@@ -3445,6 +3445,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "promise",
+ "proptest",
  "rangeset",
  "ratelim",
  "rayon",

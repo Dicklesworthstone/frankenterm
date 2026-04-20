@@ -398,6 +398,7 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::mem::offset_of;
 
     fn assert_vertices_match(
@@ -605,5 +606,70 @@ mod tests {
         assert_vertices_match(&destination.layer0[0].to_vertices(), &layer0);
         assert_vertices_match(&destination.layer1[0].to_vertices(), &layer1);
         assert_vertices_match(&destination.layer2[0].to_vertices(), &layer2);
+    }
+
+    fn arb_vertex() -> impl Strategy<Value = Vertex> {
+        (
+            prop::array::uniform2((-10_000.0f32)..10_000.0f32),
+            prop::array::uniform2((-4.0f32)..4.0f32),
+            prop::array::uniform4(0.0f32..1.0f32),
+            prop::array::uniform4(0.0f32..1.0f32),
+            prop::array::uniform3((-2.0f32)..2.0f32),
+            -4.0f32..8.0f32,
+            -1.0f32..2.0f32,
+        )
+            .prop_map(
+                |(position, tex, fg_color, alt_color, hsv, has_color, mix_value)| Vertex {
+                    position,
+                    tex,
+                    fg_color,
+                    alt_color,
+                    hsv,
+                    has_color,
+                    mix_value,
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn boxed_quad_round_trip_preserves_arbitrary_vertices(
+            vertices in prop::array::uniform4(arb_vertex())
+        ) {
+            let boxed = BoxedQuad::from_vertices(&vertices);
+            let round_tripped = boxed.to_vertices();
+
+            prop_assert_eq!(round_tripped, vertices);
+        }
+
+        #[test]
+        fn quad_position_assignment_keeps_rectangle_corners_in_sync(
+            left in -10_000.0f32..10_000.0f32,
+            top in -10_000.0f32..10_000.0f32,
+            width in 0.0f32..10_000.0f32,
+            height in 0.0f32..10_000.0f32,
+            x1 in -4.0f32..4.0f32,
+            x2 in -4.0f32..4.0f32,
+            y1 in -4.0f32..4.0f32,
+            y2 in -4.0f32..4.0f32,
+        ) {
+            let right = left + width;
+            let bottom = top + height;
+            let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+            let mut quad = Quad { vert: &mut vertices };
+
+            quad.set_position(left, top, right, bottom);
+            quad.set_texture_discrete(x1, x2, y1, y2);
+
+            prop_assert_eq!(vertices[V_TOP_LEFT].position, [left, top]);
+            prop_assert_eq!(vertices[V_TOP_RIGHT].position, [right, top]);
+            prop_assert_eq!(vertices[V_BOT_LEFT].position, [left, bottom]);
+            prop_assert_eq!(vertices[V_BOT_RIGHT].position, [right, bottom]);
+
+            prop_assert_eq!(vertices[V_TOP_LEFT].tex, [x1, y1]);
+            prop_assert_eq!(vertices[V_TOP_RIGHT].tex, [x2, y1]);
+            prop_assert_eq!(vertices[V_BOT_LEFT].tex, [x1, y2]);
+            prop_assert_eq!(vertices[V_BOT_RIGHT].tex, [x2, y2]);
+        }
     }
 }
