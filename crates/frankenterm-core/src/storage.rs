@@ -6638,16 +6638,25 @@ impl StorageHandle {
 
     /// List all active (non-expired) mutes.
     pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
-        let db_path = Arc::clone(&self.db_path);
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.list_active_mutes_with_cx(&cx, now_ms).await;
+        }
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
 
-            list_active_mutes_sync(&conn, now_ms)
-        })
-        .await
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+
+                list_active_mutes_sync(&conn, now_ms)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_mutes`].
@@ -6659,7 +6668,16 @@ impl StorageHandle {
     ) -> Result<Vec<EventMuteRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("list_active_mutes cancelled: {err}")))?;
-        self.list_active_mutes(now_ms).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            list_active_mutes_sync(&conn, now_ms)
+        })
+        .await
     }
 
     /// Fetch an event's dedupe/identity key by ID.
