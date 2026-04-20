@@ -10596,6 +10596,27 @@ impl StorageHandle {
         semantic_weight: f32,
         fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .hybrid_search_with_results_with_cx(
+                    &cx,
+                    query,
+                    options,
+                    embedder_id,
+                    query_vector,
+                    mode,
+                    rrf_k,
+                    lexical_weight,
+                    semantic_weight,
+                    fusion_backend,
+                )
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
         let query = query.to_string();
@@ -10621,6 +10642,7 @@ impl StorageHandle {
             )
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`hybrid_search_with_results`].
@@ -10642,17 +10664,30 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("hybrid_search_with_results cancelled: {err}"))
         })?;
-        self.hybrid_search_with_results(
-            query,
-            options,
-            embedder_id,
-            query_vector,
-            mode,
-            rrf_k,
-            lexical_weight,
-            semantic_weight,
-            fusion_backend,
-        )
+        let db_path = Arc::clone(&self.db_path);
+        let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
+        let query = query.to_string();
+        let embedder_id = embedder_id.to_string();
+        let query_vector = query_vector.to_vec();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            hybrid_search_with_results_sync(
+                &conn,
+                &query,
+                &options,
+                &embedder_id,
+                &query_vector,
+                mode,
+                rrf_k,
+                lexical_weight,
+                semantic_weight,
+                fusion_backend,
+                &semantic_budget_state,
+            )
+        })
         .await
     }
 
