@@ -739,6 +739,15 @@ fn arb_bundle_classification() -> impl Strategy<Value = BundleClassification> {
     ]
 }
 
+fn arb_resume_recommendation() -> impl Strategy<Value = ResumeRecommendation> {
+    prop_oneof![
+        Just(ResumeRecommendation::ContinueFromCheckpoint),
+        Just(ResumeRecommendation::RestartFresh),
+        Just(ResumeRecommendation::CompensateAndAbort),
+        Just(ResumeRecommendation::AlreadyComplete),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -859,5 +868,90 @@ proptest! {
         let back: RedactionMetadata = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.fields_redacted, fields);
         prop_assert_eq!(back.categories.len(), cats.len());
+    }
+
+    #[test]
+    fn to_s08_resume_summary_from_context_maps_counts_and_recommendation(
+        phase in arb_tx_phase(),
+        completed in proptest::collection::vec(arb_to_str(), 0..6),
+        failed in proptest::collection::vec(arb_to_str(), 0..4),
+        remaining in proptest::collection::vec(arb_to_str(), 0..6),
+        compensated in proptest::collection::vec(arb_to_str(), 0..4),
+        chain_intact in proptest::bool::ANY,
+        recommendation in arb_resume_recommendation(),
+    ) {
+        let expected_recommendation = match recommendation {
+            ResumeRecommendation::ContinueFromCheckpoint => "continue_from_checkpoint",
+            ResumeRecommendation::RestartFresh => "restart_fresh",
+            ResumeRecommendation::CompensateAndAbort => "compensate_and_abort",
+            ResumeRecommendation::AlreadyComplete => "already_complete",
+        };
+        let ctx = ResumeContext {
+            execution_id: "exec-ctx".to_string(),
+            plan_id: "plan-ctx".to_string(),
+            interrupted_phase: phase,
+            completed_steps: completed.clone(),
+            failed_steps: failed.clone(),
+            remaining_steps: remaining.clone(),
+            compensated_steps: compensated.clone(),
+            chain_intact,
+            last_hash: "hash-tip".to_string(),
+            recommendation,
+        };
+
+        let summary = ResumeSummary::from_context(&ctx);
+        prop_assert_eq!(summary.execution_id, "exec-ctx");
+        prop_assert_eq!(summary.interrupted_phase, phase);
+        prop_assert_eq!(summary.completed_count, completed.len());
+        prop_assert_eq!(summary.failed_count, failed.len());
+        prop_assert_eq!(summary.remaining_count, remaining.len());
+        prop_assert_eq!(summary.compensated_count, compensated.len());
+        prop_assert_eq!(summary.chain_intact, chain_intact);
+        prop_assert_eq!(summary.recommendation, expected_recommendation);
+    }
+
+    #[test]
+    fn to_s09_tx_observability_config_serde(
+        max_timeline_entries in 1usize..8192,
+        max_events in 1usize..16384,
+        redact_command_text in proptest::bool::ANY,
+        redact_error_messages in proptest::bool::ANY,
+        redact_results in proptest::bool::ANY,
+        redact_approval_codes in proptest::bool::ANY,
+        redact_labels in proptest::bool::ANY,
+        classification in arb_bundle_classification(),
+    ) {
+        let config = TxObservabilityConfig {
+            max_timeline_entries,
+            max_events,
+            redaction_policy: RedactionPolicy {
+                redact_command_text,
+                redact_error_messages,
+                redact_results,
+                redact_approval_codes,
+                redact_labels,
+                redaction_marker: "[REDACTED]".to_string(),
+            },
+            default_classification: classification.clone(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TxObservabilityConfig = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.max_timeline_entries, max_timeline_entries);
+        prop_assert_eq!(back.max_events, max_events);
+        prop_assert_eq!(
+            back.redaction_policy.redact_command_text,
+            redact_command_text
+        );
+        prop_assert_eq!(
+            back.redaction_policy.redact_error_messages,
+            redact_error_messages
+        );
+        prop_assert_eq!(back.redaction_policy.redact_results, redact_results);
+        prop_assert_eq!(
+            back.redaction_policy.redact_approval_codes,
+            redact_approval_codes
+        );
+        prop_assert_eq!(back.redaction_policy.redact_labels, redact_labels);
+        prop_assert_eq!(back.default_classification, classification);
     }
 }
