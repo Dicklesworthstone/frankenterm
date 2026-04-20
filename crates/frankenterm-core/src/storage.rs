@@ -7797,14 +7797,23 @@ impl StorageHandle {
 
     /// Get daily aggregated metric summaries since a given timestamp.
     pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            aggregate_daily_sync(&conn, since_ts)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.aggregate_daily_metrics_with_cx(&cx, since_ts).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                aggregate_daily_sync(&conn, since_ts)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_daily_metrics`].
@@ -7817,7 +7826,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("aggregate_daily_metrics cancelled: {err}"))
         })?;
-        self.aggregate_daily_metrics(since_ts).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            aggregate_daily_sync(&conn, since_ts)
+        })
+        .await
     }
 
     /// Get per-agent metric breakdown since a given timestamp.
