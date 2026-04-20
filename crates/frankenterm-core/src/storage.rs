@@ -6275,18 +6275,29 @@ impl StorageHandle {
         triage_state: Option<String>,
         updated_by: Option<String>,
     ) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::SetEventTriageState {
-                event_id,
-                triage_state,
-                updated_by,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .set_event_triage_state_with_cx(&cx, event_id, triage_state, updated_by)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::SetEventTriageState {
+                    event_id,
+                    triage_state,
+                    updated_by,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_triage_state`].
@@ -6327,18 +6338,29 @@ impl StorageHandle {
         note: Option<String>,
         updated_by: Option<String>,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::SetEventNote {
-                event_id,
-                note,
-                updated_by,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .set_event_note_with_cx(&cx, event_id, note, updated_by)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::SetEventNote {
+                    event_id,
+                    note,
+                    updated_by,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_note`].
@@ -6378,18 +6400,29 @@ impl StorageHandle {
         label: String,
         created_by: Option<String>,
     ) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::AddEventLabel {
-                event_id,
-                label,
-                created_by,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .add_event_label_with_cx(&cx, event_id, label, created_by)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::AddEventLabel {
+                    event_id,
+                    label,
+                    created_by,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_label`].
@@ -6424,17 +6457,28 @@ impl StorageHandle {
     ///
     /// Returns true if a label row was deleted.
     pub async fn remove_event_label(&self, event_id: i64, label: String) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::RemoveEventLabel {
-                event_id,
-                label,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .remove_event_label_with_cx(&cx, event_id, label)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::RemoveEventLabel {
+                    event_id,
+                    label,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_label`].
