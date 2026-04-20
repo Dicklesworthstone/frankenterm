@@ -9986,6 +9986,14 @@ impl StorageHandle {
 
     /// Get agent sessions for a specific pane
     pub async fn get_sessions_for_pane(&self, pane_id: u64) -> Result<Vec<AgentSessionRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_sessions_for_pane_with_cx(&cx, pane_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
@@ -9996,6 +10004,7 @@ impl StorageHandle {
             query_sessions_for_pane(&conn, pane_id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_sessions_for_pane`].
@@ -10008,7 +10017,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_sessions_for_pane cancelled: {err}"))
         })?;
-        self.get_sessions_for_pane(pane_id).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_sessions_for_pane(&conn, pane_id)
+        })
+        .await
     }
 
     /// Search segments using FTS5
