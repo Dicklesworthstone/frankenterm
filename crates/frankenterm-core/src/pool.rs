@@ -137,7 +137,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn try_acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.try_acquire_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -207,7 +207,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.acquire_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -315,7 +315,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn put(&self, conn: C) {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.put_with_cx(&cx, conn).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -355,7 +355,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn evict_idle(&self) -> usize {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.evict_idle_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -377,7 +377,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn stats(&self) -> PoolStats {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.stats_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -419,7 +419,7 @@ impl<C: Send + 'static> Pool<C> {
     pub async fn clear(&self) {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.clear_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
