@@ -8346,14 +8346,25 @@ impl StorageHandle {
 
     /// Count notification_history older than a cutoff (read-path).
     pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            count_notification_history_before_sync(&conn, before_ts)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .count_notification_history_before_with_cx(&cx, before_ts)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                count_notification_history_before_sync(&conn, before_ts)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_notification_history_before`].
@@ -8368,7 +8379,14 @@ impl StorageHandle {
                 "count_notification_history_before cancelled: {err}"
             ))
         })?;
-        self.count_notification_history_before(before_ts).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_notification_history_before_sync(&conn, before_ts)
+        })
+        .await
     }
 
     /// Delete events older than a cutoff (flat, no tier; write-path).
