@@ -1,0 +1,28 @@
+[runtime]
+tick_interval_ms = 50
+max_concurrent_panes = 128
+
+[backpressure]
+green_threshold = 100
+yellow_threshold = 500
+red_threshold = 2000
+
+[snapshot]
+interval_ms = 5000
+max_snapshot_size_bytes = 1048576
+
+[ingest]
+max_capture_bytes = 65536
+rate_limit_per_sec = 100
+
+[patterns]
+max_rules = 256
+max_pattern_len = 1024
+
+[policy]
+max_rules = 64
+evaluation_timeout_ms = 1000
+
+[workflows]
+max_steps = 50
+step_timeout_ms = 30000

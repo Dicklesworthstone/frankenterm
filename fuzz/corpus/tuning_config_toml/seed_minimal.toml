@@ -1,0 +1,3 @@
+[runtime]
+tick_interval_ms = 100
+max_concurrent_panes = 64
