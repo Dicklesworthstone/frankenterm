@@ -557,6 +557,7 @@ impl<L, N> Cursor<L, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn split_and_split_and_iterate() {
@@ -1964,5 +1965,35 @@ mod tests {
         let t = Tree::<i32>::new().cursor().assign_top(77).unwrap().tree();
         assert_eq!(t, Tree::Leaf(77));
         assert_eq!(t.num_leaves(), 1);
+    }
+
+    fn arb_tree() -> impl Strategy<Value = Tree<i32, i16>> {
+        let leaf = any::<i32>().prop_map(Tree::Leaf);
+        let node_data = prop_oneof![Just(None), any::<i16>().prop_map(Some)];
+
+        leaf.prop_recursive(4, 64, 2, move |inner| {
+            prop_oneof![
+                Just(Tree::Empty),
+                (inner.clone(), inner, node_data.clone()).prop_map(|(left, right, data)| {
+                    Tree::Node {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        data,
+                    }
+                }),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn cursor_tree_roundtrip_preserves_structure_and_leaf_count(tree in arb_tree()) {
+            let expected_leaf_count = tree.num_leaves();
+            let roundtrip = tree.cursor().tree();
+            prop_assert_eq!(roundtrip.num_leaves(), expected_leaf_count);
+            prop_assert_eq!(roundtrip, tree);
+        }
     }
 }
