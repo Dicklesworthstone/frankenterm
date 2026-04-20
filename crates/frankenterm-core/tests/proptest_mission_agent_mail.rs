@@ -18,9 +18,10 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use frankenterm_core::mission_agent_mail::{
+    AckRequirementReport,
     CoordinationEnvelope, CoordinationEventKind, CoordinationEventRequest,
     CoordinationInboxMessage, CoordinationParseFailure, DispatchedCoordinationMessage,
-    FailedCoordinationMessage, InboundCoordinationMessage, MissionAgentMailConfig,
+    FailedCoordinationMessage, InboxConsumptionReport, InboundCoordinationMessage, MissionAgentMailConfig,
     MissionAgentMailKernel, MissionCoordinationContext, MissionMailDispatchReport,
     MissionMailTransport, PendingAcknowledgement,
 };
@@ -355,6 +356,32 @@ fn arb_pending_ack() -> impl Strategy<Value = PendingAcknowledgement> {
         )
 }
 
+fn arb_inbox_consumption_report() -> impl Strategy<Value = InboxConsumptionReport> {
+    (
+        proptest::collection::vec(arb_inbound_message(), 0..5),
+        proptest::collection::vec(arb_parse_failure(), 0..5),
+        0usize..10,
+    )
+        .prop_map(|(parsed, parse_failures, raw_count)| InboxConsumptionReport {
+            parsed,
+            parse_failures,
+            raw_count,
+        })
+}
+
+fn arb_ack_requirement_report() -> impl Strategy<Value = AckRequirementReport> {
+    (
+        proptest::collection::vec(arb_pending_ack(), 0..5),
+        proptest::collection::vec(arb_parse_failure(), 0..5),
+        0usize..10,
+    )
+        .prop_map(|(pending, parse_failures, raw_count)| AckRequirementReport {
+            pending,
+            parse_failures,
+            raw_count,
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Helper: embed envelope into body for inbox consumption tests
 // ---------------------------------------------------------------------------
@@ -468,6 +495,52 @@ proptest! {
         let json = serde_json::to_string(&pa).unwrap();
         let restored: PendingAcknowledgement = serde_json::from_str(&json).unwrap();
         assert_eq!(pa, restored);
+    }
+
+    #[test]
+    fn inbox_consumption_report_serde_roundtrip(report in arb_inbox_consumption_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: InboxConsumptionReport = serde_json::from_str(&json).unwrap();
+        let v1: serde_json::Value = serde_json::to_value(&report).unwrap();
+        let v2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn ack_requirement_report_serde_roundtrip(report in arb_ack_requirement_report()) {
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: AckRequirementReport = serde_json::from_str(&json).unwrap();
+        let v1: serde_json::Value = serde_json::to_value(&report).unwrap();
+        let v2: serde_json::Value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn coherent_inbox_consumption_counts_hold(
+        parsed in proptest::collection::vec(arb_inbound_message(), 0..5),
+        parse_failures in proptest::collection::vec(arb_parse_failure(), 0..5),
+        extra_raw in 0usize..5,
+    ) {
+        let report = InboxConsumptionReport {
+            raw_count: parsed.len() + parse_failures.len() + extra_raw,
+            parsed,
+            parse_failures,
+        };
+        assert!(report.parsed.len() + report.parse_failures.len() <= report.raw_count);
+    }
+
+    #[test]
+    fn coherent_ack_requirement_counts_hold(
+        pending in proptest::collection::vec(arb_pending_ack(), 0..5),
+        parse_failures in proptest::collection::vec(arb_parse_failure(), 0..5),
+        extra_raw in 0usize..5,
+    ) {
+        let report = AckRequirementReport {
+            raw_count: pending.len() + parse_failures.len() + extra_raw,
+            pending,
+            parse_failures,
+        };
+        assert!(report.pending.len() + report.parse_failures.len() <= report.raw_count);
     }
 
     // ── Canonical thread-id properties ──────────────────────────────────
