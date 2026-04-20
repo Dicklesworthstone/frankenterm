@@ -10531,8 +10531,17 @@ impl StorageHandle {
         service: &str,
         config: &crate::accounts::AccountSelectionConfig,
     ) -> Result<crate::accounts::AccountSelectionResult> {
-        let accounts = self.get_accounts_by_service(service).await?;
-        Ok(crate::accounts::select_account(&accounts, config))
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.select_account_with_cx(&cx, service, config).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let accounts = self.get_accounts_by_service(service).await?;
+            Ok(crate::accounts::select_account(&accounts, config))
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`select_account`].
