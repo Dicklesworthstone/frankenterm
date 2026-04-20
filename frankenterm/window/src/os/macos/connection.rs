@@ -5,17 +5,17 @@
 
 use super::nsstring_to_str;
 use super::window::WindowInner;
+use crate::Appearance;
 use crate::connection::{
-    fail_window_op_for_destroyed_window, new_window_op_promise, ConnectionOps,
+    ConnectionOps, fail_window_op_for_destroyed_window, new_window_op_promise,
 };
 use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
-use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSInteger};
-use objc::runtime::{Object, BOOL, YES};
+use objc::runtime::{BOOL, Object, YES};
 use objc::*;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -104,6 +104,50 @@ impl SoftwareVersion {
     fn load() -> anyhow::Result<Self> {
         let vers: Self = plist::from_file("/System/Library/CoreServices/SystemVersion.plist")?;
         Ok(vers)
+    }
+}
+
+#[cfg(test)]
+mod software_version_tests {
+    use super::SoftwareVersion;
+
+    #[test]
+    fn software_version_plist_roundtrip_decodes_pascal_case_keys() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProductBuildVersion</key>
+    <string>23A344</string>
+    <key>ProductName</key>
+    <string>macOS</string>
+    <key>ProductUserVisibleVersion</key>
+    <string>14.0</string>
+</dict>
+</plist>
+"#;
+
+        let version: SoftwareVersion = plist::from_bytes(plist.as_bytes()).unwrap();
+        assert_eq!(version.product_build_version, "23A344");
+        assert_eq!(version.product_name, "macOS");
+        assert_eq!(version.product_user_visible_version, "14.0");
+    }
+
+    #[test]
+    fn software_version_fields_format_expected_connection_name() {
+        let version = SoftwareVersion {
+            product_build_version: "23A344".to_string(),
+            product_user_visible_version: "14.0".to_string(),
+            product_name: "macOS".to_string(),
+        };
+
+        let name = format!(
+            "{} {} ({})",
+            version.product_name,
+            version.product_user_visible_version,
+            version.product_build_version
+        );
+        assert_eq!(name, "macOS 14.0 (23A344)");
     }
 }
 
