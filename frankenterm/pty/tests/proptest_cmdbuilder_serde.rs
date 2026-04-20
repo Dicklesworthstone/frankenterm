@@ -1,6 +1,7 @@
 #![cfg(feature = "serde_support")]
 
 use portable_pty::CommandBuilder;
+use portable_pty::PtySize;
 use proptest::prelude::*;
 use std::ffi::OsString;
 
@@ -18,6 +19,17 @@ fn arb_env_pairs() -> impl Strategy<Value = Vec<(String, String)>> {
 
 fn arb_args() -> impl Strategy<Value = Vec<String>> {
     proptest::collection::vec(arb_small_string(), 1..8)
+}
+
+fn arb_pty_size() -> impl Strategy<Value = PtySize> {
+    (0u16..=4096, 0u16..=4096, 0u16..=8192, 0u16..=8192).prop_map(
+        |(rows, cols, pixel_width, pixel_height)| PtySize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        },
+    )
 }
 
 fn build_command(
@@ -101,5 +113,12 @@ proptest! {
             .collect();
         actual_env.sort();
         prop_assert_eq!(actual_env, expected_env);
+    }
+
+    #[test]
+    fn pty_size_json_roundtrip(value in arb_pty_size()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: PtySize = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
     }
 }
