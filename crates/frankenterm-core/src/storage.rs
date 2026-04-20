@@ -8863,6 +8863,14 @@ impl StorageHandle {
     /// This drops the FTS index and reindexes all segments with batched progress.
     /// Use this for recovery or when a clean rebuild is needed.
     pub async fn rebuild_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.rebuild_fts_with_cx(&cx, config).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8871,6 +8879,7 @@ impl StorageHandle {
             full_fts_rebuild_sync(&conn, &config)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`rebuild_fts`].
@@ -8882,7 +8891,14 @@ impl StorageHandle {
     ) -> Result<FtsSyncResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
-        self.rebuild_fts(config).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            full_fts_rebuild_sync(&conn, &config)
+        })
+        .await
     }
 
     /// Get the current FTS index state (version, last rebuild time).
