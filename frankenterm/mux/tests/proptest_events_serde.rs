@@ -43,4 +43,24 @@ proptest! {
         let back: HandlerPriority = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
+
+    #[test]
+    fn custom_event_type_display_prefixes_name(name in arb_small_string()) {
+        let value = EventType::Custom(name.clone());
+        prop_assert_eq!(value.to_string(), format!("custom:{name}"));
+    }
+
+    #[test]
+    fn handler_priority_order_stays_native_then_wasm_then_lua(
+        left in arb_handler_priority(),
+        right in arb_handler_priority(),
+    ) {
+        let rank = |value: HandlerPriority| match value {
+            HandlerPriority::Native => 0u8,
+            HandlerPriority::Wasm => 1u8,
+            HandlerPriority::Lua => 2u8,
+        };
+
+        prop_assert_eq!(left.cmp(&right), rank(left).cmp(&rank(right)));
+    }
 }
