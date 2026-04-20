@@ -11507,6 +11507,14 @@ impl StorageHandle {
     ///
     /// Returns all step logs for the given workflow, ordered by step index.
     pub async fn get_step_logs(&self, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_step_logs_with_cx(&cx, workflow_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
@@ -11518,6 +11526,7 @@ impl StorageHandle {
             query_step_logs(&conn, &workflow_id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_step_logs`].
@@ -11534,7 +11543,17 @@ impl StorageHandle {
     ) -> Result<Vec<WorkflowStepLogRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_step_logs cancelled: {err}")))?;
-        self.get_step_logs(workflow_id).await
+        let db_path = Arc::clone(&self.db_path);
+        let workflow_id = workflow_id.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_step_logs(&conn, &workflow_id)
+        })
+        .await
     }
 
     /// Get the latest step log for a workflow (highest step_index).
