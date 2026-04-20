@@ -10735,13 +10735,22 @@ impl StorageHandle {
 
     /// List all active (unexpired) pane reservations (read-only).
     pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
-        let db_path = self.db_path.clone();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-            list_active_reservations_sync(&conn)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.list_active_reservations_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = self.db_path.clone();
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str())
+                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+                list_active_reservations_sync(&conn)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_reservations`].
@@ -10753,7 +10762,13 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("list_active_reservations cancelled: {err}"))
         })?;
-        self.list_active_reservations().await
+        let db_path = self.db_path.clone();
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            list_active_reservations_sync(&conn)
+        })
+        .await
     }
 
     /// Check whether there is an active approval token for the exact scope on a
