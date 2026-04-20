@@ -7995,18 +7995,29 @@ impl StorageHandle {
         acknowledged_by: String,
         action_taken: Option<String>,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::AcknowledgeNotification {
-                id,
-                acknowledged_by,
-                action_taken,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .acknowledge_notification_with_cx(&cx, id, acknowledged_by, action_taken)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::AcknowledgeNotification {
+                    id,
+                    acknowledged_by,
+                    action_taken,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`acknowledge_notification`].
