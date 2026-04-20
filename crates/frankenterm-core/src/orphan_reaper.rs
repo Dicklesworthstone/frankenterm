@@ -69,6 +69,14 @@ struct ProcessEntry {
 /// Run the orphan reaper loop.  Returns when `shutdown_flag` is set or the
 /// reap interval is configured to zero (disabled).
 pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>) {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        return run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
     let interval = config.orphan_reap_interval_seconds;
     if interval == 0 {
         info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
@@ -83,18 +91,6 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
     );
 
     loop {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            // ft-xbnl0.2.3 tick 292: cx-first orphan reaper loop sleep.
-            let reaper_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            if crate::runtime_compat::sleep_with_cx(&reaper_cx, Duration::from_secs(interval))
-                .await
-                .is_err()
-            {
-                debug!("orphan reaper cancelled via cx");
-                return;
-            }
-        }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
             crate::runtime_compat::sleep(Duration::from_secs(interval)).await;
@@ -120,6 +116,7 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
         for err in &report.errors {
             warn!(error = %err, "orphan reaper error during scan");
         }
+    }
     }
 }
 
