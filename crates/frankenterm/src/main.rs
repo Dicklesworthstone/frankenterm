@@ -14890,7 +14890,8 @@ async fn run_watcher(
     use frankenterm_core::storage::StorageHandle;
     use frankenterm_core::webhook::WebhookDispatcher;
     use frankenterm_core::workflows::{
-        PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner, WorkflowRunnerConfig,
+        CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
+        WorkflowRunnerConfig,
     };
     use std::time::Duration;
 
@@ -15258,12 +15259,10 @@ async fn run_watcher(
         // Create policy engine (permissive defaults for auto-handling)
         let policy_engine = PolicyEngine::permissive();
         let wezterm_handle = wezterm_handle.clone();
-        let injector = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-            PolicyGatedInjector::with_storage(
-                policy_engine,
-                wezterm_handle,
-                storage_for_workflows.as_ref().clone(),
-            ),
+        let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
+            policy_engine,
+            wezterm_handle,
+            storage_for_workflows.as_ref().clone(),
         ));
 
         // Create workflow engine and lock manager
@@ -19498,7 +19497,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     };
                                     use frankenterm_core::storage::StorageHandle;
                                     use frankenterm_core::workflows::{
-                                        PaneWorkflowLockManager, WorkflowEngine,
+                                        CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine,
                                         WorkflowExecutionResult, WorkflowRunner,
                                         WorkflowRunnerConfig,
                                     };
@@ -19612,12 +19611,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
                                     let injector =
-                                        Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                                            PolicyGatedInjector::with_storage(
-                                                policy_engine,
-                                                wezterm_handle,
-                                                storage.as_ref().clone(),
-                                            ),
+                                        CxPolicyInjector::new(PolicyGatedInjector::with_storage(
+                                            policy_engine,
+                                            wezterm_handle,
+                                            storage.as_ref().clone(),
                                         ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
@@ -20249,8 +20246,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     };
                                     use frankenterm_core::storage::StorageHandle;
                                     use frankenterm_core::workflows::{
-                                        PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
-                                        WorkflowRunnerConfig,
+                                        CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine,
+                                        WorkflowRunner, WorkflowRunnerConfig,
                                     };
 
                                     // Set up storage
@@ -20292,12 +20289,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
                                     let injector =
-                                        Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                                            PolicyGatedInjector::with_storage(
-                                                policy_engine,
-                                                wezterm_handle,
-                                                storage.as_ref().clone(),
-                                            ),
+                                        CxPolicyInjector::new(PolicyGatedInjector::with_storage(
+                                            policy_engine,
+                                            wezterm_handle,
+                                            storage.as_ref().clone(),
                                         ));
                                     let runner_config = WorkflowRunnerConfig::default();
                                     let runner = WorkflowRunner::new(
@@ -25220,8 +25215,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
                         use frankenterm_core::storage::StorageHandle;
                         use frankenterm_core::workflows::{
-                            PaneWorkflowLockManager, WorkflowEngine, WorkflowExecutionResult,
-                            WorkflowRunner, WorkflowRunnerConfig,
+                            CxPolicyInjector, PaneWorkflowLockManager, WorkflowEngine,
+                            WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
                         };
                         use std::sync::Arc;
 
@@ -25279,12 +25274,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         .with_tuning(&config.tuning);
 
                         let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
-                        let injector = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                            PolicyGatedInjector::with_storage(
-                                policy_engine,
-                                wezterm_handle,
-                                storage.as_ref().clone(),
-                            ),
+                        let injector = CxPolicyInjector::new(PolicyGatedInjector::with_storage(
+                            policy_engine,
+                            wezterm_handle,
+                            storage.as_ref().clone(),
                         ));
                         let runner_config = WorkflowRunnerConfig::default();
                         let runner = WorkflowRunner::new(
@@ -28114,14 +28107,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     )
                     .with_tuning(&config.tuning);
                     let wezterm_handle = frankenterm_core::wezterm::default_wezterm_handle();
-                    let injector =
-                        std::sync::Arc::new(frankenterm_core::runtime_compat::Mutex::new(
-                            frankenterm_core::policy::PolicyGatedInjector::with_storage(
-                                policy_engine,
-                                wezterm_handle,
-                                storage.as_ref().clone(),
-                            ),
-                        ));
+                    let injector = frankenterm_core::workflows::CxPolicyInjector::new(
+                        frankenterm_core::policy::PolicyGatedInjector::with_storage(
+                            policy_engine,
+                            wezterm_handle,
+                            storage.as_ref().clone(),
+                        ),
+                    );
                     let runner_config =
                         frankenterm_core::workflows::WorkflowRunnerConfig::default();
                     let runner = frankenterm_core::workflows::WorkflowRunner::new(
