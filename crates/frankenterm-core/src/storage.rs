@@ -10161,6 +10161,16 @@ impl StorageHandle {
         dimension: i32,
         vector: &[u8],
     ) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .store_embedding_with_cx(&cx, segment_id, embedder_id, dimension, vector)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
@@ -10183,6 +10193,7 @@ impl StorageHandle {
 
         self.invalidate_semantic_cache();
         Ok(())
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`store_embedding`].
@@ -10197,8 +10208,28 @@ impl StorageHandle {
     ) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("store_embedding cancelled: {err}")))?;
-        self.store_embedding(segment_id, embedder_id, dimension, vector)
-            .await
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+        let vector = vector.to_vec();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+                rusqlite::params![segment_id, embedder_id, dimension, vector],
+            )
+            .map_err(|e| StorageError::Database(format!("store_embedding: {e}")))?;
+
+            Ok(())
+        })
+        .await?;
+
+        self.invalidate_semantic_cache();
+        Ok(())
     }
 
     /// Get segment IDs that have no embedding for the given embedder.
