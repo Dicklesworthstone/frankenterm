@@ -1170,4 +1170,111 @@ proptest! {
         let formatted = format_restore_summary(&summary);
         prop_assert!(!formatted.is_empty());
     }
+
+    // ================================================================
+    // 38. In-memory SQLite: find_unclean_sessions orders by latest activity
+    // ================================================================
+    #[test]
+    fn db_find_unclean_sessions_orders_by_latest_checkpoint_then_created(
+        base_created_at in 10_000i64..1_000_000,
+        checkpoint_gap in 1i64..5_000,
+    ) {
+        let (db_path, conn) = setup_test_db();
+
+        insert_session(&conn, "older-created-newer-checkpoint", false, base_created_at, "0.1.0", Some("host-a"));
+        insert_session(&conn, "newest-created-no-checkpoint", false, base_created_at + checkpoint_gap, "0.1.0", Some("host-b"));
+        insert_session(&conn, "oldest", false, base_created_at - checkpoint_gap, "0.1.0", Some("host-c"));
+
+        conn.execute(
+            "UPDATE mux_sessions SET last_checkpoint_at = ?2 WHERE session_id = ?1",
+            params!["older-created-newer-checkpoint", base_created_at + checkpoint_gap * 2],
+        )
+        .unwrap();
+
+        let candidates = frankenterm_core::session_restore::find_unclean_sessions(&db_path).unwrap();
+        let ordered_ids: Vec<&str> = candidates.iter().map(|candidate| candidate.session_id.as_str()).collect();
+
+        prop_assert_eq!(
+            ordered_ids,
+            vec![
+                "older-created-newer-checkpoint",
+                "newest-created-no-checkpoint",
+                "oldest",
+            ]
+        );
+        prop_assert_eq!(candidates[0].host_id.as_deref(), Some("host-a"));
+        prop_assert_eq!(
+            candidates[0].last_checkpoint_at,
+            Some((base_created_at + checkpoint_gap * 2) as u64)
+        );
+    }
+
+    // ================================================================
+    // 39. In-memory SQLite: list_sessions projects latest pane_count metadata
+    // ================================================================
+    #[test]
+    fn db_list_sessions_uses_latest_checkpoint_metadata(
+        first_pane_count in 1usize..5,
+        latest_pane_count in 1usize..5,
+        latest_total_bytes in 1usize..100_000,
+    ) {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-projection", false, 1000, "0.4.0", Some("host-meta"));
+
+        insert_checkpoint(&conn, "sess-projection", 2000, first_pane_count, 512, Some("periodic"));
+        insert_checkpoint(
+            &conn,
+            "sess-projection",
+            3000,
+            latest_pane_count,
+            latest_total_bytes,
+            Some("shutdown"),
+        );
+
+        let sessions = frankenterm_core::session_restore::list_sessions(&db_path).unwrap();
+        prop_assert_eq!(sessions.len(), 1);
+
+        let session = &sessions[0];
+        prop_assert_eq!(session.session_id.as_str(), "sess-projection");
+        prop_assert_eq!(session.ft_version.as_str(), "0.4.0");
+        prop_assert_eq!(session.host_id.as_deref(), Some("host-meta"));
+        prop_assert_eq!(session.checkpoint_count, 2);
+        prop_assert_eq!(session.pane_count, Some(latest_pane_count));
+    }
+
+    // ================================================================
+    // 40. In-memory SQLite: show_session preserves checkpoint metadata
+    // ================================================================
+    #[test]
+    fn db_show_session_preserves_checkpoint_metadata_roundtrip(
+        first_bytes in 0usize..50_000,
+        second_bytes in 0usize..50_000,
+        first_panes in 0usize..5,
+        second_panes in 0usize..5,
+    ) {
+        let (db_path, conn) = setup_test_db();
+        insert_session(&conn, "sess-metadata", false, 1000, "0.5.0", Some("host-z"));
+
+        let first_at = 2000i64;
+        let second_at = 3000i64;
+        insert_checkpoint(&conn, "sess-metadata", first_at, first_panes, first_bytes, Some("periodic"));
+        insert_checkpoint(&conn, "sess-metadata", second_at, second_panes, second_bytes, Some("shutdown"));
+
+        let (session, checkpoints) =
+            frankenterm_core::session_restore::show_session(&db_path, "sess-metadata").unwrap();
+
+        prop_assert_eq!(session.session_id, "sess-metadata");
+        prop_assert_eq!(session.host_id.as_deref(), Some("host-z"));
+        prop_assert_eq!(checkpoints.len(), 2);
+
+        prop_assert_eq!(checkpoints[0].checkpoint_at, second_at as u64);
+        prop_assert_eq!(checkpoints[0].checkpoint_type.as_deref(), Some("shutdown"));
+        prop_assert_eq!(checkpoints[0].pane_count, second_panes);
+        prop_assert_eq!(checkpoints[0].total_bytes, second_bytes);
+
+        prop_assert_eq!(checkpoints[1].checkpoint_at, first_at as u64);
+        prop_assert_eq!(checkpoints[1].checkpoint_type.as_deref(), Some("periodic"));
+        prop_assert_eq!(checkpoints[1].pane_count, first_panes);
+        prop_assert_eq!(checkpoints[1].total_bytes, first_bytes);
+    }
 }
