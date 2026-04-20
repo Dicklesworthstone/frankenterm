@@ -209,7 +209,7 @@ where
 {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         with_retry_outcome_cx(&cx, policy, operation).await
     }
     #[cfg(not(feature = "asupersync-runtime"))]
@@ -490,7 +490,7 @@ where
 {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         with_smart_retry_cx(&cx, policy, operation).await
     }
     #[cfg(not(feature = "asupersync-runtime"))]
