@@ -9223,6 +9223,14 @@ impl StorageHandle {
 
     /// Upsert a workflow execution record
     pub async fn upsert_workflow(&self, workflow: WorkflowRecord) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.upsert_workflow_with_cx(&cx, workflow).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::UpsertWorkflow {
@@ -9233,6 +9241,7 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_workflow`].
