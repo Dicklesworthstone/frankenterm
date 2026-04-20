@@ -6869,10 +6869,20 @@ impl StorageHandle {
     }
 
     /// Upsert undo metadata after applying redaction
-    pub async fn upsert_action_undo_redacted(&self, mut record: ActionUndoRecord) -> Result<()> {
-        let redactor = Redactor::new();
-        record.redact_fields(&redactor);
-        self.upsert_action_undo(record).await
+    pub async fn upsert_action_undo_redacted(&self, record: ActionUndoRecord) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.upsert_action_undo_redacted_with_cx(&cx, record).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut record = record;
+            let redactor = Redactor::new();
+            record.redact_fields(&redactor);
+            self.upsert_action_undo(record).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo_redacted`].
