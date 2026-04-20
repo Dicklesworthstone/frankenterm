@@ -673,6 +673,160 @@ pub(super) fn handle_stream_deltas(
         let mut subscriber = event_bus.subscribe_deltas();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let started_at_ms = epoch_ms_now();
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            task::spawn_with_cx(&stream_cx, move |child_cx| async move {
+                let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+                let mut next_emit_at = Instant::now();
+                let mut seq = 0_u64;
+                let mut consecutive_drops = 0_u64;
+                let mut after_id: Option<i64> = None;
+
+                seq += 1;
+                let ready = make_stream_frame(
+                    "deltas",
+                    "ready",
+                    seq,
+                    json!({
+                        "max_hz": max_hz,
+                        "pane_id": pane_filter
+                    }),
+                );
+                if let Some(event) = frame_to_sse("ready", seq, ready) {
+                    if !send_rate_limited_sse(
+                        &tx,
+                        event,
+                        &mut next_emit_at,
+                        min_interval,
+                        &mut consecutive_drops,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+
+                loop {
+                    let recv_result = select! {
+                        () = sender_closed(&tx) => break,
+                        recv = crate::runtime_compat::timeout_with_cx(
+                            &child_cx,
+                            Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                            subscriber.recv_cx(&child_cx),
+                        ) => recv,
+                    };
+
+                    match recv_result {
+                        Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
+                            if pane_filter.is_some_and(|pid| pid != pane_id) {
+                                continue;
+                            }
+                            if !emit_new_segment_frames(
+                                &storage,
+                                pane_filter,
+                                started_at_ms,
+                                &mut after_id,
+                                &redactor,
+                                &tx,
+                                &mut seq,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Ok(Event::GapDetected {
+                            pane_id,
+                            seq_before,
+                            seq_after,
+                            reason,
+                            detected_at_ms,
+                        })) => {
+                            if pane_filter.is_some_and(|pid| pid != pane_id) {
+                                continue;
+                            }
+
+                            seq += 1;
+                            let frame = make_stream_frame(
+                                "deltas",
+                                "gap",
+                                seq,
+                                json!({
+                                    "pane_id": pane_id,
+                                    "seq_before": seq_before,
+                                    "seq_after": seq_after,
+                                    "reason": redactor.redact(&reason),
+                                    "detected_at_ms": detected_at_ms,
+                                }),
+                            );
+                            if let Some(event) = frame_to_sse("gap", seq, frame) {
+                                if !send_rate_limited_sse(
+                                    &tx,
+                                    event,
+                                    &mut next_emit_at,
+                                    min_interval,
+                                    &mut consecutive_drops,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(RecvError::Lagged { missed_count })) => {
+                            seq += 1;
+                            let frame = make_stream_frame(
+                                "deltas",
+                                "lag",
+                                seq,
+                                json!({ "missed_count": missed_count }),
+                            );
+                            if let Some(event) = frame_to_sse("lag", seq, frame) {
+                                if !send_rate_limited_sse(
+                                    &tx,
+                                    event,
+                                    &mut next_emit_at,
+                                    min_interval,
+                                    &mut consecutive_drops,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+
+                            if !emit_new_segment_frames(
+                                &storage,
+                                pane_filter,
+                                started_at_ms,
+                                &mut after_id,
+                                &redactor,
+                                &tx,
+                                &mut seq,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Err(RecvError::Closed)) => break,
+                        Err(_) => {
+                            let _ = tx.try_send(SseEvent::comment("keepalive"));
+                        }
+                    }
+                }
+            });
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         task::spawn(async move {
             let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
             let mut next_emit_at = Instant::now();
