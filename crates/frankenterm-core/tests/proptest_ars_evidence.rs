@@ -42,6 +42,7 @@ fn arb_evidence_value() -> impl Strategy<Value = EvidenceValue> {
         "[a-zA-Z0-9 ]{1,20}".prop_map(EvidenceValue::String),
         (-1000.0..1000.0f64).prop_map(EvidenceValue::Number),
         prop::bool::ANY.prop_map(EvidenceValue::Bool),
+        prop::collection::vec("[a-zA-Z0-9 _-]{1,12}", 0..5).prop_map(EvidenceValue::StringList),
     ]
 }
 
@@ -431,6 +432,8 @@ proptest! {
         prop_assert_eq!(back.seq, entry.seq);
         prop_assert_eq!(back.category, entry.category);
         prop_assert_eq!(back.verdict, entry.verdict);
+        prop_assert_eq!(back.payload, entry.payload);
+        prop_assert_eq!(&back.summary, &entry.summary);
         prop_assert_eq!(&back.entry_hash, &entry.entry_hash);
     }
 
@@ -449,6 +452,34 @@ proptest! {
         let back: EvidenceEntry = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.seq, 0);
         prop_assert!(!back.entry_hash.is_empty());
+    }
+
+    #[test]
+    fn evidence_entry_payload_roundtrip_preserves_string_list(
+        cat in arb_category(),
+        verdict in arb_verdict(),
+        ts in 1000_u64..2_000_000_000,
+        values in prop::collection::vec("[a-zA-Z0-9 _-]{1,12}", 0..5),
+    ) {
+        let mut payload = BTreeMap::new();
+        payload.insert("list".to_string(), EvidenceValue::StringList(values.clone()));
+        let entry = EvidenceEntry {
+            seq: 7,
+            category: cat,
+            timestamp_us: ts,
+            summary: "string list payload".to_string(),
+            payload,
+            verdict,
+            entry_hash: "cafebabe".to_string(),
+            prev_hash: "feedface".to_string(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: EvidenceEntry = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(
+            back.payload.get("list"),
+            Some(&EvidenceValue::StringList(values))
+        );
     }
 }
 
