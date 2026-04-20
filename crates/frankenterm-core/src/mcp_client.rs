@@ -412,6 +412,7 @@ mod tests {
         McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
         map_mcp_error, select_server,
     };
+    use proptest::prelude::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -775,6 +776,74 @@ mod tests {
     fn content_item_as_text_returns_none_for_missing_type() {
         let item = McpClientContentItem(serde_json::json!({"text": "no type field"}));
         assert!(item.as_text().is_none());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_select_server_requested_name_is_trimmed_and_case_insensitive(
+            name in "[A-Za-z0-9_.-]{1,24}",
+            pad_left in "[ \t]{0,3}",
+            pad_right in "[ \t]{0,3}",
+            use_upper in any::<bool>(),
+        ) {
+            let config = Config::default();
+            let discovered = vec![ExternalServerConfig {
+                name: name.clone(),
+                command: "cmd".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            }];
+
+            let requested_core = if use_upper {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_ascii_lowercase()
+            };
+            let requested = format!("{pad_left}{requested_core}{pad_right}");
+
+            let selected = select_server(&config, &discovered, Some(&requested)).expect("select server");
+            prop_assert_eq!(selected.name, name);
+        }
+
+        #[test]
+        fn prop_tool_definition_destructive_flag_follows_annotation(
+            name in "[A-Za-z0-9_.-]{1,24}",
+            destructive in any::<bool>(),
+        ) {
+            let tool = McpClientToolDefinition {
+                name,
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"destructive": destructive})),
+            };
+
+            prop_assert_eq!(tool.is_destructive(), destructive);
+        }
+
+        #[test]
+        fn prop_content_item_as_text_depends_on_type_field(
+            text in "[A-Za-z0-9 _.,:/-]{1,48}",
+        ) {
+            let text_item = McpClientContentItem(serde_json::json!({
+                "type": "text",
+                "text": text.clone(),
+            }));
+            let image_item = McpClientContentItem(serde_json::json!({
+                "type": "image",
+                "text": text.clone(),
+            }));
+
+            prop_assert_eq!(text_item.as_text(), Some(text.as_str()));
+            prop_assert_eq!(image_item.as_text(), None);
+        }
     }
 
     fn field_matches(value: &str, expected: &str) -> bool {
