@@ -21,7 +21,7 @@ serial2.workspace = true
 shell-words.workspace = true
 
 [features]
-default = []
+default = ["serde_support"]
 serde_support = ["serde"]
 
 [target."cfg(windows)".dependencies]

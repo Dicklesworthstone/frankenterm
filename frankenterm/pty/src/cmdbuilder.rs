@@ -202,11 +202,76 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
 #[cfg_attr(feature = "serde_support", derive(Serialize, Deserialize))]
 pub struct CommandBuilder {
     args: Vec<OsString>,
+    #[cfg_attr(feature = "serde_support", serde(with = "env_map_serde"))]
     envs: BTreeMap<OsString, EnvEntry>,
     cwd: Option<OsString>,
     #[cfg(unix)]
     pub(crate) umask: Option<libc::mode_t>,
     controlling_tty: bool,
+}
+
+#[cfg(feature = "serde_support")]
+mod env_map_serde {
+    //! JSON-friendly adapter for `BTreeMap<OsString, EnvEntry>`.
+    //!
+    //! `OsString` on unix wraps arbitrary bytes, so serde_json cannot use
+    //! it as a map key (JSON requires string keys). This adapter serializes
+    //! the map as `BTreeMap<String, EnvEntry>` using UTF-8-lossy conversion
+    //! on the key, which covers every legal environment-variable name on
+    //! every supported platform (POSIX env names are ASCII-only; Windows
+    //! env names survive UTF-16 → UTF-8 round-tripping). Any lossy
+    //! conversion would already indicate a malformed key that the OS
+    //! rejects, so we accept that small edge case as the cost of making
+    //! the roundtrip work in JSON at all.
+    use super::{BTreeMap, EnvEntry, OsString};
+    use serde::de::{Deserializer, MapAccess, Visitor};
+    use serde::ser::{SerializeMap, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(
+        envs: &BTreeMap<OsString, EnvEntry>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(envs.len()))?;
+        for (key, value) in envs {
+            let key_str = key.to_string_lossy();
+            map.serialize_entry(key_str.as_ref(), value)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<OsString, EnvEntry>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EnvMapVisitor;
+
+        impl<'de> Visitor<'de> for EnvMapVisitor {
+            type Value = BTreeMap<OsString, EnvEntry>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map from environment variable name to EnvEntry")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut out = BTreeMap::new();
+                while let Some((key, value)) = access.next_entry::<String, EnvEntry>()? {
+                    out.insert(OsString::from(key), value);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_map(EnvMapVisitor)
+    }
 }
 
 impl CommandBuilder {
