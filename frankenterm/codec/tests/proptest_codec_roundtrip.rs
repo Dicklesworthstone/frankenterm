@@ -1,9 +1,9 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
-    GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes, PaneRemoved, Pdu, Ping, Pong,
-    RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace, SetClipboard, SetLayoutCycle,
-    SetWindowWorkspace, TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WriteToPane,
+    GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes, PaneRemoved,
+    Pdu, Ping, Pong, RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace, SetClipboard,
+    SetFocusedPane, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -156,6 +156,19 @@ fn arb_pane_removed() -> impl Strategy<Value = PaneRemoved> {
 
 fn arb_kill_pane() -> impl Strategy<Value = KillPane> {
     (0u64..=4096).prop_map(|pane_id| KillPane { pane_id })
+}
+
+fn arb_set_focused_pane() -> impl Strategy<Value = SetFocusedPane> {
+    (0u64..=4096).prop_map(|pane_id| SetFocusedPane { pane_id })
+}
+
+fn arb_get_pane_direction_response() -> impl Strategy<Value = GetPaneDirectionResponse> {
+    prop_oneof![
+        Just(GetPaneDirectionResponse { pane_id: None }),
+        (0u64..=4096).prop_map(|pane_id| GetPaneDirectionResponse {
+            pane_id: Some(pane_id),
+        }),
+    ]
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -370,6 +383,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::KillPane(payload));
+    }
+
+    #[test]
+    fn set_focused_pane_json_and_pdu_roundtrip(
+        payload in arb_set_focused_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetFocusedPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetFocusedPane(payload));
+    }
+
+    #[test]
+    fn get_pane_direction_response_json_and_pdu_roundtrip(
+        payload in arb_get_pane_direction_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneDirectionResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneDirectionResponse(payload));
     }
 
     #[test]
