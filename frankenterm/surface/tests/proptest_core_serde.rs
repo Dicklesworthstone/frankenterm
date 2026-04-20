@@ -231,3 +231,30 @@ fn flush_changes_older_than_future_seqno_is_noop_for_seqno() {
     assert_eq!(surface.current_seqno(), seq);
     assert!(!surface.has_changes(seq));
 }
+
+#[test]
+fn surface_add_changes_returns_new_current_seqno() {
+    let mut surface = Surface::new(2, 1);
+
+    let seq = surface.add_changes(vec![
+        Change::Text("x".to_string()),
+        Change::Text("y".to_string()),
+    ]);
+
+    assert_eq!(seq, 2);
+    assert_eq!(surface.current_seqno(), 2);
+    assert!(surface.has_changes(0));
+    assert!(!surface.has_changes(2));
+}
+
+#[test]
+fn flush_changes_older_than_zero_preserves_pending_change_visibility() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+
+    surface.flush_changes_older_than(0);
+
+    assert_eq!(surface.current_seqno(), 1);
+    assert!(surface.has_changes(0));
+    assert!(!surface.has_changes(1));
+}
