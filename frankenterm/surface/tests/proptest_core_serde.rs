@@ -1,5 +1,6 @@
 #![cfg(feature = "use_serde")]
 
+use frankenterm_surface::hyperlink::Rule;
 use frankenterm_surface::{
     Change, CursorShape, CursorVisibility, DirtyRect, LineAttribute, Position,
 };
@@ -63,6 +64,17 @@ fn arb_change() -> impl Strategy<Value = Change> {
     ]
 }
 
+fn arb_rule() -> impl Strategy<Value = Rule> {
+    prop_oneof![
+        Just(Rule::new(r"foo", "$0").unwrap()),
+        Just(Rule::new(r"\\d+", "num:$0").unwrap()),
+        Just(Rule::with_highlight(r"(\\w+)://(\\S+)", "link:$2", 1).unwrap()),
+        proptest::collection::vec(any::<char>(), 0..32)
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+            .prop_map(|format| Rule::new(r"foo", &format).unwrap()),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -106,5 +118,15 @@ proptest! {
         let json = serde_json::to_string(&value).unwrap();
         let back: Change = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn hyperlink_rule_json_roundtrip(value in arb_rule()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: Rule = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(back.regex.to_string(), value.regex.to_string());
+        prop_assert_eq!(back.format, value.format);
+        prop_assert_eq!(back.highlight, value.highlight);
     }
 }
