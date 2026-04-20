@@ -11216,6 +11216,14 @@ impl StorageHandle {
 
     /// Get the maximum sequence number for a pane (to resume capture).
     pub async fn get_max_seq(&self, pane_id: u64) -> Result<Option<u64>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_max_seq_with_cx(&cx, pane_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -11226,6 +11234,7 @@ impl StorageHandle {
             query_max_seq(&conn, pane_id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_max_seq`].
@@ -11237,7 +11246,16 @@ impl StorageHandle {
     ) -> Result<Option<u64>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_max_seq cancelled: {err}")))?;
-        self.get_max_seq(pane_id).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_max_seq(&conn, pane_id)
+        })
+        .await
     }
 
     /// Get all panes
