@@ -1,5 +1,7 @@
 use mux::renderable::StableCursorPosition;
-use mux::tab::{PaneEntry, PaneNode, SerdeUrl};
+use mux::tab::{
+    PaneEntry, PaneNode, SerdeUrl, SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize,
+};
 use proptest::prelude::*;
 use url::Url;
 
@@ -109,6 +111,50 @@ fn arb_pane_node() -> impl Strategy<Value = PaneNode> {
     ]
 }
 
+fn arb_split_direction() -> impl Strategy<Value = SplitDirection> {
+    prop_oneof![
+        Just(SplitDirection::Horizontal),
+        Just(SplitDirection::Vertical),
+    ]
+}
+
+fn arb_split_size() -> impl Strategy<Value = SplitSize> {
+    prop_oneof![
+        (0usize..=256).prop_map(SplitSize::Cells),
+        (0u8..=100).prop_map(SplitSize::Percent),
+    ]
+}
+
+fn arb_split_request() -> impl Strategy<Value = SplitRequest> {
+    (
+        arb_split_direction(),
+        any::<bool>(),
+        any::<bool>(),
+        arb_split_size(),
+    )
+        .prop_map(
+            |(direction, target_is_second, top_level, size)| SplitRequest {
+                direction,
+                target_is_second,
+                top_level,
+                size,
+            },
+        )
+}
+
+fn arb_split_direction_and_size() -> impl Strategy<Value = SplitDirectionAndSize> {
+    (
+        arb_split_direction(),
+        arb_terminal_size(),
+        arb_terminal_size(),
+    )
+        .prop_map(|(direction, first, second)| SplitDirectionAndSize {
+            direction,
+            first,
+            second,
+        })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -130,6 +176,20 @@ proptest! {
     fn pane_node_json_roundtrip(value in arb_pane_node()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: PaneNode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn split_request_json_roundtrip(value in arb_split_request()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SplitRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn split_direction_and_size_json_roundtrip(value in arb_split_direction_and_size()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SplitDirectionAndSize = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
