@@ -8769,6 +8769,14 @@ impl StorageHandle {
 
     /// Get a full indexing health report (per-pane stats + FTS integrity).
     pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_indexing_health_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8779,6 +8787,7 @@ impl StorageHandle {
             Ok(build_indexing_health_report(stats, fts_ok))
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_indexing_health`].
@@ -8790,7 +8799,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_indexing_health cancelled: {err}"))
         })?;
-        self.get_indexing_health().await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            let stats = get_pane_indexing_stats_sync(&conn)?;
+            let fts_ok = check_fts_integrity_sync(&conn)?;
+            Ok(build_indexing_health_report(stats, fts_ok))
+        })
+        .await
     }
 
     /// Perform incremental FTS sync on startup.
