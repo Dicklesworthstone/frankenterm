@@ -1,10 +1,10 @@
 use codec::{
-    AdjustPaneSize, CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion,
+    AdjustPaneSize, CreateFloatingPane, CycleStack, ErrorResponse, GetClientList, GetCodecVersion,
     GetCodecVersionResponse, GetPaneDirection, GetPaneDirectionResponse, GetTlsCreds,
     GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
     PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane,
     SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
-    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow, TabResized,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
     TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
     WindowWorkspaceChanged, WriteToPane,
 };
@@ -125,6 +125,23 @@ fn arb_set_layout_cycle() -> impl Strategy<Value = SetLayoutCycle> {
     (0u64..=4096, arb_layout_names()).prop_map(|(tab_id, layout_names)| SetLayoutCycle {
         tab_id,
         layout_names,
+    })
+}
+
+fn arb_swap_to_layout() -> impl Strategy<Value = SwapToLayout> {
+    (0u64..=4096, 0usize..=128).prop_map(|(tab_id, layout_index)| SwapToLayout {
+        tab_id,
+        layout_index,
+    })
+}
+
+fn arb_cycle_stack() -> impl Strategy<Value = CycleStack> {
+    (0u64..=4096, 0usize..=128, any::<bool>()).prop_map(|(tab_id, slot_index, forward)| {
+        CycleStack {
+            tab_id,
+            slot_index,
+            forward,
+        }
     })
 }
 
@@ -417,6 +434,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SetLayoutCycle(payload));
+    }
+
+    #[test]
+    fn swap_to_layout_json_and_pdu_roundtrip(
+        payload in arb_swap_to_layout(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SwapToLayout = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SwapToLayout(payload));
+    }
+
+    #[test]
+    fn cycle_stack_json_and_pdu_roundtrip(
+        payload in arb_cycle_stack(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: CycleStack = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::CycleStack(payload));
     }
 
     #[test]
