@@ -1,11 +1,13 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
-    GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes, PaneFocused,
-    PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace,
-    SetClipboard, SetFocusedPane, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged,
-    UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
+    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane,
+    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFocusedPane, SetLayoutCycle,
+    SetWindowWorkspace, TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
+use mux::client::ClientId;
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
 use std::path::PathBuf;
@@ -180,6 +182,39 @@ fn arb_window_workspace_changed() -> impl Strategy<Value = WindowWorkspaceChange
         window_id,
         workspace,
     })
+}
+
+fn arb_client_id() -> impl Strategy<Value = ClientId> {
+    (
+        arb_small_string(),
+        arb_small_string(),
+        any::<u32>(),
+        any::<u64>(),
+        0usize..=4096,
+        prop_oneof![Just(None), arb_small_string().prop_map(Some)],
+    )
+        .prop_map(
+            |(hostname, username, pid, epoch, id, ssh_auth_sock)| ClientId {
+                hostname,
+                username,
+                pid,
+                epoch,
+                id,
+                ssh_auth_sock,
+            },
+        )
+}
+
+fn arb_set_client_id() -> impl Strategy<Value = SetClientId> {
+    (arb_client_id(), any::<bool>()).prop_map(|(client_id, is_proxy)| SetClientId {
+        client_id,
+        is_proxy,
+    })
+}
+
+fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
+    (0u64..=4096, any::<bool>())
+        .prop_map(|(pane_id, is_alive)| LivenessResponse { pane_id, is_alive })
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -442,6 +477,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::WindowWorkspaceChanged(payload));
+    }
+
+    #[test]
+    fn set_client_id_json_and_pdu_roundtrip(
+        payload in arb_set_client_id(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetClientId = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetClientId(payload));
+    }
+
+    #[test]
+    fn liveness_response_json_and_pdu_roundtrip(
+        payload in arb_liveness_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: LivenessResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::LivenessResponse(payload));
     }
 
     #[test]
