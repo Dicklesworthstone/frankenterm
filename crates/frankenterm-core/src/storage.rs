@@ -6960,16 +6960,25 @@ impl StorageHandle {
 
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::PurgeAuditActions {
-                before_ts,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.purge_audit_actions_before_with_cx(&cx, before_ts).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::PurgeAuditActions {
+                    before_ts,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_audit_actions_before`].
@@ -6982,7 +6991,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("purge_audit_actions_before cancelled: {err}"))
         })?;
-        self.purge_audit_actions_before(before_ts).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PurgeAuditActions {
+                    before_ts,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a maintenance event
