@@ -8399,17 +8399,28 @@ impl StorageHandle {
 
     /// Delete events older than a cutoff (flat, no tier; write-path).
     pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::DeleteEventsBefore {
-                before_ts,
-                batch_size,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .delete_events_before_with_cx(&cx, before_ts, batch_size)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::DeleteEventsBefore {
+                    before_ts,
+                    batch_size,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_before`].
@@ -8423,7 +8434,20 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("delete_events_before cancelled: {err}"))
         })?;
-        self.delete_events_before(before_ts, batch_size).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteEventsBefore {
+                    before_ts,
+                    batch_size,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Delete events matching tier criteria older than a cutoff (write-path).
