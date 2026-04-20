@@ -1,0 +1,7 @@
+[runtime]
+tick_interval_ms = "not a number"
+max_concurrent_panes = -1
+
+[backpressure]
+green_threshold = 1.5
+yellow_threshold = true

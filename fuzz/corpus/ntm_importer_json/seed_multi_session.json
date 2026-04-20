@@ -1,0 +1,1 @@
+[{"name":"workspace","windows":[{"name":"code","panes":[{"command":"nvim","cwd":"/src","active":true},{"command":"cargo watch","cwd":"/src","active":false}]},{"name":"logs","panes":[{"command":"tail -f /var/log/app.log","cwd":"/","active":false}]}]},{"name":"monitor","windows":[{"name":"htop","panes":[{"command":"htop","cwd":"/","active":true}]}]}]
