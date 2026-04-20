@@ -10431,14 +10431,25 @@ impl StorageHandle {
         &self,
         service: &str,
     ) -> Result<Vec<crate::accounts::AccountRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_accounts_by_service_with_cx(&cx, service).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         let db_path = self.db_path.clone();
+        #[cfg(not(feature = "asupersync-runtime"))]
         let service = service.to_string();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-            get_accounts_by_service_sync(&conn, &service)
-        })
-        .await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str())
+                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+                get_accounts_by_service_sync(&conn, &service)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_accounts_by_service`].
@@ -10451,7 +10462,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_accounts_by_service cancelled: {err}"))
         })?;
-        self.get_accounts_by_service(service).await
+        let db_path = self.db_path.clone();
+        let service = service.to_string();
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_accounts_by_service_sync(&conn, &service)
+        })
+        .await
     }
 
     /// Get a single account by service and account_id
