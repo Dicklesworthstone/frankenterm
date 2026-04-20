@@ -805,7 +805,7 @@ impl CassClient {
     ) -> Result<CassSearchResult, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.search_with_cx(&cx, query, options).await
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -847,7 +847,7 @@ impl CassClient {
     ) -> Result<Vec<CassSession>, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.search_sessions_with_cx(&cx, path, agent).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -888,7 +888,7 @@ impl CassClient {
     pub async fn query_session(&self, session_id: &str) -> Result<CassSession, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.query_session_with_cx(&cx, session_id).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -933,7 +933,7 @@ impl CassClient {
     ) -> Result<CassViewResult, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .query_with_cx(&cx, session_path, line_number, options)
                 .await;
@@ -965,7 +965,7 @@ impl CassClient {
     pub async fn status(&self) -> Result<CassStatus, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.status_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -998,7 +998,7 @@ impl CassClient {
     ) -> Result<CassIndexResult, CassError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.trigger_index_with_cx(&cx, workspace).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
