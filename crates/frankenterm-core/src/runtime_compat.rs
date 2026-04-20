@@ -307,7 +307,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.read_with_cx(&cx).await
     }
 
@@ -336,7 +336,7 @@ impl<T> RwLock<T> {
 
     #[allow(clippy::future_not_send)] // asupersync RwLock is !Sync by design
     pub async fn write(&self) -> RwLockWriteGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.write_with_cx(&cx).await
     }
 
@@ -494,7 +494,7 @@ impl Semaphore {
     }
 
     pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.acquire_with_cx(&cx).await
     }
 
@@ -546,7 +546,7 @@ impl Semaphore {
     }
 
     pub async fn acquire_owned(self: Arc<Self>) -> Result<OwnedSemaphorePermit, AcquireError> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.acquire_owned_with_cx(&cx).await
     }
 
