@@ -8689,6 +8689,14 @@ impl StorageHandle {
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
     pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.database_page_stats_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8697,6 +8705,7 @@ impl StorageHandle {
             database_page_stats_sync(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`database_page_stats`].
@@ -8708,7 +8717,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("database_page_stats cancelled: {err}"))
         })?;
-        self.database_page_stats().await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            database_page_stats_sync(&conn)
+        })
+        .await
     }
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
