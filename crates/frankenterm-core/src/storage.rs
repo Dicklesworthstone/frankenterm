@@ -6905,18 +6905,29 @@ impl StorageHandle {
     /// Returns `true` when the row was updated and `false` when the target
     /// action was already undone, non-undoable, or missing undo metadata.
     pub async fn mark_action_undone(&self, audit_action_id: i64, undone_by: &str) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::MarkActionUndone {
-                audit_action_id,
-                undone_at: now_ms(),
-                undone_by: undone_by.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .mark_action_undone_with_cx(&cx, audit_action_id, undone_by)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::MarkActionUndone {
+                    audit_action_id,
+                    undone_at: now_ms(),
+                    undone_by: undone_by.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_action_undone`].
@@ -6930,7 +6941,21 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("mark_action_undone cancelled: {err}"))
         })?;
-        self.mark_action_undone(audit_action_id, undone_by).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::MarkActionUndone {
+                    audit_action_id,
+                    undone_at: now_ms(),
+                    undone_by: undone_by.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge audit actions older than a cutoff timestamp
