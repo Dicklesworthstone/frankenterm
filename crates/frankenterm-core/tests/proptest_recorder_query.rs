@@ -23,7 +23,7 @@ use frankenterm_core::recorder_audit::{
 };
 use frankenterm_core::recorder_query::{
     InMemoryEventStore, QueryError, QueryEventKind, QueryStats, RecorderQueryExecutor,
-    RecorderQueryRequest, TimeRange,
+    QueryPlan, QueryResultEvent, RecorderQueryRequest, RecorderQueryResponse, TimeRange,
 };
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::{
@@ -78,6 +78,14 @@ fn arb_query_event_kind() -> impl Strategy<Value = QueryEventKind> {
         Just(QueryEventKind::EgressOutput),
         Just(QueryEventKind::ControlMarker),
         Just(QueryEventKind::LifecycleMarker),
+    ]
+}
+
+fn arb_sensitivity_tier() -> impl Strategy<Value = SensitivityTier> {
+    prop_oneof![
+        Just(SensitivityTier::T1Standard),
+        Just(SensitivityTier::T2Sensitive),
+        Just(SensitivityTier::T3Restricted),
     ]
 }
 
@@ -146,6 +154,77 @@ fn arb_query_stats() -> impl Strategy<Value = QueryStats> {
             events_excluded: excluded,
             ..Default::default()
         })
+}
+
+fn arb_query_result_event() -> impl Strategy<Value = QueryResultEvent> {
+    (
+        arb_text(32),
+        0_u64..10_000,
+        arb_event_source(),
+        0_u64..1_000_000,
+        0_u64..10_000,
+        prop::option::of(arb_text(24)),
+        prop::option::of(arb_text(64)),
+        any::<bool>(),
+        arb_sensitivity_tier(),
+        arb_query_event_kind(),
+    )
+        .prop_map(
+            |(
+                event_id,
+                pane_id,
+                source,
+                occurred_at_ms,
+                sequence,
+                session_id,
+                text,
+                redacted,
+                sensitivity,
+                event_kind,
+            )| QueryResultEvent {
+                event_id,
+                pane_id,
+                source,
+                occurred_at_ms,
+                sequence,
+                session_id,
+                text,
+                redacted,
+                sensitivity,
+                event_kind,
+            },
+        )
+}
+
+fn arb_query_plan() -> impl Strategy<Value = QueryPlan> {
+    (
+        arb_access_tier(),
+        arb_access_tier(),
+        0_usize..10_000,
+        prop::collection::vec(arb_sensitivity_tier(), 0..4),
+        arb_text(80),
+    )
+        .prop_map(
+            |(
+                required_tier,
+                actor_tier,
+                estimated_scan_count,
+                sensitivity_tiers_accessed,
+                explanation,
+            )| {
+                let can_execute = actor_tier.satisfies(required_tier);
+                let elevation_needed = !can_execute;
+                QueryPlan {
+                    required_tier,
+                    actor_tier,
+                    can_execute,
+                    elevation_needed,
+                    estimated_scan_count,
+                    sensitivity_tiers_accessed,
+                    explanation,
+                }
+            },
+        )
 }
 
 fn make_executor(events: Vec<RecorderEvent>) -> RecorderQueryExecutor<InMemoryEventStore> {
@@ -649,6 +728,104 @@ proptest! {
             prop_assert_eq!(masked.len(), text.len(),
                 "masked text length ({}) should equal original ({})", masked.len(), text.len());
         }
+    }
+}
+
+// =============================================================================
+// Serde: QueryResultEvent roundtrip
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn serde_query_result_event_roundtrip(event in arb_query_result_event()) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: QueryResultEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.event_id, event.event_id);
+        prop_assert_eq!(back.pane_id, event.pane_id);
+        prop_assert_eq!(back.source, event.source);
+        prop_assert_eq!(back.occurred_at_ms, event.occurred_at_ms);
+        prop_assert_eq!(back.sequence, event.sequence);
+        prop_assert_eq!(back.session_id, event.session_id);
+        prop_assert_eq!(back.text, event.text);
+        prop_assert_eq!(back.redacted, event.redacted);
+        prop_assert_eq!(back.sensitivity, event.sensitivity);
+        prop_assert_eq!(back.event_kind, event.event_kind);
+    }
+}
+
+// =============================================================================
+// Serde: RecorderQueryResponse roundtrip + duration skip invariant
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn serde_recorder_query_response_roundtrip(
+        events in prop::collection::vec(arb_query_result_event(), 0..8),
+        effective_tier in arb_access_tier(),
+        stats in arb_query_stats(),
+    ) {
+        let redaction_applied = events.iter().any(|event| event.redacted);
+        let response = RecorderQueryResponse {
+            total_count: events.len(),
+            has_more: false,
+            effective_tier,
+            redaction_applied,
+            stats,
+            events,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let back: RecorderQueryResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.events.len(), response.events.len());
+        for (back_event, original_event) in back.events.iter().zip(response.events.iter()) {
+            prop_assert_eq!(&back_event.event_id, &original_event.event_id);
+            prop_assert_eq!(back_event.pane_id, original_event.pane_id);
+            prop_assert_eq!(back_event.source, original_event.source);
+            prop_assert_eq!(back_event.occurred_at_ms, original_event.occurred_at_ms);
+            prop_assert_eq!(back_event.sequence, original_event.sequence);
+            prop_assert_eq!(&back_event.session_id, &original_event.session_id);
+            prop_assert_eq!(&back_event.text, &original_event.text);
+            prop_assert_eq!(back_event.redacted, original_event.redacted);
+            prop_assert_eq!(back_event.sensitivity, original_event.sensitivity);
+            prop_assert_eq!(back_event.event_kind, original_event.event_kind);
+        }
+        prop_assert_eq!(back.total_count, response.total_count);
+        prop_assert_eq!(back.has_more, response.has_more);
+        prop_assert_eq!(back.effective_tier, response.effective_tier);
+        prop_assert_eq!(back.redaction_applied, response.redaction_applied);
+        prop_assert_eq!(back.stats.events_scanned, response.stats.events_scanned);
+        prop_assert_eq!(back.stats.events_matched, response.stats.events_matched);
+        prop_assert_eq!(back.stats.events_redacted, response.stats.events_redacted);
+        prop_assert_eq!(back.stats.events_excluded, response.stats.events_excluded);
+        prop_assert_eq!(back.stats.duration, std::time::Duration::default());
+        prop_assert_eq!(back.redaction_applied, back.events.iter().any(|event| event.redacted));
+        prop_assert!(back.total_count >= back.events.len());
+    }
+}
+
+// =============================================================================
+// Serde: QueryPlan roundtrip + execution/elevation invariant
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn serde_query_plan_roundtrip(plan in arb_query_plan()) {
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: QueryPlan = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.required_tier, plan.required_tier);
+        prop_assert_eq!(back.actor_tier, plan.actor_tier);
+        prop_assert_eq!(back.can_execute, plan.can_execute);
+        prop_assert_eq!(back.elevation_needed, plan.elevation_needed);
+        prop_assert_eq!(back.estimated_scan_count, plan.estimated_scan_count);
+        prop_assert_eq!(back.sensitivity_tiers_accessed, plan.sensitivity_tiers_accessed);
+        prop_assert_eq!(back.explanation, plan.explanation);
+        prop_assert!(!back.can_execute || !back.elevation_needed);
     }
 }
 
