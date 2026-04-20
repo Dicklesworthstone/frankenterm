@@ -1,4 +1,4 @@
-use mux::pane::{PaneConstraints, Pattern, SearchResult};
+use mux::pane::{CollapsePriority, PaneConstraints, Pattern, PatternType, SearchResult};
 use proptest::prelude::*;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
@@ -65,6 +65,23 @@ fn arb_pattern() -> impl Strategy<Value = Pattern> {
     ]
 }
 
+fn arb_pattern_type() -> impl Strategy<Value = PatternType> {
+    prop_oneof![
+        Just(PatternType::CaseSensitiveString),
+        Just(PatternType::CaseInSensitiveString),
+        Just(PatternType::Regex),
+    ]
+}
+
+fn arb_collapse_priority() -> impl Strategy<Value = CollapsePriority> {
+    prop_oneof![
+        Just(CollapsePriority::Never),
+        Just(CollapsePriority::Low),
+        Just(CollapsePriority::Normal),
+        Just(CollapsePriority::High),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -86,6 +103,20 @@ proptest! {
     fn pattern_json_roundtrip(value in arb_pattern()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: Pattern = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn pattern_type_json_roundtrip(value in arb_pattern_type()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: PatternType = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn collapse_priority_json_roundtrip(value in arb_collapse_priority()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: CollapsePriority = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
