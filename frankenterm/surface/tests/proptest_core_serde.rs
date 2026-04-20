@@ -207,3 +207,27 @@ fn surface_resize_with_pending_changes_invalidates_change_log_and_bumps_seqno() 
     assert!(surface.has_changes(1));
     assert!(!surface.has_changes(2));
 }
+
+#[test]
+fn flush_changes_older_than_current_seqno_clears_pending_change_visibility() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+    let seq = surface.current_seqno();
+
+    surface.flush_changes_older_than(seq);
+
+    assert_eq!(surface.current_seqno(), seq);
+    assert!(!surface.has_changes(seq));
+}
+
+#[test]
+fn flush_changes_older_than_future_seqno_is_noop_for_seqno() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+    let seq = surface.current_seqno();
+
+    surface.flush_changes_older_than(seq + 10);
+
+    assert_eq!(surface.current_seqno(), seq);
+    assert!(!surface.has_changes(seq));
+}
