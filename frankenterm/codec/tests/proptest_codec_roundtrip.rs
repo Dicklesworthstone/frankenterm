@@ -1,16 +1,16 @@
 use codec::{
-    ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, ErrorResponse,
-    GetClientList, GetCodecVersion, GetCodecVersionResponse, GetPaneDirection,
+    ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
+    ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderableDimensions,
     GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
     LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
-    RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane, SendPaste, SetActiveWorkspace,
-    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
-    SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
-    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SelectStackPane,
+    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
     WindowWorkspaceChanged, WriteToPane,
 };
-use config::keyassignment::PaneDirection;
+use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::ClientId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -417,6 +417,46 @@ fn arb_move_floating_pane() -> impl Strategy<Value = MoveFloatingPane> {
 
 fn arb_remove_floating_pane() -> impl Strategy<Value = RemoveFloatingPane> {
     (0u64..=4096).prop_map(|pane_id| RemoveFloatingPane { pane_id })
+}
+
+fn arb_pattern() -> impl Strategy<Value = mux::pane::Pattern> {
+    prop_oneof![
+        arb_small_string().prop_map(mux::pane::Pattern::CaseSensitiveString),
+        arb_small_string().prop_map(mux::pane::Pattern::CaseInSensitiveString),
+        arb_small_string().prop_map(mux::pane::Pattern::Regex),
+    ]
+}
+
+fn arb_scrollback_erase_mode() -> impl Strategy<Value = ScrollbackEraseMode> {
+    prop_oneof![
+        Just(ScrollbackEraseMode::ScrollbackOnly),
+        Just(ScrollbackEraseMode::ScrollbackAndViewport),
+    ]
+}
+
+fn arb_erase_scrollback_request() -> impl Strategy<Value = EraseScrollbackRequest> {
+    (0u64..=4096, arb_scrollback_erase_mode()).prop_map(|(pane_id, erase_mode)| {
+        EraseScrollbackRequest {
+            pane_id,
+            erase_mode,
+        }
+    })
+}
+
+fn arb_search_scrollback_request() -> impl Strategy<Value = SearchScrollbackRequest> {
+    (
+        0u64..=4096,
+        arb_pattern(),
+        -100_000isize..=100_000isize,
+        -100_000isize..=100_000isize,
+        prop_oneof![Just(None), any::<u32>().prop_map(Some)],
+    )
+        .prop_map(|(pane_id, pattern, a, b, limit)| SearchScrollbackRequest {
+            pane_id,
+            pattern,
+            range: a.min(b)..a.max(b),
+            limit,
+        })
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
@@ -866,6 +906,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderableDimensionsResponse(payload));
+    }
+
+    #[test]
+    fn erase_scrollback_request_json_and_pdu_roundtrip(
+        payload in arb_erase_scrollback_request(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: EraseScrollbackRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::EraseScrollbackRequest(payload));
+    }
+
+    #[test]
+    fn search_scrollback_request_json_and_pdu_roundtrip(
+        payload in arb_search_scrollback_request(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SearchScrollbackRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SearchScrollbackRequest(payload));
     }
 
     #[test]
