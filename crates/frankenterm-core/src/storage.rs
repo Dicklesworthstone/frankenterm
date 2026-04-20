@@ -10326,6 +10326,16 @@ impl StorageHandle {
         segment_id: i64,
         embedder_id: &str,
     ) -> Result<Option<Vec<u8>>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .get_embedding_with_cx(&cx, segment_id, embedder_id)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
@@ -10346,6 +10356,7 @@ impl StorageHandle {
             Ok(result)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_embedding`].
@@ -10358,7 +10369,26 @@ impl StorageHandle {
     ) -> Result<Option<Vec<u8>>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_embedding cancelled: {err}")))?;
-        self.get_embedding(segment_id, embedder_id).await
+        let db_path = Arc::clone(&self.db_path);
+        let embedder_id = embedder_id.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open connection: {e}"))
+            })?;
+
+            let result: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
+                    rusqlite::params![segment_id, embedder_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| StorageError::Database(format!("get_embedding: {e}")))?;
+
+            Ok(result)
+        })
+        .await
     }
 
     /// Get embedding statistics per embedder.
