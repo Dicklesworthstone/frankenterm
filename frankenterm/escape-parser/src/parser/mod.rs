@@ -803,6 +803,30 @@ mod test {
     }
 
     #[test]
+    fn parse_first_streaming_st_terminator_split_across_chunks() {
+        let mut p = Parser::new();
+
+        assert_eq!(None, p.parse_first(b"\x1b]0;hello\x1b"));
+
+        let chunk = b"\\X";
+        let (action, consumed) = p
+            .parse_first(chunk)
+            .expect("expected OSC action once ST terminator is completed");
+        assert_eq!(
+            Action::OperatingSystemCommand(Box::new(
+                OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned()),
+            )),
+            action
+        );
+        assert_eq!(1, consumed);
+
+        assert_eq!(
+            Some((Action::Print('X'), 1)),
+            p.parse_first(&chunk[consumed..])
+        );
+    }
+
+    #[test]
     fn parse_first_as_vec_stops_at_ground_boundary() {
         let mut p = Parser::new();
         let data = b"\x1b[1mB";
@@ -818,6 +842,33 @@ mod test {
         assert_eq!(
             Some((vec![Action::Print('B')], 1)),
             p.parse_first_as_vec(&data[consumed..])
+        );
+    }
+
+    #[test]
+    fn parse_first_as_vec_streaming_st_terminator_split_across_chunks() {
+        let mut p = Parser::new();
+
+        assert_eq!(None, p.parse_first_as_vec(b"\x1b]0;hello\x1b"));
+
+        let chunk = b"\\X";
+        let (actions, consumed) = p
+            .parse_first_as_vec(chunk)
+            .expect("expected completed OSC+ST sequence");
+
+        assert_eq!(
+            vec![
+                Action::OperatingSystemCommand(Box::new(
+                    OperatingSystemCommand::SetIconNameAndWindowTitle("hello".to_owned()),
+                )),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ],
+            actions
+        );
+        assert_eq!(1, consumed);
+        assert_eq!(
+            Some((vec![Action::Print('X')], 1)),
+            p.parse_first_as_vec(&chunk[consumed..])
         );
     }
 
