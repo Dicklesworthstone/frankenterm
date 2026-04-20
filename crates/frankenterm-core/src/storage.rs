@@ -7377,6 +7377,14 @@ impl StorageHandle {
 
     /// List saved searches in deterministic order.
     pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.list_saved_searches_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -7385,6 +7393,7 @@ impl StorageHandle {
             list_saved_searches_sync(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_saved_searches`].
@@ -7396,7 +7405,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("list_saved_searches cancelled: {err}"))
         })?;
-        self.list_saved_searches().await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            list_saved_searches_sync(&conn)
+        })
+        .await
     }
 
     /// Insert a pane bookmark. Returns the row ID.
