@@ -786,8 +786,19 @@ where
 
         macro_rules! reserve_capture_event_permit {
             ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
+                // Inherit the ambient task Cx so a shutdown signal sent to
+                // the supervisor propagates into the permit-reservation
+                // wait. The earlier revision unconditionally called
+                // `crate::cx::for_request()`, which built a detached
+                // request-scoped Cx with no parent chain — meaning an
+                // in-flight poll task blocked on `$tx.reserve` would keep
+                // waiting up to `send_timeout` even after its parent was
+                // cancelled. Matches the inherit-or-fallback idiom already
+                // used in native_events.rs, cpu_pressure.rs, storage.rs,
+                // etc.
                 #[cfg(feature = "asupersync-runtime")]
-                let $reserve_cx = crate::cx::for_request();
+                let $reserve_cx =
+                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 #[cfg(feature = "asupersync-runtime")]
                 let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
                     Ok(Ok(permit)) => permit,
