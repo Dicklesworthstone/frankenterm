@@ -1,8 +1,9 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
-    GetTlsCreds, GetTlsCredsResponse, ListPanes, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane,
-    SendPaste, SetActiveWorkspace, SetClipboard, SetLayoutCycle, SetWindowWorkspace,
-    TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes, PaneRemoved, Pdu, Ping, Pong,
+    RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace, SetClipboard, SetLayoutCycle,
+    SetWindowWorkspace, TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -147,6 +148,14 @@ fn arb_get_tls_creds_response() -> impl Strategy<Value = GetTlsCredsResponse> {
 
 fn arb_write_to_pane() -> impl Strategy<Value = WriteToPane> {
     (0u64..=4096, arb_small_bytes()).prop_map(|(pane_id, data)| WriteToPane { pane_id, data })
+}
+
+fn arb_pane_removed() -> impl Strategy<Value = PaneRemoved> {
+    (0u64..=4096).prop_map(|pane_id| PaneRemoved { pane_id })
+}
+
+fn arb_kill_pane() -> impl Strategy<Value = KillPane> {
+    (0u64..=4096).prop_map(|pane_id| KillPane { pane_id })
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -337,6 +346,30 @@ proptest! {
     #[test]
     fn get_client_list_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::GetClientList(GetClientList {}));
+    }
+
+    #[test]
+    fn pane_removed_json_and_pdu_roundtrip(
+        payload in arb_pane_removed(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: PaneRemoved = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::PaneRemoved(payload));
+    }
+
+    #[test]
+    fn kill_pane_json_and_pdu_roundtrip(
+        payload in arb_kill_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: KillPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::KillPane(payload));
     }
 
     #[test]
