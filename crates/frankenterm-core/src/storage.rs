@@ -8542,6 +8542,14 @@ impl StorageHandle {
         &self,
         query: NotificationHistoryQuery,
     ) -> Result<Vec<NotificationHistoryRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.query_notification_history_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8550,6 +8558,7 @@ impl StorageHandle {
             query_notification_history_sync(&conn, &query)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`query_notification_history`].
@@ -8562,7 +8571,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("query_notification_history cancelled: {err}"))
         })?;
-        self.query_notification_history(query).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_notification_history_sync(&conn, &query)
+        })
+        .await
     }
 
     /// Get a single notification by ID.
