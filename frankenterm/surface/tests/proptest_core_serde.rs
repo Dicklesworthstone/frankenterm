@@ -298,3 +298,25 @@ fn add_change_text_updates_screen_chars_to_string() {
 
     assert_eq!(surface.screen_chars_to_string(), "hi \n");
 }
+
+#[test]
+fn resize_larger_preserves_content_and_space_pads_new_area() {
+    let mut surface = Surface::new(2, 2);
+    surface.add_change(Change::Text("abcd".to_string()));
+
+    surface.resize(4, 4);
+
+    assert_eq!(surface.dimensions(), (4, 4));
+    assert_eq!(surface.screen_chars_to_string(), "ab  \ncd  \n    \n    \n");
+}
+
+#[test]
+fn resize_smaller_truncates_visible_screen_content() {
+    let mut surface = Surface::new(4, 4);
+    surface.add_change(Change::Text("abcdefghijklmnop".to_string()));
+
+    surface.resize(2, 2);
+
+    assert_eq!(surface.dimensions(), (2, 2));
+    assert_eq!(surface.screen_chars_to_string(), "ab\nef\n");
+}
