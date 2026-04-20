@@ -1,5 +1,5 @@
-use window::parameters::Border;
 use window::ResizeIncrement;
+use window::parameters::Border;
 
 pub struct ResizeIncrementCalculator {
     pub x: u16,
@@ -12,8 +12,9 @@ pub struct ResizeIncrementCalculator {
     pub tab_bar_height: usize,
 }
 
-fn saturating_resize_base(value: usize) -> u16 {
-    value.min(usize::from(u16::MAX)) as u16
+fn saturating_resize_base(value: usize, increment: u16) -> u16 {
+    let max_base = usize::from(u16::MAX.saturating_sub(increment));
+    value.min(max_base) as u16
 }
 
 impl Into<ResizeIncrement> for ResizeIncrementCalculator {
@@ -30,8 +31,8 @@ impl Into<ResizeIncrement> for ResizeIncrementCalculator {
         ResizeIncrement {
             x: self.x,
             y: self.y,
-            base_width: saturating_resize_base(base_width),
-            base_height: saturating_resize_base(base_height),
+            base_width: saturating_resize_base(base_width, self.x),
+            base_height: saturating_resize_base(base_height, self.y),
         }
     }
 }
@@ -40,9 +41,9 @@ impl Into<ResizeIncrement> for ResizeIncrementCalculator {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use window::ULength;
     use window::color::LinearRgba;
     use window::parameters::Border;
-    use window::ULength;
 
     fn test_border(top: usize, left: usize, bottom: usize, right: usize) -> Border {
         Border {
@@ -73,13 +74,13 @@ mod tests {
                 .saturating_add(padding_right)
                 .saturating_add(border_left)
                 .saturating_add(border_right)
-                .min(usize::from(u16::MAX));
+                .min(usize::from(u16::MAX.saturating_sub(x)));
             let expected_base_height = padding_top
                 .saturating_add(padding_bottom)
                 .saturating_add(border_top)
                 .saturating_add(border_bottom)
                 .saturating_add(tab_bar_height)
-                .min(usize::from(u16::MAX));
+                .min(usize::from(u16::MAX.saturating_sub(y)));
 
             let increment: ResizeIncrement = ResizeIncrementCalculator {
                 x,
@@ -97,6 +98,8 @@ mod tests {
             prop_assert_eq!(increment.y, y);
             prop_assert_eq!(usize::from(increment.base_width), expected_base_width);
             prop_assert_eq!(usize::from(increment.base_height), expected_base_height);
+            prop_assert!(increment.base_width.checked_add(increment.x).is_some());
+            prop_assert!(increment.base_height.checked_add(increment.y).is_some());
         }
     }
 
@@ -136,7 +139,9 @@ mod tests {
 
         assert_eq!(increment.x, 9);
         assert_eq!(increment.y, 18);
-        assert_eq!(increment.base_width, u16::MAX);
-        assert_eq!(increment.base_height, u16::MAX);
+        assert_eq!(increment.base_width, u16::MAX - 9);
+        assert_eq!(increment.base_height, u16::MAX - 18);
+        assert_eq!(increment.base_width + increment.x, u16::MAX);
+        assert_eq!(increment.base_height + increment.y, u16::MAX);
     }
 }
