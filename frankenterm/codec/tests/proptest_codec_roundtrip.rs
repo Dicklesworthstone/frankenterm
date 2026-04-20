@@ -1,12 +1,12 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
     GetPaneDirectionResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
-    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane,
-    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFocusedPane, SetLayoutCycle,
-    SetWindowWorkspace, TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    LivenessResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RenameWorkspace, Resize,
+    SelectStackPane, SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFocusedPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabTitleChanged, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
-use frankenterm_term::ClipboardSelection;
+use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::ClientId;
 use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
@@ -18,6 +18,25 @@ fn arb_small_string() -> impl Strategy<Value = String> {
 
 fn arb_small_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..128)
+}
+
+fn arb_terminal_size() -> impl Strategy<Value = TerminalSize> {
+    (
+        0usize..=512,
+        0usize..=512,
+        0usize..=8192,
+        0usize..=8192,
+        0u32..=960,
+    )
+        .prop_map(
+            |(rows, cols, pixel_width, pixel_height, dpi)| TerminalSize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                dpi,
+            },
+        )
 }
 
 fn arb_path_buf() -> impl Strategy<Value = PathBuf> {
@@ -215,6 +234,26 @@ fn arb_set_client_id() -> impl Strategy<Value = SetClientId> {
 fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
     (0u64..=4096, any::<bool>())
         .prop_map(|(pane_id, is_alive)| LivenessResponse { pane_id, is_alive })
+}
+
+fn arb_resize() -> impl Strategy<Value = Resize> {
+    (0u64..=4096, 0u64..=4096, arb_terminal_size()).prop_map(
+        |(containing_tab_id, pane_id, size)| Resize {
+            containing_tab_id,
+            pane_id,
+            size,
+        },
+    )
+}
+
+fn arb_set_pane_zoomed() -> impl Strategy<Value = SetPaneZoomed> {
+    (0u64..=4096, 0u64..=4096, any::<bool>()).prop_map(|(containing_tab_id, pane_id, zoomed)| {
+        SetPaneZoomed {
+            containing_tab_id,
+            pane_id,
+            zoomed,
+        }
+    })
 }
 
 fn arb_rename_workspace() -> impl Strategy<Value = RenameWorkspace> {
@@ -501,6 +540,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::LivenessResponse(payload));
+    }
+
+    #[test]
+    fn resize_json_and_pdu_roundtrip(
+        payload in arb_resize(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: Resize = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::Resize(payload));
+    }
+
+    #[test]
+    fn set_pane_zoomed_json_and_pdu_roundtrip(
+        payload in arb_set_pane_zoomed(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetPaneZoomed = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetPaneZoomed(payload));
     }
 
     #[test]
