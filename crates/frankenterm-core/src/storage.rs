@@ -11363,6 +11363,14 @@ impl StorageHandle {
 
     /// Scan segments in ascending id order with incremental paging.
     pub async fn scan_segments(&self, query: SegmentScanQuery) -> Result<Vec<Segment>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.scan_segments_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -11373,6 +11381,7 @@ impl StorageHandle {
             query_scan_segments(&conn, &query)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`scan_segments`].
@@ -11384,7 +11393,16 @@ impl StorageHandle {
     ) -> Result<Vec<Segment>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("scan_segments cancelled: {err}")))?;
-        self.scan_segments(query).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_scan_segments(&conn, &query)
+        })
+        .await
     }
 
     /// Fetch the most recent secret scan report for a scope hash.
