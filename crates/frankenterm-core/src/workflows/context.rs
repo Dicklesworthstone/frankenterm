@@ -723,4 +723,233 @@ mod tests {
         assert!(key.0.starts_with("step:"));
         assert!(ctx.get_step_idempotency_key(1).is_none());
     }
+
+    // ========================================================================
+    // Cx-first send_* error path tests (no injector configured)
+    // ========================================================================
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut runtime = asupersync::LabRuntime::new(
+            asupersync::LabConfig::new(seed)
+                .with_auto_advance()
+                .worker_count(1)
+                .max_steps(100_000),
+        );
+        let region = runtime
+            .state
+            .create_root_region(asupersync::Budget::INFINITE);
+        let (task_id, _handle) = runtime
+            .state
+            .create_task(region, asupersync::Budget::INFINITE, async move {
+                f().await;
+            })
+            .expect("spawn lab task");
+        runtime.scheduler.lock().schedule(task_id, 0);
+        runtime.step_for_test();
+        let _ = runtime.run_with_auto_advance();
+        let report = runtime.run_until_quiescent_with_report();
+        assert!(
+            report.oracle_report.all_passed(),
+            "LabRuntime oracles must all pass: {report:?}"
+        );
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    fn make_injector_from_handle(handle: crate::wezterm::WeztermHandle) -> CxPolicyInjector {
+        let engine = crate::policy::PolicyEngine::new(100, 1000, false);
+        let gated = crate::policy::PolicyGatedInjector::new(engine, handle);
+        CxPolicyInjector::new(gated)
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_text_with_cx_no_injector_returns_err() {
+        run_lab(0xA001_0001, || async {
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-1");
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_text_with_cx(&cx, "hello").await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "No injector configured");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_c_with_cx_no_injector_returns_err() {
+        run_lab(0xA001_0002, || async {
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-2");
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_c_with_cx(&cx).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "No injector configured");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_d_with_cx_no_injector_returns_err() {
+        run_lab(0xA001_0003, || async {
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-3");
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_d_with_cx(&cx).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "No injector configured");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_z_with_cx_no_injector_returns_err() {
+        run_lab(0xA001_0004, || async {
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-4");
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_z_with_cx(&cx).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "No injector configured");
+        });
+    }
+
+    // ========================================================================
+    // Cx-first send_* with injector (LabRuntime end-to-end)
+    // ========================================================================
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_text_with_cx_with_injector_delegates_to_policy() {
+        run_lab(0xA002_0001, || async {
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(42).await;
+            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+            let injector = make_injector_from_handle(handle);
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 42, PaneCapabilities::prompt(), "cx-inj-1")
+                    .with_injector(injector);
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_text_with_cx(&cx, "echo hello").await;
+            assert!(result.is_ok());
+            let injection = result.unwrap();
+            let is_allowed = matches!(injection, crate::policy::InjectionResult::Allowed { .. });
+            assert!(is_allowed, "Expected Allowed, got {injection:?}");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_c_with_cx_with_injector_delegates_to_policy() {
+        run_lab(0xA002_0002, || async {
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(43).await;
+            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+            let injector = make_injector_from_handle(handle);
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 43, PaneCapabilities::prompt(), "cx-inj-2")
+                    .with_injector(injector);
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_c_with_cx(&cx).await;
+            assert!(result.is_ok());
+            // Ctrl-C is classified as destructive by default policy → RequiresApproval
+            let injection = result.unwrap();
+            let is_policy_decision = matches!(
+                injection,
+                crate::policy::InjectionResult::Allowed { .. }
+                    | crate::policy::InjectionResult::RequiresApproval { .. }
+            );
+            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_d_with_cx_with_injector_delegates_to_policy() {
+        run_lab(0xA002_0003, || async {
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(44).await;
+            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+            let injector = make_injector_from_handle(handle);
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 44, PaneCapabilities::prompt(), "cx-inj-3")
+                    .with_injector(injector);
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_d_with_cx(&cx).await;
+            assert!(result.is_ok());
+            // Ctrl-D is classified as destructive by default policy → RequiresApproval
+            let injection = result.unwrap();
+            let is_policy_decision = matches!(
+                injection,
+                crate::policy::InjectionResult::Allowed { .. }
+                    | crate::policy::InjectionResult::RequiresApproval { .. }
+            );
+            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn send_ctrl_z_with_cx_with_injector_delegates_to_policy() {
+        run_lab(0xA002_0004, || async {
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(45).await;
+            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+            let injector = make_injector_from_handle(handle);
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 45, PaneCapabilities::prompt(), "cx-inj-4")
+                    .with_injector(injector);
+            let cx = crate::cx::for_testing();
+            let result = ctx.send_ctrl_z_with_cx(&cx).await;
+            assert!(result.is_ok());
+            // Ctrl-Z may be classified as destructive by default policy
+            let injection = result.unwrap();
+            let is_policy_decision = matches!(
+                injection,
+                crate::policy::InjectionResult::Allowed { .. }
+                    | crate::policy::InjectionResult::RequiresApproval { .. }
+            );
+            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+        });
+    }
+
+    // ========================================================================
+    // Pre-cancelled cx propagation test
+    // ========================================================================
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    #[should_panic(expected = "Cancelled")]
+    fn send_text_with_cx_pre_cancelled_cx_panics_on_lock() {
+        // A pre-cancelled cx causes the Mutex::lock_with_cx to fail with
+        // a "Cancelled" panic — this confirms the cx propagates into the
+        // lock acquisition path and prevents the operation from executing.
+        run_lab(0xA003_0001, || async {
+            let mock = crate::wezterm::MockWezterm::new();
+            mock.add_default_pane(50).await;
+            let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
+            let injector = make_injector_from_handle(handle);
+            let storage = make_storage();
+            let mut ctx =
+                WorkflowContext::new(storage, 50, PaneCapabilities::prompt(), "cx-cancel-1")
+                    .with_injector(injector);
+            let cx = crate::cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancel context test"),
+            );
+            let _ = ctx.send_text_with_cx(&cx, "should not run").await;
+        });
+    }
 }
