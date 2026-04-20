@@ -34,6 +34,7 @@ enum EventDispatchOutcome {
     Closed,
 }
 
+/// In-memory pane state snapshot received from the native event bridge.
 #[derive(Debug, Clone)]
 pub struct NativePaneState {
     pub title: String,
@@ -44,6 +45,7 @@ pub struct NativePaneState {
     pub cursor_col: u32,
 }
 
+/// Deserialized event from the frankenterm-gui native bridge socket.
 #[derive(Debug, Clone)]
 pub enum NativeEvent {
     PaneOutput {
@@ -144,6 +146,7 @@ pub enum WireEvent {
     },
 }
 
+/// Unix socket server that receives pane events from the frankenterm GUI process.
 pub struct NativeEventListener {
     socket_path: PathBuf,
     listener: UnixListener,

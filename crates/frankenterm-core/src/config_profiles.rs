@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_PROFILE_MANIFEST_VERSION: u32 = 1;
 
+/// Manifest tracking all named configuration profiles and last-applied state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConfigProfileManifest {
@@ -28,6 +29,7 @@ impl Default for ConfigProfileManifest {
     }
 }
 
+/// Single entry in the profile manifest pointing to a TOML config overlay.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigProfileManifestEntry {
@@ -39,6 +41,7 @@ pub struct ConfigProfileManifestEntry {
     pub last_applied_at: Option<u64>,
 }
 
+/// Read-only summary of a profile for display in `ft profile list`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigProfileSummary {
     pub name: String,

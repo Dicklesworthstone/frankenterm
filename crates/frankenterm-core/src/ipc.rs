@@ -463,6 +463,7 @@ struct IpcEnvelope {
     request: IpcRequest,
 }
 
+/// Parsed RPC request forwarded to a registered handler.
 pub struct IpcRpcRequest {
     pub args: Vec<String>,
     pub request_id: Option<String>,
@@ -476,6 +477,7 @@ pub type IpcRpcHandler = Arc<
         + Sync,
 >;
 
+/// Token-based authorization gate for IPC socket connections.
 #[derive(Debug, Clone)]
 pub struct IpcAuth {
     tokens: Vec<IpcAuthToken>,
@@ -1204,6 +1206,7 @@ async fn shutdown_signal_pending_with_cx(
     }
 }
 
+/// Stub IPC server for non-unix platforms (unix sockets unavailable).
 #[cfg(not(unix))]
 pub struct IpcServer {
     socket_path: PathBuf,

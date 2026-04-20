@@ -3148,12 +3148,14 @@ impl EnvOverrides {
     }
 }
 
+/// Resolved configuration with all computed paths for the active workspace.
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveConfig {
     pub config: Config,
     pub paths: EffectivePaths,
 }
 
+/// Filesystem paths derived from the workspace layout at startup.
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectivePaths {
     pub workspace_root: String,
