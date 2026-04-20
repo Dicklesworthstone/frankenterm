@@ -361,6 +361,14 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.capture_with_cx(&cx, panes, trigger).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         self.telemetry
             .captures_attempted
             .fetch_add(1, Ordering::Relaxed);
@@ -490,6 +498,7 @@ impl SnapshotEngine {
             total_bytes: result.2,
             trigger,
         })
+        }
     }
 
     /// Capture a full mux state snapshot bound to the caller's asupersync
@@ -666,6 +675,14 @@ impl SnapshotEngine {
 
     /// Run retention cleanup: remove old checkpoints exceeding limits.
     pub async fn cleanup(&self) -> std::result::Result<usize, SnapshotError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.cleanup_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
 
         let db_path = Arc::clone(&self.db_path);
@@ -680,6 +697,7 @@ impl SnapshotEngine {
             .cleanup_removed
             .fetch_add(removed as u64, Ordering::Relaxed);
         Ok(removed)
+        }
     }
 
     /// Run retention cleanup bound to the caller's asupersync capability
@@ -884,8 +902,8 @@ impl SnapshotEngine {
     {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
-            self.scheduler_body(&cx, shutdown, pane_provider).await;
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            self.run_periodic_with_cx(&cx, shutdown, pane_provider).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
@@ -1244,6 +1262,7 @@ impl SnapshotEngine {
     }
 
     /// Get or create the session ID.
+    #[cfg(not(feature = "asupersync-runtime"))]
     async fn ensure_session(
         &self,
         topology_json: &str,
@@ -1443,12 +1462,21 @@ impl SnapshotEngine {
 
     /// Mark current session as cleanly shut down.
     pub async fn mark_shutdown(&self) -> std::result::Result<(), SnapshotError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.mark_shutdown_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let session_id = { self.session_id.read().await.clone() };
         if let Some(id) = session_id {
             let db_path = Arc::clone(&self.db_path);
             Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
         }
         Ok(())
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
