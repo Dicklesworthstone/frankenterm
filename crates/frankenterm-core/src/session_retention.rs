@@ -260,7 +260,7 @@ pub async fn cleanup_sessions_async(
 ) -> Result<CleanupResult, String> {
     #[cfg(feature = "asupersync-runtime")]
     {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         cleanup_sessions_async_cx(&cx, db_path, config).await
     }
     #[cfg(not(feature = "asupersync-runtime"))]
