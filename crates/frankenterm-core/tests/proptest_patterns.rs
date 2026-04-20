@@ -220,6 +220,15 @@ proptest! {
             "Display should be lowercase, got '{}'", d
         );
     }
+
+    /// AgentType Display matches serde spelling exactly.
+    #[test]
+    fn prop_agent_type_display_matches_serde(at in arb_agent_type()) {
+        let display = at.to_string();
+        let json = serde_json::to_string(&at).unwrap();
+        let serialized = json.trim_matches('"');
+        prop_assert_eq!(display, serialized);
+    }
 }
 
 // ============================================================================
@@ -328,6 +337,65 @@ proptest! {
         };
         prop_assert_eq!(d1.dedup_key(), d2.dedup_key(),
             "Same rule_id + empty extracted should produce same dedup key");
+    }
+
+    /// Detection serde roundtrip preserves serialized fields and omits span.
+    #[test]
+    fn prop_detection_serde_roundtrip_omits_span(d in arb_detection()) {
+        let json = serde_json::to_string(&d).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        prop_assert!(parsed.get("span").is_none(), "span should be skipped in serde");
+
+        let back: Detection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.rule_id, d.rule_id);
+        prop_assert_eq!(back.agent_type, d.agent_type);
+        prop_assert_eq!(back.event_type, d.event_type);
+        prop_assert_eq!(back.severity, d.severity);
+        prop_assert!(
+            (back.confidence - d.confidence).abs() < 1e-12,
+            "confidence should survive serde roundtrip within f64 formatting tolerance: before={}, after={}",
+            d.confidence,
+            back.confidence
+        );
+        prop_assert_eq!(back.extracted, d.extracted);
+        prop_assert_eq!(back.matched_text, d.matched_text);
+        prop_assert_eq!(back.span, (0, 0));
+    }
+
+    /// Detection dedup key ignores non-extracted presentation fields.
+    #[test]
+    fn prop_detection_dedup_key_ignores_span_and_matched_text(
+        rule_id in "[a-z_.]{5,20}",
+        matched_a in "[A-Za-z0-9 _.-]{1,30}",
+        matched_b in "[A-Za-z0-9 _.-]{1,30}",
+        start_a in 0usize..100,
+        len_a in 0usize..50,
+        start_b in 0usize..100,
+        len_b in 0usize..50,
+        confidence_a in 0.0f64..1.0,
+        confidence_b in 0.0f64..1.0,
+    ) {
+        let d1 = Detection {
+            rule_id: rule_id.clone(),
+            agent_type: AgentType::Codex,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            confidence: confidence_a,
+            extracted: json!({"key": "same"}),
+            matched_text: matched_a,
+            span: (start_a, start_a + len_a),
+        };
+        let d2 = Detection {
+            rule_id,
+            agent_type: AgentType::Codex,
+            event_type: "error".to_string(),
+            severity: Severity::Warning,
+            confidence: confidence_b,
+            extracted: json!({"key": "same"}),
+            matched_text: matched_b,
+            span: (start_b, start_b + len_b),
+        };
+        prop_assert_eq!(d1.dedup_key(), d2.dedup_key());
     }
 }
 
