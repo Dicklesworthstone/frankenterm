@@ -151,6 +151,14 @@ fn no_db_golden_path() -> PathBuf {
         .join("mcp_manifest_no_db.json")
 }
 
+/// Return a per-test isolated sqlite db path plus the TempDir that owns it.
+/// Keep the TempDir alive for the caller's scope (it cleans up on drop).
+fn isolated_db_path() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("create temp dir for mcp manifest test");
+    let path = dir.path().join("mcp_manifest.sqlite3");
+    (dir, path)
+}
+
 fn read_or_update_golden(path: &PathBuf, actual: &str) -> String {
     if std::env::var("UPDATE_GOLDEN").is_ok() {
         if let Some(parent) = path.parent() {
@@ -210,9 +218,8 @@ fn string_set(values: &[Value], key: &str) -> std::collections::BTreeSet<String>
 fn mcp_manifest_matches_golden_without_db() {
     let manifest = capture_manifest(None);
     let actual = pretty_canonical(&manifest);
-    let full_manifest = capture_manifest(Some(PathBuf::from(
-        "/tmp/ft-mcp-manifest-no-db-subset.sqlite3",
-    )));
+    let (_db_dir, db_path) = isolated_db_path();
+    let full_manifest = capture_manifest(Some(db_path));
 
     assert_matches_golden(&actual, &no_db_golden_path());
 
@@ -357,19 +364,20 @@ fn mcp_manifest_matches_golden_without_db() {
 
 #[test]
 fn mcp_manifest_matches_golden_with_db() {
-    // Use a fixed path for the manifest capture. The tool handlers only
-    // record the path; they do not open the DB during registration, so
-    // the file need not exist.
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-golden-fixture.sqlite3"));
-
-    let manifest = capture_manifest(db_path);
+    // The tool handlers only record the path; they do not open the DB during
+    // registration, so the file need not exist. Use an isolated per-test path
+    // (ft-h164o) so any future code that opens the DB won't race with other
+    // concurrent test processes.
+    let (_db_dir, path) = isolated_db_path();
+    let manifest = capture_manifest(Some(path));
     let actual = pretty_canonical(&manifest);
     assert_matches_golden(&actual, &golden_path());
 }
 
 #[test]
 fn mcp_manifest_capture_is_deterministic() {
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-determinism.sqlite3"));
+    let (_db_dir, path) = isolated_db_path();
+    let db_path = Some(path);
     let first = pretty_canonical(&capture_manifest(db_path.clone()));
     let second = pretty_canonical(&capture_manifest(db_path.clone()));
     let third = pretty_canonical(&capture_manifest(db_path));
@@ -385,8 +393,8 @@ fn mcp_manifest_capture_is_deterministic() {
 
 #[test]
 fn mcp_manifest_tool_names_are_unique() {
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-unique.sqlite3"));
-    let manifest = capture_manifest(db_path);
+    let (_db_dir, path) = isolated_db_path();
+    let manifest = capture_manifest(Some(path));
     let tools = manifest
         .get("tools")
         .and_then(Value::as_array)
@@ -407,10 +415,8 @@ fn mcp_manifest_tool_names_are_unique() {
 
 #[test]
 fn mcp_manifest_resource_uris_are_unique() {
-    let db_path = Some(PathBuf::from(
-        "/tmp/ft-mcp-manifest-resource-unique.sqlite3",
-    ));
-    let manifest = capture_manifest(db_path);
+    let (_db_dir, path) = isolated_db_path();
+    let manifest = capture_manifest(Some(path));
     let resources = manifest
         .get("resources")
         .and_then(Value::as_array)
@@ -448,8 +454,8 @@ fn mcp_manifest_resource_uris_are_unique() {
 
 #[test]
 fn mcp_manifest_tool_input_schemas_are_objects() {
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-schema-shape.sqlite3"));
-    let manifest = capture_manifest(db_path);
+    let (_db_dir, path) = isolated_db_path();
+    let manifest = capture_manifest(Some(path));
     let tools = manifest
         .get("tools")
         .and_then(Value::as_array)
