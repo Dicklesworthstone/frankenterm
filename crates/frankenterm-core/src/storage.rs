@@ -10839,14 +10839,23 @@ impl StorageHandle {
 
     /// Export output gaps with optional pane/time/limit filters
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_export_gaps(&conn, &query)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.export_gaps_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_export_gaps(&conn, &query)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_gaps`].
@@ -10858,7 +10867,14 @@ impl StorageHandle {
     ) -> Result<Vec<Gap>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
-        self.export_gaps(query).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_export_gaps(&conn, &query)
+        })
+        .await
     }
 
     /// Get all output gaps (for search explain diagnostics)
