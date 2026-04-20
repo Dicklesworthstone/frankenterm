@@ -8,22 +8,22 @@ use codec::{
     GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTabResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane,
     RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
-    SendKeyDown, SendKeyUp, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId,
-    SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
-    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace,
+    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SplitPane, SwapToLayout, TabAddedToWindow, TabResized,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
     WindowWorkspaceChanged, WriteToPane,
 };
-use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
+use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::tab::FloatingPaneRect;
+use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize};
 use proptest::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::image::ImageData;
-use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
@@ -301,6 +301,62 @@ fn arb_spawn_response() -> impl Strategy<Value = SpawnResponse> {
     )
 }
 
+fn arb_spawn_tab_domain() -> impl Strategy<Value = SpawnTabDomain> {
+    prop_oneof![
+        Just(SpawnTabDomain::DefaultDomain),
+        Just(SpawnTabDomain::CurrentPaneDomain),
+        arb_small_string().prop_map(SpawnTabDomain::DomainName),
+        (0usize..=1024).prop_map(SpawnTabDomain::DomainId),
+    ]
+}
+
+fn arb_split_size() -> impl Strategy<Value = SplitSize> {
+    prop_oneof![
+        (0usize..=256).prop_map(SplitSize::Cells),
+        (0u8..=100).prop_map(SplitSize::Percent),
+    ]
+}
+
+fn arb_split_request() -> impl Strategy<Value = SplitRequest> {
+    (
+        prop_oneof![
+            Just(SplitDirection::Horizontal),
+            Just(SplitDirection::Vertical),
+        ],
+        any::<bool>(),
+        any::<bool>(),
+        arb_split_size(),
+    )
+        .prop_map(
+            |(direction, target_is_second, top_level, size)| SplitRequest {
+                direction,
+                target_is_second,
+                top_level,
+                size,
+            },
+        )
+}
+
+fn arb_split_pane() -> impl Strategy<Value = SplitPane> {
+    (
+        0u64..=4096,
+        arb_split_request(),
+        prop::option::of(arb_small_string()),
+        arb_spawn_tab_domain(),
+        prop::option::of(0u64..=4096),
+    )
+        .prop_map(
+            |(pane_id, split_request, command_dir, domain, move_pane_id)| SplitPane {
+                pane_id,
+                split_request,
+                command: None,
+                command_dir,
+                domain,
+                move_pane_id,
+            },
+        )
+}
+
 fn arb_key_code() -> impl Strategy<Value = KeyCode> {
     prop_oneof![
         Just(KeyCode::Enter),
@@ -337,6 +393,37 @@ fn arb_send_key_down() -> impl Strategy<Value = SendKeyDown> {
 
 fn arb_send_key_up() -> impl Strategy<Value = SendKeyUp> {
     (0u64..=4096, arb_key_event()).prop_map(|(pane_id, event)| SendKeyUp { pane_id, event })
+}
+
+fn arb_mouse_buttons() -> impl Strategy<Value = MouseButtons> {
+    prop_oneof![
+        Just(MouseButtons::NONE),
+        Just(MouseButtons::LEFT),
+        Just(MouseButtons::RIGHT),
+        Just(MouseButtons::MIDDLE),
+        Just(MouseButtons::LEFT | MouseButtons::RIGHT),
+        Just(MouseButtons::VERT_WHEEL),
+        Just(MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE),
+    ]
+}
+
+fn arb_mouse_event() -> impl Strategy<Value = MouseEvent> {
+    (
+        any::<u16>(),
+        any::<u16>(),
+        arb_mouse_buttons(),
+        arb_modifiers(),
+    )
+        .prop_map(|(x, y, mouse_buttons, modifiers)| MouseEvent {
+            x,
+            y,
+            mouse_buttons,
+            modifiers,
+        })
+}
+
+fn arb_send_mouse_event() -> impl Strategy<Value = SendMouseEvent> {
+    (0u64..=4096, arb_mouse_event()).prop_map(|(pane_id, event)| SendMouseEvent { pane_id, event })
 }
 
 fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
@@ -886,6 +973,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SendKeyUp(payload));
+    }
+
+    #[test]
+    fn send_mouse_event_json_and_pdu_roundtrip(
+        payload in arb_send_mouse_event(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SendMouseEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SendMouseEvent(payload));
+    }
+
+    #[test]
+    fn split_pane_json_and_pdu_roundtrip(
+        payload in arb_split_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SplitPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SplitPane(payload));
     }
 
     #[test]
