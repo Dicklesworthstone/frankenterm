@@ -10785,6 +10785,14 @@ impl StorageHandle {
     /// Results are ordered by ascending event ID so callers can checkpoint using
     /// the last seen `id` and resume with `after_id`.
     pub async fn get_events_stream(&self, query: EventStreamQuery) -> Result<Vec<StoredEvent>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_events_stream_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -10795,6 +10803,7 @@ impl StorageHandle {
             query_events_stream(&conn, &query)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_events_stream`].
@@ -10806,7 +10815,16 @@ impl StorageHandle {
     ) -> Result<Vec<StoredEvent>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_events_stream cancelled: {err}")))?;
-        self.get_events_stream(query).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_events_stream(&conn, &query)
+        })
+        .await
     }
 
     /// Get a unified timeline of events across panes.
