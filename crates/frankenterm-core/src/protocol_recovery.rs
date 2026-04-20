@@ -635,6 +635,7 @@ impl RecoveryEngine {
             attempts: max_attempts,
             error_kinds,
         }
+        }
     }
 
     /// Execute the retry policy against the caller's asupersync capability
