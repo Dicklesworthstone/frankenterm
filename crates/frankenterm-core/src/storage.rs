@@ -6788,10 +6788,20 @@ impl StorageHandle {
     }
 
     /// Record an audit action after applying redaction
-    pub async fn record_audit_action_redacted(&self, mut action: AuditActionRecord) -> Result<i64> {
-        let redactor = Redactor::new();
-        action.redact_fields(&redactor);
-        self.record_audit_action(action).await
+    pub async fn record_audit_action_redacted(&self, action: AuditActionRecord) -> Result<i64> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.record_audit_action_redacted_with_cx(&cx, action).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let mut action = action;
+            let redactor = Redactor::new();
+            action.redact_fields(&redactor);
+            self.record_audit_action(action).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
