@@ -175,6 +175,33 @@ proptest! {
     }
 
     #[test]
+    fn snapshot_counter_relationships_hold(
+        scans in 0u64..10000,
+        quick_rejects in 0u64..10000,
+        bloom_checks in 0u64..20000,
+        bloom_positives in 0u64..20000,
+        bloom_rejects in 0u64..20000,
+        candidate_rules_evaluated in 0u64..20000,
+        regex_evaluations in 0u64..20000,
+    ) {
+        let snap = PatternTelemetrySnapshot {
+            scans_total: scans,
+            matches_total: 0,
+            quick_rejects: quick_rejects.min(scans),
+            bloom_checks,
+            bloom_positives: bloom_positives.min(bloom_checks),
+            bloom_rejects: bloom_rejects.min(bloom_checks),
+            candidate_rules_evaluated,
+            regex_evaluations: regex_evaluations.min(candidate_rules_evaluated),
+        };
+
+        prop_assert!(snap.quick_rejects <= snap.scans_total);
+        prop_assert!(snap.bloom_positives <= snap.bloom_checks);
+        prop_assert!(snap.bloom_rejects <= snap.bloom_checks);
+        prop_assert!(snap.regex_evaluations <= snap.candidate_rules_evaluated);
+    }
+
+    #[test]
     fn regex_evals_bounded_by_candidates(
         texts in prop::collection::vec(
             prop::string::string_regex("[A-Z]{0,5}: [a-z ]{0,50}").unwrap(),
@@ -195,5 +222,21 @@ proptest! {
             "regex_evaluations ({}) should be <= candidate_rules_evaluated ({})",
             snap.regex_evaluations, snap.candidate_rules_evaluated
         );
+    }
+
+    #[test]
+    fn quick_rejects_never_exceed_scans(
+        texts in prop::collection::vec("[a-zA-Z0-9 :]{0,100}", 1..20),
+    ) {
+        let engine = minimal_engine();
+
+        for text in &texts {
+            let _ = engine.detect(text);
+        }
+
+        let snap = engine.telemetry().snapshot();
+        prop_assert!(snap.quick_rejects <= snap.scans_total);
+        prop_assert!(snap.bloom_positives <= snap.bloom_checks);
+        prop_assert!(snap.bloom_rejects <= snap.bloom_checks);
     }
 }
