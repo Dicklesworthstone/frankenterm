@@ -208,7 +208,7 @@ impl WorkflowContext {
         text: &str,
     ) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let result = injector
             .send_text(
                 &cx,
@@ -252,7 +252,7 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_c(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let result = injector
             .send_ctrl_c(
                 &cx,
@@ -288,7 +288,7 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_d(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let result = injector
             .send_ctrl_d(
                 &cx,
@@ -324,7 +324,7 @@ impl WorkflowContext {
     /// See [`send_text`](Self::send_text) for lock safety rationale.
     pub async fn send_ctrl_z(&mut self) -> Result<crate::policy::InjectionResult, &'static str> {
         let injector = self.injector.as_ref().ok_or("No injector configured")?;
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         let result = injector
             .send_ctrl_z(
                 &cx,
