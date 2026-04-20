@@ -10889,6 +10889,38 @@ impl StorageHandle {
 
     /// Count retention cleanup events (for search explain diagnostics)
     pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_retention_cleanup_count_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| StorageError::Database(format!("Count retention cleanups: {e}")))?;
+                Ok(count as u64)
+            })
+            .await
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_retention_cleanup_count_with_cx(&self, cx: &crate::cx::Cx) -> Result<u64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
+        })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -10904,15 +10936,6 @@ impl StorageHandle {
             Ok(count as u64)
         })
         .await
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
-    #[cfg(feature = "asupersync-runtime")]
-    pub async fn get_retention_cleanup_count_with_cx(&self, cx: &crate::cx::Cx) -> Result<u64> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
-        })?;
-        self.get_retention_cleanup_count().await
     }
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
