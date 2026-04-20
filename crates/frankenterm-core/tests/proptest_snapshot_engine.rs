@@ -327,6 +327,14 @@ proptest! {
         prop_assert!(msg.contains(&inner), "Serialization display should contain inner: {}", msg);
         prop_assert!(msg.starts_with("serialization error: "), "unexpected prefix: {}", msg);
     }
+
+    /// SnapshotError::Cancelled displays the fixed capability-context message.
+    #[test]
+    fn error_cancelled_display(_dummy in 0..1_i32) {
+        let err = SnapshotError::Cancelled;
+        let msg = format!("{}", err);
+        prop_assert_eq!(&msg, "snapshot capture cancelled via capability context");
+    }
 }
 
 // =============================================================================
@@ -380,6 +388,13 @@ proptest! {
         let debug = format!("{:?}", err);
         prop_assert!(debug.contains("Serialization"), "Debug should contain Serialization: {}", debug);
         prop_assert!(debug.contains(&inner), "Debug should contain inner string: {}", debug);
+    }
+
+    #[test]
+    fn error_debug_cancelled(_dummy in 0..1_i32) {
+        let err = SnapshotError::Cancelled;
+        let debug = format!("{:?}", err);
+        prop_assert!(debug.contains("Cancelled"), "Debug should contain Cancelled: {}", debug);
     }
 }
 
@@ -799,5 +814,40 @@ proptest! {
         prop_assert!(obj.contains_key("captures_attempted"));
         prop_assert!(obj.contains_key("captures_succeeded"));
         prop_assert!(obj.contains_key("bytes_persisted"));
+    }
+
+    #[test]
+    fn telemetry_snapshot_coherent_counts_roundtrip(
+        attempted in 0_u64..10_000,
+        triggers_emitted in 0_u64..10_000,
+        success_ratio in 0_u8..=100,
+        dedup_ratio in 0_u8..=100,
+        error_ratio in 0_u8..=100,
+        accepted_ratio in 0_u8..=100,
+    ) {
+        let succeeded = attempted.saturating_mul(success_ratio as u64) / 100;
+        let remaining_after_success = attempted.saturating_sub(succeeded);
+        let dedup = remaining_after_success.saturating_mul(dedup_ratio as u64) / 100;
+        let remaining_after_dedup = remaining_after_success.saturating_sub(dedup);
+        let errors = remaining_after_dedup.saturating_mul(error_ratio as u64) / 100;
+        let triggers_accepted = triggers_emitted.saturating_mul(accepted_ratio as u64) / 100;
+
+        let snap = SnapshotEngineTelemetrySnapshot {
+            captures_attempted: attempted,
+            captures_succeeded: succeeded,
+            dedup_skips: dedup,
+            capture_errors: errors,
+            cleanup_runs: 0,
+            cleanup_removed: 0,
+            triggers_emitted,
+            triggers_accepted,
+            panes_captured: 0,
+            bytes_persisted: 0,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SnapshotEngineTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+
+        prop_assert!(back.captures_succeeded + back.dedup_skips + back.capture_errors <= back.captures_attempted);
+        prop_assert!(back.triggers_accepted <= back.triggers_emitted);
     }
 }
