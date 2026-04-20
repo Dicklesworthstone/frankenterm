@@ -10940,6 +10940,46 @@ impl StorageHandle {
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
     pub async fn get_segment_time_range(&self) -> Result<(Option<i64>, Option<i64>)> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_segment_time_range_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error(
+                "Task join error",
+                move || -> Result<(Option<i64>, Option<i64>)> {
+                    let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                        StorageError::Database(format!("Failed to open read connection: {e}"))
+                    })?;
+                    let (earliest, latest): (Option<i64>, Option<i64>) = conn
+                        .query_row(
+                            "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|e| {
+                            StorageError::Database(format!("Query segment time range: {e}"))
+                        })?;
+                    Ok((earliest, latest))
+                },
+            )
+            .await
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_segment_time_range`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_segment_time_range_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
+        })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
@@ -10960,18 +11000,6 @@ impl StorageHandle {
             },
         )
         .await
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`get_segment_time_range`].
-    #[cfg(feature = "asupersync-runtime")]
-    pub async fn get_segment_time_range_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-    ) -> Result<(Option<i64>, Option<i64>)> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
-        })?;
-        self.get_segment_time_range().await
     }
 
     /// Export workflow executions with optional pane/time/limit filters
