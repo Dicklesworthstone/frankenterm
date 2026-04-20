@@ -10,7 +10,7 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
 use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
 use frankenterm_core::distributed::build_tls_bundle;
-use frankenterm_core::runtime_compat::RuntimeBuilder;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::runtime_compat::task;
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -63,7 +63,7 @@ fn tls_bundle(mtls: bool) -> (TlsAcceptor, TlsConnector) {
     let mut cert_file = NamedTempFile::new().expect("cert temp");
     let cert_path = write_pem(&mut cert_file, server_der.as_ref());
     let mut key_file = NamedTempFile::new().expect("key temp");
-    let key_path = write_pem(&mut key_file, server_key.as_ref());
+    let key_path = write_pem(&mut key_file, server_key.secret_der());
 
     let mut client_cert_path = None;
     let mut client_key_path = None;
@@ -74,7 +74,7 @@ fn tls_bundle(mtls: bool) -> (TlsAcceptor, TlsConnector) {
         let mut cc = NamedTempFile::new().expect("client cert temp");
         client_cert_path = Some(write_pem(&mut cc, client_der.as_ref()));
         let mut ck = NamedTempFile::new().expect("client key temp");
-        client_key_path = Some(write_pem(&mut ck, client_key.as_ref()));
+        client_key_path = Some(write_pem(&mut ck, client_key.secret_der()));
         // keep files alive until end of scope
         Box::leak(Box::new(cc));
         Box::leak(Box::new(ck));
