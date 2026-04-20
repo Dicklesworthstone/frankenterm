@@ -465,6 +465,10 @@ harness = false
 name = "retry_backoff"
 harness = false
 
+[[bench]]
+name = "rate_limit_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
