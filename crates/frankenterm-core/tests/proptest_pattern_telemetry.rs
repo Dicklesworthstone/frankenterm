@@ -239,4 +239,49 @@ proptest! {
         prop_assert!(snap.bloom_positives <= snap.bloom_checks);
         prop_assert!(snap.bloom_rejects <= snap.bloom_checks);
     }
+
+    #[test]
+    fn quick_reject_inputs_do_not_evaluate_candidates(
+        text in prop::string::string_regex("[a-z0-9 ]{0,80}").unwrap(),
+    ) {
+        let engine = minimal_engine();
+        let before = engine.telemetry().snapshot();
+
+        let detections = engine.detect(&text);
+        let after = engine.telemetry().snapshot();
+
+        prop_assert!(detections.is_empty(), "lowercase/no-anchor text should not match");
+        prop_assert_eq!(after.scans_total, before.scans_total + 1);
+        prop_assert!(after.quick_rejects >= before.quick_rejects);
+        prop_assert_eq!(
+            after.candidate_rules_evaluated,
+            before.candidate_rules_evaluated,
+            "quick reject path should not evaluate candidate rules"
+        );
+        prop_assert_eq!(
+            after.regex_evaluations,
+            before.regex_evaluations,
+            "quick reject path should not run regex evaluation"
+        );
+    }
+
+    #[test]
+    fn matches_total_delta_equals_returned_detection_count(
+        suffix in prop::string::string_regex("[A-Za-z0-9 ]{0,40}").unwrap(),
+    ) {
+        let engine = minimal_engine();
+        let before = engine.telemetry().snapshot();
+        let text = format!("ERROR: {}", suffix);
+
+        let detections = engine.detect(&text);
+        let after = engine.telemetry().snapshot();
+
+        prop_assert!(!detections.is_empty(), "ERROR anchor text should produce at least one detection");
+        prop_assert_eq!(after.scans_total, before.scans_total + 1);
+        prop_assert_eq!(
+            after.matches_total - before.matches_total,
+            detections.len() as u64,
+            "matches_total delta should equal returned detection count"
+        );
+    }
 }
