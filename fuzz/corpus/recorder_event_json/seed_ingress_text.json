@@ -1,0 +1,1 @@
+{"schema_version":"ft.recorder.event.v1","event_id":"evt-001","pane_id":42,"session_id":"sess-1","workflow_id":null,"correlation_id":null,"source":"operator_action","occurred_at_ms":1000,"recorded_at_ms":1001,"sequence":1,"causality":{"parent_event_id":null,"depth":0},"event_type":"ingress_text","text":"ls -la","encoding":"utf8","redaction":"none","ingress_kind":"typed"}

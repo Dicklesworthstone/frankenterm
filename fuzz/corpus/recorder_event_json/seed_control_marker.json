@@ -1,0 +1,1 @@
+{"schema_version":"ft.recorder.event.v1","event_id":"evt-003","pane_id":42,"session_id":null,"workflow_id":null,"correlation_id":null,"source":"system","occurred_at_ms":3000,"recorded_at_ms":3001,"sequence":3,"causality":{"parent_event_id":null,"depth":0},"event_type":"control_marker","control_marker_type":"prompt_detected","details":{"shell_state":"idle"}}
