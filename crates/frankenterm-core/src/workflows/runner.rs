@@ -726,7 +726,7 @@ impl WorkflowRunner {
         }
 
         if let Some(adapter) = self.replay_capture.as_ref() {
-            let request_cx = crate::cx::for_request();
+            let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let injector_cx = cx.unwrap_or(&request_cx);
             self.injector
                 .set_decision_capture(injector_cx, adapter.clone())
@@ -1495,7 +1495,7 @@ impl WorkflowRunner {
                         "Workflow requesting text injection"
                     );
 
-                    let request_cx = crate::cx::for_request();
+                    let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     let injector_cx = cx.unwrap_or(&request_cx);
                     let send_result = self
                         .injector
@@ -2018,7 +2018,8 @@ impl WorkflowRunner {
                                         replay_capture: self.replay_capture.clone(),
                                     };
 
-                                    let request_cx = crate::cx::for_request();
+                                    let request_cx = crate::cx::Cx::current()
+                                        .unwrap_or_else(crate::cx::for_request);
                                     crate::runtime_compat::task::spawn_with_cx(
                                         &request_cx,
                                         move |_child_cx| async move {
