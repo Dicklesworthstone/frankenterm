@@ -6570,17 +6570,26 @@ impl StorageHandle {
 
     /// Check whether an identity key is muted (and not expired).
     pub async fn is_event_muted(&self, identity_key: &str, now_ms: i64) -> Result<bool> {
-        let db_path = Arc::clone(&self.db_path);
-        let identity_key = identity_key.to_string();
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.is_event_muted_with_cx(&cx, identity_key, now_ms).await;
+        }
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            let identity_key = identity_key.to_string();
 
-            query_event_mute(&conn, &identity_key, now_ms)
-        })
-        .await
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+
+                query_event_mute(&conn, &identity_key, now_ms)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`is_event_muted`].
@@ -6593,7 +6602,17 @@ impl StorageHandle {
     ) -> Result<bool> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("is_event_muted cancelled: {err}")))?;
-        self.is_event_muted(identity_key, now_ms).await
+        let db_path = Arc::clone(&self.db_path);
+        let identity_key = identity_key.to_string();
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_event_mute(&conn, &identity_key, now_ms)
+        })
+        .await
     }
 
     /// List all active (non-expired) mutes.
