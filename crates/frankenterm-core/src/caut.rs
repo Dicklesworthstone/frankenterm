@@ -281,7 +281,7 @@ impl CautClient {
     pub async fn usage(&self, service: CautService) -> Result<CautUsage, CautError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.usage_cx(&cx, service).await
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -316,7 +316,7 @@ impl CautClient {
     pub async fn refresh(&self, service: CautService) -> Result<CautRefresh, CautError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = crate::cx::for_request();
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.refresh_cx(&cx, service).await
         }
         #[cfg(not(feature = "asupersync-runtime"))]
