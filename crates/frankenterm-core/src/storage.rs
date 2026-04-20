@@ -8145,14 +8145,23 @@ impl StorageHandle {
 
     /// Count output_segments older than a cutoff (read-path).
     pub async fn count_segments_before(&self, before_ts: i64) -> Result<usize> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            count_segments_before_sync(&conn, before_ts)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.count_segments_before_with_cx(&cx, before_ts).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                count_segments_before_sync(&conn, before_ts)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_segments_before`].
@@ -8165,7 +8174,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("count_segments_before cancelled: {err}"))
         })?;
-        self.count_segments_before(before_ts).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            count_segments_before_sync(&conn, before_ts)
+        })
+        .await
     }
 
     /// Count events older than a cutoff (flat, no tier filters; read-path).
