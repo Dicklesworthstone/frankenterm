@@ -1,6 +1,8 @@
 #![cfg(feature = "use_serde")]
 
-use frankenterm_term::{Progress, SemanticType, SemanticZone, TerminalSize};
+use frankenterm_term::{
+    Progress, SemanticType, SemanticZone, TerminalSize, TieredScrollbackStatus,
+};
 use proptest::prelude::*;
 
 fn arb_semantic_type() -> impl Strategy<Value = SemanticType> {
@@ -58,6 +60,67 @@ fn arb_semantic_zone() -> impl Strategy<Value = SemanticZone> {
         )
 }
 
+fn arb_tiered_scrollback_status() -> impl Strategy<Value = TieredScrollbackStatus> {
+    (
+        any::<bool>(),
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=10_000_000,
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=10_000_000,
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        0usize..=100_000,
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+    )
+        .prop_map(
+            |(
+                tiering_enabled,
+                configured_scrollback_rows,
+                configured_hot_lines,
+                configured_warm_max_bytes,
+                visible_rows,
+                in_memory_scrollback_rows,
+                warm_resident_lines,
+                warm_resident_bytes,
+                warm_spill_lines_total,
+                warm_spill_bytes_total,
+                cold_spill_lines_total,
+                cold_spill_bytes_total,
+                cold_worker_peak_backlog_depth,
+                cold_worker_completion_throughput_lines_per_sec,
+                cold_worker_completed_lines_total,
+                cold_worker_completed_batches_total,
+                cold_worker_cancellation_count,
+            )| TieredScrollbackStatus {
+                tiering_enabled,
+                configured_scrollback_rows,
+                configured_hot_lines,
+                configured_warm_max_bytes,
+                visible_rows,
+                in_memory_scrollback_rows,
+                warm_resident_lines,
+                warm_resident_bytes,
+                warm_spill_lines_total,
+                warm_spill_bytes_total,
+                cold_spill_lines_total,
+                cold_spill_bytes_total,
+                cold_worker_peak_backlog_depth,
+                cold_worker_completion_throughput_lines_per_sec,
+                cold_worker_completed_lines_total,
+                cold_worker_completed_batches_total,
+                cold_worker_cancellation_count,
+            },
+        )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -79,6 +142,20 @@ proptest! {
     fn semantic_zone_json_roundtrip(value in arb_semantic_zone()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: SemanticZone = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn semantic_type_json_roundtrip(value in arb_semantic_type()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SemanticType = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn tiered_scrollback_status_json_roundtrip(value in arb_tiered_scrollback_status()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: TieredScrollbackStatus = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
