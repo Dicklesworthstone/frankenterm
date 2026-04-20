@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use frankenterm_core::command_transport::CommandRouter;
 use frankenterm_core::durable_state::DurableStateManager;
 use frankenterm_core::fleet_launcher::{
-    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec,
-    MetadataProjectionFailure, ProgramDistribution, RegistrySummary, SlotStatus, StartupStrategy,
+    AgentMixEntry, FleetLaunchError, FleetLaunchStatus, FleetLauncher, FleetSpec, LaunchOutcome,
+    LaunchPhase, LaunchPlan, MetadataProjectionFailure, ProgramDistribution, RegistrySummary,
+    SlotOutcome, SlotStatus, StartupStrategy,
 };
 use frankenterm_core::session_profiles::{ProfileRegistry, ProfileRole};
 use frankenterm_core::session_topology::{
@@ -745,6 +746,23 @@ proptest! {
         let s = err.to_string();
         prop_assert!(!s.is_empty(), "Display must produce non-empty string");
     }
+
+    #[test]
+    fn launch_phase_serde_roundtrip(
+        index in 0u32..20u32,
+        slot_count in 0usize..10usize,
+    ) {
+        let phase = LaunchPhase {
+            index,
+            label: format!("phase-{index}"),
+            slot_indices: (0..slot_count as u32).collect(),
+        };
+        let json = serde_json::to_string(&phase).unwrap();
+        let back: LaunchPhase = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(phase.index, back.index);
+        prop_assert_eq!(phase.label, back.label);
+        prop_assert_eq!(phase.slot_indices, back.slot_indices);
+    }
 }
 
 // =============================================================================
@@ -867,6 +885,23 @@ proptest! {
             "a plan from FleetLauncher::plan() should have no invariant violations, got: {:?}",
             violations);
     }
+
+    #[test]
+    fn launch_plan_serde_roundtrip(spec in arb_fleet_spec(1, 5)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let plan = launcher.plan(&spec).unwrap();
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: LaunchPlan = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(plan.name, back.name);
+        prop_assert_eq!(plan.strategy, back.strategy);
+        prop_assert_eq!(plan.generation, back.generation);
+        prop_assert_eq!(plan.workspace_id, back.workspace_id);
+        prop_assert_eq!(plan.domain, back.domain);
+        prop_assert_eq!(plan.slots.len(), back.slots.len());
+        prop_assert_eq!(plan.phases.len(), back.phases.len());
+        prop_assert_eq!(plan.warnings, back.warnings);
+    }
 }
 
 // =============================================================================
@@ -935,6 +970,41 @@ proptest! {
             outcome.failed_slots,
             "failed_outcomes() len must match failed_slots"
         );
+    }
+
+    #[test]
+    fn slot_outcome_serde_roundtrip(spec in arb_fleet_spec(1, 3)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let slot = outcome.slot_outcomes.first().unwrap().clone();
+        let json = serde_json::to_string(&slot).unwrap();
+        let back: SlotOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(slot.index, back.index);
+        prop_assert_eq!(slot.label, back.label);
+        prop_assert_eq!(slot.status, back.status);
+        prop_assert_eq!(slot.lifecycle_identity, back.lifecycle_identity);
+        prop_assert_eq!(slot.error, back.error);
+    }
+
+    #[test]
+    fn launch_outcome_serde_roundtrip(spec in arb_fleet_spec(1, 4)) {
+        let reg = test_registry();
+        let launcher = FleetLauncher::new(&reg);
+        let mut lifecycle = LifecycleRegistry::new();
+        let outcome = launcher.launch(&spec, &mut lifecycle).unwrap();
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: LaunchOutcome = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(outcome.name, back.name);
+        prop_assert_eq!(outcome.status, back.status);
+        prop_assert_eq!(outcome.total_slots, back.total_slots);
+        prop_assert_eq!(outcome.successful_slots, back.successful_slots);
+        prop_assert_eq!(outcome.failed_slots, back.failed_slots);
+        prop_assert_eq!(outcome.pre_launch_checkpoint, back.pre_launch_checkpoint);
+        prop_assert_eq!(outcome.slot_outcomes.len(), back.slot_outcomes.len());
+        prop_assert_eq!(outcome.registry_snapshot.len(), back.registry_snapshot.len());
+        prop_assert_eq!(outcome.bootstrap_dispatches, back.bootstrap_dispatches);
     }
 
     #[test]
