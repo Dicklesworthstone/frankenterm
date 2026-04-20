@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
-//!     --no-default-features --features mcp,tokio-runtime
+//!     --no-default-features --features mcp,asupersync-runtime
 //! ```
 //!
 //! The golden lives at `tests/fixtures/mcp_manifest.json` relative to the
@@ -29,8 +29,7 @@ use serde_json::{Map, Value, json};
 /// MCP server. The manifest is a BTree-sorted JSON `Object` so that its
 /// serialized form is canonical.
 fn capture_manifest(db_path: Option<PathBuf>) -> Value {
-    let server =
-        build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
 
     let mut tools: Vec<Value> = server
         .tools()
@@ -40,9 +39,7 @@ fn capture_manifest(db_path: Option<PathBuf>) -> Value {
             entry.insert("name".to_string(), Value::String(tool.name));
             entry.insert(
                 "description".to_string(),
-                tool.description
-                    .map(Value::String)
-                    .unwrap_or(Value::Null),
+                tool.description.map(Value::String).unwrap_or(Value::Null),
             );
             entry.insert("input_schema".to_string(), tool.input_schema);
             entry.insert(
@@ -119,10 +116,6 @@ fn capture_manifest(db_path: Option<PathBuf>) -> Value {
     })
 }
 
-fn canonical_json(value: &Value) -> String {
-    canonicalize(value).to_string()
-}
-
 fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -134,9 +127,7 @@ fn canonicalize(value: &Value) -> Value {
             }
             Value::Object(out)
         }
-        Value::Array(items) => {
-            Value::Array(items.iter().map(canonicalize).collect())
-        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
         other => other.clone(),
     }
 }
@@ -153,6 +144,65 @@ fn golden_path() -> PathBuf {
         .join("mcp_manifest.json")
 }
 
+fn no_db_golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("mcp_manifest_no_db.json")
+}
+
+fn read_or_update_golden(path: &PathBuf, actual: &str) -> String {
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixtures dir");
+        }
+        std::fs::write(path, format!("{actual}\n")).expect("write golden");
+        return actual.to_string();
+    }
+
+    std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!(
+            "missing MCP manifest golden at {}: {err}. Regenerate with:\n  \
+             UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
+             --no-default-features --features mcp,asupersync-runtime",
+            path.display()
+        )
+    })
+}
+
+fn assert_matches_golden(actual: &str, golden: &PathBuf) {
+    let expected = read_or_update_golden(golden, actual);
+    let expected_trimmed = expected.trim_end_matches('\n');
+    let actual_trimmed = actual.trim_end_matches('\n');
+
+    if expected_trimmed != actual_trimmed {
+        let actual_path = golden.with_extension("actual.json");
+        let _ = std::fs::write(&actual_path, format!("{actual}\n"));
+        panic!(
+            "MCP manifest drift detected. Review the diff between:\n  \
+             expected: {}\n  actual:   {}\n\n\
+             If intentional, regenerate with:\n  \
+             UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
+             --no-default-features --features mcp,asupersync-runtime",
+            golden.display(),
+            actual_path.display()
+        );
+    }
+}
+
+fn string_set(values: &[Value], key: &str) -> std::collections::BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("missing `{key}` in manifest entry: {value}"))
+                .to_string()
+        })
+        .collect()
+}
+
 /// With `db_path == None`, the server registers only the always-on tool set.
 /// The golden lives alongside the in-db manifest so a missing db_path variant
 /// has its own focused surface test.
@@ -160,23 +210,132 @@ fn golden_path() -> PathBuf {
 fn mcp_manifest_matches_golden_without_db() {
     let manifest = capture_manifest(None);
     let actual = pretty_canonical(&manifest);
+    let full_manifest = capture_manifest(Some(PathBuf::from(
+        "/tmp/ft-mcp-manifest-no-db-subset.sqlite3",
+    )));
 
-    // Freeze: the always-on (no-db) tool set must be a non-empty strict
-    // subset of the full manifest. We don't commit a second golden; we
-    // just assert structural properties that cannot drift silently.
-    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
-    assert!(!tools.is_empty(), "no-db MCP server must expose at least one tool");
-    for tool in tools {
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .expect("tool name");
+    assert_matches_golden(&actual, &no_db_golden_path());
+
+    let no_db_tools = string_set(
+        manifest
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools"),
+        "name",
+    );
+    let full_tools = string_set(
+        full_manifest
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools"),
+        "name",
+    );
+    assert!(
+        !no_db_tools.is_empty(),
+        "no-db MCP server must expose at least one tool"
+    );
+    assert!(
+        no_db_tools.is_subset(&full_tools),
+        "no-db tool manifest must be a subset of the db-backed manifest"
+    );
+    assert!(
+        full_tools.len() > no_db_tools.len(),
+        "db-backed MCP manifest must advertise at least one db-gated tool"
+    );
+
+    let no_db_resources = string_set(
+        manifest
+            .get("resources")
+            .and_then(Value::as_array)
+            .expect("resources"),
+        "uri",
+    );
+    let full_resources = string_set(
+        full_manifest
+            .get("resources")
+            .and_then(Value::as_array)
+            .expect("resources"),
+        "uri",
+    );
+    assert!(
+        no_db_resources.is_subset(&full_resources),
+        "no-db resources must be a subset of the db-backed manifest"
+    );
+    assert!(
+        full_resources.len() > no_db_resources.len(),
+        "db-backed MCP manifest must advertise at least one db-gated resource"
+    );
+
+    let no_db_templates = string_set(
+        manifest
+            .get("resource_templates")
+            .and_then(Value::as_array)
+            .expect("resource_templates"),
+        "uri_template",
+    );
+    let full_templates = string_set(
+        full_manifest
+            .get("resource_templates")
+            .and_then(Value::as_array)
+            .expect("resource_templates"),
+        "uri_template",
+    );
+    assert!(
+        no_db_templates.is_subset(&full_templates),
+        "no-db resource templates must be a subset of the db-backed manifest"
+    );
+
+    let absent_db_tools: Vec<_> = full_tools.difference(&no_db_tools).cloned().collect();
+    assert!(
+        !absent_db_tools.is_empty(),
+        "expected db-backed manifest to expose db-gated tools absent from no-db mode"
+    );
+    for expected_absent_tool in [
+        "wa.accounts",
+        "wa.events",
+        "wa.reserve",
+        "wa.release",
+        "wa.search",
+        "wa.send",
+        "wa.workflow_run",
+    ] {
         assert!(
-            name.starts_with("wa.") || name.starts_with("frankenterm.") || name.contains('_'),
-            "unexpected tool name shape (no-db variant): {name}"
+            !no_db_tools.contains(expected_absent_tool),
+            "db-gated tool unexpectedly advertised without db_path: {expected_absent_tool}"
         );
     }
-    // Non-destructive: ensure the output is valid JSON by round-tripping.
+
+    let absent_db_resources: Vec<_> = full_resources
+        .difference(&no_db_resources)
+        .cloned()
+        .collect();
+    assert!(
+        !absent_db_resources.is_empty(),
+        "expected db-backed manifest to expose db-gated resources absent from no-db mode"
+    );
+    for expected_absent_resource in [
+        "wa://accounts",
+        "wa://events",
+        "wa://reservations",
+    ] {
+        assert!(
+            !no_db_resources.contains(expected_absent_resource),
+            "db-gated resource unexpectedly advertised without db_path: {expected_absent_resource}"
+        );
+    }
+
+    for expected_absent_template in [
+        "wa://accounts/{service}",
+        "wa://events/{limit}",
+        "wa://events/unhandled/{limit}",
+        "wa://reservations/{pane_id}",
+    ] {
+        assert!(
+            !no_db_templates.contains(expected_absent_template),
+            "db-gated template unexpectedly advertised without db_path: {expected_absent_template}"
+        );
+    }
+
     let _: Value = serde_json::from_str(&actual).expect("round-trip no-db manifest");
 }
 
@@ -185,48 +344,11 @@ fn mcp_manifest_matches_golden_with_db() {
     // Use a fixed path for the manifest capture. The tool handlers only
     // record the path; they do not open the DB during registration, so
     // the file need not exist.
-    let db_path = Some(PathBuf::from(
-        "/tmp/ft-mcp-manifest-golden-fixture.sqlite3",
-    ));
+    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-golden-fixture.sqlite3"));
 
     let manifest = capture_manifest(db_path);
     let actual = pretty_canonical(&manifest);
-    let golden = golden_path();
-
-    if std::env::var("UPDATE_GOLDEN").is_ok() {
-        if let Some(parent) = golden.parent() {
-            std::fs::create_dir_all(parent).expect("create fixtures dir");
-        }
-        std::fs::write(&golden, format!("{actual}\n")).expect("write golden");
-        return;
-    }
-
-    let expected = std::fs::read_to_string(&golden).unwrap_or_else(|err| {
-        panic!(
-            "missing MCP manifest golden at {}: {err}. Regenerate with \
-             UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden",
-            golden.display()
-        )
-    });
-
-    // Tolerate a trailing newline in the committed file.
-    let expected_trimmed = expected.trim_end_matches('\n');
-    let actual_trimmed = actual.trim_end_matches('\n');
-
-    if expected_trimmed != actual_trimmed {
-        // Write actual next to the golden for easy diff review.
-        let actual_path = golden.with_extension("actual.json");
-        let _ = std::fs::write(&actual_path, format!("{actual}\n"));
-        panic!(
-            "MCP manifest drift detected. Review the diff between:\n  \
-             expected: {}\n  actual:   {}\n\n\
-             If intentional, regenerate with:\n  \
-             UPDATE_GOLDEN=1 cargo test --test mcp_manifest_golden \
-             --no-default-features --features mcp,tokio-runtime",
-            golden.display(),
-            actual_path.display()
-        );
-    }
+    assert_matches_golden(&actual, &golden_path());
 }
 
 #[test]
@@ -235,7 +357,10 @@ fn mcp_manifest_capture_is_deterministic() {
     let first = pretty_canonical(&capture_manifest(db_path.clone()));
     let second = pretty_canonical(&capture_manifest(db_path.clone()));
     let third = pretty_canonical(&capture_manifest(db_path));
-    assert_eq!(first, second, "manifest must be deterministic across captures");
+    assert_eq!(
+        first, second,
+        "manifest must be deterministic across captures"
+    );
     assert_eq!(
         second, third,
         "manifest must remain deterministic across repeated captures"
@@ -246,7 +371,10 @@ fn mcp_manifest_capture_is_deterministic() {
 fn mcp_manifest_tool_names_are_unique() {
     let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-unique.sqlite3"));
     let manifest = capture_manifest(db_path);
-    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
+    let tools = manifest
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools");
     let mut names: Vec<&str> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -263,7 +391,9 @@ fn mcp_manifest_tool_names_are_unique() {
 
 #[test]
 fn mcp_manifest_resource_uris_are_unique() {
-    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-resource-unique.sqlite3"));
+    let db_path = Some(PathBuf::from(
+        "/tmp/ft-mcp-manifest-resource-unique.sqlite3",
+    ));
     let manifest = capture_manifest(db_path);
     let resources = manifest
         .get("resources")
@@ -302,16 +432,14 @@ fn mcp_manifest_resource_uris_are_unique() {
 
 #[test]
 fn mcp_manifest_tool_input_schemas_are_objects() {
-    let db_path = Some(PathBuf::from(
-        "/tmp/ft-mcp-manifest-schema-shape.sqlite3",
-    ));
+    let db_path = Some(PathBuf::from("/tmp/ft-mcp-manifest-schema-shape.sqlite3"));
     let manifest = capture_manifest(db_path);
-    let tools = manifest.get("tools").and_then(Value::as_array).expect("tools");
+    let tools = manifest
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools");
     for tool in tools {
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .expect("tool name");
+        let name = tool.get("name").and_then(Value::as_str).expect("tool name");
         let schema = tool.get("input_schema").expect("input_schema");
         assert!(
             schema.is_object(),

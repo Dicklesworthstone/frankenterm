@@ -1,0 +1,774 @@
+{
+  "resource_templates": [
+    {
+      "description": "Filter rule catalog by agent type",
+      "mime_type": "application/json",
+      "name": "ft rules by agent",
+      "tags": [
+        "wa",
+        "rules"
+      ],
+      "uri_template": "wa://rules/{agent_type}",
+      "version": "0.1.0"
+    }
+  ],
+  "resources": [
+    {
+      "description": "Pane snapshot (same data surface as wa.state)",
+      "mime_type": "application/json",
+      "name": "ft panes",
+      "tags": [
+        "wa",
+        "panes"
+      ],
+      "uri": "wa://panes",
+      "version": "0.1.0"
+    },
+    {
+      "description": "Rule catalog (same data surface as wa.rules_list with verbose output)",
+      "mime_type": "application/json",
+      "name": "ft rules",
+      "tags": [
+        "wa",
+        "rules"
+      ],
+      "uri": "wa://rules",
+      "version": "0.1.0"
+    },
+    {
+      "description": "Builtin workflow catalog and metadata",
+      "mime_type": "application/json",
+      "name": "ft workflows",
+      "tags": [
+        "wa",
+        "workflows"
+      ],
+      "uri": "wa://workflows",
+      "version": "0.1.0"
+    }
+  ],
+  "tools": [
+    {
+      "annotations": null,
+      "description": "Search coding agent session history via cass",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt",
+            "type": "string"
+          },
+          "days": {
+            "description": "Only sessions within the last N days",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fields": {
+            "description": "Field selection (cass-defined; e.g. minimal)",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Maximum results (0 = cass default)",
+            "maximum": 1000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "description": "Max tokens per hit content (cass-defined)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Offset into results",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Search query string",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace": {
+            "description": "Workspace filter (cass-defined)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "wa.cass_search",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Check cass index status",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.cass_status",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "View context for a cass search hit",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "context_lines": {
+            "default": 10,
+            "description": "Context lines before/after match",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "line_number": {
+            "description": "Line number returned by cass search",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_path": {
+            "description": "Source path returned by cass search",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_path",
+          "line_number"
+        ],
+        "type": "object"
+      },
+      "name": "wa.cass_view",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Get text content from a pane (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "escapes": {
+            "default": false,
+            "description": "Include escape sequences",
+            "type": "boolean"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "pane_id": {
+            "description": "The pane ID to read from",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tail": {
+            "default": 500,
+            "description": "Number of lines to return (from end)",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pane_id"
+        ],
+        "type": "object"
+      },
+      "name": "wa.get_text",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Abort a mission, cancelling all in-flight assignments (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "error_code": {
+            "description": "Optional error code for the abort",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "mission_file": {
+            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Reason code for the abort (required)",
+            "type": "string"
+          },
+          "requested_by": {
+            "description": "Who requested the abort (default: mcp-agent)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "name": "wa.mission_abort",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "mission"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Show legal lifecycle transitions, failure catalog, and optional assignment context (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "description": "Optional assignment ID for dispatch context details",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "mission_file": {
+            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.mission_explain",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "mission"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Pause an active mission, creating a checkpoint (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "mission_file": {
+            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Reason code for the pause (required)",
+            "type": "string"
+          },
+          "requested_by": {
+            "description": "Who requested the pause (default: mcp-agent)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "name": "wa.mission_pause",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "mission"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Resume a paused mission, restoring prior lifecycle state (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "mission_file": {
+            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+            "type": "string"
+          },
+          "requested_by": {
+            "description": "Who requested the resume (default: mcp-agent)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.mission_resume",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "mission"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Query mission lifecycle state, assignments, and counters with optional filtering (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action_state": {
+            "description": "Filter by action state (ready, blocked, completed)",
+            "type": "string"
+          },
+          "agent_state": {
+            "description": "Filter by agent approval state (not_required, pending, approved, denied, expired)",
+            "type": "string"
+          },
+          "assignee": {
+            "description": "Filter by assignee name",
+            "type": "string"
+          },
+          "assignment_id": {
+            "description": "Filter to specific assignment ID",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max assignments to return (default: 100)",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mission_file": {
+            "description": "Optional path to mission JSON (default: .ft/mission/active.json)",
+            "type": "string"
+          },
+          "mission_state": {
+            "description": "Filter by lifecycle state (e.g., running, paused, completed)",
+            "type": "string"
+          },
+          "run_state": {
+            "description": "Filter assignments by run state (pending, succeeded, failed, cancelled)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.mission_state",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "mission"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "List pattern detection rules in the rule library (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_type": {
+            "description": "Filter by agent type (codex, claude_code, gemini, wezterm)",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "verbose": {
+            "default": false,
+            "description": "Include descriptions in output",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.rules_list",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "rules"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Test pattern detection rules against provided text (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "Text to test pattern detection against",
+            "type": "string"
+          },
+          "trace": {
+            "default": false,
+            "description": "Include trace information in matches",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "wa.rules_test",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "rules"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Get current pane states (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "pane_id": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.state",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Validate and summarize mission transaction contract metadata (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "contract_file": {
+            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.tx_plan",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "tx"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Execute compensation phase for committed tx steps (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "contract_file": {
+            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+            "type": "string"
+          },
+          "fail_compensation_for_step": {
+            "description": "Deterministic compensation failure injection step_id",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.tx_rollback",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "tx"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Execute deterministic tx prepare+commit and compensation on partial failure (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "contract_file": {
+            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+            "type": "string"
+          },
+          "fail_step": {
+            "description": "Deterministic commit failure injection step_id",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "kill_switch": {
+            "description": "off|safe_mode|hard_stop (safe-mode/hard-stop also accepted)",
+            "type": "string"
+          },
+          "paused": {
+            "default": false,
+            "description": "Treat mission as paused; commit returns pause-suspended outcome",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.tx_run",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "tx"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Inspect mission tx lifecycle, receipts, and legal transitions (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "contract_file": {
+            "description": "Optional path to MissionTxContract JSON (default: .ft/mission/tx-active.json)",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "include_contract": {
+            "default": false,
+            "description": "Include full contract payload in response",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.tx_show",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "tx"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Wait for a pattern match in pane output (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "pane_id": {
+            "description": "Pane ID to wait on",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pattern": {
+            "description": "Pattern to match (substring or regex)",
+            "type": "string"
+          },
+          "regex": {
+            "default": false,
+            "description": "Treat pattern as regex",
+            "type": "boolean"
+          },
+          "tail": {
+            "default": 200,
+            "description": "Tail lines to search (0 = full buffer)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timeout_secs": {
+            "default": 30,
+            "description": "Timeout in seconds",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pane_id",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "name": "wa.wait_for",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot"
+      ],
+      "version": "0.1.0"
+    }
+  ]
+}
