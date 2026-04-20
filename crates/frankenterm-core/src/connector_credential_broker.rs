@@ -1953,4 +1953,125 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().contains("exceeds configured ceiling"));
     }
+
+    // ========================================================================
+    // Variant-dispatch Display coverage
+    // ========================================================================
+
+    #[test]
+    fn sensitivity_and_kind_display_remaining_variants() {
+        // CredentialSensitivity: Medium + High were untested
+        assert_eq!(CredentialSensitivity::Medium.to_string(), "medium");
+        assert_eq!(CredentialSensitivity::High.to_string(), "high");
+
+        // CredentialKind: 4 variants were untested
+        assert_eq!(CredentialKind::OAuth2Client.to_string(), "oauth2_client");
+        assert_eq!(CredentialKind::SshKey.to_string(), "ssh_key");
+        assert_eq!(CredentialKind::SymmetricKey.to_string(), "symmetric_key");
+        assert_eq!(CredentialKind::GenericSecret.to_string(), "generic_secret");
+    }
+
+    #[test]
+    fn audit_type_display_remaining_variants() {
+        // 7 variants were untested
+        assert_eq!(
+            CredentialAuditType::CredentialRegistered.to_string(),
+            "credential_registered"
+        );
+        assert_eq!(
+            CredentialAuditType::LeaseExpired.to_string(),
+            "lease_expired"
+        );
+        assert_eq!(
+            CredentialAuditType::LeaseRevoked.to_string(),
+            "lease_revoked"
+        );
+        assert_eq!(
+            CredentialAuditType::CredentialRevoked.to_string(),
+            "credential_revoked"
+        );
+        assert_eq!(
+            CredentialAuditType::CredentialExpired.to_string(),
+            "credential_expired"
+        );
+        assert_eq!(
+            CredentialAuditType::ProviderRegistered.to_string(),
+            "provider_registered"
+        );
+        assert_eq!(
+            CredentialAuditType::ProviderStatusChanged.to_string(),
+            "provider_status_changed"
+        );
+    }
+
+    #[test]
+    fn broker_error_display_all_variants() {
+        assert_eq!(
+            CredentialBrokerError::ProviderNotFound {
+                provider_id: "vault".into(),
+            }
+            .to_string(),
+            "provider not found: vault"
+        );
+        assert_eq!(
+            CredentialBrokerError::CredentialNotFound {
+                credential_id: "c1".into(),
+            }
+            .to_string(),
+            "credential not found: c1"
+        );
+        assert_eq!(
+            CredentialBrokerError::NotAuthorized {
+                connector_id: "conn".into(),
+                scope: "admin".into(),
+            }
+            .to_string(),
+            "connector not authorized: conn for scope admin"
+        );
+        assert_eq!(
+            CredentialBrokerError::CredentialExpired {
+                credential_id: "c2".into(),
+            }
+            .to_string(),
+            "credential expired: c2"
+        );
+        assert_eq!(
+            CredentialBrokerError::CredentialRevoked {
+                credential_id: "c3".into(),
+            }
+            .to_string(),
+            "credential revoked: c3"
+        );
+        assert_eq!(
+            CredentialBrokerError::ProviderUnavailable {
+                provider_id: "v1".into(),
+                reason: "timeout".into(),
+            }
+            .to_string(),
+            "provider unavailable: v1: timeout"
+        );
+        assert_eq!(
+            CredentialBrokerError::RotationFailed {
+                credential_id: "c4".into(),
+                reason: "locked".into(),
+            }
+            .to_string(),
+            "rotation failed for c4: locked"
+        );
+        assert_eq!(
+            CredentialBrokerError::LeaseExpired {
+                lease_id: "l1".into(),
+            }
+            .to_string(),
+            "lease expired: l1"
+        );
+        assert_eq!(
+            CredentialBrokerError::MaxLeasesExceeded {
+                connector_id: "conn".into(),
+                limit: 5,
+            }
+            .to_string(),
+            "max active leases exceeded for conn: limit=5"
+        );
+    }
 }
