@@ -336,4 +336,122 @@ mod tests {
                 .any(|check| check.gate_id == "REL-02-guard-surface" && !check.passed)
         );
     }
+
+    #[test]
+    fn render_summary_includes_pass_fail_icons_and_actions() {
+        let mut inputs = passing_inputs();
+        inputs.soak.release_cycles = 1; // force one gate to fail
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        let summary = report.render_summary();
+        assert!(
+            summary.contains("[PASS]"),
+            "summary must include [PASS] for passing gates"
+        );
+        assert!(
+            summary.contains("[FAIL]"),
+            "summary must include [FAIL] for failing gates"
+        );
+        assert!(
+            summary.contains("action:"),
+            "summary must include action for failing gates"
+        );
+        assert!(
+            summary.contains("Blocked"),
+            "summary must show Blocked decision"
+        );
+    }
+
+    #[test]
+    fn render_summary_ready_has_no_actions() {
+        let report = ReleaseGatePolicy::finish_line().evaluate(&passing_inputs());
+        let summary = report.render_summary();
+        assert!(summary.contains("Ready"));
+        assert!(!summary.contains("action:"), "ready report should have no action lines");
+    }
+
+    #[test]
+    fn wrong_pane_scales_blocks_soak_confidence() {
+        let mut inputs = passing_inputs();
+        inputs.soak.pane_scales = vec![1, 50, 100]; // missing 200
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        assert_eq!(report.decision, ReleaseDecision::Blocked);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.gate_id == "REL-03-soak-confidence" && !check.passed)
+        );
+    }
+
+    #[test]
+    fn backpressure_not_exercised_blocks_performance_budget() {
+        let mut inputs = passing_inputs();
+        inputs.soak.backpressure_exercised = false;
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        assert_eq!(report.decision, ReleaseDecision::Blocked);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.gate_id == "REL-04-performance-budget" && !check.passed)
+        );
+    }
+
+    #[test]
+    fn release_gate_report_serde_roundtrip() {
+        let report = ReleaseGatePolicy::finish_line().evaluate(&passing_inputs());
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: ReleaseGateReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.decision, report.decision);
+        assert_eq!(restored.checks.len(), report.checks.len());
+        for (orig, rest) in report.checks.iter().zip(restored.checks.iter()) {
+            assert_eq!(orig.gate_id, rest.gate_id);
+            assert_eq!(orig.passed, rest.passed);
+            assert_eq!(orig.blocking, rest.blocking);
+        }
+    }
+
+    #[test]
+    fn release_gate_inputs_serde_roundtrip() {
+        let inputs = passing_inputs();
+        let json = serde_json::to_string(&inputs).unwrap();
+        let restored: ReleaseGateInputs = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.leak.summary_present, inputs.leak.summary_present);
+        assert_eq!(restored.soak.release_cycles, inputs.soak.release_cycles);
+        assert_eq!(restored.guard_contract_passed, inputs.guard_contract_passed);
+    }
+
+    #[test]
+    fn release_gate_policy_serde_roundtrip() {
+        let policy = ReleaseGatePolicy::finish_line();
+        let json = serde_json::to_string(&policy).unwrap();
+        let restored: ReleaseGatePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.required_pane_scales, policy.required_pane_scales);
+        assert_eq!(restored.required_metric_count, policy.required_metric_count);
+        assert_eq!(restored.min_release_cycles, policy.min_release_cycles);
+    }
+
+    #[test]
+    fn failed_count_matches_actual_failures() {
+        let mut inputs = passing_inputs();
+        // Fail all 4 gates
+        inputs.leak.summary_present = false;
+        inputs.guard_contract_passed = false;
+        inputs.soak.release_cycles = 0;
+        inputs.soak.metric_count = 0;
+        let report = ReleaseGatePolicy::finish_line().evaluate(&inputs);
+        assert_eq!(report.decision, ReleaseDecision::Blocked);
+        assert_eq!(report.failed_count(), 4);
+        assert_eq!(report.checks.len(), 4);
+    }
+
+    #[test]
+    fn finish_line_policy_defaults() {
+        let policy = ReleaseGatePolicy::finish_line();
+        assert_eq!(policy.required_pane_scales, vec![1, 50, 100, 200]);
+        assert_eq!(policy.required_metric_count, 8);
+        assert_eq!(policy.min_release_cycles, 3);
+        assert!((policy.max_peak_rss_mb - 32.0).abs() < f64::EPSILON);
+        assert!((policy.max_duration_s - 3.0).abs() < f64::EPSILON);
+    }
 }
