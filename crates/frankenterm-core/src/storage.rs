@@ -6544,16 +6544,25 @@ impl StorageHandle {
 
     /// Remove a persistent event mute by identity key.
     pub async fn remove_event_mute(&self, identity_key: &str) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::DeleteEventMute {
-                identity_key: identity_key.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.remove_event_mute_with_cx(&cx, identity_key).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::DeleteEventMute {
+                    identity_key: identity_key.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_mute`].
@@ -6565,7 +6574,19 @@ impl StorageHandle {
     ) -> Result<bool> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("remove_event_mute cancelled: {err}")))?;
-        self.remove_event_mute(identity_key).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteEventMute {
+                    identity_key: identity_key.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Check whether an identity key is muted (and not expired).
