@@ -1,0 +1,105 @@
+#![cfg(feature = "serde_support")]
+
+use portable_pty::CommandBuilder;
+use proptest::prelude::*;
+use std::ffi::OsString;
+
+fn arb_small_string() -> impl Strategy<Value = String> {
+    proptest::collection::vec(any::<char>(), 1..16).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn arb_optional_string() -> impl Strategy<Value = Option<String>> {
+    prop_oneof![Just(None), arb_small_string().prop_map(Some),]
+}
+
+fn arb_env_pairs() -> impl Strategy<Value = Vec<(String, String)>> {
+    proptest::collection::vec((arb_small_string(), arb_small_string()), 0..8)
+}
+
+fn arb_args() -> impl Strategy<Value = Vec<String>> {
+    proptest::collection::vec(arb_small_string(), 1..8)
+}
+
+fn build_command(
+    argv: &[String],
+    cwd: Option<&String>,
+    env_pairs: &[(String, String)],
+    controlling_tty: bool,
+) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(&argv[0]);
+    cmd.env_clear();
+    cmd.args(argv.iter().skip(1));
+    if let Some(cwd) = cwd {
+        cmd.cwd(cwd);
+    }
+    for (key, value) in env_pairs {
+        cmd.env(key, value);
+    }
+    cmd.set_controlling_tty(controlling_tty);
+    cmd
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn command_builder_json_roundtrip(
+        argv in arb_args(),
+        cwd in arb_optional_string(),
+        env_pairs in arb_env_pairs(),
+        controlling_tty in any::<bool>(),
+    ) {
+        let cmd = build_command(&argv, cwd.as_ref(), &env_pairs, controlling_tty);
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: CommandBuilder = serde_json::from_str(&json).unwrap();
+
+        let expected_argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+        prop_assert_eq!(back.get_argv(), &expected_argv);
+        prop_assert_eq!(back.get_controlling_tty(), controlling_tty);
+        prop_assert_eq!(back.get_cwd().cloned(), cwd.clone().map(OsString::from));
+
+        let mut expected_env = env_pairs.clone();
+        expected_env.sort();
+        let mut actual_env: Vec<(String, String)> = back
+            .iter_extra_env_as_str()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        actual_env.sort();
+        prop_assert_eq!(actual_env, expected_env);
+    }
+
+    #[test]
+    fn default_prog_command_builder_json_roundtrip(
+        cwd in arb_optional_string(),
+        env_pairs in arb_env_pairs(),
+        controlling_tty in any::<bool>(),
+    ) {
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.env_clear();
+        if let Some(cwd) = &cwd {
+            cmd.cwd(cwd);
+        }
+        for (key, value) in &env_pairs {
+            cmd.env(key, value);
+        }
+        cmd.set_controlling_tty(controlling_tty);
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: CommandBuilder = serde_json::from_str(&json).unwrap();
+
+        prop_assert!(back.is_default_prog());
+        prop_assert_eq!(back.get_argv(), &Vec::<OsString>::new());
+        prop_assert_eq!(back.get_controlling_tty(), controlling_tty);
+        prop_assert_eq!(back.get_cwd().cloned(), cwd.clone().map(OsString::from));
+
+        let mut expected_env = env_pairs.clone();
+        expected_env.sort();
+        let mut actual_env: Vec<(String, String)> = back
+            .iter_extra_env_as_str()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        actual_env.sort();
+        prop_assert_eq!(actual_env, expected_env);
+    }
+}

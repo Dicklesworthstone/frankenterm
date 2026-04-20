@@ -40,3 +40,5 @@ winreg.workspace = true
 
 [dev-dependencies]
 asupersync.workspace = true
+proptest = "1.8.0"
+serde_json.workspace = true
