@@ -839,16 +839,38 @@ proptest! {
         capacity in 10_usize..1000,
         buckets in 64_usize..4096,
         pid in 0_u32..65535,
+        per_process_metrics in any::<bool>(),
     ) {
         let mut config = TelemetryConfig::default();
         config.buffer_capacity = capacity;
         config.histogram_buckets = buckets;
         config.mux_server_pid = pid;
+        config.per_process_metrics = per_process_metrics;
         let json = serde_json::to_string(&config).unwrap();
         let back: TelemetryConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.buffer_capacity, capacity);
         prop_assert_eq!(back.histogram_buckets, buckets);
         prop_assert_eq!(back.mux_server_pid, pid);
+        prop_assert_eq!(back.per_process_metrics, per_process_metrics);
+    }
+
+    #[test]
+    fn telemetry_config_core_fields_stay_positive(
+        sample_secs in 1_u64..3600,
+        capacity in 1_usize..1000,
+        buckets in 1_usize..4096,
+    ) {
+        let config = TelemetryConfig {
+            sample_interval: std::time::Duration::from_secs(sample_secs),
+            buffer_capacity: capacity,
+            histogram_buckets: buckets,
+            per_process_metrics: true,
+            mux_server_pid: 0,
+        };
+
+        prop_assert!(config.sample_interval > std::time::Duration::ZERO);
+        prop_assert!(config.buffer_capacity > 0);
+        prop_assert!(config.histogram_buckets > 0);
     }
 }
 
@@ -966,6 +988,23 @@ proptest! {
         prop_assert_eq!(back_res.pid, pid);
         prop_assert_eq!(back_res.rss_bytes, rss);
     }
+
+    #[test]
+    fn telemetry_snapshot_sample_counts_coherent(
+        buffer_samples in 0_u64..1000,
+        extra_total in 0_u64..5000,
+    ) {
+        let snap = TelemetrySnapshot {
+            timestamp_secs: 1_700_000_000,
+            resource: None,
+            histograms: vec![],
+            counters: HashMap::new(),
+            buffer_samples,
+            total_samples: buffer_samples + extra_total,
+        };
+
+        prop_assert!(snap.buffer_samples <= snap.total_samples);
+    }
 }
 
 // =============================================================================
@@ -998,5 +1037,32 @@ proptest! {
         prop_assert_eq!(back.sample_count, samples);
         prop_assert_eq!(back.mean_rss_bytes, mean_rss);
         prop_assert_eq!(back.mean_cpu_percent.is_some(), cpu.is_some());
+    }
+
+    #[test]
+    fn hourly_aggregate_peak_fields_dominate_means(
+        hour_ts in 0_u64..2_000_000_000,
+        sample_count in 1_u32..1000,
+        mean_rss_bytes in 0_u64..10_000_000_000,
+        peak_rss_extra in 0_u64..10_000_000_000,
+        mean_fd_count in 0_u64..10_000,
+        peak_fd_extra in 0_u64..10_000,
+        mean_cpu_percent in proptest::option::of(0.0_f64..100.0),
+    ) {
+        let agg = HourlyAggregate {
+            hour_ts,
+            sample_count,
+            mean_rss_bytes,
+            peak_rss_bytes: mean_rss_bytes.saturating_add(peak_rss_extra),
+            mean_fd_count,
+            peak_fd_count: mean_fd_count.saturating_add(peak_fd_extra),
+            mean_cpu_percent,
+        };
+
+        prop_assert!(agg.peak_rss_bytes >= agg.mean_rss_bytes);
+        prop_assert!(agg.peak_fd_count >= agg.mean_fd_count);
+        if let Some(cpu) = agg.mean_cpu_percent {
+            prop_assert!((0.0..=100.0).contains(&cpu));
+        }
     }
 }
