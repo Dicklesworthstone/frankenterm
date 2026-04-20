@@ -383,6 +383,39 @@ fn full_pipeline_mux_checkpoint_topology() {
     assert_eq!(server.registry().len(), server_entity_count);
 
     // Phase 5: verify restored topology matches initial.
+    //
+    // Primary check (ft-olq2e): derive the post-rollback pane id set from the
+    // actual server registry state so a misbehaving rollback that leaves the
+    // wrong entities in place would fail the assertion. Re-deserializing the
+    // pre-mutation baseline JSON only proves serde roundtrip, not rollback
+    // correctness.
+    let post_rollback_pane_ids: Vec<u64> = server
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter(|record| record.identity.kind == LifecycleEntityKind::Pane)
+        .map(|record| record.identity.local_id)
+        .collect();
+    let mut post_rollback_pane_ids_sorted = post_rollback_pane_ids.clone();
+    post_rollback_pane_ids_sorted.sort_unstable();
+
+    let mut baseline_pane_ids: Vec<u64> =
+        initial_panes.iter().map(|pane| pane.pane_id).collect();
+    baseline_pane_ids.sort_unstable();
+
+    assert_eq!(
+        post_rollback_pane_ids_sorted, baseline_pane_ids,
+        "rollback should restore exactly the pre-expansion pane id set"
+    );
+    assert_eq!(
+        post_rollback_pane_ids.len(),
+        initial_topo.pane_count(),
+        "post-rollback pane count must match pre-expansion baseline"
+    );
+
+    // Secondary check: the baseline topology JSON is still parseable and
+    // matches the live TopologySnapshot captured in Phase 1. This guards the
+    // serde surface but is no longer the sole evidence that rollback worked.
     let restored_topo = TopologySnapshot::from_json(&initial_topo_json)
         .expect("deserialize initial topology");
     assert_eq!(restored_topo.pane_count(), 2);
