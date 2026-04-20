@@ -19,3 +19,4 @@ frankenterm-dynamic-derive.workspace = true
 
 [dev-dependencies]
 maplit.workspace = true
+proptest = "1.8.0"
