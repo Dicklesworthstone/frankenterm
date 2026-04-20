@@ -54,6 +54,12 @@ fn build_command(
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
+    /// JSON roundtrip for CommandBuilder argv, cwd, controlling_tty, and env.
+    ///
+    /// Note: `env_clear()` is called to remove the process-inherited
+    /// `BTreeMap<OsString, EnvEntry>` base environment. Generated env
+    /// pairs use ASCII-safe `String` keys that serialize as valid JSON
+    /// map keys.
     #[test]
     fn command_builder_json_roundtrip(
         argv in arb_args(),
@@ -120,5 +126,39 @@ proptest! {
         let json = serde_json::to_string(&value).unwrap();
         let back: PtySize = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_builder_umask_json_roundtrip(
+        argv in arb_args(),
+        cwd in arb_optional_string(),
+        controlling_tty in any::<bool>(),
+        umask_val in prop_oneof![
+            Just(None),
+            (0u32..=0o7777u32).prop_map(|v| Some(v as libc::mode_t)),
+        ],
+    ) {
+        let mut cmd = CommandBuilder::new(&argv[0]);
+        cmd.env_clear();
+        cmd.args(argv.iter().skip(1));
+        if let Some(cwd) = &cwd {
+            cmd.cwd(cwd);
+        }
+        cmd.set_controlling_tty(controlling_tty);
+        cmd.umask(umask_val);
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: CommandBuilder = serde_json::from_str(&json).unwrap();
+
+        // PartialEq covers all fields including umask
+        prop_assert_eq!(&back, &cmd);
+
+        // Also verify through JSON Value that umask field is preserved
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        match umask_val {
+            None => prop_assert_eq!(&val["umask"], &serde_json::Value::Null),
+            Some(m) => prop_assert_eq!(val["umask"].as_u64().unwrap(), m as u64),
+        }
     }
 }

@@ -2619,4 +2619,178 @@ mod tests {
             "scope z in state running, expected Draining"
         );
     }
+
+    // ── Concurrency tests ───────────────────────────────────────────────
+
+    #[test]
+    fn concurrent_child_creation_all_registered() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let parent = CancellationToken::new(ScopeId("parent".into()));
+        let n_threads = 10;
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|i| {
+                let parent = parent.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    parent.child(ScopeId(format!("child_{i}")))
+                })
+            })
+            .collect();
+
+        let children: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(parent.child_count(), n_threads);
+        for c in &children {
+            assert!(!c.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn cancel_races_child_creation_all_children_see_cancellation() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Run multiple rounds to increase chance of hitting the race.
+        for _ in 0..20 {
+            let parent = CancellationToken::new(ScopeId("parent".into()));
+            let n_creators = 8;
+            let barrier = Arc::new(Barrier::new(n_creators + 1));
+
+            // Spawn child-creation threads
+            let handles: Vec<_> = (0..n_creators)
+                .map(|i| {
+                    let parent = parent.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        parent.child(ScopeId(format!("c_{i}")))
+                    })
+                })
+                .collect();
+
+            // Cancel from main thread at the same instant
+            barrier.wait();
+            parent.cancel(ShutdownReason::UserRequested);
+
+            let children: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            // Every child must see cancellation — either:
+            //   a) Created before cancel: propagation reached it, OR
+            //   b) Created after cancel: child() detects parent cancelled
+            for (i, c) in children.iter().enumerate() {
+                assert!(
+                    c.is_cancelled(),
+                    "round: child_{i} not cancelled despite parent cancel"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let parent = CancellationToken::new(ScopeId("parent".into()));
+        let c1 = parent.child(ScopeId("c1".into()));
+        let _c2 = parent.child(ScopeId("c2".into()));
+        let c3 = parent.child(ScopeId("c3".into()));
+
+        c1.cancel(ShutdownReason::UserRequested);
+        c3.cancel(ShutdownReason::UserRequested);
+
+        assert_eq!(parent.child_count(), 3);
+
+        let first_prune = parent.prune_cancelled_children();
+        assert_eq!(first_prune, 2);
+        assert_eq!(parent.child_count(), 1);
+
+        // Second prune finds nothing new.
+        let second_prune = parent.prune_cancelled_children();
+        assert_eq!(second_prune, 0);
+        assert_eq!(parent.child_count(), 1);
+    }
+
+    #[test]
+    fn deep_propagation_chain_cancels_all_levels() {
+        // 5-level deep tree: root → L1 → L2 → L3 → L4
+        let root = CancellationToken::new(ScopeId("root".into()));
+        let l1 = root.child(ScopeId("l1".into()));
+        let l2 = l1.child(ScopeId("l2".into()));
+        let l3 = l2.child(ScopeId("l3".into()));
+        let l4 = l3.child(ScopeId("l4".into()));
+
+        assert!(!l4.is_cancelled());
+
+        root.cancel(ShutdownReason::UserRequested);
+
+        assert!(l1.is_cancelled());
+        assert!(l2.is_cancelled());
+        assert!(l3.is_cancelled());
+        assert!(l4.is_cancelled());
+
+        // All descendants get ParentShutdown reason
+        for (label, token) in [("l1", &l1), ("l2", &l2), ("l3", &l3), ("l4", &l4)] {
+            let reason = token.reason().unwrap();
+            let is_parent = matches!(reason, ShutdownReason::ParentShutdown { .. });
+            assert!(is_parent, "{label} should have ParentShutdown reason");
+        }
+
+        // Root gets UserRequested reason
+        let is_user = matches!(root.reason(), Some(ShutdownReason::UserRequested));
+        assert!(is_user, "root should have UserRequested reason");
+    }
+
+    #[test]
+    fn generation_advances_on_cancel_and_propagation() {
+        let parent = CancellationToken::new(ScopeId("parent".into()));
+        assert_eq!(parent.generation(), 0);
+
+        let child = parent.child(ScopeId("child".into()));
+        assert_eq!(child.generation(), 0);
+
+        parent.cancel(ShutdownReason::UserRequested);
+
+        // Parent generation should advance by 1.
+        assert_eq!(parent.generation(), 1);
+        // Child generation should also advance (propagation does its own increment).
+        assert_eq!(child.generation(), 1);
+
+        // Double-cancel is a no-op (compare_exchange fails).
+        parent.cancel(ShutdownReason::UserRequested);
+        assert_eq!(parent.generation(), 1);
+    }
+
+    #[test]
+    fn coordinator_prune_cancelled_across_scopes() {
+        let mut coord = ShutdownCoordinator::new();
+        let s1 = ScopeId("scope_a".into());
+        let s2 = ScopeId("scope_b".into());
+
+        coord.register_scope(&s1, ScopeTier::Worker, None).unwrap();
+        coord.register_scope(&s2, ScopeTier::Worker, None).unwrap();
+
+        // Add children under each scope's token
+        let t1 = coord.token(&s1).unwrap().clone();
+        let t2 = coord.token(&s2).unwrap().clone();
+
+        let c1a = t1.child(ScopeId("c1a".into()));
+        let _c1b = t1.child(ScopeId("c1b".into()));
+        let c2a = t2.child(ScopeId("c2a".into()));
+
+        // Cancel some children
+        c1a.cancel(ShutdownReason::UserRequested);
+        c2a.cancel(ShutdownReason::UserRequested);
+
+        assert_eq!(t1.child_count(), 2);
+        assert_eq!(t2.child_count(), 1);
+
+        let total_pruned = coord.prune_cancelled();
+        assert_eq!(total_pruned, 2); // c1a + c2a
+
+        assert_eq!(t1.child_count(), 1); // c1b remains
+        assert_eq!(t2.child_count(), 0);
+    }
 }
