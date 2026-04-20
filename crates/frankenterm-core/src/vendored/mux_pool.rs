@@ -200,7 +200,7 @@ impl MuxPool {
     async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.acquire_client_with_cx(&cx).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -331,7 +331,7 @@ impl MuxPool {
     {
         #[cfg(feature = "asupersync-runtime")]
         {
-            let cx = cx::for_request();
+            let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.execute_with_recovery_with_cx(&cx, op_name, op).await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
