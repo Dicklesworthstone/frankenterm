@@ -5,7 +5,7 @@
 
 use frankenterm_core::aegis_backpressure::{
     ExternalCauseEvidence, GaussianPosterior, PacBayesBackpressure, PacBayesConfig,
-    PacBayesSnapshot, QueueObservation,
+    PacBayesSnapshot, PacBayesTelemetrySnapshot, PacBayesThrottleActions, QueueObservation,
 };
 use proptest::prelude::*;
 
@@ -546,5 +546,83 @@ proptest! {
         prop_assert!(detect <= 0.25 + 1e-10);
         prop_assert!(buffer >= 0.2 - 1e-10);
         prop_assert!(buffer <= 1.0 + 1e-10);
+    }
+}
+
+// ── Additional carrier serde coverage ────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(150))]
+
+    #[test]
+    fn external_cause_evidence_serde_roundtrip(
+        evidence in arb_external_evidence(),
+    ) {
+        let json = serde_json::to_string(&evidence).unwrap();
+        let back: ExternalCauseEvidence = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.system_load - evidence.system_load).abs() < 1e-10);
+        prop_assert!((back.other_panes_slow_fraction - evidence.other_panes_slow_fraction).abs() < 1e-10);
+        prop_assert_eq!(back.pty_producing, evidence.pty_producing);
+        prop_assert!((back.io_wait_fraction - evidence.io_wait_fraction).abs() < 1e-10);
+    }
+
+    #[test]
+    fn throttle_actions_serde_roundtrip(
+        severity in 0.0..=1.0_f64,
+        poll_multiplier in 1.0..=4.0_f64,
+        pane_skip_fraction in 0.0..=0.5_f64,
+        detection_skip_fraction in 0.0..=0.25_f64,
+        buffer_limit_factor in 0.2..=1.0_f64,
+        starvation_guard_active in any::<bool>(),
+        risk_bound in 0.0..=1.0_f64,
+        kl_divergence in 0.0..=100.0_f64,
+        optimal_threshold in 0.0..=1.0_f64,
+    ) {
+        let actions = PacBayesThrottleActions {
+            severity,
+            poll_multiplier,
+            pane_skip_fraction,
+            detection_skip_fraction,
+            buffer_limit_factor,
+            starvation_guard_active,
+            risk_bound,
+            kl_divergence,
+            optimal_threshold,
+        };
+        let json = serde_json::to_string(&actions).unwrap();
+        let back: PacBayesThrottleActions = serde_json::from_str(&json).unwrap();
+        prop_assert!((back.severity - actions.severity).abs() < 1e-10);
+        prop_assert!((back.poll_multiplier - actions.poll_multiplier).abs() < 1e-10);
+        prop_assert!((back.pane_skip_fraction - actions.pane_skip_fraction).abs() < 1e-10);
+        prop_assert!((back.detection_skip_fraction - actions.detection_skip_fraction).abs() < 1e-10);
+        prop_assert!((back.buffer_limit_factor - actions.buffer_limit_factor).abs() < 1e-10);
+        prop_assert_eq!(back.starvation_guard_active, actions.starvation_guard_active);
+        prop_assert!((back.risk_bound - actions.risk_bound).abs() < 1e-10);
+        prop_assert!((back.kl_divergence - actions.kl_divergence).abs() < 1e-10);
+        prop_assert!((back.optimal_threshold - actions.optimal_threshold).abs() < 1e-10);
+    }
+
+    #[test]
+    fn telemetry_snapshot_serde_roundtrip(
+        observations in 0u64..100_000,
+        frame_drops_observed in 0u64..100_000,
+        throttle_activations in 0u64..100_000,
+        starvation_guards in 0u64..100_000,
+        posterior_updates in 0u64..100_000,
+        pane_resets in 0u64..100_000,
+        full_resets in 0u64..100_000,
+    ) {
+        let snap = PacBayesTelemetrySnapshot {
+            observations,
+            frame_drops_observed,
+            throttle_activations,
+            starvation_guards,
+            posterior_updates,
+            pane_resets,
+            full_resets,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: PacBayesTelemetrySnapshot = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, snap);
     }
 }
