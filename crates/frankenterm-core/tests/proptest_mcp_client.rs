@@ -6,9 +6,13 @@
 //! Validates:
 //! - ExternalServerConfig serde roundtrip
 //! - McpClientError serialization and Display consistency
+//! - McpClientToolDefinition serde + destructive annotation behavior
+//! - McpClientContentItem serde + text extraction behavior
 //! - Server selection determinism
 
-use frankenterm_core::mcp_client::{ExternalServerConfig, McpClientError};
+use frankenterm_core::mcp_client::{
+    ExternalServerConfig, McpClientContentItem, McpClientError, McpClientToolDefinition,
+};
 use proptest::prelude::*;
 use std::collections::HashMap;
 
@@ -55,6 +59,69 @@ fn arb_external_server_config() -> impl Strategy<Value = ExternalServerConfig> {
                 disabled,
             },
         )
+}
+
+fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
+    prop_oneof![
+        any::<bool>().prop_map(serde_json::Value::Bool),
+        (0_i64..10_000).prop_map(|v| serde_json::Value::Number(v.into())),
+        "[a-zA-Z0-9 _./:-]{0,24}".prop_map(serde_json::Value::String),
+        prop::collection::vec("[a-z]{1,8}", 0..4).prop_map(|items| {
+            serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect())
+        }),
+    ]
+}
+
+fn arb_tool_definition() -> impl Strategy<Value = McpClientToolDefinition> {
+    (
+        arb_name(),
+        proptest::option::of("[a-zA-Z0-9 .:_/-]{1,40}"),
+        arb_json_value(),
+        proptest::option::of(arb_json_value()),
+        proptest::option::of(arb_json_value()),
+        proptest::option::of("[0-9a-zA-Z._-]{1,16}"),
+        prop::collection::vec("[a-z0-9_-]{1,12}", 0..4),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(name, description, input_schema, output_schema, icon, version, tags, destructive)| {
+                let annotations = serde_json::json!({
+                    "destructive": destructive,
+                    "owner": "tests",
+                });
+                McpClientToolDefinition {
+                    name,
+                    description,
+                    input_schema,
+                    output_schema,
+                    icon,
+                    version,
+                    tags,
+                    annotations: Some(annotations),
+                }
+            },
+        )
+}
+
+fn arb_content_item() -> impl Strategy<Value = McpClientContentItem> {
+    prop_oneof![
+        "[a-zA-Z0-9 .,_:-]{1,40}".prop_map(|text| {
+            McpClientContentItem(serde_json::json!({
+                "type": "text",
+                "text": text,
+            }))
+        }),
+        arb_json_value().prop_map(|value| {
+            McpClientContentItem(serde_json::json!({
+                "type": "json",
+                "payload": value,
+            }))
+        }),
+        Just(McpClientContentItem(serde_json::json!({
+            "type": "text",
+            "text": 42,
+        }))),
+    ]
 }
 
 /// Strategy for known error codes (must be &'static str).
@@ -264,6 +331,50 @@ proptest! {
         prop_assert!(json.contains("hint"), "JSON should contain hint when Some");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(value["hint"].as_str(), Some(hint.as_str()));
+    }
+}
+
+// ── McpClientToolDefinition properties ──────────────────────────────
+
+proptest! {
+    #[test]
+    fn mcp_tool_definition_serde_roundtrip(tool in arb_tool_definition()) {
+        let json = serde_json::to_string(&tool).unwrap();
+        let back: McpClientToolDefinition = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&tool, &back);
+    }
+
+    #[test]
+    fn mcp_tool_definition_is_destructive_matches_annotation(tool in arb_tool_definition()) {
+        let expected = tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("destructive"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        prop_assert_eq!(tool.is_destructive(), expected);
+    }
+}
+
+// ── McpClientContentItem properties ─────────────────────────────────
+
+proptest! {
+    #[test]
+    fn mcp_content_item_serde_roundtrip(item in arb_content_item()) {
+        let json = serde_json::to_string(&item).unwrap();
+        let back: McpClientContentItem = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(&item, &back);
+    }
+
+    #[test]
+    fn mcp_content_item_as_text_matches_payload(item in arb_content_item()) {
+        let expected = item.0
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| *value == "text")
+            .and_then(|_| item.0.get("text"))
+            .and_then(serde_json::Value::as_str);
+        prop_assert_eq!(item.as_text(), expected);
     }
 }
 
