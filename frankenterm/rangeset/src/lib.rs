@@ -1,5 +1,5 @@
 use num::{Integer, ToPrimitive};
-use std::cmp::{max, min, Ordering};
+use std::cmp::{Ordering, max, min};
 use std::fmt::Debug;
 use std::ops::Range;
 
@@ -32,11 +32,7 @@ pub fn range_intersection<T: Integer + Copy + Debug>(
     let start = max(r1.start, r2.start);
     let end = min(r1.end, r2.end);
 
-    if end > start {
-        Some(start..end)
-    } else {
-        None
-    }
+    if end > start { Some(start..end) } else { None }
 }
 
 /// Computes the r1 - r2, which may result in up to two non-overlapping ranges.
@@ -335,9 +331,32 @@ impl<T: Integer + Copy + Debug + ToPrimitive> RangeSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn collect<T: Integer + Copy + Debug + ToPrimitive>(set: &RangeSet<T>) -> Vec<Range<T>> {
         set.iter().cloned().collect()
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Add(Range<i32>),
+        Remove(Range<i32>),
+    }
+
+    fn arb_range() -> impl Strategy<Value = Range<i32>> {
+        (-64i32..=64, -64i32..=64).prop_map(|(a, b)| {
+            let start = a.min(b);
+            let end = a.max(b);
+            start..end
+        })
+    }
+
+    fn arb_op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            arb_range().prop_map(Op::Add),
+            arb_range().prop_map(Op::Remove),
+        ]
     }
 
     #[test]
@@ -1349,5 +1368,36 @@ mod tests {
         set.remove(10);
         assert_eq!(collect(&set), vec![1..5, 6..7, 8..10, 11..20]);
         assert_eq!(set.len(), 16);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn iter_values_matches_naive_membership_model(ops in proptest::collection::vec(arb_op(), 0..64)) {
+            let mut set = RangeSet::new();
+            let mut naive = BTreeSet::new();
+
+            for op in ops {
+                match op {
+                    Op::Add(range) => {
+                        set.add_range(range.clone());
+                        for value in range {
+                            naive.insert(value);
+                        }
+                    }
+                    Op::Remove(range) => {
+                        set.remove_range(range.clone());
+                        for value in range {
+                            naive.remove(&value);
+                        }
+                    }
+                }
+            }
+
+            let actual: Vec<i32> = set.iter_values().collect();
+            let expected: Vec<i32> = naive.into_iter().collect();
+            prop_assert_eq!(actual, expected);
+        }
     }
 }

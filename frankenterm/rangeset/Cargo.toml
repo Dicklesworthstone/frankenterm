@@ -10,8 +10,8 @@ num.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest = "1.8.0"
 
 [[bench]]
 name = "rangeset"
 harness = false
-
