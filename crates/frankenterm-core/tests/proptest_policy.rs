@@ -1997,6 +1997,29 @@ fn arb_forensic_compliance_summary() -> impl Strategy<Value = ForensicCompliance
     })
 }
 
+fn arb_forensic_query() -> impl Strategy<Value = ForensicQuery> {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        prop::option::of(arb_actor_kind()),
+        prop::option::of(arb_action_kind()),
+        prop::option::of(any::<u64>()),
+        prop::option::of("[a-z0-9_.-]{1,20}"),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(start_ms, end_ms, actor, action, pane_id, domain, denials_only)| ForensicQuery {
+                start_ms,
+                end_ms,
+                actor,
+                action,
+                pane_id,
+                domain,
+                denials_only,
+            },
+        )
+}
+
 fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
     prop_oneof![
         Just(DecisionOutcome::Allow),
@@ -2092,6 +2115,18 @@ fn arb_forensic_report() -> impl Strategy<Value = ForensicReport> {
 // ============================================================================
 // Forensic type property tests
 // ============================================================================
+
+#[test]
+fn prop_forensic_query_default_is_unfiltered() {
+    let query = ForensicQuery::default();
+    assert_eq!(query.start_ms, 0);
+    assert_eq!(query.end_ms, 0);
+    assert_eq!(query.actor, None);
+    assert_eq!(query.action, None);
+    assert_eq!(query.pane_id, None);
+    assert_eq!(query.domain, None);
+    assert!(!query.denials_only);
+}
 
 proptest! {
     /// Property 100: ForensicAuditEntry serde roundtrip
@@ -2221,5 +2256,48 @@ proptest! {
         prop_assert_eq!(back.target_namespace, event.target_namespace);
         prop_assert_eq!(back.resource_kind, event.resource_kind);
         prop_assert_eq!(back.resource_id, event.resource_id);
+    }
+
+    /// Property 111: ForensicQuery clone preserves all filters exactly.
+    #[test]
+    fn prop_forensic_query_clone_preserves_fields(query in arb_forensic_query()) {
+        let cloned = query.clone();
+        prop_assert_eq!(cloned.start_ms, query.start_ms);
+        prop_assert_eq!(cloned.end_ms, query.end_ms);
+        prop_assert_eq!(cloned.actor, query.actor);
+        prop_assert_eq!(cloned.action, query.action);
+        prop_assert_eq!(cloned.pane_id, query.pane_id);
+        prop_assert_eq!(cloned.domain, query.domain);
+        prop_assert_eq!(cloned.denials_only, query.denials_only);
+    }
+
+    /// Property 112: ForensicQuery optional filters vary independently.
+    #[test]
+    fn prop_forensic_query_optional_filters_independent(
+        actor in prop::option::of(arb_actor_kind()),
+        action in prop::option::of(arb_action_kind()),
+        pane_id in prop::option::of(any::<u64>()),
+        domain in prop::option::of("[a-z0-9_.-]{1,20}"),
+        denials_only in any::<bool>(),
+    ) {
+        let actor_some = actor.is_some();
+        let action_some = action.is_some();
+        let pane_id_some = pane_id.is_some();
+        let domain_some = domain.is_some();
+        let query = ForensicQuery {
+            start_ms: 0,
+            end_ms: 0,
+            actor,
+            action,
+            pane_id,
+            domain,
+            denials_only,
+        };
+
+        prop_assert_eq!(query.actor.is_some(), actor_some);
+        prop_assert_eq!(query.action.is_some(), action_some);
+        prop_assert_eq!(query.pane_id.is_some(), pane_id_some);
+        prop_assert_eq!(query.domain.is_some(), domain_some);
+        prop_assert_eq!(query.denials_only, denials_only);
     }
 }
