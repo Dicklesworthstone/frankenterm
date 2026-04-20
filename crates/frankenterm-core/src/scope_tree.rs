@@ -1364,4 +1364,89 @@ mod tests {
         assert_eq!(tree.count_by_tier(ScopeTier::Ephemeral), 2);
         assert_eq!(tree.live_count_by_tier(ScopeTier::Ephemeral), 1);
     }
+
+    // ========================================================================
+    // Variant-dispatch Display coverage
+    // ========================================================================
+
+    #[test]
+    fn scope_id_and_tier_display_all_variants() {
+        // ScopeId
+        assert_eq!(ScopeId::root().to_string(), "root");
+        assert_eq!(ScopeId("daemon:capture".into()).to_string(), "daemon:capture");
+
+        // ScopeTier — all 5 variants
+        assert_eq!(ScopeTier::Root.to_string(), "root");
+        assert_eq!(ScopeTier::Daemon.to_string(), "daemon");
+        assert_eq!(ScopeTier::Watcher.to_string(), "watcher");
+        assert_eq!(ScopeTier::Worker.to_string(), "worker");
+        assert_eq!(ScopeTier::Ephemeral.to_string(), "ephemeral");
+    }
+
+    #[test]
+    fn scope_state_display_all_variants() {
+        assert_eq!(ScopeState::Created.to_string(), "created");
+        assert_eq!(ScopeState::Running.to_string(), "running");
+        assert_eq!(ScopeState::Draining.to_string(), "draining");
+        assert_eq!(ScopeState::Finalizing.to_string(), "finalizing");
+        assert_eq!(ScopeState::Closed.to_string(), "closed");
+    }
+
+    #[test]
+    fn scope_tree_error_display_all_variants() {
+        assert_eq!(
+            ScopeTreeError::DuplicateScope {
+                scope_id: ScopeId("a".into()),
+            }
+            .to_string(),
+            "scope already exists: a"
+        );
+        assert_eq!(
+            ScopeTreeError::ParentNotFound {
+                parent_id: ScopeId("p".into()),
+            }
+            .to_string(),
+            "parent scope not found: p"
+        );
+        assert_eq!(
+            ScopeTreeError::ParentNotAccepting {
+                parent_id: ScopeId("p".into()),
+                state: ScopeState::Closed,
+            }
+            .to_string(),
+            "parent p not accepting children (state: closed)"
+        );
+        assert_eq!(
+            ScopeTreeError::ScopeNotFound {
+                scope_id: ScopeId("x".into()),
+            }
+            .to_string(),
+            "scope not found: x"
+        );
+        assert_eq!(
+            ScopeTreeError::InvalidTransition {
+                scope_id: ScopeId("s".into()),
+                from: ScopeState::Created,
+                to: ScopeState::Closed,
+            }
+            .to_string(),
+            "invalid transition for s: created \u{2192} closed"
+        );
+        assert_eq!(
+            ScopeTreeError::HasLiveChildren {
+                scope_id: ScopeId("r".into()),
+                live_count: 3,
+            }
+            .to_string(),
+            "scope r has 3 live children"
+        );
+        assert_eq!(
+            ScopeTreeError::TierCannotHaveChildren {
+                scope_id: ScopeId("w".into()),
+                tier: ScopeTier::Worker,
+            }
+            .to_string(),
+            "tier worker cannot have children (scope: w)"
+        );
+    }
 }
