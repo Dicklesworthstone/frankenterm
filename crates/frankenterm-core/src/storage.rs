@@ -11278,6 +11278,14 @@ impl StorageHandle {
 
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_segments_with_cx(&cx, pane_id, limit).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let mmap_mirror_dir = self
             .mmap_mirror_dir
@@ -11308,6 +11316,7 @@ impl StorageHandle {
             query_segments(&conn, pane_id, limit)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_segments`].
@@ -11320,7 +11329,36 @@ impl StorageHandle {
     ) -> Result<Vec<Segment>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_segments cancelled: {err}")))?;
-        self.get_segments(pane_id, limit).await
+        let db_path = Arc::clone(&self.db_path);
+        let mmap_mirror_dir = self
+            .mmap_mirror_dir
+            .as_ref()
+            .map(|dir| dir.as_ref().clone());
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
+                match query_segments_from_mmap(mmap_dir, pane_id, limit) {
+                    Ok(Some(segments)) => return Ok(segments),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            pane_id,
+                            limit,
+                            path = %mmap_dir.display(),
+                            error = %error,
+                            "mmap segment read failed; falling back to sqlite"
+                        );
+                    }
+                }
+            }
+
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_segments(&conn, pane_id, limit)
+        })
+        .await
     }
 
     /// Scan segments in ascending id order with incremental paging.
