@@ -6506,16 +6506,25 @@ impl StorageHandle {
 
     /// Add or update a persistent event mute by identity key.
     pub async fn add_event_mute(&self, record: EventMuteRecord) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpsertEventMute {
-                record,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.add_event_mute_with_cx(&cx, record).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpsertEventMute {
+                    record,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_mute`].
