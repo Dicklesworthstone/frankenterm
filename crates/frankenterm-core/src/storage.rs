@@ -11668,6 +11668,14 @@ impl StorageHandle {
     /// Returns all workflows with status 'running' or 'waiting', ordered by started_at.
     /// These are workflows that were interrupted and should be resumed.
     pub async fn find_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.find_incomplete_workflows_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -11678,6 +11686,7 @@ impl StorageHandle {
             query_incomplete_workflows(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`find_incomplete_workflows`].
@@ -11689,7 +11698,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("find_incomplete_workflows cancelled: {err}"))
         })?;
-        self.find_incomplete_workflows().await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_incomplete_workflows(&conn)
+        })
+        .await
     }
 
     /// Check if the storage is writable (writer thread is alive and responsive).
