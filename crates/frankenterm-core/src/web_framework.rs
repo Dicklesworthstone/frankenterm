@@ -48,6 +48,14 @@ pub struct FrameworkWebRuntime {
 impl FrameworkWebRuntime {
     #[doc(hidden)]
     pub async fn start(bind_addr: String, app: App) -> Result<(SocketAddr, Self)> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return Self::start_with_cx(&cx, bind_addr, app).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         match app.run_startup_hooks().await {
             StartupOutcome::Success => {}
             StartupOutcome::PartialSuccess { warnings } => {
@@ -81,6 +89,7 @@ impl FrameworkWebRuntime {
         };
 
         Ok((local_addr, Self { app, server, join }))
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`start`].
