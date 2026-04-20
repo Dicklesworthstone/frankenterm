@@ -10501,20 +10501,31 @@ impl StorageHandle {
         reason: Option<&str>,
         ttl_ms: i64,
     ) -> Result<PaneReservation> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::CreateReservation {
-                pane_id,
-                owner_kind: owner_kind.to_string(),
-                owner_id: owner_id.to_string(),
-                reason: reason.map(String::from),
-                ttl_ms,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .create_reservation_with_cx(&cx, pane_id, owner_kind, owner_id, reason, ttl_ms)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::CreateReservation {
+                    pane_id,
+                    owner_kind: owner_kind.to_string(),
+                    owner_id: owner_id.to_string(),
+                    reason: reason.map(String::from),
+                    ttl_ms,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`create_reservation`].
