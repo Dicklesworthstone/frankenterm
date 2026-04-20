@@ -15,6 +15,7 @@
 use proptest::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
+use tempfile::tempdir;
 
 use frankenterm_core::subprocess_bridge::{BridgeError, SubprocessBridge};
 
@@ -50,6 +51,16 @@ fn bridge_error_strategy() -> impl Strategy<Value = BridgeError> {
 
 fn search_path_strategy() -> impl Strategy<Value = Vec<PathBuf>> {
     prop::collection::vec("[a-z/]{1,30}".prop_map(PathBuf::from), 0..5)
+}
+
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, body).unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
 }
 
 // =============================================================================
@@ -359,5 +370,40 @@ proptest! {
             "Display should contain message '{}', got '{}'",
             msg, display
         );
+    }
+
+    // ── Direct path binaries bypass PATH/search-root discovery ───────────
+
+    #[test]
+    fn direct_missing_path_returns_not_found(
+        leaf in "[a-z]{4,16}",
+    ) {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join(format!("{leaf}_missing_bin"));
+        let binary = missing.to_string_lossy().to_string();
+        let b: SubprocessBridge<serde_json::Value> = SubprocessBridge::new(&binary)
+            .with_search_paths(Vec::<PathBuf>::new());
+        prop_assert!(!b.is_available());
+        let err = b.invoke(&[]).unwrap_err();
+        prop_assert!(matches!(err, BridgeError::BinaryNotFound(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_executable_path_invokes_without_search_paths(
+        value in 0_i32..10_000,
+    ) {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("bridge-script");
+        write_executable(
+            &script,
+            &format!("#!/bin/sh\nprintf '{{\"value\":{value}}}'\n"),
+        );
+        let binary = script.to_string_lossy().to_string();
+        let b: SubprocessBridge<serde_json::Value> = SubprocessBridge::new(&binary)
+            .with_search_paths(Vec::<PathBuf>::new());
+        prop_assert!(b.is_available());
+        let out = b.invoke(&[]).unwrap();
+        prop_assert_eq!(out["value"].as_i64(), Some(i64::from(value)));
     }
 }
