@@ -1,4 +1,4 @@
-use frankenterm_input_types::{KeyCode, Modifiers, PhysKeyCode};
+use frankenterm_input_types::{KeyCode, Modifiers, PhysKeyCode, WindowDecorations};
 use proptest::prelude::*;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
@@ -98,6 +98,42 @@ fn arb_modifiers() -> impl Strategy<Value = Modifiers> {
         })
 }
 
+fn arb_window_decorations() -> impl Strategy<Value = WindowDecorations> {
+    (
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(title, resize, integrated, bg_titlebar, force_enable_shadow, shadow_or_corners)| {
+                let mut flags = WindowDecorations::NONE;
+                if title {
+                    flags |= WindowDecorations::TITLE;
+                }
+                if resize {
+                    flags |= WindowDecorations::RESIZE;
+                }
+                if integrated {
+                    flags |= WindowDecorations::INTEGRATED_BUTTONS;
+                }
+                if bg_titlebar {
+                    flags |= WindowDecorations::MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR;
+                }
+                if force_enable_shadow {
+                    flags |= WindowDecorations::MACOS_FORCE_ENABLE_SHADOW;
+                } else if shadow_or_corners {
+                    flags |= WindowDecorations::MACOS_FORCE_DISABLE_SHADOW;
+                } else {
+                    flags |= WindowDecorations::MACOS_FORCE_SQUARE_CORNERS;
+                }
+                flags
+            },
+        )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -112,6 +148,20 @@ proptest! {
     fn modifiers_json_roundtrip(value in arb_modifiers()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: Modifiers = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn phys_key_code_json_roundtrip(value in arb_phys_key_code()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: PhysKeyCode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn window_decorations_json_roundtrip(value in arb_window_decorations()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: WindowDecorations = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
