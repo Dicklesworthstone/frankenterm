@@ -3903,7 +3903,7 @@ impl TabInner {
 
 /// This type is used directly by the codec, take care to bump
 /// the codec version if you change this
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub enum PaneNode {
     Empty,
     Split {

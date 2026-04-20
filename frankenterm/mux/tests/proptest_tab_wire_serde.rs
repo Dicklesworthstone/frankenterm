@@ -48,68 +48,73 @@ fn arb_terminal_size() -> impl Strategy<Value = frankenterm_term::TerminalSize> 
 }
 
 fn arb_pane_entry() -> impl Strategy<Value = PaneEntry> {
-    (
-        0usize..=4096,
-        0usize..=4096,
-        0usize..=4096,
-        arb_small_string(),
-        arb_terminal_size(),
-        prop_oneof![Just(None), arb_serde_url().prop_map(Some),],
-        any::<bool>(),
-        any::<bool>(),
-        any::<bool>(),
-        arb_small_string(),
-        0usize..=4096,
-        -10_000isize..=10_000isize,
-        0usize..=4096,
-        0usize..=4096,
-        prop_oneof![Just(None), arb_small_string().prop_map(Some),],
-    )
-        .prop_map(
-            |(
-                window_id,
-                tab_id,
-                pane_id,
-                title,
-                size,
-                working_dir,
-                alt_screen_active,
-                is_active_pane,
-                is_zoomed_pane,
-                workspace,
-                cursor_x,
-                physical_top,
-                top_row,
-                left_col,
-                tty_name,
-            )| PaneEntry {
-                window_id,
-                tab_id,
-                pane_id,
-                title,
-                size,
-                working_dir,
-                alt_screen_active,
-                is_active_pane,
-                is_zoomed_pane,
-                workspace,
-                cursor_pos: StableCursorPosition {
-                    x: cursor_x,
-                    ..StableCursorPosition::default()
-                },
-                physical_top,
-                top_row,
-                left_col,
-                tty_name,
+    // Split into two sub-tuples to stay within proptest's 12-arity limit.
+    let ids_and_content = (
+        0usize..=4096,                                           // window_id
+        0usize..=4096,                                           // tab_id
+        0usize..=4096,                                           // pane_id
+        arb_small_string(),                                      // title
+        arb_terminal_size(),                                     // size
+        prop_oneof![Just(None), arb_serde_url().prop_map(Some)], // working_dir
+        any::<bool>(),                                           // alt_screen_active
+        any::<bool>(),                                           // is_active_pane
+        any::<bool>(),                                           // is_zoomed_pane
+    );
+    let position_and_meta = (
+        arb_small_string(),                                          // workspace
+        0usize..=4096,                                               // cursor_x
+        -10_000isize..=10_000isize,                                  // physical_top
+        0usize..=4096,                                               // top_row
+        0usize..=4096,                                               // left_col
+        prop_oneof![Just(None), arb_small_string().prop_map(Some)],  // tty_name
+    );
+    (ids_and_content, position_and_meta).prop_map(
+        |(
+            (window_id, tab_id, pane_id, title, size, working_dir,
+             alt_screen_active, is_active_pane, is_zoomed_pane),
+            (workspace, cursor_x, physical_top, top_row, left_col, tty_name),
+        )| PaneEntry {
+            window_id,
+            tab_id,
+            pane_id,
+            title,
+            size,
+            working_dir,
+            alt_screen_active,
+            is_active_pane,
+            is_zoomed_pane,
+            workspace,
+            cursor_pos: StableCursorPosition {
+                x: cursor_x,
+                ..StableCursorPosition::default()
             },
-        )
+            physical_top,
+            top_row,
+            left_col,
+            tty_name,
+        },
+    )
 }
 
 fn arb_pane_node() -> impl Strategy<Value = PaneNode> {
-    prop_oneof![
+    let leaf = prop_oneof![
         Just(PaneNode::Empty),
         arb_pane_entry().prop_map(PaneNode::Leaf),
-    ]
+    ];
+    leaf.prop_recursive(
+        3,  // max depth
+        16, // max nodes
+        2,  // items per recursive step
+        |inner| {
+            (inner.clone(), inner, arb_split_direction_and_size()).prop_map(
+                |(left, right, node)| PaneNode::Split {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    node,
+                },
+            )
+        },
+    )
 }
 
 fn arb_split_direction() -> impl Strategy<Value = SplitDirection> {
