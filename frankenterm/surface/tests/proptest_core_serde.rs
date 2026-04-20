@@ -1,6 +1,8 @@
 #![cfg(feature = "use_serde")]
 
-use frankenterm_surface::{CursorShape, CursorVisibility, DirtyRect, Position};
+use frankenterm_surface::{
+    Change, CursorShape, CursorVisibility, DirtyRect, LineAttribute, Position,
+};
 use proptest::prelude::*;
 
 fn arb_position() -> impl Strategy<Value = Position> {
@@ -41,6 +43,26 @@ fn arb_cursor_shape() -> impl Strategy<Value = CursorShape> {
     ]
 }
 
+fn arb_line_attribute() -> impl Strategy<Value = LineAttribute> {
+    prop_oneof![
+        Just(LineAttribute::DoubleHeightTopHalfLine),
+        Just(LineAttribute::DoubleHeightBottomHalfLine),
+        Just(LineAttribute::DoubleWidthLine),
+        Just(LineAttribute::SingleWidthLine),
+    ]
+}
+
+fn arb_change() -> impl Strategy<Value = Change> {
+    prop_oneof![
+        proptest::collection::vec(any::<char>(), 0..32)
+            .prop_map(|chars| Change::Text(chars.into_iter().collect())),
+        (arb_position(), arb_position()).prop_map(|(x, y)| Change::CursorPosition { x, y }),
+        arb_cursor_shape().prop_map(Change::CursorShape),
+        arb_cursor_visibility().prop_map(Change::CursorVisibility),
+        arb_line_attribute().prop_map(Change::LineAttribute),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -69,6 +91,20 @@ proptest! {
     fn cursor_shape_json_roundtrip(value in arb_cursor_shape()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: CursorShape = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn line_attribute_json_roundtrip(value in arb_line_attribute()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: LineAttribute = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn change_json_roundtrip(value in arb_change()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: Change = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
