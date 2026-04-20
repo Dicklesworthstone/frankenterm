@@ -247,7 +247,7 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        self.search_with_cx(Cx::for_request(), request, on_phase)
+        self.search_with_cx(Cx::current().unwrap_or_else(Cx::for_request), request, on_phase)
             .await
     }
 
