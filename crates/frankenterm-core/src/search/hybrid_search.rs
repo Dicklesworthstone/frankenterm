@@ -61,13 +61,6 @@ pub struct FusedResult {
     pub semantic_rank: Option<usize>,
 }
 
-fn rrf_component_score(rank: usize, k: u32, weight: f32) -> f32 {
-    if weight <= 0.0 {
-        return 0.0;
-    }
-    weight / (k as f32 + rank as f32 + 1.0)
-}
-
 fn dedupe_ranked_hits(items: &[(u64, f32)]) -> Vec<(u64, f32)> {
     let mut seen = HashSet::with_capacity(items.len());
     let mut deduped = Vec::with_capacity(items.len());
@@ -108,18 +101,43 @@ pub fn rrf_fuse_weighted(
 ) -> Vec<FusedResult> {
     let lexical = dedupe_ranked_hits(lexical);
     let semantic = dedupe_ranked_hits(semantic);
-    let mut scores: HashMap<u64, (f32, Option<usize>, Option<usize>)> = HashMap::new();
 
-    for (rank, &(id, _score)) in lexical.iter().enumerate() {
-        let entry = scores.entry(id).or_insert((0.0, None, None));
-        entry.0 += rrf_component_score(rank, k, lexical_weight);
-        entry.1 = Some(rank);
+    // Pre-size the score table so HashMap insertion does not trigger any
+    // rehashing during the two ranking passes. The upper bound on distinct
+    // keys is |lexical| + |semantic|; the usual case (partial overlap)
+    // still fits without reallocation, and the pathological no-overlap
+    // case lands in exactly the right bucket count on the first insert.
+    let mut scores: HashMap<u64, (f32, Option<usize>, Option<usize>)> =
+        HashMap::with_capacity(lexical.len() + semantic.len());
+
+    // Hoist the one-time cast and precompute the per-lane numerator so the
+    // inner loops reduce to a single division plus an add.
+    let k_f = k as f32;
+
+    if lexical_weight > 0.0 {
+        for (rank, &(id, _score)) in lexical.iter().enumerate() {
+            let entry = scores.entry(id).or_insert((0.0, None, None));
+            entry.0 += lexical_weight / (k_f + rank as f32 + 1.0);
+            entry.1 = Some(rank);
+        }
+    } else {
+        // Still record the lexical rank for downstream inspection even when
+        // the weight is zero — callers rely on lexical_rank being populated.
+        for (rank, &(id, _score)) in lexical.iter().enumerate() {
+            scores.entry(id).or_insert((0.0, None, None)).1 = Some(rank);
+        }
     }
 
-    for (rank, &(id, _score)) in semantic.iter().enumerate() {
-        let entry = scores.entry(id).or_insert((0.0, None, None));
-        entry.0 += rrf_component_score(rank, k, semantic_weight);
-        entry.2 = Some(rank);
+    if semantic_weight > 0.0 {
+        for (rank, &(id, _score)) in semantic.iter().enumerate() {
+            let entry = scores.entry(id).or_insert((0.0, None, None));
+            entry.0 += semantic_weight / (k_f + rank as f32 + 1.0);
+            entry.2 = Some(rank);
+        }
+    } else {
+        for (rank, &(id, _score)) in semantic.iter().enumerate() {
+            scores.entry(id).or_insert((0.0, None, None)).2 = Some(rank);
+        }
     }
 
     let mut results: Vec<FusedResult> = scores
