@@ -1,0 +1,42 @@
+{
+  "escapes_included": false,
+  "pane_text": {
+    "1": {
+      "status": "ok",
+      "text": "$ echo hello\nhello\n$ ",
+      "truncated": false,
+      "truncation_info": null
+    },
+    "2": {
+      "code": "pane_unreachable",
+      "hint": "check network connectivity to remote host",
+      "message": "ssh domain unreachable",
+      "status": "error"
+    }
+  },
+  "panes": [
+    {
+      "cwd": "file:///home/agent",
+      "domain": "local",
+      "ignore_reason": null,
+      "observed": true,
+      "pane_id": 1,
+      "pane_uuid": null,
+      "tab_id": 10,
+      "title": "claude",
+      "window_id": 100
+    },
+    {
+      "cwd": "file://remote/srv/repo",
+      "domain": "ssh:remote",
+      "ignore_reason": null,
+      "observed": true,
+      "pane_id": 2,
+      "pane_uuid": null,
+      "tab_id": 10,
+      "title": "editor",
+      "window_id": 100
+    }
+  ],
+  "tail_lines": 20
+}
