@@ -10318,18 +10318,29 @@ impl StorageHandle {
         account_id: &str,
         last_used_at: i64,
     ) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpdateAccountLastUsed {
-                service: service.to_string(),
-                account_id: account_id.to_string(),
-                last_used_at,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .update_account_last_used_with_cx(&cx, service, account_id, last_used_at)
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpdateAccountLastUsed {
+                    service: service.to_string(),
+                    account_id: account_id.to_string(),
+                    last_used_at,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_account_last_used`].
