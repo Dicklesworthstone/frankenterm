@@ -130,3 +130,19 @@ proptest! {
         prop_assert_eq!(back.highlight, value.highlight);
     }
 }
+
+#[test]
+fn cursor_shape_is_blinking_matches_variant_class() {
+    assert!(!CursorShape::Default.is_blinking());
+    assert!(CursorShape::BlinkingBlock.is_blinking());
+    assert!(!CursorShape::SteadyBlock.is_blinking());
+    assert!(CursorShape::BlinkingUnderline.is_blinking());
+    assert!(!CursorShape::SteadyUnderline.is_blinking());
+    assert!(CursorShape::BlinkingBar.is_blinking());
+    assert!(!CursorShape::SteadyBar.is_blinking());
+}
+
+#[test]
+fn cursor_visibility_default_is_visible() {
+    assert_eq!(CursorVisibility::default(), CursorVisibility::Visible);
+}
