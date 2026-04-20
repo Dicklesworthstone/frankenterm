@@ -6858,16 +6858,25 @@ impl StorageHandle {
 
     /// Fetch undo metadata for a specific audit action ID.
     pub async fn get_action_undo(&self, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
-        let db_path = Arc::clone(&self.db_path);
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_action_undo_with_cx(&cx, audit_action_id).await;
+        }
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
 
-            query_action_undo_sync(&conn, audit_action_id)
-        })
-        .await
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+
+                query_action_undo_sync(&conn, audit_action_id)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_undo`].
@@ -6879,7 +6888,16 @@ impl StorageHandle {
     ) -> Result<Option<ActionUndoRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_action_undo cancelled: {err}")))?;
-        self.get_action_undo(audit_action_id).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_action_undo_sync(&conn, audit_action_id)
+        })
+        .await
     }
 
     /// Mark an undo record as executed.
