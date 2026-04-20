@@ -224,6 +224,32 @@ proptest! {
         prop_assert!(value.get("type").is_some(),
             "response JSON should contain a 'type' field");
     }
+
+    /// Request type tag exactly matches the enum variant.
+    #[test]
+    fn prop_request_type_tag_matches_variant(req in arb_daemon_request()) {
+        let json = serde_json::to_string(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected = match req {
+            DaemonRequest::Embed(_) => "embed",
+            DaemonRequest::Shutdown => "shutdown",
+            DaemonRequest::Ping => "ping",
+        };
+        prop_assert_eq!(&value["type"], expected);
+    }
+
+    /// Response type tag exactly matches the enum variant.
+    #[test]
+    fn prop_response_type_tag_matches_variant(resp in arb_daemon_response()) {
+        let json = serde_json::to_string(&resp).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected = match resp {
+            DaemonResponse::Embed(_) => "embed",
+            DaemonResponse::Pong => "pong",
+            DaemonResponse::Error(_) => "error",
+        };
+        prop_assert_eq!(&value["type"], expected);
+    }
 }
 
 // =========================================================================
@@ -302,4 +328,16 @@ fn embed_request_none_model_omits_field_or_null() {
     let json = serde_json::to_string(&req).unwrap();
     let back: EmbedRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(back.model, None);
+}
+
+#[test]
+fn request_wire_rejects_unknown_type() {
+    let bad = br#"{"type":"definitely-unknown"}"#;
+    assert!(DaemonRequest::from_json_bytes(bad).is_err());
+}
+
+#[test]
+fn response_wire_rejects_malformed_json() {
+    let bad = br#"{"type":"pong""#;
+    assert!(DaemonResponse::from_json_bytes(bad).is_err());
 }
