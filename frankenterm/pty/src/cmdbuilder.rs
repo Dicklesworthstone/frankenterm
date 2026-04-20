@@ -227,7 +227,7 @@ mod env_map_serde {
     //! that carries the raw bytes / code units), so every pair roundtrips
     //! losslessly regardless of UTF-8 validity.
     use super::{BTreeMap, EnvEntry, OsString};
-    use serde::de::{Deserialize, Deserializer};
+    use serde::de::{Deserialize, Deserializer, Error as DeError};
     use serde::ser::{SerializeSeq, Serializer};
 
     pub fn serialize<S>(
@@ -244,14 +244,31 @@ mod env_map_serde {
         seq.end()
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<BTreeMap<OsString, EnvEntry>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<OsString, EnvEntry>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let pairs: Vec<(OsString, EnvEntry)> = Deserialize::deserialize(deserializer)?;
-        Ok(pairs.into_iter().collect())
+        let mut envs = BTreeMap::new();
+
+        for (key, entry) in pairs {
+            let expected_key = EnvEntry::map_key(entry.preferred_key.clone());
+            if key != expected_key {
+                return Err(D::Error::custom(format!(
+                    "serialized env entry key {:?} does not match preferred_key {:?}",
+                    key, entry.preferred_key
+                )));
+            }
+
+            if envs.insert(key.clone(), entry).is_some() {
+                return Err(D::Error::custom(format!(
+                    "duplicate serialized env entry for key {:?}",
+                    key
+                )));
+            }
+        }
+
+        Ok(envs)
     }
 }
 
@@ -818,6 +835,8 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "serde_support")]
+    use serde_json::json;
 
     #[cfg(unix)]
     #[test]
@@ -1318,5 +1337,59 @@ mod tests {
     fn controlling_tty_is_true_by_default() {
         let cmd = CommandBuilder::new("test");
         assert!(cmd.get_controlling_tty());
+    }
+
+    #[cfg(feature = "serde_support")]
+    #[test]
+    fn serde_rejects_duplicate_env_pairs() {
+        let mut payload = serde_json::to_value(CommandBuilder::new("prog")).unwrap();
+        let key = EnvEntry::map_key(OsString::from("PATH"));
+        let first = EnvEntry {
+            is_from_base_env: false,
+            preferred_key: OsString::from("PATH"),
+            value: OsString::from("/tmp/first"),
+        };
+        let second = EnvEntry {
+            is_from_base_env: false,
+            preferred_key: OsString::from("PATH"),
+            value: OsString::from("/tmp/second"),
+        };
+        payload.as_object_mut().unwrap().insert(
+            "envs".to_string(),
+            json!([
+                [
+                    serde_json::to_value(key.clone()).unwrap(),
+                    serde_json::to_value(first).unwrap()
+                ],
+                [
+                    serde_json::to_value(key).unwrap(),
+                    serde_json::to_value(second).unwrap()
+                ]
+            ]),
+        );
+
+        let err = serde_json::from_value::<CommandBuilder>(payload).unwrap_err();
+        assert!(err.to_string().contains("duplicate serialized env entry"));
+    }
+
+    #[cfg(feature = "serde_support")]
+    #[test]
+    fn serde_rejects_inconsistent_env_pair_key() {
+        let mut payload = serde_json::to_value(CommandBuilder::new("prog")).unwrap();
+        let entry = EnvEntry {
+            is_from_base_env: false,
+            preferred_key: OsString::from("PATH"),
+            value: OsString::from("/tmp/bin"),
+        };
+        payload.as_object_mut().unwrap().insert(
+            "envs".to_string(),
+            json!([[
+                serde_json::to_value(EnvEntry::map_key(OsString::from("HOME"))).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            ]]),
+        );
+
+        let err = serde_json::from_value::<CommandBuilder>(payload).unwrap_err();
+        assert!(err.to_string().contains("does not match preferred_key"));
     }
 }
