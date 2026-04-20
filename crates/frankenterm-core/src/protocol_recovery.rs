@@ -497,7 +497,7 @@ impl RecoveryEngine {
 
     pub async fn execute<T, E, F, Fut, C>(
         &mut self,
-        mut operation: F,
+        operation: F,
         classify: C,
     ) -> RecoveryOutcome<T>
     where
@@ -512,6 +512,9 @@ impl RecoveryEngine {
             return self.execute_with_cx(&cx, operation, classify).await;
         }
 
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+        let mut operation = operation;
         self.counters
             .total_operations
             .fetch_add(1, Ordering::Relaxed);

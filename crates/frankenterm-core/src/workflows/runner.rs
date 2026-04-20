@@ -3381,6 +3381,27 @@ pub struct AbortResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::CompatRuntime;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .expect("failed to build runtime for async test");
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        #[cfg(feature = "asupersync-runtime")]
+        crate::runtime_compat::clear_runtime_handle();
+        if let Err(payload) = test_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     // ========================================================================
     // WorkflowStartResult predicates
@@ -3925,7 +3946,7 @@ mod tests {
         ///    sleep that ignores cancellation entirely.
         #[test]
         fn wait_condition_pause_observes_pre_cancelled_cx() {
-            crate::runtime_compat::run_async_test(async {
+            run_async_test(async {
                 let cx = crate::cx::for_testing();
                 cx.cancel_with(
                     crate::outcome::CancelKind::User,

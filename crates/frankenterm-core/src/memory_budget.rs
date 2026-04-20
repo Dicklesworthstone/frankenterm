@@ -402,28 +402,32 @@ impl MemoryBudgetManager {
             return self.run_with_cx(&cx, shutdown).await;
         }
 
-        let interval = std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
-        let mut first_tick = true;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let interval =
+                std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
+            let mut first_tick = true;
 
-        loop {
-            if !first_tick {
-                sleep(interval).await;
-            }
-            first_tick = false;
+            loop {
+                if !first_tick {
+                    sleep(interval).await;
+                }
+                first_tick = false;
 
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
 
-            let summary = self.sample_all();
-            if summary.throttled_count > 0 || summary.over_budget_count > 0 {
-                tracing::warn!(
-                    throttled = summary.throttled_count,
-                    over_budget = summary.over_budget_count,
-                    worst_pane = ?summary.worst_pane_id,
-                    worst_ratio = format!("{:.2}", summary.worst_usage_ratio),
-                    "Memory budget pressure detected"
-                );
+                let summary = self.sample_all();
+                if summary.throttled_count > 0 || summary.over_budget_count > 0 {
+                    tracing::warn!(
+                        throttled = summary.throttled_count,
+                        over_budget = summary.over_budget_count,
+                        worst_pane = ?summary.worst_pane_id,
+                        worst_ratio = format!("{:.2}", summary.worst_usage_ratio),
+                        "Memory budget pressure detected"
+                    );
+                }
             }
         }
     }

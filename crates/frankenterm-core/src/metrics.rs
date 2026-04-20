@@ -633,6 +633,7 @@ impl MetricsServer {
     }
 }
 
+#[cfg(not(feature = "asupersync-runtime"))]
 async fn handle_connection(
     mut socket: TcpStream,
     prefix: &str,

@@ -714,6 +714,7 @@ impl EventSubscriber {
             return self.recv_cx(&cx).await;
         }
 
+        #[cfg(not(feature = "asupersync-runtime"))]
         match crate::runtime_compat::broadcast_recv(&mut self.receiver).await {
             Ok(event) => Ok(event),
             Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
