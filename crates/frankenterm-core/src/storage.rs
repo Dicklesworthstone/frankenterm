@@ -7334,6 +7334,14 @@ impl StorageHandle {
 
     /// Fetch a saved search by name.
     pub async fn get_saved_search_by_name(&self, name: &str) -> Result<Option<SavedSearchRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_saved_search_by_name_with_cx(&cx, name).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
         Self::spawn_blocking_storage(move || {
@@ -7343,6 +7351,7 @@ impl StorageHandle {
             query_saved_search_by_name(&conn, &name)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_saved_search_by_name`].
@@ -7355,7 +7364,15 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_saved_search_by_name cancelled: {err}"))
         })?;
-        self.get_saved_search_by_name(name).await
+        let db_path = Arc::clone(&self.db_path);
+        let name = name.to_string();
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_saved_search_by_name(&conn, &name)
+        })
+        .await
     }
 
     /// List saved searches in deterministic order.
