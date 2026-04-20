@@ -457,6 +457,14 @@ harness = false
 name = "cass_search_ops"
 harness = false
 
+[[bench]]
+name = "config_hot_path"
+harness = false
+
+[[bench]]
+name = "retry_backoff"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
