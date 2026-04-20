@@ -8470,20 +8470,38 @@ impl StorageHandle {
         handled: Option<bool>,
         batch_size: usize,
     ) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::DeleteEventsByTier {
-                before_ts,
-                severities: severities.to_vec(),
-                event_types: event_types.to_vec(),
-                handled,
-                batch_size,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .delete_events_by_tier_with_cx(
+                    &cx,
+                    before_ts,
+                    severities,
+                    event_types,
+                    handled,
+                    batch_size,
+                )
+                .await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::DeleteEventsByTier {
+                    before_ts,
+                    severities: severities.to_vec(),
+                    event_types: event_types.to_vec(),
+                    handled,
+                    batch_size,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_by_tier`].
@@ -8500,8 +8518,23 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("delete_events_by_tier cancelled: {err}"))
         })?;
-        self.delete_events_by_tier(before_ts, severities, event_types, handled, batch_size)
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteEventsByTier {
+                    before_ts,
+                    severities: severities.to_vec(),
+                    event_types: event_types.to_vec(),
+                    handled,
+                    batch_size,
+                    respond: tx,
+                },
+            )
             .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Query notification history with filters.
