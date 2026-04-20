@@ -9,12 +9,13 @@ use codec::{
     MovePaneToNewTabResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane,
     RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
     SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace,
-    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
-    SetWindowWorkspace, SpawnResponse, SplitPane, SwapToLayout, TabAddedToWindow, TabResized,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WindowWorkspaceChanged, WriteToPane,
+    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
+    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
+    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
+use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{ClipboardSelection, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -299,6 +300,33 @@ fn arb_spawn_response() -> impl Strategy<Value = SpawnResponse> {
             size,
         },
     )
+}
+
+fn arb_spawn_v2() -> impl Strategy<Value = SpawnV2> {
+    (
+        arb_spawn_tab_domain(),
+        prop::option::of(0u64..=4096),
+        prop::option::of(arb_small_string()),
+        arb_terminal_size(),
+        arb_small_string(),
+    )
+        .prop_map(
+            |(domain, window_id, command_dir, size, workspace)| SpawnV2 {
+                domain,
+                window_id,
+                command: None,
+                command_dir,
+                size,
+                workspace,
+            },
+        )
+}
+
+fn arb_set_palette() -> impl Strategy<Value = SetPalette> {
+    (0u64..=4096).prop_map(|pane_id| SetPalette {
+        pane_id,
+        palette: ColorPalette::default(),
+    })
 }
 
 fn arb_spawn_tab_domain() -> impl Strategy<Value = SpawnTabDomain> {
@@ -949,6 +977,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SpawnResponse(payload));
+    }
+
+    #[test]
+    fn spawn_v2_json_and_pdu_roundtrip(
+        payload in arb_spawn_v2(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SpawnV2 = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SpawnV2(payload));
+    }
+
+    #[test]
+    fn set_palette_json_and_pdu_roundtrip(
+        payload in arb_set_palette(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SetPalette = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SetPalette(payload));
     }
 
     #[test]
