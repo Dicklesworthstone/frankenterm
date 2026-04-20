@@ -1034,11 +1034,8 @@ where
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            let _ = crate::runtime_compat::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(50),
-            )
-            .await;
+            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(50))
+                .await;
             if cx.is_cancel_requested() {
                 return Err::<
                     asupersync::http::h1::types::Response,

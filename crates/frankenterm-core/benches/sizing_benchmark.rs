@@ -229,13 +229,15 @@ fn bench_insert_throughput(c: &mut Criterion) {
             BenchmarkId::new("throughput", format!("{num_panes}p_{segs_per_pane}s")),
             &(num_panes, segs_per_pane),
             |b, &(panes, segs)| {
-                b.iter(|| rt.block_on(async {
-                    let (_dir, db_path) = temp_db();
-                    let storage = StorageHandle::new(&db_path).await.expect("create storage");
-                    let elapsed = populate_multi_pane(&storage, panes, segs).await;
-                    storage.shutdown().await.expect("shutdown");
-                    elapsed
-                }));
+                b.iter(|| {
+                    rt.block_on(async {
+                        let (_dir, db_path) = temp_db();
+                        let storage = StorageHandle::new(&db_path).await.expect("create storage");
+                        let elapsed = populate_multi_pane(&storage, panes, segs).await;
+                        storage.shutdown().await.expect("shutdown");
+                        elapsed
+                    })
+                });
             },
         );
     }
@@ -264,21 +266,23 @@ fn bench_db_growth(c: &mut Criterion) {
             BenchmarkId::new("size_per_segment", label),
             &(num_panes, segs_per_pane),
             |b, &(panes, segs)| {
-                b.iter(|| rt.block_on(async {
-                    let (_dir, db_path) = temp_db();
-                    let storage = StorageHandle::new(&db_path).await.expect("create storage");
-                    populate_multi_pane(&storage, panes, segs).await;
+                b.iter(|| {
+                    rt.block_on(async {
+                        let (_dir, db_path) = temp_db();
+                        let storage = StorageHandle::new(&db_path).await.expect("create storage");
+                        populate_multi_pane(&storage, panes, segs).await;
 
-                    // Vacuum to consolidate WAL and get accurate size
-                    storage.vacuum().await.ok();
+                        // Vacuum to consolidate WAL and get accurate size
+                        storage.vacuum().await.ok();
 
-                    let db_size = get_db_size(&db_path);
-                    #[allow(clippy::cast_precision_loss)]
-                    let bytes_per_segment = db_size as f64 / total_segments as f64;
+                        let db_size = get_db_size(&db_path);
+                        #[allow(clippy::cast_precision_loss)]
+                        let bytes_per_segment = db_size as f64 / total_segments as f64;
 
-                    storage.shutdown().await.expect("shutdown");
-                    bytes_per_segment
-                }));
+                        storage.shutdown().await.expect("shutdown");
+                        bytes_per_segment
+                    })
+                });
             },
         );
     }
@@ -319,27 +323,35 @@ fn bench_query_at_scale(c: &mut Criterion) {
 
         // Query benchmarks
         group.bench_function(BenchmarkId::new("simple_term", label), |b| {
-            b.iter(|| rt.block_on(async { storage.search_with_options("cargo", opts.clone()).await }));
+            b.iter(|| {
+                rt.block_on(async { storage.search_with_options("cargo", opts.clone()).await })
+            });
         });
 
         group.bench_function(BenchmarkId::new("phrase", label), |b| {
-            b.iter(|| rt.block_on(async {
-                storage
-                    .search_with_options("\"Running 5/5\"", opts.clone())
-                    .await
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    storage
+                        .search_with_options("\"Running 5/5\"", opts.clone())
+                        .await
+                })
+            });
         });
 
         group.bench_function(BenchmarkId::new("boolean", label), |b| {
-            b.iter(|| rt.block_on(async {
-                storage
-                    .search_with_options("error AND types", opts.clone())
-                    .await
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    storage
+                        .search_with_options("error AND types", opts.clone())
+                        .await
+                })
+            });
         });
 
         group.bench_function(BenchmarkId::new("wildcard", label), |b| {
-            b.iter(|| rt.block_on(async { storage.search_with_options("compil*", opts.clone()).await }));
+            b.iter(|| {
+                rt.block_on(async { storage.search_with_options("compil*", opts.clone()).await })
+            });
         });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
@@ -358,22 +370,24 @@ fn bench_retention_simulation(c: &mut Criterion) {
     // This tests the DELETE performance for old segments
 
     group.bench_function("delete_old_segments", |b| {
-        b.iter(|| rt.block_on(async {
-            let (_dir, db_path) = temp_db();
-            let storage = StorageHandle::new(&db_path).await.expect("create storage");
+        b.iter(|| {
+            rt.block_on(async {
+                let (_dir, db_path) = temp_db();
+                let storage = StorageHandle::new(&db_path).await.expect("create storage");
 
-            // Populate with segments
-            populate_multi_pane(&storage, 20, 500).await;
+                // Populate with segments
+                populate_multi_pane(&storage, 20, 500).await;
 
-            // Simulate retention: delete segments older than threshold
-            // (In practice, would delete by timestamp)
-            let start = Instant::now();
-            storage.vacuum().await.ok();
-            let elapsed = start.elapsed();
+                // Simulate retention: delete segments older than threshold
+                // (In practice, would delete by timestamp)
+                let start = Instant::now();
+                storage.vacuum().await.ok();
+                let elapsed = start.elapsed();
 
-            storage.shutdown().await.expect("shutdown");
-            elapsed
-        }));
+                storage.shutdown().await.expect("shutdown");
+                elapsed
+            })
+        });
     });
 
     group.finish();

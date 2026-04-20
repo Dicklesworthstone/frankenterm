@@ -49,7 +49,9 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 
 fn make_search_hit(i: usize) -> CassSearchHit {
     CassSearchHit {
-        source_path: Some(format!("/home/user/.local/share/cass/sessions/session-{i:04}.jsonl")),
+        source_path: Some(format!(
+            "/home/user/.local/share/cass/sessions/session-{i:04}.jsonl"
+        )),
         line_number: Some(i * 10 + 5),
         agent: Some(if i % 3 == 0 { "codex" } else { "claude_code" }.to_string()),
         workspace: Some(format!("/workspace/project-{}", i % 8)),
@@ -133,17 +135,13 @@ fn bench_search_result_deser(c: &mut Criterion) {
     for &hit_count in &[10usize, 50, 200] {
         let json = make_search_result_json(hit_count);
         group.throughput(Throughput::Bytes(json.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::new("hits", hit_count),
-            &json,
-            |b, json| {
-                b.iter(|| {
-                    let result: CassSearchResult =
-                        serde_json::from_str(black_box(json)).expect("deser");
-                    black_box(result.hits.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hits", hit_count), &json, |b, json| {
+            b.iter(|| {
+                let result: CassSearchResult =
+                    serde_json::from_str(black_box(json)).expect("deser");
+                black_box(result.hits.len());
+            });
+        });
     }
 
     group.finish();
@@ -170,17 +168,13 @@ fn bench_timestamp_parse(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size));
 
     for (label, input) in &cases {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(label),
-            input,
-            |b, input| {
-                b.iter(|| {
-                    for _ in 0..batch_size {
-                        black_box(parse_cass_timestamp_ms(black_box(input)));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(label), input, |b, input| {
+            b.iter(|| {
+                for _ in 0..batch_size {
+                    black_box(parse_cass_timestamp_ms(black_box(input)));
+                }
+            });
+        });
     }
 
     group.finish();
@@ -197,19 +191,15 @@ fn bench_hint_format(c: &mut Criterion) {
     for &hit_count in &[10usize, 50, 200] {
         let hits: Vec<CassSearchHit> = (0..hit_count).map(make_search_hit).collect();
         group.throughput(Throughput::Elements(hit_count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("hits", hit_count),
-            &hits,
-            |b, hit_list| {
-                b.iter(|| {
-                    let hint_count = hit_list
-                        .iter()
-                        .filter_map(|h| format_hit_as_hint(black_box(h)))
-                        .count();
-                    black_box(hint_count);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hits", hit_count), &hits, |b, hit_list| {
+            b.iter(|| {
+                let hint_count = hit_list
+                    .iter()
+                    .filter_map(|h| format_hit_as_hint(black_box(h)))
+                    .count();
+                black_box(hint_count);
+            });
+        });
     }
 
     group.finish();
@@ -232,11 +222,8 @@ fn bench_session_summary(c: &mut Criterion) {
             |b, session| {
                 b.iter(|| {
                     // Compute summary: total tokens, message count, time span
-                    let total_tokens: u64 = session
-                        .messages
-                        .iter()
-                        .filter_map(|m| m.token_count)
-                        .sum();
+                    let total_tokens: u64 =
+                        session.messages.iter().filter_map(|m| m.token_count).sum();
                     let first_ts = session
                         .messages
                         .first()

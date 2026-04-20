@@ -1,5 +1,5 @@
 use num::{Integer, ToPrimitive};
-use std::cmp::{Ordering, max, min};
+use std::cmp::{max, min, Ordering};
 use std::fmt::Debug;
 use std::ops::Range;
 
@@ -32,7 +32,11 @@ pub fn range_intersection<T: Integer + Copy + Debug>(
     let start = max(r1.start, r2.start);
     let end = min(r1.end, r2.end);
 
-    if end > start { Some(start..end) } else { None }
+    if end > start {
+        Some(start..end)
+    } else {
+        None
+    }
 }
 
 /// Computes the r1 - r2, which may result in up to two non-overlapping ranges.

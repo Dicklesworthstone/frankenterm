@@ -100,8 +100,9 @@ fn bench_eviction_at_capacity(c: &mut Criterion) {
 
     group.bench_function("eviction_at_capacity", |b| {
         // Pre-generate keys beyond capacity
-        let overflow_keys: Vec<String> =
-            (capacity..capacity + extra as usize).map(|i| format!("overflow-{i}")).collect();
+        let overflow_keys: Vec<String> = (capacity..capacity + extra as usize)
+            .map(|i| format!("overflow-{i}"))
+            .collect();
 
         b.iter_batched(
             || {

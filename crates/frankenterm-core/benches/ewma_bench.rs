@@ -146,19 +146,15 @@ fn bench_ewma_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
         let data = noisy_metric(count as usize);
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(count),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut ewma = Ewma::with_half_life_ms(1000.0);
-                    for &(val, ts) in data {
-                        ewma.observe(black_box(val), black_box(ts));
-                    }
-                    black_box(ewma.value())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(count), &data, |b, data| {
+            b.iter(|| {
+                let mut ewma = Ewma::with_half_life_ms(1000.0);
+                for &(val, ts) in data {
+                    ewma.observe(black_box(val), black_box(ts));
+                }
+                black_box(ewma.value())
+            });
+        });
     }
 
     group.finish();
@@ -346,9 +342,7 @@ fn bench_stats(c: &mut Criterion) {
         let stats = ewma.stats();
         b.iter(|| {
             let json = serde_json::to_string(black_box(&stats)).unwrap();
-            black_box(
-                serde_json::from_str::<frankenterm_core::ewma::EwmaStats>(&json).unwrap(),
-            )
+            black_box(serde_json::from_str::<frankenterm_core::ewma::EwmaStats>(&json).unwrap())
         });
     });
 

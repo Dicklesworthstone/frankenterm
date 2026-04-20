@@ -54,13 +54,9 @@ fn bench_delay_presets(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("retry/presets");
     for (name, policy) in &presets {
-        group.bench_with_input(
-            BenchmarkId::new("attempt_2", name),
-            policy,
-            |b, p| {
-                b.iter(|| p.delay_for_attempt(black_box(2)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("attempt_2", name), policy, |b, p| {
+            b.iter(|| p.delay_for_attempt(black_box(2)));
+        });
     }
     group.finish();
 }

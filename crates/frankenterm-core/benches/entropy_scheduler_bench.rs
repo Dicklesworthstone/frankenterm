@@ -61,7 +61,9 @@ fn uniform_data(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push((state >> 33) as u8);
     }
     out
@@ -129,7 +131,11 @@ fn bench_1kb_block(c: &mut Criterion) {
     let english = english_data(1024);
     let constant = constant_data(1024);
 
-    for (label, data) in [("uniform", &uniform), ("english", &english), ("constant", &constant)] {
+    for (label, data) in [
+        ("uniform", &uniform),
+        ("english", &english),
+        ("constant", &constant),
+    ] {
         group.bench_with_input(BenchmarkId::from_parameter(label), data, |b, data| {
             b.iter_batched(
                 || EntropyEstimator::new(65_536),
@@ -282,8 +288,7 @@ fn bench_feed_bytes_throughput(c: &mut Criterion) {
             |b, data| {
                 b.iter_batched(
                     || {
-                        let mut sched =
-                            EntropyScheduler::new(EntropySchedulerConfig::default());
+                        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
                         sched.register_pane(0);
                         sched
                     },
@@ -311,8 +316,7 @@ fn bench_snapshot(c: &mut Criterion) {
             |b, &count| {
                 b.iter_batched(
                     || {
-                        let mut sched =
-                            EntropyScheduler::new(EntropySchedulerConfig::default());
+                        let mut sched = EntropyScheduler::new(EntropySchedulerConfig::default());
                         let data = english_data(1024);
                         for i in 0..count {
                             sched.register_pane(i as u64);

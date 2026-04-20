@@ -879,10 +879,9 @@ fn userdata_wezterm_to_dynamic_error_path() {
     .unwrap();
 
     let err = lua_value_to_dynamic(LuaValue::UserData(ud)).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("error calling __wezterm_to_dynamic")
-    );
+    assert!(err
+        .to_string()
+        .contains("error calling __wezterm_to_dynamic"));
 }
 
 #[test]

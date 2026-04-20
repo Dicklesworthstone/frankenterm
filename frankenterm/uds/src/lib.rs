@@ -29,11 +29,11 @@ use uds_windows::UnixStream as StreamImpl;
 #[allow(dead_code)]
 struct _AsupersyncDep(asupersync::io::IoNotAvailable);
 #[cfg(feature = "async-asupersync")]
-use asupersync::Cx;
-#[cfg(feature = "async-asupersync")]
 use asupersync::io::{AsyncRead, AsyncReadVectored, AsyncWrite, ReadBuf};
 #[cfg(feature = "async-asupersync")]
 use asupersync::runtime::{Interest, IoRegistration};
+#[cfg(feature = "async-asupersync")]
+use asupersync::Cx;
 #[cfg(feature = "async-asupersync")]
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 
@@ -1650,7 +1650,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let mut c = client.join().unwrap();
         drop(listener); // drop listener
-        // Communication should still work
+                        // Communication should still work
         server.write_all(b"after drop").unwrap();
         server.flush().unwrap();
         let mut buf = [0u8; 64];
@@ -1693,7 +1693,7 @@ mod tests {
         let (mut server, _) = listener.accept().unwrap();
         let c = client.join().unwrap();
         drop(c); // close client end
-        // Give OS time to propagate the close
+                 // Give OS time to propagate the close
         std::thread::sleep(std::time::Duration::from_millis(50));
         // First write may succeed (buffered), but repeated writes should eventually fail
         let mut failed = false;

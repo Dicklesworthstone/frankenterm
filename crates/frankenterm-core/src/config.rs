@@ -7140,10 +7140,7 @@ block_alt_screen = true
             changes: vec![],
             forbidden: vec![],
         };
-        assert_eq!(
-            empty.to_string(),
-            "No configuration changes detected"
-        );
+        assert_eq!(empty.to_string(), "No configuration changes detected");
 
         // Only hot-reloadable changes
         let changes_only = HotReloadResult {

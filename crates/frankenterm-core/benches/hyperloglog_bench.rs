@@ -75,19 +75,15 @@ fn bench_insert_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
         let values = random_u64s(count as usize);
 
-        group.bench_with_input(
-            BenchmarkId::new("distinct", count),
-            &values,
-            |b, values| {
-                b.iter(|| {
-                    let mut hll = HyperLogLog::new();
-                    for v in values {
-                        hll.insert(black_box(v));
-                    }
-                    black_box(hll.cardinality())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("distinct", count), &values, |b, values| {
+            b.iter(|| {
+                let mut hll = HyperLogLog::new();
+                for v in values {
+                    hll.insert(black_box(v));
+                }
+                black_box(hll.cardinality())
+            });
+        });
     }
 
     // Insert duplicates only (same element repeated).
@@ -153,17 +149,13 @@ fn bench_cardinality(c: &mut Criterion) {
 
     // Vary cardinality at default precision (p=14).
     for n in [100, 1_000, 10_000, 100_000] {
-        group.bench_with_input(
-            BenchmarkId::new("p14", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || build_hll(14, n),
-                    |hll| black_box(hll.cardinality()),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("p14", n), &n, |b, &n| {
+            b.iter_batched(
+                || build_hll(14, n),
+                |hll| black_box(hll.cardinality()),
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     // Vary precision at fixed cardinality (10K).

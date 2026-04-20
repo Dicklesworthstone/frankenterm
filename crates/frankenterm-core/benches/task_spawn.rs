@@ -81,7 +81,6 @@ fn bench_region_batch(c: &mut Criterion) {
                 });
             },
         );
-
     }
     group.finish();
 }

@@ -111,16 +111,20 @@ fn bench_single_agent_ingest(c: &mut Criterion) {
             .collect();
 
         group.throughput(Throughput::Elements(batch_size));
-        group.bench_with_input(BenchmarkId::new("raw_json", label), &envelopes, |b, envelopes| {
-            b.iter(|| {
-                let mut agg = Aggregator::new(16);
-                for bytes in envelopes {
-                    let result = agg.ingest(black_box(bytes));
-                    black_box(&result);
-                }
-                black_box(agg.total_accepted());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("raw_json", label),
+            &envelopes,
+            |b, envelopes| {
+                b.iter(|| {
+                    let mut agg = Aggregator::new(16);
+                    for bytes in envelopes {
+                        let result = agg.ingest(black_box(bytes));
+                        black_box(&result);
+                    }
+                    black_box(agg.total_accepted());
+                });
+            },
+        );
 
         // Also bench the pre-decoded path (ingest_envelope_at).
         let decoded: Vec<WireEnvelope> = (0..batch_size)
@@ -262,8 +266,7 @@ fn bench_stale_pruning(c: &mut Criterion) {
                         let _ = agg.ingest_envelope_at(envelope, ts);
                     }
 
-                    let pruned =
-                        agg.prune_stale_agents(black_box(base_ts + stale_after_ms + 2000));
+                    let pruned = agg.prune_stale_agents(black_box(base_ts + stale_after_ms + 2000));
                     black_box(pruned);
                 });
             },

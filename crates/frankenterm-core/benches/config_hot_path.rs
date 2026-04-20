@@ -52,21 +52,13 @@ fn bench_config_parse(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("config/parse");
 
-    group.bench_with_input(
-        BenchmarkId::new("toml", "minimal"),
-        &minimal,
-        |b, toml| {
-            b.iter(|| Config::from_toml(black_box(toml)).unwrap());
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("toml", "minimal"), &minimal, |b, toml| {
+        b.iter(|| Config::from_toml(black_box(toml)).unwrap());
+    });
 
-    group.bench_with_input(
-        BenchmarkId::new("toml", "medium"),
-        &medium,
-        |b, toml| {
-            b.iter(|| Config::from_toml(black_box(toml)).unwrap());
-        },
-    );
+    group.bench_with_input(BenchmarkId::new("toml", "medium"), &medium, |b, toml| {
+        b.iter(|| Config::from_toml(black_box(toml)).unwrap());
+    });
 
     group.bench_with_input(
         BenchmarkId::new("toml", "large_50_rules"),
@@ -102,7 +94,13 @@ fn bench_check_pane(c: &mut Criterion) {
     // No rules — fast path
     let empty = PaneFilterConfig::default();
     group.bench_function("no_rules", |b| {
-        b.iter(|| empty.check_pane(black_box("local"), black_box("bash"), black_box("/home/user")));
+        b.iter(|| {
+            empty.check_pane(
+                black_box("local"),
+                black_box("bash"),
+                black_box("/home/user"),
+            )
+        });
     });
 
     // 5 exclude rules, no match (worst case for small configs)

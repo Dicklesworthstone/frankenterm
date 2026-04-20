@@ -118,7 +118,10 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_batched(
             || build_tree(1000),
             |mut tree| {
-                tree.insert(Interval::new(black_box(5000), black_box(5100)), black_box(9999));
+                tree.insert(
+                    Interval::new(black_box(5000), black_box(5100)),
+                    black_box(9999),
+                );
                 tree
             },
             BatchSize::SmallInput,
@@ -130,7 +133,10 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_batched(
             || build_tree(10_000),
             |mut tree| {
-                tree.insert(Interval::new(black_box(5000), black_box(5100)), black_box(9999));
+                tree.insert(
+                    Interval::new(black_box(5000), black_box(5100)),
+                    black_box(9999),
+                );
                 tree
             },
             BatchSize::SmallInput,
@@ -206,14 +212,10 @@ fn bench_point_query(c: &mut Criterion) {
 
     // Point query at different tree sizes.
     for n in [100, 1_000, 10_000] {
-        group.bench_with_input(
-            BenchmarkId::new("scaling", n),
-            &n,
-            |b, &n| {
-                let tree = build_tree(n);
-                b.iter(|| black_box(tree.query_point(black_box(&5000))));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scaling", n), &n, |b, &n| {
+            let tree = build_tree(n);
+            b.iter(|| black_box(tree.query_point(black_box(&5000))));
+        });
     }
 
     group.finish();
@@ -246,15 +248,11 @@ fn bench_overlap_query(c: &mut Criterion) {
 
     // Scaling: overlap query at different tree sizes.
     for n in [100, 1_000, 10_000] {
-        group.bench_with_input(
-            BenchmarkId::new("scaling", n),
-            &n,
-            |b, &n| {
-                let tree = build_tree(n);
-                let query = Interval::new(5000, 5100);
-                b.iter(|| black_box(tree.query_overlap(black_box(&query))));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scaling", n), &n, |b, &n| {
+            let tree = build_tree(n);
+            let query = Interval::new(5000, 5100);
+            b.iter(|| black_box(tree.query_overlap(black_box(&query))));
+        });
     }
 
     group.finish();

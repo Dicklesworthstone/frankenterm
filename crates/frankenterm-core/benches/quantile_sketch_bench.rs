@@ -166,19 +166,15 @@ fn bench_insert_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
         let data = random_values(count as usize);
 
-        group.bench_with_input(
-            BenchmarkId::new("random", count),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut td = TDigest::new();
-                    for &v in data {
-                        td.insert(black_box(v));
-                    }
-                    black_box(td.count())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("random", count), &data, |b, data| {
+            b.iter(|| {
+                let mut td = TDigest::new();
+                for &v in data {
+                    td.insert(black_box(v));
+                }
+                black_box(td.count())
+            });
+        });
     }
 
     // Bimodal distribution throughput.
@@ -283,24 +279,20 @@ fn bench_merge(c: &mut Criterion) {
     let mut group = c.benchmark_group("tdigest/merge");
 
     for n in [1_000, 10_000] {
-        group.bench_with_input(
-            BenchmarkId::new("equal_size", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        let a = build_digest(n);
-                        let b_td = build_digest(n);
-                        (a, b_td)
-                    },
-                    |(mut a, b_td)| {
-                        a.merge(black_box(&b_td));
-                        black_box(a.count())
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("equal_size", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let a = build_digest(n);
+                    let b_td = build_digest(n);
+                    (a, b_td)
+                },
+                |(mut a, b_td)| {
+                    a.merge(black_box(&b_td));
+                    black_box(a.count())
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     // Merge empty into populated.

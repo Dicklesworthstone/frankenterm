@@ -45,7 +45,9 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 
 /// Generate deterministic key-value pairs for map benchmarks.
 fn generate_kv_pairs(n: usize) -> Vec<(String, i64)> {
-    (0..n).map(|i| (format!("key_{:06}", i), i as i64)).collect()
+    (0..n)
+        .map(|i| (format!("key_{:06}", i), i as i64))
+        .collect()
 }
 
 /// Pre-build a PersistentMap with `n` entries.
@@ -72,33 +74,25 @@ fn bench_persistent_insert_vs_mutable(c: &mut Criterion) {
     for n in [100, 1000, 10_000] {
         let pairs = generate_kv_pairs(n);
 
-        group.bench_with_input(
-            BenchmarkId::new("persistent_map", n),
-            &pairs,
-            |b, pairs| {
-                b.iter(|| {
-                    let mut m = PersistentMap::new();
-                    for (k, v) in pairs {
-                        m = m.insert(k.clone(), *v);
-                    }
-                    black_box(m)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("persistent_map", n), &pairs, |b, pairs| {
+            b.iter(|| {
+                let mut m = PersistentMap::new();
+                for (k, v) in pairs {
+                    m = m.insert(k.clone(), *v);
+                }
+                black_box(m)
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("std_hashmap", n),
-            &pairs,
-            |b, pairs| {
-                b.iter(|| {
-                    let mut m = HashMap::new();
-                    for (k, v) in pairs {
-                        m.insert(k.clone(), *v);
-                    }
-                    black_box(m)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("std_hashmap", n), &pairs, |b, pairs| {
+            b.iter(|| {
+                let mut m = HashMap::new();
+                for (k, v) in pairs {
+                    m.insert(k.clone(), *v);
+                }
+                black_box(m)
+            });
+        });
     }
 
     group.finish();
@@ -110,29 +104,21 @@ fn bench_persistent_clone_vs_deep_copy(c: &mut Criterion) {
     let mut group = c.benchmark_group("persistent_ds/clone_vs_deep_copy");
 
     for n in [100, 1000, 5000] {
-        group.bench_with_input(
-            BenchmarkId::new("persistent_clone", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || build_persistent_map(n),
-                    |m| black_box(m.clone()),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("persistent_clone", n), &n, |b, &n| {
+            b.iter_batched(
+                || build_persistent_map(n),
+                |m| black_box(m.clone()),
+                BatchSize::SmallInput,
+            );
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("std_hashmap_clone", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || build_std_hashmap(n),
-                    |m| black_box(m.clone()),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("std_hashmap_clone", n), &n, |b, &n| {
+            b.iter_batched(
+                || build_std_hashmap(n),
+                |m| black_box(m.clone()),
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();
@@ -225,17 +211,13 @@ fn bench_structural_sharing_overhead(c: &mut Criterion) {
 
     // Measure single mutation cost on maps of different sizes.
     for n in [100, 1000, 5000] {
-        group.bench_with_input(
-            BenchmarkId::new("single_mutation", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || build_persistent_map(n),
-                    |m| black_box(m.insert("new_key".to_string(), 42)),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("single_mutation", n), &n, |b, &n| {
+            b.iter_batched(
+                || build_persistent_map(n),
+                |m| black_box(m.insert("new_key".to_string(), 42)),
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();
@@ -250,10 +232,7 @@ fn bench_diff_two_versions(c: &mut Criterion) {
     let base_size = 1000;
     for change_count in [1, 10, 100, 500] {
         group.bench_with_input(
-            BenchmarkId::new(
-                "changes_on_1k_base",
-                format!("{}_changes", change_count),
-            ),
+            BenchmarkId::new("changes_on_1k_base", format!("{}_changes", change_count)),
             &change_count,
             |b, &change_count| {
                 b.iter_batched(
@@ -261,8 +240,7 @@ fn bench_diff_two_versions(c: &mut Criterion) {
                         let base = build_persistent_map(base_size);
                         let mut modified = base.clone();
                         for i in 0..change_count {
-                            modified =
-                                modified.insert(format!("key_{:06}", i), (i as i64) * 1000);
+                            modified = modified.insert(format!("key_{:06}", i), (i as i64) * 1000);
                         }
                         (base, modified)
                     },
@@ -367,53 +345,45 @@ fn bench_persistent_map_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("persistent_ds/map_lookup");
 
     for n in [100, 1000, 5000] {
-        group.bench_with_input(
-            BenchmarkId::new("persistent_get", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        let m = build_persistent_map(n);
-                        let keys: Vec<_> = (0..n).map(|i| format!("key_{:06}", i)).collect();
-                        (m, keys)
-                    },
-                    |(m, keys)| {
-                        let mut found = 0u64;
-                        for k in &keys {
-                            if m.get(k).is_some() {
-                                found += 1;
-                            }
+        group.bench_with_input(BenchmarkId::new("persistent_get", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let m = build_persistent_map(n);
+                    let keys: Vec<_> = (0..n).map(|i| format!("key_{:06}", i)).collect();
+                    (m, keys)
+                },
+                |(m, keys)| {
+                    let mut found = 0u64;
+                    for k in &keys {
+                        if m.get(k).is_some() {
+                            found += 1;
                         }
-                        black_box(found)
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+                    }
+                    black_box(found)
+                },
+                BatchSize::SmallInput,
+            );
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("std_hashmap_get", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        let m = build_std_hashmap(n);
-                        let keys: Vec<_> = (0..n).map(|i| format!("key_{:06}", i)).collect();
-                        (m, keys)
-                    },
-                    |(m, keys)| {
-                        let mut found = 0u64;
-                        for k in &keys {
-                            if m.contains_key(k) {
-                                found += 1;
-                            }
+        group.bench_with_input(BenchmarkId::new("std_hashmap_get", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let m = build_std_hashmap(n);
+                    let keys: Vec<_> = (0..n).map(|i| format!("key_{:06}", i)).collect();
+                    (m, keys)
+                },
+                |(m, keys)| {
+                    let mut found = 0u64;
+                    for k in &keys {
+                        if m.contains_key(k) {
+                            found += 1;
                         }
-                        black_box(found)
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+                    }
+                    black_box(found)
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();

@@ -15,11 +15,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 #[cfg(feature = "async-asupersync")]
-use asupersync::Cx;
-#[cfg(feature = "async-asupersync")]
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "async-asupersync")]
 use asupersync::runtime::{Interest, IoRegistration};
+#[cfg(feature = "async-asupersync")]
+use asupersync::Cx;
 #[cfg(feature = "async-asupersync")]
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 

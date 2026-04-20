@@ -327,20 +327,16 @@ fn bench_capacity_scaling(c: &mut Criterion) {
         );
 
         // Get from full cache.
-        group.bench_with_input(
-            BenchmarkId::new("get_from_full", cap),
-            &cap,
-            |b, &cap| {
-                b.iter_batched(
-                    || build_full_cache(cap),
-                    |mut cache| {
-                        black_box(cache.get(black_box(&(cap as u64 / 2))));
-                        cache
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("get_from_full", cap), &cap, |b, &cap| {
+            b.iter_batched(
+                || build_full_cache(cap),
+                |mut cache| {
+                    black_box(cache.get(black_box(&(cap as u64 / 2))));
+                    cache
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();

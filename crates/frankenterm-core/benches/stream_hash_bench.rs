@@ -97,17 +97,13 @@ fn bench_hash_payload_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         let data = pseudo_random(size);
 
-        group.bench_with_input(
-            BenchmarkId::new("random", label),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut h = StreamHash::new();
-                    h.update(black_box(data));
-                    black_box(h.digest())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("random", label), &data, |b, data| {
+            b.iter(|| {
+                let mut h = StreamHash::new();
+                h.update(black_box(data));
+                black_box(h.digest())
+            });
+        });
     }
 
     // Also benchmark terminal-like data at 64 KB.

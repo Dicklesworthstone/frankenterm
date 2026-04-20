@@ -158,11 +158,13 @@ fn bench_fts_small_db(c: &mut Criterion) {
     });
 
     group.bench_function("phrase_search", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("\"mismatched types\"", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("\"mismatched types\"", opts(10))
+                    .await
+            })
+        });
     });
 
     group.bench_function("prefix_search", |b| {
@@ -170,19 +172,23 @@ fn bench_fts_small_db(c: &mut Criterion) {
     });
 
     group.bench_function("boolean_search", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("error AND types", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("error AND types", opts(10))
+                    .await
+            })
+        });
     });
 
     group.bench_function("no_match", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("nonexistent_term_xyz", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("nonexistent_term_xyz", opts(10))
+                    .await
+            })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -208,11 +214,13 @@ fn bench_fts_medium_db(c: &mut Criterion) {
     });
 
     group.bench_function("phrase_search", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("\"test result\"", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("\"test result\"", opts(10))
+                    .await
+            })
+        });
     });
 
     group.bench_function("common_term_high_results", |b| {
@@ -245,11 +253,13 @@ fn bench_fts_large_db(c: &mut Criterion) {
     });
 
     group.bench_function("phrase_search", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("\"expected i32\"", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("\"expected i32\"", opts(10))
+                    .await
+            })
+        });
     });
 
     group.bench_function("common_term_limited", |b| {
@@ -257,11 +267,13 @@ fn bench_fts_large_db(c: &mut Criterion) {
     });
 
     group.bench_function("rare_term", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("\"Auto-compact\"", opts(10))
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("\"Auto-compact\"", opts(10))
+                    .await
+            })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -284,7 +296,9 @@ fn bench_fts_result_limits(c: &mut Criterion) {
     // Test how result limit affects performance
     for limit in [1, 10, 50, 100, 500] {
         group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &limit| {
-            b.iter(|| rt.block_on(async { storage.search_with_options("status", opts(limit)).await }));
+            b.iter(|| {
+                rt.block_on(async { storage.search_with_options("status", opts(limit)).await })
+            });
         });
     }
 

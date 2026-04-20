@@ -45,11 +45,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 // Agent type cycling
 // ---------------------------------------------------------------------------
 
-const AGENT_TYPES: &[AgentType] = &[
-    AgentType::Codex,
-    AgentType::ClaudeCode,
-    AgentType::Gemini,
-];
+const AGENT_TYPES: &[AgentType] = &[AgentType::Codex, AgentType::ClaudeCode, AgentType::Gemini];
 
 fn agent_type_at(i: usize) -> AgentType {
     AGENT_TYPES[i % AGENT_TYPES.len()]
@@ -150,11 +146,7 @@ fn bench_dashboard_snapshot(c: &mut Criterion) {
     let mut group = c.benchmark_group("quota_cost_ops/dashboard_snapshot");
     group.measurement_time(Duration::from_secs(5));
 
-    for &(pane_count, label) in &[
-        (5usize, "5_panes"),
-        (50, "50_panes"),
-        (200, "200_panes"),
-    ] {
+    for &(pane_count, label) in &[(5usize, "5_panes"), (50, "50_panes"), (200, "200_panes")] {
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::from_parameter(label),

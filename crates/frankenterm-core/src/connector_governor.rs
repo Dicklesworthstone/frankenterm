@@ -2101,9 +2101,6 @@ mod tests {
             GovernorReason::BudgetExceeded.to_string(),
             "budget_exceeded"
         );
-        assert_eq!(
-            GovernorReason::Backpressure.to_string(),
-            "backpressure"
-        );
+        assert_eq!(GovernorReason::Backpressure.to_string(), "backpressure");
     }
 }

@@ -161,19 +161,15 @@ fn bench_acquire_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count));
         let traffic = bursty_traffic(count as usize);
 
-        group.bench_with_input(
-            BenchmarkId::new("bursty", count),
-            &traffic,
-            |b, traffic| {
-                b.iter(|| {
-                    let mut bucket = TokenBucket::with_time(100.0, 50.0, 0);
-                    for &(cost, ts) in traffic {
-                        bucket.try_acquire(black_box(cost), black_box(ts));
-                    }
-                    black_box(bucket.total_consumed())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("bursty", count), &traffic, |b, traffic| {
+            b.iter(|| {
+                let mut bucket = TokenBucket::with_time(100.0, 50.0, 0);
+                for &(cost, ts) in traffic {
+                    bucket.try_acquire(black_box(cost), black_box(ts));
+                }
+                black_box(bucket.total_consumed())
+            });
+        });
     }
 
     // Uniform traffic (all cost=1, fixed interval).
@@ -301,10 +297,7 @@ fn bench_hierarchical(c: &mut Criterion) {
             for &(cost, ts) in &traffic {
                 hb.try_acquire(black_box(cost), black_box(ts));
             }
-            black_box((
-                hb.local().total_consumed(),
-                hb.global().total_consumed(),
-            ))
+            black_box((hb.local().total_consumed(), hb.global().total_consumed()))
         });
     });
 

@@ -559,8 +559,8 @@ fn arb_get_pane_renderable_dimensions() -> impl Strategy<Value = GetPaneRenderab
     (0u64..=4096).prop_map(|pane_id| GetPaneRenderableDimensions { pane_id })
 }
 
-fn arb_get_pane_renderable_dimensions_response()
--> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
+fn arb_get_pane_renderable_dimensions_response(
+) -> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
     (
         0u64..=4096,
         any::<bool>(),

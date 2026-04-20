@@ -131,13 +131,9 @@ fn bench_sha256_hash(c: &mut Criterion) {
     for &size in &[64_usize, 256, 1024, 4096, 16384] {
         let data = agent_output(size);
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("sha256_hash", size),
-            &data,
-            |b, data| {
-                b.iter(|| black_box(content_hash(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("sha256_hash", size), &data, |b, data| {
+            b.iter(|| black_box(content_hash(data)));
+        });
     }
 
     group.finish();

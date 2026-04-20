@@ -9,7 +9,6 @@
 //! - **upsert_pane p95 < 1ms** (metadata write)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     RecorderStorage,
@@ -18,6 +17,7 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
+use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::search::{FusionBackend, SearchMode};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 #[cfg(feature = "distributed")]
@@ -236,12 +236,14 @@ fn bench_append_single(c: &mut Criterion) {
 
         let counter = std::sync::atomic::AtomicUsize::new(db_size);
         group.bench_function(BenchmarkId::new("latency", label), |b| {
-            b.iter(|| rt.block_on(async {
-                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let content = gen_content(idx);
-                let s = &storage;
-                s.append_segment(1, &content, None).await
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let content = gen_content(idx);
+                    let s = &storage;
+                    s.append_segment(1, &content, None).await
+                })
+            });
         });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
@@ -265,21 +267,23 @@ fn bench_append_batch(c: &mut Criterion) {
     group.throughput(Throughput::Elements(batch_size));
 
     group.bench_function("1K_batch_on_empty", |b| {
-        b.iter(|| rt.block_on(async {
-            let (_dir, db_path) = temp_db();
-            let storage = StorageHandle::new(&db_path).await.expect("create storage");
-            storage
-                .upsert_pane(test_pane(1))
-                .await
-                .expect("upsert pane");
-            for i in 0..batch_size as usize {
+        b.iter(|| {
+            rt.block_on(async {
+                let (_dir, db_path) = temp_db();
+                let storage = StorageHandle::new(&db_path).await.expect("create storage");
                 storage
-                    .append_segment(1, &gen_content(i), None)
-                .await
-                .expect("append");
-            }
-            storage.shutdown().await.expect("shutdown");
-        }));
+                    .upsert_pane(test_pane(1))
+                    .await
+                    .expect("upsert pane");
+                for i in 0..batch_size as usize {
+                    storage
+                        .append_segment(1, &gen_content(i), None)
+                        .await
+                        .expect("append");
+                }
+                storage.shutdown().await.expect("shutdown");
+            })
+        });
     });
 
     // Batch on pre-populated DB (10K existing)
@@ -292,15 +296,18 @@ fn bench_append_batch(c: &mut Criterion) {
         });
 
         let counter = std::sync::atomic::AtomicUsize::new(10_000);
-        b.iter(|| rt.block_on(async {
-            let base = counter.fetch_add(batch_size as usize, std::sync::atomic::Ordering::Relaxed);
-            let s = &storage;
-            for i in 0..batch_size as usize {
-                s.append_segment(1, &gen_content(base + i), None)
-                    .await
-                    .expect("append");
-            }
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                let base =
+                    counter.fetch_add(batch_size as usize, std::sync::atomic::Ordering::Relaxed);
+                let s = &storage;
+                for i in 0..batch_size as usize {
+                    s.append_segment(1, &gen_content(base + i), None)
+                        .await
+                        .expect("append");
+                }
+            })
+        });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
     });
@@ -335,31 +342,39 @@ fn bench_fts_regression(c: &mut Criterion) {
     });
 
     group.bench_function("phrase_100K", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("\"mismatched types\"", opts.clone())
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("\"mismatched types\"", opts.clone())
+                    .await
+            })
+        });
     });
 
     group.bench_function("prefix_100K", |b| {
-        b.iter(|| rt.block_on(async { storage.search_with_options("compil*", opts.clone()).await }));
+        b.iter(|| {
+            rt.block_on(async { storage.search_with_options("compil*", opts.clone()).await })
+        });
     });
 
     group.bench_function("boolean_100K", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("error AND types", opts.clone())
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("error AND types", opts.clone())
+                    .await
+            })
+        });
     });
 
     group.bench_function("no_match_100K", |b| {
-        b.iter(|| rt.block_on(async {
-            storage
-                .search_with_options("zzz_nonexistent_zzz", opts.clone())
-                .await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                storage
+                    .search_with_options("zzz_nonexistent_zzz", opts.clone())
+                    .await
+            })
+        });
     });
 
     // High-limit query regression guard
@@ -368,7 +383,9 @@ fn bench_fts_regression(c: &mut Criterion) {
         ..Default::default()
     };
     group.bench_function("high_limit_100K", |b| {
-        b.iter(|| rt.block_on(async { storage.search_with_options("test", opts_100.clone()).await }));
+        b.iter(|| {
+            rt.block_on(async { storage.search_with_options("test", opts_100.clone()).await })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -397,21 +414,25 @@ fn bench_upsert_pane(c: &mut Criterion) {
 
     // Update existing pane (hot path)
     group.bench_function("update_existing", |b| {
-        b.iter(|| rt.block_on(async {
-            let mut pane = test_pane(1);
-            pane.last_seen_at = now_ms();
-            storage.upsert_pane(pane).await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                let mut pane = test_pane(1);
+                pane.last_seen_at = now_ms();
+                storage.upsert_pane(pane).await
+            })
+        });
     });
 
     // Insert new pane
     let counter = std::sync::atomic::AtomicU64::new(1000);
     group.bench_function("insert_new", |b| {
-        b.iter(|| rt.block_on(async {
-            let id = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let s = &storage;
-            s.upsert_pane(test_pane(id)).await
-        }));
+        b.iter(|| {
+            rt.block_on(async {
+                let id = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let s = &storage;
+                s.upsert_pane(test_pane(id)).await
+            })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -444,12 +465,14 @@ fn bench_append_scaling(c: &mut Criterion) {
 
         let counter = std::sync::atomic::AtomicUsize::new(pre_pop);
         group.bench_function(BenchmarkId::new("at", label), |b| {
-            b.iter(|| rt.block_on(async {
-                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let content = gen_content(idx);
-                let s = &storage;
-                s.append_segment(1, &content, None).await
-            }));
+            b.iter(|| {
+                rt.block_on(async {
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let content = gen_content(idx);
+                    let s = &storage;
+                    s.append_segment(1, &content, None).await
+                })
+            });
         });
 
         rt.block_on(storage.shutdown()).expect("shutdown");
@@ -483,36 +506,47 @@ fn bench_recorder_append_log_profile(c: &mut Criterion) {
             BenchmarkId::new("append_batch_cycle", label),
             &(pane_count, events_per_pane),
             |b, &(pane_count, events_per_pane)| {
-                b.iter(|| rt.block_on(async {
-                    let storage_ref = &storage;
-                    let cycle = cycle_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let mut events = Vec::with_capacity((pane_count as usize) * events_per_pane);
-                    let mut sequence: u64 = cycle.saturating_mul(events_per_cycle);
-                    for pane_id in 1..=pane_count {
-                        for event_idx in 0..events_per_pane {
-                            events.push(bench_recorder_event(pane_id, sequence, cycle, event_idx));
-                            sequence = sequence.saturating_add(1);
+                b.iter(|| {
+                    rt.block_on(async {
+                        let storage_ref = &storage;
+                        let cycle =
+                            cycle_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut events =
+                            Vec::with_capacity((pane_count as usize) * events_per_pane);
+                        let mut sequence: u64 = cycle.saturating_mul(events_per_cycle);
+                        for pane_id in 1..=pane_count {
+                            for event_idx in 0..events_per_pane {
+                                events.push(bench_recorder_event(
+                                    pane_id, sequence, cycle, event_idx,
+                                ));
+                                sequence = sequence.saturating_add(1);
+                            }
                         }
-                    }
 
-                    let append_started = std::time::Instant::now();
-                    let response = storage_ref
-                        .append_batch(AppendRequest {
-                            batch_id: format!("append-log-{cycle}"),
-                            events,
-                            required_durability: DurabilityLevel::Appended,
-                            producer_ts_ms: u64::try_from(now_ms()).unwrap_or_default(),
-                        })
-                        .await
-                        .expect("append batch");
-                    let append_elapsed = append_started.elapsed();
+                        let append_started = std::time::Instant::now();
+                        let response = storage_ref
+                            .append_batch(AppendRequest {
+                                batch_id: format!("append-log-{cycle}"),
+                                events,
+                                required_durability: DurabilityLevel::Appended,
+                                producer_ts_ms: u64::try_from(now_ms()).unwrap_or_default(),
+                            })
+                            .await
+                            .expect("append batch");
+                        let append_elapsed = append_started.elapsed();
 
-                    let health_started = std::time::Instant::now();
-                    let health = storage_ref.health().await;
-                    let health_elapsed = health_started.elapsed();
+                        let health_started = std::time::Instant::now();
+                        let health = storage_ref.health().await;
+                        let health_elapsed = health_started.elapsed();
 
-                    black_box((append_elapsed, health_elapsed, response.accepted_count, health));
-                }));
+                        black_box((
+                            append_elapsed,
+                            health_elapsed,
+                            response.accepted_count,
+                            health,
+                        ));
+                    })
+                });
             },
         );
     }
@@ -553,7 +587,8 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
             BenchmarkId::new("ingest_index_query_cycle", label),
             &(pane_count, events_per_pane),
             |b, &(pane_count, events_per_pane)| {
-                b.iter(|| rt.block_on(async {
+                b.iter(|| {
+                    rt.block_on(async {
                     let storage_ref = &storage;
                     let cycle = round.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let ingest_started = std::time::Instant::now();
@@ -630,7 +665,8 @@ fn bench_recorder_swarm_load_profile(c: &mut Criterion) {
                         lexical_hits.len(),
                         hybrid_bundle.results.len(),
                     ));
-                }));
+                })
+                });
             },
         );
 
@@ -751,40 +787,42 @@ fn bench_aggregator_persist_latency(c: &mut Criterion) {
     let payload = delta_payload(512);
 
     group.bench_function("bench_aggregator_persist_latency", |b| {
-        b.iter(|| rt.block_on(async {
-            let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
-            let started = std::time::Instant::now();
+        b.iter(|| {
+            rt.block_on(async {
+                let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
+                let started = std::time::Instant::now();
 
-            let envelope = WireEnvelope::new(
-                seq,
-                "agent-latency",
-                WirePayload::PaneDelta(PaneDelta {
-                    pane_id: 1,
+                let envelope = WireEnvelope::new(
                     seq,
-                    content: payload.clone(),
-                    content_len: payload.len(),
-                    captured_at_ms: now_ms(),
-                }),
-            );
+                    "agent-latency",
+                    WirePayload::PaneDelta(PaneDelta {
+                        pane_id: 1,
+                        seq,
+                        content: payload.clone(),
+                        content_len: payload.len(),
+                        captured_at_ms: now_ms(),
+                    }),
+                );
 
-            let ingest = {
-                let mut guard = aggregator.lock().expect("lock aggregator");
-                guard.ingest_envelope(envelope).expect("ingest")
-            };
+                let ingest = {
+                    let mut guard = aggregator.lock().expect("lock aggregator");
+                    guard.ingest_envelope(envelope).expect("ingest")
+                };
 
-            if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
-                storage
-                    .append_segment(
-                        delta.pane_id,
-                        &delta.content,
-                        Some(format!("remote_seq:{}", delta.seq)),
-                    )
-                    .await
-                    .expect("append");
-            }
+                if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
+                    storage
+                        .append_segment(
+                            delta.pane_id,
+                            &delta.content,
+                            Some(format!("remote_seq:{}", delta.seq)),
+                        )
+                        .await
+                        .expect("append");
+                }
 
-            black_box(started.elapsed());
-        }));
+                black_box(started.elapsed());
+            })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -820,50 +858,52 @@ fn bench_aggregator_query_under_load(c: &mut Criterion) {
     };
 
     group.bench_function("bench_aggregator_query_under_load", |b| {
-        b.iter(|| rt.block_on(async {
-            let round = round_counter.fetch_add(1, Ordering::Relaxed);
-            let payload = format!("LOAD_QUERY_MARKER round={round}");
+        b.iter(|| {
+            rt.block_on(async {
+                let round = round_counter.fetch_add(1, Ordering::Relaxed);
+                let payload = format!("LOAD_QUERY_MARKER round={round}");
 
-            for agent_ix in 0..5_u64 {
-                let sender = format!("agent-q-{agent_ix}");
-                let pane_id = agent_ix + 1;
-                let envelope = WireEnvelope::new(
-                    round,
-                    &sender,
-                    WirePayload::PaneDelta(PaneDelta {
-                        pane_id,
-                        seq: round,
-                        content: payload.clone(),
-                        content_len: payload.len(),
-                        captured_at_ms: now_ms(),
-                    }),
-                );
+                for agent_ix in 0..5_u64 {
+                    let sender = format!("agent-q-{agent_ix}");
+                    let pane_id = agent_ix + 1;
+                    let envelope = WireEnvelope::new(
+                        round,
+                        &sender,
+                        WirePayload::PaneDelta(PaneDelta {
+                            pane_id,
+                            seq: round,
+                            content: payload.clone(),
+                            content_len: payload.len(),
+                            captured_at_ms: now_ms(),
+                        }),
+                    );
 
-                let ingest = {
-                    let mut guard = aggregator.lock().expect("lock aggregator");
-                    guard.ingest_envelope(envelope).expect("ingest")
-                };
+                    let ingest = {
+                        let mut guard = aggregator.lock().expect("lock aggregator");
+                        guard.ingest_envelope(envelope).expect("ingest")
+                    };
 
-                if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
-                    storage
-                        .append_segment(
-                            delta.pane_id,
-                            &delta.content,
-                            Some(format!("remote_seq:{}", delta.seq)),
-                        )
-                        .await
-                        .expect("append");
+                    if let IngestResult::Accepted(WirePayload::PaneDelta(delta)) = ingest {
+                        storage
+                            .append_segment(
+                                delta.pane_id,
+                                &delta.content,
+                                Some(format!("remote_seq:{}", delta.seq)),
+                            )
+                            .await
+                            .expect("append");
+                    }
                 }
-            }
 
-            let query_started = std::time::Instant::now();
-            let hits = storage
-                .search_with_options("LOAD_QUERY_MARKER", opts.clone())
-                .await
-                .expect("search");
-            black_box(query_started.elapsed());
-            black_box(hits.len());
-        }));
+                let query_started = std::time::Instant::now();
+                let hits = storage
+                    .search_with_options("LOAD_QUERY_MARKER", opts.clone())
+                    .await
+                    .expect("search");
+                black_box(query_started.elapsed());
+                black_box(hits.len());
+            })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
