@@ -11410,6 +11410,16 @@ impl StorageHandle {
         &self,
         scope_hash: &str,
     ) -> Result<Option<SecretScanReportRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .latest_secret_scan_report_with_cx(&cx, scope_hash)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let scope_hash = scope_hash.to_string();
 
@@ -11421,6 +11431,7 @@ impl StorageHandle {
             query_latest_secret_scan_report(&conn, &scope_hash)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`latest_secret_scan_report`].
@@ -11433,7 +11444,17 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("latest_secret_scan_report cancelled: {err}"))
         })?;
-        self.latest_secret_scan_report(scope_hash).await
+        let db_path = Arc::clone(&self.db_path);
+        let scope_hash = scope_hash.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_latest_secret_scan_report(&conn, &scope_hash)
+        })
+        .await
     }
 
     /// Get workflow by ID
