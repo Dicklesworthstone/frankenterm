@@ -10393,6 +10393,14 @@ impl StorageHandle {
 
     /// Get embedding statistics per embedder.
     pub async fn embedding_stats(&self) -> Result<Vec<EmbeddingStats>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.embedding_stats_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -10425,6 +10433,7 @@ impl StorageHandle {
             Ok(stats)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
@@ -10432,7 +10441,38 @@ impl StorageHandle {
     pub async fn embedding_stats_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<EmbeddingStats>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
-        self.embedding_stats().await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT embedder_id, dimension, COUNT(*) as count,
+                            MIN(embedded_at) as earliest, MAX(embedded_at) as latest
+                     FROM segment_embeddings
+                     GROUP BY embedder_id, dimension",
+                )
+                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
+
+            let stats: Vec<EmbeddingStats> = stmt
+                .query_map([], |row| {
+                    Ok(EmbeddingStats {
+                        embedder_id: row.get(0)?,
+                        dimension: row.get(1)?,
+                        count: row.get(2)?,
+                        earliest_at: row.get(3)?,
+                        latest_at: row.get(4)?,
+                    })
+                })
+                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(stats)
+        })
+        .await
     }
 
     /// Store an f32 embedding vector (little-endian packed) for a segment.
