@@ -521,6 +521,7 @@ mod tests {
         compose_proxy_tools, filter_remote_tools, insert_route_prefix, sanitize_prefix_segment,
         select_proxy_servers,
     };
+    use proptest::prelude::*;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -844,5 +845,70 @@ mod tests {
         let mut used = HashSet::new();
         insert_route_prefix(&mut used, "remote/my-tool");
         assert!(!insert_route_prefix(&mut used, "remote/my-tool"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_sanitize_prefix_segment_output_is_lowercase_and_bounded(
+            raw in "[A-Za-z0-9 _./@:-]{0,48}",
+        ) {
+            let sanitized = sanitize_prefix_segment(&raw);
+            prop_assert!(!sanitized.is_empty());
+            prop_assert_eq!(&sanitized, &sanitized.to_ascii_lowercase());
+            prop_assert!(sanitized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'));
+        }
+
+        #[test]
+        fn prop_insert_route_prefix_is_case_insensitive_once(
+            segment in "[A-Za-z0-9/_-]{1,32}",
+        ) {
+            let lower = segment.to_ascii_lowercase();
+            let upper = segment.to_ascii_uppercase();
+            let mut used = HashSet::new();
+
+            prop_assert!(insert_route_prefix(&mut used, &lower));
+            prop_assert!(!insert_route_prefix(&mut used, &upper));
+            prop_assert_eq!(used.len(), 1);
+        }
+
+        #[test]
+        fn prop_filter_remote_tools_matches_destructive_policy(
+            safe_name in "[A-Za-z0-9_.-]{1,16}",
+            destructive_name in "[A-Za-z0-9_.-]{1,16}",
+        ) {
+            prop_assume!(safe_name != destructive_name);
+
+            let safe = McpClientToolDefinition {
+                name: safe_name.clone(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"destructive": false})),
+            };
+            let destructive = McpClientToolDefinition {
+                name: destructive_name.clone(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(serde_json::json!({"destructive": true})),
+            };
+
+            let mut settings = McpClientConfig::default();
+            settings.proxy_allow_mutating_tools = false;
+            let filtered = filter_remote_tools(&settings, vec![safe.clone(), destructive.clone()]);
+            prop_assert_eq!(filtered.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![safe_name.as_str()]);
+
+            settings.proxy_allow_mutating_tools = true;
+            let unfiltered = filter_remote_tools(&settings, vec![safe, destructive]);
+            prop_assert_eq!(unfiltered.len(), 2);
+        }
     }
 }
