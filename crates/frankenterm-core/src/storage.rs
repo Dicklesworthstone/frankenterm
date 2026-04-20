@@ -9898,6 +9898,14 @@ impl StorageHandle {
 
     /// Get an agent session by ID
     pub async fn get_agent_session(&self, session_id: i64) -> Result<Option<AgentSessionRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_agent_session_with_cx(&cx, session_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
@@ -9908,6 +9916,7 @@ impl StorageHandle {
             query_agent_session(&conn, session_id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_agent_session`].
@@ -9919,7 +9928,16 @@ impl StorageHandle {
     ) -> Result<Option<AgentSessionRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_agent_session cancelled: {err}")))?;
-        self.get_agent_session(session_id).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_agent_session(&conn, session_id)
+        })
+        .await
     }
 
     /// Get active agent sessions (those without an ended_at timestamp)
