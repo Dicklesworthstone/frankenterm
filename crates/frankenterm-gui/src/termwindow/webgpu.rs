@@ -168,29 +168,18 @@ impl Texture2d for WebGpuTexture {
 
         // wgpu 25 removed caller-specified timeouts from PollType::Wait, so
         // preserve FrankenTerm's 5-second readback deadline with a bounded poll loop.
-        let deadline = Instant::now() + WEBGPU_READBACK_TIMEOUT;
-        loop {
-            self.device
-                .poll(wgpu::PollType::Poll)
-                .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
-
-            match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(result) => {
-                    result
-                        .map_err(|err| anyhow!("mapping webgpu readback buffer failed: {err:?}"))?;
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(anyhow!("timed out waiting for webgpu readback mapping"));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow!(
-                        "webgpu readback mapping callback disconnected before completion"
-                    ));
-                }
-            }
-        }
+        wait_for_webgpu_readback_map(
+            WEBGPU_READBACK_TIMEOUT,
+            Duration::from_millis(10),
+            || {
+                self.device
+                    .poll(wgpu::PollType::Poll)
+                    .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
+                Ok(())
+            },
+            |poll_interval| receiver.recv_timeout(poll_interval),
+            Instant::now,
+        )?;
 
         let data = slice.get_mapped_range();
         // wgpu requires 256-byte row alignment for copy-to-buffer, but the
@@ -273,6 +262,41 @@ fn padded_readback_bytes_per_row(width: u32) -> u32 {
         let aligned = u64::from(unpadded).div_ceil(alignment) * alignment;
         let max_aligned = (u64::from(u32::MAX) / alignment) * alignment;
         aligned.min(max_aligned) as u32
+    }
+}
+
+fn wait_for_webgpu_readback_map<E, TPoll, TRecv, TNow>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut poll: TPoll,
+    mut recv: TRecv,
+    mut now: TNow,
+) -> anyhow::Result<()>
+where
+    E: std::fmt::Debug,
+    TPoll: FnMut() -> anyhow::Result<()>,
+    TRecv: FnMut(Duration) -> Result<Result<(), E>, mpsc::RecvTimeoutError>,
+    TNow: FnMut() -> Instant,
+{
+    let deadline = now() + timeout;
+    loop {
+        poll()?;
+
+        match recv(poll_interval) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                return Err(anyhow!("mapping webgpu readback buffer failed: {err:?}"));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if now() < deadline => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(anyhow!("timed out waiting for webgpu readback mapping"));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!(
+                    "webgpu readback mapping callback disconnected before completion"
+                ));
+            }
+        }
     }
 }
 
@@ -740,10 +764,64 @@ mod tests {
     use super::{
         copy_padded_readback_to_image, initial_surface_extent, padded_readback_bytes_per_row,
         resize_surface_extent, select_composite_alpha_mode, select_surface_format,
-        select_surface_view_formats, select_view_formats_for_format,
+        select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
     };
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
     use window::Dimensions;
     use window::bitmaps::{BitmapImage, Image};
+
+    #[derive(Debug)]
+    struct ReadbackWaitSnapshot {
+        result: String,
+        poll_calls: usize,
+        recv_timeouts_ms: Vec<u128>,
+    }
+
+    fn snapshot_readback_wait<E: std::fmt::Debug>(
+        recv_results: impl IntoIterator<Item = Result<Result<(), E>, mpsc::RecvTimeoutError>>,
+        now_offsets_ms: impl IntoIterator<Item = u64>,
+    ) -> ReadbackWaitSnapshot {
+        let timeout = Duration::from_millis(20);
+        let poll_interval = Duration::from_millis(5);
+        let base = Instant::now();
+        let mut recv_results = recv_results.into_iter().collect::<VecDeque<_>>();
+        let mut now_offsets = now_offsets_ms
+            .into_iter()
+            .map(|offset| base + Duration::from_millis(offset))
+            .collect::<VecDeque<_>>();
+        let mut last_now = base;
+        let mut poll_calls = 0;
+        let mut recv_timeouts_ms = Vec::new();
+        let result = wait_for_webgpu_readback_map(
+            timeout,
+            poll_interval,
+            || {
+                poll_calls += 1;
+                Ok(())
+            },
+            |timeout| {
+                recv_timeouts_ms.push(timeout.as_millis());
+                recv_results
+                    .pop_front()
+                    .expect("test must provide enough recv results")
+            },
+            || {
+                let now = now_offsets.pop_front().unwrap_or(last_now);
+                last_now = now;
+                now
+            },
+        );
+
+        ReadbackWaitSnapshot {
+            result: result
+                .map(|_| "ok".to_string())
+                .unwrap_or_else(|err| err.to_string()),
+            poll_calls,
+            recv_timeouts_ms,
+        }
+    }
 
     #[test]
     fn surface_format_prefers_srgb_variant() {
@@ -999,6 +1077,68 @@ mod tests {
         assert_eq!(
             dest.pixel_data_slice(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn wait_for_webgpu_readback_map_retries_until_callback_completes() {
+        k9::snapshot!(
+            snapshot_readback_wait::<&'static str>(
+                [Err(mpsc::RecvTimeoutError::Timeout), Ok(Ok(()))],
+                [0, 5],
+            ),
+            "
+ReadbackWaitSnapshot {
+    result: \"ok\",
+    poll_calls: 2,
+    recv_timeouts_ms: [
+        5,
+        5,
+    ],
+}
+"
+        );
+    }
+
+    #[test]
+    fn wait_for_webgpu_readback_map_times_out_at_deadline_boundary() {
+        k9::snapshot!(
+            snapshot_readback_wait::<&'static str>(
+                [
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                ],
+                [0, 5, 20],
+            ),
+            "
+ReadbackWaitSnapshot {
+    result: \"timed out waiting for webgpu readback mapping\",
+    poll_calls: 2,
+    recv_timeouts_ms: [
+        5,
+        5,
+    ],
+}
+"
+        );
+    }
+
+    #[test]
+    fn wait_for_webgpu_readback_map_reports_disconnected_callback() {
+        k9::snapshot!(
+            snapshot_readback_wait::<&'static str>(
+                [Err(mpsc::RecvTimeoutError::Disconnected)],
+                [0],
+            ),
+            "
+ReadbackWaitSnapshot {
+    result: \"webgpu readback mapping callback disconnected before completion\",
+    poll_calls: 1,
+    recv_timeouts_ms: [
+        5,
+    ],
+}
+"
         );
     }
 }
