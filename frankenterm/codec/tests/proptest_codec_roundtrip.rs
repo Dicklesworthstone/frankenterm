@@ -1,8 +1,8 @@
 use codec::{
     CreateFloatingPane, ErrorResponse, GetCodecVersion, GetCodecVersionResponse, GetTlsCreds,
-    GetTlsCredsResponse, Pdu, RenameWorkspace, SelectStackPane, SendPaste, SetActiveWorkspace,
-    SetClipboard, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    GetTlsCredsResponse, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane, SendPaste,
+    SetActiveWorkspace, SetClipboard, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged,
+    UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -317,6 +317,16 @@ proptest! {
     #[test]
     fn get_tls_creds_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::GetTlsCreds(GetTlsCreds {}));
+    }
+
+    #[test]
+    fn ping_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::Ping(Ping {}));
+    }
+
+    #[test]
+    fn pong_response_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::Pong(Pong {}));
     }
 
     #[test]
