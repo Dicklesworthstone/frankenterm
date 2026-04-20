@@ -425,12 +425,28 @@ impl RecordingManager {
 
     /// Record a captured output segment under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
+    ///
+    /// Redaction is a pure function over `&self.redactor` and
+    /// `&self.options` — it does not touch the `recorders` mutex, so we
+    /// run it *before* acquiring the lock. This keeps the critical
+    /// section reduced to the HashMap lookup, the `is_recording` check,
+    /// and the synchronous `record_output` write; concurrent callers
+    /// targeting *other* panes are no longer serialized behind this
+    /// pane's regex-scan + allocation work.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_segment_with_cx(
         &self,
         cx: &crate::cx::Cx,
         segment: &CapturedSegment,
     ) -> Result<()> {
+        let payload: Vec<u8> = if self.options.redact_output {
+            self.redactor.redact(&segment.content).into_bytes()
+        } else {
+            segment.content.as_bytes().to_vec()
+        };
+        let content_len = segment.content.len() as u64;
+        let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
+
         let mut guard = self.recorders.lock_with_cx(cx).await;
         let Some(recorder) = guard.get_mut(&segment.pane_id) else {
             return Ok(());
@@ -439,15 +455,7 @@ impl RecordingManager {
             return Ok(());
         }
 
-        let payload = if self.options.redact_output {
-            let redacted = self.redactor.redact(&segment.content);
-            redacted.into_bytes()
-        } else {
-            segment.content.as_bytes().to_vec()
-        };
-
-        let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
-        recorder.bytes_raw += segment.content.len() as u64;
+        recorder.bytes_raw += content_len;
         recorder.record_output(segment.captured_at, is_gap, &payload)
     }
 
@@ -485,6 +493,10 @@ impl RecordingManager {
 
     /// Record a detection event under an explicit `&Cx` (ft-xbnl0.2.3
     /// Cx-first entry point).
+    ///
+    /// Mirrors the critical-section reduction in `record_segment_with_cx`:
+    /// the redaction step is a pure function over `&self.redactor` and
+    /// does not touch the `recorders` mutex, so it runs above the lock.
     #[cfg(feature = "asupersync-runtime")]
     pub async fn record_event_with_cx(
         &self,
@@ -493,6 +505,13 @@ impl RecordingManager {
         detection: &Detection,
         captured_at_ms: i64,
     ) -> Result<()> {
+        let redacted_owned: Option<Detection> = if self.options.redact_events {
+            Some(redact_detection(detection, &self.redactor))
+        } else {
+            None
+        };
+        let detection_ref: &Detection = redacted_owned.as_ref().unwrap_or(detection);
+
         let mut guard = self.recorders.lock_with_cx(cx).await;
         let Some(recorder) = guard.get_mut(&pane_id) else {
             return Ok(());
@@ -500,12 +519,7 @@ impl RecordingManager {
         if !recorder.is_recording() {
             return Ok(());
         }
-
-        let mut detection = detection.clone();
-        if self.options.redact_events {
-            detection = redact_detection(&detection, &self.redactor);
-        }
-        recorder.record_event(&detection, captured_at_ms)
+        recorder.record_event(detection_ref, captured_at_ms)
     }
 }
 
