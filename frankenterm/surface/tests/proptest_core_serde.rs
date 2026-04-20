@@ -258,3 +258,27 @@ fn flush_changes_older_than_zero_preserves_pending_change_visibility() {
     assert!(surface.has_changes(0));
     assert!(!surface.has_changes(1));
 }
+
+#[test]
+fn get_changes_at_current_seqno_returns_empty_delta() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+    let seq = surface.current_seqno();
+
+    let (next_seq, changes) = surface.get_changes(seq);
+
+    assert_eq!(next_seq, seq);
+    assert!(changes.is_empty());
+}
+
+#[test]
+fn get_changes_from_zero_returns_non_empty_repaint_and_current_seqno() {
+    let mut surface = Surface::new(2, 1);
+    surface.add_change(Change::Text("x".to_string()));
+    let seq = surface.current_seqno();
+
+    let (next_seq, changes) = surface.get_changes(0);
+
+    assert_eq!(next_seq, seq);
+    assert!(!changes.is_empty());
+}
