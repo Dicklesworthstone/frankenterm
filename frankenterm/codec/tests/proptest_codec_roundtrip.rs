@@ -2,14 +2,15 @@ use chrono::TimeZone;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
     ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderableDimensions,
-    GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
-    LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
-    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
-    SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout,
-    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    GetImageCell, GetLines, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
+    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
+    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
+    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize,
+    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendPaste,
+    SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -509,6 +510,35 @@ fn arb_search_scrollback_response() -> impl Strategy<Value = SearchScrollbackRes
         .prop_map(|results| SearchScrollbackResponse { results })
 }
 
+fn arb_get_lines() -> impl Strategy<Value = GetLines> {
+    (
+        0u64..=4096,
+        proptest::collection::vec(
+            (-100_000isize..=100_000isize, -100_000isize..=100_000isize),
+            0..=16,
+        ),
+    )
+        .prop_map(|(pane_id, lines)| GetLines {
+            pane_id,
+            lines: lines.into_iter().map(|(a, b)| a.min(b)..a.max(b)).collect(),
+        })
+}
+
+fn arb_get_image_cell() -> impl Strategy<Value = GetImageCell> {
+    (
+        0u64..=4096,
+        any::<i64>(),
+        0usize..=1024,
+        prop::array::uniform32(any::<u8>()),
+    )
+        .prop_map(|(pane_id, line_idx, cell_idx, data_hash)| GetImageCell {
+            pane_id,
+            line_idx,
+            cell_idx,
+            data_hash,
+        })
+}
+
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
     let mut encoded = Vec::new();
     pdu.encode(&mut encoded, serial).unwrap();
@@ -1004,6 +1034,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SearchScrollbackResponse(payload));
+    }
+
+    #[test]
+    fn get_lines_json_and_pdu_roundtrip(
+        payload in arb_get_lines(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetLines = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetLines(payload));
+    }
+
+    #[test]
+    fn get_image_cell_json_and_pdu_roundtrip(
+        payload in arb_get_image_cell(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetImageCell = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetImageCell(payload));
     }
 
     #[test]
