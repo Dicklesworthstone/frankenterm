@@ -10879,6 +10879,52 @@ impl StorageHandle {
 
     /// Get all output gaps (for search explain diagnostics)
     pub async fn get_gaps(&self) -> Result<Vec<Gap>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_gaps_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error(
+                "Task join error",
+                move || -> Result<Vec<Gap>> {
+                    let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                        StorageError::Database(format!("Failed to open read connection: {e}"))
+                    })?;
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
+                         FROM output_gaps ORDER BY detected_at DESC",
+                        )
+                        .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok(Gap {
+                                id: row.get(0)?,
+                                pane_id: row.get::<_, i64>(1)? as u64,
+                                seq_before: row.get::<_, i64>(2)? as u64,
+                                seq_after: row.get::<_, i64>(3)? as u64,
+                                reason: row.get(4)?,
+                                detected_at: row.get(5)?,
+                            })
+                        })
+                        .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
+                },
+            )
+            .await
+        }
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
+    #[cfg(feature = "asupersync-runtime")]
+    pub async fn get_gaps_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<Gap>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
@@ -10909,14 +10955,6 @@ impl StorageHandle {
             },
         )
         .await
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
-    #[cfg(feature = "asupersync-runtime")]
-    pub async fn get_gaps_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<Gap>> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
-        self.get_gaps().await
     }
 
     /// Count retention cleanup events (for search explain diagnostics)
