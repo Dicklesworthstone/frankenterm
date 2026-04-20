@@ -151,6 +151,14 @@ pub struct NativeEventListener {
 
 impl NativeEventListener {
     pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return Self::bind_with_cx(&cx, socket_path).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         if socket_path.as_os_str().is_empty() {
             return Err(NativeEventError::EmptySocketPath);
         }
@@ -166,6 +174,7 @@ impl NativeEventListener {
             socket_path,
             listener,
         })
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
