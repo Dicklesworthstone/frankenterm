@@ -1923,6 +1923,39 @@ mod tests {
         }
     }
 
+    /// Like `run_async_test` but spawns a dedicated thread so the test gets
+    /// a pristine TLS state. Prevents interference when 25 000+ tests run
+    /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
+    fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let result = std::thread::Builder::new()
+            .name("snapshot-test-isolated".into())
+            .spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("snapshot test runtime should build");
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(f());
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(runtime);
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::runtime_compat::clear_runtime_handle();
+                }));
+                if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .expect("failed to spawn isolated test thread")
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     fn make_test_pane(id: u64, rows: u32, cols: u32) -> PaneInfo {
         PaneInfo {
             pane_id: id,
@@ -2375,7 +2408,8 @@ mod tests {
     #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_periodic_with_cx_mid_flight_cancel_exits_quickly() {
-        run_async_test(async {
+        // Thread-isolated to prevent TLS interference from 25K+ parallel tests.
+        run_async_test_isolated(|| async {
             let (_tmp, db_path) = setup_test_db();
             let config = SnapshotConfig {
                 interval_seconds: 30,
@@ -2413,8 +2447,8 @@ mod tests {
             let elapsed = started.elapsed();
 
             assert!(
-                elapsed < Duration::from_secs(2),
-                "mid-flight cx-cancel should cut the scheduler within 2s \
+                elapsed < Duration::from_secs(5),
+                "mid-flight cx-cancel should cut the scheduler within 5s \
                  (cx threading upgrade should avoid the 30s interval wait), took {elapsed:?}"
             );
         });

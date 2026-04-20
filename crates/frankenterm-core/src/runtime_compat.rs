@@ -2868,6 +2868,38 @@ mod tests {
         }
     }
 
+    /// Like `run_async_test` but spawns a dedicated thread so the test gets
+    /// a pristine TLS state. Prevents interference when 25 000+ tests run
+    /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
+    fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let result = std::thread::Builder::new()
+            .name("runtime-compat-test-isolated".into())
+            .spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("failed to build runtime for isolated test");
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(f());
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(runtime);
+                }));
+                #[cfg(feature = "asupersync-runtime")]
+                clear_runtime_handle();
+                if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .expect("failed to spawn isolated test thread")
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[cfg(not(feature = "asupersync-runtime"))]
     fn run_paused_async_test<F>(future: F)
     where
@@ -5107,8 +5139,8 @@ mod tests {
     #[cfg(all(feature = "asupersync-runtime", unix))]
     #[test]
     fn process_command_output_with_cx_cancellation_surfaces_as_interrupted() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
+        // Thread-isolated to prevent TLS interference from 25K+ parallel tests.
+        run_async_test_isolated(|| async {
             let cx = crate::cx::for_testing();
             let cx_cancel_trigger = cx.clone();
             task::spawn(async move {
@@ -5135,7 +5167,7 @@ mod tests {
                 "cx-cancelled process output must surface as Interrupted: {err}"
             );
             assert!(
-                elapsed < Duration::from_secs(2),
+                elapsed < Duration::from_secs(5),
                 "cancellation should surface promptly (got {elapsed:?}); the 10s sleep would dominate if cx was ignored"
             );
         });

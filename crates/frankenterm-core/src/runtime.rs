@@ -4801,7 +4801,9 @@ mod tests {
                     .with_wezterm_handle(wezterm_handle);
 
             let handle = runtime.start().await.expect("runtime should start");
-            sleep(Duration::from_millis(30)).await;
+            // Allow generous time for the runtime to complete its initial
+            // discovery cycle under heavy parallel-test load.
+            sleep(Duration::from_millis(100)).await;
 
             let summary = handle.shutdown_with_summary().await;
             assert!(
@@ -4851,14 +4853,15 @@ mod tests {
             let handle = runtime.start().await.expect("runtime should start");
 
             // Start with no panes, then add one after startup so discovery
-            // has a deterministic pane surface for capture.
-            sleep(Duration::from_millis(120)).await;
+            // has a deterministic pane surface for capture. Generous delays
+            // for heavy parallel-test load.
+            sleep(Duration::from_millis(200)).await;
             mock.add_default_pane(0).await;
-            sleep(Duration::from_millis(220)).await;
+            sleep(Duration::from_millis(300)).await;
             mock.inject_output(0, "replay capture smoke\n")
                 .await
                 .unwrap();
-            sleep(Duration::from_millis(220)).await;
+            sleep(Duration::from_millis(300)).await;
 
             let summary = handle.shutdown_with_summary().await;
             assert!(

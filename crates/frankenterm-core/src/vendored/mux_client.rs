@@ -2566,6 +2566,40 @@ mod tests {
         }
     }
 
+    /// Like `run_async_test` but spawns a dedicated thread so the test gets
+    /// a pristine TLS state. Prevents interference when 25 000+ tests run
+    /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
+    #[allow(dead_code)]
+    fn run_async_test_isolated<F>(f: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let result = std::thread::Builder::new()
+            .name("mux-client-test-isolated".into())
+            .spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("failed to build runtime for mux_client isolated test");
+                let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    CompatRuntime::block_on(&runtime, f());
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(runtime);
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::runtime_compat::clear_runtime_handle();
+                }));
+                if let Err(payload) = test_result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .expect("failed to spawn isolated test thread")
+            .join();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     async fn write_response_pdu(
         stream: &mut compat_unix::UnixStream,
         pdu: &Pdu,
