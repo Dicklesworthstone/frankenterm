@@ -10970,6 +10970,14 @@ impl StorageHandle {
 
     /// Query audit actions with filters
     pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_audit_actions_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
@@ -10980,6 +10988,7 @@ impl StorageHandle {
             crate::storage::query_audit_actions(&conn, &query)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions`].
@@ -10995,7 +11004,16 @@ impl StorageHandle {
     ) -> Result<Vec<AuditActionRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_audit_actions cancelled: {err}")))?;
-        self.get_audit_actions(query).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            crate::storage::query_audit_actions(&conn, &query)
+        })
+        .await
     }
 
     /// Stream audit actions using a cursor and stable ordering.
