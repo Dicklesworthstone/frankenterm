@@ -65,6 +65,7 @@ impl Drop for UmaskSaver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::Mutex;
 
     // UmaskSaver mutates process-global state, so tests must be serialized.
@@ -1608,5 +1609,30 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let saver = UmaskSaver::new();
         drop(saver);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[cfg(unix)]
+        #[test]
+        fn arbitrary_umask_roundtrips_through_saver(original in 0u16..=0o777u16) {
+            let _g = TEST_LOCK.lock().unwrap();
+            let original = original as libc::mode_t;
+            let prior = unsafe { umask(original) };
+
+            {
+                let _saver = UmaskSaver::new();
+                let current = unsafe { umask(0o077) };
+                prop_assert_eq!(current, 0o077);
+                unsafe { umask(current) };
+                prop_assert_eq!(UmaskSaver::saved_umask(), Some(original));
+            }
+
+            let restored = unsafe { umask(prior) };
+            prop_assert_eq!(restored, original);
+            prop_assert!(UmaskSaver::saved_umask().is_none());
+            unsafe { umask(prior) };
+        }
     }
 }
