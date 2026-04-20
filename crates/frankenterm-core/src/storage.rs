@@ -7660,16 +7660,25 @@ impl StorageHandle {
         &self,
         records: Vec<UsageMetricRecord>,
     ) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::RecordUsageMetricsBatch {
-                records,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.record_usage_metrics_batch_with_cx(&cx, records).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::RecordUsageMetricsBatch {
+                    records,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metrics_batch`].
@@ -7682,7 +7691,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("record_usage_metrics_batch cancelled: {err}"))
         })?;
-        self.record_usage_metrics_batch(records).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordUsageMetricsBatch {
+                    records,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Purge usage metrics older than a cutoff timestamp.
