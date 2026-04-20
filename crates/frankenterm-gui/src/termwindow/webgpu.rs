@@ -3,7 +3,7 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use window::bitmaps::{Texture2d, validate_texture_readback_request};
 use window::raw_window_handle::{
@@ -166,16 +166,31 @@ impl Texture2d for WebGpuTexture {
             let _ = sender.send(result);
         });
 
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(WEBGPU_READBACK_TIMEOUT),
-            })
-            .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
-        receiver
-            .recv_timeout(WEBGPU_READBACK_TIMEOUT)
-            .map_err(|_| anyhow!("timed out waiting for webgpu readback mapping"))?
-            .map_err(|err| anyhow!("mapping webgpu readback buffer failed: {err:?}"))?;
+        // wgpu 25 removed caller-specified timeouts from PollType::Wait, so
+        // preserve FrankenTerm's 5-second readback deadline with a bounded poll loop.
+        let deadline = Instant::now() + WEBGPU_READBACK_TIMEOUT;
+        loop {
+            self.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|err| anyhow!("polling webgpu readback failed: {err:?}"))?;
+
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => {
+                    result
+                        .map_err(|err| anyhow!("mapping webgpu readback buffer failed: {err:?}"))?;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(anyhow!("timed out waiting for webgpu readback mapping"));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow!(
+                        "webgpu readback mapping callback disconnected before completion"
+                    ));
+                }
+            }
+        }
 
         let data = slice.get_mapped_range();
         // wgpu requires 256-byte row alignment for copy-to-buffer, but the
