@@ -224,7 +224,7 @@ impl<T> Mutex<T> {
     }
 
     pub async fn lock(&self) -> MutexGuard<'_, T> {
-        let cx = crate::cx::for_request();
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.lock_with_cx(&cx).await
     }
 
