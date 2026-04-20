@@ -21,3 +21,7 @@ uuid = {workspace=true, features=["v4", "rng"]}
 default = []
 serde = ["dep:serde", "uuid/serde"]
 simple_tempdir = ["dep:tempfile"]
+
+[dev-dependencies]
+proptest = "1.8.0"
+serde_json.workspace = true
