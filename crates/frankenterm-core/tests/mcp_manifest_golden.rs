@@ -290,6 +290,10 @@ fn mcp_manifest_matches_golden_without_db() {
         !absent_db_tools.is_empty(),
         "expected db-backed manifest to expose db-gated tools absent from no-db mode"
     );
+    // Whitelist of tools that MUST be db-gated. Each entry is verified
+    // twice (ft-cbeyl): (a) the tool still exists in the db-backed manifest
+    // — guards against rename/removal silently making the no-db check pass
+    // trivially — and (b) the tool is absent from the no-db manifest.
     for expected_absent_tool in [
         "wa.accounts",
         "wa.events",
@@ -299,6 +303,10 @@ fn mcp_manifest_matches_golden_without_db() {
         "wa.send",
         "wa.workflow_run",
     ] {
+        assert!(
+            full_tools.contains(expected_absent_tool),
+            "whitelist drift (ft-cbeyl): {expected_absent_tool} no longer exists in the db-backed manifest — update the whitelist deliberately instead of letting the no-db check pass trivially"
+        );
         assert!(
             !no_db_tools.contains(expected_absent_tool),
             "db-gated tool unexpectedly advertised without db_path: {expected_absent_tool}"
@@ -319,6 +327,10 @@ fn mcp_manifest_matches_golden_without_db() {
         "wa://reservations",
     ] {
         assert!(
+            full_resources.contains(expected_absent_resource),
+            "whitelist drift (ft-cbeyl): {expected_absent_resource} no longer exists in the db-backed manifest — update the whitelist deliberately instead of letting the no-db check pass trivially"
+        );
+        assert!(
             !no_db_resources.contains(expected_absent_resource),
             "db-gated resource unexpectedly advertised without db_path: {expected_absent_resource}"
         );
@@ -330,6 +342,10 @@ fn mcp_manifest_matches_golden_without_db() {
         "wa://events/unhandled/{limit}",
         "wa://reservations/{pane_id}",
     ] {
+        assert!(
+            full_templates.contains(expected_absent_template),
+            "whitelist drift (ft-cbeyl): {expected_absent_template} no longer exists in the db-backed manifest — update the whitelist deliberately instead of letting the no-db check pass trivially"
+        );
         assert!(
             !no_db_templates.contains(expected_absent_template),
             "db-gated template unexpectedly advertised without db_path: {expected_absent_template}"
