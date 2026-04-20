@@ -433,6 +433,118 @@ pub(super) fn handle_stream_events(
         };
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            task::spawn_with_cx(&stream_cx, move |child_cx| async move {
+                let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
+                let mut next_emit_at = Instant::now();
+                let mut seq = 0_u64;
+                let mut consecutive_drops = 0_u64;
+
+                seq += 1;
+                let ready = make_stream_frame(
+                    "events",
+                    "ready",
+                    seq,
+                    json!({
+                        "channel": format!("{channel:?}").to_lowercase(),
+                        "max_hz": max_hz,
+                        "pane_id": pane_filter
+                    }),
+                );
+                if let Some(event) = frame_to_sse("ready", seq, ready) {
+                    if !send_rate_limited_sse(
+                        &tx,
+                        event,
+                        &mut next_emit_at,
+                        min_interval,
+                        &mut consecutive_drops,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+
+                loop {
+                    let recv_result = select! {
+                        () = sender_closed(&tx) => break,
+                        recv = crate::runtime_compat::timeout_with_cx(
+                            &child_cx,
+                            Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                            subscriber.recv_cx(&child_cx),
+                        ) => recv,
+                    };
+
+                    match recv_result {
+                        Ok(Ok(event)) => {
+                            if !event_matches_pane(&event, pane_filter) {
+                                continue;
+                            }
+
+                            let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
+                                json!({
+                                    "error": "event_serialization_failed"
+                                })
+                            });
+                            redact_json_value(&mut event_json, &redactor);
+
+                            seq += 1;
+                            let frame = make_stream_frame(
+                                "events",
+                                "event",
+                                seq,
+                                json!({ "event": event_json }),
+                            );
+                            if let Some(event) = frame_to_sse("event", seq, frame) {
+                                if !send_rate_limited_sse(
+                                    &tx,
+                                    event,
+                                    &mut next_emit_at,
+                                    min_interval,
+                                    &mut consecutive_drops,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(RecvError::Lagged { missed_count })) => {
+                            seq += 1;
+                            let frame = make_stream_frame(
+                                "events",
+                                "lag",
+                                seq,
+                                json!({ "missed_count": missed_count }),
+                            );
+                            if let Some(event) = frame_to_sse("lag", seq, frame) {
+                                if !send_rate_limited_sse(
+                                    &tx,
+                                    event,
+                                    &mut next_emit_at,
+                                    min_interval,
+                                    &mut consecutive_drops,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(RecvError::Closed)) => break,
+                        Err(_) => {
+                            if tx.try_send(SseEvent::comment("keepalive")).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         task::spawn(async move {
             let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
             let mut next_emit_at = Instant::now();
