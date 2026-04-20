@@ -159,6 +159,14 @@ impl FrameworkWebRuntime {
 
     #[doc(hidden)]
     pub async fn finish(self, result: FrameworkServerJoinResult) -> Result<()> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.finish_with_cx(&cx, result).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         match result {
             Ok(()) => {}
             Err(ServerError::Shutdown) => {}
@@ -173,6 +181,7 @@ impl FrameworkWebRuntime {
         }
         self.app.run_shutdown_hooks().await;
         Ok(())
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`finish`].
