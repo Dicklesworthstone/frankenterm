@@ -9808,6 +9808,16 @@ impl StorageHandle {
 
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .get_latest_checkpoint_hash_with_cx(&cx, session_id)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -9816,6 +9826,7 @@ impl StorageHandle {
             get_latest_checkpoint_hash(&conn, &session_id)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_checkpoint_hash`].
@@ -9828,7 +9839,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_latest_checkpoint_hash cancelled: {err}"))
         })?;
-        self.get_latest_checkpoint_hash(session_id).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_latest_checkpoint_hash(&conn, &session_id)
+        })
+        .await
     }
 
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
