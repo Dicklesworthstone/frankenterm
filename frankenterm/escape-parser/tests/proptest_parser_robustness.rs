@@ -11,8 +11,8 @@
 //!   4. **Reparse stability** — display(parse(input)) re-parses without panic
 //!   5. **Action::append_to coalescence** — Print chars merge correctly
 
-use frankenterm_escape_parser::parser::Parser;
 use frankenterm_escape_parser::Action;
+use frankenterm_escape_parser::parser::Parser;
 use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────────
@@ -28,6 +28,9 @@ fn arb_printable_bytes() -> impl Strategy<Value = Vec<u8>> {
 }
 
 /// Structured CSI sequences: ESC [ <params> <final byte>.
+///
+/// The broad variant covers every byte in the 0x40..0x7e CSI final range
+/// so `parse_never_panics_on_csi` exercises unknown finals too.
 fn arb_csi_sequence() -> impl Strategy<Value = Vec<u8>> {
     (
         proptest::collection::vec(0u16..1000u16, 0..5),
@@ -46,18 +49,53 @@ fn arb_csi_sequence() -> impl Strategy<Value = Vec<u8>> {
         })
 }
 
+/// Canonical CSI byte strings that the parser is expected to reduce to
+/// exactly one `Action::CSI(...)` (ft-mdaon).
+///
+/// This is deliberately narrower than "all complete CSI sequences": the
+/// parser intentionally expands some syntactically complete inputs, such
+/// as multi-parameter SGR (`ESC[1;3m`), into multiple actions. The roundtrip
+/// MR needs a singleton corpus so it can hard-fail on shape drift instead
+/// of silently skipping or asserting a false contract.
+fn arb_singleton_csi_sequence() -> impl Strategy<Value = Vec<u8>> {
+    let canonical_singletons: Vec<Vec<u8>> = vec![
+        b"\x1b[0m".to_vec(),
+        b"\x1b[1m".to_vec(),
+        b"\x1b[22m".to_vec(),
+        b"\x1b[3m".to_vec(),
+        b"\x1b[23m".to_vec(),
+        b"\x1b[4m".to_vec(),
+        b"\x1b[24m".to_vec(),
+        b"\x1b[7m".to_vec(),
+        b"\x1b[27m".to_vec(),
+        b"\x1b[8m".to_vec(),
+        b"\x1b[28m".to_vec(),
+        b"\x1b[9m".to_vec(),
+        b"\x1b[29m".to_vec(),
+        b"\x1b[53m".to_vec(),
+        b"\x1b[55m".to_vec(),
+        b"\x1b[A".to_vec(),
+        b"\x1b[5B".to_vec(),
+        b"\x1b[10G".to_vec(),
+        b"\x1b[2J".to_vec(),
+        b"\x1b[3K".to_vec(),
+        b"\x1b[!p".to_vec(),
+    ];
+
+    proptest::sample::select(canonical_singletons)
+}
+
 /// Structured OSC sequences: ESC ] <num> ; <data> ST.
 fn arb_osc_sequence() -> impl Strategy<Value = Vec<u8>> {
-    (0u16..200u16, "[a-zA-Z0-9 _/.-]{0,32}")
-        .prop_map(|(num, data)| {
-            let mut bytes = vec![0x1b, b']'];
-            bytes.extend_from_slice(num.to_string().as_bytes());
-            bytes.push(b';');
-            bytes.extend_from_slice(data.as_bytes());
-            bytes.push(0x1b);
-            bytes.push(b'\\'); // ST = ESC backslash
-            bytes
-        })
+    (0u16..200u16, "[a-zA-Z0-9 _/.-]{0,32}").prop_map(|(num, data)| {
+        let mut bytes = vec![0x1b, b']'];
+        bytes.extend_from_slice(num.to_string().as_bytes());
+        bytes.push(b';');
+        bytes.extend_from_slice(data.as_bytes());
+        bytes.push(0x1b);
+        bytes.push(b'\\'); // ST = ESC backslash
+        bytes
+    })
 }
 
 /// Mix of structured sequences and random noise.
@@ -164,24 +202,80 @@ proptest! {
         let _actions2 = parser2.parse_as_vec(re_encoded.as_bytes());
     }
 
-    /// For pure CSI sequences, parse → display → re-parse should yield
-    /// an action with the same Debug representation (metamorphic roundtrip).
+    /// For well-known CSI sequences, parse → display → re-parse must yield
+    /// exactly one action on BOTH passes, and those actions must share a
+    /// Debug representation (metamorphic roundtrip).
+    ///
+    /// ft-mdaon: previously the body was an `if actions1.len() == 1 { if
+    /// actions2.len() == 1 { ... } }` that silently passed on non-singleton
+    /// parses, so any regression that started emitting zero or multiple
+    /// actions for a canonical singleton CSI would hide behind the skip.
+    /// The generator is now narrowed to `arb_singleton_csi_sequence`, and
+    /// both singleton parses are now hard asserts.
     #[test]
-    fn csi_roundtrip_via_display(bytes in arb_csi_sequence()) {
+    fn csi_roundtrip_via_display(bytes in arb_singleton_csi_sequence()) {
         let mut parser1 = Parser::new();
         let actions1 = parser1.parse_as_vec(&bytes);
 
-        if actions1.len() == 1 {
-            let re_encoded = actions1[0].to_string();
-            let mut parser2 = Parser::new();
-            let actions2 = parser2.parse_as_vec(re_encoded.as_bytes());
+        prop_assert!(
+            actions1.len() == 1,
+            "well-known CSI input {:?} should parse to exactly one action, got {} ({:?})",
+            bytes,
+            actions1.len(),
+            actions1
+        );
 
-            if actions2.len() == 1 {
-                let repr1 = format!("{:?}", actions1[0]);
-                let repr2 = format!("{:?}", actions2[0]);
-                prop_assert_eq!(repr1, repr2, "CSI roundtrip mismatch");
-            }
-        }
+        let re_encoded = actions1[0].to_string();
+        let mut parser2 = Parser::new();
+        let actions2 = parser2.parse_as_vec(re_encoded.as_bytes());
+
+        prop_assert!(
+            actions2.len() == 1,
+            "re-encoded CSI {:?} should round-trip to exactly one action, got {} ({:?})",
+            re_encoded,
+            actions2.len(),
+            actions2
+        );
+
+        let repr1 = format!("{:?}", actions1[0]);
+        let repr2 = format!("{:?}", actions2[0]);
+        prop_assert_eq!(repr1, repr2, "CSI roundtrip Debug representation mismatch");
+    }
+
+    // ── Concatenation consistency ───────────────────────────────────
+
+    /// Parsing `a ++ b` on a fresh parser must produce the same rendered
+    /// text as feeding `a` then `b` to a single stateful parser.
+    ///
+    /// ft-mdaon: the suite header advertised this metamorphic relation
+    /// (property 3) but had no corresponding test. The relation only
+    /// holds when neither `a` nor `b` splits a multi-byte sequence at
+    /// its boundary — we restrict inputs to pure printable ASCII so the
+    /// parser never has pending intermediate state across the split.
+    #[test]
+    fn concatenation_consistency_for_printable(
+        a in proptest::collection::vec(0x20u8..0x7eu8, 0..64),
+        b in proptest::collection::vec(0x20u8..0x7eu8, 0..64),
+    ) {
+        let mut concat: Vec<u8> = Vec::with_capacity(a.len() + b.len());
+        concat.extend_from_slice(&a);
+        concat.extend_from_slice(&b);
+
+        let mut bulk_parser = Parser::new();
+        let bulk_actions = bulk_parser.parse_as_vec(&concat);
+        let bulk_text: String = bulk_actions.iter().map(|act| act.to_string()).collect();
+
+        let mut streaming_parser = Parser::new();
+        let mut streaming_actions = streaming_parser.parse_as_vec(&a);
+        streaming_actions.extend(streaming_parser.parse_as_vec(&b));
+        let streaming_text: String =
+            streaming_actions.iter().map(|act| act.to_string()).collect();
+
+        prop_assert_eq!(
+            bulk_text,
+            streaming_text,
+            "parse(a ++ b) must render the same text as parse(a) then parse(b) for printable inputs"
+        );
     }
 
     // ── Action coalescence ──────────────────────────────────────────
