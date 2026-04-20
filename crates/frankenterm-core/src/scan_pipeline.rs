@@ -1000,4 +1000,46 @@ mod tests {
             );
         }
     }
+
+    /// Adversarial seeds targeting crash-prone patterns: encoding abuse,
+    /// boundary conditions, unterminated sequences, byte floods.
+    #[test]
+    fn fuzz_adversarial_seeds_no_panic() {
+        let seeds: &[&[u8]] = &[
+            // ESC flood — all escape, no parameters or terminators
+            b"\x1b\x1b\x1b\x1b\x1b\x1b\x1b\x1b\x1b\x1b",
+            // Overlong UTF-8 (invalid: 2-byte encoding of ASCII)
+            b"\xc0\xaf\xc1\xbf\xe0\x80\xaf\xf0\x80\x80\xaf",
+            // Truncated multi-byte UTF-8 interrupted by ANSI escapes
+            b"\xe4\x1b[0m\xf0\x9f\x1b[31m\xf0\x1b",
+            // 0xFF flood (256 bytes, no valid UTF-8)
+            &[0xFF; 256],
+        ];
+
+        // Dynamic seeds that can't be byte literals
+        let nul_esc: Vec<u8> = (0..64).flat_map(|_| [0x00, 0x1b]).collect();
+        let mut unterminated_csi = Vec::with_capacity(1002);
+        unterminated_csi.extend_from_slice(b"\x1b[");
+        for _ in 0..500 {
+            unterminated_csi.extend_from_slice(b"0;");
+        }
+        let mut sgr_128 = Vec::with_capacity(260);
+        sgr_128.extend_from_slice(b"\x1b[");
+        for i in 0..128u8 {
+            if i > 0 { sgr_128.push(b';'); }
+            sgr_128.push(b'0');
+        }
+        sgr_128.push(b'm');
+
+        let dynamic_seeds: &[&[u8]] = &[&nul_esc, &unterminated_csi, &sgr_128];
+
+        for (i, seed) in seeds.iter().chain(dynamic_seeds.iter()).enumerate() {
+            let output = quick_scan(seed);
+            assert_eq!(
+                output.input_bytes,
+                seed.len() as u64,
+                "adversarial seed {i}: input_bytes mismatch"
+            );
+        }
+    }
 }
