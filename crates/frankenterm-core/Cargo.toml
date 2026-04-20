@@ -469,6 +469,19 @@ harness = false
 name = "rate_limit_ops"
 harness = false
 
+[[bench]]
+name = "notification_coalescing"
+harness = false
+
+[[bench]]
+name = "tailer"
+harness = false
+required-features = ["asupersync-runtime"]
+
+[[bench]]
+name = "event_dedup"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
