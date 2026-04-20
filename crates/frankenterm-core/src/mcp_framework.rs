@@ -276,6 +276,7 @@ fn framework_payload_error(label: &str, err: impl Display) -> McpClientError {
 #[cfg(all(test, feature = "mcp-client"))]
 mod tests {
     use super::{McpClientContentItem, McpClientToolDefinition};
+    use proptest::prelude::*;
 
     #[test]
     fn tool_definition_roundtrips_across_framework_seam() {
@@ -356,5 +357,89 @@ mod tests {
 
         assert_eq!(recovered, content);
         assert_eq!(recovered.as_text(), Some("hello from seam test"));
+    }
+
+    fn arb_opt_string() -> impl Strategy<Value = Option<String>> {
+        prop::option::of("[A-Za-z0-9 _.:/-]{1,32}")
+    }
+
+    fn arb_tags() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec("[A-Za-z0-9_.-]{1,16}", 0..4)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_tool_definition_roundtrips_across_framework_seam(
+            name in "[A-Za-z0-9_.-]{1,24}",
+            description in arb_opt_string(),
+            version in arb_opt_string(),
+            tags in arb_tags(),
+            destructive in any::<bool>(),
+            has_icon in any::<bool>(),
+        ) {
+            let definition = McpClientToolDefinition {
+                name: name.clone(),
+                description: description.clone(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "content": { "type": "array" } },
+                })),
+                icon: has_icon.then(|| serde_json::json!({
+                    "src": "https://example.com/icon.png",
+                    "mimeType": "image/png",
+                    "sizes": "32x32"
+                })),
+                version: version.clone(),
+                tags: tags.clone(),
+                annotations: Some(serde_json::json!({
+                    "destructive": destructive,
+                    "idempotent": !destructive,
+                })),
+            };
+
+            let framework = definition.clone().into_framework().expect("into framework");
+            let recovered = McpClientToolDefinition::from_framework(framework).expect("from framework");
+
+            prop_assert_eq!(&recovered, &definition);
+            prop_assert_eq!(recovered.is_destructive(), destructive);
+        }
+
+        #[test]
+        fn prop_content_item_text_roundtrips_and_as_text(
+            text in "[A-Za-z0-9 _.,:/-]{1,64}",
+        ) {
+            let content = McpClientContentItem(serde_json::json!({
+                "type": "text",
+                "text": text.clone(),
+            }));
+
+            let framework = content.clone().into_framework().expect("into framework");
+            let recovered = McpClientContentItem::from_framework(framework).expect("from framework");
+
+            prop_assert_eq!(&recovered, &content);
+            prop_assert_eq!(recovered.as_text(), Some(text.as_str()));
+        }
+
+        #[test]
+        fn prop_content_item_non_text_has_no_as_text(
+            payload in "[A-Za-z0-9 _.,:/-]{1,32}",
+        ) {
+            let content = McpClientContentItem(serde_json::json!({
+                "type": "image",
+                "url": format!("https://example.com/{payload}.png"),
+            }));
+
+            let framework = content.clone().into_framework().expect("into framework");
+            let recovered = McpClientContentItem::from_framework(framework).expect("from framework");
+
+            prop_assert_eq!(&recovered, &content);
+            prop_assert_eq!(recovered.as_text(), None);
+        }
     }
 }
