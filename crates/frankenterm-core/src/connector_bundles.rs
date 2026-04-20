@@ -1924,4 +1924,94 @@ mod tests {
         let err = BundleRegistryError::CapacityExceeded { max: 10 };
         assert!(err.to_string().contains("10"));
     }
+
+    // ========================================================================
+    // Variant-dispatch Display coverage
+    // ========================================================================
+
+    #[test]
+    fn bundle_tier_and_category_display_all_variants() {
+        // BundleTier: Tier2 + Tier3 were untested
+        assert_eq!(BundleTier::Tier2.to_string(), "tier2");
+        assert_eq!(BundleTier::Tier3.to_string(), "tier3");
+
+        // BundleCategory: 5 variants were untested
+        assert_eq!(
+            BundleCategory::ProjectManagement.to_string(),
+            "project_management"
+        );
+        assert_eq!(BundleCategory::Knowledge.to_string(), "knowledge");
+        assert_eq!(BundleCategory::Email.to_string(), "email");
+        assert_eq!(BundleCategory::Monitoring.to_string(), "monitoring");
+        assert_eq!(BundleCategory::General.to_string(), "general");
+    }
+
+    #[test]
+    fn ingestion_outcome_display_rejected_variant() {
+        let rejected = IngestionOutcome::Rejected {
+            reason: "bad schema".into(),
+        };
+        assert_eq!(rejected.to_string(), "rejected: bad schema");
+    }
+
+    #[test]
+    fn bundle_validation_result_display_all_paths() {
+        // valid, no warnings
+        let ok = BundleValidationResult::ok();
+        assert_eq!(ok.to_string(), "valid");
+
+        // valid with warnings
+        let mut with_warn = BundleValidationResult::ok();
+        with_warn.warn("deprecation");
+        with_warn.warn("unused field");
+        assert_eq!(with_warn.to_string(), "valid (2 warnings)");
+
+        // invalid, no warnings
+        let mut invalid = BundleValidationResult::ok();
+        invalid.error("missing manifest");
+        assert_eq!(invalid.to_string(), "INVALID (1 errors)");
+
+        // invalid with warnings
+        let mut both = BundleValidationResult::ok();
+        both.error("no sig");
+        both.error("bad hash");
+        both.warn("large bundle");
+        assert_eq!(both.to_string(), "INVALID (2 errors) (1 warnings)");
+    }
+
+    #[test]
+    fn bundle_registry_error_display_remaining_variants() {
+        // AlreadyExists, ValidationFailed, ConnectorNotInBundle, TrustInsufficient
+        assert_eq!(
+            BundleRegistryError::AlreadyExists {
+                bundle_id: "b1".into(),
+            }
+            .to_string(),
+            "bundle already exists: b1"
+        );
+        assert_eq!(
+            BundleRegistryError::ValidationFailed {
+                reason: "bad sig".into(),
+            }
+            .to_string(),
+            "bundle validation failed: bad sig"
+        );
+        assert_eq!(
+            BundleRegistryError::ConnectorNotInBundle {
+                bundle_id: "core".into(),
+                package_id: "slack".into(),
+            }
+            .to_string(),
+            "connector not found in bundle 'core': slack"
+        );
+        assert_eq!(
+            BundleRegistryError::TrustInsufficient {
+                package_id: "sketchy".into(),
+                required: "trusted".into(),
+                actual: "untrusted".into(),
+            }
+            .to_string(),
+            "trust level insufficient: connector 'sketchy' requires trusted, has untrusted"
+        );
+    }
 }
