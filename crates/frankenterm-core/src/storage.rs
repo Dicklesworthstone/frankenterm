@@ -6465,14 +6465,23 @@ impl StorageHandle {
 
     /// Fetch triage state, note, and labels for an event.
     pub async fn get_event_annotations(&self, event_id: i64) -> Result<Option<EventAnnotations>> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_event_annotations_sync(&conn, event_id)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_event_annotations_with_cx(&cx, event_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_event_annotations_sync(&conn, event_id)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_annotations`].
@@ -6485,7 +6494,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_event_annotations cancelled: {err}"))
         })?;
-        self.get_event_annotations(event_id).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_event_annotations_sync(&conn, event_id)
+        })
+        .await
     }
 
     /// Add or update a persistent event mute by identity key.
