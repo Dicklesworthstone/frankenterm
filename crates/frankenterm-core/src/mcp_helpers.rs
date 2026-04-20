@@ -575,8 +575,10 @@ mod tests {
         SEND_OSC_SEGMENT_LIMIT, StorageHandle, approval_command, check_refresh_cooldown,
         effective_search_fusion_weights, effective_search_quality_timeout_ms,
         effective_search_rrf_k, elapsed_ms, mcp_audit_decision_context, policy_reason,
-        record_mcp_audit, redact_mcp_args, resolve_alt_screen_state,
+        record_mcp_audit, redact_mcp_args, reservation_to_mcp_info, resolve_alt_screen_state,
     };
+    use crate::storage::PaneReservation;
+    use proptest::prelude::*;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1120,6 +1122,109 @@ mod tests {
                 names.contains(name),
                 "helpers builtin_workflows missing: {name}"
             );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_check_refresh_cooldown_matches_elapsed_math(
+            most_recent_refresh_ms in 1i64..=4_102_444_800_000i64,
+            elapsed_ms_val in 0i64..=120_000i64,
+            cooldown_ms in 1i64..=120_000i64,
+        ) {
+            let now_ms_val = most_recent_refresh_ms.saturating_add(elapsed_ms_val);
+            let result = check_refresh_cooldown(most_recent_refresh_ms, now_ms_val, cooldown_ms);
+
+            if elapsed_ms_val < cooldown_ms {
+                let (elapsed_s, remaining_s) = result.expect("cooldown should trigger");
+                prop_assert_eq!(elapsed_s, elapsed_ms_val / 1000);
+                prop_assert_eq!(remaining_s, (cooldown_ms - elapsed_ms_val) / 1000);
+            } else {
+                prop_assert!(result.is_none());
+            }
+        }
+
+        #[test]
+        fn prop_reservation_to_mcp_info_released_status_wins(
+            id in any::<i64>(),
+            pane_id in any::<u64>(),
+            owner_kind in "[A-Za-z0-9_.-]{1,24}",
+            owner_id in "[A-Za-z0-9_.-]{1,24}",
+            reason in proptest::option::of("[A-Za-z0-9 _.,:/-]{0,40}"),
+            created_at in 0i64..=4_102_444_800_000i64,
+            expires_offset_ms in -120_000i64..=120_000i64,
+            released_offset_ms in 0i64..=120_000i64,
+        ) {
+            let now = super::now_ms() as i64;
+            let reservation = PaneReservation {
+                id,
+                pane_id,
+                owner_kind: owner_kind.clone(),
+                owner_id: owner_id.clone(),
+                reason: reason.clone(),
+                created_at,
+                expires_at: now.saturating_add(expires_offset_ms),
+                released_at: Some(now.saturating_sub(released_offset_ms)),
+                status: "active".to_string(),
+            };
+
+            let info = reservation_to_mcp_info(&reservation);
+            prop_assert_eq!(info.id, id);
+            prop_assert_eq!(info.pane_id, pane_id);
+            prop_assert_eq!(info.owner_kind, owner_kind);
+            prop_assert_eq!(info.owner_id, owner_id);
+            prop_assert_eq!(info.reason, reason);
+            prop_assert_eq!(info.created_at, created_at);
+            prop_assert_eq!(info.expires_at, reservation.expires_at);
+            prop_assert_eq!(info.released_at, reservation.released_at);
+            prop_assert_eq!(info.status, "released");
+        }
+
+        #[test]
+        fn prop_reservation_to_mcp_info_active_and_expired_statuses(
+            id in any::<i64>(),
+            pane_id in any::<u64>(),
+            owner_kind in "[A-Za-z0-9_.-]{1,24}",
+            owner_id in "[A-Za-z0-9_.-]{1,24}",
+            reason in proptest::option::of("[A-Za-z0-9 _.,:/-]{0,40}"),
+            created_at in 0i64..=4_102_444_800_000i64,
+            future_offset_ms in 1i64..=120_000i64,
+            past_offset_ms in 1i64..=120_000i64,
+        ) {
+            let now = super::now_ms() as i64;
+
+            let active = PaneReservation {
+                id,
+                pane_id,
+                owner_kind: owner_kind.clone(),
+                owner_id: owner_id.clone(),
+                reason: reason.clone(),
+                created_at,
+                expires_at: now.saturating_add(future_offset_ms),
+                released_at: None,
+                status: "active".to_string(),
+            };
+            let expired = PaneReservation {
+                id,
+                pane_id,
+                owner_kind: owner_kind.clone(),
+                owner_id: owner_id.clone(),
+                reason: reason.clone(),
+                created_at,
+                expires_at: now.saturating_sub(past_offset_ms),
+                released_at: None,
+                status: "active".to_string(),
+            };
+
+            let active_info = reservation_to_mcp_info(&active);
+            let expired_info = reservation_to_mcp_info(&expired);
+
+            prop_assert_eq!(active_info.status, "active");
+            prop_assert_eq!(expired_info.status, "expired");
+            prop_assert_eq!(active_info.reason, reason);
+            prop_assert_eq!(expired_info.reason, reason);
         }
     }
 }
