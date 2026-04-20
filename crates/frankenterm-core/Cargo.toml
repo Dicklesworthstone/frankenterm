@@ -490,6 +490,10 @@ harness = false
 name = "content_dedup_ops"
 harness = false
 
+[[bench]]
+name = "sliding_window_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
