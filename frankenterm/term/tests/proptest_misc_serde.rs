@@ -159,3 +159,22 @@ proptest! {
         prop_assert_eq!(back, value);
     }
 }
+
+#[test]
+fn progress_default_is_none() {
+    assert_eq!(Progress::default(), Progress::None);
+}
+
+#[test]
+fn terminal_size_default_matches_classic_terminal_geometry() {
+    assert_eq!(
+        TerminalSize::default(),
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        }
+    );
+}
