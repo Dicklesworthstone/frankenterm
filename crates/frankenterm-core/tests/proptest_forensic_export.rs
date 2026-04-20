@@ -1,6 +1,6 @@
 //! Property tests for forensic_export module.
 //!
-//! Covers serde roundtrip for all 16 serializable types plus behavioral
+//! Covers serde roundtrip for all serializable forensic carriers plus behavioral
 //! invariants for ForensicStore query/ingest/redaction and display impls.
 
 use frankenterm_core::forensic_export::*;
@@ -315,6 +315,23 @@ fn arb_forensic_telemetry_snapshot() -> impl Strategy<Value = ForensicTelemetryS
         )
 }
 
+fn arb_forensic_query_result() -> impl Strategy<Value = ForensicQueryResult> {
+    (
+        prop::collection::vec(arb_forensic_record(), 0..8),
+        any::<bool>(),
+        0_u64..1_000_000,
+    )
+        .prop_map(|(records, has_more, query_time_us)| {
+            let extra = usize::from(has_more);
+            ForensicQueryResult {
+                total_count: records.len() + extra,
+                has_more,
+                query_time_us,
+                records,
+            }
+        })
+}
+
 // =============================================================================
 // Serde roundtrip tests
 // =============================================================================
@@ -425,6 +442,19 @@ proptest! {
         let json = serde_json::to_string(&s).unwrap();
         let back: ForensicTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(s, back);
+    }
+
+    #[test]
+    fn forensic_query_result_json_roundtrip(r in arb_forensic_query_result()) {
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ForensicQueryResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back.records.len(), r.records.len());
+        for (back_record, original_record) in back.records.iter().zip(r.records.iter()) {
+            prop_assert_eq!(back_record, original_record);
+        }
+        prop_assert_eq!(back.total_count, r.total_count);
+        prop_assert_eq!(back.has_more, r.has_more);
+        prop_assert_eq!(back.query_time_us, r.query_time_us);
     }
 }
 
@@ -624,5 +654,31 @@ proptest! {
         prop_assert!(q.verdict_filter.is_none());
         prop_assert!(q.limit.is_none());
         prop_assert!(q.offset.is_none());
+    }
+
+    #[test]
+    fn forensic_query_result_count_coherence(result in arb_forensic_query_result()) {
+        prop_assert!(result.total_count >= result.records.len());
+        prop_assert_eq!(result.has_more, result.total_count > result.records.len());
+    }
+
+    #[test]
+    fn forensic_telemetry_snapshot_capacity_coherence(
+        counters in arb_forensic_telemetry(),
+        captured_at_ms in 0_u64..u64::MAX,
+        max_records in 1_usize..1000,
+        current_record_count in 0_usize..1000,
+    ) {
+        let current_record_count = current_record_count.min(max_records);
+        let snapshot = ForensicTelemetrySnapshot {
+            captured_at_ms,
+            counters,
+            current_record_count,
+            max_records,
+        };
+
+        prop_assert!(snapshot.current_record_count <= snapshot.max_records);
+        prop_assert!(snapshot.max_records >= 1);
+        prop_assert_eq!(snapshot.captured_at_ms, captured_at_ms);
     }
 }
