@@ -21,10 +21,11 @@ use std::collections::{HashMap, HashSet};
 
 use frankenterm_core::resize_scheduler::{
     ResizeControlPlaneGateState, ResizeDomain, ResizeExecutionPhase, ResizeIntent,
-    ResizeLifecycleStage, ResizeOverloadReason, ResizeScheduler, ResizeSchedulerConfig,
-    ResizeSchedulerDebugSnapshot, ResizeSchedulerMetrics, ResizeSchedulerPaneSnapshot,
-    ResizeSchedulerSnapshot, ResizeStalledTransaction, ResizeWorkClass, ScheduleFrameResult,
-    ScheduledResizeWork, SubmitOutcome,
+    ResizeLifecycleDetail, ResizeLifecycleStage, ResizeOverloadReason, ResizeScheduler,
+    ResizeSchedulerConfig, ResizeSchedulerDebugSnapshot, ResizeSchedulerMetrics,
+    ResizeSchedulerPaneSnapshot, ResizeSchedulerSnapshot, ResizeStalledTransaction,
+    ResizeTransactionLifecycleEvent, ResizeWorkClass, ScheduleFrameResult, ScheduledResizeWork,
+    SubmitOutcome,
 };
 use proptest::prelude::*;
 
@@ -1250,6 +1251,173 @@ fn arb_stalled_tx() -> impl Strategy<Value = ResizeStalledTransaction> {
         })
 }
 
+fn arb_lifecycle_detail() -> impl Strategy<Value = ResizeLifecycleDetail> {
+    prop_oneof![
+        proptest::option::of(0_u64..10_000).prop_map(|replaced_pending_seq| {
+            ResizeLifecycleDetail::IntentSubmitted { replaced_pending_seq }
+        }),
+        (0_u64..10_000).prop_map(|latest_seq| {
+            ResizeLifecycleDetail::IntentRejectedNonMonotonic { latest_seq }
+        }),
+        (0_usize..128).prop_map(|pending_total| {
+            ResizeLifecycleDetail::IntentRejectedOverload { pending_total }
+        }),
+        (any::<bool>(), any::<bool>()).prop_map(|(emergency_disable, legacy_fallback)| {
+            ResizeLifecycleDetail::IntentSuppressedByGate {
+                emergency_disable,
+                legacy_fallback,
+            }
+        }),
+        (arb_overload_reason(), 0_u64..10_000, 0_u64..10_000).prop_map(
+            |(reason, dropped_pane_id, dropped_intent_seq)| {
+                ResizeLifecycleDetail::PendingDroppedOverload {
+                    reason,
+                    dropped_pane_id,
+                    dropped_intent_seq,
+                }
+            },
+        ),
+        (arb_work_class(), 1_u32..100, any::<bool>(), any::<bool>()).prop_map(
+            |(scheduler_class, work_units, over_budget, forced_by_starvation)| {
+                ResizeLifecycleDetail::IntentScheduled {
+                    scheduler_class,
+                    work_units,
+                    over_budget,
+                    forced_by_starvation,
+                }
+            },
+        ),
+        (0_u64..10_000).prop_map(|superseded_by_seq| {
+            ResizeLifecycleDetail::ActiveCancelledSuperseded { superseded_by_seq }
+        }),
+        Just(ResizeLifecycleDetail::ActiveCompleted),
+        arb_execution_phase().prop_map(|phase| {
+            ResizeLifecycleDetail::ActivePhaseTransition { phase }
+        }),
+        proptest::option::of(0_u64..10_000).prop_map(|active_seq| {
+            ResizeLifecycleDetail::ActiveCompletionRejected { active_seq }
+        }),
+        (proptest::option::of(0_u64..10_000), arb_execution_phase()).prop_map(
+            |(active_seq, requested_phase)| {
+                ResizeLifecycleDetail::ActivePhaseTransitionRejected {
+                    active_seq,
+                    requested_phase,
+                }
+            },
+        ),
+    ]
+}
+
+fn arb_lifecycle_event() -> impl Strategy<Value = ResizeTransactionLifecycleEvent> {
+    (
+        0_u64..100_000,
+        0_u64..10_000,
+        0_u64..10_000,
+        0_u64..100_000,
+        proptest::option::of(0_u64..2_000_000_000_000),
+        proptest::option::of(0_u64..100_000),
+        proptest::option::of(0_u64..100_000),
+        proptest::option::of(0_u64..100_000),
+        arb_lifecycle_stage(),
+        arb_lifecycle_detail(),
+    )
+        .prop_map(
+            |(
+                event_seq,
+                frame_seq,
+                pane_id,
+                intent_seq,
+                observed_at_ms,
+                latest_seq,
+                pending_seq,
+                active_seq,
+                stage,
+                detail,
+            )| ResizeTransactionLifecycleEvent {
+                event_seq,
+                frame_seq,
+                pane_id,
+                intent_seq,
+                observed_at_ms,
+                latest_seq,
+                pending_seq,
+                active_seq,
+                stage,
+                detail,
+            },
+        )
+}
+
+fn arb_schedule_frame_result() -> impl Strategy<Value = ScheduleFrameResult> {
+    let budget_fields = (
+        1_u32..64,
+        1_u32..64,
+        1_u32..64,
+        1_u32..64,
+        proptest::option::of(24_u32..241),
+        proptest::option::of(1_000_u32..50_000),
+        0_u32..64,
+        0_u32..64,
+        0_u32..64,
+    );
+    let tail_fields = (
+        0_u32..64,
+        0_u32..64,
+        proptest::string::string_regex("[a-z_]{3,24}").unwrap(),
+        0_u32..100,
+        0_u32..64,
+        any::<bool>(),
+        0_u32..64,
+        prop::collection::vec(arb_scheduled_resize_work(), 0..5),
+        0_usize..128,
+    );
+    (budget_fields, tail_fields).prop_map(
+        |(
+            (
+                requested_frame_budget_units,
+                frame_budget_units,
+                pacing_budget_units,
+                vsync_adjusted_budget_units,
+                vsync_refresh_hz,
+                vsync_interval_us,
+                effective_resize_budget_units,
+                input_reserved_units,
+                input_reserved_base_units,
+            ),
+            (
+                input_reserved_surge_units,
+                input_resize_floor_units,
+                input_guardrail_reason_code,
+                pending_input_events,
+                budget_spent_units,
+                hitch_detected,
+                hitch_overrun_units,
+                scheduled,
+                pending_after,
+            ),
+        )| ScheduleFrameResult {
+            requested_frame_budget_units,
+            frame_budget_units,
+            pacing_budget_units,
+            vsync_adjusted_budget_units,
+            vsync_refresh_hz,
+            vsync_interval_us,
+            effective_resize_budget_units,
+            input_reserved_units,
+            input_reserved_base_units,
+            input_reserved_surge_units,
+            input_resize_floor_units,
+            input_guardrail_reason_code,
+            pending_input_events,
+            budget_spent_units,
+            hitch_detected,
+            hitch_overrun_units,
+            scheduled,
+            pending_after,
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Enum serde roundtrips
 // ---------------------------------------------------------------------------
@@ -1374,6 +1542,14 @@ proptest! {
         prop_assert_eq!(back, result);
     }
 
+    /// ScheduleFrameResult serde roundtrip for populated values.
+    #[test]
+    fn prop_frame_result_serde(result in arb_schedule_frame_result()) {
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ScheduleFrameResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, result);
+    }
+
     /// ResizeControlPlaneGateState serde roundtrip.
     #[test]
     fn prop_gate_state_serde(gate in arb_gate_state()) {
@@ -1400,6 +1576,22 @@ proptest! {
         prop_assert_eq!(back.active_phase, tx.active_phase);
         prop_assert_eq!(back.age_ms, tx.age_ms);
         prop_assert_eq!(back.latest_seq, tx.latest_seq);
+    }
+
+    /// ResizeLifecycleDetail serde roundtrip.
+    #[test]
+    fn prop_lifecycle_detail_serde(detail in arb_lifecycle_detail()) {
+        let json = serde_json::to_string(&detail).unwrap();
+        let back: ResizeLifecycleDetail = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, detail);
+    }
+
+    /// ResizeTransactionLifecycleEvent serde roundtrip.
+    #[test]
+    fn prop_lifecycle_event_serde(event in arb_lifecycle_event()) {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ResizeTransactionLifecycleEvent = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, event);
     }
 
     /// ResizeSchedulerMetrics default is all zeros.
