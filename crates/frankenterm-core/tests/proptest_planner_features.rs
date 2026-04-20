@@ -11,11 +11,13 @@ use frankenterm_core::beads_types::{
 };
 use frankenterm_core::plan::{MissionAgentAvailability, MissionAgentCapabilityProfile};
 use frankenterm_core::planner_features::{
-    ConflictPair, EffortBucket, GovernorAction, GovernorConfig, MissionProfile, MissionProfileKind,
-    PlannerExtractionConfig, PlannerExtractionContext, PlannerFeatureVector, PlannerWeights,
-    SafetyGate, ScoredCandidate, ScorerConfig, ScorerInput, SolverConfig, ThrashGovernor,
-    UtilityPolicyTuner, extract_planner_features, extract_planner_features_all, score_candidates,
-    solve_assignments,
+    ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigValidationError, ConfigValidationResult,
+    ConflictPair, DecisionExplanation, DecisionOutcome, EffortBucket, ExplainabilityReport,
+    ExplanationFactor, FactorPolarity, GovernorAction, GovernorConfig, MissionProfile,
+    MissionProfileKind, PlannerExtractionConfig, PlannerExtractionContext, PlannerFeatureVector,
+    PlannerWeights, SafetyGate, ScoredCandidate, ScorerConfig, ScorerInput, SolverConfig,
+    ThrashGovernor, UtilityPolicyTuner, extract_planner_features, extract_planner_features_all,
+    score_candidates, solve_assignments,
 };
 
 // ── Strategies ────────────────────────────────────────────────────────────────
@@ -218,6 +220,79 @@ fn arb_profile_kind() -> impl Strategy<Value = MissionProfileKind> {
         Just(MissionProfileKind::UrgencyDriven),
         Just(MissionProfileKind::Conservative),
     ]
+}
+
+fn arb_decision_outcome() -> impl Strategy<Value = DecisionOutcome> {
+    prop_oneof![
+        Just(DecisionOutcome::Assigned),
+        Just(DecisionOutcome::Rejected),
+    ]
+}
+
+fn arb_factor_polarity() -> impl Strategy<Value = FactorPolarity> {
+    prop_oneof![
+        Just(FactorPolarity::Positive),
+        Just(FactorPolarity::Negative),
+        Just(FactorPolarity::Neutral),
+    ]
+}
+
+fn arb_explanation_factor() -> impl Strategy<Value = ExplanationFactor> {
+    (
+        "[a-z_]{3,16}",
+        -1000.0f64..1000.0,
+        ".{0,64}",
+        arb_factor_polarity(),
+    )
+        .prop_map(|(dimension, value, description, polarity)| ExplanationFactor {
+            dimension,
+            value,
+            description,
+            polarity,
+        })
+}
+
+fn arb_decision_explanation() -> impl Strategy<Value = DecisionExplanation> {
+    (
+        arb_bead_id(),
+        arb_decision_outcome(),
+        ".{0,96}",
+        proptest::collection::vec(arb_explanation_factor(), 0..5),
+    )
+        .prop_map(|(bead_id, outcome, summary, factors)| DecisionExplanation {
+            bead_id,
+            outcome,
+            summary,
+            factors,
+        })
+}
+
+fn arb_diag_severity() -> impl Strategy<Value = ConfigDiagnosticSeverity> {
+    prop_oneof![
+        Just(ConfigDiagnosticSeverity::Error),
+        Just(ConfigDiagnosticSeverity::Warning),
+        Just(ConfigDiagnosticSeverity::Info),
+    ]
+}
+
+fn arb_config_diagnostic() -> impl Strategy<Value = ConfigDiagnostic> {
+    (arb_diag_severity(), "[a-z_]{3,16}", ".{0,64}").prop_map(|(severity, field, message)| {
+        ConfigDiagnostic {
+            severity,
+            field,
+            message,
+        }
+    })
+}
+
+fn arb_config_validation_error() -> impl Strategy<Value = ConfigValidationError> {
+    ("[a-z_]{3,16}", ".{0,64}").prop_map(|(field, message)| ConfigValidationError { field, message })
+}
+
+fn arb_config_validation_result() -> impl Strategy<Value = ConfigValidationResult> {
+    (any::<bool>(), proptest::collection::vec(arb_config_diagnostic(), 0..8)).prop_map(
+        |(valid, diagnostics)| ConfigValidationResult { valid, diagnostics },
+    )
 }
 
 // ── Tests: Feature vector composite scoring ──────────────────────────────────
@@ -1032,6 +1107,94 @@ proptest! {
         let json = serde_json::to_string(&bucket).unwrap();
         let back: EffortBucket = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(bucket, back);
+    }
+
+    /// Decision explanations roundtrip and remain addressable inside reports.
+    #[test]
+    fn prop_decision_explanation_report_roundtrip(
+        explanations in proptest::collection::vec(arb_decision_explanation(), 1..8),
+        cycle_id in any::<u64>(),
+    ) {
+        let mut deduped = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for explanation in explanations {
+            if seen.insert(explanation.bead_id.clone()) {
+                deduped.push(explanation);
+            }
+        }
+        prop_assume!(!deduped.is_empty());
+
+        let report = ExplainabilityReport {
+            cycle_id,
+            explanations: deduped.clone(),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ExplainabilityReport = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(report.cycle_id, back.cycle_id);
+        prop_assert_eq!(report.explanations.len(), back.explanations.len());
+        for original in &report.explanations {
+            let restored = back.get(&original.bead_id).expect("missing explanation after roundtrip");
+            prop_assert_eq!(original.outcome, restored.outcome);
+            prop_assert_eq!(&original.summary, &restored.summary);
+            prop_assert_eq!(original.factors.len(), restored.factors.len());
+            for (expected, actual) in original.factors.iter().zip(&restored.factors) {
+                prop_assert_eq!(&expected.dimension, &actual.dimension);
+                prop_assert!((expected.value - actual.value).abs() < 1e-10);
+                prop_assert_eq!(&expected.description, &actual.description);
+                prop_assert_eq!(expected.polarity, actual.polarity);
+            }
+        }
+    }
+
+    /// Decision and factor enums preserve their snake_case serde forms.
+    #[test]
+    fn prop_planner_explainability_enums_use_snake_case(
+        outcome in arb_decision_outcome(),
+        polarity in arb_factor_polarity(),
+    ) {
+        let outcome_json = serde_json::to_string(&outcome).unwrap();
+        let polarity_json = serde_json::to_string(&polarity).unwrap();
+        prop_assert!(matches!(outcome_json.as_str(), "\"assigned\"" | "\"rejected\""));
+        prop_assert!(matches!(polarity_json.as_str(), "\"positive\"" | "\"negative\"" | "\"neutral\""));
+        let outcome_back: DecisionOutcome = serde_json::from_str(&outcome_json).unwrap();
+        let polarity_back: FactorPolarity = serde_json::from_str(&polarity_json).unwrap();
+        prop_assert_eq!(outcome, outcome_back);
+        prop_assert_eq!(polarity, polarity_back);
+    }
+
+    /// Config validation helpers remain coherent after serde roundtrip.
+    #[test]
+    fn prop_config_validation_counts_match_manual(
+        result in arb_config_validation_result(),
+    ) {
+        let manual_errors = result
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.severity == ConfigDiagnosticSeverity::Error)
+            .count();
+        let manual_warnings = result
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.severity == ConfigDiagnosticSeverity::Warning)
+            .count();
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: ConfigValidationResult = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(manual_errors, back.error_count());
+        prop_assert_eq!(manual_warnings, back.warning_count());
+        prop_assert_eq!(result.valid, back.valid);
+    }
+
+    /// Validation errors preserve their payload over serde roundtrip.
+    #[test]
+    fn prop_config_validation_error_serde(
+        error in arb_config_validation_error(),
+    ) {
+        let json = serde_json::to_string(&error).unwrap();
+        let back: ConfigValidationError = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(error.field, back.field);
+        prop_assert_eq!(error.message, back.message);
     }
 }
 
