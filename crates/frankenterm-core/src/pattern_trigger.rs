@@ -595,4 +595,14 @@ mod tests {
         let all = all_default_patterns();
         assert_eq!(scanner.pattern_count(), all.len());
     }
+
+    #[test]
+    fn trigger_category_display_all_variants() {
+        assert_eq!(TriggerCategory::Error.to_string(), "error");
+        assert_eq!(TriggerCategory::Warning.to_string(), "warning");
+        assert_eq!(TriggerCategory::Completion.to_string(), "completion");
+        assert_eq!(TriggerCategory::Progress.to_string(), "progress");
+        assert_eq!(TriggerCategory::TestResult.to_string(), "test_result");
+        assert_eq!(TriggerCategory::Custom.to_string(), "custom");
+    }
 }

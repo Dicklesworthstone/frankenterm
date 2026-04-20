@@ -816,4 +816,23 @@ mod tests {
         assert_eq!(config.max_input_bytes, 64 * 1024 * 1024);
         assert!(!config.include_size_prefix);
     }
+
+    #[test]
+    fn byte_compression_error_display_all_variants() {
+        assert_eq!(
+            ByteCompressionError::InvalidInput("truncated".into()).to_string(),
+            "invalid input: truncated"
+        );
+        assert_eq!(
+            ByteCompressionError::DecompressionFailed("corrupt".into()).to_string(),
+            "decompression failed: corrupt"
+        );
+        assert_eq!(
+            ByteCompressionError::TrainingFailed("too few".into()).to_string(),
+            "dictionary training failed: too few"
+        );
+        // std::error::Error trait conformance
+        let err: &dyn std::error::Error = &ByteCompressionError::InvalidInput("x".into());
+        assert!(!err.to_string().is_empty());
+    }
 }

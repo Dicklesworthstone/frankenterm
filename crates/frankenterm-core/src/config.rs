@@ -7131,4 +7131,64 @@ block_alt_screen = true
         assert_eq!(safety.compliance.max_violations, 500);
         assert_eq!(safety.compliance.sla_threshold_ms, 3_600_000);
     }
+
+    #[test]
+    fn hot_reload_result_display_all_paths() {
+        // No changes at all
+        let empty = HotReloadResult {
+            allowed: true,
+            changes: vec![],
+            forbidden: vec![],
+        };
+        assert_eq!(
+            empty.to_string(),
+            "No configuration changes detected"
+        );
+
+        // Only hot-reloadable changes
+        let changes_only = HotReloadResult {
+            allowed: true,
+            changes: vec![HotReloadChange {
+                name: "poll_interval_ms".into(),
+                old_value: "500".into(),
+                new_value: "1000".into(),
+            }],
+            forbidden: vec![],
+        };
+        let s = changes_only.to_string();
+        assert!(s.contains("Hot-reloadable changes:"));
+        assert!(s.contains("poll_interval_ms: 500 -> 1000"));
+        assert!(!s.contains("Forbidden"));
+
+        // Only forbidden changes
+        let forbidden_only = HotReloadResult {
+            allowed: false,
+            changes: vec![],
+            forbidden: vec![ForbiddenChange {
+                name: "db_path".into(),
+                reason: "requires restart".into(),
+            }],
+        };
+        let s = forbidden_only.to_string();
+        assert!(s.contains("Forbidden changes (require restart):"));
+        assert!(s.contains("db_path: requires restart"));
+        assert!(!s.contains("Hot-reloadable"));
+
+        // Both forbidden and reloadable
+        let both = HotReloadResult {
+            allowed: false,
+            changes: vec![HotReloadChange {
+                name: "timeout_ms".into(),
+                old_value: "100".into(),
+                new_value: "200".into(),
+            }],
+            forbidden: vec![ForbiddenChange {
+                name: "port".into(),
+                reason: "bind address locked".into(),
+            }],
+        };
+        let s = both.to_string();
+        assert!(s.contains("Forbidden"));
+        assert!(s.contains("Hot-reloadable"));
+    }
 }
