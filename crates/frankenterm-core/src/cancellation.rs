@@ -2476,4 +2476,147 @@ mod tests {
         assert_eq!(snap.finalizers_failed, 0);
         assert_eq!(snap.shutdowns_completed, 2);
     }
+
+    // ========================================================================
+    // Variant-dispatch Display coverage for cancellation enums
+    // ========================================================================
+
+    #[test]
+    fn shutdown_reason_display_all_variants() {
+        // UserRequested + Timeout already tested; cover remaining 6
+        assert_eq!(
+            ShutdownReason::GracefulTermination.to_string(),
+            "graceful-termination"
+        );
+        assert_eq!(
+            ShutdownReason::ChildError {
+                child_id: ScopeId("child-1".into()),
+                error_msg: "oops".into(),
+            }
+            .to_string(),
+            "child-error(child-1: oops)"
+        );
+        assert_eq!(
+            ShutdownReason::CascadingFailure {
+                origin_id: ScopeId("origin".into()),
+            }
+            .to_string(),
+            "cascading-failure(origin=origin)"
+        );
+        assert_eq!(
+            ShutdownReason::ResourceExhausted {
+                resource: "fd".into(),
+            }
+            .to_string(),
+            "resource-exhausted(fd)"
+        );
+        assert_eq!(
+            ShutdownReason::PolicyViolation {
+                rule: "max-cost".into(),
+            }
+            .to_string(),
+            "policy-violation(max-cost)"
+        );
+        assert_eq!(
+            ShutdownReason::ParentShutdown {
+                parent_id: ScopeId("root".into()),
+            }
+            .to_string(),
+            "parent-shutdown(root)"
+        );
+    }
+
+    #[test]
+    fn finalizer_action_display_remaining_variants() {
+        // FlushChannel + CloseConnection already tested; cover remaining 4
+        assert_eq!(
+            FinalizerAction::PersistState {
+                key: "session".into(),
+            }
+            .to_string(),
+            "persist(session)"
+        );
+        assert_eq!(
+            FinalizerAction::ReleaseResource {
+                resource_id: "pool-7".into(),
+            }
+            .to_string(),
+            "release(pool-7)"
+        );
+        assert_eq!(
+            FinalizerAction::CancelTimers {
+                scope_prefix: "watcher::".into(),
+            }
+            .to_string(),
+            "cancel-timers(watcher::)"
+        );
+        assert_eq!(
+            FinalizerAction::Custom {
+                action_name: "notify-peers".into(),
+                metadata: HashMap::new(),
+            }
+            .to_string(),
+            "custom(notify-peers)"
+        );
+    }
+
+    #[test]
+    fn finalizer_status_display_all_variants() {
+        assert_eq!(FinalizerStatus::Pending.to_string(), "pending");
+        assert_eq!(FinalizerStatus::Running.to_string(), "running");
+        assert_eq!(
+            FinalizerStatus::Completed { duration_ms: 42 }.to_string(),
+            "completed(42ms)"
+        );
+        assert_eq!(
+            FinalizerStatus::Failed {
+                error: "timeout".into(),
+                duration_ms: 100,
+            }
+            .to_string(),
+            "failed(timeout, 100ms)"
+        );
+        assert_eq!(
+            FinalizerStatus::Skipped {
+                reason: "disabled".into(),
+            }
+            .to_string(),
+            "skipped(disabled)"
+        );
+    }
+
+    #[test]
+    fn shutdown_coordinator_error_display_all_variants() {
+        assert_eq!(
+            ShutdownCoordinatorError::ScopeNotRegistered {
+                scope_id: ScopeId("x".into()),
+            }
+            .to_string(),
+            "scope not registered: x"
+        );
+        assert_eq!(
+            ShutdownCoordinatorError::ScopeAlreadyRegistered {
+                scope_id: ScopeId("y".into()),
+            }
+            .to_string(),
+            "scope already registered: y"
+        );
+        assert_eq!(
+            ShutdownCoordinatorError::FinalizerNotFound {
+                scope_id: ScopeId("s".into()),
+                finalizer_name: "flush".into(),
+            }
+            .to_string(),
+            "finalizer flush not found for scope s"
+        );
+        assert_eq!(
+            ShutdownCoordinatorError::InvalidState {
+                scope_id: ScopeId("z".into()),
+                expected: "Draining",
+                actual: ScopeState::Running,
+            }
+            .to_string(),
+            "scope z in state running, expected Draining"
+        );
+    }
 }
