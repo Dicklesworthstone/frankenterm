@@ -6682,16 +6682,25 @@ impl StorageHandle {
 
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
-        let db_path = Arc::clone(&self.db_path);
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_event_identity_key_with_cx(&cx, event_id).await;
+        }
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
 
-            query_event_identity_key(&conn, event_id)
-        })
-        .await
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+
+                query_event_identity_key(&conn, event_id)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_identity_key`].
@@ -6704,7 +6713,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_event_identity_key cancelled: {err}"))
         })?;
-        self.get_event_identity_key(event_id).await
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_event_identity_key(&conn, event_id)
+        })
+        .await
     }
 
     /// Record an audit action
