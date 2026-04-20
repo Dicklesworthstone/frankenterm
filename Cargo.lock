@@ -667,6 +667,9 @@ dependencies = [
 [[package]]
 name = "bintree"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "bit-set"
@@ -1265,8 +1268,10 @@ dependencies = [
  "metrics",
  "mux",
  "portable-pty",
+ "proptest",
  "rangeset",
  "serde",
+ "serde_json",
  "smol",
  "termwiz 0.24.0",
  "thiserror 2.0.18",
@@ -3189,7 +3194,9 @@ name = "frankenterm-blob-leases"
 version = "0.1.1"
 dependencies = [
  "getrandom 0.3.4",
+ "proptest",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -3234,7 +3241,9 @@ dependencies = [
  "deltae",
  "frankenterm-dynamic",
  "num-traits",
+ "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3328,6 +3337,7 @@ dependencies = [
  "log",
  "maplit",
  "ordered-float 4.6.0",
+ "proptest",
  "strsim",
  "thiserror 2.0.18",
 ]
@@ -3363,7 +3373,9 @@ dependencies = [
  "ordered-float 4.6.0",
  "pest",
  "pest_derive",
+ "proptest",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "vtparse 0.7.0",
@@ -3480,7 +3492,9 @@ dependencies = [
  "bitflags 1.3.2",
  "euclid",
  "frankenterm-dynamic",
+ "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3616,7 +3630,9 @@ dependencies = [
  "frankenterm-input-types",
  "k9",
  "ordered-float 4.6.0",
+ "proptest",
  "serde",
+ "serde_json",
  "siphasher",
  "unicode-segmentation",
 ]
@@ -3647,7 +3663,9 @@ dependencies = [
  "miniz_oxide 0.7.4",
  "num-traits",
  "ordered-float 4.6.0",
+ "proptest",
  "serde",
+ "serde_json",
  "terminfo",
  "termwiz 0.24.0",
  "unicode-normalization",
@@ -6179,6 +6197,7 @@ dependencies = [
  "log",
  "mlua",
  "ordered-float 4.6.0",
+ "proptest",
 ]
 
 [[package]]
@@ -7559,7 +7578,9 @@ dependencies = [
  "libc",
  "log",
  "nix 0.29.0",
+ "proptest",
  "serde",
+ "serde_json",
  "serial2",
  "shared_library",
  "shell-words",
@@ -7718,6 +7739,7 @@ dependencies = [
  "async-task",
  "flume",
  "lazy_static",
+ "proptest",
  "thiserror 2.0.18",
 ]
 
@@ -7970,6 +7992,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
  "num",
+ "proptest",
 ]
 
 [[package]]
@@ -8063,6 +8086,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "governor",
+ "proptest",
 ]
 
 [[package]]
@@ -9775,7 +9799,9 @@ dependencies = [
  "pest",
  "pest_derive",
  "phf",
+ "proptest",
  "serde",
+ "serde_json",
  "sha2",
  "signal-hook 0.3.18",
  "siphasher",
@@ -10429,6 +10455,7 @@ version = "0.1.0"
 dependencies = [
  "lazy_static",
  "libc",
+ "proptest",
 ]
 
 [[package]]
@@ -11588,6 +11615,7 @@ dependencies = [
 name = "wezterm-open-url"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "winapi",
 ]
 

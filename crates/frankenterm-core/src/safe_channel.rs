@@ -1331,4 +1331,163 @@ mod tests {
         let err: &dyn std::error::Error = &SafeChannelError::Closed;
         assert!(err.source().is_none());
     }
+
+    // -----------------------------------------------------------------
+    // Query method coverage (len, is_empty, is_closed, pending_reservations,
+    // is_drained, Reservation::id, Reservation::into_inner)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn query_methods_and_reservation_accessors() {
+        let config = SafeChannelConfig {
+            capacity: 4,
+            max_reservations: 4,
+            ..Default::default()
+        };
+        let (tx, rx) = safe_channel::<u64>(config);
+
+        // Fresh channel state
+        assert_eq!(tx.len(), 0);
+        assert!(tx.is_empty());
+        assert!(!tx.is_closed());
+        assert_eq!(rx.pending_reservations(), 0);
+        assert!(rx.is_drained());
+
+        // After one send
+        tx.try_send(10).unwrap();
+        assert_eq!(tx.len(), 1);
+        assert!(!tx.is_empty());
+        assert!(!rx.is_drained()); // queue non-empty
+
+        // Reserve: queue shrinks, pending grows
+        let r = rx.try_reserve().unwrap();
+        assert_eq!(tx.len(), 0);
+        assert_eq!(rx.pending_reservations(), 1);
+        assert!(!rx.is_drained()); // reservation outstanding
+
+        // Reservation accessors
+        let rid = r.id();
+        assert_eq!(rid.0, 0); // first reservation = ID 0 (fetch_add starts at 0)
+        assert_eq!(*r.peek(), 10);
+
+        // into_inner is alias for commit
+        let val = r.into_inner();
+        assert_eq!(val, 10);
+        assert_eq!(rx.pending_reservations(), 0);
+        assert!(rx.is_drained());
+
+        // Close state
+        tx.close();
+        assert!(tx.is_closed());
+        assert!(rx.is_drained());
+    }
+
+    // -----------------------------------------------------------------
+    // Close wakes threads blocked on reservation limit
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn close_wakes_blocked_on_reservation_limit() {
+        let config = SafeChannelConfig {
+            capacity: 4,
+            max_reservations: 1, // only 1 reservation allowed
+            ..Default::default()
+        };
+        let (tx, rx) = safe_channel::<u64>(config);
+
+        // Send one item then grab the only reservation slot
+        tx.try_send(1).unwrap();
+        let r1 = rx.try_reserve().unwrap();
+        assert_eq!(rx.pending_reservations(), 1);
+
+        // Queue is now empty, channel not closed. Second reserve blocks
+        // on reservation_released (limit hit) with empty queue.
+        let rx2 = rx.clone();
+        let handle = std::thread::spawn(move || rx2.reserve());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Close wakes blocked thread. Since queue is empty and closed,
+        // it returns Err(Closed).
+        tx.close();
+
+        let result = handle.join().unwrap();
+        assert_eq!(result.unwrap_err(), SafeChannelError::Closed);
+
+        // Commit the original reservation to clean up
+        r1.commit();
+    }
+
+    // -----------------------------------------------------------------
+    // Metrics accuracy through full lifecycle
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn metrics_lifecycle_accuracy() {
+        let config = SafeChannelConfig {
+            capacity: 8,
+            max_reservations: 8,
+            ..Default::default()
+        };
+        let (tx, rx) = safe_channel::<u64>(config);
+
+        // Initial metrics
+        let m = tx.metrics();
+        assert_eq!(m.total_sent, 0);
+        assert_eq!(m.total_committed, 0);
+        assert_eq!(m.total_rollbacks, 0);
+        assert_eq!(m.total_drop_rollbacks, 0);
+        assert_eq!(m.queue_depth, 0);
+        assert_eq!(m.reserved_count, 0);
+        assert_eq!(m.queue_hwm, 0);
+        assert_eq!(m.reservation_hwm, 0);
+
+        // Send 5 items
+        for i in 0..5 {
+            tx.try_send(i).unwrap();
+        }
+        let m = tx.metrics();
+        assert_eq!(m.total_sent, 5);
+        assert_eq!(m.queue_depth, 5);
+        assert_eq!(m.queue_hwm, 5);
+
+        // Commit 2
+        let r1 = rx.try_reserve().unwrap();
+        let r2 = rx.try_reserve().unwrap();
+        let m = rx.metrics();
+        assert_eq!(m.reserved_count, 2);
+        assert_eq!(m.reservation_hwm, 2);
+        r1.commit();
+        r2.commit();
+        let m = rx.metrics();
+        assert_eq!(m.total_committed, 2);
+        assert_eq!(m.reserved_count, 0);
+        assert_eq!(m.queue_depth, 3);
+
+        // Explicit rollback 1
+        let r3 = rx.try_reserve().unwrap();
+        r3.rollback();
+        let m = rx.metrics();
+        assert_eq!(m.total_rollbacks, 1);
+        assert_eq!(m.queue_depth, 3); // item re-enqueued
+
+        // Drop-triggered rollback 1
+        {
+            let _r4 = rx.try_reserve().unwrap();
+            // _r4 drops here without commit
+        }
+        let m = rx.metrics();
+        assert_eq!(m.total_drop_rollbacks, 1);
+        assert_eq!(m.queue_depth, 3); // item re-enqueued again
+
+        // Failed send (fill to capacity, then fail)
+        for _ in 0..5 {
+            tx.try_send(99).unwrap();
+        }
+        assert_eq!(tx.try_send(99), Err(SafeChannelError::Full));
+        let m = tx.metrics();
+        assert_eq!(m.total_send_failures, 1);
+        assert_eq!(m.total_sent, 10); // 5 original + 5 more
+        assert_eq!(m.queue_hwm, 8); // hit capacity
+    }
 }
