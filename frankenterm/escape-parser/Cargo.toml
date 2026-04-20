@@ -61,6 +61,8 @@ docs = ["use_serde", "image", "tmux_cc", "kitty-shm"]
 criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
+proptest = "1.8.0"
+serde_json.workspace = true
 
 [package.metadata.docs.rs]
 features = ["docs"]
