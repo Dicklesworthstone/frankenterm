@@ -8062,16 +8062,25 @@ impl StorageHandle {
 
     /// Purge notification history older than the given timestamp.
     pub async fn purge_notification_history(&self, before_ts: i64) -> Result<usize> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::PurgeNotificationHistory {
-                before_ts,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.purge_notification_history_with_cx(&cx, before_ts).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::PurgeNotificationHistory {
+                    before_ts,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_notification_history`].
@@ -8084,7 +8093,19 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("purge_notification_history cancelled: {err}"))
         })?;
-        self.purge_notification_history(before_ts).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PurgeNotificationHistory {
+                    before_ts,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     // =========================================================================
