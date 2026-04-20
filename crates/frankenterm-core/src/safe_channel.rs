@@ -1306,4 +1306,29 @@ mod tests {
         // Just verify no panics/deadlocks — committed count varies
         assert!(committed > 0, "some items should have been committed");
     }
+
+    #[test]
+    fn safe_channel_error_display_all_variants() {
+        assert_eq!(SafeChannelError::Closed.to_string(), "channel closed");
+        assert_eq!(SafeChannelError::Full.to_string(), "channel full");
+        assert_eq!(SafeChannelError::Empty.to_string(), "channel empty");
+        assert_eq!(
+            SafeChannelError::ReservationLimitReached.to_string(),
+            "reservation limit reached"
+        );
+        assert_eq!(
+            SafeChannelError::Cancelled {
+                reason: "timeout".into()
+            }
+            .to_string(),
+            "cancelled: timeout"
+        );
+        assert_eq!(
+            SafeChannelError::InvalidReservation { id: 42 }.to_string(),
+            "invalid reservation: 42"
+        );
+        // Also verify std::error::Error conformance
+        let err: &dyn std::error::Error = &SafeChannelError::Closed;
+        assert!(err.source().is_none());
+    }
 }

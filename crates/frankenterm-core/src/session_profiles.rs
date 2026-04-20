@@ -2092,4 +2092,65 @@ mod tests {
         assert!(spec.model.is_none());
         assert!(spec.task.is_none());
     }
+
+    #[test]
+    fn validation_error_display_remaining_variants() {
+        // Already tested: EmptyName, ProfileNotFound, EmptyFleet
+        assert_eq!(
+            ProfileValidationError::SlotRefNotFound {
+                fleet: "f1".into(),
+                slot: "s1".into(),
+                ref_name: "r1".into(),
+            }
+            .to_string(),
+            "fleet 'f1' slot 's1' references unknown 'r1'"
+        );
+        assert_eq!(
+            ProfileValidationError::DuplicateSlotLabel {
+                fleet: "f2".into(),
+                label: "lbl".into(),
+            }
+            .to_string(),
+            "fleet 'f2' contains duplicate slot label 'lbl'"
+        );
+        assert_eq!(
+            ProfileValidationError::InvalidSlotWeight {
+                fleet: "f3".into(),
+                slot: "s3".into(),
+            }
+            .to_string(),
+            "fleet 'f3' slot 's3' has invalid zero weight"
+        );
+        assert_eq!(
+            ProfileValidationError::EmptyProgramMixTarget {
+                fleet: "f4".into(),
+            }
+            .to_string(),
+            "fleet 'f4' contains program mix target with empty program"
+        );
+        assert_eq!(
+            ProfileValidationError::InvalidProgramMixWeight {
+                fleet: "f5".into(),
+                program: "p5".into(),
+            }
+            .to_string(),
+            "fleet 'f5' program target 'p5' has invalid zero weight"
+        );
+        assert_eq!(
+            ProfileValidationError::DuplicateProgramMixTarget {
+                fleet: "f6".into(),
+                program: "p6".into(),
+            }
+            .to_string(),
+            "fleet 'f6' contains duplicate program target 'p6'"
+        );
+        assert_eq!(
+            ProfileValidationError::EmptyBootstrapCommand {
+                profile: "prof".into(),
+                index: 3,
+            }
+            .to_string(),
+            "profile 'prof' has empty bootstrap command at index 3"
+        );
+    }
 }

@@ -2081,4 +2081,29 @@ mod tests {
         assert!(allowed >= 40, "expected ~50 allows, got {allowed}");
         assert!(throttled >= 40, "expected ~50 throttles, got {throttled}");
     }
+
+    #[test]
+    fn governor_reason_display_remaining_variants() {
+        // Already tested: Clear, ConnectorRateLimit, AdaptiveBackoff
+        assert_eq!(
+            GovernorReason::GlobalRateLimit.to_string(),
+            "global_rate_limit"
+        );
+        assert_eq!(
+            GovernorReason::ConnectorQuotaExhausted.to_string(),
+            "connector_quota_exhausted"
+        );
+        assert_eq!(
+            GovernorReason::GlobalQuotaExhausted.to_string(),
+            "global_quota_exhausted"
+        );
+        assert_eq!(
+            GovernorReason::BudgetExceeded.to_string(),
+            "budget_exceeded"
+        );
+        assert_eq!(
+            GovernorReason::Backpressure.to_string(),
+            "backpressure"
+        );
+    }
 }
