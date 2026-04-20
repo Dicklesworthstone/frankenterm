@@ -7244,4 +7244,114 @@ mod tests {
             });
         }
     }
+
+    // ========================================================================
+    // Variant-dispatch coverage for broadcast error enums and Display impls
+    // ========================================================================
+
+    #[test]
+    fn broadcast_try_recv_closed_channel() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = broadcast::channel::<i32>(16);
+            drop(tx);
+            let result = broadcast_try_recv(&mut rx);
+            match result {
+                Err(BroadcastTryRecvError::Closed) => {} // expected
+                other => panic!("expected Closed, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn broadcast_try_recv_lagged_receiver() {
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = broadcast::channel(2);
+            broadcast_send(&tx, 1).expect("send 1");
+            broadcast_send(&tx, 2).expect("send 2");
+            broadcast_send(&tx, 3).expect("send 3"); // overflows capacity
+            let result = broadcast_try_recv(&mut rx);
+            match result {
+                Err(BroadcastTryRecvError::Lagged(n)) => {
+                    assert!(n >= 1, "should have lagged by at least 1 message");
+                }
+                other => panic!("expected Lagged, got {:?}", other),
+            }
+        });
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_recv_error_display_lagged() {
+        let err = broadcast::RecvError::Lagged(42);
+        assert_eq!(err.to_string(), "receiver lagged by 42 messages");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_recv_error_display_closed() {
+        let err = broadcast::RecvError::Closed;
+        assert_eq!(err.to_string(), "broadcast channel closed");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_try_recv_error_display_all_variants() {
+        let empty = broadcast::TryRecvError::Empty;
+        assert_eq!(empty.to_string(), "broadcast channel empty");
+
+        let closed = broadcast::TryRecvError::Closed;
+        assert_eq!(closed.to_string(), "broadcast channel closed");
+
+        let lagged = broadcast::TryRecvError::Lagged(7);
+        assert_eq!(lagged.to_string(), "receiver lagged by 7 messages");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_send_error_display() {
+        let err = broadcast::SendError(99);
+        assert_eq!(err.to_string(), "sending on a closed broadcast channel");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn try_acquire_error_display_variant_text() {
+        let no_permits = TryAcquireError::NoPermits;
+        assert_eq!(no_permits.to_string(), "no semaphore permits available");
+
+        let closed = TryAcquireError::Closed;
+        assert_eq!(closed.to_string(), "semaphore closed");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn acquire_error_display_cancelled() {
+        let err = AcquireError::Cancelled;
+        assert_eq!(err.to_string(), "semaphore acquire cancelled");
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn acquire_error_display_polled_after_completion() {
+        let err = AcquireError::PolledAfterCompletion;
+        assert_eq!(
+            err.to_string(),
+            "semaphore acquire future polled after completion"
+        );
+    }
+
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn broadcast_try_recv_error_is_std_error() {
+        let empty: &dyn std::error::Error = &broadcast::TryRecvError::Empty;
+        assert!(!empty.to_string().is_empty());
+
+        let closed: &dyn std::error::Error = &broadcast::TryRecvError::Closed;
+        assert!(!closed.to_string().is_empty());
+
+        let lagged: &dyn std::error::Error = &broadcast::TryRecvError::Lagged(5);
+        assert!(!lagged.to_string().is_empty());
+    }
 }
