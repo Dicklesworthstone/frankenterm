@@ -8233,16 +8233,27 @@ impl StorageHandle {
         event_types: &[String],
         handled: Option<bool>,
     ) -> Result<usize> {
-        let db_path = Arc::clone(&self.db_path);
-        let severities = severities.to_vec();
-        let event_types = event_types.to_vec();
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .count_events_by_tier_with_cx(&cx, before_ts, severities, event_types, handled)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            let severities = severities.to_vec();
+            let event_types = event_types.to_vec();
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_by_tier`].
