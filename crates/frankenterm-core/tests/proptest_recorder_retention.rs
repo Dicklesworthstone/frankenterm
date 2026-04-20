@@ -1531,3 +1531,130 @@ proptest! {
         prop_assert!(transitions.is_empty(), "Purged should have no valid transitions");
     }
 }
+
+// =============================================================================
+// 46. Sweep held entries correspond to purge candidates and remain archived
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn sweep_held_segments_remain_purge_candidates(
+        consumer in "[a-z]{3,10}"
+    ) {
+        let cfg = RetentionConfig {
+            hot_hours: 1,
+            warm_days: 1,
+            cold_days: 1,
+            ..Default::default()
+        };
+        let mut mgr = RetentionManager::new(cfg).unwrap();
+        let mut seg = make_active_segment("held-seg", SensitivityTier::T2Sensitive, 0, 100, 10);
+        seg.transition(SegmentPhase::Sealed, MS_PER_HOUR).unwrap();
+        seg.transition(SegmentPhase::Archived, MS_PER_HOUR + MS_PER_DAY).unwrap();
+        mgr.add_segment(seg);
+
+        let mut holders = HashMap::new();
+        holders.insert("held-seg".to_string(), vec![consumer.clone()]);
+
+        let result = mgr.sweep(MS_PER_HOUR + MS_PER_DAY + 2 * MS_PER_DAY, &holders);
+        prop_assert!(result.purged.is_empty(), "held segment should not purge");
+        prop_assert_eq!(result.purge_candidates, vec!["held-seg".to_string()]);
+        prop_assert_eq!(result.held, vec![("held-seg".to_string(), consumer)]);
+
+        let seg = mgr.get_segment("held-seg").expect("segment still present");
+        prop_assert_eq!(seg.phase, SegmentPhase::Archived);
+    }
+}
+
+// =============================================================================
+// 47. Sweep output matches resulting manager phase buckets
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn sweep_result_matches_manager_phase_updates(
+        hot_hours in 1u32..=24,
+        warm_days in 1u32..=7,
+        cold_days in 1u32..=14
+    ) {
+        let cfg = RetentionConfig {
+            hot_hours,
+            warm_days,
+            cold_days,
+            ..Default::default()
+        };
+        let mut mgr = RetentionManager::new(cfg).unwrap();
+
+        mgr.add_segment(make_active_segment("active-now", SensitivityTier::T2Sensitive, 0, 100, 10));
+
+        let mut sealed = make_active_segment("sealed-now", SensitivityTier::T2Sensitive, 0, 100, 10);
+        sealed.transition(SegmentPhase::Sealed, (hot_hours as u64) * MS_PER_HOUR).unwrap();
+        mgr.add_segment(sealed);
+
+        let mut archived = make_active_segment("purge-now", SensitivityTier::T2Sensitive, 0, 100, 10);
+        archived.transition(SegmentPhase::Sealed, (hot_hours as u64) * MS_PER_HOUR).unwrap();
+        archived.transition(
+            SegmentPhase::Archived,
+            (hot_hours as u64) * MS_PER_HOUR + (warm_days as u64) * MS_PER_DAY
+        ).unwrap();
+        mgr.add_segment(archived);
+
+        let now_ms = (hot_hours as u64) * MS_PER_HOUR
+            + (warm_days as u64) * MS_PER_DAY
+            + (cold_days as u64) * MS_PER_DAY
+            + MS_PER_HOUR;
+        let result = mgr.sweep(now_ms, &HashMap::new());
+
+        prop_assert!(result.sealed.contains(&"active-now".to_string()));
+        prop_assert!(result.archived.contains(&"sealed-now".to_string()));
+        prop_assert!(result.purged.contains(&"purge-now".to_string()));
+
+        prop_assert_eq!(mgr.get_segment("active-now").unwrap().phase, SegmentPhase::Sealed);
+        prop_assert_eq!(mgr.get_segment("sealed-now").unwrap().phase, SegmentPhase::Archived);
+        prop_assert_eq!(mgr.get_segment("purge-now").unwrap().phase, SegmentPhase::Purged);
+    }
+}
+
+// =============================================================================
+// 48. stats() phase counts sum to segment_count()
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn manager_stats_counts_partition_segment_count(
+        active_size in 0u64..1_000_000,
+        sealed_size in 0u64..1_000_000,
+        archived_size in 0u64..1_000_000,
+        purged_size in 0u64..1_000_000
+    ) {
+        let mut mgr = RetentionManager::with_defaults();
+        mgr.add_segment(make_active_segment("a1", SensitivityTier::T1Standard, 0, active_size, 10));
+
+        let mut sealed = make_segment_at_phase("s1", SensitivityTier::T2Sensitive, SegmentPhase::Sealed, 0);
+        sealed.size_bytes = sealed_size;
+        mgr.add_segment(sealed);
+
+        let mut archived = make_segment_at_phase("ar1", SensitivityTier::T2Sensitive, SegmentPhase::Archived, 0);
+        archived.size_bytes = archived_size;
+        mgr.add_segment(archived);
+
+        let mut purged = make_segment_at_phase("p1", SensitivityTier::T3Restricted, SegmentPhase::Purged, 0);
+        purged.size_bytes = purged_size;
+        mgr.add_segment(purged);
+
+        let stats = mgr.stats();
+        prop_assert_eq!(
+            stats.active_count + stats.sealed_count + stats.archived_count + stats.purged_count,
+            mgr.segment_count()
+        );
+        prop_assert_eq!(stats.active_bytes, active_size);
+        prop_assert_eq!(stats.sealed_bytes, sealed_size);
+        prop_assert_eq!(stats.archived_bytes, archived_size);
+    }
+}
