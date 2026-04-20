@@ -19,3 +19,7 @@ frankenterm-dynamic.workspace = true
 [features]
 default = ["serde", "std"]
 std = ["serde/std", "euclid/std"]
+
+[dev-dependencies]
+proptest = "1.8.0"
+serde_json.workspace = true
