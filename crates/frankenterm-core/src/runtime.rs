@@ -191,6 +191,64 @@ where
     }
 }
 
+/// RAII-guarded holder for the capture task's per-pane vendored streaming
+/// subtasks.
+///
+/// The HashMap stores one `JoinHandle<()>` per observed pane while the
+/// capture loop is routing work via the vendored (mux-socket) fast path.
+/// On a clean shutdown the capture loop explicitly drains this map and
+/// aborts each handle (see the `for (_pane_id, handle) in drain()` block at
+/// the bottom of `spawn_capture_task`). However, if the capture future
+/// itself is dropped mid-flight — because a parent scope cancels the
+/// runtime JoinHandle, because an outer `select!` races to another branch,
+/// or because a panic unwinds through the capture loop — that explicit
+/// drain never runs and the child streaming subtasks become orphaned
+/// (the asupersync runtime detaches, rather than aborts, on bare
+/// `JoinHandle` drop). They keep holding the mux socket, capture_tx
+/// sender half, and shutdown_flag Arc indefinitely.
+///
+/// Wrapping the map in this newtype makes cancellation-safe cleanup the
+/// default: `Drop::drop` aborts every still-live child regardless of how
+/// the capture future is dismantled.
+#[cfg(all(feature = "vendored", unix))]
+struct StreamingTasks {
+    tasks: HashMap<u64, JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl StreamingTasks {
+    fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl std::ops::Deref for StreamingTasks {
+    type Target = HashMap<u64, JoinHandle<()>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tasks
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl std::ops::DerefMut for StreamingTasks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tasks
+    }
+}
+
+#[cfg(all(feature = "vendored", unix))]
+impl Drop for StreamingTasks {
+    fn drop(&mut self) {
+        for (_pane_id, handle) in self.tasks.drain() {
+            handle.abort();
+        }
+    }
+}
+
 async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
     #[cfg(feature = "asupersync-runtime")]
     {
@@ -2435,8 +2493,12 @@ impl ObservationRuntime {
             #[cfg(all(feature = "vendored", unix, not(feature = "asupersync-runtime")))]
             let (stream_exit_tx, mut stream_exit_rx) =
                 mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
+            // Per-pane vendored streaming subtasks. Dropping the capture future
+            // (runtime shutdown, panic, outer select loss) aborts every still-live
+            // child via StreamingTasks::drop — the explicit drain below is kept
+            // as the fast path on clean shutdown but is no longer load-bearing.
             #[cfg(all(feature = "vendored", unix))]
-            let mut streaming_tasks: HashMap<u64, JoinHandle<()>> = HashMap::new();
+            let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
             #[cfg(all(feature = "vendored", unix))]
             let mut observed_panes_cache: HashMap<u64, PaneInfo> = HashMap::new();
 
