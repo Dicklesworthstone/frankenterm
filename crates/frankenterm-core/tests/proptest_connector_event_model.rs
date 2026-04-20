@@ -658,6 +658,16 @@ proptest! {
         prop_assert_eq!(report.missing_fields.len(), back.missing_fields.len());
         prop_assert_eq!(report.deprecated_fields.len(), back.deprecated_fields.len());
     }
+
+    #[test]
+    fn compatibility_report_compatible_matches_missing_fields(
+        src in arb_schema_version(),
+        tgt in arb_schema_version(),
+    ) {
+        let registry = SchemaEvolutionRegistry::new();
+        let report = check_compatibility(&registry, &src, &tgt);
+        prop_assert_eq!(report.compatible, report.missing_fields.is_empty());
+    }
 }
 
 // =============================================================================
@@ -699,6 +709,42 @@ proptest! {
         prop_assert_eq!(contract.filterable_fields, back.filterable_fields);
         prop_assert_eq!(contract.sortable_fields, back.sortable_fields);
         prop_assert_eq!(contract.facet_fields, back.facet_fields);
+    }
+
+    #[test]
+    fn indexing_contract_default_fields_are_nonempty_and_unique(_unused in 0..1u8) {
+        let contract = IndexingContract::default_contract();
+
+        for fields in [
+            &contract.searchable_fields,
+            &contract.filterable_fields,
+            &contract.sortable_fields,
+            &contract.facet_fields,
+        ] {
+            prop_assert!(fields.iter().all(|field| !field.trim().is_empty()));
+            let mut uniq = std::collections::BTreeSet::new();
+            for field in fields {
+                prop_assert!(uniq.insert(field.clone()), "duplicate field in indexing contract: {}", field);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(60))]
+
+    #[test]
+    fn schema_validation_result_valid_matches_error_emptiness(
+        errors in proptest::collection::vec("[a-z_ ]{3,30}", 0..4),
+        warnings in proptest::collection::vec("[a-z_ ]{3,30}", 0..4),
+    ) {
+        let result = SchemaValidationResult {
+            valid: errors.is_empty(),
+            errors,
+            warnings,
+        };
+
+        prop_assert_eq!(result.valid, result.errors.is_empty());
     }
 }
 
