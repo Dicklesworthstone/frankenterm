@@ -379,6 +379,14 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    #[cfg(feature = "asupersync-runtime")]
+    {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        return with_retry_and_circuit_cx(&cx, policy, circuit, operation).await;
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    {
     use crate::error::WeztermError;
 
     // Check circuit state first
@@ -397,6 +405,7 @@ where
     }
 
     outcome.result
+    }
 }
 
 /// Circuit-aware retry under an explicit `&Cx` (ft-xbnl0.2.2).
