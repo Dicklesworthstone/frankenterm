@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::command_transport::{CommandRequest, CommandResult, CommandRouter};
 use crate::durable_state::{CheckpointId, CheckpointTrigger, DurableStateManager};
-use crate::session_topology::{LifecycleEntityKind, LifecycleRegistry};
+use crate::session_topology::{LifecycleEntityKind, LifecycleRegistry, TopologySnapshot};
 
 // =============================================================================
 // Server identity and federation
@@ -253,6 +253,7 @@ pub struct CheckpointInfo {
 pub struct HeadlessMuxServer {
     config: ServerConfig,
     registry: LifecycleRegistry,
+    topology_snapshot: Option<TopologySnapshot>,
     router: CommandRouter,
     state_manager: DurableStateManager,
     peers: HashMap<String, PeerInfo>,
@@ -265,6 +266,7 @@ impl HeadlessMuxServer {
         Self {
             config,
             registry: LifecycleRegistry::new(),
+            topology_snapshot: None,
             router: CommandRouter::new(),
             state_manager: DurableStateManager::new(),
             peers: HashMap::new(),
@@ -280,6 +282,16 @@ impl HeadlessMuxServer {
     /// Mutable access to the lifecycle registry.
     pub fn registry_mut(&mut self) -> &mut LifecycleRegistry {
         &mut self.registry
+    }
+
+    /// Access the live topology snapshot tracked alongside the registry.
+    pub fn topology_snapshot(&self) -> Option<&TopologySnapshot> {
+        self.topology_snapshot.as_ref()
+    }
+
+    /// Replace the live topology snapshot tracked by the headless server.
+    pub fn set_topology_snapshot(&mut self, snapshot: TopologySnapshot) {
+        self.topology_snapshot = Some(snapshot);
     }
 
     /// Access the durable state manager.
@@ -338,8 +350,9 @@ impl HeadlessMuxServer {
             }
 
             RemoteRequest::Checkpoint { label } => {
-                let cp = self.state_manager.checkpoint(
+                let cp = self.state_manager.checkpoint_with_topology(
                     &self.registry,
+                    self.topology_snapshot.clone(),
                     &label,
                     CheckpointTrigger::Manual,
                     HashMap::new(),
@@ -350,10 +363,12 @@ impl HeadlessMuxServer {
             RemoteRequest::Rollback {
                 checkpoint_id,
                 reason,
-            } => match self
-                .state_manager
-                .rollback(checkpoint_id, &mut self.registry, reason)
-            {
+            } => match self.state_manager.rollback_with_topology(
+                checkpoint_id,
+                &mut self.registry,
+                &mut self.topology_snapshot,
+                reason,
+            ) {
                 Ok(record) => RemoteResponse::RollbackComplete {
                     restored: record.restored_entity_count,
                     removed: record.removed_entity_count,

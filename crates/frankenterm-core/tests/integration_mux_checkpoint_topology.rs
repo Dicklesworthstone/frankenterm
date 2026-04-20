@@ -3,9 +3,9 @@
 //! Exercises the session persistence pipeline:
 //!
 //!   HeadlessMuxServer.handle_request(Checkpoint { label })
-//!     → DurableStateManager.checkpoint(registry, label, trigger, metadata)
+//!     → DurableStateManager.checkpoint_with_topology(registry, topology, label, trigger, metadata)
 //!       → TopologySnapshot::from_panes(panes) → JSON roundtrip
-//!         → DurableStateManager.rollback(id, registry, reason) → RollbackRecord
+//!         → DurableStateManager.rollback_with_topology(id, registry, topology, reason) → RollbackRecord
 //!           → StateDiff (added/removed/changed entities)
 //!
 //! The HeadlessMuxServer orchestrates pane lifecycle via LifecycleRegistry.
@@ -13,15 +13,13 @@
 //! roll back to any prior checkpoint. TopologySnapshot captures the spatial
 //! layout (windows, tabs, pane trees) for persistence and restore.
 
-use std::collections::HashMap;
-
 use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateManager};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, RemoteRequest, RemoteResponse, ServerConfig,
 };
 use frankenterm_core::session_topology::{
     LifecycleEntityKind, LifecycleIdentity, LifecycleRegistry, LifecycleState,
-    MuxPaneLifecycleState, TopologySnapshot,
+    MuxPaneLifecycleState, PaneNode, TopologySnapshot,
 };
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 
@@ -66,18 +64,9 @@ fn make_pane(
     }
 }
 
-fn register_pane(
-    registry: &mut LifecycleRegistry,
-    pane_id: u64,
-    ts: u64,
-) -> LifecycleIdentity {
-    let identity = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        pane_id,
-        1,
-    );
+fn register_pane(registry: &mut LifecycleRegistry, pane_id: u64, ts: u64) -> LifecycleIdentity {
+    let identity =
+        LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", pane_id, 1);
     registry
         .register_entity(
             identity.clone(),
@@ -86,6 +75,93 @@ fn register_pane(
         )
         .expect("register pane");
     identity
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopologyFingerprint {
+    windows: Vec<WindowFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowFingerprint {
+    window_id: u64,
+    active_tab_index: Option<usize>,
+    tabs: Vec<TabFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TabFingerprint {
+    tab_id: u64,
+    active_pane_id: Option<u64>,
+    pane_tree: PaneTreeFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneTreeFingerprint {
+    Leaf {
+        pane_id: u64,
+        rows: u16,
+        cols: u16,
+    },
+    HSplit {
+        children: Vec<(u16, PaneTreeFingerprint)>,
+    },
+    VSplit {
+        children: Vec<(u16, PaneTreeFingerprint)>,
+    },
+}
+
+fn topology_fingerprint(snapshot: &TopologySnapshot) -> TopologyFingerprint {
+    TopologyFingerprint {
+        windows: snapshot
+            .windows
+            .iter()
+            .map(|window| WindowFingerprint {
+                window_id: window.window_id,
+                active_tab_index: window.active_tab_index,
+                tabs: window
+                    .tabs
+                    .iter()
+                    .map(|tab| TabFingerprint {
+                        tab_id: tab.tab_id,
+                        active_pane_id: tab.active_pane_id,
+                        pane_tree: pane_tree_fingerprint(&tab.pane_tree),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn pane_tree_fingerprint(node: &PaneNode) -> PaneTreeFingerprint {
+    match node {
+        PaneNode::Leaf {
+            pane_id,
+            rows,
+            cols,
+            ..
+        } => PaneTreeFingerprint::Leaf {
+            pane_id: *pane_id,
+            rows: *rows,
+            cols: *cols,
+        },
+        PaneNode::HSplit { children } => PaneTreeFingerprint::HSplit {
+            children: children
+                .iter()
+                .map(|(ratio, child)| (encode_ratio(*ratio), pane_tree_fingerprint(child)))
+                .collect(),
+        },
+        PaneNode::VSplit { children } => PaneTreeFingerprint::VSplit {
+            children: children
+                .iter()
+                .map(|(ratio, child)| (encode_ratio(*ratio), pane_tree_fingerprint(child)))
+                .collect(),
+        },
+    }
+}
+
+fn encode_ratio(ratio: f64) -> u16 {
+    (ratio * 10_000.0).round() as u16
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -97,20 +173,8 @@ fn server_checkpoint_and_rollback_via_remote_protocol() {
     let mut server = HeadlessMuxServer::new(ServerConfig::default());
 
     // Register 2 panes via the lifecycle registry.
-    let pane1 = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        1,
-        1,
-    );
-    let pane2 = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        2,
-        1,
-    );
+    let pane1 = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", 1, 1);
+    let pane2 = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", 2, 1);
     server
         .registry_mut()
         .register_entity(
@@ -131,6 +195,12 @@ fn server_checkpoint_and_rollback_via_remote_protocol() {
     assert_eq!(server.registry().len(), 2);
 
     // Checkpoint via remote request.
+    let baseline_panes = vec![
+        make_pane(1, 10, 100, 24, 80, Some("/home"), Some("shell")),
+        make_pane(2, 10, 100, 24, 80, Some("/src"), Some("editor")),
+    ];
+    let (baseline_topology, _) = TopologySnapshot::from_panes(&baseline_panes, 1000);
+    server.set_topology_snapshot(baseline_topology.clone());
     let cp_id = match server.handle_request(RemoteRequest::Checkpoint {
         label: "before-expansion".into(),
     }) {
@@ -143,20 +213,8 @@ fn server_checkpoint_and_rollback_via_remote_protocol() {
     };
 
     // Add 2 more panes after the checkpoint.
-    let pane3 = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        3,
-        1,
-    );
-    let pane4 = LifecycleIdentity::new(
-        LifecycleEntityKind::Pane,
-        "default",
-        "local",
-        4,
-        1,
-    );
+    let pane3 = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", 3, 1);
+    let pane4 = LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", 4, 1);
     server
         .registry_mut()
         .register_entity(
@@ -175,6 +233,14 @@ fn server_checkpoint_and_rollback_via_remote_protocol() {
         .unwrap();
 
     assert_eq!(server.registry().len(), 4);
+    let expanded_panes = vec![
+        make_pane(1, 10, 100, 24, 40, Some("/home"), Some("shell")),
+        make_pane(2, 10, 100, 12, 60, Some("/src"), Some("editor")),
+        make_pane(3, 10, 100, 12, 60, Some("/tmp"), Some("logs")),
+        make_pane(4, 10, 100, 24, 20, Some("/aux"), Some("metrics")),
+    ];
+    let (expanded_topology, _) = TopologySnapshot::from_panes(&expanded_panes, 2000);
+    server.set_topology_snapshot(expanded_topology);
 
     // Rollback to the checkpoint (should restore to 2 panes).
     match server.handle_request(RemoteRequest::Rollback {
@@ -186,15 +252,13 @@ fn server_checkpoint_and_rollback_via_remote_protocol() {
             // removed = entities in current that weren't in checkpoint
             assert_eq!(removed, 2, "should remove 2 added panes");
             // restored may be 0 if the 2 originals are unchanged
-            assert!(
-                restored + removed > 0,
-                "rollback should have some effect"
-            );
+            assert!(restored + removed > 0, "rollback should have some effect");
         }
         other => panic!("expected RollbackComplete, got {other:?}"),
     }
 
     assert_eq!(server.registry().len(), 2);
+    assert_eq!(server.topology_snapshot(), Some(&baseline_topology));
 
     // Verify rollback history is recorded.
     let history = server.state_manager().rollback_history();
@@ -214,9 +278,7 @@ fn topology_snapshot_with_checkpoint_diff() {
     ];
 
     // Bootstrap lifecycle registry from panes.
-    let mut registry =
-        LifecycleRegistry::bootstrap_from_panes(&panes, 1, 1000)
-            .expect("bootstrap");
+    let mut registry = LifecycleRegistry::bootstrap_from_panes(&panes, 1, 1000).expect("bootstrap");
 
     // Registry should contain session + window + pane entities.
     let pane_count = registry.entity_count_by_kind(LifecycleEntityKind::Pane);
@@ -288,24 +350,49 @@ fn topology_snapshot_with_checkpoint_diff() {
 /// mutate state → rollback → diff → verify restored topology matches original.
 #[test]
 fn full_pipeline_mux_checkpoint_topology() {
-    // Phase 1: build initial pane layout.
+    // Phase 1: build an intentionally non-trivial baseline layout.
+    //
+    // Metamorphic rollback invariant (/testing-metamorphic):
+    //
+    //   expand_tree(initial) != initial
+    //   rollback(expand_tree(initial)) == initial
+    //
+    // The baseline is a VSplit with:
+    // - left: one full-height pane
+    // - right: an HSplit of two half-height panes
     let initial_panes = vec![
-        make_pane(1, 10, 100, 24, 80, Some("/home"), Some("shell")),
-        make_pane(2, 10, 100, 24, 80, Some("/src"), Some("editor")),
+        make_pane(1, 10, 100, 24, 40, Some("/left"), Some("shell")),
+        make_pane(2, 10, 100, 12, 60, Some("/right/top"), Some("editor")),
+        make_pane(3, 10, 100, 12, 60, Some("/right/bottom"), Some("logs")),
+    ];
+    let expanded_panes = vec![
+        initial_panes[0].clone(),
+        initial_panes[1].clone(),
+        initial_panes[2].clone(),
+        make_pane(4, 10, 100, 24, 20, Some("/aux"), Some("metrics")),
+        make_pane(5, 10, 100, 24, 20, Some("/ops"), Some("tail")),
     ];
 
     // Bootstrap registry.
     let registry =
-        LifecycleRegistry::bootstrap_from_panes(&initial_panes, 1, 1000)
-            .expect("bootstrap");
+        LifecycleRegistry::bootstrap_from_panes(&initial_panes, 1, 1000).expect("bootstrap");
 
     let initial_entity_count = registry.len();
     assert!(initial_entity_count >= 2); // At least 2 panes (plus session/window)
 
     // Capture initial topology.
     let (initial_topo, _) = TopologySnapshot::from_panes(&initial_panes, 1000);
-    assert_eq!(initial_topo.pane_count(), 2);
+    assert_eq!(initial_topo.pane_count(), 3);
     let initial_topo_json = initial_topo.to_json().expect("serialize initial");
+    let initial_fingerprint = topology_fingerprint(&initial_topo);
+
+    // Expansion must actually perturb the topology or the rollback invariant is weak.
+    let (expanded_topo, _) = TopologySnapshot::from_panes(&expanded_panes, 2000);
+    let expanded_fingerprint = topology_fingerprint(&expanded_topo);
+    assert_ne!(
+        expanded_fingerprint, initial_fingerprint,
+        "expansion must change split hierarchy so rollback proves a real topology invariant"
+    );
 
     // Phase 2: checkpoint initial state via server.
     let mut server = HeadlessMuxServer::new(ServerConfig {
@@ -322,6 +409,7 @@ fn full_pipeline_mux_checkpoint_topology() {
             record.updated_at_ms,
         );
     }
+    server.set_topology_snapshot(initial_topo.clone());
 
     let server_entity_count = server.registry().len();
 
@@ -333,15 +421,10 @@ fn full_pipeline_mux_checkpoint_topology() {
         other => panic!("expected CheckpointCreated, got {other:?}"),
     };
 
-    // Phase 3: simulate expansion — add 3 more panes.
-    for id in 3..=5u64 {
-        let pane_identity = LifecycleIdentity::new(
-            LifecycleEntityKind::Pane,
-            "default",
-            "local",
-            id,
-            1,
-        );
+    // Phase 3: simulate expansion — add 2 more panes.
+    for id in 4..=5u64 {
+        let pane_identity =
+            LifecycleIdentity::new(LifecycleEntityKind::Pane, "default", "local", id, 1);
         server
             .registry_mut()
             .register_entity(
@@ -351,8 +434,9 @@ fn full_pipeline_mux_checkpoint_topology() {
             )
             .unwrap();
     }
+    server.set_topology_snapshot(expanded_topo.clone());
 
-    assert_eq!(server.registry().len(), server_entity_count + 3);
+    assert_eq!(server.registry().len(), server_entity_count + 2);
 
     // Verify checkpoint list shows 1 checkpoint.
     match server.handle_request(RemoteRequest::ListCheckpoints) {
@@ -371,10 +455,7 @@ fn full_pipeline_mux_checkpoint_topology() {
         RemoteResponse::RollbackComplete { restored, removed } => {
             // removed = entities added after checkpoint that got purged
             assert!(removed > 0, "should remove expanded entities");
-            assert!(
-                restored + removed > 0,
-                "rollback should have some effect"
-            );
+            assert!(restored + removed > 0, "rollback should have some effect");
         }
         other => panic!("expected RollbackComplete, got {other:?}"),
     }
@@ -384,11 +465,9 @@ fn full_pipeline_mux_checkpoint_topology() {
 
     // Phase 5: verify restored topology matches initial.
     //
-    // Primary check (ft-olq2e): derive the post-rollback pane id set from the
+    // Primary check (ft-olq2e): derive the post-rollback pane set from the
     // actual server registry state so a misbehaving rollback that leaves the
-    // wrong entities in place would fail the assertion. Re-deserializing the
-    // pre-mutation baseline JSON only proves serde roundtrip, not rollback
-    // correctness.
+    // wrong entities in place fails immediately.
     let post_rollback_pane_ids: Vec<u64> = server
         .registry()
         .snapshot()
@@ -399,8 +478,7 @@ fn full_pipeline_mux_checkpoint_topology() {
     let mut post_rollback_pane_ids_sorted = post_rollback_pane_ids.clone();
     post_rollback_pane_ids_sorted.sort_unstable();
 
-    let mut baseline_pane_ids: Vec<u64> =
-        initial_panes.iter().map(|pane| pane.pane_id).collect();
+    let mut baseline_pane_ids: Vec<u64> = initial_panes.iter().map(|pane| pane.pane_id).collect();
     baseline_pane_ids.sort_unstable();
 
     assert_eq!(
@@ -413,13 +491,27 @@ fn full_pipeline_mux_checkpoint_topology() {
         "post-rollback pane count must match pre-expansion baseline"
     );
 
+    // Metamorphic check: baseline -> expand -> rollback must recover the live
+    // pre-snapshot pane tree captured in the checkpoint payload.
+    let post_rollback_topo = server
+        .topology_snapshot()
+        .expect("rollback should restore a live topology snapshot");
+    let post_rollback_fingerprint = topology_fingerprint(post_rollback_topo);
+    assert_eq!(
+        post_rollback_fingerprint, initial_fingerprint,
+        "rollback should restore the exact pre-expansion pane tree"
+    );
+    assert_ne!(
+        post_rollback_fingerprint, expanded_fingerprint,
+        "rollback must not leave the expanded pane tree in place"
+    );
+
     // Secondary check: the baseline topology JSON is still parseable and
-    // matches the live TopologySnapshot captured in Phase 1. This guards the
-    // serde surface but is no longer the sole evidence that rollback worked.
-    let restored_topo = TopologySnapshot::from_json(&initial_topo_json)
-        .expect("deserialize initial topology");
-    assert_eq!(restored_topo.pane_count(), 2);
-    assert_eq!(restored_topo.pane_ids(), initial_topo.pane_ids());
+    // structurally identical to the live TopologySnapshot captured in Phase 1.
+    let restored_topo =
+        TopologySnapshot::from_json(&initial_topo_json).expect("deserialize initial topology");
+    assert_eq!(restored_topo.pane_count(), 3);
+    assert_eq!(topology_fingerprint(&restored_topo), initial_fingerprint);
 
     // Phase 6: server status should reflect healthy state.
     match server.handle_request(RemoteRequest::Status) {
@@ -440,8 +532,26 @@ fn full_pipeline_mux_checkpoint_topology() {
     let rollback_history = server.state_manager().rollback_history();
     assert_eq!(rollback_history.len(), 1);
     assert_eq!(rollback_history[0].target_checkpoint_id, cp_id);
+    assert_eq!(rollback_history[0].reason, "restore baseline");
+
+    let original_checkpoint = server
+        .state_manager()
+        .get_checkpoint(cp_id)
+        .expect("baseline checkpoint");
+    assert_eq!(original_checkpoint.topology.as_ref(), Some(&initial_topo));
+
+    let pre_rollback_checkpoint = server
+        .state_manager()
+        .latest_checkpoint()
+        .expect("pre-rollback checkpoint");
+    assert!(
+        pre_rollback_checkpoint
+            .label
+            .starts_with("pre-rollback-to-"),
+        "latest checkpoint should capture the expanded tree before rollback"
+    );
     assert_eq!(
-        rollback_history[0].reason,
-        "restore baseline"
+        pre_rollback_checkpoint.topology.as_ref(),
+        Some(&expanded_topo)
     );
 }

@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::session_topology::{
-    LifecycleEntityRecord, LifecycleIdentity, LifecycleRegistry, LifecycleState,
+    LifecycleEntityRecord, LifecycleIdentity, LifecycleRegistry, LifecycleState, TopologySnapshot,
 };
 
 // =============================================================================
@@ -34,6 +34,9 @@ pub struct Checkpoint {
     pub created_at: u64,
     /// The lifecycle registry snapshot at checkpoint time.
     pub entities: Vec<LifecycleEntityRecord>,
+    /// The mux topology snapshot captured alongside the lifecycle registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologySnapshot>,
     /// Metadata attached to this checkpoint.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
@@ -153,6 +156,18 @@ impl DurableStateManager {
         trigger: CheckpointTrigger,
         metadata: HashMap<String, String>,
     ) -> &Checkpoint {
+        self.checkpoint_with_topology(registry, None, label, trigger, metadata)
+    }
+
+    /// Create a checkpoint from the current registry state and topology snapshot.
+    pub fn checkpoint_with_topology(
+        &mut self,
+        registry: &LifecycleRegistry,
+        topology: Option<TopologySnapshot>,
+        label: impl Into<String>,
+        trigger: CheckpointTrigger,
+        metadata: HashMap<String, String>,
+    ) -> &Checkpoint {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -161,6 +176,7 @@ impl DurableStateManager {
             label: label.into(),
             created_at: epoch_ms(),
             entities: registry.snapshot(),
+            topology,
             metadata,
             trigger,
             rolled_back: false,
@@ -239,6 +255,18 @@ impl DurableStateManager {
         registry: &mut LifecycleRegistry,
         reason: impl Into<String>,
     ) -> Result<RollbackRecord, DurableStateError> {
+        let mut no_topology = None;
+        self.rollback_with_topology(target_id, registry, &mut no_topology, reason)
+    }
+
+    /// Roll back the registry and live topology snapshot to a previous checkpoint.
+    pub fn rollback_with_topology(
+        &mut self,
+        target_id: CheckpointId,
+        registry: &mut LifecycleRegistry,
+        topology: &mut Option<TopologySnapshot>,
+        reason: impl Into<String>,
+    ) -> Result<RollbackRecord, DurableStateError> {
         // Find the target checkpoint
         let target_idx = self
             .checkpoints
@@ -254,9 +282,11 @@ impl DurableStateManager {
         // Snapshot current state so we can both compute diffs and persist
         // a pre-rollback checkpoint only after rollback validation succeeds.
         let current_snapshot = registry.snapshot();
+        let current_topology = topology.clone();
 
         // Compute what needs to change
         let target_entities = &self.checkpoints[target_idx].entities;
+        let target_topology = self.checkpoints[target_idx].topology.clone();
         let target_keys: HashMap<String, &LifecycleEntityRecord> = target_entities
             .iter()
             .map(|e| (e.identity.stable_key(), e))
@@ -305,6 +335,7 @@ impl DurableStateManager {
             label: format!("pre-rollback-to-{target_id}"),
             created_at: epoch_ms(),
             entities: current_snapshot.clone(),
+            topology: current_topology,
             metadata: HashMap::new(),
             trigger: CheckpointTrigger::PreOperation {
                 operation: format!("rollback-to-{target_id}"),
@@ -312,6 +343,7 @@ impl DurableStateManager {
             rolled_back: false,
         });
         *registry = rebuilt_registry;
+        *topology = target_topology;
 
         // Mark rolled-back checkpoints
         for cp in &mut self.checkpoints {
@@ -617,7 +649,8 @@ fn normalize_max_checkpoints(max: usize) -> usize {
 mod tests {
     use super::*;
     use crate::session_topology::{
-        LifecycleEntityKind, MuxPaneLifecycleState, SessionLifecycleState,
+        LifecycleEntityKind, MuxPaneLifecycleState, PaneNode, SessionLifecycleState, TabSnapshot,
+        TopologySnapshot, WindowSnapshot,
     };
 
     fn pane_identity(id: u64) -> LifecycleIdentity {
@@ -635,6 +668,27 @@ mod tests {
             .expect("register pane");
         }
         reg
+    }
+
+    fn sample_topology(window_id: u64, pane_tree: PaneNode) -> TopologySnapshot {
+        TopologySnapshot {
+            schema_version: 1,
+            captured_at: 1000,
+            workspace_id: Some("default".to_string()),
+            windows: vec![WindowSnapshot {
+                window_id,
+                title: None,
+                position: None,
+                size: None,
+                tabs: vec![TabSnapshot {
+                    tab_id: 10,
+                    title: None,
+                    pane_tree,
+                    active_pane_id: Some(1),
+                }],
+                active_tab_index: Some(0),
+            }],
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -923,6 +977,142 @@ mod tests {
         assert_eq!(record.removed_entity_count, 1);
         assert_eq!(record.restored_entity_count, 0);
         assert_eq!(reg_modified.snapshot(), reg_initial.snapshot());
+    }
+
+    #[test]
+    fn rollback_with_topology_restores_live_topology_snapshot() {
+        let reg_initial = make_registry(&[1, 2, 3]);
+        let initial_topology = sample_topology(
+            1,
+            PaneNode::VSplit {
+                children: vec![
+                    (
+                        0.4,
+                        PaneNode::Leaf {
+                            pane_id: 1,
+                            rows: 24,
+                            cols: 40,
+                            cwd: Some("/left".to_string()),
+                            title: Some("shell".to_string()),
+                            is_active: true,
+                        },
+                    ),
+                    (
+                        0.6,
+                        PaneNode::HSplit {
+                            children: vec![
+                                (
+                                    0.5,
+                                    PaneNode::Leaf {
+                                        pane_id: 2,
+                                        rows: 12,
+                                        cols: 60,
+                                        cwd: Some("/right/top".to_string()),
+                                        title: Some("editor".to_string()),
+                                        is_active: false,
+                                    },
+                                ),
+                                (
+                                    0.5,
+                                    PaneNode::Leaf {
+                                        pane_id: 3,
+                                        rows: 12,
+                                        cols: 60,
+                                        cwd: Some("/right/bottom".to_string()),
+                                        title: Some("logs".to_string()),
+                                        is_active: false,
+                                    },
+                                ),
+                            ],
+                        },
+                    ),
+                ],
+            },
+        );
+        let expanded_topology = sample_topology(
+            1,
+            PaneNode::VSplit {
+                children: vec![
+                    (
+                        0.25,
+                        PaneNode::Leaf {
+                            pane_id: 1,
+                            rows: 24,
+                            cols: 20,
+                            cwd: Some("/left".to_string()),
+                            title: Some("shell".to_string()),
+                            is_active: true,
+                        },
+                    ),
+                    (
+                        0.25,
+                        PaneNode::Leaf {
+                            pane_id: 4,
+                            rows: 24,
+                            cols: 20,
+                            cwd: Some("/aux".to_string()),
+                            title: Some("metrics".to_string()),
+                            is_active: false,
+                        },
+                    ),
+                    (
+                        0.5,
+                        PaneNode::HSplit {
+                            children: vec![
+                                (
+                                    0.5,
+                                    PaneNode::Leaf {
+                                        pane_id: 2,
+                                        rows: 12,
+                                        cols: 60,
+                                        cwd: Some("/right/top".to_string()),
+                                        title: Some("editor".to_string()),
+                                        is_active: false,
+                                    },
+                                ),
+                                (
+                                    0.5,
+                                    PaneNode::Leaf {
+                                        pane_id: 3,
+                                        rows: 12,
+                                        cols: 60,
+                                        cwd: Some("/right/bottom".to_string()),
+                                        title: Some("logs".to_string()),
+                                        is_active: false,
+                                    },
+                                ),
+                            ],
+                        },
+                    ),
+                ],
+            },
+        );
+        let mut mgr = DurableStateManager::new();
+        let cp_id = mgr
+            .checkpoint_with_topology(
+                &reg_initial,
+                Some(initial_topology.clone()),
+                "initial",
+                CheckpointTrigger::Manual,
+                HashMap::new(),
+            )
+            .id;
+
+        let mut reg_modified = make_registry(&[1, 2, 3, 4]);
+        let mut live_topology = Some(expanded_topology.clone());
+        mgr.rollback_with_topology(
+            cp_id,
+            &mut reg_modified,
+            &mut live_topology,
+            "test rollback",
+        )
+        .unwrap();
+
+        assert_eq!(reg_modified.snapshot(), reg_initial.snapshot());
+        assert_eq!(live_topology, Some(initial_topology));
+
+        let pre_rollback = mgr.latest_checkpoint().expect("pre-rollback checkpoint");
+        assert_eq!(pre_rollback.topology, Some(expanded_topology));
     }
 
     #[test]
