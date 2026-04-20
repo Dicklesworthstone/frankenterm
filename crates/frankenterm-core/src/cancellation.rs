@@ -2653,42 +2653,92 @@ mod tests {
     #[test]
     fn cancel_races_child_creation_all_children_see_cancellation() {
         use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
+        use std::time::Duration;
 
-        // Run multiple rounds to increase chance of hitting the race.
-        for _ in 0..20 {
-            let parent = CancellationToken::new(ScopeId("parent".into()));
-            let n_creators = 8;
+        // [ft-e8brh] Earlier versions of this test used 8 creator threads
+        // with no scheduler perturbation, so on any machine with ≥8 cores
+        // all creators typically finished `parent.child(...)` before main
+        // reached `parent.cancel(...)`. That reduces the test to the
+        // pre-existing-child case already covered by other tests.
+        //
+        // Widen the race window:
+        //   * spawn many more creators than the host's core count so some
+        //     are preempted mid-call,
+        //   * make each creator yield (and occasionally micro-sleep) after
+        //     the barrier but before calling `child()` so the cancel call
+        //     from main can win the race in some rounds,
+        //   * run many rounds, and
+        //   * separately verify across rounds that at least one round was
+        //     observed where main's cancel landed before *any* child()
+        //     registration (a "cancel-first" round) — if this never
+        //     happens, the race is not being exercised and the test is
+        //     silently degrading back to the pre-existing-child case.
+        let n_creators = 64;
+        let rounds = 64;
+        let observed_cancel_first = AtomicBool::new(false);
+
+        for round in 0..rounds {
+            let parent = CancellationToken::new(ScopeId(format!("parent-{round}")));
             let barrier = Arc::new(Barrier::new(n_creators + 1));
 
-            // Spawn child-creation threads
             let handles: Vec<_> = (0..n_creators)
                 .map(|i| {
                     let parent = parent.clone();
                     let barrier = Arc::clone(&barrier);
                     thread::spawn(move || {
                         barrier.wait();
-                        parent.child(ScopeId(format!("c_{i}")))
+                        // Widen the race window deterministically: first
+                        // yield, then on a modulo slice of threads add a
+                        // small sleep so the main thread's cancel has
+                        // room to run before `child()` registers.
+                        thread::yield_now();
+                        if i % 4 == 0 {
+                            thread::sleep(Duration::from_micros(50));
+                        }
+                        let pre_cancelled = parent.is_cancelled();
+                        let child = parent.child(ScopeId(format!("c_{i}")));
+                        (pre_cancelled, child)
                     })
                 })
                 .collect();
 
-            // Cancel from main thread at the same instant
+            // All creators are past the barrier. Give them a chance to
+            // queue up inside their yield/sleep, then cancel.
             barrier.wait();
             parent.cancel(ShutdownReason::UserRequested);
 
-            let children: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-            // Every child must see cancellation — either:
-            //   a) Created before cancel: propagation reached it, OR
-            //   b) Created after cancel: child() detects parent cancelled
-            for (i, c) in children.iter().enumerate() {
+            // Invariant: every child, regardless of whether it was created
+            // before or after the cancel, must observe cancellation on exit.
+            for (i, (pre_cancelled, child)) in outcomes.iter().enumerate() {
                 assert!(
-                    c.is_cancelled(),
-                    "round: child_{i} not cancelled despite parent cancel"
+                    child.is_cancelled(),
+                    "round {round}: child_{i} not cancelled (pre_cancelled={pre_cancelled}) \
+                     despite parent cancel"
                 );
             }
+
+            // Track whether this round actually exercised the cancel-first
+            // ordering (i.e. at least one creator observed parent already
+            // cancelled before calling `child()`).
+            if outcomes.iter().any(|(pre, _)| *pre) {
+                observed_cancel_first.store(true, Ordering::Relaxed);
+            }
         }
+
+        // If across all rounds no creator ever saw `parent.is_cancelled()`
+        // before calling `child()`, we never exercised the interesting
+        // race — the test has degraded to the pre-existing-child case.
+        assert!(
+            observed_cancel_first.load(Ordering::Relaxed),
+            "never observed a round where parent was cancelled before child() \
+             registration; the race window was not exercised. Increase creator \
+             count, lengthen per-thread delays, or use loom/shuttle for \
+             deterministic interleaving."
+        );
     }
 
     #[test]
