@@ -113,6 +113,20 @@ proptest! {
     }
 
     #[test]
+    fn mouse_event_kind_json_roundtrip(value in arb_mouse_event_kind()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: MouseEventKind = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn key_modifiers_json_roundtrip(value in arb_key_modifiers()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: KeyModifiers = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
     fn mouse_event_json_roundtrip(value in arb_mouse_event()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: MouseEvent = serde_json::from_str(&json).unwrap();
