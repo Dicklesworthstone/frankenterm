@@ -7632,11 +7632,31 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("prune_segments_before cancelled: {err}"))
         })?;
-        self.prune_segments_before(before_ts).await
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::PruneSegments {
+                    before_ts,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        Self::recv_writer_response(rx).await
     }
 
     /// Prune output segments older than a cutoff timestamp
     pub async fn prune_segments_before(&self, before_ts: i64) -> Result<usize> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.prune_segments_before_with_cx(&cx, before_ts).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::PruneSegments {
@@ -7647,6 +7667,7 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
         Self::recv_writer_response(rx).await
+        }
     }
 
     /// Run retention cleanup and log the maintenance event
