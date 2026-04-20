@@ -486,6 +486,10 @@ harness = false
 name = "bloom_filter_ops"
 harness = false
 
+[[bench]]
+name = "content_dedup_ops"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
