@@ -13,8 +13,8 @@ use frankenterm_core::accounts::QuotaAvailability;
 use frankenterm_core::cost_tracker::{AlertSeverity, BudgetAlert};
 use frankenterm_core::patterns::AgentType;
 use frankenterm_core::quota_gate::{
-    LaunchDecision, LaunchVerdict, QuotaGate, QuotaGateTelemetrySnapshot, QuotaSignals,
-    WarningSource,
+    LaunchDecision, LaunchVerdict, LaunchWarning, QuotaGate, QuotaGateTelemetrySnapshot,
+    QuotaSignals, WarningSource,
 };
 use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, ProviderRateLimitSummary};
 use proptest::prelude::*;
@@ -49,6 +49,38 @@ fn arb_quota_availability() -> impl Strategy<Value = QuotaAvailability> {
         Just(QuotaAvailability::Low),
         Just(QuotaAvailability::Exhausted),
     ]
+}
+
+/// Strategy for warning source.
+fn arb_warning_source() -> impl Strategy<Value = WarningSource> {
+    prop_oneof![
+        Just(WarningSource::Budget),
+        Just(WarningSource::RateLimit),
+        Just(WarningSource::AccountQuota),
+    ]
+}
+
+/// Strategy for launch verdict.
+fn arb_launch_verdict() -> impl Strategy<Value = LaunchVerdict> {
+    prop_oneof![
+        Just(LaunchVerdict::Allow),
+        Just(LaunchVerdict::Warn),
+        Just(LaunchVerdict::Block),
+    ]
+}
+
+/// Strategy for launch warning.
+fn arb_launch_warning() -> impl Strategy<Value = LaunchWarning> {
+    (
+        arb_warning_source(),
+        any::<bool>(),
+        "[a-zA-Z0-9 .,:_%$/-]{1,80}",
+    )
+        .prop_map(|(source, blocking, message)| LaunchWarning {
+            source,
+            blocking,
+            message,
+        })
 }
 
 /// Strategy for a budget alert targeting a given provider name.
@@ -110,6 +142,42 @@ fn arb_signals(agent_type: AgentType) -> impl Strategy<Value = QuotaSignals> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Invariant 0: LaunchVerdict serde roundtrip preserves ordering carrier.
+    #[test]
+    fn launch_verdict_serde_roundtrip(
+        verdict in arb_launch_verdict(),
+    ) {
+        let json = serde_json::to_string(&verdict).unwrap();
+        let deserialized: LaunchVerdict = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(verdict, deserialized);
+    }
+
+    /// Invariant 0b: WarningSource serializes as snake_case.
+    #[test]
+    fn warning_source_snake_case(
+        source in arb_warning_source(),
+    ) {
+        let json = serde_json::to_string(&source).unwrap();
+        let inner = json.trim_matches('"');
+        prop_assert!(
+            inner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "serialized warning source should be snake_case, got '{}'",
+            inner
+        );
+    }
+
+    /// Invariant 0c: LaunchWarning serde roundtrip preserves all fields.
+    #[test]
+    fn launch_warning_serde_roundtrip(
+        warning in arb_launch_warning(),
+    ) {
+        let json = serde_json::to_string(&warning).unwrap();
+        let deserialized: LaunchWarning = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(warning.source, deserialized.source);
+        prop_assert_eq!(warning.blocking, deserialized.blocking);
+        prop_assert_eq!(warning.message, deserialized.message);
+    }
 
     /// Invariant 1: The verdict is Block iff at least one warning is blocking.
     #[test]
