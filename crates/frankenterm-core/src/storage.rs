@@ -7828,16 +7828,25 @@ impl StorageHandle {
 
     /// Record a usage metric for analytics tracking.
     pub async fn record_usage_metric(&self, record: UsageMetricRecord) -> Result<i64> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::RecordUsageMetric {
-                record,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.record_usage_metric_with_cx(&cx, record).await;
+        }
 
-        Self::recv_writer_response(rx).await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::RecordUsageMetric {
+                    record,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+            Self::recv_writer_response(rx).await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metric`].
