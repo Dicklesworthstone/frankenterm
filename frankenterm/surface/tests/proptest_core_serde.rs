@@ -320,3 +320,23 @@ fn resize_smaller_truncates_visible_screen_content() {
     assert_eq!(surface.dimensions(), (2, 2));
     assert_eq!(surface.screen_chars_to_string(), "ab\nef\n");
 }
+
+#[test]
+fn resize_preserves_title() {
+    let mut surface = Surface::new(4, 3);
+    surface.add_change(Change::Title("myterm".to_string()));
+
+    surface.resize(6, 5);
+
+    assert_eq!(surface.title(), "myterm");
+}
+
+#[test]
+fn resize_preserves_cursor_visibility() {
+    let mut surface = Surface::new(4, 3);
+    surface.add_change(Change::CursorVisibility(CursorVisibility::Hidden));
+
+    surface.resize(6, 5);
+
+    assert_eq!(surface.cursor_visibility(), CursorVisibility::Hidden);
+}
