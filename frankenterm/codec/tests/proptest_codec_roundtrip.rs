@@ -1,11 +1,12 @@
 use codec::{
     AdjustPaneSize, CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion,
     GetCodecVersionResponse, GetPaneDirection, GetPaneDirectionResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, PaneFocused, PaneRemoved, Pdu,
-    Ping, Pong, RenameWorkspace, Resize, SelectStackPane, SendPaste, SetActiveWorkspace,
-    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
-    SetWindowWorkspace, TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane,
-    UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
+    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SelectStackPane,
+    SendPaste, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, TabAddedToWindow, TabResized,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::PaneDirection;
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -329,6 +330,15 @@ fn arb_set_floating_pane_z() -> impl Strategy<Value = SetFloatingPaneZ> {
 fn arb_toggle_floating_pane() -> impl Strategy<Value = ToggleFloatingPane> {
     (0u64..=4096, any::<bool>())
         .prop_map(|(pane_id, visible)| ToggleFloatingPane { pane_id, visible })
+}
+
+fn arb_move_floating_pane() -> impl Strategy<Value = MoveFloatingPane> {
+    (0u64..=4096, arb_floating_rect())
+        .prop_map(|(pane_id, rect)| MoveFloatingPane { pane_id, rect })
+}
+
+fn arb_remove_floating_pane() -> impl Strategy<Value = RemoveFloatingPane> {
+    (0u64..=4096).prop_map(|pane_id| RemoveFloatingPane { pane_id })
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
@@ -682,6 +692,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::ToggleFloatingPane(payload));
+    }
+
+    #[test]
+    fn move_floating_pane_json_and_pdu_roundtrip(
+        payload in arb_move_floating_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: MoveFloatingPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::MoveFloatingPane(payload));
+    }
+
+    #[test]
+    fn remove_floating_pane_json_and_pdu_roundtrip(
+        payload in arb_remove_floating_pane(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: RemoveFloatingPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::RemoveFloatingPane(payload));
     }
 
     #[test]
