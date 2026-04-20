@@ -131,6 +131,39 @@ proptest! {
     }
 
     #[test]
+    fn approval_tracker_snapshot_coherent_counters(
+        total in 0usize..1000,
+        pending in 0usize..1000,
+        approved in 0usize..1000,
+        rejected in 0usize..1000,
+        expired in 0usize..1000,
+        revoked in 0usize..1000,
+        extra_capacity in 0usize..1000,
+    ) {
+        let pending = pending.min(total);
+        let approved = approved.min(total.saturating_sub(pending));
+        let rejected = rejected.min(total.saturating_sub(pending + approved));
+        let expired = expired.min(total.saturating_sub(pending + approved + rejected));
+        let revoked = revoked.min(total.saturating_sub(pending + approved + rejected + expired));
+
+        let snap = ApprovalTrackerSnapshot {
+            total,
+            pending,
+            approved,
+            rejected,
+            expired,
+            revoked,
+            max_entries: total + extra_capacity,
+        };
+
+        prop_assert_eq!(
+            snap.pending + snap.approved + snap.rejected + snap.expired + snap.revoked,
+            snap.total
+        );
+        prop_assert!(snap.total <= snap.max_entries);
+    }
+
+    #[test]
     fn approval_request_json_roundtrip(req in arb_approval_request()) {
         let json = serde_json::to_string(&req).unwrap();
         let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
@@ -409,6 +442,22 @@ proptest! {
         let json = serde_json::to_string(&snap).unwrap();
         let back: RevocationRegistrySnapshot = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn revocation_registry_snapshot_active_not_above_total(
+        total_records in 0usize..1000,
+        active_revocations in 0usize..1000,
+        extra_capacity in 0usize..1000,
+    ) {
+        let snap = RevocationRegistrySnapshot {
+            total_records,
+            active_revocations: active_revocations.min(total_records),
+            max_records: total_records + extra_capacity,
+        };
+
+        prop_assert!(snap.active_revocations <= snap.total_records);
+        prop_assert!(snap.total_records <= snap.max_records);
     }
 }
 
