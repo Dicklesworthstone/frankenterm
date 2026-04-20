@@ -7838,14 +7838,23 @@ impl StorageHandle {
 
     /// Get per-agent metric breakdown since a given timestamp.
     pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            aggregate_by_agent_sync(&conn, since_ts)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.aggregate_by_agent_with_cx(&cx, since_ts).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                aggregate_by_agent_sync(&conn, since_ts)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_by_agent`].
@@ -7858,7 +7867,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("aggregate_by_agent cancelled: {err}"))
         })?;
-        self.aggregate_by_agent(since_ts).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            aggregate_by_agent_sync(&conn, since_ts)
+        })
+        .await
     }
 
     // ---- Notification History ----
