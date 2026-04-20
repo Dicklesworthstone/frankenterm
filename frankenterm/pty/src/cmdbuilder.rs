@@ -214,19 +214,21 @@ pub struct CommandBuilder {
 mod env_map_serde {
     //! JSON-friendly adapter for `BTreeMap<OsString, EnvEntry>`.
     //!
-    //! `OsString` on unix wraps arbitrary bytes, so serde_json cannot use
-    //! it as a map key (JSON requires string keys). This adapter serializes
-    //! the map as `BTreeMap<String, EnvEntry>` using UTF-8-lossy conversion
-    //! on the key, which covers every legal environment-variable name on
-    //! every supported platform (POSIX env names are ASCII-only; Windows
-    //! env names survive UTF-16 → UTF-8 round-tripping). Any lossy
-    //! conversion would already indicate a malformed key that the OS
-    //! rejects, so we accept that small edge case as the cost of making
-    //! the roundtrip work in JSON at all.
+    //! `OsString` on unix wraps arbitrary bytes; on windows it wraps UTF-16
+    //! code units that may include unpaired surrogates. Neither representation
+    //! is legal as a JSON map key, and a UTF-8-lossy conversion is not
+    //! injective — two distinct `OsString` keys can collapse to the same
+    //! `String` via `U+FFFD` replacement, silently dropping entries from
+    //! the roundtripped map.
+    //!
+    //! To preserve every distinct input key, serialize as a *sequence* of
+    //! `(OsString, EnvEntry)` pairs rather than a map. In a value position
+    //! `OsString`'s derived serde impl is bijective (it emits the enum form
+    //! that carries the raw bytes / code units), so every pair roundtrips
+    //! losslessly regardless of UTF-8 validity.
     use super::{BTreeMap, EnvEntry, OsString};
-    use serde::de::{Deserializer, MapAccess, Visitor};
-    use serde::ser::{SerializeMap, Serializer};
-    use std::fmt;
+    use serde::de::{Deserialize, Deserializer};
+    use serde::ser::{SerializeSeq, Serializer};
 
     pub fn serialize<S>(
         envs: &BTreeMap<OsString, EnvEntry>,
@@ -235,12 +237,11 @@ mod env_map_serde {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(envs.len()))?;
-        for (key, value) in envs {
-            let key_str = key.to_string_lossy();
-            map.serialize_entry(key_str.as_ref(), value)?;
+        let mut seq = serializer.serialize_seq(Some(envs.len()))?;
+        for entry in envs {
+            seq.serialize_element(&entry)?;
         }
-        map.end()
+        seq.end()
     }
 
     pub fn deserialize<'de, D>(
@@ -249,28 +250,8 @@ mod env_map_serde {
     where
         D: Deserializer<'de>,
     {
-        struct EnvMapVisitor;
-
-        impl<'de> Visitor<'de> for EnvMapVisitor {
-            type Value = BTreeMap<OsString, EnvEntry>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a map from environment variable name to EnvEntry")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut out = BTreeMap::new();
-                while let Some((key, value)) = access.next_entry::<String, EnvEntry>()? {
-                    out.insert(OsString::from(key), value);
-                }
-                Ok(out)
-            }
-        }
-
-        deserializer.deserialize_map(EnvMapVisitor)
+        let pairs: Vec<(OsString, EnvEntry)> = Deserialize::deserialize(deserializer)?;
+        Ok(pairs.into_iter().collect())
     }
 }
 
