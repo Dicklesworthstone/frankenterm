@@ -1314,31 +1314,40 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         timeout: Duration,
     ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
-        let result = crate::runtime_compat::timeout(timeout, async {
-            let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
-            if let Err(e) = self.mark_shutdown().await {
-                tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
-            }
-            capture_result
-        })
-        .await;
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.shutdown_checkpoint_with_cx(&cx, panes, timeout).await;
+        }
 
-        match result {
-            Ok(Ok(snap)) => Ok(Some(snap)),
-            Ok(Err(SnapshotError::NoChanges)) => {
-                // No changes but still mark shutdown
-                let _ = self.mark_shutdown().await;
-                Ok(None)
-            }
-            Ok(Err(e)) => {
-                // Capture failed, still try to mark shutdown
-                let _ = self.mark_shutdown().await;
-                Err(e)
-            }
-            Err(_) => {
-                tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
-                let _ = self.mark_shutdown().await;
-                Ok(None)
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let result = crate::runtime_compat::timeout(timeout, async {
+                let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
+                if let Err(e) = self.mark_shutdown().await {
+                    tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
+                }
+                capture_result
+            })
+            .await;
+
+            match result {
+                Ok(Ok(snap)) => Ok(Some(snap)),
+                Ok(Err(SnapshotError::NoChanges)) => {
+                    // No changes but still mark shutdown
+                    let _ = self.mark_shutdown().await;
+                    Ok(None)
+                }
+                Ok(Err(e)) => {
+                    // Capture failed, still try to mark shutdown
+                    let _ = self.mark_shutdown().await;
+                    Err(e)
+                }
+                Err(_) => {
+                    tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
+                    let _ = self.mark_shutdown().await;
+                    Ok(None)
+                }
             }
         }
     }
