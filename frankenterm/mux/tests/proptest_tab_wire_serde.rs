@@ -208,6 +208,20 @@ proptest! {
     }
 
     #[test]
+    fn split_direction_json_roundtrip(value in arb_split_direction()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SplitDirection = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn split_size_json_roundtrip(value in arb_split_size()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SplitSize = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
     fn split_request_json_roundtrip(value in arb_split_request()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: SplitRequest = serde_json::from_str(&json).unwrap();
