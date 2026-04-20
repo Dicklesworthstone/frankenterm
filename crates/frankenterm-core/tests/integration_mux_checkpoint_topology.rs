@@ -13,6 +13,8 @@
 //! roll back to any prior checkpoint. TopologySnapshot captures the spatial
 //! layout (windows, tabs, pane trees) for persistence and restore.
 
+use std::collections::HashMap;
+
 use frankenterm_core::durable_state::{CheckpointTrigger, DurableStateManager};
 use frankenterm_core::headless_mux_server::{
     HeadlessMuxServer, RemoteRequest, RemoteResponse, ServerConfig,
@@ -498,6 +500,10 @@ fn full_pipeline_mux_checkpoint_topology() {
         .expect("rollback should restore a live topology snapshot");
     let post_rollback_fingerprint = topology_fingerprint(post_rollback_topo);
     assert_eq!(
+        post_rollback_topo, &initial_topo,
+        "rollback should restore the exact pre-expansion topology snapshot, not just the pane id set"
+    );
+    assert_eq!(
         post_rollback_fingerprint, initial_fingerprint,
         "rollback should restore the exact pre-expansion pane tree"
     );
@@ -511,6 +517,7 @@ fn full_pipeline_mux_checkpoint_topology() {
     let restored_topo =
         TopologySnapshot::from_json(&initial_topo_json).expect("deserialize initial topology");
     assert_eq!(restored_topo.pane_count(), 3);
+    assert_eq!(restored_topo, initial_topo);
     assert_eq!(topology_fingerprint(&restored_topo), initial_fingerprint);
 
     // Phase 6: server status should reflect healthy state.
