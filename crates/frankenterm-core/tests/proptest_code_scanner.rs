@@ -186,6 +186,29 @@ proptest! {
         prop_assert_eq!(restored.line, finding.line);
         prop_assert_eq!(&restored.suggestion, &finding.suggestion);
     }
+
+    // 8b. Missing optional fields stay absent after serde.
+    #[test]
+    fn finding_optional_fields_preserve_absence(
+        severity in arb_severity(),
+        category in "[a-z-]{3,12}",
+        message in "[A-Za-z ]{5,30}",
+    ) {
+        let finding = ScanFinding {
+            severity,
+            category,
+            message,
+            file: None,
+            line: None,
+            suggestion: None,
+            extra: HashMap::new(),
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        let restored: ScanFinding = serde_json::from_str(&json).unwrap();
+        prop_assert!(restored.file.is_none());
+        prop_assert!(restored.line.is_none());
+        prop_assert!(restored.suggestion.is_none());
+    }
 }
 
 // ── ScannerSummary serde ────────────────────────────────────────────────────
@@ -219,6 +242,71 @@ proptest! {
         prop_assert_eq!(&restored.project, &report.project);
         prop_assert_eq!(restored.scanners.len(), report.scanners.len());
         prop_assert_eq!(restored.totals.total(), report.totals.total());
+    }
+
+    // 10b. Scanner summary totals never exceed report totals in coherent reports.
+    #[test]
+    fn report_totals_dominate_scanner_rollups(
+        summaries in prop::collection::vec(arb_scanner_summary(), 0..=4),
+        extra_critical in 0..=50usize,
+        extra_warning in 0..=50usize,
+        extra_info in 0..=50usize,
+        extra_files in 0..=20usize,
+    ) {
+        let scanner_critical: usize = summaries.iter().map(|s| s.critical).sum();
+        let scanner_warning: usize = summaries.iter().map(|s| s.warning).sum();
+        let scanner_info: usize = summaries.iter().map(|s| s.info).sum();
+        let scanner_files: usize = summaries.iter().map(|s| s.files).sum();
+
+        let report = ScanReport {
+            project: Some("/tmp/project".to_string()),
+            scanners: summaries,
+            totals: ScanTotals {
+                critical: scanner_critical + extra_critical,
+                warning: scanner_warning + extra_warning,
+                info: scanner_info + extra_info,
+                files: scanner_files + extra_files,
+            },
+            extra: HashMap::new(),
+        };
+
+        prop_assert!(report.totals.critical >= scanner_critical);
+        prop_assert!(report.totals.warning >= scanner_warning);
+        prop_assert!(report.totals.info >= scanner_info);
+        prop_assert!(report.totals.files >= scanner_files);
+    }
+
+    // 10c. Report classification matches total severity thresholds even with scanners present.
+    #[test]
+    fn report_classification_uses_report_totals_precedence(
+        summaries in prop::collection::vec(arb_scanner_summary(), 0..=3),
+        critical in 0..=3usize,
+        warning in 0..=150usize,
+        info in 0..=50usize,
+    ) {
+        let report = ScanReport {
+            project: Some("/tmp/project".to_string()),
+            scanners: summaries,
+            totals: ScanTotals {
+                critical,
+                warning,
+                info,
+                files: 1,
+            },
+            extra: HashMap::new(),
+        };
+
+        let expected = if critical > 0 {
+            ScanClassification::Critical
+        } else if warning > 100 {
+            ScanClassification::HighWarning
+        } else if warning > 0 {
+            ScanClassification::Warning
+        } else {
+            ScanClassification::Clean
+        };
+
+        prop_assert_eq!(CodeScanner::classify(&report), expected);
     }
 }
 
