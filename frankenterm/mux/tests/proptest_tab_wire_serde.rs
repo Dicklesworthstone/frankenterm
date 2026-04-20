@@ -1,3 +1,4 @@
+use mux::layout::{LayoutArrangement, SwapLayout};
 use mux::renderable::StableCursorPosition;
 use mux::tab::{
     PaneEntry, PaneNode, SerdeUrl, SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize,
@@ -155,6 +156,33 @@ fn arb_split_direction_and_size() -> impl Strategy<Value = SplitDirectionAndSize
         })
 }
 
+fn arb_layout_arrangement() -> impl Strategy<Value = LayoutArrangement> {
+    let leaf = any::<bool>().prop_map(|is_main| LayoutArrangement::Slot { is_main });
+    leaf.prop_recursive(4, 32, 2, |inner| {
+        (arb_split_direction(), 0.0f64..=1.0f64, inner.clone(), inner).prop_map(
+            |(direction, ratio, first, second)| LayoutArrangement::Split {
+                direction,
+                ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            },
+        )
+    })
+}
+
+fn arb_swap_layout() -> impl Strategy<Value = SwapLayout> {
+    (
+        arb_small_string(),
+        prop::option::of(arb_small_string()),
+        arb_layout_arrangement(),
+    )
+        .prop_map(|(name, description, arrangement)| SwapLayout {
+            name,
+            description,
+            arrangement,
+        })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -190,6 +218,20 @@ proptest! {
     fn split_direction_and_size_json_roundtrip(value in arb_split_direction_and_size()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: SplitDirectionAndSize = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn layout_arrangement_json_roundtrip(value in arb_layout_arrangement()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: LayoutArrangement = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn swap_layout_json_roundtrip(value in arb_swap_layout()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SwapLayout = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
