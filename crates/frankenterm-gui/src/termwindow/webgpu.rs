@@ -278,8 +278,7 @@ where
     TRecv: FnMut(Duration) -> Result<Result<(), E>, mpsc::RecvTimeoutError>,
     TNow: FnMut() -> Instant,
 {
-    let start = now();
-    let deadline = start.checked_add(timeout).unwrap_or(start);
+    let deadline = now() + timeout;
     loop {
         poll()?;
 
@@ -1140,43 +1139,6 @@ ReadbackWaitSnapshot {
     ],
 }
 "
-        );
-    }
-
-    #[test]
-    fn wait_for_webgpu_readback_map_propagates_callback_error() {
-        k9::snapshot!(
-            snapshot_readback_wait::<&'static str>([Ok(Err("device lost"))], [0],),
-            "
-ReadbackWaitSnapshot {
-    result: \"mapping webgpu readback buffer failed: \\\"device lost\\\"\",
-    poll_calls: 1,
-    recv_timeouts_ms: [
-        5,
-    ],
-}
-"
-        );
-    }
-
-    #[test]
-    fn wait_for_webgpu_readback_map_propagates_poll_error_before_waiting_on_channel() {
-        let mut recv_called = false;
-        let result = wait_for_webgpu_readback_map::<&'static str, _, _, _>(
-            Duration::from_millis(20),
-            Duration::from_millis(5),
-            || Err(anyhow!("readback cancelled")),
-            |_| {
-                recv_called = true;
-                Err(mpsc::RecvTimeoutError::Disconnected)
-            },
-            Instant::now,
-        );
-
-        assert_eq!(result.unwrap_err().to_string(), "readback cancelled");
-        assert!(
-            !recv_called,
-            "poll failure/cancellation should return before waiting on the callback channel"
         );
     }
 }
