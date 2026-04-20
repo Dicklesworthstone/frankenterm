@@ -8903,6 +8903,14 @@ impl StorageHandle {
 
     /// Get the current FTS index state (version, last rebuild time).
     pub async fn get_fts_index_state(&self) -> Result<Option<FtsIndexState>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_fts_index_state_with_cx(&cx).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
@@ -8911,6 +8919,7 @@ impl StorageHandle {
             get_fts_index_state_sync(&conn)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_fts_index_state`].
@@ -8922,7 +8931,14 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_fts_index_state cancelled: {err}"))
         })?;
-        self.get_fts_index_state().await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_fts_index_state_sync(&conn)
+        })
+        .await
     }
 
     /// Insert an approval token
