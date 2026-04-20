@@ -10478,15 +10478,27 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<Option<crate::accounts::AccountRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_account_with_cx(&cx, service, account_id).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
         let db_path = self.db_path.clone();
+        #[cfg(not(feature = "asupersync-runtime"))]
         let service = service.to_string();
+        #[cfg(not(feature = "asupersync-runtime"))]
         let account_id = account_id.to_string();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-            get_account_sync(&conn, &service, &account_id)
-        })
-        .await
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str())
+                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+                get_account_sync(&conn, &service, &account_id)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_account`].
@@ -10499,7 +10511,15 @@ impl StorageHandle {
     ) -> Result<Option<crate::accounts::AccountRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_account cancelled: {err}")))?;
-        self.get_account(service, account_id).await
+        let db_path = self.db_path.clone();
+        let service = service.to_string();
+        let account_id = account_id.to_string();
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str())
+                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            get_account_sync(&conn, &service, &account_id)
+        })
+        .await
     }
 
     /// Select the best account for a service according to selection policy
