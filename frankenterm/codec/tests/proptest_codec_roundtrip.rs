@@ -5,7 +5,7 @@ use codec::{
     GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, ListPanesResponse, LivenessResponse,
+    GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
     Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
     SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
@@ -1546,5 +1546,25 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::WindowTitleChanged(payload));
+    }
+
+    #[test]
+    fn input_serial_json_roundtrip_preserves_millis(millis in any::<u64>()) {
+        let payload: InputSerial =
+            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into();
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: InputSerial = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+    }
+
+    #[test]
+    fn input_serial_order_matches_millis_order(a in any::<u64>(), b in any::<u64>()) {
+        let left: InputSerial =
+            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(a)).into();
+        let right: InputSerial =
+            (std::time::UNIX_EPOCH + std::time::Duration::from_millis(b)).into();
+
+        prop_assert_eq!(left.cmp(&right), a.cmp(&b));
     }
 }
