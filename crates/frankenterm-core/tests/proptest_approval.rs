@@ -146,6 +146,17 @@ fn arb_policy_input() -> impl Strategy<Value = PolicyInput> {
         )
 }
 
+fn arb_audit_context() -> impl Strategy<Value = ApprovalAuditContext> {
+    (
+        proptest::option::of("[a-zA-Z0-9:_-]{1,32}"),
+        proptest::option::of("[a-zA-Z0-9 .,_:/{}\\[\\]-]{1,80}"),
+    )
+        .prop_map(|(correlation_id, decision_context)| ApprovalAuditContext {
+            correlation_id,
+            decision_context,
+        })
+}
+
 // =============================================================================
 // Property 1: fingerprint_for_input is deterministic
 // =============================================================================
@@ -548,6 +559,66 @@ proptest! {
         let ctx = ApprovalAuditContext::default();
         prop_assert!(ctx.correlation_id.is_none());
         prop_assert!(ctx.decision_context.is_none());
+    }
+}
+
+// =============================================================================
+// Property 21b: ApprovalAuditContext clone preserves optional fields
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(120))]
+
+    #[test]
+    fn audit_context_clone_preserves_randomized(
+        ctx in arb_audit_context(),
+    ) {
+        let cloned = ctx.clone();
+        prop_assert_eq!(cloned.correlation_id, ctx.correlation_id);
+        prop_assert_eq!(cloned.decision_context, ctx.decision_context);
+    }
+}
+
+// =============================================================================
+// Property 21c: ApprovalScope::from_input is deterministic
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(120))]
+
+    #[test]
+    fn scope_from_input_deterministic(
+        ws in "[a-zA-Z0-9_-]{1,24}",
+        input in arb_policy_input(),
+    ) {
+        let first = ApprovalScope::from_input(&ws, &input);
+        let second = ApprovalScope::from_input(&ws, &input);
+        prop_assert_eq!(first.workspace_id, second.workspace_id);
+        prop_assert_eq!(first.action_kind, second.action_kind);
+        prop_assert_eq!(first.pane_id, second.pane_id);
+        prop_assert_eq!(first.action_fingerprint, second.action_fingerprint);
+    }
+}
+
+// =============================================================================
+// Property 21d: workspace_id does not affect action fingerprint
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(120))]
+
+    #[test]
+    fn scope_workspace_change_does_not_change_fingerprint(
+        ws1 in "[a-zA-Z0-9_-]{1,24}",
+        ws2 in "[a-zA-Z0-9_-]{1,24}",
+        input in arb_policy_input(),
+    ) {
+        prop_assume!(ws1 != ws2);
+        let first = ApprovalScope::from_input(&ws1, &input);
+        let second = ApprovalScope::from_input(&ws2, &input);
+        prop_assert_eq!(first.action_fingerprint, second.action_fingerprint);
+        prop_assert_eq!(first.action_kind, second.action_kind);
+        prop_assert_eq!(first.pane_id, second.pane_id);
     }
 }
 
