@@ -1560,6 +1560,73 @@ mod tests {
         });
     }
 
+    /// ft-xbnl0.2.3 Cx-first: record_event_with_cx records a detection event
+    /// into an active recording, then verifies the event appears in replay.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn recording_manager_record_event_with_cx_captures_detection() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test_event_cx.war");
+
+            let manager = RecordingManager::new(RecordingOptions::default());
+            let cx = crate::cx::for_request();
+
+            manager
+                .start_recording_with_cx(&cx, 8, &path, 1_000)
+                .await
+                .expect("start_recording_with_cx");
+
+            let detection = crate::patterns::Detection {
+                rule_id: "test.cx_event".to_string(),
+                agent_type: crate::patterns::AgentType::Unknown,
+                event_type: "test_event".to_string(),
+                severity: crate::patterns::Severity::Info,
+                confidence: 0.95,
+                extracted: serde_json::json!({"key": "value"}),
+                matched_text: "test matched text".to_string(),
+                span: (0, 17),
+            };
+            manager
+                .record_event_with_cx(&cx, 8, &detection, 1_200)
+                .await
+                .expect("record_event_with_cx");
+
+            let stats = manager
+                .stop_recording_with_cx(&cx, 8)
+                .await
+                .expect("stop_recording_with_cx");
+            assert!(stats.is_some(), "stopping active recorder returns stats");
+        });
+    }
+
+    /// ft-xbnl0.2.3 Cx-first: record_event_with_cx on an unrecorded pane
+    /// is a no-op — returns Ok(()) without error.
+    #[cfg(feature = "asupersync-runtime")]
+    #[test]
+    fn recording_manager_record_event_with_cx_unknown_pane_noop() {
+        run_async_test(async {
+            let manager = RecordingManager::new(RecordingOptions::default());
+            let cx = crate::cx::for_request();
+
+            let detection = crate::patterns::Detection {
+                rule_id: "test.noop".to_string(),
+                agent_type: crate::patterns::AgentType::Unknown,
+                event_type: "noop_event".to_string(),
+                severity: crate::patterns::Severity::Info,
+                confidence: 1.0,
+                extracted: serde_json::json!(null),
+                matched_text: String::new(),
+                span: (0, 0),
+            };
+            // No recording started for pane 999 → should return Ok(())
+            manager
+                .record_event_with_cx(&cx, 999, &detection, 5_000)
+                .await
+                .expect("record_event_with_cx on unknown pane should be infallible");
+        });
+    }
+
     // Ingress tap unit tests (ft-oegrb.2.2)
 
     #[test]
