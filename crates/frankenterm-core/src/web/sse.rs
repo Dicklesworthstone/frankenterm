@@ -11,7 +11,9 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, select, sleep, task, timeout};
+use crate::runtime_compat::{mpsc, select, sleep, task};
+#[cfg(not(feature = "asupersync-runtime"))]
+use crate::runtime_compat::timeout;
 use crate::storage::{SegmentScanQuery, StorageHandle};
 use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
 use asupersync::stream::Stream;

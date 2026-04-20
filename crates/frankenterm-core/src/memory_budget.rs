@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
