@@ -1,4 +1,5 @@
 use mux::pane::{CollapsePriority, PaneConstraints, Pattern, PatternType, SearchResult};
+use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions};
 use proptest::prelude::*;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
@@ -82,6 +83,104 @@ fn arb_collapse_priority() -> impl Strategy<Value = CollapsePriority> {
     ]
 }
 
+fn arb_renderable_dimensions() -> impl Strategy<Value = RenderableDimensions> {
+    (
+        0usize..=512,
+        0usize..=512,
+        0usize..=100_000,
+        -100_000isize..=100_000isize,
+        -100_000isize..=100_000isize,
+        0u32..=960,
+        0usize..=8192,
+        0usize..=8192,
+        any::<bool>(),
+    )
+        .prop_map(
+            |(
+                cols,
+                viewport_rows,
+                scrollback_rows,
+                physical_top,
+                scrollback_top,
+                dpi,
+                pixel_width,
+                pixel_height,
+                reverse_video,
+            )| RenderableDimensions {
+                cols,
+                viewport_rows,
+                scrollback_rows,
+                physical_top,
+                scrollback_top,
+                dpi,
+                pixel_width,
+                pixel_height,
+                reverse_video,
+            },
+        )
+}
+
+fn arb_pane_tiered_scrollback_status() -> impl Strategy<Value = PaneTieredScrollbackStatus> {
+    (
+        any::<bool>(),
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=10_000_000,
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=100_000,
+        0usize..=10_000_000,
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        0usize..=100_000,
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+    )
+        .prop_map(
+            |(
+                tiering_enabled,
+                configured_scrollback_rows,
+                configured_hot_lines,
+                configured_warm_max_bytes,
+                visible_rows,
+                in_memory_scrollback_rows,
+                warm_resident_lines,
+                warm_resident_bytes,
+                warm_spill_lines_total,
+                warm_spill_bytes_total,
+                cold_spill_lines_total,
+                cold_spill_bytes_total,
+                cold_worker_peak_backlog_depth,
+                cold_worker_completion_throughput_lines_per_sec,
+                cold_worker_completed_lines_total,
+                cold_worker_completed_batches_total,
+                cold_worker_cancellation_count,
+            )| PaneTieredScrollbackStatus {
+                tiering_enabled,
+                configured_scrollback_rows,
+                configured_hot_lines,
+                configured_warm_max_bytes,
+                visible_rows,
+                in_memory_scrollback_rows,
+                warm_resident_lines,
+                warm_resident_bytes,
+                warm_spill_lines_total,
+                warm_spill_bytes_total,
+                cold_spill_lines_total,
+                cold_spill_bytes_total,
+                cold_worker_peak_backlog_depth,
+                cold_worker_completion_throughput_lines_per_sec,
+                cold_worker_completed_lines_total,
+                cold_worker_completed_batches_total,
+                cold_worker_cancellation_count,
+            },
+        )
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -117,6 +216,20 @@ proptest! {
     fn collapse_priority_json_roundtrip(value in arb_collapse_priority()) {
         let json = serde_json::to_string(&value).unwrap();
         let back: CollapsePriority = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn renderable_dimensions_json_roundtrip(value in arb_renderable_dimensions()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: RenderableDimensions = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(back, value);
+    }
+
+    #[test]
+    fn pane_tiered_scrollback_status_json_roundtrip(value in arb_pane_tiered_scrollback_status()) {
+        let json = serde_json::to_string(&value).unwrap();
+        let back: PaneTieredScrollbackStatus = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back, value);
     }
 }
