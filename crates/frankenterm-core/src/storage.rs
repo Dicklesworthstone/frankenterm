@@ -11044,14 +11044,23 @@ impl StorageHandle {
 
     /// Export agent sessions with optional pane/time/limit filters
     pub async fn export_sessions(&self, query: ExportQuery) -> Result<Vec<AgentSessionRecord>> {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_export_sessions(&conn, &query)
-        })
-        .await
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.export_sessions_with_cx(&cx, query).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_export_sessions(&conn, &query)
+            })
+            .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
@@ -11063,7 +11072,14 @@ impl StorageHandle {
     ) -> Result<Vec<AgentSessionRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
-        self.export_sessions(query).await
+        let db_path = Arc::clone(&self.db_path);
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_export_sessions(&conn, &query)
+        })
+        .await
     }
 
     /// Export pane reservations (active + historical) with optional pane/time/limit filters
