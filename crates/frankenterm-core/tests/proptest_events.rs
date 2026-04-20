@@ -13,6 +13,7 @@ use frankenterm_core::events::*;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use proptest::prelude::*;
 use std::time::Duration;
+use std::sync::atomic::Ordering;
 
 // ============================================================================
 // Strategies
@@ -1049,11 +1050,32 @@ proptest! {
         prop_assert_eq!(snap.subscriber_lag_events, 0);
     }
 
+    /// Property 56: EventBusMetrics::snapshot reflects current atomic counters.
+    #[test]
+    fn prop_event_bus_metrics_snapshot_reflects_counters(
+        events_published in any::<u64>(),
+        dropped in any::<u64>(),
+        subscribers in any::<u64>(),
+        lag_events in any::<u64>(),
+    ) {
+        let m = EventBusMetrics::new();
+        m.events_published.store(events_published, Ordering::Relaxed);
+        m.events_dropped_no_subscribers.store(dropped, Ordering::Relaxed);
+        m.active_subscribers.store(subscribers, Ordering::Relaxed);
+        m.subscriber_lag_events.store(lag_events, Ordering::Relaxed);
+
+        let snap = m.snapshot();
+        prop_assert_eq!(snap.events_published, events_published);
+        prop_assert_eq!(snap.events_dropped_no_subscribers, dropped);
+        prop_assert_eq!(snap.active_subscribers, subscribers);
+        prop_assert_eq!(snap.subscriber_lag_events, lag_events);
+    }
+
     // ========================================================================
     // Property Tests: RecvError
     // ========================================================================
 
-    /// Property 56: RecvError::Closed display message is consistent.
+    /// Property 57: RecvError::Closed display message is consistent.
     #[test]
     fn prop_recv_error_closed_display(_dummy in Just(())) {
         let err = RecvError::Closed;
@@ -1061,7 +1083,7 @@ proptest! {
         prop_assert!(msg.contains("closed"), "Closed error should mention 'closed': {}", msg);
     }
 
-    /// Property 57: RecvError::Lagged display includes count.
+    /// Property 58: RecvError::Lagged display includes count.
     #[test]
     fn prop_recv_error_lagged_display(count in 1..10000u64) {
         let err = RecvError::Lagged { missed_count: count };
@@ -1074,7 +1096,7 @@ proptest! {
     // Property Tests: UserVarError
     // ========================================================================
 
-    /// Property 58: UserVarError::WatcherNotRunning display includes socket path.
+    /// Property 59: UserVarError::WatcherNotRunning display includes socket path.
     #[test]
     fn prop_user_var_error_watcher_display(path in "/[a-z/]{1,30}\\.sock") {
         let err = UserVarError::WatcherNotRunning {
@@ -1085,7 +1107,7 @@ proptest! {
             "WatcherNotRunning should include path: {}", msg);
     }
 
-    /// Property 59: UserVarError::IpcSendFailed display includes message.
+    /// Property 60: UserVarError::IpcSendFailed display includes message.
     #[test]
     fn prop_user_var_error_ipc_display(detail in "[a-z ]{1,30}") {
         let err = UserVarError::IpcSendFailed {
@@ -1096,7 +1118,7 @@ proptest! {
             "IpcSendFailed should include detail: {}", msg);
     }
 
-    /// Property 60: UserVarError::ParseFailed display includes reason.
+    /// Property 61: UserVarError::ParseFailed display includes reason.
     #[test]
     fn prop_user_var_error_parse_display(reason in "[a-z ]{1,30}") {
         let err = UserVarError::ParseFailed(reason.clone());
