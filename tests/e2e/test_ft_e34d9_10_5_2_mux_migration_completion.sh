@@ -179,6 +179,12 @@ else
   record_structural_fail "read_recovery_test_presence" "missing" "E_READ_RECOVERY" "${STRUCTURAL_FILE}"
 fi
 
+if rg -q 'simulated_network_read_error_then_fragmented_recovery_preserves_payload_order' "${TEST_FILE}"; then
+  record_structural_pass "fragmented_read_recovery_test_presence" "present" "${STRUCTURAL_FILE}"
+else
+  record_structural_fail "fragmented_read_recovery_test_presence" "missing" "E_FRAGMENTED_READ_RECOVERY" "${STRUCTURAL_FILE}"
+fi
+
 if rg -q 'pool_timeout_cascade_then_recovery_restores_capacity' "${TEST_FILE}"; then
   record_structural_pass "timeout_recovery_test_presence" "present" "${STRUCTURAL_FILE}"
 else
@@ -231,6 +237,11 @@ run_rch_phase \
   "read_recovery_targeted" \
   "cargo test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored simulated_network_read_error_then_recovery_preserves_buffered_data -- --test-threads=1" \
   test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored simulated_network_read_error_then_recovery_preserves_buffered_data -- --test-threads=1
+
+run_rch_phase \
+  "fragmented_read_recovery_targeted" \
+  "cargo test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored simulated_network_read_error_then_fragmented_recovery_preserves_payload_order -- --test-threads=1" \
+  test -p frankenterm-core --test mux_migration_completion --features asupersync-runtime,vendored simulated_network_read_error_then_fragmented_recovery_preserves_payload_order -- --test-threads=1
 
 run_rch_phase \
   "timeout_recovery_targeted" \

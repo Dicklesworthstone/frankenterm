@@ -692,6 +692,72 @@ fn simulated_network_read_error_then_recovery_preserves_buffered_data() {
     });
 }
 
+#[test]
+fn simulated_network_read_error_then_fragmented_recovery_preserves_payload_order() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let cx = healthy_cx();
+        let (a, b) = mock_unix_stream_pair();
+        let expected = b"fragmented-recovery-keeps-byte-order".to_vec();
+
+        a.write(&cx, &expected)
+            .await
+            .expect("seed pending payload");
+
+        let read_fault = SimulatedNetwork::new(
+            b.clone(),
+            SimulatedNetworkConfig {
+                read_error_rate: 1.0,
+                ..SimulatedNetworkConfig::healthy()
+            },
+            123,
+        );
+
+        let result = read_fault.read(&cx, expected.len()).await;
+        assert!(
+            result.is_err(),
+            "forced transient read error should surface"
+        );
+        assert_eq!(read_fault.errors_injected(), 1);
+        assert_eq!(
+            b.bytes_read(),
+            0,
+            "fault injection must not consume buffered bytes before fragmented recovery"
+        );
+
+        let recovered = SimulatedNetwork::new(
+            b,
+            SimulatedNetworkConfig {
+                max_read_bytes: Some(7),
+                ..SimulatedNetworkConfig::healthy()
+            },
+            124,
+        );
+
+        let mut observed = Vec::new();
+        while observed.len() < expected.len() {
+            let chunk = recovered.read(&cx, expected.len()).await.expect("recovery read");
+            assert!(
+                !chunk.is_empty(),
+                "fragmented recovery should continue returning buffered bytes until drained"
+            );
+            observed.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(
+            observed, expected,
+            "fragmented recovery must preserve the buffered payload byte-for-byte"
+        );
+        assert_eq!(
+            recovered.inner().bytes_read() as usize,
+            expected.len(),
+            "fragmented recovery must consume exactly the preserved payload bytes"
+        );
+        assert_eq!(recovered.errors_injected(), 0);
+        assert_eq!(recovered.drops_injected(), 0);
+    });
+}
+
 // ===========================================================================
 // Section 5: Pool + MuxClient composition
 //
