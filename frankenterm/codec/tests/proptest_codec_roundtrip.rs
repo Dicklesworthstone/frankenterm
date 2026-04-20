@@ -5,22 +5,24 @@ use codec::{
     GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
-    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane,
-    MovePaneToNewTabResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane,
-    RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
-    SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SerializedLines, SetActiveWorkspace,
-    SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
-    SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    GetTlsCredsResponse, KillPane, ListPanes, ListPanesResponse, LivenessResponse,
+    MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
+    Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
+    SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
+    SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
+    SetFocusedPane, SetLayoutCycle, SetPalette, SetPaneZoomed, SetWindowWorkspace, SpawnResponse,
+    SpawnV2, SplitPane, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
+    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{ClipboardSelection, TerminalSize};
+use frankenterm_term::{Alert, ClipboardSelection, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize};
 use proptest::prelude::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::image::ImageData;
@@ -327,6 +329,45 @@ fn arb_set_palette() -> impl Strategy<Value = SetPalette> {
         pane_id,
         palette: ColorPalette::default(),
     })
+}
+
+fn arb_list_panes_response() -> impl Strategy<Value = ListPanesResponse> {
+    (
+        proptest::collection::vec(arb_small_string(), 0..=8),
+        proptest::collection::vec((0u64..=4096, arb_small_string()), 0..=8),
+    )
+        .prop_map(|(tab_titles, window_titles)| ListPanesResponse {
+            tabs: vec![],
+            tab_titles,
+            window_titles: window_titles.into_iter().collect::<HashMap<_, _>>(),
+        })
+}
+
+fn arb_alert() -> impl Strategy<Value = Alert> {
+    prop_oneof![
+        Just(Alert::Bell),
+        Just(Alert::CurrentWorkingDirectoryChanged),
+        Just(Alert::PaletteChanged),
+        Just(Alert::OutputSinceFocusLost),
+        arb_small_string().prop_map(Alert::WindowTitleChanged),
+        prop::option::of(arb_small_string()).prop_map(Alert::TabTitleChanged),
+        (
+            prop::option::of(arb_small_string()),
+            arb_small_string(),
+            any::<bool>()
+        )
+            .prop_map(|(title, body, focus)| Alert::ToastNotification {
+                title,
+                body,
+                focus
+            }),
+        (arb_small_string(), arb_small_string())
+            .prop_map(|(name, value)| Alert::SetUserVar { name, value }),
+    ]
+}
+
+fn arb_notify_alert() -> impl Strategy<Value = NotifyAlert> {
+    (0u64..=4096, arb_alert()).prop_map(|(pane_id, alert)| NotifyAlert { pane_id, alert })
 }
 
 fn arb_spawn_tab_domain() -> impl Strategy<Value = SpawnTabDomain> {
@@ -956,6 +997,18 @@ proptest! {
     }
 
     #[test]
+    fn list_panes_response_json_and_pdu_roundtrip(
+        payload in arb_list_panes_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: ListPanesResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::ListPanesResponse(payload));
+    }
+
+    #[test]
     fn move_pane_to_new_tab_response_json_and_pdu_roundtrip(
         payload in arb_move_pane_to_new_tab_response(),
         serial in any::<u64>(),
@@ -1001,6 +1054,18 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SetPalette(payload));
+    }
+
+    #[test]
+    fn notify_alert_json_and_pdu_roundtrip(
+        payload in arb_notify_alert(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: NotifyAlert = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::NotifyAlert(payload));
     }
 
     #[test]
