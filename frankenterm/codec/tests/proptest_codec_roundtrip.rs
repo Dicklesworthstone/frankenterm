@@ -1,8 +1,8 @@
 use codec::{
-    CreateFloatingPane, ErrorResponse, GetCodecVersion, GetCodecVersionResponse, GetTlsCreds,
-    GetTlsCredsResponse, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane, SendPaste,
-    SetActiveWorkspace, SetClipboard, SetLayoutCycle, SetWindowWorkspace, TabTitleChanged,
-    UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
+    CreateFloatingPane, ErrorResponse, GetClientList, GetCodecVersion, GetCodecVersionResponse,
+    GetTlsCreds, GetTlsCredsResponse, ListPanes, Pdu, Ping, Pong, RenameWorkspace, SelectStackPane,
+    SendPaste, SetActiveWorkspace, SetClipboard, SetLayoutCycle, SetWindowWorkspace,
+    TabTitleChanged, UnitResponse, UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use frankenterm_term::ClipboardSelection;
 use mux::tab::FloatingPaneRect;
@@ -327,6 +327,16 @@ proptest! {
     #[test]
     fn pong_response_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::Pong(Pong {}));
+    }
+
+    #[test]
+    fn list_panes_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::ListPanes(ListPanes {}));
+    }
+
+    #[test]
+    fn get_client_list_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::GetClientList(GetClientList {}));
     }
 
     #[test]
