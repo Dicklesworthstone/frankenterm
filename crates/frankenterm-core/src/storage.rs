@@ -11116,6 +11116,16 @@ impl StorageHandle {
 
     /// Count active (unused + unexpired) approval tokens for a workspace
     pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self
+                .count_active_approvals_with_cx(&cx, workspace_id, now_ms)
+                .await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
 
@@ -11127,6 +11137,7 @@ impl StorageHandle {
             query_active_approvals_count(&conn, &workspace_id, now_ms)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_active_approvals`].
@@ -11140,7 +11151,17 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("count_active_approvals cancelled: {err}"))
         })?;
-        self.count_active_approvals(workspace_id, now_ms).await
+        let db_path = Arc::clone(&self.db_path);
+        let workspace_id = workspace_id.to_string();
+
+        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_active_approvals_count(&conn, &workspace_id, now_ms)
+        })
+        .await
     }
 
     /// Look up an approval token by code hash (without consuming it)
