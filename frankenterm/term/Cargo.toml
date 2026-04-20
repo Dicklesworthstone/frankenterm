@@ -43,6 +43,8 @@ frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"
 [dev-dependencies]
 env_logger.workspace = true
 k9.workspace = true
+proptest = "1.8.0"
+serde_json.workspace = true
 
 [dependencies.termwiz]
 workspace = true
