@@ -3010,4 +3010,131 @@ proptest! {
         prop_assert_eq!(back.warnings.len(), warn_count);
         prop_assert_eq!(back.guidance.len(), guidance_count);
     }
+
+    // ── RT-88: GetTextData with nested Some(TruncationInfo) ─────────────────
+    //
+    // Conformance gap: arb_get_text_data() hardcodes truncation_info: None
+    // and prop_get_text_data_serde never asserts on that field. Any regression
+    // in the Option<TruncationInfo> serde path (field flatten, skip_serializing,
+    // rename) would not be caught. This test fuzzes truncation_info as Some and
+    // pins idempotent JSON (serialize -> deserialize -> serialize equality)
+    // plus per-field equality on every TruncationInfo subfield.
+    #[test]
+    fn rt88_get_text_data_with_truncation_info_serde(
+        pane_id in 0u64..1_000_000,
+        text in "[a-zA-Z0-9 \n]{0,80}",
+        tail_lines in 0usize..10_000,
+        escapes_included in proptest::bool::ANY,
+        original_bytes in 0usize..1_000_000,
+        returned_bytes in 0usize..1_000_000,
+        original_lines in 0usize..100_000,
+        returned_lines in 0usize..100_000,
+    ) {
+        let data = GetTextData {
+            pane_id,
+            text: text.clone(),
+            tail_lines,
+            escapes_included,
+            truncated: true,
+            truncation_info: Some(TruncationInfo {
+                original_bytes,
+                returned_bytes,
+                original_lines,
+                returned_lines,
+            }),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: GetTextData = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+        prop_assert_eq!(back.pane_id, pane_id);
+        prop_assert_eq!(&back.text, &text);
+        prop_assert_eq!(back.tail_lines, tail_lines);
+        prop_assert_eq!(back.escapes_included, escapes_included);
+        prop_assert!(back.truncated);
+        let ti = back
+            .truncation_info
+            .expect("truncation_info must roundtrip as Some");
+        prop_assert_eq!(ti.original_bytes, original_bytes);
+        prop_assert_eq!(ti.returned_bytes, returned_bytes);
+        prop_assert_eq!(ti.original_lines, original_lines);
+        prop_assert_eq!(ti.returned_lines, returned_lines);
+    }
+
+    // ── RT-89: BatchGetTextData with populated PaneTextResult map ──────────
+    //
+    // Conformance gap: rt67_batch_get_text_data_serde uses an empty results
+    // BTreeMap, so the tagged-enum (status=ok|error) serialization inside the
+    // map is untested for BatchGetTextData. This test populates results with
+    // both PaneTextResult::Ok and PaneTextResult::Error entries and asserts
+    // (1) the outer JSON roundtrips idempotently, (2) both variants survive
+    // with their payloads intact, and (3) the tag discriminator is preserved.
+    #[test]
+    fn rt89_batch_get_text_data_with_results_serde(
+        pane_ok in 1u64..500,
+        pane_err_offset in 1u64..500,
+        ok_text in "[a-z ]{1,40}",
+        err_code in "[A-Z]{2}-[0-9]{3}",
+        err_msg in "[a-z ]{1,30}",
+        tail_lines in 0usize..500,
+    ) {
+        let pane_err = pane_ok.saturating_add(pane_err_offset);
+        prop_assume!(pane_ok != pane_err);
+        let mut results: BTreeMap<u64, PaneTextResult> = BTreeMap::new();
+        results.insert(
+            pane_ok,
+            PaneTextResult::Ok {
+                text: ok_text.clone(),
+                truncated: false,
+                truncation_info: None,
+            },
+        );
+        results.insert(
+            pane_err,
+            PaneTextResult::Error {
+                code: err_code.clone(),
+                message: err_msg.clone(),
+                hint: None,
+            },
+        );
+        let data = BatchGetTextData {
+            pane_ids: vec![pane_ok, pane_err],
+            tail_lines,
+            escapes_included: false,
+            results,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let back: BatchGetTextData = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        prop_assert_eq!(&json, &json2);
+        prop_assert_eq!(back.pane_ids, vec![pane_ok, pane_err]);
+        prop_assert_eq!(back.tail_lines, tail_lines);
+        prop_assert_eq!(back.results.len(), 2);
+        prop_assert!(json.contains("\"status\":\"ok\""));
+        prop_assert!(json.contains("\"status\":\"error\""));
+        match back.results.get(&pane_ok).expect("ok pane entry present") {
+            PaneTextResult::Ok {
+                text, truncated, ..
+            } => {
+                prop_assert_eq!(text, &ok_text);
+                prop_assert!(!truncated);
+            }
+            other => prop_assert!(
+                false,
+                "expected PaneTextResult::Ok for pane_ok, got {:?}",
+                other
+            ),
+        }
+        match back.results.get(&pane_err).expect("err pane entry present") {
+            PaneTextResult::Error { code, message, .. } => {
+                prop_assert_eq!(code, &err_code);
+                prop_assert_eq!(message, &err_msg);
+            }
+            other => prop_assert!(
+                false,
+                "expected PaneTextResult::Error for pane_err, got {:?}",
+                other
+            ),
+        }
+    }
 }
