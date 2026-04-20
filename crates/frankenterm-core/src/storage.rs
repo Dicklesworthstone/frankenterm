@@ -7498,6 +7498,14 @@ impl StorageHandle {
         &self,
         alias: &str,
     ) -> Result<Option<PaneBookmarkRecord>> {
+        #[cfg(feature = "asupersync-runtime")]
+        {
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            return self.get_pane_bookmark_by_alias_with_cx(&cx, alias).await;
+        }
+
+        #[cfg(not(feature = "asupersync-runtime"))]
+        {
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
         Self::spawn_blocking_storage(move || {
@@ -7507,6 +7515,7 @@ impl StorageHandle {
             query_pane_bookmark_by_alias(&conn, &alias)
         })
         .await
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_bookmark_by_alias`].
@@ -7519,7 +7528,15 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_pane_bookmark_by_alias cancelled: {err}"))
         })?;
-        self.get_pane_bookmark_by_alias(alias).await
+        let db_path = Arc::clone(&self.db_path);
+        let alias = alias.to_string();
+        Self::spawn_blocking_storage(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            query_pane_bookmark_by_alias(&conn, &alias)
+        })
+        .await
     }
 
     /// List all pane bookmarks in alias order.
