@@ -2,15 +2,16 @@ use chrono::TimeZone;
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CreateFloatingPane, CycleStack, EraseScrollbackRequest,
     ErrorResponse, GetClientList, GetClientListResponse, GetCodecVersion, GetCodecVersionResponse,
-    GetImageCell, GetLines, GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse,
-    GetPaneRenderChanges, GetPaneRenderChangesResponse, GetPaneRenderableDimensions,
-    GetPaneRenderableDimensionsResponse, GetTlsCreds, GetTlsCredsResponse, KillPane, ListPanes,
-    LivenessResponse, MoveFloatingPane, PaneFocused, PaneRemoved, Pdu, Ping, Pong,
-    RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse,
-    SelectStackPane, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard,
-    SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace,
-    SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
+    GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
+    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
+    GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane, PaneFocused,
+    PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize,
+    SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane, SendPaste, SerializedLines,
+    SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ, SetFocusedPane,
+    SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SwapToLayout, TabAddedToWindow, TabResized,
+    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -20,6 +21,7 @@ use mux::tab::FloatingPaneRect;
 use proptest::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
+use termwiz::image::ImageData;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
@@ -536,6 +538,17 @@ fn arb_get_image_cell() -> impl Strategy<Value = GetImageCell> {
             line_idx,
             cell_idx,
             data_hash,
+        })
+}
+
+fn arb_get_image_cell_response() -> impl Strategy<Value = GetImageCellResponse> {
+    (
+        0u64..=4096,
+        prop::option::of(proptest::collection::vec(any::<u8>(), 0..=32)),
+    )
+        .prop_map(|(pane_id, data)| GetImageCellResponse {
+            pane_id,
+            data: data.map(|bytes| Arc::new(ImageData::with_raw_data(bytes))),
         })
 }
 
@@ -1093,6 +1106,18 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::GetImageCell(payload));
+    }
+
+    #[test]
+    fn get_image_cell_response_json_and_pdu_roundtrip(
+        payload in arb_get_image_cell_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetImageCellResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::GetImageCellResponse(payload));
     }
 
     #[test]
