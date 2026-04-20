@@ -8,10 +8,11 @@ use codec::{
     GetTlsCredsResponse, KillPane, ListPanes, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTabResponse, PaneFocused, PaneRemoved, Pdu, Ping, Pong, RemoveFloatingPane,
     RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
-    SendPaste, SerializedLines, SetActiveWorkspace, SetClientId, SetClipboard, SetFloatingPaneZ,
-    SetFocusedPane, SetLayoutCycle, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SwapToLayout,
-    TabAddedToWindow, TabResized, TabTitleChanged, ToggleFloatingPane, UnitResponse,
-    UpdatePaneConstraints, WindowTitleChanged, WindowWorkspaceChanged, WriteToPane,
+    SendKeyDown, SendKeyUp, SendPaste, SerializedLines, SetActiveWorkspace, SetClientId,
+    SetClipboard, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPaneZoomed,
+    SetWindowWorkspace, SpawnResponse, SwapToLayout, TabAddedToWindow, TabResized, TabTitleChanged,
+    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
+    WindowWorkspaceChanged, WriteToPane,
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::{ClipboardSelection, TerminalSize};
@@ -22,6 +23,7 @@ use proptest::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::image::ImageData;
+use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
@@ -297,6 +299,44 @@ fn arb_spawn_response() -> impl Strategy<Value = SpawnResponse> {
             size,
         },
     )
+}
+
+fn arb_key_code() -> impl Strategy<Value = KeyCode> {
+    prop_oneof![
+        Just(KeyCode::Enter),
+        Just(KeyCode::Escape),
+        Just(KeyCode::Tab),
+        Just(KeyCode::LeftArrow),
+        Just(KeyCode::RightArrow),
+        any::<char>().prop_map(KeyCode::Char),
+    ]
+}
+
+fn arb_modifiers() -> impl Strategy<Value = Modifiers> {
+    prop_oneof![
+        Just(Modifiers::NONE),
+        Just(Modifiers::SHIFT),
+        Just(Modifiers::ALT),
+        Just(Modifiers::CTRL),
+        Just(Modifiers::SHIFT | Modifiers::ALT),
+        Just(Modifiers::SHIFT | Modifiers::CTRL),
+    ]
+}
+
+fn arb_key_event() -> impl Strategy<Value = KeyEvent> {
+    (arb_key_code(), arb_modifiers()).prop_map(|(key, modifiers)| KeyEvent { key, modifiers })
+}
+
+fn arb_send_key_down() -> impl Strategy<Value = SendKeyDown> {
+    (0u64..=4096, arb_key_event(), any::<u64>()).prop_map(|(pane_id, event, millis)| SendKeyDown {
+        pane_id,
+        event,
+        input_serial: (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into(),
+    })
+}
+
+fn arb_send_key_up() -> impl Strategy<Value = SendKeyUp> {
+    (0u64..=4096, arb_key_event()).prop_map(|(pane_id, event)| SendKeyUp { pane_id, event })
 }
 
 fn arb_liveness_response() -> impl Strategy<Value = LivenessResponse> {
@@ -822,6 +862,30 @@ proptest! {
         prop_assert_eq!(decoded_json, payload);
 
         assert_pdu_roundtrip(serial, Pdu::SpawnResponse(payload));
+    }
+
+    #[test]
+    fn send_key_down_json_and_pdu_roundtrip(
+        payload in arb_send_key_down(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SendKeyDown = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SendKeyDown(payload));
+    }
+
+    #[test]
+    fn send_key_up_json_and_pdu_roundtrip(
+        payload in arb_send_key_up(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SendKeyUp = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload);
+
+        assert_pdu_roundtrip(serial, Pdu::SendKeyUp(payload));
     }
 
     #[test]
