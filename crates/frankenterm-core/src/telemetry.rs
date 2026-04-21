@@ -760,10 +760,8 @@ impl TelemetryCollector {
     ///
     /// Samples resource metrics at `config.sample_interval`.
     pub async fn run(&self) {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.run_cx(&cx).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_cx(&cx).await
     }
 
     /// Run the collection loop under an explicit `&Cx` (ft-xbnl0.2.2

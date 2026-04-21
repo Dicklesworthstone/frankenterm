@@ -1479,11 +1479,8 @@ mod tests {
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
-        {
-            let cx = crate::cx::for_testing();
-            rx.recv(&cx).await.ok()
-        }
-
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.ok()
     }
 
     fn make_pane(id: u64) -> PaneInfo {

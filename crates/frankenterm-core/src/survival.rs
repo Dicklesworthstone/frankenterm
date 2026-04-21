@@ -974,10 +974,8 @@ impl SurvivalModel {
 
     /// Run the model update loop (call from async context).
     pub async fn run(&self) {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_cx(&cx).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_cx(&cx).await;
     }
 
     /// Run the model update loop under an explicit `&Cx` (ft-xbnl0.2.2

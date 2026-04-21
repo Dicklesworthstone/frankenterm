@@ -277,10 +277,8 @@ impl CautClient {
 
     /// Fetch usage data via `caut usage`.
     pub async fn usage(&self, service: CautService) -> Result<CautUsage, CautError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.usage_cx(&cx, service).await
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.usage_cx(&cx, service).await
     }
 
     /// Fetch usage data via `caut usage` under an explicit `&Cx`.
@@ -304,10 +302,8 @@ impl CautClient {
     /// `usage` call performs the refresh/read in one step and returns the latest
     /// account snapshot.
     pub async fn refresh(&self, service: CautService) -> Result<CautRefresh, CautError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.refresh_cx(&cx, service).await
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.refresh_cx(&cx, service).await
     }
 
     /// Refresh usage data under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first API).

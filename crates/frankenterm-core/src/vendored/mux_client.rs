@@ -11,7 +11,6 @@ use crate::config as wa_config;
 use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
 use crate::runtime_compat::mpsc_reserve_send;
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
 use crate::runtime_compat::task;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
@@ -1888,7 +1887,6 @@ pub struct PaneOutputSubscription {
     receiver: mpsc::Receiver<PaneDelta>,
     cancel: watch::Sender<bool>,
     task: Option<SubscriptionTask>,
-    );
 }
 
 async fn join_subscription_task(task: SubscriptionTask) {

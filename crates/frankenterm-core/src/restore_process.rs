@@ -187,10 +187,8 @@ impl ProcessLauncher {
     /// Plans are executed sequentially with `launch_delay_ms` between each
     /// to prevent resource spikes.
     pub async fn execute(&self, plans: &[ProcessPlan]) -> LaunchReport {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.execute_cx(&cx, plans).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_cx(&cx, plans).await
     }
 
     /// Execute process plans under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first

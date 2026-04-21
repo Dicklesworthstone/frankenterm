@@ -258,7 +258,6 @@ pub mod ntm_importer;
 pub mod ntm_parity;
 pub mod operator_runbooks;
 pub mod orphan_reaper;
-#[cfg(any(feature = "web", feature = "sync", feature = "asupersync-runtime"))]
 pub mod outcome;
 pub mod output;
 pub mod output_compression;

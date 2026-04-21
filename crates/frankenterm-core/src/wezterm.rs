@@ -1052,7 +1052,7 @@ impl WeztermClient {
     ///
     /// The legacy [`list_panes`](Self::list_panes) entry point is
     /// preserved for non-migrated callers; this is strictly additive.
-    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    #[cfg(all(feature = "vendored", unix))]
     pub async fn list_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         if let Some(ref pool) = self.mux_pool {
             if self.mux_circuit_guard() {
@@ -1087,7 +1087,7 @@ impl WeztermClient {
     /// NOT have the `vendored` + unix + asupersync combination. The
     /// legacy `list_panes` is invoked so existing callers behave
     /// identically.
-    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         self.list_panes().await
     }
@@ -1247,7 +1247,7 @@ impl WeztermClient {
     /// When `escapes == true` the mux path is not used (vendored mux
     /// does not support escape-sequence extraction) and the call
     /// delegates to the legacy CLI path.
-    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    #[cfg(all(feature = "vendored", unix))]
     pub async fn get_text_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1356,7 +1356,7 @@ impl WeztermClient {
 
     /// Stub `get_text_with_cx` for configurations without
     /// vendored+unix+asupersync — delegates to the legacy get_text.
-    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn get_text_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -1427,7 +1427,7 @@ impl WeztermClient {
     /// fallback path surfaces a `CommandFailed` error matching the
     /// legacy [`pane_tiered_scrollback_summary`](Self::pane_tiered_scrollback_summary)
     /// contract.
-    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    #[cfg(all(feature = "vendored", unix))]
     pub async fn pane_tiered_scrollback_summary_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1473,7 +1473,7 @@ impl WeztermClient {
     /// Stub `pane_tiered_scrollback_summary_with_cx` for configurations
     /// without vendored+unix+asupersync — delegates to the legacy
     /// method which returns the CLI-unavailable error path.
-    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    #[cfg(not(all(feature = "vendored", unix)))]
     pub async fn pane_tiered_scrollback_summary_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -1966,8 +1966,6 @@ impl WeztermClient {
                 } else {
                     pool.send_paste_with_cx(&cx, pane_id, data).await
                 };
-                    pool.send_paste(pane_id, data).await
-                };
                 match pool_result {
                     Ok(_) => {
                         self.mux_circuit_record_success();
@@ -2004,7 +2002,7 @@ impl WeztermClient {
     /// legacy `send_text_impl` since threading Cx through
     /// `run_cli_with_pane_check` + `retry_with` would require a
     /// wider refactor (same rationale as `list_panes_with_cx`).
-    #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+    #[cfg(all(feature = "vendored", unix))]
     async fn send_text_impl_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2052,7 +2050,7 @@ impl WeztermClient {
 
     /// Stub `send_text_impl_with_cx` for configurations without
     /// vendored+unix+asupersync — delegates to the legacy impl.
-    #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    #[cfg(not(all(feature = "vendored", unix)))]
     async fn send_text_impl_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2620,7 +2618,7 @@ impl WeztermInterface for WeztermClient {
         pane_id: u64,
         escapes: bool,
     ) -> WeztermFuture<'a, String> {
-        Box::pin(async move { WeztermClient::get_text_with_cx(self, cx, pane_id, escapes).await })
+        Box::pin(async move { self.get_text_with_cx(cx, pane_id, escapes).await })
     }
 
     fn send_text(&self, pane_id: u64, text: &str) -> WeztermFuture<'_, ()> {

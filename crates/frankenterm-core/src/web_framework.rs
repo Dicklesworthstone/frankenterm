@@ -48,11 +48,8 @@ pub struct FrameworkWebRuntime {
 impl FrameworkWebRuntime {
     #[doc(hidden)]
     pub async fn start(bind_addr: String, app: App) -> Result<(SocketAddr, Self)> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return Self::start_with_cx(&cx, bind_addr, app).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::start_with_cx(&cx, bind_addr, app).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`start`].
@@ -121,11 +118,8 @@ impl FrameworkWebRuntime {
 
     #[doc(hidden)]
     pub async fn finish(self, result: FrameworkServerJoinResult) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.finish_with_cx(&cx, result).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.finish_with_cx(&cx, result).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`finish`].

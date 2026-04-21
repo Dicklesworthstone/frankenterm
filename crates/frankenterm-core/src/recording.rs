@@ -312,12 +312,10 @@ impl RecordingManager {
         path: &Path,
         started_at_ms: i64,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .start_recording_with_cx(&cx, pane_id, path, started_at_ms)
-                .await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .start_recording_with_cx(&cx, pane_id, path, started_at_ms)
+            .await
     }
 
     /// Start recording a pane under an explicit `&Cx` (ft-xbnl0.2.3
@@ -346,10 +344,8 @@ impl RecordingManager {
 
     /// Stop recording a pane and flush any buffered frames.
     pub async fn stop_recording(&self, pane_id: u64) -> Result<Option<RecorderStats>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.stop_recording_with_cx(&cx, pane_id).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.stop_recording_with_cx(&cx, pane_id).await
     }
 
     /// Stop recording a pane under an explicit `&Cx` (ft-xbnl0.2.3
@@ -369,10 +365,8 @@ impl RecordingManager {
 
     /// Record a captured output segment (redacted if configured).
     pub async fn record_segment(&self, segment: &CapturedSegment) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_segment_with_cx(&cx, segment).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_segment_with_cx(&cx, segment).await
     }
 
     /// Record a captured output segment under an explicit `&Cx`
@@ -417,12 +411,10 @@ impl RecordingManager {
         detection: &Detection,
         captured_at_ms: i64,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
-                .await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
+            .await
     }
 
     /// Record a detection event under an explicit `&Cx` (ft-xbnl0.2.3

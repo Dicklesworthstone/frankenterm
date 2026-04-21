@@ -298,8 +298,20 @@ impl RecoveryConfig {
             self.initial_delay.as_millis() as f64 * self.backoff_factor.powi(attempt as i32);
         let capped_ms = base_ms.min(self.max_delay.as_millis() as f64);
         let jitter_range = capped_ms * self.jitter_fraction;
-        let jitter_seed = ((attempt as f64 * 7.13).sin().abs()).mul_add(2.0, -1.0);
-        let jittered_ms = jitter_range.mul_add(jitter_seed, capped_ms).max(1.0);
+        // The previous implementation derived jitter from `sin(attempt *
+        // 7.13)`, which is fully deterministic: every `RecoveryEngine`
+        // produced the same delay sequence for a given attempt count, so
+        // 100 panes that lost their mux connection simultaneously would
+        // all reconnect at the same instants — the exact thundering-herd
+        // pattern jitter is supposed to break. Draw from thread-rng so
+        // each engine's retries desynchronize across the fleet.
+        let jitter = if jitter_range > 0.0 {
+            use rand::Rng;
+            rand::rng().random_range(-jitter_range..=jitter_range)
+        } else {
+            0.0
+        };
+        let jittered_ms = (capped_ms + jitter).max(1.0);
         Duration::from_millis(jittered_ms as u64)
     }
 }
@@ -506,11 +518,8 @@ impl RecoveryEngine {
         Fut: std::future::Future<Output = Result<T, E>>,
         C: Fn(&E) -> ProtocolErrorKind,
     {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.execute_with_cx(&cx, operation, classify).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.execute_with_cx(&cx, operation, classify).await
     }
 
     /// Execute the retry policy against the caller's asupersync capability

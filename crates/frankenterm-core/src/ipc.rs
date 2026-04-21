@@ -110,13 +110,9 @@ enum MpscRecvState<T> {
     Cancelled,
 }
 
-#[cfg(any(not(unix), not(feature = "asupersync-runtime")))]
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        mpsc_recv_state_with_cx(rx, &cx).await
-    }
-
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    mpsc_recv_state_with_cx(rx, &cx).await
 }
 
 async fn mpsc_recv_state_with_cx<T>(
@@ -135,19 +131,16 @@ async fn mpsc_recv_state_with_cx<T>(
 
 #[cfg(test)]
 async fn mpsc_send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
-    {
-        let cx = crate::cx::for_testing();
-        match tx.reserve(&cx).await {
-            Ok(permit) => {
-                permit.send(value);
-                Ok(())
-            }
-            Err(mpsc::SendError::Disconnected(())) => Err(mpsc::SendError::Disconnected(value)),
-            Err(mpsc::SendError::Cancelled(())) => Err(mpsc::SendError::Cancelled(value)),
-            Err(mpsc::SendError::Full(())) => Err(mpsc::SendError::Full(value)),
+    let cx = crate::cx::for_testing();
+    match tx.reserve(&cx).await {
+        Ok(permit) => {
+            permit.send(value);
+            Ok(())
         }
+        Err(mpsc::SendError::Disconnected(())) => Err(mpsc::SendError::Disconnected(value)),
+        Err(mpsc::SendError::Cancelled(())) => Err(mpsc::SendError::Cancelled(value)),
+        Err(mpsc::SendError::Full(())) => Err(mpsc::SendError::Full(value)),
     }
-
 }
 
 fn resolve_search_index_dir(raw: &str) -> PathBuf {
@@ -666,11 +659,8 @@ impl IpcServer {
         socket_path: impl AsRef<Path>,
         permissions: Option<u32>,
     ) -> std::io::Result<Self> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return Self::bind_with_permissions_with_cx(&cx, socket_path, permissions).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::bind_with_permissions_with_cx(&cx, socket_path, permissions).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind_with_permissions`].
@@ -798,23 +788,9 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
-                .await;
-        }
-
-        // Abort active client handlers so shutdown cannot hang on a client
-        // that connected but never completed a newline-delimited request.
-        connection_tasks.abort_all();
-        while let Some(join_result) = connection_tasks.join_next().await {
-            if let Err(join_err) = join_result {
-                tracing::debug!(error = %join_err, "IPC client task failed during shutdown");
-            }
-        }
-
-        // Clean up socket file
-        let _ = std::fs::remove_file(&self.socket_path);
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
+            .await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_context`].
@@ -992,16 +968,12 @@ impl IpcServer {
 }
 
 #[cfg(unix)]
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        return shutdown_signal_pending_with_cx(shutdown_rx, &cx).await;
-    }
-
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    shutdown_signal_pending_with_cx(shutdown_rx, &cx).await
 }
 
-#[cfg(all(unix, feature = "asupersync-runtime"))]
+#[cfg(unix)]
 async fn shutdown_signal_pending_with_cx(
     shutdown_rx: &mut mpsc::Receiver<()>,
     cx: &crate::cx::Cx,
@@ -1140,7 +1112,7 @@ impl IpcServer {
 /// request-response lifetime of a single connection, so the
 /// primary value of the cx seam is interrupting slow lock waits
 /// during server shutdown.
-#[cfg(all(unix, feature = "asupersync-runtime"))]
+#[cfg(unix)]
 async fn handle_client_with_context_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
@@ -2202,7 +2174,7 @@ mod tests {
     /// clear_pane_priority, call_rpc) must match their legacy
     /// siblings on the missing-socket path. Consolidated test
     /// covers all 5 with one fixture.
-    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[cfg(unix)]
     #[test]
     fn remaining_ipc_with_cx_entries_match_legacy_on_missing_socket() {
         use crate::runtime_compat::CompatRuntime;
@@ -2275,7 +2247,7 @@ mod tests {
     /// string. The Cx-first path's pre-flight checkpoint doesn't
     /// short-circuit an uncancelled cx, so the socket check
     /// still fires as the next step after the checkpoint.
-    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[cfg(unix)]
     #[test]
     fn ping_with_cx_returns_watcher_not_running_on_missing_socket() {
         use crate::runtime_compat::CompatRuntime;

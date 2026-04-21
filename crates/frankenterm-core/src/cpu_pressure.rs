@@ -247,11 +247,8 @@ impl CpuPressureMonitor {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.run_with_cx(&cx, shutdown).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, shutdown).await
     }
 
     /// Explicit quarantine for legacy non-asupersync CPU-pressure sampling.

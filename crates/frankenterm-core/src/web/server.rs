@@ -185,7 +185,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 /// for the caller's graceful-shutdown logic. That keeps
 /// `run_web_server_with_cx`'s shutdown branch simple: whichever
 /// of the three (SIGINT, SIGTERM, cx-cancel) fires first wins.
-#[cfg(all(unix, feature = "asupersync-runtime"))]
+#[cfg(unix)]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use crate::runtime_compat::signal::unix::SignalKind;
     use futures::future::{Either, select};
@@ -220,7 +220,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(not(unix), feature = "asupersync-runtime"))]
+#[cfg(not(unix))]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
     use futures::future::{Either, select};
     use futures::pin_mut;

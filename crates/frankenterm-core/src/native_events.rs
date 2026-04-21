@@ -154,11 +154,8 @@ pub struct NativeEventListener {
 
 impl NativeEventListener {
     pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return Self::bind_with_cx(&cx, socket_path).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::bind_with_cx(&cx, socket_path).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
@@ -409,7 +406,12 @@ async fn handle_connection_with_cx(
             }
             Ok(None) => {}
             Err(err) => {
-                debug!(error = %err, "failed to decode native event (cx path)");
+                // Promoted from debug! — a malformed wire event is a
+                // protocol-level anomaly (version skew, corruption, or
+                // a hostile client writing to the native-events socket)
+                // and must not sink silently into a debug-level log
+                // that operators routinely filter out.
+                warn!(error = %err, "failed to decode native event (cx path)");
             }
         }
     }
@@ -437,17 +439,14 @@ async fn dispatch_event_with_cx(
     dispatch_event_with_timeout_with_cx(cx, event_tx, event, EVENT_SEND_TIMEOUT).await
 }
 
-#[cfg(any(not(feature = "asupersync-runtime"), test))]
+#[cfg(test)]
 async fn dispatch_event_with_timeout(
     event_tx: &mpsc::Sender<NativeEvent>,
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    {
-        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        return dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await;
-    }
-
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event_with_timeout`].

@@ -1984,7 +1984,7 @@ mod tests {
     /// socket check. Only exercises the error-path semantics;
     /// full round-trip testing requires a running watcher
     /// daemon which is out of scope for unit tests.
-    #[cfg(all(unix, feature = "asupersync-runtime"))]
+    #[cfg(unix)]
     #[test]
     fn call_with_cx_surfaces_watcher_not_running() {
         use crate::runtime_compat::CompatRuntime;

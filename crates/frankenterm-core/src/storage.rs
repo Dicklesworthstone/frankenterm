@@ -5794,11 +5794,8 @@ impl WriteCommandSender {
         &self,
         command: WriteCommand,
     ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
-        {
-            let cx = crate::cx::for_request();
-            self.inner.send(&cx, command).await
-        }
-
+        let cx = crate::cx::for_request();
+        self.inner.send(&cx, command).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
@@ -6018,13 +6015,10 @@ impl StorageHandle {
         content: &str,
         content_hash: Option<String>,
     ) -> Result<Segment> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .append_segment_with_cx(&cx, pane_id, content, content_hash)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .append_segment_with_cx(&cx, pane_id, content, content_hash)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`append_segment`].
@@ -6068,11 +6062,8 @@ impl StorageHandle {
     /// Indicates a discontinuity in capture for the given pane.
     /// Returns `None` if the gap was skipped (e.g. at start of stream).
     pub async fn record_gap(&self, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_gap_with_cx(&cx, pane_id, reason).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_gap_with_cx(&cx, pane_id, reason).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_gap`].
@@ -6109,11 +6100,8 @@ impl StorageHandle {
     ///
     /// Returns the event ID.
     pub async fn record_event(&self, event: StoredEvent) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_event_with_cx(&cx, event).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_event_with_cx(&cx, event).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_event`].
@@ -6148,13 +6136,10 @@ impl StorageHandle {
         workflow_id: Option<String>,
         status: &str,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .mark_event_handled_with_cx(&cx, event_id, workflow_id, status)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .mark_event_handled_with_cx(&cx, event_id, workflow_id, status)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_event_handled`].
@@ -6200,13 +6185,10 @@ impl StorageHandle {
         triage_state: Option<String>,
         updated_by: Option<String>,
     ) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .set_event_triage_state_with_cx(&cx, event_id, triage_state, updated_by)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .set_event_triage_state_with_cx(&cx, event_id, triage_state, updated_by)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_triage_state`].
@@ -6246,13 +6228,10 @@ impl StorageHandle {
         note: Option<String>,
         updated_by: Option<String>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .set_event_note_with_cx(&cx, event_id, note, updated_by)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .set_event_note_with_cx(&cx, event_id, note, updated_by)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_note`].
@@ -6291,13 +6270,10 @@ impl StorageHandle {
         label: String,
         created_by: Option<String>,
     ) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .add_event_label_with_cx(&cx, event_id, label, created_by)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .add_event_label_with_cx(&cx, event_id, label, created_by)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_label`].
@@ -6331,11 +6307,8 @@ impl StorageHandle {
     ///
     /// Returns true if a label row was deleted.
     pub async fn remove_event_label(&self, event_id: i64, label: String) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.remove_event_label_with_cx(&cx, event_id, label).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.remove_event_label_with_cx(&cx, event_id, label).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_label`].
@@ -6366,11 +6339,8 @@ impl StorageHandle {
 
     /// Fetch triage state, note, and labels for an event.
     pub async fn get_event_annotations(&self, event_id: i64) -> Result<Option<EventAnnotations>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_event_annotations_with_cx(&cx, event_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_event_annotations_with_cx(&cx, event_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_annotations`].
@@ -6394,11 +6364,8 @@ impl StorageHandle {
 
     /// Add or update a persistent event mute by identity key.
     pub async fn add_event_mute(&self, record: EventMuteRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.add_event_mute_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.add_event_mute_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_mute`].
@@ -6426,11 +6393,8 @@ impl StorageHandle {
 
     /// Remove a persistent event mute by identity key.
     pub async fn remove_event_mute(&self, identity_key: &str) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.remove_event_mute_with_cx(&cx, identity_key).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.remove_event_mute_with_cx(&cx, identity_key).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_mute`].
@@ -6458,11 +6422,8 @@ impl StorageHandle {
 
     /// Check whether an identity key is muted (and not expired).
     pub async fn is_event_muted(&self, identity_key: &str, now_ms: i64) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.is_event_muted_with_cx(&cx, identity_key, now_ms).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.is_event_muted_with_cx(&cx, identity_key, now_ms).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`is_event_muted`].
@@ -6489,11 +6450,8 @@ impl StorageHandle {
 
     /// List all active (non-expired) mutes.
     pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.list_active_mutes_with_cx(&cx, now_ms).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_active_mutes_with_cx(&cx, now_ms).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_mutes`].
@@ -6518,11 +6476,8 @@ impl StorageHandle {
 
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_event_identity_key_with_cx(&cx, event_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_event_identity_key_with_cx(&cx, event_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_identity_key`].
@@ -6548,11 +6503,8 @@ impl StorageHandle {
 
     /// Record an audit action
     pub async fn record_audit_action(&self, action: AuditActionRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_audit_action_with_cx(&cx, action).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_audit_action_with_cx(&cx, action).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action`].
@@ -6586,11 +6538,8 @@ impl StorageHandle {
 
     /// Record an audit action after applying redaction
     pub async fn record_audit_action_redacted(&self, action: AuditActionRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_audit_action_redacted_with_cx(&cx, action).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_audit_action_redacted_with_cx(&cx, action).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
@@ -6609,11 +6558,8 @@ impl StorageHandle {
 
     /// Upsert undo metadata for an audit action
     pub async fn upsert_action_undo(&self, record: ActionUndoRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_action_undo_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_action_undo_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo`].
@@ -6642,11 +6588,8 @@ impl StorageHandle {
 
     /// Upsert undo metadata after applying redaction
     pub async fn upsert_action_undo_redacted(&self, record: ActionUndoRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_action_undo_redacted_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_action_undo_redacted_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo_redacted`].
@@ -6669,11 +6612,8 @@ impl StorageHandle {
 
     /// Fetch undo metadata for a specific audit action ID.
     pub async fn get_action_undo(&self, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_action_undo_with_cx(&cx, audit_action_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_action_undo_with_cx(&cx, audit_action_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_undo`].
@@ -6701,13 +6641,10 @@ impl StorageHandle {
     /// Returns `true` when the row was updated and `false` when the target
     /// action was already undone, non-undoable, or missing undo metadata.
     pub async fn mark_action_undone(&self, audit_action_id: i64, undone_by: &str) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .mark_action_undone_with_cx(&cx, audit_action_id, undone_by)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .mark_action_undone_with_cx(&cx, audit_action_id, undone_by)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_action_undone`].
@@ -6739,13 +6676,10 @@ impl StorageHandle {
 
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .purge_audit_actions_before_with_cx(&cx, before_ts)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .purge_audit_actions_before_with_cx(&cx, before_ts)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_audit_actions_before`].
@@ -6774,11 +6708,8 @@ impl StorageHandle {
 
     /// Record a maintenance event
     pub async fn record_maintenance(&self, record: MaintenanceRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_maintenance_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_maintenance_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_maintenance`].
@@ -6807,11 +6738,8 @@ impl StorageHandle {
 
     /// Record a secret scan report (checkpoint + payload).
     pub async fn record_secret_scan_report(&self, record: SecretScanReportRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_secret_scan_report_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_secret_scan_report_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_secret_scan_report`].
@@ -6840,11 +6768,8 @@ impl StorageHandle {
 
     /// Insert a saved search definition.
     pub async fn insert_saved_search(&self, record: SavedSearchRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.insert_saved_search_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.insert_saved_search_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_saved_search`].
@@ -6879,19 +6804,16 @@ impl StorageHandle {
         last_result_count: Option<i64>,
         last_error: Option<String>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .update_saved_search_run_with_cx(
-                    &cx,
-                    id,
-                    last_run_at,
-                    last_result_count,
-                    last_error,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .update_saved_search_run_with_cx(
+                &cx,
+                id,
+                last_run_at,
+                last_result_count,
+                last_error,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_run`].
@@ -6931,13 +6853,10 @@ impl StorageHandle {
         enabled: bool,
         schedule_interval_ms: Option<i64>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .update_saved_search_schedule_with_cx(&cx, id, enabled, schedule_interval_ms)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .update_saved_search_schedule_with_cx(&cx, id, enabled, schedule_interval_ms)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_schedule`].
@@ -6970,11 +6889,8 @@ impl StorageHandle {
 
     /// Delete a saved search by name. Returns number of rows deleted.
     pub async fn delete_saved_search(&self, name: &str) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.delete_saved_search_with_cx(&cx, name).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.delete_saved_search_with_cx(&cx, name).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_saved_search`].
@@ -7003,11 +6919,8 @@ impl StorageHandle {
 
     /// Fetch a saved search by name.
     pub async fn get_saved_search_by_name(&self, name: &str) -> Result<Option<SavedSearchRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_saved_search_by_name_with_cx(&cx, name).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_saved_search_by_name_with_cx(&cx, name).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_saved_search_by_name`].
@@ -7032,11 +6945,8 @@ impl StorageHandle {
 
     /// List saved searches in deterministic order.
     pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.list_saved_searches_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_saved_searches_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_saved_searches`].
@@ -7059,11 +6969,8 @@ impl StorageHandle {
 
     /// Insert a pane bookmark. Returns the row ID.
     pub async fn insert_pane_bookmark(&self, record: PaneBookmarkRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.insert_pane_bookmark_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.insert_pane_bookmark_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_pane_bookmark`].
@@ -7092,11 +6999,8 @@ impl StorageHandle {
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
     pub async fn delete_pane_bookmark(&self, alias: &str) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.delete_pane_bookmark_with_cx(&cx, alias).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.delete_pane_bookmark_with_cx(&cx, alias).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_pane_bookmark`].
@@ -7128,11 +7032,8 @@ impl StorageHandle {
         &self,
         alias: &str,
     ) -> Result<Option<PaneBookmarkRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_pane_bookmark_by_alias_with_cx(&cx, alias).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_pane_bookmark_by_alias_with_cx(&cx, alias).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_bookmark_by_alias`].
@@ -7157,11 +7058,8 @@ impl StorageHandle {
 
     /// List all pane bookmarks in alias order.
     pub async fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.list_pane_bookmarks_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_pane_bookmarks_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks`].
@@ -7184,11 +7082,8 @@ impl StorageHandle {
 
     /// List pane bookmarks filtered by tag.
     pub async fn list_pane_bookmarks_by_tag(&self, tag: &str) -> Result<Vec<PaneBookmarkRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.list_pane_bookmarks_by_tag_with_cx(&cx, tag).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_pane_bookmarks_by_tag_with_cx(&cx, tag).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks_by_tag`].
@@ -7237,11 +7132,8 @@ impl StorageHandle {
 
     /// Prune output segments older than a cutoff timestamp
     pub async fn prune_segments_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.prune_segments_before_with_cx(&cx, before_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.prune_segments_before_with_cx(&cx, before_ts).await
     }
 
     /// Run retention cleanup and log the maintenance event
@@ -7293,11 +7185,8 @@ impl StorageHandle {
 
     /// Record a usage metric for analytics tracking.
     pub async fn record_usage_metric(&self, record: UsageMetricRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_usage_metric_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_usage_metric_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metric`].
@@ -7331,11 +7220,8 @@ impl StorageHandle {
         &self,
         records: Vec<UsageMetricRecord>,
     ) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_usage_metrics_batch_with_cx(&cx, records).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_usage_metrics_batch_with_cx(&cx, records).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metrics_batch`].
@@ -7364,11 +7250,8 @@ impl StorageHandle {
 
     /// Purge usage metrics older than a cutoff timestamp.
     pub async fn purge_usage_metrics(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.purge_usage_metrics_with_cx(&cx, before_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.purge_usage_metrics_with_cx(&cx, before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_usage_metrics`].
@@ -7397,11 +7280,8 @@ impl StorageHandle {
 
     /// Query usage metrics with filters (read-only, uses read connection).
     pub async fn query_usage_metrics(&self, query: MetricQuery) -> Result<Vec<UsageMetricRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.query_usage_metrics_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.query_usage_metrics_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`query_usage_metrics`].
@@ -7425,11 +7305,8 @@ impl StorageHandle {
 
     /// Get daily aggregated metric summaries since a given timestamp.
     pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.aggregate_daily_metrics_with_cx(&cx, since_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.aggregate_daily_metrics_with_cx(&cx, since_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_daily_metrics`].
@@ -7453,11 +7330,8 @@ impl StorageHandle {
 
     /// Get per-agent metric breakdown since a given timestamp.
     pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.aggregate_by_agent_with_cx(&cx, since_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.aggregate_by_agent_with_cx(&cx, since_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_by_agent`].
@@ -7483,11 +7357,8 @@ impl StorageHandle {
 
     /// Record a notification in the persistent history log.
     pub async fn record_notification(&self, record: NotificationHistoryRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.record_notification_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_notification_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_notification`].
@@ -7521,13 +7392,10 @@ impl StorageHandle {
         status: NotificationStatus,
         error_message: Option<String>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .update_notification_status_with_cx(&cx, id, status, error_message)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .update_notification_status_with_cx(&cx, id, status, error_message)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_notification_status`].
@@ -7565,13 +7433,10 @@ impl StorageHandle {
         acknowledged_by: String,
         action_taken: Option<String>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .acknowledge_notification_with_cx(&cx, id, acknowledged_by, action_taken)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .acknowledge_notification_with_cx(&cx, id, acknowledged_by, action_taken)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`acknowledge_notification`].
@@ -7604,11 +7469,8 @@ impl StorageHandle {
 
     /// Increment the retry count for a notification and reset its status to pending.
     pub async fn increment_notification_retry(&self, id: i64) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.increment_notification_retry_with_cx(&cx, id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.increment_notification_retry_with_cx(&cx, id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`increment_notification_retry`].
@@ -7634,13 +7496,10 @@ impl StorageHandle {
 
     /// Purge notification history older than the given timestamp.
     pub async fn purge_notification_history(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .purge_notification_history_with_cx(&cx, before_ts)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .purge_notification_history_with_cx(&cx, before_ts)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_notification_history`].
@@ -7673,11 +7532,8 @@ impl StorageHandle {
 
     /// Count output_segments older than a cutoff (read-path).
     pub async fn count_segments_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.count_segments_before_with_cx(&cx, before_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_segments_before_with_cx(&cx, before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_segments_before`].
@@ -7701,11 +7557,8 @@ impl StorageHandle {
 
     /// Count events older than a cutoff (flat, no tier filters; read-path).
     pub async fn count_events_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.count_events_before_with_cx(&cx, before_ts).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_events_before_with_cx(&cx, before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_before`].
@@ -7735,13 +7588,10 @@ impl StorageHandle {
         event_types: &[String],
         handled: Option<bool>,
     ) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .count_events_by_tier_with_cx(&cx, before_ts, severities, event_types, handled)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .count_events_by_tier_with_cx(&cx, before_ts, severities, event_types, handled)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_by_tier`].
@@ -7770,13 +7620,10 @@ impl StorageHandle {
 
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .count_audit_actions_before_with_cx(&cx, before_ts)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .count_audit_actions_before_with_cx(&cx, before_ts)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_audit_actions_before`].
@@ -7800,13 +7647,10 @@ impl StorageHandle {
 
     /// Count usage_metrics older than a cutoff (read-path).
     pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .count_usage_metrics_before_with_cx(&cx, before_ts)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .count_usage_metrics_before_with_cx(&cx, before_ts)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_usage_metrics_before`].
@@ -7830,13 +7674,10 @@ impl StorageHandle {
 
     /// Count notification_history older than a cutoff (read-path).
     pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .count_notification_history_before_with_cx(&cx, before_ts)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .count_notification_history_before_with_cx(&cx, before_ts)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_notification_history_before`].
@@ -7862,13 +7703,10 @@ impl StorageHandle {
 
     /// Delete events older than a cutoff (flat, no tier; write-path).
     pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .delete_events_before_with_cx(&cx, before_ts, batch_size)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .delete_events_before_with_cx(&cx, before_ts, batch_size)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_before`].
@@ -7906,20 +7744,17 @@ impl StorageHandle {
         handled: Option<bool>,
         batch_size: usize,
     ) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .delete_events_by_tier_with_cx(
-                    &cx,
-                    before_ts,
-                    severities,
-                    event_types,
-                    handled,
-                    batch_size,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .delete_events_by_tier_with_cx(
+                &cx,
+                before_ts,
+                severities,
+                event_types,
+                handled,
+                batch_size,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_by_tier`].
@@ -7959,11 +7794,8 @@ impl StorageHandle {
         &self,
         query: NotificationHistoryQuery,
     ) -> Result<Vec<NotificationHistoryRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.query_notification_history_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.query_notification_history_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`query_notification_history`].
@@ -7987,11 +7819,8 @@ impl StorageHandle {
 
     /// Get a single notification by ID.
     pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_notification_with_cx(&cx, id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_notification_with_cx(&cx, id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_notification`].
@@ -8078,11 +7907,8 @@ impl StorageHandle {
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
     pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.database_page_stats_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.database_page_stats_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`database_page_stats`].
@@ -8105,11 +7931,8 @@ impl StorageHandle {
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
     pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_pane_indexing_stats_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_pane_indexing_stats_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_indexing_stats`].
@@ -8132,11 +7955,8 @@ impl StorageHandle {
 
     /// Get a full indexing health report (per-pane stats + FTS integrity).
     pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_indexing_health_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_indexing_health_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_indexing_health`].
@@ -8168,11 +7988,8 @@ impl StorageHandle {
     ///
     /// Returns a result describing what was synced.
     pub async fn sync_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.sync_fts_with_cx(&cx, config).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.sync_fts_with_cx(&cx, config).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`sync_fts`].
@@ -8198,11 +8015,8 @@ impl StorageHandle {
     /// This drops the FTS index and reindexes all segments with batched progress.
     /// Use this for recovery or when a clean rebuild is needed.
     pub async fn rebuild_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.rebuild_fts_with_cx(&cx, config).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.rebuild_fts_with_cx(&cx, config).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`rebuild_fts`].
@@ -8225,11 +8039,8 @@ impl StorageHandle {
 
     /// Get the current FTS index state (version, last rebuild time).
     pub async fn get_fts_index_state(&self) -> Result<Option<FtsIndexState>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_fts_index_state_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_fts_index_state_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_fts_index_state`].
@@ -8252,11 +8063,8 @@ impl StorageHandle {
 
     /// Insert an approval token
     pub async fn insert_approval_token(&self, token: ApprovalTokenRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.insert_approval_token_with_cx(&cx, token).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.insert_approval_token_with_cx(&cx, token).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_approval_token`].
@@ -8287,20 +8095,17 @@ impl StorageHandle {
         pane_id: Option<u64>,
         action_fingerprint: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .consume_approval_token_with_cx(
-                    &cx,
-                    code_hash,
-                    workspace_id,
-                    action_kind,
-                    pane_id,
-                    action_fingerprint,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .consume_approval_token_with_cx(
+                &cx,
+                code_hash,
+                workspace_id,
+                action_kind,
+                pane_id,
+                action_fingerprint,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
@@ -8341,13 +8146,10 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .get_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .get_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token_by_code`].
@@ -8387,13 +8189,10 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .consume_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .consume_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token_by_code`].
@@ -8424,11 +8223,8 @@ impl StorageHandle {
 
     /// Upsert a pane record
     pub async fn upsert_pane(&self, pane: PaneRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_pane_with_cx(&cx, pane).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_pane_with_cx(&cx, pane).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_pane`].
@@ -8457,11 +8253,8 @@ impl StorageHandle {
 
     /// Upsert a workflow execution record
     pub async fn upsert_workflow(&self, workflow: WorkflowRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_workflow_with_cx(&cx, workflow).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_workflow_with_cx(&cx, workflow).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_workflow`].
@@ -8498,13 +8291,10 @@ impl StorageHandle {
         workflow_id: &str,
         plan: &crate::plan::ActionPlan,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .upsert_action_plan_with_cx(&cx, workflow_id, plan)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .upsert_action_plan_with_cx(&cx, workflow_id, plan)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_plan`].
@@ -8535,11 +8325,8 @@ impl StorageHandle {
 
     /// Insert a prepared plan preview for later commit
     pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.insert_prepared_plan_with_cx(&cx, record).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.insert_prepared_plan_with_cx(&cx, record).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_prepared_plan`].
@@ -8572,13 +8359,10 @@ impl StorageHandle {
         plan_id: &str,
         now_ms: i64,
     ) -> Result<Option<PreparedPlanRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .consume_prepared_plan_with_cx(&cx, plan_id, now_ms)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .consume_prepared_plan_with_cx(&cx, plan_id, now_ms)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_prepared_plan`].
@@ -8625,28 +8409,25 @@ impl StorageHandle {
         started_at: i64,
         completed_at: i64,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .insert_step_log_with_cx(
-                    &cx,
-                    workflow_id,
-                    audit_action_id,
-                    step_index,
-                    step_name,
-                    step_id,
-                    step_kind,
-                    result_type,
-                    result_data,
-                    policy_summary,
-                    verification_refs,
-                    error_code,
-                    started_at,
-                    completed_at,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .insert_step_log_with_cx(
+                &cx,
+                workflow_id,
+                audit_action_id,
+                step_index,
+                step_name,
+                step_id,
+                step_kind,
+                result_type,
+                result_data,
+                policy_summary,
+                verification_refs,
+                error_code,
+                started_at,
+                completed_at,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_step_log`].
@@ -8713,13 +8494,10 @@ impl StorageHandle {
         ft_version: String,
         host_id: Option<String>,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .insert_mux_session_with_cx(&cx, session_id, topology_json, ft_version, host_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .insert_mux_session_with_cx(&cx, session_id, topology_json, ft_version, host_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_mux_session`].
@@ -8764,22 +8542,19 @@ impl StorageHandle {
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .insert_session_checkpoint_with_cx(
-                    &cx,
-                    session_id,
-                    checkpoint_type,
-                    state_hash,
-                    pane_count,
-                    total_bytes,
-                    metadata_json,
-                    pane_states,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .insert_session_checkpoint_with_cx(
+                &cx,
+                session_id,
+                checkpoint_type,
+                state_hash,
+                pane_count,
+                total_bytes,
+                metadata_json,
+                pane_states,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
@@ -8866,13 +8641,10 @@ impl StorageHandle {
 
     /// Mark a session as cleanly shut down.
     pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .mark_session_shutdown_clean_with_cx(&cx, session_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .mark_session_shutdown_clean_with_cx(&cx, session_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
@@ -8901,13 +8673,10 @@ impl StorageHandle {
 
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .get_latest_checkpoint_hash_with_cx(&cx, session_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .get_latest_checkpoint_hash_with_cx(&cx, session_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_checkpoint_hash`].
@@ -8930,11 +8699,8 @@ impl StorageHandle {
     }
 
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_agent_session_with_cx(&cx, session).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_agent_session_with_cx(&cx, session).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_agent_session`].
@@ -8963,11 +8729,8 @@ impl StorageHandle {
 
     /// Get an agent session by ID
     pub async fn get_agent_session(&self, session_id: i64) -> Result<Option<AgentSessionRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_agent_session_with_cx(&cx, session_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_agent_session_with_cx(&cx, session_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_agent_session`].
@@ -8992,11 +8755,8 @@ impl StorageHandle {
 
     /// Get active agent sessions (those without an ended_at timestamp)
     pub async fn get_active_sessions(&self) -> Result<Vec<AgentSessionRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_active_sessions_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_active_sessions_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_sessions`].
@@ -9021,11 +8781,8 @@ impl StorageHandle {
 
     /// Get agent sessions for a specific pane
     pub async fn get_sessions_for_pane(&self, pane_id: u64) -> Result<Vec<AgentSessionRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_sessions_for_pane_with_cx(&cx, pane_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_sessions_for_pane_with_cx(&cx, pane_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_sessions_for_pane`].
@@ -9121,11 +8878,8 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.search_with_results_with_cx(&cx, query, options).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.search_with_results_with_cx(&cx, query, options).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_results`].
@@ -9163,13 +8917,10 @@ impl StorageHandle {
         dimension: i32,
         vector: &[u8],
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .store_embedding_with_cx(&cx, segment_id, embedder_id, dimension, vector)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .store_embedding_with_cx(&cx, segment_id, embedder_id, dimension, vector)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`store_embedding`].
@@ -9213,13 +8964,10 @@ impl StorageHandle {
         embedder_id: &str,
         limit: usize,
     ) -> Result<Vec<i64>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .get_unembedded_segments_with_cx(&cx, embedder_id, limit)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .get_unembedded_segments_with_cx(&cx, embedder_id, limit)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_unembedded_segments`].
@@ -9268,13 +9016,10 @@ impl StorageHandle {
         segment_id: i64,
         embedder_id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .get_embedding_with_cx(&cx, segment_id, embedder_id)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .get_embedding_with_cx(&cx, segment_id, embedder_id)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_embedding`].
@@ -9310,11 +9055,8 @@ impl StorageHandle {
 
     /// Get embedding statistics per embedder.
     pub async fn embedding_stats(&self) -> Result<Vec<EmbeddingStats>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.embedding_stats_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.embedding_stats_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
@@ -9411,13 +9153,10 @@ impl StorageHandle {
         query_vector: &[f32],
         options: SearchOptions,
     ) -> Result<Vec<SemanticSearchHit>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .semantic_search_with_cx(&cx, embedder_id, query_vector, options)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .semantic_search_with_cx(&cx, embedder_id, query_vector, options)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`semantic_search`].
@@ -9459,24 +9198,21 @@ impl StorageHandle {
         semantic_weight: f32,
         fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .hybrid_search_with_results_with_cx(
-                    &cx,
-                    query,
-                    options,
-                    embedder_id,
-                    query_vector,
-                    mode,
-                    rrf_k,
-                    lexical_weight,
-                    semantic_weight,
-                    fusion_backend,
-                )
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .hybrid_search_with_results_with_cx(
+                &cx,
+                query,
+                options,
+                embedder_id,
+                query_vector,
+                mode,
+                rrf_k,
+                lexical_weight,
+                semantic_weight,
+                fusion_backend,
+            )
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`hybrid_search_with_results`].
@@ -9526,11 +9262,8 @@ impl StorageHandle {
 
     /// Get unhandled events
     pub async fn get_unhandled_events(&self, limit: usize) -> Result<Vec<StoredEvent>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_unhandled_events_with_cx(&cx, limit).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_unhandled_events_with_cx(&cx, limit).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_unhandled_events`].
@@ -9556,11 +9289,8 @@ impl StorageHandle {
 
     /// Query events with filters
     pub async fn get_events(&self, query: EventQuery) -> Result<Vec<StoredEvent>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_events_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_events_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_events`].
@@ -9588,11 +9318,8 @@ impl StorageHandle {
     /// Results are ordered by ascending event ID so callers can checkpoint using
     /// the last seen `id` and resume with `after_id`.
     pub async fn get_events_stream(&self, query: EventStreamQuery) -> Result<Vec<StoredEvent>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_events_stream_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_events_stream_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_events_stream`].
@@ -9620,11 +9347,8 @@ impl StorageHandle {
     /// Returns events enriched with pane info and correlations,
     /// sorted chronologically with pagination support.
     pub async fn get_timeline(&self, query: TimelineQuery) -> Result<Timeline> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_timeline_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_timeline_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_timeline`].
@@ -9653,11 +9377,8 @@ impl StorageHandle {
     pub async fn count_unhandled_events_by_pane(
         &self,
     ) -> Result<std::collections::HashMap<u64, u32>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.count_unhandled_events_by_pane_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.count_unhandled_events_by_pane_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_unhandled_events_by_pane`].
@@ -9684,11 +9405,8 @@ impl StorageHandle {
     ///
     /// Returns a map from pane_id to the most recent segment captured_at timestamp.
     pub async fn get_last_activity_by_pane(&self) -> Result<std::collections::HashMap<u64, i64>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_last_activity_by_pane_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_last_activity_by_pane_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_last_activity_by_pane`].
@@ -9713,11 +9431,8 @@ impl StorageHandle {
 
     /// Query audit actions with filters
     pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_audit_actions_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_audit_actions_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions`].
@@ -9751,11 +9466,8 @@ impl StorageHandle {
         &self,
         query: AuditStreamQuery,
     ) -> Result<AuditStreamPage> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_audit_actions_stream_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_audit_actions_stream_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions_stream`].
@@ -9784,11 +9496,8 @@ impl StorageHandle {
         &self,
         query: ActionHistoryQuery,
     ) -> Result<Vec<ActionHistoryRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_action_history_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_action_history_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_history`].
@@ -9814,13 +9523,10 @@ impl StorageHandle {
 
     /// Count active (unused + unexpired) approval tokens for a workspace
     pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .count_active_approvals_with_cx(&cx, workspace_id, now_ms)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .count_active_approvals_with_cx(&cx, workspace_id, now_ms)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_active_approvals`].
@@ -9851,11 +9557,8 @@ impl StorageHandle {
     /// Returns the token record if found, regardless of whether it's expired or consumed.
     /// Use this for validation and dry-run checks.
     pub async fn get_approval_token(&self, code_hash: &str) -> Result<Option<ApprovalTokenRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_approval_token_with_cx(&cx, code_hash).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_approval_token_with_cx(&cx, code_hash).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token`].
@@ -9882,11 +9585,8 @@ impl StorageHandle {
 
     /// Get the maximum sequence number for a pane (to resume capture).
     pub async fn get_max_seq(&self, pane_id: u64) -> Result<Option<u64>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_max_seq_with_cx(&cx, pane_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_max_seq_with_cx(&cx, pane_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_max_seq`].
@@ -9911,11 +9611,8 @@ impl StorageHandle {
 
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_panes_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_panes_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_panes`].
@@ -9936,11 +9633,8 @@ impl StorageHandle {
 
     /// Get a specific pane
     pub async fn get_pane(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_pane_with_cx(&cx, pane_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_pane_with_cx(&cx, pane_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane`].
@@ -9975,11 +9669,8 @@ impl StorageHandle {
 
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_segments_with_cx(&cx, pane_id, limit).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_segments_with_cx(&cx, pane_id, limit).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_segments`].
@@ -10025,11 +9716,8 @@ impl StorageHandle {
 
     /// Scan segments in ascending id order with incremental paging.
     pub async fn scan_segments(&self, query: SegmentScanQuery) -> Result<Vec<Segment>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.scan_segments_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.scan_segments_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`scan_segments`].
@@ -10057,13 +9745,10 @@ impl StorageHandle {
         &self,
         scope_hash: &str,
     ) -> Result<Option<SecretScanReportRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .latest_secret_scan_report_with_cx(&cx, scope_hash)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .latest_secret_scan_report_with_cx(&cx, scope_hash)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`latest_secret_scan_report`].
@@ -10090,11 +9775,8 @@ impl StorageHandle {
 
     /// Get workflow by ID
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_workflow_with_cx(&cx, workflow_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_workflow_with_cx(&cx, workflow_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_workflow`].
@@ -10122,11 +9804,8 @@ impl StorageHandle {
     ///
     /// Returns all step logs for the given workflow, ordered by step index.
     pub async fn get_step_logs(&self, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_step_logs_with_cx(&cx, workflow_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_step_logs_with_cx(&cx, workflow_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_step_logs`].
@@ -10160,11 +9839,8 @@ impl StorageHandle {
         &self,
         workflow_id: &str,
     ) -> Result<Option<WorkflowStepLogRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_latest_step_log_with_cx(&cx, workflow_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_latest_step_log_with_cx(&cx, workflow_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_step_log`].
@@ -10194,11 +9870,8 @@ impl StorageHandle {
         &self,
         workflow_id: &str,
     ) -> Result<Option<WorkflowActionPlanRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_action_plan_with_cx(&cx, workflow_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_action_plan_with_cx(&cx, workflow_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_plan`].
@@ -10224,11 +9897,8 @@ impl StorageHandle {
 
     /// Get a prepared plan preview by plan_id
     pub async fn get_prepared_plan(&self, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_prepared_plan_with_cx(&cx, plan_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_prepared_plan_with_cx(&cx, plan_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_prepared_plan`].
@@ -10257,11 +9927,8 @@ impl StorageHandle {
     /// Returns all workflows with status 'running' or 'waiting', ordered by started_at.
     /// These are workflows that were interrupted and should be resumed.
     pub async fn find_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.find_incomplete_workflows_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.find_incomplete_workflows_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`find_incomplete_workflows`].
@@ -10314,11 +9981,8 @@ impl StorageHandle {
     ///
     /// Returns the row ID of the upserted account.
     pub async fn upsert_account(&self, account: crate::accounts::AccountRecord) -> Result<i64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.upsert_account_with_cx(&cx, account).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.upsert_account_with_cx(&cx, account).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_account`].
@@ -10353,13 +10017,10 @@ impl StorageHandle {
         account_id: &str,
         last_used_at: i64,
     ) -> Result<()> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .update_account_last_used_with_cx(&cx, service, account_id, last_used_at)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .update_account_last_used_with_cx(&cx, service, account_id, last_used_at)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_account_last_used`].
@@ -10394,11 +10055,8 @@ impl StorageHandle {
     ///
     /// Returns true if an account was deleted, false if not found.
     pub async fn delete_account(&self, service: &str, account_id: &str) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.delete_account_with_cx(&cx, service, account_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.delete_account_with_cx(&cx, service, account_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_account`].
@@ -10433,11 +10091,8 @@ impl StorageHandle {
         &self,
         service: &str,
     ) -> Result<Vec<crate::accounts::AccountRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_accounts_by_service_with_cx(&cx, service).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_accounts_by_service_with_cx(&cx, service).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_accounts_by_service`].
@@ -10465,11 +10120,8 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<Option<crate::accounts::AccountRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_account_with_cx(&cx, service, account_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_account_with_cx(&cx, service, account_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_account`].
@@ -10501,11 +10153,8 @@ impl StorageHandle {
         service: &str,
         config: &crate::accounts::AccountSelectionConfig,
     ) -> Result<crate::accounts::AccountSelectionResult> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.select_account_with_cx(&cx, service, config).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.select_account_with_cx(&cx, service, config).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`select_account`].
@@ -10540,13 +10189,10 @@ impl StorageHandle {
         reason: Option<&str>,
         ttl_ms: i64,
     ) -> Result<PaneReservation> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .create_reservation_with_cx(&cx, pane_id, owner_kind, owner_id, reason, ttl_ms)
-                .await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .create_reservation_with_cx(&cx, pane_id, owner_kind, owner_id, reason, ttl_ms)
+            .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`create_reservation`].
@@ -10585,11 +10231,8 @@ impl StorageHandle {
     ///
     /// Returns true if released, false if not found or already released.
     pub async fn release_reservation(&self, reservation_id: i64) -> Result<bool> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.release_reservation_with_cx(&cx, reservation_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.release_reservation_with_cx(&cx, reservation_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`release_reservation`].
@@ -10618,11 +10261,8 @@ impl StorageHandle {
 
     /// Get the active reservation for a pane (read-only).
     pub async fn get_active_reservation(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_active_reservation_with_cx(&cx, pane_id).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_active_reservation_with_cx(&cx, pane_id).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_reservation`].
@@ -10652,11 +10292,8 @@ impl StorageHandle {
 
     /// List all active (unexpired) pane reservations (read-only).
     pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.list_active_reservations_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_active_reservations_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_reservations`].
@@ -10704,11 +10341,8 @@ impl StorageHandle {
 
     /// Export segments with optional pane/time/limit filters
     pub async fn export_segments(&self, query: ExportQuery) -> Result<Vec<Segment>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.export_segments_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.export_segments_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_segments`].
@@ -10731,11 +10365,8 @@ impl StorageHandle {
 
     /// Export output gaps with optional pane/time/limit filters
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.export_gaps_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.export_gaps_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_gaps`].
@@ -10758,11 +10389,8 @@ impl StorageHandle {
 
     /// Get all output gaps (for search explain diagnostics)
     pub async fn get_gaps(&self) -> Result<Vec<Gap>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_gaps_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_gaps_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
@@ -10803,11 +10431,8 @@ impl StorageHandle {
 
     /// Count retention cleanup events (for search explain diagnostics)
     pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_retention_cleanup_count_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_retention_cleanup_count_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
@@ -10834,11 +10459,8 @@ impl StorageHandle {
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
     pub async fn get_segment_time_range(&self) -> Result<(Option<i64>, Option<i64>)> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.get_segment_time_range_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_segment_time_range_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_segment_time_range`].
@@ -10873,11 +10495,8 @@ impl StorageHandle {
 
     /// Export workflow executions with optional pane/time/limit filters
     pub async fn export_workflows(&self, query: ExportQuery) -> Result<Vec<WorkflowRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.export_workflows_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.export_workflows_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_workflows`].
@@ -10900,11 +10519,8 @@ impl StorageHandle {
 
     /// Export agent sessions with optional pane/time/limit filters
     pub async fn export_sessions(&self, query: ExportQuery) -> Result<Vec<AgentSessionRecord>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.export_sessions_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.export_sessions_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
@@ -10927,11 +10543,8 @@ impl StorageHandle {
 
     /// Export pane reservations (active + historical) with optional pane/time/limit filters
     pub async fn export_reservations(&self, query: ExportQuery) -> Result<Vec<PaneReservation>> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.export_reservations_with_cx(&cx, query).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.export_reservations_with_cx(&cx, query).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_reservations`].
@@ -10957,11 +10570,8 @@ impl StorageHandle {
     ///
     /// Returns the number of reservations expired.
     pub async fn expire_stale_reservations(&self) -> Result<usize> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.expire_stale_reservations_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.expire_stale_reservations_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
@@ -28067,18 +27677,14 @@ mod backpressure_integration_tests {
     }
 
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
-        {
-            let cx = crate::cx::for_testing();
-            let sent = tx.send(&cx, value).await;
-            assert!(sent.is_ok(), "test mpsc send should succeed");
-        }
+        let cx = crate::cx::for_testing();
+        let sent = tx.send(&cx, value).await;
+        assert!(sent.is_ok(), "test mpsc send should succeed");
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
-        {
-            let cx = crate::cx::for_testing();
-            rx.recv(&cx).await.expect("test mpsc recv should succeed")
-        }
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.expect("test mpsc recv should succeed")
     }
 
     #[test]

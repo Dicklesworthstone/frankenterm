@@ -591,10 +591,8 @@ impl MuxWatchdog {
 
     /// Run a single health check and return the sample.
     pub async fn check(&mut self) -> MuxHealthSample {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.check_cx(&cx).await
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.check_cx(&cx).await
     }
 
     /// Run a single health check under an explicit `&Cx` (ft-xbnl0.2.2

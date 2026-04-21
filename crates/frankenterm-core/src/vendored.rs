@@ -10,7 +10,7 @@ use std::process::Command;
 
 #[cfg(all(feature = "vendored", unix))]
 mod mux_client;
-#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+#[cfg(all(feature = "vendored", unix))]
 pub use mux_client::subscribe_pane_output_with_inherited_cx;
 #[cfg(all(feature = "vendored", unix))]
 pub use mux_client::{

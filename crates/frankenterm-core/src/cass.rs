@@ -607,7 +607,7 @@ pub async fn export_sessions(
 /// export batches in flight; a cancelled parent cx now bails at
 /// the earliest boundary *and* at every storage seam inside the
 /// export loop.
-#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+#[cfg(feature = "cass-export")]
 pub async fn export_sessions_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -705,7 +705,7 @@ pub async fn export_content(
 /// `resolve_export_session_with_cx` and the segment scan uses
 /// `scan_segments_with_cx`. Used by the cass connector's
 /// per-session chunk-fetch loop.
-#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+#[cfg(feature = "cass-export")]
 pub async fn export_content_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -801,10 +801,8 @@ impl CassClient {
         query: &str,
         options: &SearchOptions,
     ) -> Result<CassSearchResult, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.search_with_cx(&cx, query, options).await
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.search_with_cx(&cx, query, options).await
     }
 
     /// Search sessions via `cass search` under an explicit `&Cx`.
@@ -835,10 +833,8 @@ impl CassClient {
         path: &Path,
         agent: Option<CassAgent>,
     ) -> Result<Vec<CassSession>, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.search_sessions_with_cx(&cx, path, agent).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.search_sessions_with_cx(&cx, path, agent).await
     }
 
     /// Search sessions under a given path + agent under an explicit `&Cx`
@@ -862,10 +858,8 @@ impl CassClient {
 
     /// Query a specific session by session id.
     pub async fn query_session(&self, session_id: &str) -> Result<CassSession, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.query_session_with_cx(&cx, session_id).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.query_session_with_cx(&cx, session_id).await
     }
 
     /// Query a specific session by session id under an explicit `&Cx`
@@ -893,12 +887,10 @@ impl CassClient {
         line_number: usize,
         options: &ViewOptions,
     ) -> Result<CassViewResult, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .query_with_cx(&cx, session_path, line_number, options)
-                .await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self
+            .query_with_cx(&cx, session_path, line_number, options)
+            .await
     }
 
     /// Query a specific session via `cass view` under an explicit `&Cx`
@@ -917,10 +909,8 @@ impl CassClient {
 
     /// Check cass health via `cass status`.
     pub async fn status(&self) -> Result<CassStatus, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.status_with_cx(&cx).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.status_with_cx(&cx).await
     }
 
     /// Check cass health via `cass status` under an explicit `&Cx`
@@ -942,10 +932,8 @@ impl CassClient {
         &self,
         workspace: Option<&str>,
     ) -> Result<CassIndexResult, CassError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.trigger_index_with_cx(&cx, workspace).await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.trigger_index_with_cx(&cx, workspace).await
     }
 
     /// Trigger a cass index refresh under an explicit `&Cx`
@@ -1263,7 +1251,7 @@ async fn estimate_session_content_tokens(
 ///
 /// Routes through `export_segments_with_cx` so the session-token
 /// estimate honours cancellation of the parent export loop.
-#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+#[cfg(feature = "cass-export")]
 async fn estimate_session_content_tokens_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -1351,7 +1339,7 @@ async fn resolve_export_session(
 /// Routes both the direct `get_agent_session_with_cx` probe and the
 /// bounded `export_sessions_with_cx` fallback through cx-first
 /// storage siblings so a cancelled parent interrupts the scan.
-#[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+#[cfg(feature = "cass-export")]
 async fn resolve_export_session_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -2335,7 +2323,7 @@ mod tests {
     /// `resolve_export_session_with_cx` helper. On an empty DB the
     /// session lookup must return `Storage(NotFound)` from *both*
     /// the legacy and cx-first paths — byte-parity on the error type.
-    #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+    #[cfg(feature = "cass-export")]
     #[test]
     fn cass_export_content_with_cx_missing_session_matches_legacy() {
         use crate::runtime_compat::CompatRuntime;
@@ -2392,7 +2380,7 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `export_sessions_with_cx` with a
     /// fresh cx on an empty DB must return an empty Vec (same
     /// as the legacy `export_sessions` on an empty DB).
-    #[cfg(all(feature = "cass-export", feature = "asupersync-runtime"))]
+    #[cfg(feature = "cass-export")]
     #[test]
     fn cass_export_sessions_with_cx_empty_db_matches_legacy() {
         use crate::runtime_compat::CompatRuntime;

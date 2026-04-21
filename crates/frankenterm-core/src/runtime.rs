@@ -56,6 +56,7 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
+use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -66,9 +67,7 @@ use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
 #[cfg(all(feature = "vendored", unix))]
 use crate::tailer::StreamingBridge;
 use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
-#[cfg(all(feature = "vendored", unix, not(feature = "asupersync-runtime")))]
-use crate::vendored::subscribe_pane_output;
-#[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
+#[cfg(all(feature = "vendored", unix))]
 use crate::vendored::subscribe_pane_output_with_inherited_cx;
 #[cfg(all(feature = "vendored", unix))]
 use crate::vendored::{DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig};
@@ -2461,10 +2460,7 @@ impl ObservationRuntime {
             let mut pane_priorities = config_rx.borrow().pane_priorities.clone();
             #[cfg(all(feature = "vendored", unix))]
             let mut vendored_subscription_config = initial_vendored_subscription_config;
-            #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
-            let (stream_exit_tx, mut stream_exit_rx) =
-                mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
-            #[cfg(all(feature = "vendored", unix, not(feature = "asupersync-runtime")))]
+            #[cfg(all(feature = "vendored", unix))]
             let (stream_exit_tx, mut stream_exit_rx) =
                 mpsc::channel::<StreamingTaskExit>(vendored_channel_capacity);
             // Per-pane vendored streaming subtasks. Dropping the capture future
@@ -4515,10 +4511,8 @@ mod tests {
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
-        {
-            let cx = crate::cx::for_testing();
-            rx.recv(&cx).await.expect("test mpsc recv should succeed")
-        }
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx).await.expect("test mpsc recv should succeed")
     }
 
     fn temp_db_path() -> (TempDir, String) {

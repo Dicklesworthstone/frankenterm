@@ -365,11 +365,8 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.capture_with_cx(&cx, panes, trigger).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.capture_with_cx(&cx, panes, trigger).await
     }
 
     /// Capture a full mux state snapshot bound to the caller's asupersync
@@ -545,11 +542,8 @@ impl SnapshotEngine {
 
     /// Run retention cleanup: remove old checkpoints exceeding limits.
     pub async fn cleanup(&self) -> std::result::Result<usize, SnapshotError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.cleanup_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.cleanup_with_cx(&cx).await
     }
 
     /// Run retention cleanup bound to the caller's asupersync capability
@@ -750,11 +744,9 @@ impl SnapshotEngine {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_periodic_with_cx(&cx, shutdown, pane_provider)
-                .await;
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_periodic_with_cx(&cx, shutdown, pane_provider)
+            .await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_periodic`].
@@ -1011,11 +1003,8 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         timeout: Duration,
     ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.shutdown_checkpoint_with_cx(&cx, panes, timeout).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_checkpoint_with_cx(&cx, panes, timeout).await
     }
 
     /// Capture a final shutdown checkpoint, bound to the caller's asupersync
@@ -1108,11 +1097,8 @@ impl SnapshotEngine {
 
     /// Mark current session as cleanly shut down.
     pub async fn mark_shutdown(&self) -> std::result::Result<(), SnapshotError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.mark_shutdown_with_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.mark_shutdown_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
@@ -1520,12 +1506,10 @@ mod tests {
     use crate::wezterm::PaneSize;
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
-        {
-            let cx = crate::cx::for_testing();
-            rx.recv(&cx)
-                .await
-                .expect("snapshot trigger recv should succeed")
-        }
+        let cx = crate::cx::for_testing();
+        rx.recv(&cx)
+            .await
+            .expect("snapshot trigger recv should succeed")
     }
 
     fn run_async_test<F>(future: F)

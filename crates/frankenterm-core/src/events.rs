@@ -708,11 +708,8 @@ impl EventSubscriber {
     /// - `RecvError::Closed` if the event bus was dropped
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.recv_cx(&cx).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.recv_cx(&cx).await
     }
 
     /// Receive the next event under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
@@ -1794,16 +1791,11 @@ mod tests {
             // (ring-buffer retention vs tokio's slowest-receiver drain). The
             // key invariant is that both messages were successfully received
             // above without error.
-            if cfg!(feature = "asupersync-runtime") {
-                assert!(
-                    stats.delta_queued <= 2,
-                    "queued should be at most the 2 published, got {}",
-                    stats.delta_queued
-                );
-            } else {
-                assert_eq!(stats.delta_queued, 0);
-                assert_eq!(stats.delta_oldest_lag_ms, None);
-            }
+            assert!(
+                stats.delta_queued <= 2,
+                "queued should be at most the 2 published, got {}",
+                stats.delta_queued
+            );
         });
     }
 

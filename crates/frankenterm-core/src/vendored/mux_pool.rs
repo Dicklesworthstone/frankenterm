@@ -195,12 +195,10 @@ impl MuxPool {
     /// Returns the client and a guard that holds the concurrency slot.
     /// The guard must be dropped after the client is returned (or discarded).
     /// Used directly by tests and by `execute_with_recovery_inner`.
-    #[cfg_attr(feature = "asupersync-runtime", allow(dead_code))]
+    #[allow(dead_code)]
     async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        {
-            let cx = Cx::current().unwrap_or_else(cx::for_request);
-            return self.acquire_client_with_cx(&cx).await;
-        }
+        let cx = Cx::current().unwrap_or_else(cx::for_request);
+        self.acquire_client_with_cx(&cx).await
     }
 
     /// Acquire a client using an explicit capability context.

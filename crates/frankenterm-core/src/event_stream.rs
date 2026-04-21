@@ -520,11 +520,8 @@ impl EventWaiter {
     /// Subscribes to the bus and blocks until the condition is met or
     /// timeout expires. Returns the matching event or timeout result.
     pub async fn wait(self, bus: &EventBus) -> WaitResult {
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.wait_with_cx(&cx, bus).await;
-        }
-
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.wait_with_cx(&cx, bus).await
     }
 
     /// Explicit quarantine for legacy non-asupersync event waits.
