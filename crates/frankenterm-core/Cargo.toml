@@ -430,6 +430,10 @@ name = "safe_channel"
 harness = false
 
 [[bench]]
+name = "mcp_response"
+harness = false
+
+[[bench]]
 name = "input_latency_bench"
 harness = false
 
