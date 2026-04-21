@@ -185,7 +185,10 @@ pub async fn build_explain_context_with_cx(
     pane_filter: Option<u64>,
 ) -> crate::Result<SearchExplainContext> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("build_explain_context cancelled: {err}")))?;
+        .map_err(|err| crate::Error::RuntimeOperation {
+            operation: "build_explain_context",
+            source: crate::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?;
 
     let pane_records = storage.get_panes_with_cx(cx).await?;
     let indexing_stats_raw = storage.get_pane_indexing_stats_with_cx(cx).await?;

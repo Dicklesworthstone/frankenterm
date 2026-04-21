@@ -247,7 +247,10 @@ pub async fn export_jsonl_with_cx<W: Write>(
     writer: &mut W,
 ) -> crate::Result<usize> {
     cx.checkpoint()
-        .map_err(|err| crate::Error::Runtime(format!("export_jsonl cancelled: {err}")))?;
+        .map_err(|err| crate::Error::RuntimeOperation {
+            operation: "export_jsonl",
+            source: crate::error::RuntimeOperationSource::Cancelled(err.to_string()),
+        })?;
 
     let redactor = if opts.redact {
         Some(Redactor::new())

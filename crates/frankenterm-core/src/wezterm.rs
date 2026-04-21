@@ -5031,7 +5031,10 @@ mod tests {
 
     #[test]
     fn is_not_retryable_non_wezterm_error() {
-        let err = crate::Error::Runtime("generic error".to_string());
+        let err = crate::Error::RuntimeOperation {
+            operation: "apply_config_update",
+            source: crate::error::RuntimeOperationSource::WatchChannelClosed,
+        };
         assert!(!is_retryable_error(&err));
     }
 
@@ -6669,9 +6672,13 @@ impl MockWezterm {
     /// Inject an event into a specific pane.
     pub async fn inject(&self, pane_id: u64, event: MockEvent) -> crate::Result<()> {
         let mut panes = self.panes.write().await;
-        let pane = panes.get_mut(&pane_id).ok_or_else(|| {
-            crate::Error::Runtime(format!("MockWezterm: pane {pane_id} not found"))
-        })?;
+        let pane = panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| crate::Error::PaneOperation {
+                pane_id,
+                operation: "inject",
+                source: crate::error::PaneOperationSource::PaneNotFound,
+            })?;
         match event {
             MockEvent::AppendOutput(text) => pane.content.push_str(&text),
             MockEvent::ClearScreen => pane.content.clear(),
@@ -6699,9 +6706,13 @@ impl MockWezterm {
         event: MockEvent,
     ) -> crate::Result<()> {
         let mut panes = self.panes.write_with_cx(cx).await;
-        let pane = panes.get_mut(&pane_id).ok_or_else(|| {
-            crate::Error::Runtime(format!("MockWezterm: pane {pane_id} not found"))
-        })?;
+        let pane = panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| crate::Error::PaneOperation {
+                pane_id,
+                operation: "inject_with_cx",
+                source: crate::error::PaneOperationSource::PaneNotFound,
+            })?;
         match event {
             MockEvent::AppendOutput(text) => pane.content.push_str(&text),
             MockEvent::ClearScreen => pane.content.clear(),
@@ -6982,7 +6993,10 @@ impl WeztermInterface for MockWezterm {
     fn watchdog_warnings(&self) -> WeztermFuture<'_, Vec<String>> {
         Box::pin(async move {
             if let Some(err) = self.watchdog_warning_error.read().await.clone() {
-                return Err(crate::Error::Runtime(err));
+                return Err(crate::Error::WatchdogWarningRead {
+                    backend: "mock_wezterm",
+                    source: crate::error::WatchdogWarningSource::Backend(err),
+                });
             }
             Ok(self.watchdog_warnings.read().await.clone())
         })
@@ -7166,6 +7180,51 @@ mod mock_tests {
             assert_eq!(state.title, "New Title");
             assert_eq!(state.cols, 120);
             assert_eq!(state.rows, 40);
+        });
+    }
+
+    #[test]
+    fn structured_error_mock_inject_missing_pane_reports_operation_context() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            let err = mock
+                .inject(99, MockEvent::AppendOutput("line 1\n".to_string()))
+                .await
+                .expect_err("missing pane should fail");
+            match err {
+                crate::Error::PaneOperation {
+                    pane_id,
+                    operation,
+                    source: crate::error::PaneOperationSource::PaneNotFound,
+                } => {
+                    assert_eq!(pane_id, 99);
+                    assert_eq!(operation, "inject");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn structured_error_mock_watchdog_warning_error_reports_backend_context() {
+        run_async_test(async {
+            let mock = MockWezterm::new();
+            mock.set_watchdog_warning_error(Some("socket closed".to_string()))
+                .await;
+            let err = mock
+                .watchdog_warnings()
+                .await
+                .expect_err("watchdog warning probe should fail");
+            match err {
+                crate::Error::WatchdogWarningRead {
+                    backend,
+                    source: crate::error::WatchdogWarningSource::Backend(source_err),
+                } => {
+                    assert_eq!(backend, "mock_wezterm");
+                    assert_eq!(source_err, "socket closed");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         });
     }
 

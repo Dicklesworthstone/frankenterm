@@ -116,6 +116,36 @@ impl Remediation {
 /// Result type alias using the library's Error type
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Structured source for runtime lifecycle/coordination failures.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeOperationSource {
+    /// The hot-reload/config watch channel has no active receivers.
+    #[error("watch channel closed")]
+    WatchChannelClosed,
+    /// Operation was cancelled with backend-specific context.
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+}
+
+/// Structured source for pane-targeted operations.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum PaneOperationSource {
+    /// The requested pane no longer exists.
+    #[error("pane not found")]
+    PaneNotFound,
+    /// Backend-specific failure details when no stronger typed source exists yet.
+    #[error("{0}")]
+    Backend(String),
+}
+
+/// Structured source for watchdog warning probe failures.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogWarningSource {
+    /// Backend-specific probe error details.
+    #[error("{0}")]
+    Backend(String),
+}
+
 /// Main error type for frankenterm-core
 #[derive(Error, Debug)]
 pub enum Error {
@@ -151,7 +181,42 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Structured runtime operation failures.
+    #[error("Runtime operation '{operation}' failed: {source}")]
+    RuntimeOperation {
+        /// High-level runtime action that failed.
+        operation: &'static str,
+        /// Structured source for the failure.
+        #[source]
+        source: RuntimeOperationSource,
+    },
+
+    /// Structured pane-targeted operation failures.
+    #[error("Pane operation '{operation}' failed for pane {pane_id}: {source}")]
+    PaneOperation {
+        /// Target pane for the failed operation.
+        pane_id: u64,
+        /// Operation name.
+        operation: &'static str,
+        /// Structured source for the failure.
+        #[source]
+        source: PaneOperationSource,
+    },
+
+    /// Structured watchdog warning probe failures.
+    #[error("Watchdog warnings read failed for backend '{backend}': {source}")]
+    WatchdogWarningRead {
+        /// Backend name that emitted the probe failure.
+        backend: &'static str,
+        /// Structured source for the failure.
+        #[source]
+        source: WatchdogWarningSource,
+    },
+
     /// Runtime errors (hot reload, channel failures, etc.)
+    #[deprecated(
+        note = "Prefer typed variants with operation/pane/source context; Runtime is a last-resort catch-all only"
+    )]
     #[error("Runtime error: {0}")]
     Runtime(String),
 
@@ -194,6 +259,46 @@ impl Error {
                     .command("Validate JSON", "python -m json.tool < input.json")
                     .alternative("Check for trailing commas or invalid UTF-8."),
             ),
+            Self::RuntimeOperation { operation, source } => Some(match source {
+                RuntimeOperationSource::WatchChannelClosed => Remediation::new(format!(
+                    "Runtime operation '{operation}' could not notify any active tasks because the watch channel is closed."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("If the runtime is shutting down, restart `ft watch` before retrying."),
+                RuntimeOperationSource::Cancelled(_) => Remediation::new(format!(
+                    "Runtime operation '{operation}' was cancelled before completion."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Retry if the cancellation was unexpected or increase the caller's budget/deadline."),
+            }),
+            Self::PaneOperation {
+                pane_id,
+                operation,
+                source,
+            } => Some(match source {
+                PaneOperationSource::PaneNotFound => Remediation::new(format!(
+                    "Pane {pane_id} was missing while performing '{operation}'."
+                ))
+                .command("List panes", "ft list")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Refresh pane state and retry with a valid pane id."),
+                PaneOperationSource::Backend(_) => Remediation::new(format!(
+                    "Pane {pane_id} operation '{operation}' failed in the backend."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Retry after the backend/mux is healthy."),
+            }),
+            Self::WatchdogWarningRead { backend, .. } => Some(
+                Remediation::new(format!(
+                    "Watchdog warning telemetry could not be read from backend '{backend}'."
+                ))
+                .command("Status", "ft status")
+                .command("Diagnostics", "ft doctor")
+                .alternative("Treat missing watchdog data as backend-health uncertainty until the probe recovers."),
+            ),
             Self::Runtime(_) => Some(
                 Remediation::new("Restart the watcher or retry the command.")
                     .command("Diagnostics", "ft doctor")
@@ -228,7 +333,15 @@ impl Error {
             Self::Wezterm(e) => e.error_kind(),
             Self::Io(e) => crate::network_reliability::classify_io_error(e),
             Self::Cancelled(_) => NetworkErrorKind::Transient,
-            Self::Panicked(_) | Self::Runtime(_) => NetworkErrorKind::Transient,
+            Self::Panicked(_) | Self::Runtime(_) | Self::RuntimeOperation { .. } => {
+                NetworkErrorKind::Transient
+            }
+            Self::PaneOperation {
+                source: PaneOperationSource::PaneNotFound,
+                ..
+            } => NetworkErrorKind::Permanent,
+            Self::PaneOperation { .. } => NetworkErrorKind::Transient,
+            Self::WatchdogWarningRead { .. } => NetworkErrorKind::Degraded,
             Self::Json(_) | Self::Pattern(_) | Self::Config(_) | Self::SetupError(_) => {
                 NetworkErrorKind::Permanent
             }
@@ -675,7 +788,19 @@ mod tests {
             Error::Policy("denied".to_string()),
             Error::Io(std::io::Error::other("io")),
             Error::Json(json_err),
-            Error::Runtime("runtime".to_string()),
+            Error::RuntimeOperation {
+                operation: "apply_config_update",
+                source: RuntimeOperationSource::WatchChannelClosed,
+            },
+            Error::PaneOperation {
+                pane_id: 1,
+                operation: "inject",
+                source: PaneOperationSource::PaneNotFound,
+            },
+            Error::WatchdogWarningRead {
+                backend: "mock_wezterm",
+                source: WatchdogWarningSource::Backend("socket closed".to_string()),
+            },
             Error::SetupError("setup".to_string()),
             Error::Cancelled("user cancelled".to_string()),
             Error::Panicked("task panicked".to_string()),
@@ -814,8 +939,12 @@ mod tests {
         let err = Error::Policy("rate limit exceeded".to_string());
         assert!(err.to_string().contains("rate limit exceeded"));
 
-        let err = Error::Runtime("channel closed".to_string());
+        let err = Error::RuntimeOperation {
+            operation: "apply_config_update",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        };
         assert!(err.to_string().contains("channel closed"));
+        assert!(err.to_string().contains("apply_config_update"));
     }
 
     #[test]
@@ -1196,7 +1325,10 @@ mod tests {
 
     #[test]
     fn format_error_with_remediation_includes_error_and_guidance() {
-        let err = Error::Runtime("channel closed".to_string());
+        let err = Error::RuntimeOperation {
+            operation: "apply_config_update",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        };
         let output = format_error_with_remediation(&err);
         assert!(output.starts_with("Error:"));
         assert!(output.contains("channel closed"));
@@ -1313,5 +1445,42 @@ mod tests {
             existing_id: 9,
         });
         assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+    }
+
+    #[test]
+    fn structured_error_pane_operation_not_found_is_permanent() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::PaneOperation {
+            pane_id: 42,
+            operation: "inject",
+            source: PaneOperationSource::PaneNotFound,
+        };
+        assert_eq!(err.error_kind(), NetworkErrorKind::Permanent);
+        let remediation = err.remediation().expect("missing remediation");
+        assert!(remediation.summary.contains("Pane 42"));
+    }
+
+    #[test]
+    fn structured_error_watchdog_warning_read_is_degraded() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::WatchdogWarningRead {
+            backend: "mock_wezterm",
+            source: WatchdogWarningSource::Backend("socket closed".to_string()),
+        };
+        assert_eq!(err.error_kind(), NetworkErrorKind::Degraded);
+        let remediation = err.remediation().expect("missing remediation");
+        assert!(remediation.summary.contains("mock_wezterm"));
+    }
+
+    #[test]
+    fn structured_error_runtime_operation_is_transient() {
+        use crate::network_reliability::NetworkErrorKind;
+        let err = Error::RuntimeOperation {
+            operation: "apply_config_update",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        };
+        assert_eq!(err.error_kind(), NetworkErrorKind::Transient);
+        let remediation = err.remediation().expect("missing remediation");
+        assert!(remediation.summary.contains("apply_config_update"));
     }
 }
