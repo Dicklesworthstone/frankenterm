@@ -1,0 +1,9 @@
+{
+  "scenario": "codex_device_code",
+  "source": "wezterm_cli_capture",
+  "captured_at": "2026-04-21T16:38:00Z",
+  "platform": "macos",
+  "cross_platform": "pending",
+  "sanitized": true,
+  "notes": "Captured from an isolated local WezTerm pane running codex under a temporary HOME. The one-time code was redacted to a placeholder before committing."
+}

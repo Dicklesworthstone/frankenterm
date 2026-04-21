@@ -1,0 +1,9 @@
+{
+  "scenario": "claude_code_usage_reached",
+  "source": "wezterm_cli_capture",
+  "captured_at": "2026-04-21T16:39:00Z",
+  "platform": "macos",
+  "cross_platform": "pending",
+  "sanitized": true,
+  "notes": "Captured from live WezTerm scrollback on pane 204. The snippet was trimmed to the limit banner and follow-up guidance line."
+}

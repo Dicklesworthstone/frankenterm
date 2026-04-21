@@ -1433,7 +1433,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "context compacted".to_string(),
                 ],
                 regex: Some(
-                    r"(?:compacted|summarized)\s+(?P<tokens_before>[\d,]+)\s+tokens?\s+to\s+(?P<tokens_after>[\d,]+)".to_string()
+                    r"(?:Conversation compacted(?:\s*\([^)]+\))?|Auto-compact:\s*context compacted|context compacted)(?:[:\s]+(?:(?:compacted|summarized)\s+)?(?P<tokens_before>[\d,]+)\s+tokens?\s+to\s+(?P<tokens_after>[\d,]+))?".to_string()
                 ),
                 description: "Claude Code context compaction event".to_string(),
                 remediation: Some("Context was reduced - some history may be lost".to_string()),
@@ -1755,9 +1755,10 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "Compaction complete".to_string(),
                     "Summary created".to_string(),
                     "compacted successfully".to_string(),
+                    "Compacted (ctrl+o".to_string(),
                 ],
                 regex: Some(
-                    r"(?:Compaction complete|compacted successfully|Summary created)(?:.*?saved\s+(?P<tokens_saved>[\d,]+))?".to_string()
+                    r"(?:Compaction complete|compacted successfully|Summary created|Compacted(?:\s*\([^)]+\))?)(?:.*?saved\s+(?P<tokens_saved>[\d,]+))?".to_string()
                 ),
                 description: "Claude Code compaction completed".to_string(),
                 remediation: None,
@@ -4000,6 +4001,50 @@ rules:
         assert!(
             detection.is_some(),
             "Should match claude_code.compaction with summarized variant"
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_banner_variant() {
+        let engine = PatternEngine::new();
+        let text = "Conversation compacted (ctrl+o for history)";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction banner variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("tokens_before").and_then(|v| v.as_str()),
+            None
+        );
+        assert_eq!(
+            d.extracted.get("tokens_after").and_then(|v| v.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_claude_code_compaction_complete_ctrl_o_variant() {
+        let engine = PatternEngine::new();
+        let text = "Compacted (ctrl+o to see full summary)";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.compaction.complete");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.compaction.complete ctrl+o variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(
+            d.extracted.get("tokens_saved").and_then(|v| v.as_str()),
+            None
         );
     }
 

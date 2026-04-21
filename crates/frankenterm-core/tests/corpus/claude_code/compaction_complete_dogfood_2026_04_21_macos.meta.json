@@ -1,0 +1,9 @@
+{
+  "scenario": "claude_code_compaction_complete",
+  "source": "wezterm_cli_capture",
+  "captured_at": "2026-04-21T16:56:05Z",
+  "platform": "macos",
+  "cross_platform": "pending",
+  "sanitized": true,
+  "notes": "Captured from the same isolated local WezTerm Claude Code session immediately after /compact completed. The snippet was trimmed to the completion banner."
+}

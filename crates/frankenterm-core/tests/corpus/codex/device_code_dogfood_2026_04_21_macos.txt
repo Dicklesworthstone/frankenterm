@@ -1,0 +1,15 @@
+Welcome to Codex, OpenAI's command-line coding agent
+
+Finish signing in via your browser
+
+1. Open this link in your browser and sign in
+
+https://auth.openai.com/codex/device
+
+2. Enter this one-time code after you are signed in (expires in 15 minutes)
+
+ABCD-12345
+
+Device codes are a common phishing target. Never share this code.
+
+Press Esc to cancel
