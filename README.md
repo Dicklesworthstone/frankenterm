@@ -124,7 +124,7 @@ The project needs an honest status table, not migration-era hand-waving.
 |---------|----------------|-------|
 | Watch / status / triage / doctor / reproduce | Supported | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints. |
 | Search / events / audit / workflows / mission / tx | Supported | Backed by local storage, policy, and workflow subsystems. |
-| Robot mode | Supported | Core families are implemented: state, get-text, send, wait-for, search, events, rules, workflows, agents, accounts, reservations, mission, tx, health, approvals, and the NTM-aligned families listed by `ft robot help --json`. |
+| Robot mode | Supported | Core families are implemented: state, get-text, send, wait-for, search, events, rules, workflows, agents, accounts, reservations, mission, tx, health, approvals, and the NTM-aligned families listed by `ft robot help` (or `ft robot --format toon help` for compact machine output). |
 | Session persistence | Supported with backend prerequisite | Snapshots, session inspection, restore, and `ft session doctor` are implemented, but live restore still depends on the current WezTerm mux interop boundary. `ft restart` is currently Unix-only. |
 | Web API / SSE | Supported behind `--features web` | `/health`, `/panes`, `/events`, `/search`, and `/stream/*` are implemented; this is more than "health only". |
 | Distributed mode | Supported with explicit limitations | Remote panes persist into the same DB and surface through status/search/state, but live `get-text` for distributed panes is intentionally unavailable. |
@@ -552,7 +552,7 @@ ft session doctor            # Health check for session persistence
 ft config show               # Display current config
 ft config validate           # Check config syntax
 ft config set <key> <value>  # Update one config value
-ft config export             # Export effective config
+ft config export             # Export the current config as TOML or JSON
 ```
 
 For the full command matrix (human + robot + MCP), see `docs/cli-reference.md`.
@@ -563,7 +563,7 @@ For GUI onboarding and WezTerm migration, see `docs/frankenterm-gui-user-guide.m
 
 ## Configuration
 
-Configuration lives in `~/.config/ft/ft.toml`:
+Configuration lives in `ft.toml` in the current directory when present; otherwise ft uses the platform default config file (`~/.config/ft/ft.toml` on XDG platforms, `~/Library/Application Support/ft/ft.toml` on macOS):
 
 ```toml
 [general]

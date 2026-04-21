@@ -137,6 +137,7 @@ This remains the most automatic restore path.
 
 `ft snapshot restore <id>` recreates the saved mux layout from a specific checkpoint.
 By default it also replays captured scrollback for each pane up to the checkpoint’s recorded `scrollback_checkpoint_seq`.
+This restore path is currently supported only on Unix platforms.
 
 Use `--layout-only` when you want to restore the pane/window topology without replaying scrollback:
 
@@ -152,6 +153,8 @@ ft snapshot restore 123 --layout-only
 2) Stop `frankenterm-mux-server`
 3) Start `frankenterm-mux-server`
 4) Restore from the captured snapshot unless `--skip-restore` is set
+
+Like `ft snapshot restore`, `ft restart` is currently supported only on Unix platforms.
 
 Examples:
 

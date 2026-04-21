@@ -294,7 +294,7 @@ Examples:
 - `ft robot search "compilation failed" --mode hybrid`
 
 Notes:
-- `ft robot help --json` is the fastest machine-readable command inventory.
+- `ft robot help` emits the machine-readable command inventory by default; use `ft robot --format toon help` for the compact TOON form.
 - Distributed panes appear in `state`, `search`, and related persisted-data surfaces, but live `get-text` is intentionally unavailable for them.
 - Some NTM-aligned robot families are specialized machine surfaces; they are listed here because they ship, even when most humans stay on the higher-level human CLI.
 
