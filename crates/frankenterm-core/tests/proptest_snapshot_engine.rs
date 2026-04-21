@@ -851,3 +851,89 @@ proptest! {
         prop_assert!(back.triggers_accepted <= back.triggers_emitted);
     }
 }
+
+// =============================================================================
+// Canonical-form invariance fuzz (ft snapshot-engine serde stability)
+// =============================================================================
+//
+// The existing telemetry_snapshot_serde_roundtrip test asserts
+//   deserialize(serialize(x)) == x
+// which is the weaker structural roundtrip. These tests assert the stronger
+//   serialize(x) == serialize(deserialize(serialize(x)))
+// byte-level canonical-form invariance. A violation means that JSON produced
+// from the value is not a stable snapshot of the value — the very next
+// serialize pass after a roundtrip produces different bytes. That class of
+// drift bites hash-chained audit logs, content-addressed snapshots, cache
+// keys, and any downstream consumer that computes a digest over the JSON.
+//
+// Real failure modes this catches that the weaker roundtrip does NOT:
+//   (a) #[serde(default)] + #[serde(skip_serializing_if = "..")] divergence
+//       where a field's default is serialized on first pass but skipped on
+//       second pass (or vice versa),
+//   (b) HashMap field-order non-determinism within a single process (though
+//       serde_json::Map is BTreeMap-backed, so in-value drift is rare — the
+//       risk is external: custom Serialize impls iterating HashMaps),
+//   (c) float NaN / +0.0 vs -0.0 round-trip asymmetry,
+//   (d) enum tag representation drift (e.g., Some -> null rehydration).
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// SnapshotEngineTelemetrySnapshot: one pass of serialize after a full
+    /// deserialize must produce byte-identical JSON. If this fails, the
+    /// snapshot's JSON is not a stable fingerprint — downstream code that
+    /// hashes/caches on serialized bytes will see churn on untouched data.
+    #[test]
+    fn fuzz_telemetry_snapshot_canonical_form_invariant(
+        attempted in 0_u64..10_000,
+        succeeded in 0_u64..10_000,
+        dedup in 0_u64..10_000,
+        errors in 0_u64..1000,
+        cleanup_runs in 0_u64..1000,
+        cleanup_removed in 0_u64..10_000,
+        triggers_emitted in 0_u64..10_000,
+        triggers_accepted in 0_u64..10_000,
+        panes in 0_u64..10_000,
+        bytes in 0_u64..100_000_000,
+    ) {
+        let snap = SnapshotEngineTelemetrySnapshot {
+            captures_attempted: attempted,
+            captures_succeeded: succeeded,
+            dedup_skips: dedup,
+            capture_errors: errors,
+            cleanup_runs,
+            cleanup_removed,
+            triggers_emitted,
+            triggers_accepted,
+            panes_captured: panes,
+            bytes_persisted: bytes,
+        };
+        let first = serde_json::to_string(&snap).unwrap();
+        let rehydrated: SnapshotEngineTelemetrySnapshot =
+            serde_json::from_str(&first).unwrap();
+        let second = serde_json::to_string(&rehydrated).unwrap();
+        prop_assert_eq!(
+            &first, &second,
+            "telemetry snapshot JSON drifted across roundtrip"
+        );
+    }
+
+    /// Same property for SnapshotConfig — the larger, nested config surface
+    /// with enum sub-fields (SnapshotSchedulingMode, SnapshotSchedulingConfig)
+    /// and a Default-derived permutation baseline. Nested #[serde(default)]
+    /// defaults are the most likely source of asymmetric-serialize drift,
+    /// which is why this test uses the arb_snapshot_config strategy that
+    /// constructs from SnapshotConfig::default() with random overrides.
+    #[test]
+    fn fuzz_snapshot_config_canonical_form_invariant(
+        config in arb_snapshot_config(),
+    ) {
+        let first = serde_json::to_string(&config).unwrap();
+        let rehydrated: SnapshotConfig = serde_json::from_str(&first).unwrap();
+        let second = serde_json::to_string(&rehydrated).unwrap();
+        prop_assert_eq!(
+            &first, &second,
+            "snapshot config JSON drifted across roundtrip"
+        );
+    }
+}
