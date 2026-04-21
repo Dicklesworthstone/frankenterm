@@ -24,6 +24,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml = "0.9.34"
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
+toon_rust.workspace = true
 
 [[bin]]
 name = "fts_query"
@@ -112,6 +113,11 @@ required-features = ["codec-fuzz-targets"]
 [[bin]]
 name = "termwiz_csi_parser"
 path = "fuzz_targets/termwiz_csi_parser.rs"
+doc = false
+
+[[bin]]
+name = "toon_decode"
+path = "fuzz_targets/toon_decode.rs"
 doc = false
 
 [profile.release]
