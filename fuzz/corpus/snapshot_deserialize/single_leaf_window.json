@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "captured_at": 1713720000000,
+  "workspace_id": "dogfood-main",
+  "windows": [
+    {
+      "window_id": 100,
+      "title": "controller",
+      "position": [
+        32,
+        64
+      ],
+      "size": [
+        1440,
+        900
+      ],
+      "tabs": [
+        {
+          "tab_id": 200,
+          "title": "orchestrator",
+          "pane_tree": {
+            "type": "Leaf",
+            "pane_id": 300,
+            "rows": 52,
+            "cols": 180,
+            "cwd": "/Users/jemanuel/projects/frankenterm",
+            "title": "cargo fuzz run",
+            "is_active": true
+          },
+          "active_pane_id": 300
+        }
+      ],
+      "active_tab_index": 0
+    }
+  ],
+  "seed_label": "single-leaf"
+}

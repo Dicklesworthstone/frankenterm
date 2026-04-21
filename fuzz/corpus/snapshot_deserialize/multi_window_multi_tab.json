@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "captured_at": 1713727200000,
+  "workspace_id": "fleet-b",
+  "windows": [
+    {
+      "window_id": 1,
+      "title": "left-monitor",
+      "position": [
+        0,
+        0
+      ],
+      "size": [
+        1728,
+        1117
+      ],
+      "tabs": [
+        {
+          "tab_id": 11,
+          "title": "idle",
+          "pane_tree": {
+            "type": "Leaf",
+            "pane_id": 1101,
+            "rows": 48,
+            "cols": 120,
+            "cwd": "/tmp/ft-idle",
+            "title": "idle",
+            "is_active": false
+          },
+          "active_pane_id": null
+        },
+        {
+          "tab_id": 12,
+          "title": "agents",
+          "pane_tree": {
+            "type": "HSplit",
+            "children": [
+              [
+                0.5,
+                {
+                  "type": "Leaf",
+                  "pane_id": 1201,
+                  "rows": 24,
+                  "cols": 120,
+                  "cwd": "/tmp/agent-1",
+                  "title": "agent-1",
+                  "is_active": false
+                }
+              ],
+              [
+                0.5,
+                {
+                  "type": "Leaf",
+                  "pane_id": 1202,
+                  "rows": 24,
+                  "cols": 120,
+                  "cwd": "/tmp/agent-2",
+                  "title": "agent-2",
+                  "is_active": true
+                }
+              ]
+            ]
+          },
+          "active_pane_id": 1202
+        }
+      ],
+      "active_tab_index": 1
+    },
+    {
+      "window_id": 2,
+      "title": "right-monitor",
+      "position": [
+        1728,
+        0
+      ],
+      "size": [
+        1728,
+        1117
+      ],
+      "tabs": [
+        {
+          "tab_id": 21,
+          "title": "chat",
+          "pane_tree": {
+            "type": "VSplit",
+            "children": [
+              [
+                0.5,
+                {
+                  "type": "Leaf",
+                  "pane_id": 2101,
+                  "rows": 40,
+                  "cols": 60,
+                  "cwd": "/tmp/chat-a",
+                  "title": "chat-a",
+                  "is_active": false
+                }
+              ],
+              [
+                0.5,
+                {
+                  "type": "Leaf",
+                  "pane_id": 2102,
+                  "rows": 40,
+                  "cols": 60,
+                  "cwd": "/tmp/chat-b",
+                  "title": "chat-b",
+                  "is_active": false
+                }
+              ]
+            ]
+          },
+          "active_pane_id": null
+        }
+      ],
+      "active_tab_index": null
+    }
+  ]
+}
