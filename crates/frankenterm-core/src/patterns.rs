@@ -1072,6 +1072,40 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     Ok(pack)
 }
 
+/// Canonicalize `candidate` and `root`, then verify the canonical
+/// candidate is contained within the canonical root.
+///
+/// Both `..` traversal (e.g. `root/../etc/passwd`) and symlink escape
+/// (e.g. `root/link` where `link -> /etc/passwd`) are rejected —
+/// `fs::canonicalize` resolves both in a single syscall sequence, and a
+/// prefix check on the result rejects anything that slipped out.
+///
+/// Fails with `PackNotFound` when the candidate doesn't exist so the
+/// user-facing error family stays stable with the pre-sandbox behavior
+/// (the old code's `read_to_string` also surfaced missing files as
+/// `PackNotFound`). Fails with `InvalidRule` when the candidate exists
+/// but resolves outside `root`.
+fn sandbox_resolve(candidate: &Path, root: &Path) -> Result<PathBuf> {
+    let root_canonical = root.canonicalize().map_err(|e| {
+        PatternError::InvalidRule(format!(
+            "sandbox root {} is not accessible: {e}",
+            root.display()
+        ))
+    })?;
+    let candidate_canonical = candidate.canonicalize().map_err(|e| {
+        PatternError::PackNotFound(format!("{} ({e})", candidate.display()))
+    })?;
+    if !candidate_canonical.starts_with(&root_canonical) {
+        return Err(PatternError::InvalidRule(format!(
+            "pack path {} resolves outside sandbox root {}",
+            candidate_canonical.display(),
+            root_canonical.display()
+        ))
+        .into());
+    }
+    Ok(candidate_canonical)
+}
+
 fn is_pack_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
