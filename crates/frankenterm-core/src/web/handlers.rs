@@ -564,3 +564,462 @@ pub(super) fn handle_saved_searches(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rulesets::RulesetProfileSummary;
+    use crate::storage::{
+        EventAnnotations, PaneBookmarkRecord, SavedSearchRecord, SearchResult, Segment,
+        StorageHandle, StoredEvent,
+    };
+    use crate::web_framework::{Method, ResponseBody};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use crate::runtime_compat::CompatRuntime;
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build web handlers test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    async fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft.db");
+        let storage = StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("storage handle");
+        (dir, storage)
+    }
+
+    fn make_request(path: &str, query: Option<&str>, storage: Option<StorageHandle>) -> Request {
+        let mut req = Request::new(Method::GET, path);
+        if let Some(query) = query {
+            req.set_query(Some(query.to_string()));
+        }
+        req.insert_extension(super::super::middleware::AppState {
+            storage,
+            event_bus: None,
+            redactor: Arc::new(Redactor::new()),
+        });
+        req
+    }
+
+    fn response_json(response: Response) -> Value {
+        let (_, _, body) = response.into_parts();
+        match body {
+            ResponseBody::Bytes(bytes) => serde_json::from_slice(&bytes).expect("json body"),
+            ResponseBody::Empty => panic!("expected JSON response body"),
+            ResponseBody::Stream(_) => panic!("expected non-streaming response body"),
+        }
+    }
+
+    fn sample_pane(pane_id: u64) -> PaneRecord {
+        PaneRecord {
+            pane_id,
+            pane_uuid: Some(format!("pane-{pane_id}-uuid")),
+            domain: "local".to_string(),
+            window_id: Some(7),
+            tab_id: Some(3),
+            title: Some(format!("pane-{pane_id}")),
+            cwd: Some(format!("/tmp/pane-{pane_id}")),
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_123,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: Some(1_700_000_000_100),
+        }
+    }
+
+    fn sample_event(pane_id: u64) -> StoredEvent {
+        StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: "claude_code".to_string(),
+            event_type: "usage".to_string(),
+            severity: "warning".to_string(),
+            confidence: 0.91,
+            extracted: Some(serde_json::json!({"remaining": 1})),
+            matched_text: Some("usage warning".to_string()),
+            segment_id: None,
+            detected_at: 1_700_000_000_500,
+            dedupe_key: Some("dedupe-1".to_string()),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    #[test]
+    fn health_response_serializes_ok_and_version() {
+        let response = health_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response);
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["version"], VERSION);
+    }
+
+    #[test]
+    fn pane_view_from_record_maps_optional_fields() {
+        let pane = PaneView::from_record(sample_pane(42), &Redactor::new());
+        assert_eq!(pane.pane_id, 42);
+        assert_eq!(pane.pane_uuid.as_deref(), Some("pane-42-uuid"));
+        assert_eq!(pane.domain, "local");
+        assert_eq!(pane.title.as_deref(), Some("pane-42"));
+        assert_eq!(pane.cwd.as_deref(), Some("/tmp/pane-42"));
+        assert_eq!(pane.window_id, Some(7));
+        assert_eq!(pane.tab_id, Some(3));
+    }
+
+    #[test]
+    fn event_annotations_view_from_stored_maps_labels_and_note() {
+        let annotations = EventAnnotationsView::from_stored(
+            EventAnnotations {
+                triage_state: Some("needs_review".to_string()),
+                triage_updated_at: Some(10),
+                triage_updated_by: Some("agent".to_string()),
+                note: Some("operator note".to_string()),
+                note_updated_at: Some(20),
+                note_updated_by: Some("agent".to_string()),
+                labels: vec!["alpha".to_string(), "beta".to_string()],
+            },
+            &Redactor::new(),
+        );
+        assert_eq!(annotations.triage_state.as_deref(), Some("needs_review"));
+        assert_eq!(annotations.note.as_deref(), Some("operator note"));
+        assert_eq!(annotations.labels, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn event_view_from_stored_carries_annotations_and_text() {
+        let view = EventView::from_stored(
+            sample_event(7),
+            &Redactor::new(),
+            Some(EventAnnotationsView {
+                triage_state: Some("open".to_string()),
+                note: None,
+                labels: vec!["triage".to_string()],
+            }),
+        );
+        assert_eq!(view.pane_id, 7);
+        assert_eq!(view.rule_id, "claude_code.usage.reached");
+        assert_eq!(view.matched_text.as_deref(), Some("usage warning"));
+        assert_eq!(
+            view.annotations.as_ref().map(|a| a.labels.clone()),
+            Some(vec!["triage".to_string()])
+        );
+    }
+
+    #[test]
+    fn search_hit_from_result_uses_segment_metadata() {
+        let hit = SearchHit::from_result(
+            SearchResult {
+                segment: Segment {
+                    id: 9,
+                    pane_id: 4,
+                    seq: 2,
+                    content: "needle in haystack".to_string(),
+                    content_len: 18,
+                    content_hash: None,
+                    captured_at: 1_700_000_000_777,
+                },
+                snippet: Some("needle".to_string()),
+                highlight: None,
+                score: 0.42,
+            },
+            &Redactor::new(),
+        );
+        assert_eq!(hit.segment_id, 9);
+        assert_eq!(hit.pane_id, 4);
+        assert_eq!(hit.snippet.as_deref(), Some("needle"));
+        assert_eq!(hit.content_len, 18);
+        assert_eq!(hit.score, 0.42);
+    }
+
+    #[test]
+    fn bookmark_view_from_query_maps_fields() {
+        let view = BookmarkView::from_query(
+            crate::ui_query::PaneBookmarkView {
+                pane_id: 11,
+                alias: "ops".to_string(),
+                tags: vec!["prod".to_string(), "ssh".to_string()],
+                description: Some("primary pane".to_string()),
+                created_at: 100,
+                updated_at: 200,
+            },
+            &Redactor::new(),
+        );
+        assert_eq!(view.pane_id, 11);
+        assert_eq!(view.alias, "ops");
+        assert_eq!(view.tags, vec!["prod", "ssh"]);
+        assert_eq!(view.description.as_deref(), Some("primary pane"));
+        assert_eq!(view.created_at, 100);
+        assert_eq!(view.updated_at, 200);
+    }
+
+    #[test]
+    fn ruleset_profile_view_from_summary_maps_fields() {
+        let view = RulesetProfileView::from_summary(
+            RulesetProfileSummary {
+                name: "default".to_string(),
+                description: Some("Default profile".to_string()),
+                path: Some("/tmp/rulesets/default.toml".to_string()),
+                last_applied_at: Some(123),
+                implicit: false,
+            },
+            &Redactor::new(),
+        );
+        assert_eq!(view.name, "default");
+        assert_eq!(view.description.as_deref(), Some("Default profile"));
+        assert_eq!(view.path.as_deref(), Some("/tmp/rulesets/default.toml"));
+        assert_eq!(view.last_applied_at, Some(123));
+        assert!(!view.implicit);
+    }
+
+    #[test]
+    fn saved_search_view_from_query_maps_fields() {
+        let view = SavedSearchView::from_query(
+            crate::ui_query::SavedSearchView {
+                id: "ss-1".to_string(),
+                name: "Failures".to_string(),
+                query: "error".to_string(),
+                pane_id: Some(5),
+                limit: 25,
+                since_mode: "last_run".to_string(),
+                since_ms: None,
+                schedule_interval_ms: Some(60_000),
+                enabled: true,
+                last_run_at: Some(200),
+                last_result_count: Some(3),
+                last_error: Some("boom".to_string()),
+                created_at: 100,
+                updated_at: 200,
+            },
+            &Redactor::new(),
+        );
+        assert_eq!(view.id, "ss-1");
+        assert_eq!(view.name, "Failures");
+        assert_eq!(view.query, "error");
+        assert_eq!(view.pane_id, Some(5));
+        assert_eq!(view.schedule_interval_ms, Some(60_000));
+        assert_eq!(view.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn handle_panes_without_state_returns_internal_error() {
+        run_async_test(async {
+            let req = Request::new(Method::GET, "/panes");
+            let response = handle_panes(&req).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let json = response_json(response);
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], "internal_error");
+        });
+    }
+
+    #[test]
+    fn handle_search_without_query_returns_bad_request() {
+        run_async_test(async {
+            let req = Request::new(Method::GET, "/search");
+            let response = handle_search(&req).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let json = response_json(response);
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["error_code"], "missing_query");
+        });
+    }
+
+    #[test]
+    fn handle_panes_with_storage_returns_serialized_panes() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .upsert_pane(sample_pane(21))
+                .await
+                .expect("upsert pane");
+
+            let req = make_request("/panes", None, Some(storage.clone()));
+            let response = handle_panes(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            assert_eq!(json["ok"], true);
+            assert_eq!(json["data"]["total"], 1);
+            assert_eq!(json["data"]["panes"][0]["pane_id"], 21);
+            assert_eq!(json["data"]["panes"][0]["cwd"], "/tmp/pane-21");
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn handle_events_with_storage_returns_annotations() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .upsert_pane(sample_pane(8))
+                .await
+                .expect("upsert pane");
+            let event_id = storage
+                .record_event(sample_event(8))
+                .await
+                .expect("record event");
+            storage
+                .set_event_triage_state(
+                    event_id,
+                    Some("needs_review".to_string()),
+                    Some("tester".to_string()),
+                )
+                .await
+                .expect("triage state");
+            storage
+                .set_event_note(
+                    event_id,
+                    Some("operator note".to_string()),
+                    Some("tester".to_string()),
+                )
+                .await
+                .expect("event note");
+            storage
+                .add_event_label(event_id, "urgent".to_string(), Some("tester".to_string()))
+                .await
+                .expect("event label");
+
+            let req = make_request(
+                "/events",
+                Some("pane_id=not-a-number&since=oops&until=nah&unhandled=yes"),
+                Some(storage.clone()),
+            );
+            let response = handle_events(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            assert_eq!(json["data"]["total"], 1);
+            assert_eq!(json["data"]["events"][0]["pane_id"], 8);
+            assert_eq!(
+                json["data"]["events"][0]["annotations"]["triage_state"],
+                "needs_review"
+            );
+            assert_eq!(
+                json["data"]["events"][0]["annotations"]["note"],
+                "operator note"
+            );
+            assert_eq!(
+                json["data"]["events"][0]["annotations"]["labels"][0],
+                "urgent"
+            );
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn handle_search_with_storage_returns_search_hits() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .upsert_pane(sample_pane(5))
+                .await
+                .expect("upsert pane");
+            storage
+                .append_segment(5, "needle in haystack", None)
+                .await
+                .expect("append segment");
+
+            let req = make_request("/search", Some("q=needle"), Some(storage.clone()));
+            let response = handle_search(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            assert_eq!(json["data"]["total"], 1);
+            assert_eq!(json["data"]["results"][0]["pane_id"], 5);
+            assert_eq!(json["data"]["results"][0]["content_len"], 18);
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn handle_bookmarks_with_storage_returns_serialized_bookmarks() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .upsert_pane(sample_pane(3))
+                .await
+                .expect("upsert pane");
+            storage
+                .insert_pane_bookmark(PaneBookmarkRecord {
+                    id: 0,
+                    pane_id: 3,
+                    alias: "ops".to_string(),
+                    tags: Some(vec!["prod".to_string(), "ssh".to_string()]),
+                    description: Some("primary".to_string()),
+                    created_at: 10,
+                    updated_at: 20,
+                })
+                .await
+                .expect("insert bookmark");
+
+            let req = make_request("/bookmarks", None, Some(storage.clone()));
+            let response = handle_bookmarks(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            assert_eq!(json["data"]["total"], 1);
+            assert_eq!(json["data"]["bookmarks"][0]["alias"], "ops");
+            assert_eq!(json["data"]["bookmarks"][0]["tags"][0], "prod");
+            assert_eq!(json["data"]["bookmarks"][0]["description"], "primary");
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn handle_saved_searches_with_storage_returns_serialized_saved_searches() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .insert_saved_search(SavedSearchRecord::new(
+                    "Failures".to_string(),
+                    "error".to_string(),
+                    Some(9),
+                    25,
+                    "last_run".to_string(),
+                    None,
+                ))
+                .await
+                .expect("insert saved search");
+
+            let req = make_request("/saved-searches", None, Some(storage.clone()));
+            let response = handle_saved_searches(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            assert_eq!(json["data"]["total"], 1);
+            assert_eq!(json["data"]["saved_searches"][0]["name"], "Failures");
+            assert_eq!(json["data"]["saved_searches"][0]["query"], "error");
+            assert_eq!(json["data"]["saved_searches"][0]["pane_id"], 9);
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+}
