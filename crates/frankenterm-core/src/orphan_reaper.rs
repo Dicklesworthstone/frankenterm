@@ -480,7 +480,7 @@ fn parse_ps_line_if_reapable(line: &str) -> Option<ProcessEntry> {
     };
 
     // Only reap subcommands on the explicit allowlist.
-    if !REAPABLE_SUBCOMMANDS.contains(subcommand) {
+    if !REAPABLE_SUBCOMMANDS.contains(&subcommand) {
         return None;
     }
 
