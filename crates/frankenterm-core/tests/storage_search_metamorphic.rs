@@ -31,9 +31,7 @@
 //!       therefore every search score — bit-identical.
 
 use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
-use frankenterm_core::storage::{
-    PaneRecord, SearchOptions, SearchResult, StorageHandle,
-};
+use frankenterm_core::storage::{PaneRecord, SearchOptions, SearchResult, StorageHandle};
 use tempfile::TempDir;
 
 fn runtime() -> frankenterm_core::runtime_compat::Runtime {
@@ -76,7 +74,10 @@ async fn seed_corpus(storage: &StorageHandle, pane_id: u64) {
     // The corpus deliberately mixes case and repeated tokens so BM25 has
     // non-trivial scoring to compare across queries.
     let ts = now_ms();
-    storage.upsert_pane(pane(pane_id, ts)).await.expect("upsert pane");
+    storage
+        .upsert_pane(pane(pane_id, ts))
+        .await
+        .expect("upsert pane");
     for content in [
         "Apple Banana Cherry Apple",
         "banana cherry date",
@@ -141,8 +142,16 @@ fn mr_case_insensitive_search_yields_identical_results() {
             .expect("search title");
 
         assert!(!lower.is_empty(), "corpus must contain 'apple' matches");
-        assert_eq!(canon(&lower), canon(&upper), "case should not affect search");
-        assert_eq!(canon(&upper), canon(&title), "case should not affect search");
+        assert_eq!(
+            canon(&lower),
+            canon(&upper),
+            "case should not affect search"
+        );
+        assert_eq!(
+            canon(&upper),
+            canon(&title),
+            "case should not affect search"
+        );
     });
 }
 
@@ -173,7 +182,11 @@ fn mr_whitespace_normalization_yields_identical_results() {
             .expect("search tabbed");
 
         assert!(!tight.is_empty(), "corpus must match 'apple cherry'");
-        assert_eq!(canon(&tight), canon(&spaced), "extra space must be absorbed");
+        assert_eq!(
+            canon(&tight),
+            canon(&spaced),
+            "extra space must be absorbed"
+        );
         assert_eq!(canon(&tight), canon(&tabbed), "tab must be absorbed");
     });
 }
@@ -233,10 +246,7 @@ fn mr_noop_prune_preserves_lexical_scores() {
         // every inserted segment's captured_at is > 0. If the FTS5 index is
         // mutated as a side effect of running an empty prune pass (e.g. a
         // spurious delete+reindex), the post-prune scores will drift.
-        let removed = storage
-            .prune_segments_before(0)
-            .await
-            .expect("noop prune");
+        let removed = storage.prune_segments_before(0).await.expect("noop prune");
         assert_eq!(removed, 0, "prune_segments_before(0) must be a no-op");
 
         let after = storage
