@@ -5,7 +5,7 @@
 //!
 //! Uses 8-lane unrolled dot product for search and IEEE 754 half-precision (f16).
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 const MAGIC: &[u8; 4] = b"FTVI";
 const VERSION: u16 = 1;
@@ -110,26 +110,38 @@ pub struct FtviRecord {
     pub vector: Vec<f32>,
 }
 
-/// Writer for creating FTVI index files.
-pub struct FtviWriter<W: Write> {
+/// Streaming writer for FTVI index files.
+///
+/// Requires `Write + Seek` because the count-header field at offset 8..12 is
+/// written as a placeholder in [`FtviWriter::new`] and patched with the final
+/// record count when [`FtviWriter::finish`] is called. For non-seekable
+/// destinations (pipes, sockets, compressed streams), use [`write_ftvi_vec`]
+/// to build the full byte buffer in one shot instead.
+pub struct FtviWriter<W: Write + Seek> {
     writer: W,
     dimension: u16,
     count: u32,
     buf: Vec<u8>,
+    /// Absolute stream offset of the 4-byte little-endian count header.
+    /// Captured in `new()` so that `finish()` can patch the field even when
+    /// the underlying writer did not start at offset 0 (e.g. appending into
+    /// a pre-existing file or a mid-stream region of a larger artifact).
+    count_header_offset: u64,
 }
 
-impl<W: Write> FtviWriter<W> {
+impl<W: Write + Seek> FtviWriter<W> {
     pub fn new(mut writer: W, dimension: u16) -> io::Result<Self> {
         writer.write_all(MAGIC)?;
         writer.write_all(&VERSION.to_le_bytes())?;
         writer.write_all(&dimension.to_le_bytes())?;
-        // placeholder for count — will be patched on finish
+        let count_header_offset = writer.stream_position()?;
         writer.write_all(&0u32.to_le_bytes())?;
         Ok(Self {
             writer,
             dimension,
             count: 0,
             buf: Vec::with_capacity(dimension as usize * 2 + 8),
+            count_header_offset,
         })
     }
 
@@ -158,10 +170,16 @@ impl<W: Write> FtviWriter<W> {
         self.count
     }
 
-    /// Finish writing. Returns the inner writer.
-    /// NOTE: The count header field requires a seekable writer to patch.
-    /// For non-seekable writers, use `finish_to_vec` instead.
-    pub fn finish(self) -> io::Result<W> {
+    /// Patch the count-header placeholder with the final record count, then
+    /// return the inner writer with its cursor restored to end-of-stream so
+    /// subsequent appends land after the FTVI payload. Produces bytes that
+    /// `FtviIndex::from_bytes` can round-trip.
+    pub fn finish(mut self) -> io::Result<W> {
+        let end = self.writer.stream_position()?;
+        self.writer
+            .seek(SeekFrom::Start(self.count_header_offset))?;
+        self.writer.write_all(&self.count.to_le_bytes())?;
+        self.writer.seek(SeekFrom::Start(end))?;
         Ok(self.writer)
     }
 }
@@ -425,11 +443,33 @@ mod tests {
     #[test]
     fn writer_count() {
         let mut buf = Vec::new();
-        let mut w = FtviWriter::new(&mut buf, 2).unwrap();
+        let mut w = FtviWriter::new(io::Cursor::new(&mut buf), 2).unwrap();
         assert_eq!(w.count(), 0);
         w.push(1, &[1.0, 0.0]).unwrap();
         w.push(2, &[0.0, 1.0]).unwrap();
         assert_eq!(w.count(), 2);
+    }
+
+    /// Regression test for ft-yv02l / category-A "placeholder count not
+    /// patched on finish" defect. Before the fix, `finish()` was a no-op:
+    /// the count header stayed 0 and `FtviIndex::from_bytes` reported an
+    /// empty index even after pushes. This test parses the output end-to-end
+    /// to guarantee the header is patched.
+    #[test]
+    fn writer_finish_patches_count_header() {
+        let mut buf = Vec::new();
+        let mut w = FtviWriter::new(io::Cursor::new(&mut buf), 2).unwrap();
+        w.push(10, &[1.0, 0.0]).unwrap();
+        w.push(20, &[0.0, 1.0]).unwrap();
+        w.push(30, &[0.5, 0.5]).unwrap();
+        let _ = w.finish().unwrap();
+
+        // Header count field lives at bytes 8..12.
+        let header_count = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(header_count, 3, "finish() must patch the count header");
+
+        let idx = FtviIndex::from_bytes(&buf).expect("parse round-trip");
+        assert_eq!(idx.len(), 3);
     }
 
     // =====================================================================
@@ -536,7 +576,7 @@ mod tests {
     #[test]
     fn writer_dimension_mismatch_error() {
         let mut buf = Vec::new();
-        let mut w = FtviWriter::new(&mut buf, 3).unwrap();
+        let mut w = FtviWriter::new(io::Cursor::new(&mut buf), 3).unwrap();
         let err = w.push(1, &[1.0, 2.0]); // 2 elements, expected 3
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("dimension"));
@@ -545,7 +585,7 @@ mod tests {
     #[test]
     fn writer_finish_returns_writer() {
         let mut buf = Vec::new();
-        let w = FtviWriter::new(&mut buf, 2).unwrap();
+        let w = FtviWriter::new(io::Cursor::new(&mut buf), 2).unwrap();
         let _inner = w.finish().unwrap();
         // Should not panic
     }

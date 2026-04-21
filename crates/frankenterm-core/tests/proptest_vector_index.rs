@@ -255,7 +255,7 @@ proptest! {
     #[test]
     fn writer_count_tracks_pushes((dim, records) in arb_records()) {
         let mut buf = Vec::new();
-        let mut writer = FtviWriter::new(&mut buf, dim).unwrap();
+        let mut writer = FtviWriter::new(std::io::Cursor::new(&mut buf), dim).unwrap();
         prop_assert_eq!(writer.count(), 0, "initial count should be 0");
         for (i, (id, vec)) in records.iter().enumerate() {
             writer.push(*id, vec).unwrap();
@@ -286,7 +286,7 @@ proptest! {
         id in any::<u64>()
     ) {
         let mut buf = Vec::new();
-        let mut writer = FtviWriter::new(&mut buf, dim).unwrap();
+        let mut writer = FtviWriter::new(std::io::Cursor::new(&mut buf), dim).unwrap();
         let wrong_vec: Vec<f32> = vec![1.0; (dim - 1) as usize];
         let result = writer.push(id, &wrong_vec);
         prop_assert!(result.is_err(),
@@ -484,26 +484,31 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
-    // 31. FtviWriter then finish produces valid bytes that from_bytes can parse.
+    // 31. FtviWriter + finish produces bytes that round-trip through
+    // FtviIndex::from_bytes with the correct record count — previously broken
+    // (ft-yv02l): finish() was a no-op placeholder and the count header
+    // stayed 0, so parsing always yielded an empty index.
     #[test]
     fn writer_finish_produces_parseable_bytes((dim, records) in arb_records()) {
         let mut buf = Vec::new();
         {
-            let mut writer = FtviWriter::new(&mut buf, dim).unwrap();
+            let mut writer = FtviWriter::new(std::io::Cursor::new(&mut buf), dim).unwrap();
             for (id, vec) in &records {
                 writer.push(*id, vec).unwrap();
             }
             let _ = writer.finish().unwrap();
         }
-        // Note: FtviWriter::finish doesn't patch count for non-seekable writers,
-        // so write_ftvi_vec is the preferred path. But we can verify the writer
-        // produces valid structure (magic, version, dimension are correct).
         prop_assert_eq!(&buf[0..4], b"FTVI", "writer magic mismatch");
         let version = u16::from_le_bytes([buf[4], buf[5]]);
         prop_assert_eq!(version, 1, "writer version mismatch: {}", version);
         let stored_dim = u16::from_le_bytes([buf[6], buf[7]]);
         prop_assert_eq!(stored_dim, dim,
             "writer dimension {} != {}", stored_dim, dim);
+        let stored_count = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        prop_assert_eq!(stored_count, records.len() as u32,
+            "writer count header: expected {}, got {}", records.len(), stored_count);
+        let idx = FtviIndex::from_bytes(&buf).expect("writer output must parse");
+        prop_assert_eq!(idx.len(), records.len());
     }
 
     // 32. Idempotent double-parse: from_bytes(build_bytes(...)) == from_bytes(build_bytes(...)).

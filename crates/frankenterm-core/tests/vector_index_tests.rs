@@ -195,7 +195,7 @@ fn ftvi_dimension_mismatch_returns_empty() {
 #[test]
 fn ftvi_writer_tracks_count() {
     let mut buf = Vec::new();
-    let mut writer = FtviWriter::new(&mut buf, 4).unwrap();
+    let mut writer = FtviWriter::new(std::io::Cursor::new(&mut buf), 4).unwrap();
 
     assert_eq!(writer.count(), 0);
     writer.push(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -204,6 +204,11 @@ fn ftvi_writer_tracks_count() {
     assert_eq!(writer.count(), 2);
 
     writer.finish().unwrap();
+
+    // ft-yv02l: finish() must patch the count header so the file is
+    // round-trippable via FtviIndex::from_bytes.
+    let idx = FtviIndex::from_bytes(&buf).expect("writer output parses");
+    assert_eq!(idx.len(), 2);
 }
 
 #[test]
