@@ -50,6 +50,10 @@ use thiserror::Error;
 
 mod bounded_varbincode;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize_for_fuzz;
+
 #[cfg(test)]
 mod runtime {
     #[cfg(all(feature = "async-asupersync", not(feature = "async-smol")))]

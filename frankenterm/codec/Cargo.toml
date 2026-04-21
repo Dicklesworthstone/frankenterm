@@ -36,3 +36,4 @@ default = ["async-asupersync"]
 
 async-smol = ["dep:smol"]
 async-asupersync = ["dep:asupersync"]
+fuzzing = []

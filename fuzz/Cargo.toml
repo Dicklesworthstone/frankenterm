@@ -14,12 +14,14 @@ codec-fuzz-targets = ["dep:codec"]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
+leb128.workspace = true
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
-codec = { path = "../frankenterm/codec", optional = true }
+codec = { path = "../frankenterm/codec", optional = true, features = ["fuzzing"] }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
 serde_yaml = "0.9.34"
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 
@@ -84,6 +86,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "robot_envelope_json"
+path = "fuzz_targets/robot_envelope_json.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "string_parsers"
 path = "fuzz_targets/string_parsers.rs"
 doc = false
@@ -92,6 +100,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "pdu_stream_decode"
 path = "fuzz_targets/pdu_stream_decode.rs"
+doc = false
+required-features = ["codec-fuzz-targets"]
+
+[[bin]]
+name = "bounded_varbincode"
+path = "fuzz_targets/bounded_varbincode.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
 
