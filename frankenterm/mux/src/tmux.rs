@@ -46,6 +46,19 @@ fn cap_backlog_payload(payload: &[u8]) -> Vec<u8> {
     }
 }
 
+fn append_backlog_payload(backlog: &mut Vec<u8>, payload: &[u8]) {
+    if payload.is_empty() {
+        return;
+    }
+
+    backlog.extend_from_slice(payload);
+    let max = max_backlog_bytes_per_pane();
+    if backlog.len() > max {
+        let excess = backlog.len() - max;
+        backlog.drain(..excess);
+    }
+}
+
 /// Push a command onto the tmux cmd_queue while enforcing the CMD_QUEUE_MAX_DEPTH
 /// hard cap (ft-4qom2).
 ///
@@ -247,7 +260,13 @@ impl TmuxDomainState {
                     } else {
                         // the output may come early then pane is ready, in this case we
                         // backlog it
-                        self.backlog.lock().insert(*pane, cap_backlog_payload(text));
+                        let mut backlog = self.backlog.lock();
+                        append_backlog_payload(
+                            backlog
+                                .entry(*pane)
+                                .or_insert_with(Vec::new),
+                            &cap_backlog_payload(text),
+                        );
                         log::debug!("Tmux pane {} havn't been attached", pane);
                     }
                 }
@@ -850,6 +869,24 @@ mod tests {
         let capped = cap_backlog_payload(&exact);
         assert_eq!(exact.len(), capped.len());
         assert_eq!(exact, capped);
+    }
+
+    #[test]
+    fn append_backlog_payload_preserves_multiple_chunks_until_attach() {
+        let mut backlog = b"hello ".to_vec();
+        append_backlog_payload(&mut backlog, b"world");
+        assert_eq!(backlog, b"hello world");
+    }
+
+    #[test]
+    fn append_backlog_payload_keeps_newest_tail_when_combined_chunks_exceed_limit() {
+        let max = max_backlog_bytes_per_pane();
+        let mut backlog = vec![b'a'; max];
+        append_backlog_payload(&mut backlog, b"bc");
+
+        assert_eq!(backlog.len(), max);
+        assert_eq!(&backlog[max - 2..], b"bc");
+        assert!(backlog[..max - 2].iter().all(|b| *b == b'a'));
     }
 
     #[test]
