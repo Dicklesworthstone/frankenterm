@@ -700,9 +700,7 @@ fn simulated_network_read_error_then_fragmented_recovery_preserves_payload_order
         let (a, b) = mock_unix_stream_pair();
         let expected = b"fragmented-recovery-keeps-byte-order".to_vec();
 
-        a.write(&cx, &expected)
-            .await
-            .expect("seed pending payload");
+        a.write(&cx, &expected).await.expect("seed pending payload");
 
         let read_fault = SimulatedNetwork::new(
             b.clone(),
@@ -736,7 +734,10 @@ fn simulated_network_read_error_then_fragmented_recovery_preserves_payload_order
 
         let mut observed = Vec::new();
         while observed.len() < expected.len() {
-            let chunk = recovered.read(&cx, expected.len()).await.expect("recovery read");
+            let chunk = recovered
+                .read(&cx, expected.len())
+                .await
+                .expect("recovery read");
             assert!(
                 !chunk.is_empty(),
                 "fragmented recovery should continue returning buffered bytes until drained"

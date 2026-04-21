@@ -36,7 +36,10 @@ fn arb_slug_subset() -> impl Strategy<Value = Vec<String>> {
     )
     .prop_map(|slugs| {
         let mut set = BTreeSet::new();
-        slugs.into_iter().filter(|slug| set.insert(slug.clone())).collect()
+        slugs
+            .into_iter()
+            .filter(|slug| set.insert(slug.clone()))
+            .collect()
     })
 }
 

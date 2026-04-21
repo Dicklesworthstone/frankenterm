@@ -24,8 +24,9 @@ fn arb_json_leaf() -> impl Strategy<Value = Value> {
         any::<bool>().prop_map(Value::Bool),
         // Restrict to ±2^50 to avoid f64 precision loss through TOON roundtrip
         (-1125899906842624_i64..=1125899906842624_i64).prop_map(|n| Value::Number(n.into())),
-        (0.001f64..1e6)
-            .prop_map(|f| serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)),
+        (0.001f64..1e6).prop_map(|f| serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)),
         "[a-zA-Z0-9_ ]{0,64}".prop_map(Value::String),
     ]
 }
@@ -41,13 +42,8 @@ fn arb_json_value() -> impl Strategy<Value = Value> {
                 // Array of values
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
                 // Object with string keys
-                prop::collection::vec(
-                    ("[a-z_]{1,12}".prop_map(String::from), inner),
-                    0..6,
-                )
-                .prop_map(|pairs| {
-                    Value::Object(pairs.into_iter().collect())
-                }),
+                prop::collection::vec(("[a-z_]{1,12}".prop_map(String::from), inner), 0..6,)
+                    .prop_map(|pairs| { Value::Object(pairs.into_iter().collect()) }),
             ]
         },
     )
@@ -64,19 +60,14 @@ fn arb_json_object() -> impl Strategy<Value = Value> {
 
 /// Generate a robot-mode style response envelope.
 fn arb_robot_envelope() -> impl Strategy<Value = Value> {
-    (
-        any::<bool>(),
-        arb_json_value(),
-        0u64..5000,
-    )
-        .prop_map(|(ok, data, elapsed)| {
-            json!({
-                "ok": ok,
-                "data": data,
-                "elapsed_ms": elapsed,
-                "version": "0.1.0",
-            })
+    (any::<bool>(), arb_json_value(), 0u64..5000).prop_map(|(ok, data, elapsed)| {
+        json!({
+            "ok": ok,
+            "data": data,
+            "elapsed_ms": elapsed,
+            "version": "0.1.0",
         })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +455,15 @@ mod edge_cases {
 
     #[test]
     fn integer_boundary_roundtrip() {
-        for n in [0i64, 1, -1, i32::MAX as i64, i32::MIN as i64, (1i64 << 53), -(1i64 << 53)] {
+        for n in [
+            0i64,
+            1,
+            -1,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            (1i64 << 53),
+            -(1i64 << 53),
+        ] {
             let val = json!(n);
             let toon = toon_rust::encode(val.clone(), None);
             let decoded = toon_rust::try_decode(&toon, None).unwrap();
@@ -533,8 +532,8 @@ mod edge_cases {
         let toon = toon_rust::encode(payload.clone(), None);
         let lines: Vec<String> = toon.lines().map(|l| l.to_string()).collect();
 
-        let events = toon_rust::try_decode_stream_sync(lines, None)
-            .expect("stream decode should succeed");
+        let events =
+            toon_rust::try_decode_stream_sync(lines, None).expect("stream decode should succeed");
         assert!(!events.is_empty(), "stream should produce events");
 
         // Also verify single-pass matches

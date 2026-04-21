@@ -247,8 +247,12 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        self.search_with_cx(Cx::current().unwrap_or_else(Cx::for_request), request, on_phase)
-            .await
+        self.search_with_cx(
+            Cx::current().unwrap_or_else(Cx::for_request),
+            request,
+            on_phase,
+        )
+        .await
     }
 
     /// Run a search with a caller-provided capability context.
@@ -643,7 +647,8 @@ fn spawn_asupersync_cancellation_watcher(
             if cancellation.is_cancelled() {
                 break;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
+            let _ =
+                crate::runtime_compat::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
         }
     });
 

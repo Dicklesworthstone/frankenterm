@@ -387,24 +387,24 @@ where
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
-    use crate::error::WeztermError;
+        use crate::error::WeztermError;
 
-    // Check circuit state first
-    if !circuit.allow() {
-        let status = circuit.status();
-        let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
-        return Err(Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms }));
-    }
+        // Check circuit state first
+        if !circuit.allow() {
+            let status = circuit.status();
+            let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
+            return Err(Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms }));
+        }
 
-    let outcome = with_retry_outcome(policy, operation).await;
+        let outcome = with_retry_outcome(policy, operation).await;
 
-    // Update circuit state based on outcome
-    match &outcome.result {
-        Ok(_) => circuit.record_success(),
-        Err(_) => circuit.record_failure(),
-    }
+        // Update circuit state based on outcome
+        match &outcome.result {
+            Ok(_) => circuit.record_success(),
+            Err(_) => circuit.record_failure(),
+        }
 
-    outcome.result
+        outcome.result
     }
 }
 
@@ -1840,7 +1840,10 @@ mod tests {
                 with_retry_outcome_cx(&cx, &policy, || async { Ok::<_, Error>(777) }).await;
             assert!(outcome.result.is_ok());
             assert_eq!(outcome.result.unwrap(), 777);
-            assert_eq!(outcome.attempts, 1, "first-try success should report 1 attempt");
+            assert_eq!(
+                outcome.attempts, 1,
+                "first-try success should report 1 attempt"
+            );
         });
     }
 

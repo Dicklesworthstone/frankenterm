@@ -991,10 +991,29 @@ pub(crate) const MAX_PACK_BYTES: u64 = 16 * 1024 * 1024;
 
 fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     let raw_path = PathBuf::from(path);
-    let resolved = if raw_path.is_absolute() {
+    let candidate = if raw_path.is_absolute() {
         raw_path
     } else {
         root.map(|r| r.join(&raw_path)).unwrap_or(raw_path)
+    };
+
+    // Sandbox enforcement: when a `root` is supplied by the caller, every
+    // `file:` pack path — whether the caller wrote it as relative, as
+    // absolute, or disguised with `..` traversal — must canonicalize to a
+    // location inside that root. The earlier revision used the candidate
+    // verbatim, so an attacker who controlled the config's `[patterns]
+    // packs = [...]` list could add `file:/etc/passwd` or
+    // `file:../../../.ssh/id_rsa` and read arbitrary files through the
+    // pack-loading surface. Symlink escape (a link inside root pointing
+    // out) is also blocked because `fs::canonicalize` follows symlinks.
+    //
+    // Callers that pass `root: None` (currently `discover_packs_from_dir`)
+    // have already vetted the path via directory iteration inside a known
+    // prefix, so the sandbox check is skipped on that path.
+    let resolved = if let Some(root) = root {
+        sandbox_resolve(&candidate, root)?
+    } else {
+        candidate
     };
 
     // [ft-05hfm] Stat before read — cheaper to reject oversize packs on
@@ -3064,8 +3083,10 @@ mod tests {
         // susceptible to catastrophic backtracking. Must complete
         // against a 100 KiB pane-tail-shaped input without running
         // the backtrack budget dry.
-        let regex = compile_rule_regex(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining")
-            .expect("legitimate pattern must compile");
+        let regex = compile_rule_regex(
+            r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining",
+        )
+        .expect("legitimate pattern must compile");
         let mut padding = "filler content ".repeat(100 * 1024 / 15);
         padding.push_str("less than 5% of your 5h limit remaining");
         padding.push_str(&" more filler ".repeat(100));
@@ -5703,7 +5724,10 @@ rules:
         let base = "name: boundary\nversion: 1.0.0\nrules: []\n";
         let filler_count = (MAX_PACK_BYTES as usize) - base.len() - 10;
         let mut body = String::from(base);
-        body.push_str(&format!("# {}\n", "f".repeat(filler_count.saturating_sub(3))));
+        body.push_str(&format!(
+            "# {}\n",
+            "f".repeat(filler_count.saturating_sub(3))
+        ));
         assert!(
             body.len() as u64 <= MAX_PACK_BYTES,
             "test fixture mis-sized: {} > {}",
@@ -5720,7 +5744,8 @@ rules:
     fn load_pack_from_file_rejects_oversize_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.json");
-        let payload = "{".to_string() + &"\"x\":0,".repeat((MAX_PACK_BYTES as usize) / 6 + 1024) + "\"y\":0}";
+        let payload =
+            "{".to_string() + &"\"x\":0,".repeat((MAX_PACK_BYTES as usize) / 6 + 1024) + "\"y\":0}";
         assert!(payload.len() as u64 > MAX_PACK_BYTES);
         fs::write(&path, payload).unwrap();
         let err = load_pack_from_file(path.to_str().unwrap(), None)

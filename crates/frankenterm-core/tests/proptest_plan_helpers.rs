@@ -8,10 +8,7 @@ use frankenterm_core::workflows::{
 use proptest::prelude::*;
 
 fn arb_step() -> impl Strategy<Value = WorkflowStep> {
-    (
-        "[A-Za-z0-9_.-]{1,24}",
-        "[A-Za-z0-9 _,.:/-]{1,64}",
-    )
+    ("[A-Za-z0-9_.-]{1,24}", "[A-Za-z0-9 _,.:/-]{1,64}")
         .prop_map(|(name, description)| WorkflowStep::new(name, description))
 }
 
@@ -48,10 +45,15 @@ impl Workflow for PlanHelperWorkflow {
 fn arb_idempotency_result() -> impl Strategy<Value = IdempotencyCheckResult> {
     prop_oneof![
         Just(IdempotencyCheckResult::NotExecuted),
-        (0i64..=4_102_444_800_000i64, prop::option::of("[A-Za-z0-9 _.,:-]{0,40}"))
-            .prop_map(|(completed_at, previous_result)| IdempotencyCheckResult::AlreadyCompleted {
-                completed_at,
-                previous_result,
+        (
+            0i64..=4_102_444_800_000i64,
+            prop::option::of("[A-Za-z0-9 _.,:-]{0,40}")
+        )
+            .prop_map(|(completed_at, previous_result)| {
+                IdempotencyCheckResult::AlreadyCompleted {
+                    completed_at,
+                    previous_result,
+                }
             }),
         (0i64..=4_102_444_800_000i64)
             .prop_map(|started_at| IdempotencyCheckResult::PartiallyExecuted { started_at }),

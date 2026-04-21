@@ -17,7 +17,9 @@ use frankenterm_core::config::SnapshotConfig;
 use frankenterm_core::session_pane_state::{
     AgentMetadata, PaneStateSnapshot, ProcessInfo, TerminalState,
 };
-use frankenterm_core::session_restore::{find_unclean_sessions, load_latest_checkpoint, show_session};
+use frankenterm_core::session_restore::{
+    find_unclean_sessions, load_latest_checkpoint, show_session,
+};
 use frankenterm_core::session_topology::{PaneNode, TopologySnapshot};
 use frankenterm_core::snapshot_engine::{SnapshotEngine, SnapshotError, SnapshotTrigger};
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
@@ -217,7 +219,11 @@ fn restore_queries_follow_newest_unclean_checkpoint() {
             .await
             .unwrap();
 
-        let periodic_panes = vec![make_pane_simple(0), make_pane_simple(1), make_pane_simple(2)];
+        let periodic_panes = vec![
+            make_pane_simple(0),
+            make_pane_simple(1),
+            make_pane_simple(2),
+        ];
         let periodic = engine
             .capture(&periodic_panes, SnapshotTrigger::Periodic)
             .await
@@ -237,8 +243,14 @@ fn restore_queries_follow_newest_unclean_checkpoint() {
         let (session, checkpoints) = show_session(db_path.as_str(), &startup.session_id).unwrap();
         assert_eq!(session.session_id, startup.session_id);
         assert_eq!(checkpoints.len(), 2);
-        assert_eq!(session.last_checkpoint_at, Some(checkpoints[0].checkpoint_at));
-        assert_eq!(candidates[0].last_checkpoint_at, Some(checkpoints[0].checkpoint_at));
+        assert_eq!(
+            session.last_checkpoint_at,
+            Some(checkpoints[0].checkpoint_at)
+        );
+        assert_eq!(
+            candidates[0].last_checkpoint_at,
+            Some(checkpoints[0].checkpoint_at)
+        );
         assert_eq!(checkpoints[0].id, periodic.checkpoint_id);
         assert_eq!(checkpoints[0].pane_count, 3);
         assert_eq!(checkpoints[1].id, startup.checkpoint_id);

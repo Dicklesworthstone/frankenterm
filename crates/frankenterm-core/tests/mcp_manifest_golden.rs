@@ -328,11 +328,7 @@ fn mcp_manifest_matches_golden_without_db() {
         !absent_db_resources.is_empty(),
         "expected db-backed manifest to expose db-gated resources absent from no-db mode"
     );
-    for expected_absent_resource in [
-        "wa://accounts",
-        "wa://events",
-        "wa://reservations",
-    ] {
+    for expected_absent_resource in ["wa://accounts", "wa://events", "wa://reservations"] {
         assert!(
             full_resources.contains(expected_absent_resource),
             "whitelist drift (ft-cbeyl): {expected_absent_resource} no longer exists in the db-backed manifest — update the whitelist deliberately instead of letting the no-db check pass trivially"

@@ -11,21 +11,25 @@ fn arb_wait_result() -> impl Strategy<Value = WaitConditionResult> {
             0usize..=10_000,
             prop::option::of("[A-Za-z0-9 _.,:-]{0,40}"),
         )
-            .prop_map(|(elapsed_ms, polls, context)| WaitConditionResult::Satisfied {
-                elapsed_ms,
-                polls,
-                context,
-            }),
+            .prop_map(
+                |(elapsed_ms, polls, context)| WaitConditionResult::Satisfied {
+                    elapsed_ms,
+                    polls,
+                    context,
+                }
+            ),
         (
             0u64..=600_000,
             0usize..=10_000,
             prop::option::of("[A-Za-z0-9 _.,:-]{0,40}"),
         )
-            .prop_map(|(elapsed_ms, polls, last_observed)| WaitConditionResult::TimedOut {
-                elapsed_ms,
-                polls,
-                last_observed,
-            }),
+            .prop_map(
+                |(elapsed_ms, polls, last_observed)| WaitConditionResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_observed,
+                }
+            ),
         "[A-Za-z0-9 _.,:-]{1,60}".prop_map(|reason| WaitConditionResult::Unsupported { reason }),
     ]
 }
@@ -38,9 +42,10 @@ fn arb_wait_options() -> impl Strategy<Value = WaitConditionOptions> {
         1usize..=100_000,
         any::<bool>(),
     )
-        .prop_filter("poll_initial must be <= poll_max", |(_, initial_ms, max_ms, _, _)| {
-            initial_ms <= max_ms
-        })
+        .prop_filter(
+            "poll_initial must be <= poll_max",
+            |(_, initial_ms, max_ms, _, _)| initial_ms <= max_ms,
+        )
         .prop_map(
             |(tail_lines, initial_ms, max_ms, max_polls, allow_idle_heuristics)| {
                 WaitConditionOptions {

@@ -378,8 +378,8 @@ impl RestartScheduler {
         };
 
         let recommendation = windows.first().filter(|w| w.score >= min_score).cloned();
-        let would_trigger = matches!(self.config.mode, RestartMode::Automatic { .. })
-            && recommendation.is_some();
+        let would_trigger =
+            matches!(self.config.mode, RestartMode::Automatic { .. }) && recommendation.is_some();
 
         SchedulingDecision {
             windows,
@@ -428,8 +428,7 @@ impl RestartScheduler {
             if s.notified {
                 return false;
             }
-            let warn_ms =
-                s.scheduled_at_ms - (self.config.advance_warning_minutes as i64 * 60_000);
+            let warn_ms = s.scheduled_at_ms - (self.config.advance_warning_minutes as i64 * 60_000);
             current_ms >= warn_ms
         } else {
             false
@@ -757,9 +756,7 @@ mod tests {
         scheduler.record_restart(1_700_000_000_000);
         let json = serde_json::to_string(&scheduler).unwrap();
         let back: RestartScheduler = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            scheduler.last_restart_ms, back.last_restart_ms
-        );
+        assert_eq!(scheduler.last_restart_ms, back.last_restart_ms);
         assert_eq!(
             scheduler.activity_profile.observations(),
             back.activity_profile.observations()

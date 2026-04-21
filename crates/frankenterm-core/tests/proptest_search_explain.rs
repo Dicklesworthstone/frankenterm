@@ -992,8 +992,7 @@ proptest! {
 }
 
 fn arb_search_explain_evidence() -> impl Strategy<Value = SearchExplainEvidence> {
-    ("[a-z_]{1,24}", ".{0,64}")
-        .prop_map(|(key, value)| SearchExplainEvidence { key, value })
+    ("[a-z_]{1,24}", ".{0,64}").prop_map(|(key, value)| SearchExplainEvidence { key, value })
 }
 
 fn arb_search_explain_reason() -> impl Strategy<Value = SearchExplainReason> {
@@ -1011,13 +1010,15 @@ fn arb_search_explain_reason() -> impl Strategy<Value = SearchExplainReason> {
         proptest::collection::vec(".{1,60}", 0..6),
         0.0f64..=1.0f64,
     )
-        .prop_map(|(code, summary, evidence, suggestions, confidence)| SearchExplainReason {
-            code,
-            summary,
-            evidence,
-            suggestions,
-            confidence,
-        })
+        .prop_map(
+            |(code, summary, evidence, suggestions, confidence)| SearchExplainReason {
+                code,
+                summary,
+                evidence,
+                suggestions,
+                confidence,
+            },
+        )
 }
 
 fn arb_search_explain_result() -> impl Strategy<Value = SearchExplainResult> {

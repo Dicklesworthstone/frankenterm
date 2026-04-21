@@ -23,11 +23,10 @@ fn arb_search_index_stats() -> impl Strategy<Value = SearchIndexStats> {
             1usize..10_000,
             prop_oneof![
                 Just((None::<i64>, None::<i64>)),
-                (0i64..9_999_999_999_999, 0i64..9_999_999_999_999)
-                    .prop_map(|(a, b)| {
-                        let (oldest, newest) = if a <= b { (a, b) } else { (b, a) };
-                        (Some(oldest), Some(newest))
-                    }),
+                (0i64..9_999_999_999_999, 0i64..9_999_999_999_999).prop_map(|(a, b)| {
+                    let (oldest, newest) = if a <= b { (a, b) } else { (b, a) };
+                    (Some(oldest), Some(newest))
+                }),
             ],
             prop::option::of(0i64..9_999_999_999_999),
             prop::collection::hash_map("[a-z_]{3,20}", 0usize..10_000, 0..8),

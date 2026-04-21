@@ -21,7 +21,7 @@ use frankenterm_core::differential_snapshot::{
 };
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, TerminalState};
 use frankenterm_core::session_topology::{
-    PaneNode, TabSnapshot, TopologySnapshot, WindowSnapshot, TOPOLOGY_SCHEMA_VERSION,
+    PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot, WindowSnapshot,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -92,11 +92,15 @@ fn dirty_tracker_drives_diff_capture() {
     let pane_ids = [1, 2, 3];
 
     // Initialize with base snapshot.
-    let base = BaseSnapshot::new(1000, make_topology(&pane_ids), vec![
-        make_pane_state(1, 24, 80),
-        make_pane_state(2, 24, 80),
-        make_pane_state(3, 24, 80),
-    ]);
+    let base = BaseSnapshot::new(
+        1000,
+        make_topology(&pane_ids),
+        vec![
+            make_pane_state(1, 24, 80),
+            make_pane_state(2, 24, 80),
+            make_pane_state(3, 24, 80),
+        ],
+    );
     engine.initialize(base);
     assert!(engine.is_initialized());
     assert_eq!(engine.chain_len(), 0);
@@ -173,10 +177,11 @@ fn diff_chain_restore_and_compact() {
     assert_eq!(latest.pane_states.len(), 3);
 
     // Also test standalone DiffChain with the captured diffs.
-    let base = BaseSnapshot::new(1000, make_topology(&pane_ids), vec![
-        make_pane_state(1, 24, 80),
-        make_pane_state(2, 24, 80),
-    ]);
+    let base = BaseSnapshot::new(
+        1000,
+        make_topology(&pane_ids),
+        vec![make_pane_state(1, 24, 80), make_pane_state(2, 24, 80)],
+    );
     let mut chain = DiffChain::new(base);
     chain.push_diff(diff0);
     chain.push_diff(diff1);
@@ -195,7 +200,10 @@ fn diff_chain_restore_and_compact() {
 
     // Restore after compact should match pre-compact latest.
     let post_compact = chain.restore_latest();
-    assert_eq!(post_compact.pane_states.len(), chain_latest.pane_states.len());
+    assert_eq!(
+        post_compact.pane_states.len(),
+        chain_latest.pane_states.len()
+    );
 }
 
 /// Degradation manager responds to capture failures: when capture subsystem
@@ -258,12 +266,16 @@ fn full_pipeline_diff_capture_to_degradation_recovery() {
     let pane_ids = [1, 2, 3, 4];
 
     // Phase 1: healthy — initialize and capture diffs.
-    let base = BaseSnapshot::new(1000, make_topology(&pane_ids), vec![
-        make_pane_state(1, 24, 80),
-        make_pane_state(2, 24, 80),
-        make_pane_state(3, 24, 80),
-        make_pane_state(4, 24, 80),
-    ]);
+    let base = BaseSnapshot::new(
+        1000,
+        make_topology(&pane_ids),
+        vec![
+            make_pane_state(1, 24, 80),
+            make_pane_state(2, 24, 80),
+            make_pane_state(3, 24, 80),
+            make_pane_state(4, 24, 80),
+        ],
+    );
     engine.initialize(base);
     assert_eq!(dm.overall_status(), OverallStatus::Healthy);
 
@@ -281,10 +293,7 @@ fn full_pipeline_diff_capture_to_degradation_recovery() {
     assert_eq!(telem.clean_skips, 0);
 
     // Phase 2: failure — DB write subsystem goes down.
-    dm.enter_degraded(
-        Subsystem::DbWrite,
-        "disk I/O error on WAL sync".to_string(),
-    );
+    dm.enter_degraded(Subsystem::DbWrite, "disk I/O error on WAL sync".to_string());
     assert_eq!(dm.overall_status(), OverallStatus::Degraded);
 
     // We can still capture diffs in memory, but can't persist them.
@@ -302,10 +311,7 @@ fn full_pipeline_diff_capture_to_degradation_recovery() {
     assert_eq!(dm.queued_write_count(), 1);
 
     // Phase 3: capture subsystem also degrades (cascade).
-    dm.enter_degraded(
-        Subsystem::Capture,
-        "pane listing timeout".to_string(),
-    );
+    dm.enter_degraded(Subsystem::Capture, "pane listing timeout".to_string());
     dm.pause_workflow("periodic-snapshot".to_string());
 
     // Multiple degradations → still Degraded (not Critical unless unavailable).
@@ -392,10 +398,7 @@ fn degradation_escalation_to_critical() {
     assert_eq!(dm.disabled_patterns().len(), 1);
 
     // Escalate to unavailable.
-    dm.enter_unavailable(
-        Subsystem::PatternEngine,
-        "pattern engine OOM".to_string(),
-    );
+    dm.enter_unavailable(Subsystem::PatternEngine, "pattern engine OOM".to_string());
     assert!(dm.is_unavailable(Subsystem::PatternEngine));
     assert_eq!(dm.overall_status(), OverallStatus::Critical);
 

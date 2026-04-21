@@ -1,9 +1,7 @@
 //! Property-based tests for public `web` tuning/config carriers.
 
 use frankenterm_core::tuning_config::WebTuning;
-use frankenterm_core::web::{
-    WebServerConfig, resolve_host, resolve_port, resolve_runtime_limits,
-};
+use frankenterm_core::web::{WebServerConfig, resolve_host, resolve_port, resolve_runtime_limits};
 use proptest::prelude::*;
 
 fn arb_host() -> impl Strategy<Value = String> {

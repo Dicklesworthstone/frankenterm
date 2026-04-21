@@ -2,9 +2,9 @@
 
 #![cfg(feature = "mcp")]
 
+use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::{build_server, build_server_with_db};
-use frankenterm_core::VERSION;
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

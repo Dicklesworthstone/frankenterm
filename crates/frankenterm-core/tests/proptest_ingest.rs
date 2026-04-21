@@ -16,9 +16,9 @@ use proptest::prelude::*;
 use frankenterm_core::ingest::{
     AltScreenChange, CapturedSegmentKind, DiscoveryDiff, IngestTelemetrySnapshot,
     ObservationDecision, Osc133Marker, Osc133State, OutputCache, OutputCacheConfig, OverflowPolicy,
-    PaneCursor, PaneFingerprint, PanePriorityOverride, ShellState, StreamChannel,
+    PaneCursor, PaneFingerprint, PanePriorityOverride, PersistedCapture, ShellState, StreamChannel,
     StreamChannelConfig, StreamEvent, StreamIngester, StreamIngesterTelemetrySnapshot,
-    PersistedCapture, detect_alt_screen_changes, generate_pane_uuid,
+    detect_alt_screen_changes, generate_pane_uuid,
 };
 use frankenterm_core::storage::{Gap, Segment};
 use frankenterm_core::wezterm::PaneInfo;
@@ -101,15 +101,17 @@ fn arb_storage_segment() -> impl Strategy<Value = Segment> {
         prop::option::of("[0-9a-f]{8,64}"),
         arb_timestamp(),
     )
-        .prop_map(|(id, pane_id, seq, content, content_hash, captured_at)| Segment {
-            id,
-            pane_id,
-            seq,
-            content_len: content.len(),
-            content,
-            content_hash,
-            captured_at,
-        })
+        .prop_map(
+            |(id, pane_id, seq, content, content_hash, captured_at)| Segment {
+                id,
+                pane_id,
+                seq,
+                content_len: content.len(),
+                content,
+                content_hash,
+                captured_at,
+            },
+        )
 }
 
 fn arb_persisted_capture() -> impl Strategy<Value = PersistedCapture> {
@@ -129,16 +131,18 @@ fn arb_persisted_capture() -> impl Strategy<Value = PersistedCapture> {
                 arb_reason(),
                 arb_timestamp(),
             )
-                .prop_map(move |(id, seq_before, seq_after, reason, detected_at)| PersistedCapture {
-                    segment: segment_for_gap.clone(),
-                    gap: Some(Gap {
-                        id,
-                        pane_id,
-                        seq_before,
-                        seq_after,
-                        reason,
-                        detected_at,
-                    }),
+                .prop_map(move |(id, seq_before, seq_after, reason, detected_at)| {
+                    PersistedCapture {
+                        segment: segment_for_gap.clone(),
+                        gap: Some(Gap {
+                            id,
+                            pane_id,
+                            seq_before,
+                            seq_after,
+                            reason,
+                            detected_at,
+                        }),
+                    }
                 }),
         ]
     })

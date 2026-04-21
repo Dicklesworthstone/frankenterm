@@ -15,9 +15,8 @@ struct TestPayload {
 }
 
 fn arb_payload() -> impl Strategy<Value = TestPayload> {
-    ("[A-Za-z0-9 _.-]{0,40}", any::<u32>(), any::<bool>()).prop_map(
-        |(message, count, ok)| TestPayload { message, count, ok },
-    )
+    ("[A-Za-z0-9 _.-]{0,40}", any::<u32>(), any::<bool>())
+        .prop_map(|(message, count, ok)| TestPayload { message, count, ok })
 }
 
 fn header_value<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {

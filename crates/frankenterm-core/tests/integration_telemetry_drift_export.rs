@@ -13,8 +13,7 @@
 
 use frankenterm_core::drift::{DriftConfig, DriftMonitor, DriftType};
 use frankenterm_core::telemetry::{
-    Histogram, MetricPoint, MetricRegistry, TelemetryCollector, TelemetryConfig,
-    TelemetrySnapshot,
+    Histogram, MetricPoint, MetricRegistry, TelemetryCollector, TelemetryConfig, TelemetrySnapshot,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -239,11 +238,19 @@ fn multi_rule_drift_tracking_with_export() {
     // Rule A should have no drifts.
     let summary = drift.summary();
     assert_eq!(summary.total_rules, 2);
-    let rule_a = summary.rules.iter().find(|r| r.rule_id == "rule_a").unwrap();
+    let rule_a = summary
+        .rules
+        .iter()
+        .find(|r| r.rule_id == "rule_a")
+        .unwrap();
     assert_eq!(rule_a.total_drifts, 0);
 
     // Rule B should have at least one drift.
-    let rule_b = summary.rules.iter().find(|r| r.rule_id == "rule_b").unwrap();
+    let rule_b = summary
+        .rules
+        .iter()
+        .find(|r| r.rule_id == "rule_b")
+        .unwrap();
     assert!(rule_b.total_drifts >= 1);
 
     // Histogram summaries reflect the recorded data.

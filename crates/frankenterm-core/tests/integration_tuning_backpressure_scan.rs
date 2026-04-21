@@ -15,9 +15,7 @@
 use frankenterm_core::backpressure::{
     BackpressureConfig, BackpressureManager, BackpressureTier, QueueDepths,
 };
-use frankenterm_core::scan_pipeline::{
-    ChunkedPipelineState, ScanPipeline, ScanPipelineConfig,
-};
+use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 use frankenterm_core::tuning_config::TuningConfig;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -61,11 +59,17 @@ fn tuning_validates_and_drives_pipeline_config() {
     // Default tuning is valid.
     let tuning = TuningConfig::default();
     let errors = tuning.validate();
-    assert!(errors.is_empty(), "default tuning should be valid: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "default tuning should be valid: {errors:?}"
+    );
 
     // Tuning constants flow into pipeline configuration.
     let segment_limit = tuning.ingest.max_persist_segment_bytes;
-    assert!(segment_limit >= 1024, "segment limit should be at least 1KB");
+    assert!(
+        segment_limit >= 1024,
+        "segment limit should be at least 1KB"
+    );
 
     // Create scan pipeline with tuning-derived compression threshold.
     let scan_config = ScanPipelineConfig {
@@ -131,7 +135,10 @@ fn backpressure_tier_drives_scan_buffer_decisions() {
     assert_eq!(bp.classify(&depths_at(0.20, 0.10)), BackpressureTier::Green);
 
     // Yellow when capture crosses 40%.
-    assert_eq!(bp.classify(&depths_at(0.45, 0.10)), BackpressureTier::Yellow);
+    assert_eq!(
+        bp.classify(&depths_at(0.45, 0.10)),
+        BackpressureTier::Yellow
+    );
 
     // Red when capture crosses 70%.
     assert_eq!(bp.classify(&depths_at(0.75, 0.10)), BackpressureTier::Red);
@@ -148,7 +155,10 @@ fn backpressure_tier_drives_scan_buffer_decisions() {
 
     assert!(green_buffer > yellow_buffer);
     assert!(yellow_buffer > red_buffer);
-    assert!(red_buffer >= 1024, "red buffer should still be at least 1KB");
+    assert!(
+        red_buffer >= 1024,
+        "red buffer should still be at least 1KB"
+    );
 
     // Create chunked states at each tier's buffer size.
     let green_state = ChunkedPipelineState::new(green_buffer);

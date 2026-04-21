@@ -15,12 +15,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use frankenterm_core::circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitStateKind,
-};
+use frankenterm_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
 use frankenterm_core::gc::{
-    compact_u64_map, free_page_ratio, normalized_vacuum_threshold, should_vacuum,
-    CacheGcSettings,
+    CacheGcSettings, compact_u64_map, free_page_ratio, normalized_vacuum_threshold, should_vacuum,
 };
 use frankenterm_core::retry::RetryPolicy;
 
@@ -32,7 +29,7 @@ fn test_circuit(failure_threshold: u32) -> CircuitBreaker {
         "test_circuit",
         CircuitBreakerConfig::new(
             failure_threshold,
-            1, // single success resets
+            1,                         // single success resets
             Duration::from_millis(10), // short cooldown for tests
         ),
     )
@@ -95,7 +92,11 @@ fn circuit_state_drives_retry_policy() {
     }
     assert_eq!(cb.status().state, CircuitStateKind::Open);
     let open_policy = retry_for_circuit_state(cb.status().state);
-    assert_eq!(open_policy.max_attempts, Some(0), "open circuit: no retries");
+    assert_eq!(
+        open_policy.max_attempts,
+        Some(0),
+        "open circuit: no retries"
+    );
 
     // Wait for cooldown, then allow() transitions to HalfOpen.
     std::thread::sleep(Duration::from_millis(15));

@@ -86,12 +86,10 @@ fn ingest_tuning_strategy() -> impl Strategy<Value = IngestTuning> {
 }
 
 fn patterns_tuning_strategy() -> impl Strategy<Value = PatternsTuning> {
-    (1usize..10_000, 1usize..65536, positive_f64()).prop_map(|(keys, tail, bloom)| {
-        PatternsTuning {
-            max_seen_keys: keys,
-            max_tail_size_bytes: tail,
-            bloom_false_positive_rate: bloom.clamp(0.0001, 0.5),
-        }
+    (1usize..10_000, 1usize..65536, positive_f64()).prop_map(|(keys, tail, bloom)| PatternsTuning {
+        max_seen_keys: keys,
+        max_tail_size_bytes: tail,
+        bloom_false_positive_rate: bloom.clamp(0.0001, 0.5),
     })
 }
 
@@ -195,8 +193,24 @@ fn workflows_tuning_strategy() -> impl Strategy<Value = WorkflowsTuning> {
     )
         .prop_map(
             |(
-                (steps, wait_timeout, sleep, text_len, match_len, cass_start, cass_error, cass_auth_cfg),
-                (swarm_timeout, cc_cooldown, start_cooldown, error_cooldown, swarm_cooldown, auth_cooldown),
+                (
+                    steps,
+                    wait_timeout,
+                    sleep,
+                    text_len,
+                    match_len,
+                    cass_start,
+                    cass_error,
+                    cass_auth_cfg,
+                ),
+                (
+                    swarm_timeout,
+                    cc_cooldown,
+                    start_cooldown,
+                    error_cooldown,
+                    swarm_cooldown,
+                    auth_cooldown,
+                ),
             )| {
                 WorkflowsTuning {
                     max_steps: steps,
@@ -250,16 +264,24 @@ fn ipc_tuning_strategy() -> impl Strategy<Value = IpcTuning> {
 }
 
 fn wezterm_tuning_strategy() -> impl Strategy<Value = WeztermTuning> {
-    (1u64..120, 1u64..5000, 1usize..65536, 1u64..30000, 1u64..30000, 1u64..30000).prop_map(
-        |(timeout, retry, max_err, connect, read, write)| WeztermTuning {
-            timeout_secs: timeout,
-            retry_delay_ms: retry,
-            max_error_bytes: max_err,
-            connect_timeout_ms: connect,
-            read_timeout_ms: read,
-            write_timeout_ms: write,
-        },
+    (
+        1u64..120,
+        1u64..5000,
+        1usize..65536,
+        1u64..30000,
+        1u64..30000,
+        1u64..30000,
     )
+        .prop_map(
+            |(timeout, retry, max_err, connect, read, write)| WeztermTuning {
+                timeout_secs: timeout,
+                retry_delay_ms: retry,
+                max_error_bytes: max_err,
+                connect_timeout_ms: connect,
+                read_timeout_ms: read,
+                write_timeout_ms: write,
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------

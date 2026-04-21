@@ -12,8 +12,8 @@
 use frankenterm_core::events::*;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use proptest::prelude::*;
-use std::time::Duration;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 // ============================================================================
 // Strategies

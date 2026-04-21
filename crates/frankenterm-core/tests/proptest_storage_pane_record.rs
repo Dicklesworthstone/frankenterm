@@ -25,23 +25,8 @@ fn arb_pane_record() -> impl Strategy<Value = PaneRecord> {
     )
         .prop_map(
             |(
-                (
-                    pane_id,
-                    pane_uuid,
-                    domain,
-                    window_id,
-                    tab_id,
-                    title,
-                    cwd,
-                ),
-                (
-                    tty_name,
-                    first_seen_at,
-                    last_seen_at,
-                    observed,
-                    ignore_reason,
-                    last_decision_at,
-                ),
+                (pane_id, pane_uuid, domain, window_id, tab_id, title, cwd),
+                (tty_name, first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at),
             )| PaneRecord {
                 pane_id,
                 pane_uuid,

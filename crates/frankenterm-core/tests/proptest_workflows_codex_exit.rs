@@ -1,9 +1,7 @@
 // Property-based tests for workflows/codex_exit public carriers and helpers.
 
 use frankenterm_core::policy::{ActionKind, InjectionResult, PolicyDecision};
-use frankenterm_core::workflows::{
-    ctrl_c_injection_ok, CodexSessionParseError, CodexTokenUsage,
-};
+use frankenterm_core::workflows::{CodexSessionParseError, CodexTokenUsage, ctrl_c_injection_ok};
 use proptest::prelude::*;
 
 fn arb_token_usage() -> impl Strategy<Value = CodexTokenUsage> {
@@ -14,13 +12,15 @@ fn arb_token_usage() -> impl Strategy<Value = CodexTokenUsage> {
         prop::option::of(0i64..1_000_000),
         prop::option::of(0i64..1_000_000),
     )
-        .prop_map(|(total, input, output, cached, reasoning)| CodexTokenUsage {
-            total,
-            input,
-            output,
-            cached,
-            reasoning,
-        })
+        .prop_map(
+            |(total, input, output, cached, reasoning)| CodexTokenUsage {
+                total,
+                input,
+                output,
+                cached,
+                reasoning,
+            },
+        )
 }
 
 proptest! {

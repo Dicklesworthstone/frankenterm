@@ -12,12 +12,12 @@
 //! operations via its circuit breaker, auto-enqueues failed actions to
 //! the DLQ, and replay plans batch retries with backoff.
 
+use frankenterm_core::circuit_breaker::CircuitStateKind;
 use frankenterm_core::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
 use frankenterm_core::connector_reliability::{
     ConnectorCircuitConfig, ConnectorErrorKind, ConnectorReliabilityConfig,
     ConnectorReliabilityController, DeadLetterQueueConfig,
 };
-use frankenterm_core::circuit_breaker::CircuitStateKind;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -72,13 +72,26 @@ fn error_kind_drives_breaker_and_dlq_behavior() {
 
     // Record transient failures — should auto-enqueue to DLQ.
     let action1 = make_action(ConnectorActionKind::Notify, "evt-1");
-    let dlq_id = ctrl.record_failure(&action1, "connection refused", ConnectorErrorKind::Transient, 1000);
-    assert!(dlq_id.is_some(), "auto_dlq should enqueue transient failures");
+    let dlq_id = ctrl.record_failure(
+        &action1,
+        "connection refused",
+        ConnectorErrorKind::Transient,
+        1000,
+    );
+    assert!(
+        dlq_id.is_some(),
+        "auto_dlq should enqueue transient failures"
+    );
     assert_eq!(ctrl.dlq().depth(), 1);
 
     // Record permanent failure — should NOT enqueue (not retryable).
     let action2 = make_action(ConnectorActionKind::Notify, "evt-2");
-    let dlq_id = ctrl.record_failure(&action2, "invalid payload", ConnectorErrorKind::Permanent, 2000);
+    let dlq_id = ctrl.record_failure(
+        &action2,
+        "invalid payload",
+        ConnectorErrorKind::Permanent,
+        2000,
+    );
     assert!(dlq_id.is_none(), "permanent errors should not be enqueued");
     assert_eq!(ctrl.dlq().depth(), 1);
 
@@ -165,7 +178,12 @@ fn telemetry_coherent_after_mixed_lifecycle() {
     // 2 transient failures.
     for i in 0..2u64 {
         let action = make_action(ConnectorActionKind::AuditLog, &format!("audit-{i}"));
-        ctrl.record_failure(&action, "network error", ConnectorErrorKind::Transient, 1000 + i * 100);
+        ctrl.record_failure(
+            &action,
+            "network error",
+            ConnectorErrorKind::Transient,
+            1000 + i * 100,
+        );
     }
 
     // Check controller telemetry.
@@ -257,7 +275,12 @@ fn full_pipeline_operate_fail_recover_replay() {
     // Phase 2: failures escalate.
     for i in 0..3u64 {
         let action = make_action(ConnectorActionKind::TriggerWorkflow, &format!("wf-{i}"));
-        ctrl.record_failure(&action, "upstream 503", ConnectorErrorKind::ServiceUnavailable, 5000 + i * 100);
+        ctrl.record_failure(
+            &action,
+            "upstream 503",
+            ConnectorErrorKind::ServiceUnavailable,
+            5000 + i * 100,
+        );
     }
     assert_eq!(ctrl.circuit_status().state, CircuitStateKind::Open);
     assert_eq!(ctrl.dlq().depth(), 3);

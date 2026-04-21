@@ -72,13 +72,13 @@ fn gate_policy_strategy() -> impl Strategy<Value = ReleaseGatePolicy> {
 }
 
 fn leak_evidence_strategy() -> impl Strategy<Value = LeakEvidenceStatus> {
-    (any::<bool>(), any::<bool>(), "[a-zA-Z0-9/_.-]{0,80}").prop_map(
-        |(present, passed, path)| LeakEvidenceStatus {
+    (any::<bool>(), any::<bool>(), "[a-zA-Z0-9/_.-]{0,80}").prop_map(|(present, passed, path)| {
+        LeakEvidenceStatus {
             summary_present: present,
             summary_passed: passed,
             summary_path: path,
-        },
-    )
+        }
+    })
 }
 
 fn soak_evidence_strategy() -> impl Strategy<Value = SoakEvidenceStatus> {
@@ -124,13 +124,16 @@ fn soak_evidence_strategy() -> impl Strategy<Value = SoakEvidenceStatus> {
 }
 
 fn gate_inputs_strategy() -> impl Strategy<Value = ReleaseGateInputs> {
-    (leak_evidence_strategy(), soak_evidence_strategy(), any::<bool>()).prop_map(
-        |(leak, soak, guard)| ReleaseGateInputs {
+    (
+        leak_evidence_strategy(),
+        soak_evidence_strategy(),
+        any::<bool>(),
+    )
+        .prop_map(|(leak, soak, guard)| ReleaseGateInputs {
             leak,
             soak,
             guard_contract_passed: guard,
-        },
-    )
+        })
 }
 
 // ---------------------------------------------------------------------------

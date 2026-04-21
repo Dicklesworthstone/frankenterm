@@ -1373,7 +1373,10 @@ mod tests {
     fn scope_id_and_tier_display_all_variants() {
         // ScopeId
         assert_eq!(ScopeId::root().to_string(), "root");
-        assert_eq!(ScopeId("daemon:capture".into()).to_string(), "daemon:capture");
+        assert_eq!(
+            ScopeId("daemon:capture".into()).to_string(),
+            "daemon:capture"
+        );
 
         // ScopeTier — all 5 variants
         assert_eq!(ScopeTier::Root.to_string(), "root");

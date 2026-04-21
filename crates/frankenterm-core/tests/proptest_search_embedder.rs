@@ -33,7 +33,8 @@ fn arb_embed_error() -> impl Strategy<Value = EmbedError> {
         "[A-Za-z0-9 _.-]{3,40}".prop_map(EmbedError::InferenceFailed),
         (1usize..4096, 0usize..4096)
             .prop_map(|(expected, actual)| EmbedError::DimensionMismatch { expected, actual }),
-        "[A-Za-z0-9 _.-]{3,40}".prop_map(|message| EmbedError::from(std::io::Error::other(message))),
+        "[A-Za-z0-9 _.-]{3,40}"
+            .prop_map(|message| EmbedError::from(std::io::Error::other(message))),
     ]
 }
 

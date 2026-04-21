@@ -55,11 +55,13 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
         Just(serde_json::Value::Null),
         any::<bool>().prop_map(serde_json::Value::Bool),
         any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
-        (-1_000_000.0f64..1_000_000.0).prop_filter("finite", |v| v.is_finite()).prop_map(|f| {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }),
+        (-1_000_000.0f64..1_000_000.0)
+            .prop_filter("finite", |v| v.is_finite())
+            .prop_map(|f| {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }),
         "[a-zA-Z0-9_./:?=&+ \\-]{0,32}".prop_map(serde_json::Value::String),
     ];
 
@@ -71,7 +73,8 @@ fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
             prop_oneof![
                 proptest::collection::vec(inner.clone(), 0..6).prop_map(serde_json::Value::Array),
                 proptest::collection::hash_map("[a-z_]{1,12}", inner, 0..6).prop_map(|m| {
-                    let object: serde_json::Map<String, serde_json::Value> = m.into_iter().collect();
+                    let object: serde_json::Map<String, serde_json::Value> =
+                        m.into_iter().collect();
                     serde_json::Value::Object(object)
                 }),
             ]

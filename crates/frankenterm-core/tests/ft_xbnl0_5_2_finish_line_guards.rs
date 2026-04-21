@@ -187,7 +187,8 @@ fn local_contributor_path_points_to_real_guard_commands() {
     );
     assert!(
         command_strings.iter().any(|command| {
-            command.contains("cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards")
+            command
+                .contains("cargo test -p frankenterm-core --test ft_xbnl0_5_2_finish_line_guards")
         }),
         "local contributor path must point at the real ft_xbnl0_5_2_finish_line_guards integration test"
     );

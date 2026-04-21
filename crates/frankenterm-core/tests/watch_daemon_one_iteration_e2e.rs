@@ -256,8 +256,7 @@ fn watch_daemon_discovery_tick_detects_closed_panes_on_second_iteration() {
         // The persisted row for pane 2 must still be readable —
         // discovery_tick does not delete rows.
         let persisted = storage.get_panes().await.expect("read panes");
-        let ids: std::collections::BTreeSet<u64> =
-            persisted.iter().map(|r| r.pane_id).collect();
+        let ids: std::collections::BTreeSet<u64> = persisted.iter().map(|r| r.pane_id).collect();
         assert!(
             ids.contains(&1) && ids.contains(&2),
             "both panes must remain in sqlite after pane 2 is reported closed; ids={:?}",

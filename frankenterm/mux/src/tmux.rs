@@ -262,9 +262,7 @@ impl TmuxDomainState {
                         // backlog it
                         let mut backlog = self.backlog.lock();
                         append_backlog_payload(
-                            backlog
-                                .entry(*pane)
-                                .or_insert_with(Vec::new),
+                            backlog.entry(*pane).or_insert_with(Vec::new),
                             &cap_backlog_payload(text),
                         );
                         log::debug!("Tmux pane {} havn't been attached", pane);

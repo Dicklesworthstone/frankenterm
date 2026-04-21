@@ -249,15 +249,11 @@ impl<Q: QueryClient> App<Q> {
     fn handle_panes_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_pane_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
                 self.view_state.selected_index =
                     (self.view_state.selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
                 self.view_state.selected_index = self
                     .view_state
                     .selected_index
@@ -342,15 +338,11 @@ impl<Q: QueryClient> App<Q> {
     fn handle_events_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_event_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
                 self.view_state.events_selected_index =
                     (self.view_state.events_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
                 self.view_state.events_selected_index = self
                     .view_state
                     .events_selected_index
@@ -380,15 +372,11 @@ impl<Q: QueryClient> App<Q> {
     /// Handle key events in the triage view
     fn handle_triage_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if !self.view_state.triage_items.is_empty() =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if !self.view_state.triage_items.is_empty() => {
                 self.view_state.triage_selected_index = (self.view_state.triage_selected_index + 1)
                     % self.view_state.triage_items.len();
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if !self.view_state.triage_items.is_empty() =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if !self.view_state.triage_items.is_empty() => {
                 self.view_state.triage_selected_index = self
                     .view_state
                     .triage_selected_index
@@ -401,9 +389,7 @@ impl<Q: QueryClient> App<Q> {
             KeyCode::Char('m') => {
                 self.mute_selected_event();
             }
-            KeyCode::Char('e')
-                if !self.view_state.workflows.is_empty() =>
-            {
+            KeyCode::Char('e') if !self.view_state.workflows.is_empty() => {
                 // Toggle expand/collapse for workflow progress
                 if self.view_state.triage_expanded.is_some() {
                     self.view_state.triage_expanded = None;
@@ -526,15 +512,11 @@ impl<Q: QueryClient> App<Q> {
     fn handle_history_key(&mut self, key: KeyEvent) {
         let filtered_len = filtered_history_indices(&self.view_state).len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
                 self.view_state.history_selected_index =
                     (self.view_state.history_selected_index + 1) % filtered_len;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if filtered_len > 0 =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
                 self.view_state.history_selected_index = self
                     .view_state
                     .history_selected_index
@@ -566,24 +548,18 @@ impl<Q: QueryClient> App<Q> {
     fn handle_timeline_key(&mut self, key: KeyEvent) {
         let timeline_len = self.view_state.timeline_rows.len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j')
-                if timeline_len > 0 =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if timeline_len > 0 => {
                 self.view_state.timeline_selected_index =
                     (self.view_state.timeline_selected_index + 1) % timeline_len;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if timeline_len > 0 =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if timeline_len > 0 => {
                 self.view_state.timeline_selected_index = self
                     .view_state
                     .timeline_selected_index
                     .checked_sub(1)
                     .unwrap_or(timeline_len - 1);
             }
-            KeyCode::Char('+' | '=')
-                if self.view_state.timeline_zoom < 5 =>
-            {
+            KeyCode::Char('+' | '=') if self.view_state.timeline_zoom < 5 => {
                 self.view_state.timeline_zoom += 1;
                 self.refresh_timeline_data();
             }

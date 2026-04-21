@@ -123,7 +123,7 @@ fn arb_token() -> impl Strategy<Value = String> {
         Just("\u{FEFF}word".to_string()), // BOM prefix
         Just("\u{200B}word".to_string()), // zero-width space
         // Control characters
-        Just("\x07".to_string()), // bell
+        Just("\x07".to_string()),    // bell
         Just("\x1b[0m".to_string()), // ANSI SGR
         // NUL byte inside — SQLite rejects this
         Just("pre\0post".to_string()),
@@ -150,8 +150,7 @@ fn arb_operand() -> impl Strategy<Value = String> {
 
 /// A binary FTS5 expression joining two operands with an operator.
 fn arb_binary() -> impl Strategy<Value = String> {
-    (arb_operand(), "AND|OR|NOT", arb_operand())
-        .prop_map(|(a, op, b)| format!("{a} {op} {b}"))
+    (arb_operand(), "AND|OR|NOT", arb_operand()).prop_map(|(a, op, b)| format!("{a} {op} {b}"))
 }
 
 /// A deliberately-malformed fragment: unbalanced quotes, trailing ops,
@@ -160,15 +159,15 @@ fn arb_binary() -> impl Strategy<Value = String> {
 fn arb_malformed() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("\"unterminated phrase".to_string()),
-        Just("AND".to_string()),           // bare operator
-        Just("word AND".to_string()),      // trailing operator
-        Just("AND word".to_string()),      // leading operator
-        Just("(((".to_string()),           // unbalanced parens
+        Just("AND".to_string()),      // bare operator
+        Just("word AND".to_string()), // trailing operator
+        Just("AND word".to_string()), // leading operator
+        Just("(((".to_string()),      // unbalanced parens
         Just("word OR OR word".to_string()),
-        Just("".to_string()),              // empty query
-        Just(" ".to_string()),             // whitespace only
-        Just("*".to_string()),             // prefix with nothing
-        Just("word\x00middle".to_string()),// NUL byte smuggled in
+        Just("".to_string()),               // empty query
+        Just(" ".to_string()),              // whitespace only
+        Just("*".to_string()),              // prefix with nothing
+        Just("word\x00middle".to_string()), // NUL byte smuggled in
         // 4 KiB of single word — stress the tokenizer buffer
         Just("x".repeat(4096)),
         // Nested quotes
@@ -212,7 +211,10 @@ fn assert_result_well_formed(
             ));
         }
         if r.segment.id <= 0 {
-            return Err(format!("non-positive segment id {} on query {:?}", r.segment.id, query));
+            return Err(format!(
+                "non-positive segment id {} on query {:?}",
+                r.segment.id, query
+            ));
         }
         if r.segment.content.is_empty() {
             return Err(format!(

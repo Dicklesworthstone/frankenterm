@@ -22,8 +22,8 @@ use frankenterm_core::recorder_audit::{
     AccessTier, ActorIdentity, AuditLog, AuditLogConfig, AuthzDecision,
 };
 use frankenterm_core::recorder_query::{
-    InMemoryEventStore, QueryError, QueryEventKind, QueryStats, RecorderQueryExecutor,
-    QueryPlan, QueryResultEvent, RecorderQueryRequest, RecorderQueryResponse, TimeRange,
+    InMemoryEventStore, QueryError, QueryEventKind, QueryPlan, QueryResultEvent, QueryStats,
+    RecorderQueryExecutor, RecorderQueryRequest, RecorderQueryResponse, TimeRange,
 };
 use frankenterm_core::recorder_retention::SensitivityTier;
 use frankenterm_core::recording::{

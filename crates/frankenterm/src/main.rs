@@ -43962,6 +43962,219 @@ mod tests {
         });
     }
 
+    // wa-1igc acceptance — "Atomic restart state machine: for any sequence
+    // of injected failures at each phase transition, verify the system ends
+    // in a valid terminal state ... and never in an intermediate state."
+    //
+    // Exhaustive enumeration of the 2^4 failure injections over the four
+    // mutable phases (snapshot, stop, start, restore), using
+    // `execute_restart_post_preflight` directly so the driver is the same
+    // code path `ft restart` exercises at runtime. Proptest would be
+    // overkill at 16 states — a deterministic loop proves the property
+    // exactly without pulling a new dev-dep into the binary crate.
+    //
+    // The invariants pinned here are cross-cutting and already checked
+    // one-at-a-time by the single-case tests above; this test proves they
+    // compose correctly so a future refactor cannot silently swap the
+    // ordering (e.g. moving restore before start, or dropping snapshot
+    // metadata on stop failure).
+    #[cfg(unix)]
+    #[test]
+    fn restart_post_preflight_state_machine_invariants_hold_for_all_failure_injections() {
+        for mask in 0u8..16 {
+            let snap_ok = mask & 0b0001 != 0;
+            let stop_ok = mask & 0b0010 != 0;
+            let start_ok = mask & 0b0100 != 0;
+            let restore_ok = mask & 0b1000 != 0;
+
+            run_async_test(async move {
+                let stop_called =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let start_called =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let restore_called =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let outcome = execute_restart_post_preflight(
+                    sample_restart_options(),
+                    move || async move {
+                        if snap_ok {
+                            Ok(sample_restart_snapshot_result())
+                        } else {
+                            Err(anyhow::anyhow!("capture failed"))
+                        }
+                    },
+                    {
+                        let stop_called = std::sync::Arc::clone(&stop_called);
+                        move |_| async move {
+                            stop_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if stop_ok {
+                                Ok(vec![111, 222])
+                            } else {
+                                Err(anyhow::anyhow!("mux shutdown timed out"))
+                            }
+                        }
+                    },
+                    {
+                        let start_called = std::sync::Arc::clone(&start_called);
+                        move |_, _| async move {
+                            start_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if start_ok {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("mux failed to daemonize"))
+                            }
+                        }
+                    },
+                    {
+                        let restore_called = std::sync::Arc::clone(&restore_called);
+                        move |_, _, _| async move {
+                            restore_called
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            if restore_ok {
+                                Ok(sample_restart_restore_summary())
+                            } else {
+                                Err(anyhow::anyhow!("restore planner mismatch"))
+                            }
+                        }
+                    },
+                )
+                .await;
+
+                let stop_was = stop_called.load(std::sync::atomic::Ordering::SeqCst);
+                let start_was = start_called.load(std::sync::atomic::Ordering::SeqCst);
+                let restore_was =
+                    restore_called.load(std::sync::atomic::Ordering::SeqCst);
+
+                if !snap_ok {
+                    // Snapshot abort: no downstream phase runs, no snapshot metadata.
+                    let abort = outcome.expect_err(&format!(
+                        "mask={mask:04b}: snapshot failure must abort"
+                    ));
+                    assert_eq!(abort.phase, "snapshot", "mask={mask:04b}");
+                    assert!(
+                        abort.snapshot.is_none(),
+                        "mask={mask:04b}: snapshot-phase abort must not carry snapshot metadata"
+                    );
+                    assert!(
+                        !stop_was,
+                        "mask={mask:04b}: stop must not run after snapshot failure"
+                    );
+                    assert!(
+                        !start_was,
+                        "mask={mask:04b}: start must not run after snapshot failure"
+                    );
+                    assert!(
+                        !restore_was,
+                        "mask={mask:04b}: restore must not run after snapshot failure"
+                    );
+                } else if !stop_ok {
+                    // Stop abort: snapshot preserved for manual recovery, start NOT attempted.
+                    let abort = outcome.expect_err(&format!(
+                        "mask={mask:04b}: stop failure must abort"
+                    ));
+                    assert_eq!(abort.phase, "stop", "mask={mask:04b}");
+                    assert_eq!(
+                        abort.snapshot.as_ref().map(|s| s.checkpoint_id),
+                        Some(42),
+                        "mask={mask:04b}: snapshot checkpoint_id must be preserved on stop failure"
+                    );
+                    assert!(
+                        stop_was,
+                        "mask={mask:04b}: stop phase must have been invoked"
+                    );
+                    assert!(
+                        !start_was,
+                        "mask={mask:04b}: start must not run after stop failure"
+                    );
+                    assert!(
+                        !restore_was,
+                        "mask={mask:04b}: restore must not run after stop failure"
+                    );
+                } else if !start_ok {
+                    // Start abort: snapshot AND stopped_pids preserved; restore NOT attempted.
+                    let abort = outcome.expect_err(&format!(
+                        "mask={mask:04b}: start failure must abort"
+                    ));
+                    assert_eq!(abort.phase, "start", "mask={mask:04b}");
+                    assert_eq!(
+                        abort.snapshot.as_ref().map(|s| s.checkpoint_id),
+                        Some(42),
+                        "mask={mask:04b}: snapshot preserved on start failure"
+                    );
+                    assert_eq!(
+                        abort.stopped_mux_pids,
+                        vec![111, 222],
+                        "mask={mask:04b}: stopped_mux_pids must be preserved on start failure"
+                    );
+                    assert!(start_was, "mask={mask:04b}: start phase must have run");
+                    assert!(
+                        !restore_was,
+                        "mask={mask:04b}: restore must not run after start failure"
+                    );
+                } else if !restore_ok {
+                    // Restore failure is non-fatal: must produce Ok(RestoreFailed), never Err.
+                    let result = outcome.unwrap_or_else(|abort| {
+                        panic!(
+                            "mask={mask:04b}: restore failure must NOT abort (got {:?})",
+                            abort.phase
+                        )
+                    });
+                    match result {
+                        RestartWorkflowResult::RestoreFailed {
+                            snapshot, error, ..
+                        } => {
+                            assert_eq!(
+                                snapshot.checkpoint_id, 42,
+                                "mask={mask:04b}: RestoreFailed preserves snapshot.checkpoint_id"
+                            );
+                            assert_eq!(
+                                error, "restore planner mismatch",
+                                "mask={mask:04b}: RestoreFailed forwards restore error"
+                            );
+                        }
+                        other => panic!(
+                            "mask={mask:04b}: expected RestoreFailed, got {other:?}"
+                        ),
+                    }
+                    assert!(
+                        stop_was && start_was && restore_was,
+                        "mask={mask:04b}: all 4 phases must run before restore failure"
+                    );
+                } else {
+                    // All-Ok: Restored with snapshot + summary checkpoint_id wired through.
+                    let result = outcome.unwrap_or_else(|abort| {
+                        panic!(
+                            "mask={mask:04b}: all-Ok must succeed, got abort at {:?}",
+                            abort.phase
+                        )
+                    });
+                    match result {
+                        RestartWorkflowResult::Restored {
+                            snapshot, summary, ..
+                        } => {
+                            assert_eq!(
+                                snapshot.checkpoint_id, 42,
+                                "mask={mask:04b}: Restored carries snapshot.checkpoint_id"
+                            );
+                            assert_eq!(
+                                summary.checkpoint_id, 42,
+                                "mask={mask:04b}: Restored carries summary.checkpoint_id"
+                            );
+                        }
+                        other => {
+                            panic!("mask={mask:04b}: expected Restored, got {other:?}")
+                        }
+                    }
+                    assert!(
+                        stop_was && start_was && restore_was,
+                        "mask={mask:04b}: all 4 phases must run on all-Ok"
+                    );
+                }
+            });
+        }
+    }
+
     #[test]
     fn snapshot_restore_dry_run_json_includes_checkpoint_and_options() {
         let payload = snapshot_restore_dry_run_json(

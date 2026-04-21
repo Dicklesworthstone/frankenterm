@@ -53,14 +53,17 @@ impl WaEventSink for RecordingSink {
     }
 
     fn on_pane_created(&self, pane_id: u64, domain: &str, cwd: Option<&str>) {
-        self.events.lock().unwrap().push(format!(
-            "created:{pane_id}:{domain}:{}",
-            cwd.unwrap_or("")
-        ));
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("created:{pane_id}:{domain}:{}", cwd.unwrap_or("")));
     }
 
     fn on_pane_destroyed(&self, pane_id: u64) {
-        self.events.lock().unwrap().push(format!("destroyed:{pane_id}"));
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("destroyed:{pane_id}"));
     }
 }
 

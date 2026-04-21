@@ -42,7 +42,7 @@
 
 use portable_pty::CommandBuilder;
 use proptest::prelude::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn arb_ascii_string() -> impl Strategy<Value = String> {
     "[ -~]{0,24}".prop_map(|s| s)
@@ -60,14 +60,13 @@ fn arb_random_json() -> impl Strategy<Value = Value> {
     leaf.prop_recursive(3, 16, 4, |inner| {
         prop_oneof![
             proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
-            proptest::collection::hash_map(arb_ascii_string(), inner, 0..4)
-                .prop_map(|map| {
-                    let mut obj = serde_json::Map::new();
-                    for (k, v) in map {
-                        obj.insert(k, v);
-                    }
-                    Value::Object(obj)
-                }),
+            proptest::collection::hash_map(arb_ascii_string(), inner, 0..4).prop_map(|map| {
+                let mut obj = serde_json::Map::new();
+                for (k, v) in map {
+                    obj.insert(k, v);
+                }
+                Value::Object(obj)
+            }),
         ]
     })
 }
@@ -76,15 +75,9 @@ fn arb_random_json() -> impl Strategy<Value = Value> {
 /// env pairs. Start from a real CommandBuilder payload, then mutate its
 /// `envs` list to force mismatched / duplicate keys.
 #[cfg(unix)]
-fn arb_adversarial_env_frame(
-    collide_pct: u8,
-    mismatch_pct: u8,
-) -> impl Strategy<Value = Value> {
+fn arb_adversarial_env_frame(collide_pct: u8, mismatch_pct: u8) -> impl Strategy<Value = Value> {
     (
-        proptest::collection::vec(
-            ("[A-Z][A-Z0-9_]{0,6}", "[a-zA-Z0-9 _.-]{0,16}"),
-            1..6,
-        ),
+        proptest::collection::vec(("[A-Z][A-Z0-9_]{0,6}", "[a-zA-Z0-9 _.-]{0,16}"), 1..6),
         any::<bool>(),
     )
         .prop_map(move |(pairs, force_collision)| {

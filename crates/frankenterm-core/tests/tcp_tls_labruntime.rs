@@ -10,8 +10,8 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
 use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
 use frankenterm_core::distributed::build_tls_bundle;
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::runtime_compat::task;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use rcgen::{Certificate, CertificateParams, DnType, IsCa, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::{

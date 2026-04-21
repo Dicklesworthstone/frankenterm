@@ -12,9 +12,7 @@
 //! from heartbeat intervals, and the resize scheduler adapts its frame
 //! budget based on system health (e.g., fewer resize units when degraded).
 
-use frankenterm_core::input_latency::{
-    InputLatencyCollector, InputLatencyStage, Percentile,
-};
+use frankenterm_core::input_latency::{InputLatencyCollector, InputLatencyStage, Percentile};
 use frankenterm_core::kalman_watchdog::{AdaptiveWatchdog, AdaptiveWatchdogConfig};
 use frankenterm_core::resize_scheduler::{
     ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,
@@ -37,11 +35,7 @@ fn make_intent(pane_id: u64, seq: u64, work_units: u32, at_ms: u64) -> ResizeInt
 }
 
 /// Record a full input-to-render latency measurement.
-fn record_full_measurement(
-    collector: &mut InputLatencyCollector,
-    base_us: u64,
-    jitter_us: u64,
-) {
+fn record_full_measurement(collector: &mut InputLatencyCollector, base_us: u64, jitter_us: u64) {
     let mut m = collector.begin_measurement();
     let mut t = base_us;
     m.record_stage(InputLatencyStage::KeyEvent, t);

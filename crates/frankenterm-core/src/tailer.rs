@@ -797,8 +797,7 @@ where
                 // used in native_events.rs, cpu_pressure.rs, storage.rs,
                 // etc.
                 #[cfg(feature = "asupersync-runtime")]
-                let $reserve_cx =
-                    crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let $reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                 #[cfg(feature = "asupersync-runtime")]
                 let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
                     Ok(Ok(permit)) => permit,

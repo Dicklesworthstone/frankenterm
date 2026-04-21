@@ -5,9 +5,7 @@
 //! proptest coverage elsewhere in the tree (verified via grep across
 //! `crates/frankenterm-core/tests/`).
 
-use frankenterm_core::storage::{
-    HybridSearchBundle, HybridSearchResult, SearchResult, Segment,
-};
+use frankenterm_core::storage::{HybridSearchBundle, HybridSearchResult, SearchResult, Segment};
 use proptest::prelude::*;
 
 fn arb_segment() -> impl Strategy<Value = Segment> {

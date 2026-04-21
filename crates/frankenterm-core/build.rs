@@ -129,8 +129,7 @@ fn select_vendored_metadata(
     // sentinel derived from the vendored manifests so `vendored.rs` doesn't
     // trip its fail-closed "commit not recorded" guard.
     let commit = git_head_commit(vendored_root).or_else(|| source_hash_sentinel(vendored_root));
-    let resolved_source =
-        source.or_else(|| Some(format!("path+{}", vendored_root.display())));
+    let resolved_source = source.or_else(|| Some(format!("path+{}", vendored_root.display())));
 
     // When falling back to the filesystem, prefer the mux manifest version
     // (matches the `mux` lockfile entry name lookup above). This keeps the

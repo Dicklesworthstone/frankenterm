@@ -113,7 +113,7 @@ fn replay_tuning_config_toml() {
 
 #[test]
 fn replay_osc_marker_parser() {
-    use frankenterm_core::ingest::{parse_osc133_markers, Osc133State};
+    use frankenterm_core::ingest::{Osc133State, parse_osc133_markers};
 
     let seeds = read_seeds("osc_marker_parser");
     assert!(!seeds.is_empty(), "no corpus seeds found");
@@ -183,7 +183,9 @@ fn replay_recorder_event_json() {
 
 #[test]
 fn replay_ntm_importer_json() {
-    use frankenterm_core::ntm_importer::{parse_ntm_config, parse_ntm_sessions, parse_ntm_workflows};
+    use frankenterm_core::ntm_importer::{
+        parse_ntm_config, parse_ntm_sessions, parse_ntm_workflows,
+    };
 
     let seeds = read_seeds("ntm_importer_json");
     assert!(!seeds.is_empty(), "no corpus seeds found");

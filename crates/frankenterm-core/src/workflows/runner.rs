@@ -1495,7 +1495,8 @@ impl WorkflowRunner {
                         "Workflow requesting text injection"
                     );
 
-                    let request_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                    let request_cx =
+                        crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
                     let injector_cx = cx.unwrap_or(&request_cx);
                     let send_result = self
                         .injector
@@ -3974,8 +3975,7 @@ mod tests {
         #[test]
         fn wait_duration_zero_returns_immediately() {
             run_async_test(async {
-                let result =
-                    wait_duration_maybe_cx(None, Duration::ZERO, "test-zero").await;
+                let result = wait_duration_maybe_cx(None, Duration::ZERO, "test-zero").await;
                 assert!(result.is_ok());
             });
         }
@@ -4001,13 +4001,9 @@ mod tests {
         fn wait_condition_pane_idle_no_cx() {
             run_async_test(async {
                 let cond = WaitCondition::pane_idle(1);
-                let result = wait_condition_pause_maybe_cx(
-                    None,
-                    &cond,
-                    Duration::from_secs(1),
-                    "test-idle",
-                )
-                .await;
+                let result =
+                    wait_condition_pause_maybe_cx(None, &cond, Duration::from_secs(1), "test-idle")
+                        .await;
                 assert!(result.is_ok());
             });
         }
@@ -4017,13 +4013,9 @@ mod tests {
         fn wait_condition_stable_tail_no_cx() {
             run_async_test(async {
                 let cond = WaitCondition::stable_tail(1);
-                let result = wait_condition_pause_maybe_cx(
-                    None,
-                    &cond,
-                    Duration::from_secs(1),
-                    "test-tail",
-                )
-                .await;
+                let result =
+                    wait_condition_pause_maybe_cx(None, &cond, Duration::from_secs(1), "test-tail")
+                        .await;
                 assert!(result.is_ok());
             });
         }

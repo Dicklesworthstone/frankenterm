@@ -91,10 +91,18 @@ fn filter_gates_priority_and_tracking() {
 
     // These should be filtered out.
     assert!(filter.check_pane("local", "bash", "/tmp/scratch").is_some());
-    assert!(filter.check_pane("SSH:remote", "zsh", "/home/user").is_some());
+    assert!(
+        filter
+            .check_pane("SSH:remote", "zsh", "/home/user")
+            .is_some()
+    );
 
     // These pass the filter.
-    assert!(filter.check_pane("local", "vim", "/home/user/projects").is_none());
+    assert!(
+        filter
+            .check_pane("local", "vim", "/home/user/projects")
+            .is_none()
+    );
     assert!(filter.check_pane("local", "bash", "/home/user").is_none());
 
     // Priority only makes sense for non-excluded panes.
@@ -104,9 +112,11 @@ fn filter_gates_priority_and_tracking() {
     let bash_priority = priority_cfg.priority_for_pane("local", "bash", "/home/user");
     assert_eq!(bash_priority, 10, "unmatched pane gets default priority");
 
-    let projects_priority =
-        priority_cfg.priority_for_pane("local", "bash", "/home/user/projects");
-    assert_eq!(projects_priority, 5, "projects cwd matches mid-priority rule");
+    let projects_priority = priority_cfg.priority_for_pane("local", "bash", "/home/user/projects");
+    assert_eq!(
+        projects_priority, 5,
+        "projects cwd matches mid-priority rule"
+    );
 }
 
 /// Priority drives retry aggressiveness: high-priority panes get faster
@@ -184,7 +194,10 @@ fn ewma_tracks_output_rate_for_filtered_panes() {
 
     // Initialize rate estimators only for panes that pass filter.
     for pane in &mut panes {
-        if filter.check_pane(pane.domain, pane.title, pane.cwd).is_none() {
+        if filter
+            .check_pane(pane.domain, pane.title, pane.cwd)
+            .is_none()
+        {
             pane.rate_estimator = Some(RateEstimator::with_half_life_ms(5000.0));
         }
     }
@@ -192,7 +205,10 @@ fn ewma_tracks_output_rate_for_filtered_panes() {
     // Excluded pane should have no estimator.
     assert!(panes[0].rate_estimator.is_some(), "vim should pass filter");
     assert!(panes[1].rate_estimator.is_some(), "bash should pass filter");
-    assert!(panes[2].rate_estimator.is_none(), "SSH pane should be excluded");
+    assert!(
+        panes[2].rate_estimator.is_none(),
+        "SSH pane should be excluded"
+    );
 
     // Simulate events at 10 events/sec for vim (every 100ms).
     for i in 0..20 {
@@ -246,10 +262,7 @@ fn anomaly_detection_with_priority_escalation() {
 
     // The mean should be close to 50.
     let mean = tracker.mean();
-    assert!(
-        (mean - 50.0).abs() < 5.0,
-        "mean should be ~50, got {mean}"
-    );
+    assert!((mean - 50.0).abs() < 5.0, "mean should be ~50, got {mean}");
 
     // Normal value: not anomalous.
     assert!(
@@ -318,8 +331,8 @@ fn full_pipeline_filter_priority_ewma_retry() {
         ("local", "vim", "/home/user/projects/rust"),
         ("local", "bash", "/home/user"),
         ("local", "htop", "/home/user"),
-        ("SSH:staging", "deploy", "/opt/app"),  // excluded
-        ("local", "cargo", "/tmp/build"),       // excluded
+        ("SSH:staging", "deploy", "/opt/app"), // excluded
+        ("local", "cargo", "/tmp/build"),      // excluded
     ];
 
     let mut active_panes: Vec<(usize, u32, RateEstimator, EwmaWithVariance)> = Vec::new();
@@ -344,9 +357,9 @@ fn full_pipeline_filter_priority_ewma_retry() {
     assert_eq!(active_panes.len(), 3);
 
     // Verify priorities.
-    assert_eq!(active_panes[0].1, 1);   // vim → highest
-    assert_eq!(active_panes[1].1, 10);  // bash → default
-    assert_eq!(active_panes[2].1, 10);  // htop → default
+    assert_eq!(active_panes[0].1, 1); // vim → highest
+    assert_eq!(active_panes[1].1, 10); // bash → default
+    assert_eq!(active_panes[2].1, 10); // htop → default
 
     // Simulate output: vim gets high rate, bash medium, htop low.
     let rates = [100u64, 500, 2000]; // ms between events

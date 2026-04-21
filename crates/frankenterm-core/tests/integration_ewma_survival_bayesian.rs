@@ -12,9 +12,7 @@
 //! proportional hazards. The Bayesian classifier fuses evidence (output rate,
 //! entropy, time since output) into pane state posteriors (Active, Idle, Stuck).
 
-use frankenterm_core::bayesian_ledger::{
-    BayesianClassifier, Evidence, LedgerConfig, PaneState,
-};
+use frankenterm_core::bayesian_ledger::{BayesianClassifier, Evidence, LedgerConfig, PaneState};
 use frankenterm_core::ewma::{EwmaWithVariance, RateEstimator};
 use frankenterm_core::survival::{
     Covariates, HazardAction, SurvivalConfig, SurvivalModel, WeibullParams,
@@ -173,7 +171,11 @@ fn rate_estimator_feeds_survival_report() {
     assert!(!report.risk_factors.is_empty());
 
     // Risk factors should include our covariates.
-    let factor_names: Vec<&str> = report.risk_factors.iter().map(|f| f.name.as_str()).collect();
+    let factor_names: Vec<&str> = report
+        .risk_factors
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
     assert!(
         factor_names.contains(&"rss_gb") || factor_names.contains(&"output_rate_mbps"),
         "risk factors should name covariates"

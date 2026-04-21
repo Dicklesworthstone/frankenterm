@@ -2092,12 +2092,10 @@ mod tests {
             for (agent_idx, expected_seq) in expected_seqs.iter_mut().enumerate() {
                 let sender = format!("agent-{agent_idx}");
                 let seq = msg_idx + 1; // 1-based seq
-                let envelope = WireEnvelope::new(
-                    seq,
-                    &sender,
-                    WirePayload::Gap(sample_gap()),
-                );
-                let result = agg.ingest_envelope_at(envelope, now + (msg_idx as i64) * 100).unwrap();
+                let envelope = WireEnvelope::new(seq, &sender, WirePayload::Gap(sample_gap()));
+                let result = agg
+                    .ingest_envelope_at(envelope, now + (msg_idx as i64) * 100)
+                    .unwrap();
                 assert!(
                     matches!(result, IngestResult::Accepted(_)),
                     "agent-{agent_idx} seq {seq} should be accepted"
@@ -2125,23 +2123,19 @@ mod tests {
         // Agent B: 1, 1, 2 (duplicate at seq 1)
         // Agent C: 10 (high starting seq)
         let messages: Vec<(&str, u64, bool)> = vec![
-            ("a", 1, true),   // accepted
-            ("b", 1, true),   // accepted
-            ("a", 3, true),   // accepted (gap is ok, just monotonic)
-            ("b", 1, false),  // duplicate
-            ("c", 10, true),  // accepted (high seq ok for first msg)
-            ("a", 5, true),   // accepted
-            ("b", 2, true),   // accepted
-            ("a", 3, false),  // duplicate (already seen 5)
-            ("c", 9, false),  // duplicate (already seen 10)
+            ("a", 1, true),  // accepted
+            ("b", 1, true),  // accepted
+            ("a", 3, true),  // accepted (gap is ok, just monotonic)
+            ("b", 1, false), // duplicate
+            ("c", 10, true), // accepted (high seq ok for first msg)
+            ("a", 5, true),  // accepted
+            ("b", 2, true),  // accepted
+            ("a", 3, false), // duplicate (already seen 5)
+            ("c", 9, false), // duplicate (already seen 10)
         ];
 
         for (sender, seq, should_accept) in messages {
-            let envelope = WireEnvelope::new(
-                seq,
-                sender,
-                WirePayload::Gap(sample_gap()),
-            );
+            let envelope = WireEnvelope::new(seq, sender, WirePayload::Gap(sample_gap()));
             let result = agg.ingest_envelope_at(envelope, now).unwrap();
             if should_accept {
                 assert!(
@@ -2170,17 +2164,26 @@ mod tests {
 
         // Agent A at t=0
         let e_a = WireEnvelope::new(1, "agent-a", WirePayload::Gap(sample_gap()));
-        assert!(matches!(agg.ingest_envelope_at(e_a, 0).unwrap(), IngestResult::Accepted(_)));
+        assert!(matches!(
+            agg.ingest_envelope_at(e_a, 0).unwrap(),
+            IngestResult::Accepted(_)
+        ));
 
         // Agent B at t=60 (will still be fresh at t=150 since 150-60=90 < 100)
         let e_b = WireEnvelope::new(1, "agent-b", WirePayload::Gap(sample_gap()));
-        assert!(matches!(agg.ingest_envelope_at(e_b, 60).unwrap(), IngestResult::Accepted(_)));
+        assert!(matches!(
+            agg.ingest_envelope_at(e_b, 60).unwrap(),
+            IngestResult::Accepted(_)
+        ));
 
         // Agent C at t=150 — agent-a is stale (last_seen=0, 150-0=150 >= 100)
         // agent-b is fresh (last_seen=60, 150-60=90 < 100)
         // Prune agent-a, accept agent-c.
         let e_c = WireEnvelope::new(1, "agent-c", WirePayload::Gap(sample_gap()));
-        assert!(matches!(agg.ingest_envelope_at(e_c, 150).unwrap(), IngestResult::Accepted(_)));
+        assert!(matches!(
+            agg.ingest_envelope_at(e_c, 150).unwrap(),
+            IngestResult::Accepted(_)
+        ));
 
         assert_eq!(agg.agent_count(), 2);
         assert_eq!(agg.agent_last_seq("agent-a"), None);

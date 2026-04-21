@@ -236,7 +236,10 @@ fn robot_state_golden_is_deterministic() {
     let first = pretty_canonical(&serde_json::to_value(&payload).unwrap());
     let second = pretty_canonical(&serde_json::to_value(&payload).unwrap());
     let third = pretty_canonical(&serde_json::to_value(&payload).unwrap());
-    assert_eq!(first, second, "golden must be deterministic across captures");
+    assert_eq!(
+        first, second,
+        "golden must be deterministic across captures"
+    );
     assert_eq!(
         second, third,
         "golden must remain deterministic across repeated captures"

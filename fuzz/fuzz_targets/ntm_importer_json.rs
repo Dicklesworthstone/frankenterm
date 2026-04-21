@@ -1,7 +1,7 @@
 #![no_main]
 
+use frankenterm_core::ntm_importer::{parse_ntm_config, parse_ntm_sessions, parse_ntm_workflows};
 use libfuzzer_sys::fuzz_target;
-use frankenterm_core::ntm_importer::{parse_ntm_sessions, parse_ntm_workflows, parse_ntm_config};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 65_536 {

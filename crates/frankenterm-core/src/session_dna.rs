@@ -227,7 +227,8 @@ impl SessionDnaBuilder {
             // Active period
             self.active_time_s += elapsed_s;
             self.line_count += lines;
-            self.line_length_sum = (avg_line_length as f64).mul_add(lines as f64, self.line_length_sum);
+            self.line_length_sum =
+                (avg_line_length as f64).mul_add(lines as f64, self.line_length_sum);
             self.dna.total_lines += lines;
 
             // Update running entropy (weighted average)

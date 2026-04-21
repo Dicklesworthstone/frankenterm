@@ -26,7 +26,8 @@ fn arb_relative_path() -> impl Strategy<Value = String> {
 }
 
 fn arb_absolute_path() -> impl Strategy<Value = String> {
-    prop::collection::vec(arb_segment(), 1..4).prop_map(|segments| format!("/{}", segments.join("/")))
+    prop::collection::vec(arb_segment(), 1..4)
+        .prop_map(|segments| format!("/{}", segments.join("/")))
 }
 
 proptest! {

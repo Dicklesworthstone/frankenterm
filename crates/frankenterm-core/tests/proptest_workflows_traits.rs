@@ -8,10 +8,7 @@ use frankenterm_core::workflows::{
 use proptest::prelude::*;
 
 fn arb_step() -> impl Strategy<Value = WorkflowStep> {
-    (
-        "[A-Za-z0-9_.-]{1,24}",
-        "[A-Za-z0-9 _,.:/-]{1,64}",
-    )
+    ("[A-Za-z0-9_.-]{1,24}", "[A-Za-z0-9 _,.:/-]{1,64}")
         .prop_map(|(name, description)| WorkflowStep::new(name, description))
 }
 

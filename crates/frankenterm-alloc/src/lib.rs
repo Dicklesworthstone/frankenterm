@@ -6,8 +6,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Recover from `std::sync::Mutex` poisoning by taking the inner guard.
 ///
@@ -333,8 +333,7 @@ impl PaneArenaRegistry {
     /// Number of tracked pane reservations.
     #[must_use]
     pub fn count(&self) -> usize {
-        recover_poisoned(self.arenas_by_pane.lock())
-            .len()
+        recover_poisoned(self.arenas_by_pane.lock()).len()
     }
 
     /// Whether the registry is empty.

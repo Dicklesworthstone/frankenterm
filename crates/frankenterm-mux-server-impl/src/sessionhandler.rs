@@ -294,10 +294,7 @@ impl SessionHandler {
     /// notifications from mux) where silently re-creating an entry for a
     /// pane that was already removed via `PaneRemoved` produces a permanent
     /// map leak — no subsequent `PaneRemoved` ever fires for a dead pane.
-    pub(crate) fn per_pane_if_present(
-        &self,
-        pane_id: PaneId,
-    ) -> Option<Arc<Mutex<PerPane>>> {
+    pub(crate) fn per_pane_if_present(&self, pane_id: PaneId) -> Option<Arc<Mutex<PerPane>>> {
         self.per_pane.get(&pane_id).map(Arc::clone)
     }
 

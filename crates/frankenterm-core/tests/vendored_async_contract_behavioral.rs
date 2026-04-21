@@ -2185,8 +2185,8 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
             Duration::from_millis(500),
             runtime_compat::oneshot_recv(closed_rx),
         )
-            .await
-            .expect("server should observe connection close after cancellation");
+        .await
+        .expect("server should observe connection close after cancellation");
         closed.expect("server close signal should complete");
 
         runtime_compat::timeout(Duration::from_millis(500), server)
@@ -2340,8 +2340,8 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
             Duration::from_millis(500),
             runtime_compat::oneshot_recv(closed_rx),
         )
-            .await
-            .expect("server should observe connection close after shutdown");
+        .await
+        .expect("server should observe connection close after shutdown");
         closed.expect("server close signal should complete");
 
         runtime_compat::timeout(Duration::from_millis(500), server)

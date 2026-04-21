@@ -1087,9 +1087,7 @@ impl PipelineExecutor {
                 StepStatus::Skipped { .. } => {
                     completed_labels.insert(step.label.clone());
                 }
-                StepStatus::Failed { error }
-                    if !step.optional =>
-                {
+                StepStatus::Failed { error } if !step.optional => {
                     execution.status = PipelineStatus::Failed {
                         reason: format!("step '{}' failed: {error}", step.label),
                     };

@@ -204,11 +204,8 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(100),
-            )
-            .await;
+            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+                .await;
         }
     };
     let ctrl_c = signal::ctrl_c();
@@ -238,11 +235,8 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(
-                cx,
-                std::time::Duration::from_millis(100),
-            )
-            .await;
+            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+                .await;
         }
     };
     let ctrl_c = signal::ctrl_c();

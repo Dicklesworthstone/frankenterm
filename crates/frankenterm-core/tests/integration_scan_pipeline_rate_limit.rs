@@ -16,12 +16,8 @@ use std::time::{Duration, Instant};
 
 use frankenterm_core::pattern_trigger::{TriggerCategory, TriggerPattern, TriggerScanner};
 use frankenterm_core::patterns::AgentType;
-use frankenterm_core::rate_limit_tracker::{
-    ProviderRateLimitStatus, RateLimitTracker,
-};
-use frankenterm_core::scan_pipeline::{
-    ChunkedPipelineState, ScanPipeline, ScanPipelineConfig,
-};
+use frankenterm_core::rate_limit_tracker::{ProviderRateLimitStatus, RateLimitTracker};
+use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -260,11 +256,7 @@ fn chunked_pipeline_accumulates_then_flushes_to_trigger_rate_limit() {
     );
 
     // Both paths should produce the same trigger match count.
-    let flush_matches = scan
-        .triggers
-        .as_ref()
-        .map(|t| t.total_matches)
-        .unwrap_or(0);
+    let flush_matches = scan.triggers.as_ref().map(|t| t.total_matches).unwrap_or(0);
     let batch_matches = batch
         .triggers
         .as_ref()
@@ -364,7 +356,10 @@ fn custom_trigger_patterns_feed_into_rate_limit_flow() {
     let scan = pipeline.process(output);
 
     let triggers = scan.triggers.as_ref().expect("custom triggers present");
-    assert!(triggers.has_errors(), "should detect 'quota exceeded' error");
+    assert!(
+        triggers.has_errors(),
+        "should detect 'quota exceeded' error"
+    );
 
     let warning_count = triggers
         .counts
@@ -441,7 +436,10 @@ fn scan_metrics_and_tracker_telemetry_are_consistent() {
 
     // Scan metrics sanity.
     assert!(total_input_bytes > 0, "should have processed bytes");
-    assert!(total_newlines > 10, "combined outputs should have many newlines");
+    assert!(
+        total_newlines > 10,
+        "combined outputs should have many newlines"
+    );
 
     // Tracker state: panes 2 and 4 are limited.
     assert!(!tracker.is_pane_rate_limited_at(1, now));

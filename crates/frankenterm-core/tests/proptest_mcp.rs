@@ -5,7 +5,9 @@
 use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
-use frankenterm_core::mcp_framework::{FrameworkTestClient, framework_create_memory_transport_pair};
+use frankenterm_core::mcp_framework::{
+    FrameworkTestClient, framework_create_memory_transport_pair,
+};
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -16,11 +18,8 @@ struct ServerSnapshot {
     template_uris: BTreeSet<String>,
 }
 
-fn spawn_client(
-    db_path: Option<PathBuf>,
-) -> (FrameworkTestClient, ServerSnapshot) {
-    let server =
-        build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+fn spawn_client(db_path: Option<PathBuf>) -> (FrameworkTestClient, ServerSnapshot) {
+    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
     let snapshot = ServerSnapshot {
         tool_names: tool_names(server.tools()),
         resource_uris: resource_uris(server.resources()),
@@ -57,7 +56,9 @@ fn template_uris(
 #[test]
 fn initialize_reports_expected_server_identity_and_instructions() {
     let (mut client, _snapshot) = spawn_client(None);
-    let init = client.initialize().expect("initialize in-memory MCP client");
+    let init = client
+        .initialize()
+        .expect("initialize in-memory MCP client");
 
     assert_eq!(init.server_info.name, "wezterm-automata");
     assert_eq!(init.server_info.version, VERSION);
@@ -65,7 +66,10 @@ fn initialize_reports_expected_server_identity_and_instructions() {
         init.instructions.as_deref(),
         Some("ft MCP server (robot parity). See docs/mcp-api-spec.md.")
     );
-    assert_eq!(client.server_info().map(|info| info.name.as_str()), Some("wezterm-automata"));
+    assert_eq!(
+        client.server_info().map(|info| info.name.as_str()),
+        Some("wezterm-automata")
+    );
 }
 
 proptest! {

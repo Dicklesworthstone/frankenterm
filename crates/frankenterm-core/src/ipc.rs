@@ -690,29 +690,29 @@ impl IpcServer {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let socket_path = socket_path.as_ref().to_path_buf();
+            let socket_path = socket_path.as_ref().to_path_buf();
 
-        // Remove stale socket file if it exists
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)?;
-        }
+            // Remove stale socket file if it exists
+            if socket_path.exists() {
+                std::fs::remove_file(&socket_path)?;
+            }
 
-        // Create parent directory if needed
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+            // Create parent directory if needed
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
-        let listener = compat_unix::bind(&socket_path).await?;
-        if let Some(mode) = permissions {
-            let perms = std::fs::Permissions::from_mode(mode);
-            std::fs::set_permissions(&socket_path, perms)?;
-        }
-        tracing::info!(path = %socket_path.display(), "IPC server listening");
+            let listener = compat_unix::bind(&socket_path).await?;
+            if let Some(mode) = permissions {
+                let perms = std::fs::Permissions::from_mode(mode);
+                std::fs::set_permissions(&socket_path, perms)?;
+            }
+            tracing::info!(path = %socket_path.display(), "IPC server listening");
 
-        Ok(Self {
-            socket_path,
-            listener,
-        })
+            Ok(Self {
+                socket_path,
+                listener,
+            })
         }
     }
 
@@ -1024,7 +1024,9 @@ impl IpcServer {
                 Ok(Ok((stream, _addr))) => {
                     let ctx = ctx.clone();
                     connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                        if let Err(e) = handle_client_with_context_with_cx(child_cx, stream, ctx).await {
+                        if let Err(e) =
+                            handle_client_with_context_with_cx(child_cx, stream, ctx).await
+                        {
                             tracing::warn!(error = %e, "IPC client error");
                         }
                     });

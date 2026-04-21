@@ -770,8 +770,7 @@ mod tests {
     fn send_text_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0001, || async {
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-1");
+            let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-1");
             let cx = crate::cx::for_testing();
             let result = ctx.send_text_with_cx(&cx, "hello").await;
             assert!(result.is_err());
@@ -784,8 +783,7 @@ mod tests {
     fn send_ctrl_c_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0002, || async {
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-2");
+            let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-2");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_c_with_cx(&cx).await;
             assert!(result.is_err());
@@ -798,8 +796,7 @@ mod tests {
     fn send_ctrl_d_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0003, || async {
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-3");
+            let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-3");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_d_with_cx(&cx).await;
             assert!(result.is_err());
@@ -812,8 +809,7 @@ mod tests {
     fn send_ctrl_z_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0004, || async {
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-4");
+            let mut ctx = WorkflowContext::new(storage, 1, PaneCapabilities::unknown(), "cx-err-4");
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_z_with_cx(&cx).await;
             assert!(result.is_err());
@@ -834,9 +830,8 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 42, PaneCapabilities::prompt(), "cx-inj-1")
-                    .with_injector(injector);
+            let mut ctx = WorkflowContext::new(storage, 42, PaneCapabilities::prompt(), "cx-inj-1")
+                .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_text_with_cx(&cx, "echo hello").await;
             assert!(result.is_ok());
@@ -855,9 +850,8 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 43, PaneCapabilities::prompt(), "cx-inj-2")
-                    .with_injector(injector);
+            let mut ctx = WorkflowContext::new(storage, 43, PaneCapabilities::prompt(), "cx-inj-2")
+                .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_c_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -868,7 +862,10 @@ mod tests {
                 crate::policy::InjectionResult::Allowed { .. }
                     | crate::policy::InjectionResult::RequiresApproval { .. }
             );
-            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+            assert!(
+                is_policy_decision,
+                "Expected policy decision, got {injection:?}"
+            );
         });
     }
 
@@ -881,9 +878,8 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 44, PaneCapabilities::prompt(), "cx-inj-3")
-                    .with_injector(injector);
+            let mut ctx = WorkflowContext::new(storage, 44, PaneCapabilities::prompt(), "cx-inj-3")
+                .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_d_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -894,7 +890,10 @@ mod tests {
                 crate::policy::InjectionResult::Allowed { .. }
                     | crate::policy::InjectionResult::RequiresApproval { .. }
             );
-            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+            assert!(
+                is_policy_decision,
+                "Expected policy decision, got {injection:?}"
+            );
         });
     }
 
@@ -907,9 +906,8 @@ mod tests {
             let handle = std::sync::Arc::new(mock) as crate::wezterm::WeztermHandle;
             let injector = make_injector_from_handle(handle);
             let storage = make_storage();
-            let mut ctx =
-                WorkflowContext::new(storage, 45, PaneCapabilities::prompt(), "cx-inj-4")
-                    .with_injector(injector);
+            let mut ctx = WorkflowContext::new(storage, 45, PaneCapabilities::prompt(), "cx-inj-4")
+                .with_injector(injector);
             let cx = crate::cx::for_testing();
             let result = ctx.send_ctrl_z_with_cx(&cx).await;
             assert!(result.is_ok());
@@ -920,7 +918,10 @@ mod tests {
                 crate::policy::InjectionResult::Allowed { .. }
                     | crate::policy::InjectionResult::RequiresApproval { .. }
             );
-            assert!(is_policy_decision, "Expected policy decision, got {injection:?}");
+            assert!(
+                is_policy_decision,
+                "Expected policy decision, got {injection:?}"
+            );
         });
     }
 

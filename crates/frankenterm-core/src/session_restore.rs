@@ -1988,7 +1988,10 @@ mod tests {
             finalize_restore(&db_path, "sess-ok", &mapping, true).expect("finalize restore");
 
         let loaded = load_checkpoint_by_id(&db_path, cp_id).expect("load should not error");
-        assert!(loaded.is_some(), "unmodified startup checkpoint should load");
+        assert!(
+            loaded.is_some(),
+            "unmodified startup checkpoint should load"
+        );
     }
 
     #[test]
@@ -2004,8 +2007,8 @@ mod tests {
         let mut mapping = HashMap::new();
         mapping.insert(1u64, 100u64);
 
-        let cp_id = finalize_restore(&db_path, "sess-tampered", &mapping, true)
-            .expect("finalize restore");
+        let cp_id =
+            finalize_restore(&db_path, "sess-tampered", &mapping, true).expect("finalize restore");
 
         conn.execute(
             "UPDATE session_checkpoints SET state_hash = 'deadbeefdeadbeef' WHERE id = ?1",
@@ -2053,8 +2056,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_checkpoint_by_id(&db_path, cp_id)
-            .expect_err("tampered pane map must error");
+        let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("tampered pane map must error");
         assert!(
             matches!(err, RestoreError::StateHashMismatch { .. }),
             "expected StateHashMismatch, got: {err:?}"
@@ -2080,8 +2082,7 @@ mod tests {
         .unwrap();
         let cp_id = conn.last_insert_rowid();
 
-        let err =
-            load_checkpoint_by_id(&db_path, cp_id).expect_err("legacy literal must error");
+        let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("legacy literal must error");
         match err {
             RestoreError::StateHashMismatch { stored, .. } => {
                 assert_eq!(stored, "restore");

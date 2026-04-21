@@ -32,15 +32,7 @@ fn arb_account_record() -> impl Strategy<Value = AccountRecord> {
     )
         .prop_map(
             |(
-                (
-                    id,
-                    account_id,
-                    service,
-                    name,
-                    percent_remaining,
-                    reset_at,
-                    tokens_used,
-                ),
+                (id, account_id, service, name, percent_remaining, reset_at, tokens_used),
                 (
                     tokens_remaining,
                     tokens_limit,
@@ -77,11 +69,13 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
                 0.0f64..100.0,
                 "[A-Za-z0-9 %.()_-]{3,40}",
             )
-                .prop_map(|(account_id, name, percent_remaining, reason)| FilteredAccount {
-                    account_id,
-                    name,
-                    percent_remaining,
-                    reason,
+                .prop_map(|(account_id, name, percent_remaining, reason)| {
+                    FilteredAccount {
+                        account_id,
+                        name,
+                        percent_remaining,
+                        reason,
+                    }
                 }),
             0..4,
         ),
@@ -92,11 +86,13 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
                 0.0f64..100.0,
                 prop::option::of(0i64..9_999_999_999_999),
             )
-                .prop_map(|(account_id, name, percent_remaining, last_used_at)| CandidateAccount {
-                    account_id,
-                    name,
-                    percent_remaining,
-                    last_used_at,
+                .prop_map(|(account_id, name, percent_remaining, last_used_at)| {
+                    CandidateAccount {
+                        account_id,
+                        name,
+                        percent_remaining,
+                        last_used_at,
+                    }
                 }),
             0..4,
         ),
@@ -114,27 +110,51 @@ fn arb_selection_explanation() -> impl Strategy<Value = SelectionExplanation> {
 
 fn arb_quota_advisory() -> impl Strategy<Value = AccountQuotaAdvisory> {
     prop_oneof![
-        (0.0f64..100.0, prop::option::of(0.0f64..100.0), prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}"))
-            .prop_map(|(low_quota_threshold_percent, selected_percent_remaining, warning)| AccountQuotaAdvisory {
-                availability: QuotaAvailability::Available,
-                low_quota_threshold_percent,
-                selected_percent_remaining,
-                warning,
-            }),
-        (0.0f64..100.0, prop::option::of(0.0f64..100.0), prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}"))
-            .prop_map(|(low_quota_threshold_percent, selected_percent_remaining, warning)| AccountQuotaAdvisory {
-                availability: QuotaAvailability::Low,
-                low_quota_threshold_percent,
-                selected_percent_remaining,
-                warning,
-            }),
-        (0.0f64..100.0, Just(None::<f64>), prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}"))
-            .prop_map(|(low_quota_threshold_percent, selected_percent_remaining, warning)| AccountQuotaAdvisory {
-                availability: QuotaAvailability::Exhausted,
-                low_quota_threshold_percent,
-                selected_percent_remaining,
-                warning,
-            }),
+        (
+            0.0f64..100.0,
+            prop::option::of(0.0f64..100.0),
+            prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}")
+        )
+            .prop_map(
+                |(low_quota_threshold_percent, selected_percent_remaining, warning)| {
+                    AccountQuotaAdvisory {
+                        availability: QuotaAvailability::Available,
+                        low_quota_threshold_percent,
+                        selected_percent_remaining,
+                        warning,
+                    }
+                }
+            ),
+        (
+            0.0f64..100.0,
+            prop::option::of(0.0f64..100.0),
+            prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}")
+        )
+            .prop_map(
+                |(low_quota_threshold_percent, selected_percent_remaining, warning)| {
+                    AccountQuotaAdvisory {
+                        availability: QuotaAvailability::Low,
+                        low_quota_threshold_percent,
+                        selected_percent_remaining,
+                        warning,
+                    }
+                }
+            ),
+        (
+            0.0f64..100.0,
+            Just(None::<f64>),
+            prop::option::of("[A-Za-z0-9 ,.()_%:-]{3,60}")
+        )
+            .prop_map(
+                |(low_quota_threshold_percent, selected_percent_remaining, warning)| {
+                    AccountQuotaAdvisory {
+                        availability: QuotaAvailability::Exhausted,
+                        low_quota_threshold_percent,
+                        selected_percent_remaining,
+                        warning,
+                    }
+                }
+            ),
     ]
 }
 
@@ -146,11 +166,13 @@ fn arb_account_selection_step_result() -> impl Strategy<Value = AccountSelection
         0usize..32,
     )
         .prop_map(
-            |(selected, explanation, quota_advisory, accounts_refreshed)| AccountSelectionStepResult {
-                selected,
-                explanation,
-                quota_advisory,
-                accounts_refreshed,
+            |(selected, explanation, quota_advisory, accounts_refreshed)| {
+                AccountSelectionStepResult {
+                    selected,
+                    explanation,
+                    quota_advisory,
+                    accounts_refreshed,
+                }
             },
         )
 }

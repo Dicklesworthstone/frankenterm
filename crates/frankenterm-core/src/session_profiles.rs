@@ -2122,10 +2122,7 @@ mod tests {
             "fleet 'f3' slot 's3' has invalid zero weight"
         );
         assert_eq!(
-            ProfileValidationError::EmptyProgramMixTarget {
-                fleet: "f4".into(),
-            }
-            .to_string(),
+            ProfileValidationError::EmptyProgramMixTarget { fleet: "f4".into() }.to_string(),
             "fleet 'f4' contains program mix target with empty program"
         );
         assert_eq!(

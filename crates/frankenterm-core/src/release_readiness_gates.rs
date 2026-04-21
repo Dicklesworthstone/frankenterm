@@ -366,7 +366,10 @@ mod tests {
         let report = ReleaseGatePolicy::finish_line().evaluate(&passing_inputs());
         let summary = report.render_summary();
         assert!(summary.contains("Ready"));
-        assert!(!summary.contains("action:"), "ready report should have no action lines");
+        assert!(
+            !summary.contains("action:"),
+            "ready report should have no action lines"
+        );
     }
 
     #[test]

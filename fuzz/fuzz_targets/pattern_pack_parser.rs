@@ -1,8 +1,8 @@
 #![no_main]
 
+use frankenterm_core::patterns::{PatternEngine, PatternPack, RuleDef};
 use libfuzzer_sys::fuzz_target;
 use serde::Deserialize;
-use frankenterm_core::patterns::{PatternEngine, PatternPack, RuleDef};
 
 #[derive(Debug, Deserialize)]
 struct PackToml {

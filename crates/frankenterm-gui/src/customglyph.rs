@@ -158,11 +158,7 @@ impl BlockCoord {
         /// For interior points, adjust so that we get the middle of the row;
         /// in AA modes with 1px wide strokes this gives better results.
         fn hint(v: f32) -> f32 {
-            if v.fract() == 0. {
-                v - 0.5
-            } else {
-                v
-            }
+            if v.fract() == 0. { v - 0.5 } else { v }
         }
         match self {
             Self::Zero => 0.,

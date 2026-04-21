@@ -77,11 +77,10 @@ fn arb_overlap_size() -> impl Strategy<Value = usize> {
 /// `current == previous + suffix` — the pure-append corpus the
 /// fast path is optimized for.
 fn arb_append_pair() -> impl Strategy<Value = (String, String)> {
-    (arb_ascii_with_multibyte(), arb_ascii_with_multibyte())
-        .prop_map(|(previous, suffix)| {
-            let current = format!("{previous}{suffix}");
-            (previous, current)
-        })
+    (arb_ascii_with_multibyte(), arb_ascii_with_multibyte()).prop_map(|(previous, suffix)| {
+        let current = format!("{previous}{suffix}");
+        (previous, current)
+    })
 }
 
 /// Structure-aware strategy: build `(previous, current)` where

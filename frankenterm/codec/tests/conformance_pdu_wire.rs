@@ -193,8 +193,7 @@ fn conformance_boundary_payload_one_over_max_is_rejected_without_allocation() {
     let tagged_len = well_formed_len(serial, ident, over_max);
     let wire = frame(tagged_len, serial, ident, &[]);
 
-    let err =
-        Pdu::decode(wire.as_slice()).expect_err("decoder must reject payload > MAX_PDU_SIZE");
+    let err = Pdu::decode(wire.as_slice()).expect_err("decoder must reject payload > MAX_PDU_SIZE");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("exceeds maximum"),
@@ -268,8 +267,7 @@ fn conformance_trailing_garbage_leaves_remainder_in_buffer() {
         }
     );
     assert_eq!(
-        wire,
-        b"GARBAGE",
+        wire, b"GARBAGE",
         "stream_decode must consume exactly {consumed_len} bytes and leave the rest"
     );
 }

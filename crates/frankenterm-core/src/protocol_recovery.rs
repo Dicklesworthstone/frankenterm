@@ -514,127 +514,127 @@ impl RecoveryEngine {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let mut operation = operation;
-        self.counters
-            .total_operations
-            .fetch_add(1, Ordering::Relaxed);
-
-        if !self.config.enabled {
-            return RecoveryOutcome {
-                result: Err(RecoveryError::Disabled),
-                attempts: 0,
-                error_kinds: vec![],
-            };
-        }
-
-        let consecutive = self.counters.consecutive_permanent.load(Ordering::Relaxed);
-        if consecutive >= u64::from(self.config.permanent_failure_limit) {
-            return RecoveryOutcome {
-                result: Err(RecoveryError::PermanentLimitReached {
-                    limit: self.config.permanent_failure_limit,
-                }),
-                attempts: 0,
-                error_kinds: vec![],
-            };
-        }
-
-        if !self.circuit.allow() {
+            let mut operation = operation;
             self.counters
-                .circuit_rejections
+                .total_operations
                 .fetch_add(1, Ordering::Relaxed);
-            return RecoveryOutcome {
-                result: Err(RecoveryError::CircuitOpen),
-                attempts: 0,
-                error_kinds: vec![],
-            };
-        }
 
-        let max_attempts = self.config.max_retries + 1;
-        let mut error_kinds = Vec::new();
-        let mut last_error_msg = String::new();
-        let mut last_kind = ProtocolErrorKind::Recoverable;
+            if !self.config.enabled {
+                return RecoveryOutcome {
+                    result: Err(RecoveryError::Disabled),
+                    attempts: 0,
+                    error_kinds: vec![],
+                };
+            }
 
-        for attempt in 0..max_attempts {
-            match operation(attempt).await {
-                Ok(value) => {
-                    self.circuit.record_success();
-                    self.counters
-                        .consecutive_permanent
-                        .store(0, Ordering::Relaxed);
-                    if attempt == 0 {
+            let consecutive = self.counters.consecutive_permanent.load(Ordering::Relaxed);
+            if consecutive >= u64::from(self.config.permanent_failure_limit) {
+                return RecoveryOutcome {
+                    result: Err(RecoveryError::PermanentLimitReached {
+                        limit: self.config.permanent_failure_limit,
+                    }),
+                    attempts: 0,
+                    error_kinds: vec![],
+                };
+            }
+
+            if !self.circuit.allow() {
+                self.counters
+                    .circuit_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return RecoveryOutcome {
+                    result: Err(RecoveryError::CircuitOpen),
+                    attempts: 0,
+                    error_kinds: vec![],
+                };
+            }
+
+            let max_attempts = self.config.max_retries + 1;
+            let mut error_kinds = Vec::new();
+            let mut last_error_msg = String::new();
+            let mut last_kind = ProtocolErrorKind::Recoverable;
+
+            for attempt in 0..max_attempts {
+                match operation(attempt).await {
+                    Ok(value) => {
+                        self.circuit.record_success();
                         self.counters
-                            .first_try_successes
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        self.counters
-                            .retry_successes
-                            .fetch_add(1, Ordering::Relaxed);
+                            .consecutive_permanent
+                            .store(0, Ordering::Relaxed);
+                        if attempt == 0 {
+                            self.counters
+                                .first_try_successes
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.counters
+                                .retry_successes
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        return RecoveryOutcome {
+                            result: Ok(value),
+                            attempts: attempt + 1,
+                            error_kinds,
+                        };
                     }
-                    return RecoveryOutcome {
-                        result: Ok(value),
-                        attempts: attempt + 1,
-                        error_kinds,
-                    };
-                }
-                Err(err) => {
-                    let kind = classify(&err);
-                    last_error_msg = err.to_string();
-                    last_kind = kind;
-                    error_kinds.push(kind);
+                    Err(err) => {
+                        let kind = classify(&err);
+                        last_error_msg = err.to_string();
+                        last_kind = kind;
+                        error_kinds.push(kind);
 
-                    match kind {
-                        ProtocolErrorKind::Permanent => {
-                            self.circuit.record_failure();
-                            self.counters
-                                .permanent_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                            self.counters
-                                .consecutive_permanent
-                                .fetch_add(1, Ordering::Relaxed);
-                            if self.config.report_degradation {
-                                report_mux_degradation(&last_error_msg);
+                        match kind {
+                            ProtocolErrorKind::Permanent => {
+                                self.circuit.record_failure();
+                                self.counters
+                                    .permanent_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.counters
+                                    .consecutive_permanent
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if self.config.report_degradation {
+                                    report_mux_degradation(&last_error_msg);
+                                }
+                                return RecoveryOutcome {
+                                    result: Err(RecoveryError::Permanent(last_error_msg)),
+                                    attempts: attempt + 1,
+                                    error_kinds,
+                                };
                             }
-                            return RecoveryOutcome {
-                                result: Err(RecoveryError::Permanent(last_error_msg)),
-                                attempts: attempt + 1,
-                                error_kinds,
-                            };
+                            ProtocolErrorKind::Recoverable => {
+                                self.circuit.record_failure();
+                                self.counters
+                                    .recoverable_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            ProtocolErrorKind::Transient => {
+                                self.counters
+                                    .transient_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        ProtocolErrorKind::Recoverable => {
-                            self.circuit.record_failure();
-                            self.counters
-                                .recoverable_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        ProtocolErrorKind::Transient => {
-                            self.counters
-                                .transient_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
 
-                    if attempt + 1 < max_attempts {
-                        self.counters.total_retries.fetch_add(1, Ordering::Relaxed);
-                        let delay = self.config.delay_for_attempt(attempt);
-                        crate::runtime_compat::sleep(delay).await;
+                        if attempt + 1 < max_attempts {
+                            self.counters.total_retries.fetch_add(1, Ordering::Relaxed);
+                            let delay = self.config.delay_for_attempt(attempt);
+                            crate::runtime_compat::sleep(delay).await;
+                        }
                     }
                 }
             }
-        }
 
-        if self.config.report_degradation {
-            report_mux_degradation(&last_error_msg);
-        }
+            if self.config.report_degradation {
+                report_mux_degradation(&last_error_msg);
+            }
 
-        RecoveryOutcome {
-            result: Err(RecoveryError::RetriesExhausted {
+            RecoveryOutcome {
+                result: Err(RecoveryError::RetriesExhausted {
+                    attempts: max_attempts,
+                    last_error: last_error_msg,
+                    last_kind,
+                }),
                 attempts: max_attempts,
-                last_error: last_error_msg,
-                last_kind,
-            }),
-            attempts: max_attempts,
-            error_kinds,
-        }
+                error_kinds,
+            }
         }
     }
 

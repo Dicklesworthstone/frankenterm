@@ -2739,14 +2739,20 @@ mod tests {
     }
 
     fn arb_truncation_info() -> impl Strategy<Value = TruncationInfo> {
-        (0usize..=1_000_000, 0usize..=1_000_000, 0usize..=10_000, 0usize..=10_000).prop_map(
-            |(original_bytes, returned_bytes, original_lines, returned_lines)| TruncationInfo {
-                original_bytes,
-                returned_bytes,
-                original_lines,
-                returned_lines,
-            },
+        (
+            0usize..=1_000_000,
+            0usize..=1_000_000,
+            0usize..=10_000,
+            0usize..=10_000,
         )
+            .prop_map(
+                |(original_bytes, returned_bytes, original_lines, returned_lines)| TruncationInfo {
+                    original_bytes,
+                    returned_bytes,
+                    original_lines,
+                    returned_lines,
+                },
+            )
     }
 
     fn arb_mcp_get_text_data() -> impl Strategy<Value = McpGetTextData> {

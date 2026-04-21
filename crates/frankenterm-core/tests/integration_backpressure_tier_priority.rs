@@ -55,7 +55,10 @@ fn rising_load_escalates_through_all_three_modules() {
     assert_eq!(bp.classify(&depths_at(0.10, 0.10)), BackpressureTier::Green);
 
     // Yellow when capture crosses 50%.
-    assert_eq!(bp.classify(&depths_at(0.55, 0.10)), BackpressureTier::Yellow);
+    assert_eq!(
+        bp.classify(&depths_at(0.55, 0.10)),
+        BackpressureTier::Yellow
+    );
 
     // Red when capture crosses 75%.
     assert_eq!(bp.classify(&depths_at(0.80, 0.10)), BackpressureTier::Red);
@@ -357,7 +360,10 @@ fn manual_override_bypasses_automatic_classification() {
 
     // Force to Background regardless of other signals.
     priority_classifier.set_override(pane_id, PanePriority::Background);
-    assert_eq!(priority_classifier.classify(pane_id), PanePriority::Background);
+    assert_eq!(
+        priority_classifier.classify(pane_id),
+        PanePriority::Background
+    );
 
     // Even with an error signal, override holds.
     priority_classifier.observe_signal(
@@ -368,14 +374,20 @@ fn manual_override_bypasses_automatic_classification() {
             observed_at: Instant::now(),
         },
     );
-    assert_eq!(priority_classifier.classify(pane_id), PanePriority::Background);
+    assert_eq!(
+        priority_classifier.classify(pane_id),
+        PanePriority::Background
+    );
     assert!(priority_classifier.has_override(pane_id));
 
     // Clear override → automatic classification kicks in → Critical from
     // the error signal we just delivered.
     priority_classifier.clear_override(pane_id);
     assert!(!priority_classifier.has_override(pane_id));
-    assert_eq!(priority_classifier.classify(pane_id), PanePriority::Critical);
+    assert_eq!(
+        priority_classifier.classify(pane_id),
+        PanePriority::Critical
+    );
 }
 
 /// All tiers' effective intervals form a monotonically increasing sequence
@@ -404,7 +416,10 @@ fn effective_intervals_are_monotonic_across_tiers_and_bp_levels() {
 
     // Also verify that for any given tier, higher bp → longer interval.
     for tier in tiers {
-        let intervals: Vec<Duration> = bp_levels.iter().map(|bp| tier.effective_interval(*bp)).collect();
+        let intervals: Vec<Duration> = bp_levels
+            .iter()
+            .map(|bp| tier.effective_interval(*bp))
+            .collect();
 
         for window in intervals.windows(2) {
             assert!(

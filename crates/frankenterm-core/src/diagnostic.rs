@@ -3184,8 +3184,7 @@ mod tests {
 
     #[test]
     fn scrub_path_to_basename_handles_relative_path() {
-        let scrubbed =
-            scrub_path_to_basename(std::path::Path::new("relative/to/cwd/some-dir"));
+        let scrubbed = scrub_path_to_basename(std::path::Path::new("relative/to/cwd/some-dir"));
         assert_eq!(scrubbed, "some-dir");
     }
 

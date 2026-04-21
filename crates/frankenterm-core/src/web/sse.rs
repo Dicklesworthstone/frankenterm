@@ -11,9 +11,9 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, select, sleep, task};
 #[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::timeout;
+use crate::runtime_compat::{mpsc, select, sleep, task};
 use crate::storage::{SegmentScanQuery, StorageHandle};
 use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
 use asupersync::stream::Stream;
@@ -498,11 +498,12 @@ pub(super) fn handle_stream_events(
                                 continue;
                             }
 
-                            let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
-                                json!({
-                                    "error": "event_serialization_failed"
-                                })
-                            });
+                            let mut event_json =
+                                serde_json::to_value(&event).unwrap_or_else(|_| {
+                                    json!({
+                                        "error": "event_serialization_failed"
+                                    })
+                                });
                             redact_json_value(&mut event_json, &redactor);
 
                             seq += 1;

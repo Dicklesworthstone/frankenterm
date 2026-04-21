@@ -1254,7 +1254,9 @@ fn arb_stalled_tx() -> impl Strategy<Value = ResizeStalledTransaction> {
 fn arb_lifecycle_detail() -> impl Strategy<Value = ResizeLifecycleDetail> {
     prop_oneof![
         proptest::option::of(0_u64..10_000).prop_map(|replaced_pending_seq| {
-            ResizeLifecycleDetail::IntentSubmitted { replaced_pending_seq }
+            ResizeLifecycleDetail::IntentSubmitted {
+                replaced_pending_seq,
+            }
         }),
         (0_u64..10_000).prop_map(|latest_seq| {
             ResizeLifecycleDetail::IntentRejectedNonMonotonic { latest_seq }
@@ -1291,9 +1293,8 @@ fn arb_lifecycle_detail() -> impl Strategy<Value = ResizeLifecycleDetail> {
             ResizeLifecycleDetail::ActiveCancelledSuperseded { superseded_by_seq }
         }),
         Just(ResizeLifecycleDetail::ActiveCompleted),
-        arb_execution_phase().prop_map(|phase| {
-            ResizeLifecycleDetail::ActivePhaseTransition { phase }
-        }),
+        arb_execution_phase()
+            .prop_map(|phase| { ResizeLifecycleDetail::ActivePhaseTransition { phase } }),
         proptest::option::of(0_u64..10_000).prop_map(|active_seq| {
             ResizeLifecycleDetail::ActiveCompletionRejected { active_seq }
         }),

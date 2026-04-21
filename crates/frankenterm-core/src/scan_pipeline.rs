@@ -1026,7 +1026,9 @@ mod tests {
         let mut sgr_128 = Vec::with_capacity(260);
         sgr_128.extend_from_slice(b"\x1b[");
         for i in 0..128u8 {
-            if i > 0 { sgr_128.push(b';'); }
+            if i > 0 {
+                sgr_128.push(b';');
+            }
             sgr_128.push(b'0');
         }
         sgr_128.push(b'm');

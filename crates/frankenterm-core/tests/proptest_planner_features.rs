@@ -244,12 +244,14 @@ fn arb_explanation_factor() -> impl Strategy<Value = ExplanationFactor> {
         ".{0,64}",
         arb_factor_polarity(),
     )
-        .prop_map(|(dimension, value, description, polarity)| ExplanationFactor {
-            dimension,
-            value,
-            description,
-            polarity,
-        })
+        .prop_map(
+            |(dimension, value, description, polarity)| ExplanationFactor {
+                dimension,
+                value,
+                description,
+                polarity,
+            },
+        )
 }
 
 fn arb_decision_explanation() -> impl Strategy<Value = DecisionExplanation> {
@@ -286,13 +288,16 @@ fn arb_config_diagnostic() -> impl Strategy<Value = ConfigDiagnostic> {
 }
 
 fn arb_config_validation_error() -> impl Strategy<Value = ConfigValidationError> {
-    ("[a-z_]{3,16}", ".{0,64}").prop_map(|(field, message)| ConfigValidationError { field, message })
+    ("[a-z_]{3,16}", ".{0,64}")
+        .prop_map(|(field, message)| ConfigValidationError { field, message })
 }
 
 fn arb_config_validation_result() -> impl Strategy<Value = ConfigValidationResult> {
-    (any::<bool>(), proptest::collection::vec(arb_config_diagnostic(), 0..8)).prop_map(
-        |(valid, diagnostics)| ConfigValidationResult { valid, diagnostics },
+    (
+        any::<bool>(),
+        proptest::collection::vec(arb_config_diagnostic(), 0..8),
     )
+        .prop_map(|(valid, diagnostics)| ConfigValidationResult { valid, diagnostics })
 }
 
 // ── Tests: Feature vector composite scoring ──────────────────────────────────

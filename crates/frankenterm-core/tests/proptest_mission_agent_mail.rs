@@ -18,12 +18,11 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 
 use frankenterm_core::mission_agent_mail::{
-    AckRequirementReport,
-    CoordinationEnvelope, CoordinationEventKind, CoordinationEventRequest,
+    AckRequirementReport, CoordinationEnvelope, CoordinationEventKind, CoordinationEventRequest,
     CoordinationInboxMessage, CoordinationParseFailure, DispatchedCoordinationMessage,
-    FailedCoordinationMessage, InboxConsumptionReport, InboundCoordinationMessage, MissionAgentMailConfig,
-    MissionAgentMailKernel, MissionCoordinationContext, MissionMailDispatchReport,
-    MissionMailTransport, PendingAcknowledgement,
+    FailedCoordinationMessage, InboundCoordinationMessage, InboxConsumptionReport,
+    MissionAgentMailConfig, MissionAgentMailKernel, MissionCoordinationContext,
+    MissionMailDispatchReport, MissionMailTransport, PendingAcknowledgement,
 };
 
 // ---------------------------------------------------------------------------
@@ -362,11 +361,13 @@ fn arb_inbox_consumption_report() -> impl Strategy<Value = InboxConsumptionRepor
         proptest::collection::vec(arb_parse_failure(), 0..5),
         0usize..10,
     )
-        .prop_map(|(parsed, parse_failures, raw_count)| InboxConsumptionReport {
-            parsed,
-            parse_failures,
-            raw_count,
-        })
+        .prop_map(
+            |(parsed, parse_failures, raw_count)| InboxConsumptionReport {
+                parsed,
+                parse_failures,
+                raw_count,
+            },
+        )
 }
 
 fn arb_ack_requirement_report() -> impl Strategy<Value = AckRequirementReport> {
@@ -375,11 +376,13 @@ fn arb_ack_requirement_report() -> impl Strategy<Value = AckRequirementReport> {
         proptest::collection::vec(arb_parse_failure(), 0..5),
         0usize..10,
     )
-        .prop_map(|(pending, parse_failures, raw_count)| AckRequirementReport {
-            pending,
-            parse_failures,
-            raw_count,
-        })
+        .prop_map(
+            |(pending, parse_failures, raw_count)| AckRequirementReport {
+                pending,
+                parse_failures,
+                raw_count,
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------

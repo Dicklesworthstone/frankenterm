@@ -162,21 +162,21 @@ impl NativeEventListener {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        if socket_path.as_os_str().is_empty() {
-            return Err(NativeEventError::EmptySocketPath);
-        }
+            if socket_path.as_os_str().is_empty() {
+                return Err(NativeEventError::EmptySocketPath);
+            }
 
-        maybe_cleanup_stale_socket(&socket_path)?;
+            maybe_cleanup_stale_socket(&socket_path)?;
 
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
-        let listener = compat_unix::bind(&socket_path).await?;
-        Ok(Self {
-            socket_path,
-            listener,
-        })
+            let listener = compat_unix::bind(&socket_path).await?;
+            Ok(Self {
+                socket_path,
+                listener,
+            })
         }
     }
 
@@ -1620,7 +1620,10 @@ mod tests {
             // Pre-cancelled cx causes channel reserve to fail (Closed) or
             // timeout to fire (Backpressure) — either way the event is dropped.
             assert!(
-                matches!(outcome, EventDispatchOutcome::Backpressure | EventDispatchOutcome::Closed),
+                matches!(
+                    outcome,
+                    EventDispatchOutcome::Backpressure | EventDispatchOutcome::Closed
+                ),
                 "pre-cancelled cx should drop the event, got {outcome:?}"
             );
         });

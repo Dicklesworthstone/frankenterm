@@ -1293,9 +1293,8 @@ mod tests {
         // User supplies the ABSOLUTE path of the symlink inside the
         // workspace. Without canonicalize+containment, an attacker
         // could exfiltrate arbitrary files.
-        let err =
-            resolve_workspace_scoped_path(workspace_root, &symlink_path.to_string_lossy())
-                .expect_err("absolute symlink escape must be rejected");
+        let err = resolve_workspace_scoped_path(workspace_root, &symlink_path.to_string_lossy())
+            .expect_err("absolute symlink escape must be rejected");
         assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
         assert!(err.message.contains("escapes workspace root"));
     }

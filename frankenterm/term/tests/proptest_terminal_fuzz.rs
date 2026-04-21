@@ -105,7 +105,8 @@ fn assert_terminal_invariants(term: &Terminal, rows: usize, cols: usize, input: 
         .stable_row_to_phys(stable_row)
         .expect("cursor stable row must map back to a phys row");
     assert_eq!(
-        back_to_phys, phys_row,
+        back_to_phys,
+        phys_row,
         "cursor phys↔stable mapping must roundtrip (input_len={})",
         input.len(),
     );
@@ -119,16 +120,16 @@ fn assert_terminal_invariants(term: &Terminal, rows: usize, cols: usize, input: 
 /// state (BS, HT, LF, VT, FF, CR, SO, SI).
 fn arb_c0_byte() -> impl Strategy<Value = u8> {
     prop_oneof![
-        (0x20u8..=0x7E),                             // printable ASCII
-        Just(0x07u8),                                // BEL
-        Just(0x08u8),                                // BS
-        Just(0x09u8),                                // HT
-        Just(0x0Au8),                                // LF
-        Just(0x0Bu8),                                // VT
-        Just(0x0Cu8),                                // FF
-        Just(0x0Du8),                                // CR
-        Just(0x0Eu8),                                // SO
-        Just(0x0Fu8),                                // SI
+        (0x20u8..=0x7E), // printable ASCII
+        Just(0x07u8),    // BEL
+        Just(0x08u8),    // BS
+        Just(0x09u8),    // HT
+        Just(0x0Au8),    // LF
+        Just(0x0Bu8),    // VT
+        Just(0x0Cu8),    // FF
+        Just(0x0Du8),    // CR
+        Just(0x0Eu8),    // SO
+        Just(0x0Fu8),    // SI
     ]
 }
 
@@ -137,12 +138,12 @@ fn arb_c0_byte() -> impl Strategy<Value = u8> {
 fn arb_csi_body() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         // Numeric parameters separated by ';'
-        proptest::collection::vec(
-            prop_oneof![(0x30u8..=0x39), Just(0x3Bu8)],
-            0..12,
-        ),
+        proptest::collection::vec(prop_oneof![(0x30u8..=0x39), Just(0x3Bu8)], 0..12,),
         // Private-mode marker '?' + params
-        proptest::collection::vec(prop_oneof![(0x30u8..=0x39), Just(0x3Bu8), Just(0x3Fu8)], 0..12),
+        proptest::collection::vec(
+            prop_oneof![(0x30u8..=0x39), Just(0x3Bu8), Just(0x3Fu8)],
+            0..12
+        ),
         // Empty params (final byte only)
         Just(Vec::new()),
     ]
@@ -150,16 +151,28 @@ fn arb_csi_body() -> impl Strategy<Value = Vec<u8>> {
 
 fn arb_csi_final_byte() -> impl Strategy<Value = u8> {
     prop_oneof![
-        Just(b'A'), Just(b'B'), Just(b'C'), Just(b'D'), // cursor motion
-        Just(b'H'), Just(b'f'), Just(b'G'),             // cursor position
-        Just(b'J'), Just(b'K'),                          // erase
-        Just(b'h'), Just(b'l'),                          // mode set/reset
-        Just(b'm'),                                      // SGR
-        Just(b'r'),                                      // scrolling region
-        Just(b's'), Just(b'u'),                          // save/restore cursor
-        Just(b'n'), Just(b'c'),                          // reports
+        Just(b'A'),
+        Just(b'B'),
+        Just(b'C'),
+        Just(b'D'), // cursor motion
+        Just(b'H'),
+        Just(b'f'),
+        Just(b'G'), // cursor position
+        Just(b'J'),
+        Just(b'K'), // erase
+        Just(b'h'),
+        Just(b'l'), // mode set/reset
+        Just(b'm'), // SGR
+        Just(b'r'), // scrolling region
+        Just(b's'),
+        Just(b'u'), // save/restore cursor
+        Just(b'n'),
+        Just(b'c'), // reports
         // Uncommon finals — force the parser onto edge paths
-        Just(b'@'), Just(b'q'), Just(b'`'), Just(b'~'),
+        Just(b'@'),
+        Just(b'q'),
+        Just(b'`'),
+        Just(b'~'),
     ]
 }
 
