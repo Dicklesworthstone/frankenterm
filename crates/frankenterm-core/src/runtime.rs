@@ -60,7 +60,6 @@ use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
 #[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::task;
 use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
@@ -99,7 +98,7 @@ fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
 #[cfg(feature = "asupersync-runtime")]
 type RuntimeLoopCx = crate::cx::Cx;
 #[cfg(not(feature = "asupersync-runtime"))]
-type RuntimeLoopCx = ();
+type RuntimeLoopCx = crate::cx::Cx;
 
 #[cfg(feature = "asupersync-runtime")]
 fn runtime_loop_cx() -> RuntimeLoopCx {
@@ -107,7 +106,9 @@ fn runtime_loop_cx() -> RuntimeLoopCx {
 }
 
 #[cfg(not(feature = "asupersync-runtime"))]
-const fn runtime_loop_cx() -> RuntimeLoopCx {}
+fn runtime_loop_cx() -> RuntimeLoopCx {
+    crate::cx::for_request()
+}
 
 async fn persist_captured_segment_for_runtime(
     runtime_cx: &RuntimeLoopCx,
@@ -213,8 +214,7 @@ where
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
-        let _ = runtime_cx;
-        task::spawn(async move { task_fn(()).await })
+        crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
     }
 }
 

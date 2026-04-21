@@ -54,7 +54,6 @@ pub trait WeztermInterface: Send + Sync {
     /// The `cx` parameter is `&'a crate::cx::Cx` where `'a` matches the
     /// returned future's lifetime, allowing overrides to thread the
     /// caller's Cx into async operations held by the future.
-    #[cfg(feature = "asupersync-runtime")]
     fn list_panes_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -70,7 +69,6 @@ pub trait WeztermInterface: Send + Sync {
     /// Default delegates to [`get_pane`](Self::get_pane). Concrete
     /// impls with a Cx-aware path (e.g. `WeztermClient::get_pane_with_cx`
     /// which delegates to `list_panes_with_cx`) SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -94,7 +92,6 @@ pub trait WeztermInterface: Send + Sync {
     /// — a caller-cancelled read terminates promptly after the
     /// in-flight 2000-row chunk instead of consuming the full
     /// scrollback-fetch budget.
-    #[cfg(feature = "asupersync-runtime")]
     fn get_text_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -109,7 +106,6 @@ pub trait WeztermInterface: Send + Sync {
     /// Send text using paste mode bound to the caller's Cx (ft-xbnl0.2.3).
     /// Default delegates to [`send_text`](Self::send_text); concrete
     /// impls with a Cx-aware mux-pool write path SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -124,7 +120,6 @@ pub trait WeztermInterface: Send + Sync {
 
     /// Send text without paste mode bound to the caller's Cx (ft-xbnl0.2.3).
     /// Default delegates; concrete impls SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_no_paste_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -146,7 +141,6 @@ pub trait WeztermInterface: Send + Sync {
     /// Send text with explicit options bound to the caller's Cx
     /// (ft-xbnl0.2.3). Default delegates; concrete impls SHOULD
     /// override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_options_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -163,7 +157,6 @@ pub trait WeztermInterface: Send + Sync {
 
     /// Send a control character bound to the caller's Cx (ft-xbnl0.2.3).
     /// Default delegates; concrete impls SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_control_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -178,7 +171,6 @@ pub trait WeztermInterface: Send + Sync {
 
     /// Send Ctrl+C bound to the caller's Cx (ft-xbnl0.2.3).
     /// Default delegates; concrete impls SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_c_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -192,7 +184,6 @@ pub trait WeztermInterface: Send + Sync {
 
     /// Send Ctrl+D bound to the caller's Cx (ft-xbnl0.2.3).
     /// Default delegates; concrete impls SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_d_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -208,7 +199,6 @@ pub trait WeztermInterface: Send + Sync {
     /// concrete impls SHOULD override so caller
     /// cancellation/budget/virtual time propagate into the
     /// `wezterm cli spawn` subprocess.
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -230,7 +220,6 @@ pub trait WeztermInterface: Send + Sync {
     /// (ft-xbnl0.2.3). Default delegates to
     /// [`spawn_targeted`](Self::spawn_targeted); concrete impls with a
     /// Cx-aware path SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_targeted_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -253,7 +242,6 @@ pub trait WeztermInterface: Send + Sync {
     /// Split a pane bound to the caller's Cx (ft-xbnl0.2.3). Default
     /// delegates to [`split_pane`](Self::split_pane); concrete impls
     /// with a Cx-aware path SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn split_pane_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -273,7 +261,6 @@ pub trait WeztermInterface: Send + Sync {
     /// path (e.g. `WeztermClient::activate_pane_with_cx`) SHOULD
     /// override to thread caller cancellation, budget, and virtual
     /// time through the subprocess invocation.
-    #[cfg(feature = "asupersync-runtime")]
     fn activate_pane_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -295,7 +282,6 @@ pub trait WeztermInterface: Send + Sync {
     /// impls with Cx-first geometry helpers (e.g.
     /// `WeztermClient::get_pane_direction_with_cx` using
     /// `list_panes_with_cx` + `find_neighbor_pane`) SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_direction_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -313,7 +299,6 @@ pub trait WeztermInterface: Send + Sync {
     /// `WeztermClient::kill_pane_with_cx`) SHOULD override so caller
     /// cancellation/budget/virtual time propagate into the subprocess
     /// invocation.
-    #[cfg(feature = "asupersync-runtime")]
     fn kill_pane_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -330,7 +315,6 @@ pub trait WeztermInterface: Send + Sync {
     /// [`zoom_pane`](Self::zoom_pane); concrete impls with a Cx-aware
     /// `wezterm cli zoom-pane` path (e.g.
     /// `WeztermClient::zoom_pane_with_cx`) SHOULD override.
-    #[cfg(feature = "asupersync-runtime")]
     fn zoom_pane_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -354,7 +338,6 @@ pub trait WeztermInterface: Send + Sync {
     /// ambient cx. Concrete impls with a Cx-aware path should
     /// override to propagate caller cx into their backend
     /// telemetry reads (e.g. mux pool status fetch).
-    #[cfg(feature = "asupersync-runtime")]
     fn watchdog_warnings_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -385,7 +368,6 @@ pub trait WeztermInterface: Send + Sync {
     /// [`pane_tiered_scrollback_summary`](Self::pane_tiered_scrollback_summary);
     /// concrete impls with a Cx-aware mux-pool path SHOULD override to
     /// route through `MuxPool::get_pane_render_changes_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -1102,6 +1084,11 @@ impl WeztermClient {
         self.list_panes().await
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
+        self.list_panes().await
+    }
+
     /// Get a specific pane by ID
     ///
     /// Returns the pane info if found, or `WeztermError::PaneNotFound` if not.
@@ -1125,6 +1112,11 @@ impl WeztermClient {
             .into_iter()
             .find(|p| p.pane_id == pane_id)
             .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn get_pane_with_cx(&self, _cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
+        self.get_pane(pane_id).await
     }
 
     /// Get text content from a pane
@@ -1366,6 +1358,16 @@ impl WeztermClient {
         self.get_text(pane_id, escapes).await
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn get_text_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+        escapes: bool,
+    ) -> Result<String> {
+        self.get_text(pane_id, escapes).await
+    }
+
     /// Read the mux-side tiered scrollback summary for a pane when available.
     ///
     /// This is a best-effort telemetry path used by runtime maintenance. It
@@ -1460,6 +1462,15 @@ impl WeztermClient {
     /// without vendored+unix+asupersync — delegates to the legacy
     /// method which returns the CLI-unavailable error path.
     #[cfg(all(feature = "asupersync-runtime", not(all(feature = "vendored", unix))))]
+    pub async fn pane_tiered_scrollback_summary_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<PaneTieredScrollbackSummary> {
+        self.pane_tiered_scrollback_summary(pane_id).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
     pub async fn pane_tiered_scrollback_summary_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2095,6 +2106,16 @@ impl WeztermClient {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run_cli_with_pane_check_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        args: &[&str],
+        pane_id: u64,
+    ) -> Result<String> {
+        self.run_cli_with_pane_check(args, pane_id).await
+    }
+
     /// Run a WezTerm CLI command with timeout
     ///
     /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
@@ -2171,6 +2192,11 @@ impl WeztermClient {
         };
 
         Self::finalize_cli_output(output)
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    async fn run_cli_with_cx(&self, _cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
+        self.run_cli(args).await
     }
 
     /// Shared post-timeout validation: checks exit status, stderr

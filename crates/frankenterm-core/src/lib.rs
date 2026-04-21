@@ -150,6 +150,9 @@ pub mod cutover_evidence;
 pub mod cutover_playbook;
 #[cfg(feature = "asupersync-runtime")]
 pub mod cx;
+#[cfg(not(feature = "asupersync-runtime"))]
+#[path = "cx_stub.rs"]
+pub mod cx;
 pub mod dancing_links;
 pub mod dashboard;
 pub mod dataflow;
@@ -300,6 +303,7 @@ pub mod recorder_replay;
 pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
+pub mod release_readiness_gates;
 pub mod replay;
 pub mod replay_artifact_registry;
 pub mod replay_capture;
@@ -318,7 +322,6 @@ pub mod replay_mcp;
 pub mod replay_merge;
 pub mod replay_performance;
 pub mod replay_post_incident;
-pub mod release_readiness_gates;
 pub mod replay_provenance;
 pub mod replay_remediation;
 pub mod replay_report;

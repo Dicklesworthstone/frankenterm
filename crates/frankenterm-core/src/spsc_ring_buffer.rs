@@ -162,6 +162,11 @@ impl<T> SpscProducer<T> {
         }
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn send_with_cx(&self, _cx: &crate::cx::Cx, value: T) -> Result<(), T> {
+        self.send(value).await
+    }
+
     /// Try to send a value without waiting.
     pub fn try_send(&self, value: T) -> Result<(), T> {
         if self.is_closed() {
@@ -355,6 +360,11 @@ impl<T: Clone> SpmcProducer<T> {
             self.push_to_all(value);
             return Ok(());
         }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn send_with_cx(&self, _cx: &crate::cx::Cx, value: T) -> Result<(), T> {
+        self.send(value).await
     }
 
     /// Try to send a value to all consumers without waiting.

@@ -459,6 +459,15 @@ impl RecordingManager {
         recorder.record_output(segment.captured_at, is_gap, &payload)
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn record_segment_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        segment: &CapturedSegment,
+    ) -> Result<()> {
+        self.record_segment(segment).await
+    }
+
     /// Record a detection event (redacted if configured).
     pub async fn record_event(
         &self,
@@ -520,6 +529,17 @@ impl RecordingManager {
             return Ok(());
         }
         recorder.record_event(detection_ref, captured_at_ms)
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn record_event_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+        detection: &Detection,
+        captured_at_ms: i64,
+    ) -> Result<()> {
+        self.record_event(pane_id, detection, captured_at_ms).await
     }
 }
 

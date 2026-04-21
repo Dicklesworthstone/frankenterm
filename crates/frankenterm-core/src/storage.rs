@@ -6199,6 +6199,15 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn record_event_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        event: StoredEvent,
+    ) -> Result<i64> {
+        self.record_event(event).await
+    }
+
     /// Mark an event as handled
     pub async fn mark_event_handled(
         &self,
@@ -7119,6 +7128,15 @@ impl StorageHandle {
 
             Self::recv_writer_response(rx).await
         }
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn purge_audit_actions_before_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        before_ts: i64,
+    ) -> Result<usize> {
+        self.purge_audit_actions_before(before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_maintenance`].
@@ -8146,6 +8164,15 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn record_usage_metrics_batch_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        records: Vec<UsageMetricRecord>,
+    ) -> Result<usize> {
+        self.record_usage_metrics_batch(records).await
     }
 
     /// Update the delivery status of a notification.
@@ -9446,6 +9473,11 @@ impl StorageHandle {
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
         Self::recv_writer_response(rx).await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn upsert_pane_with_cx(&self, _cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
+        self.upsert_pane(pane).await
     }
 
     /// Upsert a workflow execution record
@@ -11487,6 +11519,15 @@ impl StorageHandle {
         .await
     }
 
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn get_max_seq_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<u64>> {
+        self.get_max_seq(pane_id).await
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         #[cfg(feature = "asupersync-runtime")]
@@ -11569,6 +11610,15 @@ impl StorageHandle {
             query_pane(&conn, pane_id)
         })
         .await
+    }
+
+    #[cfg(not(feature = "asupersync-runtime"))]
+    pub async fn get_pane_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<PaneRecord>> {
+        self.get_pane(pane_id).await
     }
 
     /// Get a specific pane using a synchronous read path.
