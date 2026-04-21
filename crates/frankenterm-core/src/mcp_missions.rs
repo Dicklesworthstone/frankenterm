@@ -30,9 +30,112 @@ pub(super) fn mcp_resolve_mission_tx_file_path(
     contract_file: Option<&str>,
 ) -> std::result::Result<PathBuf, McpToolError> {
     match contract_file {
-        Some(path) => Ok(PathBuf::from(path)),
+        Some(path) => {
+            let layout = config
+                .workspace_layout(None)
+                .map_err(McpToolError::from_error)?;
+            resolve_workspace_scoped_path(&layout.root, path)
+        }
         None => mcp_default_mission_tx_file_path(config),
     }
+}
+
+/// Constrain a user-supplied MCP path argument to the current workspace root.
+///
+/// [ft-security-mcp-path-traversal]
+///
+/// `wa.tx_plan`, `wa.tx_show`, `wa.tx_run`, `wa.tx_rollback`, and the
+/// mission_* tools all accept an optional `contract_file` / `mission_file`
+/// string argument that previously flowed directly into `std::fs::read_to_string`
+/// or `std::fs::write`. An MCP client could supply `/etc/passwd` or
+/// `~/.ssh/id_rsa` and trigger arbitrary-file read, or supply an absolute
+/// path and overwrite anything the watcher UID can write.
+///
+/// This helper enforces three gates:
+/// 1. Reject any `..` component in the user-supplied path.
+/// 2. Relative paths are joined to the workspace root; absolute paths
+///    are accepted only if they canonicalize inside the workspace.
+/// 3. The resolved path's nearest existing ancestor must canonicalize
+///    inside the workspace root (supports save paths where the target
+///    file does not yet exist).
+pub(super) fn resolve_workspace_scoped_path(
+    workspace_root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, McpToolError> {
+    let supplied = Path::new(user_path);
+    for component in supplied.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(McpToolError::new(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "path contains parent-directory component: {}",
+                    supplied.display()
+                ),
+                Some(
+                    "contract_file and mission_file paths must not contain `..` components."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+
+    let candidate = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        workspace_root.join(supplied)
+    };
+
+    let root_canon = workspace_root.canonicalize().map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "failed to canonicalize workspace root {}: {err}",
+                workspace_root.display()
+            ),
+            None,
+        )
+    })?;
+
+    let mut ancestor = candidate.as_path();
+    let ancestor_canon = loop {
+        match ancestor.canonicalize() {
+            Ok(p) => break p,
+            Err(_) => match ancestor.parent() {
+                Some(parent) if parent.as_os_str().is_empty() => {
+                    return Err(McpToolError::new(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("path has no accessible ancestor: {}", candidate.display()),
+                        None,
+                    ));
+                }
+                Some(parent) => ancestor = parent,
+                None => {
+                    return Err(McpToolError::new(
+                        MCP_ERR_INVALID_ARGS,
+                        format!("path has no accessible ancestor: {}", candidate.display()),
+                        None,
+                    ));
+                }
+            },
+        }
+    };
+
+    if !ancestor_canon.starts_with(&root_canon) {
+        return Err(McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "path escapes workspace root: {} is not under {}",
+                candidate.display(),
+                workspace_root.display()
+            ),
+            Some(
+                "contract_file and mission_file must resolve inside the configured workspace root."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    Ok(candidate)
 }
 
 pub(super) fn mcp_load_mission_tx_contract_from_path(
@@ -138,7 +241,15 @@ pub(super) fn mcp_resolve_mission_file_path(
     mission_file: Option<&str>,
 ) -> std::result::Result<PathBuf, McpToolError> {
     match mission_file {
-        Some(path) => Ok(PathBuf::from(path)),
+        Some(path) => {
+            // [ft-security-mcp-path-traversal] same containment guard as
+            // mcp_resolve_mission_tx_file_path — reject `..` and require
+            // the resolved path to live inside the workspace root.
+            let layout = config
+                .workspace_layout(None)
+                .map_err(McpToolError::from_error)?;
+            resolve_workspace_scoped_path(&layout.root, path)
+        }
         None => mcp_default_mission_file_path(config),
     }
 }
@@ -390,6 +501,7 @@ mod tests {
         mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions,
         mcp_parse_mission_kill_switch, mcp_resolve_mission_file_path,
         mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path, mcp_tx_transition_info,
+        resolve_workspace_scoped_path,
     };
     use crate::config::Config;
     use crate::plan::{
@@ -1026,16 +1138,93 @@ mod tests {
 
     #[test]
     fn resolve_tx_file_path_explicit() {
-        // When explicit path is given, it is used directly
+        // [ft-security-mcp-path-traversal] pre-fix this test expected the
+        // raw path to pass through unchecked. After the fix,
+        // `/tmp/my-tx.json` is outside the workspace root (cwd) and must
+        // be rejected — arbitrary-file read/write via MCP is gone.
         let result = mcp_resolve_mission_tx_file_path(&Config::default(), Some("/tmp/my-tx.json"));
-        // With explicit path, Config doesn't matter
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp/my-tx.json"));
+        let err = result.expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("escapes workspace root"),
+            "unexpected error message: {}",
+            err.message
+        );
     }
 
     #[test]
     fn resolve_mission_file_path_explicit() {
+        // [ft-security-mcp-path-traversal] same containment check as tx.
         let result =
             mcp_resolve_mission_file_path(&Config::default(), Some("/tmp/my-mission.json"));
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp/my-mission.json"));
+        let err = result.expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
+
+    // ── ft-security-mcp-path-traversal regression suite ─────────────
+
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_parent_dir_component() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let err = resolve_workspace_scoped_path(root, "../../../etc/passwd")
+            .expect_err("`..` must be rejected before any filesystem touch");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("parent-directory component"),
+            "expected ../ rejection message, got {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_absolute_path_outside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let err = resolve_workspace_scoped_path(root, "/etc/passwd")
+            .expect_err("absolute path outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_relative_under_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir mission/");
+        std::fs::write(root.join("mission/contract.json"), "{}").expect("write fixture");
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
+        assert!(
+            resolved.ends_with("mission/contract.json"),
+            "resolved path should end with supplied relative: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_save_path_for_nonexistent_target() {
+        // Save paths address a file that does not yet exist; the helper
+        // must canonicalize the nearest existing ancestor and still
+        // enforce containment.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir");
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/not-yet.json").expect("valid save path");
+        assert!(resolved.ends_with("mission/not-yet.json"));
+    }
+
+    #[test]
+    fn resolve_workspace_scoped_path_accepts_absolute_path_inside_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir");
+        std::fs::write(root.join("mission/inside.json"), "{}").expect("write");
+        let abs = root.join("mission/inside.json");
+        let resolved = resolve_workspace_scoped_path(root, &abs.to_string_lossy())
+            .expect("absolute path inside root must be accepted");
+        assert!(resolved.ends_with("mission/inside.json"));
     }
 }
