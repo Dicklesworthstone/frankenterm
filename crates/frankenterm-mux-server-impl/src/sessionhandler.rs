@@ -287,6 +287,20 @@ impl SessionHandler {
         )
     }
 
+    /// Non-inserting accessor for cached per-pane state (ft-12e8l).
+    ///
+    /// Unlike [`per_pane`], this does NOT create an entry when the pane is
+    /// untracked. Use this on push-side paths (e.g. late-arriving Alert
+    /// notifications from mux) where silently re-creating an entry for a
+    /// pane that was already removed via `PaneRemoved` produces a permanent
+    /// map leak — no subsequent `PaneRemoved` ever fires for a dead pane.
+    pub(crate) fn per_pane_if_present(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<Arc<Mutex<PerPane>>> {
+        self.per_pane.get(&pane_id).map(Arc::clone)
+    }
+
     /// Remove cached per-pane state when a pane is destroyed.
     /// Prevents unbounded HashMap growth in long-lived sessions.
     pub(crate) fn remove_per_pane(&mut self, pane_id: PaneId) {

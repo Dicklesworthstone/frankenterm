@@ -252,14 +252,23 @@ where
                     )?;
                 }
                 Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
-                    {
-                        let per_pane = handler.per_pane(pane_id);
-                        let mut per_pane = per_pane
-                            .lock()
-                            .map_err(|err| anyhow::anyhow!("per-pane lock poisoned: {err}"))?;
-                        per_pane.notifications.push(alert);
+                    // ft-12e8l: use the non-inserting accessor. If the pane
+                    // was already removed (PaneRemoved arm above clears the
+                    // entry), re-inserting a fresh PerPane here would leak —
+                    // no subsequent PaneRemoved ever fires for a dead pane.
+                    // Silently drop the stale alert; the client can't render
+                    // a dead pane anyway. For client-initiated PDU arms that
+                    // are the first reference to a pane, per_pane (not this
+                    // helper) is still correct.
+                    if let Some(per_pane) = handler.per_pane_if_present(pane_id) {
+                        {
+                            let mut per_pane = per_pane
+                                .lock()
+                                .map_err(|err| anyhow::anyhow!("per-pane lock poisoned: {err}"))?;
+                            per_pane.notifications.push(alert);
+                        }
+                        handler.schedule_pane_push(pane_id);
                     }
-                    handler.schedule_pane_push(pane_id);
                 }
                 Ok(Item::Notif(MuxNotification::SaveToDownloads { .. })) => {}
                 Ok(Item::Notif(MuxNotification::AssignClipboard {
