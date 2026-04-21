@@ -21,7 +21,7 @@ use super::query::QueryClient;
 pub use super::app::AppConfig;
 
 // Re-export View and ViewState from the ftui backend (the migration target).
-pub use super::ftui_stub::{View, ViewState};
+pub use super::ftui_backend::{View, ViewState};
 
 /// Active TUI rendering backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,11 +92,11 @@ pub fn run_tui<Q: QueryClient + Send + Sync + 'static>(
         TuiBackend::Ftui => {
             // AppConfig is structurally identical in both backends but they are
             // distinct types.  Convert field-by-field for the ftui path.
-            let ftui_config = super::ftui_stub::AppConfig {
+            let ftui_config = super::ftui_backend::AppConfig {
                 refresh_interval: config.refresh_interval,
                 debug: config.debug,
             };
-            super::ftui_stub::run_tui(query_client, ftui_config)
+            super::ftui_backend::run_tui(query_client, ftui_config)
         }
     }
 }

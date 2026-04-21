@@ -98,18 +98,25 @@ pub use app::{App, AppConfig, run_tui};
 #[cfg(all(feature = "tui", not(feature = "rollout")))]
 pub use views::{View, ViewState};
 
-// FrankenTUI backend (migration target — FTUI-03 through FTUI-06)
+// FrankenTUI backend (migration target — FTUI-03 through FTUI-06).
+//
+// [ft-lnlg4] Renamed from `ftui_stub` (2026-04-21). The module was
+// originally scaffolded as a placeholder but grew into the real backend
+// (~8.3k LOC across Home/Panes/Search/Help/Events/Triage/History/Timeline
+// views, all backed by live state). The `_stub` suffix misled every
+// reality-check sweep into flagging the file as unimplemented. Name
+// follows reality now.
 #[cfg(feature = "ftui")]
-mod ftui_stub;
+mod ftui_backend;
 
 #[cfg(all(feature = "ftui", not(feature = "rollout")))]
-pub use ftui_stub::{App, AppConfig, View, ViewState, run_tui};
+pub use ftui_backend::{App, AppConfig, View, ViewState, run_tui};
 
 // Export ftui-native model/message and alias types in both rollout and
 // non-rollout builds so benchmarks and tests can target the ftui surface
 // without depending on rollout-dispatched aliases.
 #[cfg(feature = "ftui")]
-pub use ftui_stub::{
+pub use ftui_backend::{
     AppConfig as FtuiAppConfig, View as FtuiView, ViewState as FtuiViewState, WaModel, WaMsg,
 };
 

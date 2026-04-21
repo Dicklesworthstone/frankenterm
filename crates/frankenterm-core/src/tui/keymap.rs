@@ -9,7 +9,7 @@
 //! # Parity guarantee
 //!
 //! This module is the single source of truth for keybinding behavior.  Both
-//! the ratatui (`app.rs`) and ftui (`ftui_stub.rs`) backends should dispatch
+//! the ratatui (`app.rs`) and ftui (`ftui_backend.rs`) backends should dispatch
 //! through [`resolve`] — or, during the migration period, maintain byte-level
 //! parity with the canonical table (verified by the `parity_` tests below).
 //!
