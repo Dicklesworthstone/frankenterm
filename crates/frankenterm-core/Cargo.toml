@@ -133,6 +133,10 @@ name = "delta_extraction"
 harness = false
 
 [[bench]]
+name = "alt_screen_detection"
+harness = false
+
+[[bench]]
 name = "replay_capture"
 harness = false
 
@@ -395,6 +399,10 @@ harness = false
 
 [[bench]]
 name = "frankensearch_bench"
+harness = false
+
+[[bench]]
+name = "rrf_fusion_archaeology"
 harness = false
 
 [[bench]]
