@@ -521,6 +521,28 @@ ft robot events             # Recent detection events
 ft robot help               # List all robot commands
 ```
 
+#### Implementation status
+
+Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface is real, argument parsing is real, and unimplemented families return a structured `robot.not_implemented` envelope (not silent breakage) — but a caller reaching for the unshipped surfaces will get that envelope back instead of a side effect. The `code` is `robot.not_implemented`, and each response carries an `ntm_equivalent` pointer to the current out-of-band workaround (shell out to `ntm`).
+
+| Family                   | Actions                                   | Status                |
+|--------------------------|-------------------------------------------|-----------------------|
+| `ft robot state`         | current pane state                        | ✅ shipped            |
+| `ft robot get-text`      | single / batch / all pane output          | ✅ shipped            |
+| `ft robot send`          | send text (with policy gate)              | ✅ shipped            |
+| `ft robot wait-for`      | pattern trigger                           | ✅ shipped            |
+| `ft robot search`        | lexical / semantic / hybrid               | ✅ shipped            |
+| `ft robot events`        | recent detection events                   | ✅ shipped            |
+| `ft robot trigger`       | fire detection rule                       | ✅ shipped            |
+| `ft robot approve`       | approve gated action                      | ✅ shipped            |
+| `ft robot checkpoint`    | save / rollback / list                    | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot context`       | status / rotate / history                 | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot work`          | claim / complete / status / list          | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot fleet`         | status / launch / stop / describe         | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot profile`       | show / list / set                         | ⏳ returns `robot.not_implemented` — use `ntm` |
+
+The unimplemented families are tracked under `wa-rsaf` (session state persistence epic) and `ft-z01cl` (this reality-gap note). File an issue if the `robot.not_implemented` envelope for your use case does not include a usable `ntm_equivalent` pointer.
+
 ### MCP (Model Context Protocol)
 
 ```bash
