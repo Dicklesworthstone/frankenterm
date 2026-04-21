@@ -1,0 +1,18 @@
+{
+  "timestamp": "[TIMESTAMP]",
+  "source": "bridge.outer",
+  "data": {
+    "timestamp": "[TIMESTAMP]",
+    "source": "bridge.inner",
+    "data": {
+      "pane_ids": [
+        3,
+        5,
+        9
+      ],
+      "status": "ok"
+    },
+    "degraded": true
+  },
+  "degraded": false
+}

@@ -1,0 +1,12 @@
+{
+  "timestamp": "[TIMESTAMP]",
+  "source": "bridge.float",
+  "data": {
+    "score": 0.3333,
+    "ratio": 1.2346,
+    "nested": {
+      "latency_ms": 12.9877
+    }
+  },
+  "degraded": false
+}

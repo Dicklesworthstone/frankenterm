@@ -47,11 +47,82 @@ impl<T> RobotEnvelope<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::PathBuf;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct DemoPayload {
         id: u32,
         name: String,
+    }
+
+    fn golden_fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden_robot_envelope")
+            .join(format!("{name}.json"))
+    }
+
+    fn canonicalize_json(value: &mut Value, parent_key: Option<&str>) {
+        match value {
+            Value::Object(map) => {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for key in keys {
+                    let child = map.get_mut(&key).expect("key exists");
+                    if key == "timestamp" && child.is_string() {
+                        *child = Value::String("[TIMESTAMP]".to_string());
+                    } else {
+                        canonicalize_json(child, Some(&key));
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    canonicalize_json(item, parent_key);
+                }
+                if matches!(parent_key, Some("agents" | "tags" | "pane_ids")) {
+                    items.sort_by(|left, right| {
+                        serde_json::to_string(left)
+                            .expect("serialize left")
+                            .cmp(&serde_json::to_string(right).expect("serialize right"))
+                    });
+                }
+            }
+            Value::Number(number) => {
+                if let Some(float) = number.as_f64() {
+                    if float.fract() != 0.0 {
+                        let rounded = (float * 10_000.0).round() / 10_000.0;
+                        *value = Value::Number(
+                            serde_json::Number::from_f64(rounded).expect("rounded float"),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_golden_json(name: &str, envelope: &RobotEnvelope<Value>) {
+        let mut actual = serde_json::to_value(envelope).expect("serialize envelope");
+        canonicalize_json(&mut actual, None);
+        let actual_text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&actual).expect("format envelope")
+        );
+        let path = golden_fixture_path(name);
+
+        if std::env::var_os("UPDATE_GOLDENS").is_some() {
+            fs::create_dir_all(path.parent().expect("fixture dir")).expect("create fixture dir");
+            fs::write(&path, &actual_text).expect("write golden");
+        }
+
+        let expected = fs::read_to_string(&path).expect("read golden");
+        assert_eq!(
+            actual_text,
+            expected,
+            "golden mismatch for {}",
+            path.display()
+        );
     }
 
     #[test]
@@ -308,5 +379,97 @@ mod tests {
         assert_eq!(back.data.0, 1);
         assert_eq!(back.data.1, "two");
         assert!((back.data.2 - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn golden_robot_envelope_scalar_payload_json() {
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:34:56Z".to_string(),
+            source: "bridge.scalar".to_string(),
+            data: json!(42),
+            degraded: false,
+        };
+        assert_golden_json("scalar_payload", &envelope);
+    }
+
+    #[test]
+    fn golden_robot_envelope_degraded_payload_json() {
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:35:01Z".to_string(),
+            source: "bridge.degraded".to_string(),
+            data: json!({"reason": "fallback", "attempts": 3}),
+            degraded: true,
+        };
+        assert_golden_json("degraded_payload", &envelope);
+    }
+
+    #[test]
+    fn golden_robot_envelope_float_payload_json() {
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:35:15Z".to_string(),
+            source: "bridge.float".to_string(),
+            data: json!({
+                "score": 0.3333333333,
+                "ratio": 1.23456789,
+                "nested": { "latency_ms": 12.987654321 }
+            }),
+            degraded: false,
+        };
+        assert_golden_json("float_payload", &envelope);
+    }
+
+    #[test]
+    fn golden_robot_envelope_sorted_set_payload_json() {
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:35:30Z".to_string(),
+            source: "bridge.sorted".to_string(),
+            data: json!({
+                "agents": ["agent-c", "agent-a", "agent-b"],
+                "tags": ["zeta", "alpha", "mu"],
+            }),
+            degraded: false,
+        };
+        assert_golden_json("sorted_set_payload", &envelope);
+    }
+
+    #[test]
+    fn golden_robot_envelope_nested_timestamp_payload_json() {
+        let inner = RobotEnvelope {
+            timestamp: "2026-04-20T12:36:01Z".to_string(),
+            source: "bridge.inner".to_string(),
+            data: json!({
+                "pane_ids": [9, 3, 5],
+                "status": "ok"
+            }),
+            degraded: true,
+        };
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:36:05Z".to_string(),
+            source: "bridge.outer".to_string(),
+            data: serde_json::to_value(inner).expect("serialize nested envelope"),
+            degraded: false,
+        };
+        assert_golden_json("nested_timestamp_payload", &envelope);
+    }
+
+    #[test]
+    fn golden_robot_envelope_structured_payload_json() {
+        let envelope = RobotEnvelope {
+            timestamp: "2026-04-20T12:36:20Z".to_string(),
+            source: "bridge.structured".to_string(),
+            data: json!({
+                "pane": {
+                    "id": 7,
+                    "title": "main",
+                    "cwd": "/tmp/demo"
+                },
+                "metrics": {
+                    "cpu": 0.12555555,
+                    "memory_mb": 64.4444444
+                }
+            }),
+            degraded: false,
+        };
+        assert_golden_json("structured_payload", &envelope);
     }
 }
