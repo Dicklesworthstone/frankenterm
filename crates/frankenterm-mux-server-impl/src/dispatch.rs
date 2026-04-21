@@ -3,16 +3,30 @@
 use crate::sessionhandler::{PduSender, SessionHandler};
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use asupersync::runtime::IoDriverHandle;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use asupersync::runtime::reactor::{Interest, IoUringReactor};
 use async_channel::{Receiver, Sender, TryRecvError, unbounded};
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
 use futures::future::{Either, select};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use futures::task::{ArcWake, waker};
 use futures::{FutureExt, pin_mut};
 use mux::{Mux, MuxNotification};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use parking_lot::Mutex as ParkingMutex;
 use std::future::Future;
 use std::io::ErrorKind;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use std::task::{Context as TaskContext, Poll, Waker};
 use wezterm_uds::UnixStream;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,12 +130,6 @@ impl DispatchIoRuntimeAvailability {
             io_uring_runtime_available,
         }
     }
-}
-
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IoUringReactor {
-    _marker: std::marker::PhantomData<io_uring::IoUring>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +309,11 @@ pub trait DispatchStream: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug {
 
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
+
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    fn io_uring_fd(&self) -> Option<RawFd> {
+        None
+    }
 }
 
 impl DispatchStream for UnixStream {
@@ -314,6 +327,11 @@ impl DispatchStream for UnixStream {
 
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(UnixStream::wait_for_writable(self))
+    }
+
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    fn io_uring_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
     }
 }
 
@@ -375,17 +393,271 @@ fn is_clean_disconnect(err: &anyhow::Error) -> bool {
         })
 }
 
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct DispatchRawFdSource {
+    raw_fd: RawFd,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl std::os::fd::AsRawFd for DispatchRawFdSource {
+    fn as_raw_fd(&self) -> RawFd {
+        self.raw_fd
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Default)]
+struct DispatchIoUringWaiter {
+    outcome: ParkingMutex<Option<std::io::Result<()>>>,
+    task_waker: ParkingMutex<Option<Waker>>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl DispatchIoUringWaiter {
+    fn set_task_waker(&self, waker: &Waker) {
+        let mut slot = self.task_waker.lock();
+        if slot
+            .as_ref()
+            .is_none_or(|existing| !existing.will_wake(waker))
+        {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    fn finish(&self, result: std::io::Result<()>) {
+        {
+            let mut outcome = self.outcome.lock();
+            if outcome.is_none() {
+                *outcome = Some(result);
+            }
+        }
+
+        if let Some(waker) = self.task_waker.lock().as_ref().cloned() {
+            waker.wake();
+        }
+    }
+
+    fn take_outcome(&self) -> Option<std::io::Result<()>> {
+        self.outcome.lock().take()
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl ArcWake for DispatchIoUringWaiter {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.finish(Ok(()));
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Default)]
+struct DispatchIoUringRuntimeState {
+    waiters: ParkingMutex<Vec<std::sync::Weak<DispatchIoUringWaiter>>>,
+    poll_error: ParkingMutex<Option<(std::io::ErrorKind, String)>>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl DispatchIoUringRuntimeState {
+    fn track_waiter(&self, waiter: &Arc<DispatchIoUringWaiter>) {
+        let mut waiters = self.waiters.lock();
+        waiters.retain(|existing| existing.strong_count() > 0);
+        waiters.push(Arc::downgrade(waiter));
+    }
+
+    fn poll_error(&self) -> Option<std::io::Error> {
+        self.poll_error
+            .lock()
+            .as_ref()
+            .map(|(kind, message)| std::io::Error::new(*kind, message.clone()))
+    }
+
+    fn fail_waiters(&self, kind: std::io::ErrorKind, message: String) {
+        *self.poll_error.lock() = Some((kind, message.clone()));
+        let mut waiters = self.waiters.lock();
+        waiters.retain(|waiter| {
+            if let Some(waiter) = waiter.upgrade() {
+                waiter.finish(Err(std::io::Error::new(kind, message.clone())));
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+struct DispatchIoUringRuntime {
+    driver: IoDriverHandle,
+    state: Arc<DispatchIoUringRuntimeState>,
+    shutdown: Arc<AtomicBool>,
+    poller: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+struct DispatchIoUringRuntime;
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl DispatchIoUringRuntime {
+    fn maybe_new(reactor: DispatchReactor, raw_fd: Option<RawFd>) -> Option<Self> {
+        if reactor.backend() != DispatchIoBackend::IoUring || raw_fd.is_none() {
+            return None;
+        }
+
+        match Self::new() {
+            Ok(runtime) => Some(runtime),
+            Err(err) => {
+                log::warn!(
+                    "io_uring mux dispatch backend selected but runtime init failed; falling back to readiness path: {err}"
+                );
+                None
+            }
+        }
+    }
+
+    fn new() -> std::io::Result<Self> {
+        let reactor = Arc::new(IoUringReactor::new()?);
+        let driver = IoDriverHandle::new(reactor);
+        let state = Arc::new(DispatchIoUringRuntimeState::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let poll_driver = driver.clone();
+        let poll_state = Arc::clone(&state);
+        let poll_shutdown = Arc::clone(&shutdown);
+        let poller = std::thread::Builder::new()
+            .name("ft-mux-io-uring".to_string())
+            .spawn(move || {
+                while !poll_shutdown.load(Ordering::Acquire) {
+                    match poll_driver.turn(None) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            poll_state.fail_waiters(
+                                err.kind(),
+                                format!("io_uring mux dispatch poll failed: {err}"),
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(std::io::Error::other)?;
+
+        Ok(Self {
+            driver,
+            state,
+            shutdown,
+            poller: Some(poller),
+        })
+    }
+
+    fn wait_for_fd(&self, raw_fd: RawFd, interest: Interest) -> DispatchIoUringWaitFuture<'_> {
+        DispatchIoUringWaitFuture {
+            runtime: self,
+            raw_fd,
+            interest,
+            waiter: Arc::new(DispatchIoUringWaiter::default()),
+            registration: None,
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl Drop for DispatchIoUringRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.driver.wake();
+        if let Some(poller) = self.poller.take() {
+            let _ = poller.join();
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+struct DispatchIoUringWaitFuture<'a> {
+    runtime: &'a DispatchIoUringRuntime,
+    raw_fd: RawFd,
+    interest: Interest,
+    waiter: Arc<DispatchIoUringWaiter>,
+    registration: Option<asupersync::runtime::IoRegistration>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl Future for DispatchIoUringWaitFuture<'_> {
+    type Output = std::io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(result) = self.waiter.take_outcome() {
+            self.registration.take();
+            return Poll::Ready(result);
+        }
+
+        if let Some(err) = self.runtime.state.poll_error() {
+            return Poll::Ready(Err(err));
+        }
+
+        self.waiter.set_task_waker(cx.waker());
+
+        if self.registration.is_none() {
+            self.runtime.state.track_waiter(&self.waiter);
+            let source = DispatchRawFdSource {
+                raw_fd: self.raw_fd,
+            };
+            self.registration = Some(self.runtime.driver.register(
+                &source,
+                self.interest,
+                waker(Arc::clone(&self.waiter)),
+            )?);
+        }
+
+        if let Some(result) = self.waiter.take_outcome() {
+            self.registration.take();
+            Poll::Ready(result)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+async fn wait_for_dispatch_readable<T>(
+    stream: &T,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+) -> std::io::Result<()>
+where
+    T: DispatchStream,
+{
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    if let (Some(runtime), Some(raw_fd)) = (io_uring_runtime, stream.io_uring_fd()) {
+        return runtime.wait_for_fd(raw_fd, Interest::READABLE).await;
+    }
+
+    stream.wait_for_readable().await
+}
+
+async fn wait_for_dispatch_writable<T>(
+    stream: &T,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+) -> std::io::Result<()>
+where
+    T: DispatchStream,
+{
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    if let (Some(runtime), Some(raw_fd)) = (io_uring_runtime, stream.io_uring_fd()) {
+        return runtime.wait_for_fd(raw_fd, Interest::WRITABLE).await;
+    }
+
+    stream.wait_for_writable().await
+}
+
 async fn write_pending_pdus<T>(
     stream: &mut T,
     first: Box<DecodedPdu>,
     item_rx: &Receiver<Item>,
     deferred_item: &mut Option<Item>,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
 ) -> anyhow::Result<()>
 where
     T: DispatchStream,
 {
-    stream
-        .wait_for_writable()
+    wait_for_dispatch_writable(stream, io_uring_runtime)
         .await
         .context("waiting for mux stream to become writable")?;
 
@@ -462,6 +734,10 @@ where
 
     let (item_tx, item_rx) = unbounded::<Item>();
     let mut deferred_item = None;
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    let io_uring_runtime = DispatchIoUringRuntime::maybe_new(reactor, stream.io_uring_fd());
+    #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+    let io_uring_runtime: Option<DispatchIoUringRuntime> = None;
 
     let pdu_sender = PduSender::new({
         let item_tx = item_tx.clone();
@@ -488,9 +764,11 @@ where
                         let rx_msg = item_rx
                             .recv()
                             .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
-                        let wait_for_read = stream.wait_for_readable().map(|result| {
-                            result.map(|()| Item::Readable).map_err(anyhow::Error::from)
-                        });
+                        let wait_for_read = wait_for_dispatch_readable(
+                            &stream,
+                            io_uring_runtime.as_ref(),
+                        )
+                        .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
 
                         pin_mut!(rx_msg);
                         pin_mut!(wait_for_read);
@@ -518,8 +796,14 @@ where
                     handler.process_one(decoded);
                 }
                 Ok(Item::WritePdu(decoded)) => {
-                    if let Err(err) =
-                        write_pending_pdus(&mut stream, decoded, &item_rx, &mut deferred_item).await
+                    if let Err(err) = write_pending_pdus(
+                        &mut stream,
+                        decoded,
+                        &item_rx,
+                        &mut deferred_item,
+                        io_uring_runtime.as_ref(),
+                    )
+                    .await
                     {
                         if is_clean_disconnect(&err) {
                             return Ok(());
@@ -655,6 +939,10 @@ mod tests {
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use codec::Ping;
     use std::io;
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    use std::io::Write;
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    use std::os::fd::AsRawFd;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -833,6 +1121,7 @@ mod tests {
             queued_ping(1),
             &item_rx,
             &mut deferred_item,
+            None,
         ));
 
         assert!(result.is_ok(), "batched write helper should succeed");
@@ -951,5 +1240,32 @@ mod tests {
 
         assert_eq!(reactor.backend(), DispatchIoBackend::Poll);
         assert_eq!(reactor.fallback_reason(), None);
+    }
+
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[test]
+    fn io_uring_runtime_waits_for_unix_fd_readability() {
+        let runtime = match DispatchIoUringRuntime::new() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("skipping io_uring readability test: {err}");
+                return;
+            }
+        };
+        let (left, mut right) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        left.set_nonblocking(true).expect("left nonblocking");
+        right.set_nonblocking(true).expect("right nonblocking");
+
+        let writer = std::thread::spawn(move || {
+            right.write_all(b"ping").expect("write ping");
+        });
+
+        let result =
+            promise::spawn::block_on(runtime.wait_for_fd(left.as_raw_fd(), Interest::READABLE));
+        writer.join().expect("writer thread");
+        assert!(
+            result.is_ok(),
+            "readability wait should succeed: {result:?}"
+        );
     }
 }
