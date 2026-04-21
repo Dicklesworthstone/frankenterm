@@ -4215,7 +4215,7 @@ enum SnapshotCommands {
         #[arg(long)]
         label: Option<String>,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4237,7 +4237,7 @@ enum SnapshotCommands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4252,7 +4252,7 @@ enum SnapshotCommands {
         #[arg(long)]
         session: Option<String>,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4265,7 +4265,7 @@ enum SnapshotCommands {
         /// Second snapshot ID
         id2: String,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4279,7 +4279,7 @@ enum SnapshotCommands {
         #[arg(long)]
         pane: Option<u64>,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4299,7 +4299,7 @@ enum SnapshotCommands {
 enum SessionCommands {
     /// List all saved sessions
     List {
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4313,7 +4313,7 @@ enum SessionCommands {
         #[arg(long)]
         pane: Option<u64>,
 
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -4330,7 +4330,7 @@ enum SessionCommands {
 
     /// Health check on session persistence data
     Doctor {
-        /// Output format: auto, plain, or json
+        /// Output format: auto, plain, json, or toon
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
@@ -8203,6 +8203,74 @@ fn resolve_prepare_output_format(format: &str) -> frankenterm_core::output::Outp
             std::process::exit(1);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSessionOutputFormat {
+    Plain,
+    Json,
+    Toon,
+}
+
+impl SnapshotSessionOutputFormat {
+    fn is_structured(self) -> bool {
+        matches!(self, Self::Json | Self::Toon)
+    }
+}
+
+fn parse_snapshot_session_output_format(
+    format: &str,
+) -> anyhow::Result<SnapshotSessionOutputFormat> {
+    use frankenterm_core::output::{OutputFormat, detect_format};
+
+    match format.to_lowercase().as_str() {
+        "json" => Ok(SnapshotSessionOutputFormat::Json),
+        "plain" => Ok(SnapshotSessionOutputFormat::Plain),
+        "toon" => Ok(SnapshotSessionOutputFormat::Toon),
+        "auto" => match detect_format() {
+            OutputFormat::Json => Ok(SnapshotSessionOutputFormat::Json),
+            _ => Ok(SnapshotSessionOutputFormat::Plain),
+        },
+        _ => Err(anyhow::anyhow!(
+            "Unknown output format '{format}'. Use plain, json, or toon."
+        )),
+    }
+}
+
+fn resolve_snapshot_session_output_format(format: &str) -> SnapshotSessionOutputFormat {
+    match parse_snapshot_session_output_format(format) {
+        Ok(format) => format,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn format_snapshot_session_structured_output<T: serde::Serialize>(
+    payload: &T,
+    format: SnapshotSessionOutputFormat,
+) -> anyhow::Result<Option<String>> {
+    match format {
+        SnapshotSessionOutputFormat::Plain => Ok(None),
+        SnapshotSessionOutputFormat::Json => Ok(Some(serde_json::to_string_pretty(payload)?)),
+        SnapshotSessionOutputFormat::Toon => Ok(Some(toon_rust::encode(
+            serde_json::to_value(payload)?,
+            None,
+        ))),
+    }
+}
+
+fn print_snapshot_session_structured_output<T: serde::Serialize>(
+    payload: &T,
+    format: SnapshotSessionOutputFormat,
+) -> anyhow::Result<bool> {
+    if let Some(rendered) = format_snapshot_session_structured_output(payload, format)? {
+        println!("{rendered}");
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn resolve_checkpoint_id(db_path: &str, snapshot_id: &str) -> anyhow::Result<i64> {
@@ -39188,6 +39256,7 @@ async fn handle_snapshot_command(
             label: _label,
             format,
         } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let snap_trigger = snapshot_trigger_from_cli_label(trigger.as_str());
 
             let engine = SnapshotEngine::new(db_path, config.snapshots.clone());
@@ -39201,12 +39270,10 @@ async fn handle_snapshot_command(
                 .map_err(|e| anyhow::anyhow!("Failed to list panes: {e}"))?;
 
             if panes.is_empty() {
-                if format == "json" {
-                    println!(
-                        "{}",
-                        serde_json::json!({"ok": false, "error": "No panes found"})
-                    );
-                } else {
+                if !print_snapshot_session_structured_output(
+                    &serde_json::json!({"ok": false, "error": "No panes found"}),
+                    output_format,
+                )? {
                     eprintln!(
                         "No panes found. Is the active backend bridge (current: WezTerm) running?"
                     );
@@ -39222,17 +39289,15 @@ async fn handle_snapshot_command(
                 .await
             {
                 Ok(result) => {
-                    if format == "json" {
-                        let resp = serde_json::json!({
-                            "ok": true,
-                            "session_id": result.session_id,
-                            "checkpoint_id": result.checkpoint_id,
-                            "pane_count": result.pane_count,
-                            "total_bytes": result.total_bytes,
-                            "trigger": format!("{:?}", result.trigger),
-                        });
-                        println!("{}", serde_json::to_string_pretty(&resp)?);
-                    } else {
+                    let resp = serde_json::json!({
+                        "ok": true,
+                        "session_id": result.session_id,
+                        "checkpoint_id": result.checkpoint_id,
+                        "pane_count": result.pane_count,
+                        "total_bytes": result.total_bytes,
+                        "trigger": format!("{:?}", result.trigger),
+                    });
+                    if !print_snapshot_session_structured_output(&resp, output_format)? {
                         println!("Snapshot saved");
                         println!("  Session:    {}", result.session_id);
                         println!("  Checkpoint: {}", result.checkpoint_id);
@@ -39241,12 +39306,10 @@ async fn handle_snapshot_command(
                     }
                 }
                 Err(e) => {
-                    if format == "json" {
-                        println!(
-                            "{}",
-                            serde_json::json!({"ok": false, "error": format!("{e}")})
-                        );
-                    } else {
+                    if !print_snapshot_session_structured_output(
+                        &serde_json::json!({"ok": false, "error": format!("{e}")}),
+                        output_format,
+                    )? {
                         eprintln!("Snapshot failed: {e}");
                     }
                     std::process::exit(1);
@@ -39259,6 +39322,7 @@ async fn handle_snapshot_command(
             session,
             format,
         } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let conn = rusqlite::Connection::open(db_path.as_str())?;
 
             let query = if let Some(ref sid) = session {
@@ -39296,7 +39360,7 @@ async fn handle_snapshot_command(
 
             let snapshots: Vec<_> = rows.filter_map(|r| r.ok()).collect();
 
-            if format == "json" {
+            if output_format.is_structured() {
                 let items: Vec<serde_json::Value> = snapshots
                     .iter()
                     .map(|(id, session_id, at, cp_type, panes, bytes, hash)| {
@@ -39311,14 +39375,14 @@ async fn handle_snapshot_command(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                print_snapshot_session_structured_output(
+                    &serde_json::json!({
                         "ok": true,
                         "count": items.len(),
                         "snapshots": items,
-                    }))?
-                );
+                    }),
+                    output_format,
+                )?;
             } else if snapshots.is_empty() {
                 println!("No snapshots found.");
             } else {
@@ -39346,6 +39410,7 @@ async fn handle_snapshot_command(
             pane,
             format,
         } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let conn = rusqlite::Connection::open(db_path.as_str())?;
             let cp_id: i64 = snapshot_id.parse().map_err(|_| {
                 anyhow::anyhow!("Invalid snapshot ID: {snapshot_id} (expected integer)")
@@ -39372,12 +39437,10 @@ async fn handle_snapshot_command(
             let (id, session_id, at, cp_type, pane_count, total_bytes, hash) = match checkpoint {
                 Ok(cp) => cp,
                 Err(_) => {
-                    if format == "json" {
-                        println!(
-                            "{}",
-                            serde_json::json!({"ok": false, "error": format!("Snapshot {cp_id} not found")})
-                        );
-                    } else {
+                    if !print_snapshot_session_structured_output(
+                        &serde_json::json!({"ok": false, "error": format!("Snapshot {cp_id} not found")}),
+                        output_format,
+                    )? {
                         eprintln!("Snapshot {} not found", cp_id);
                     }
                     std::process::exit(1);
@@ -39411,7 +39474,7 @@ async fn handle_snapshot_command(
             })?;
             let pane_states: Vec<_> = pane_rows.filter_map(|r| r.ok()).collect();
 
-            if format == "json" {
+            if output_format.is_structured() {
                 let panes_json: Vec<serde_json::Value> = pane_states
                     .iter()
                     .map(|(pid, cwd, cmd, term_json, agent_json)| {
@@ -39442,7 +39505,7 @@ async fn handle_snapshot_command(
                     "state_hash": hash,
                     "panes": panes_json,
                 });
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                print_snapshot_session_structured_output(&resp, output_format)?;
             } else {
                 println!("Snapshot #{id}");
                 println!("  Session:  {session_id}");
@@ -39486,6 +39549,7 @@ async fn handle_snapshot_command(
         }
 
         SnapshotCommands::Diff { id1, id2, format } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let conn = rusqlite::Connection::open(db_path.as_str())?;
             let cp1: i64 = id1
                 .parse()
@@ -39516,7 +39580,7 @@ async fn handle_snapshot_command(
             let removed: Vec<i64> = set1.difference(&set2).copied().collect();
             let common: Vec<i64> = set1.intersection(&set2).copied().collect();
 
-            if format == "json" {
+            if output_format.is_structured() {
                 let resp = serde_json::json!({
                     "ok": true,
                     "snapshot_1": cp1,
@@ -39527,7 +39591,7 @@ async fn handle_snapshot_command(
                     "panes_in_1": panes1.len(),
                     "panes_in_2": panes2.len(),
                 });
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                print_snapshot_session_structured_output(&resp, output_format)?;
             } else {
                 println!("Diff: Snapshot #{cp1} -> #{cp2}");
                 println!(
@@ -39590,8 +39654,7 @@ async fn handle_snapshot_command(
             dry_run,
             format,
         } => {
-            let output_format = resolve_prepare_output_format(&format);
-            let emit_json = matches!(output_format, frankenterm_core::output::OutputFormat::Json);
+            let output_format = resolve_snapshot_session_output_format(&format);
             let restore_options = SnapshotRestoreWorkflowOptions {
                 layout_only,
                 launch_agents,
@@ -39601,15 +39664,13 @@ async fn handle_snapshot_command(
             let checkpoint_id = match resolve_checkpoint_id(db_path.as_str(), &snapshot_id) {
                 Ok(id) => id,
                 Err(e) => {
-                    if emit_json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "ok": false,
-                                "error": e.to_string(),
-                            }))?
-                        );
-                    } else {
+                    if !print_snapshot_session_structured_output(
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": e.to_string(),
+                        }),
+                        output_format,
+                    )? {
                         eprintln!("Snapshot restore failed: {e}");
                     }
                     std::process::exit(1);
@@ -39622,15 +39683,13 @@ async fn handle_snapshot_command(
             )? {
                 Some(cp) => cp,
                 None => {
-                    if emit_json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "ok": false,
-                                "error": format!("Snapshot {checkpoint_id} not found"),
-                            }))?
-                        );
-                    } else {
+                    if !print_snapshot_session_structured_output(
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": format!("Snapshot {checkpoint_id} not found"),
+                        }),
+                        output_format,
+                    )? {
                         eprintln!("Snapshot {checkpoint_id} not found");
                     }
                     std::process::exit(1);
@@ -39638,14 +39697,11 @@ async fn handle_snapshot_command(
             };
 
             if dry_run {
-                if emit_json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&snapshot_restore_dry_run_json(
-                            &checkpoint,
-                            restore_options,
-                        ))?
-                    );
+                if output_format.is_structured() {
+                    print_snapshot_session_structured_output(
+                        &snapshot_restore_dry_run_json(&checkpoint, restore_options),
+                        output_format,
+                    )?;
                 } else {
                     for line in snapshot_restore_plan_lines(&checkpoint, restore_options) {
                         println!("{line}");
@@ -39670,21 +39726,21 @@ async fn handle_snapshot_command(
             .await
             {
                 Ok(result) => {
-                    if emit_json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&snapshot_restore_result_json(&result))?
-                        );
+                    if output_format.is_structured() {
+                        print_snapshot_session_structured_output(
+                            &snapshot_restore_result_json(&result),
+                            output_format,
+                        )?;
                     } else {
                         print_snapshot_restore_result_plain(&result);
                     }
                 }
                 Err(abort) => {
-                    if emit_json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&snapshot_restore_abort_json(&abort))?
-                        );
+                    if output_format.is_structured() {
+                        print_snapshot_session_structured_output(
+                            &snapshot_restore_abort_json(&abort),
+                            output_format,
+                        )?;
                     } else {
                         print_snapshot_restore_abort_plain(&abort);
                     }
@@ -39710,10 +39766,11 @@ async fn handle_session_command(
 
     match command {
         SessionCommands::List { format } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let sessions = session_restore::list_sessions(&db_path)?;
 
-            if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            if output_format.is_structured() {
+                print_snapshot_session_structured_output(&sessions, output_format)?;
                 return Ok(());
             }
 
@@ -39763,15 +39820,16 @@ async fn handle_session_command(
             pane,
             format,
         } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let (session, checkpoints) = session_restore::show_session(&db_path, &session_id)?;
             let pane_lookup = pane
                 .map(|pane_id| load_session_show_pane_lookup(&db_path, &session_id, pane_id))
                 .transpose()?;
 
-            if format == "json" {
+            if output_format.is_structured() {
                 let data =
                     build_session_show_json_payload(&session, &checkpoints, pane_lookup.as_ref())?;
-                println!("{}", serde_json::to_string_pretty(&data)?);
+                print_snapshot_session_structured_output(&data, output_format)?;
                 return Ok(());
             }
 
@@ -39874,14 +39932,15 @@ async fn handle_session_command(
         }
 
         SessionCommands::Doctor { format } => {
+            let output_format = resolve_snapshot_session_output_format(&format);
             let report = session_restore::session_doctor(&db_path)?;
             let guidance = build_session_recovery_guidance(&report);
 
-            if format == "json" {
+            if output_format.is_structured() {
                 let mut payload = serde_json::to_value(&report)?;
                 payload["operator_guidance"] =
                     serde_json::to_value(&guidance).unwrap_or(serde_json::Value::Null);
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                print_snapshot_session_structured_output(&payload, output_format)?;
                 return Ok(());
             }
 
@@ -43280,6 +43339,59 @@ mod tests {
         assert_eq!(payload["pane"]["status"].as_str(), Some("pane_not_found"));
         assert_eq!(payload["pane"]["requested_pane_id"].as_u64(), Some(42));
         assert_eq!(payload["pane"]["checkpoint_id"].as_i64(), Some(17));
+    }
+
+    #[test]
+    fn parse_snapshot_session_output_format_supports_toon() {
+        assert_eq!(
+            parse_snapshot_session_output_format("toon").expect("toon should parse"),
+            SnapshotSessionOutputFormat::Toon
+        );
+        assert_eq!(
+            parse_snapshot_session_output_format("TOON").expect("uppercase toon should parse"),
+            SnapshotSessionOutputFormat::Toon
+        );
+        assert_eq!(
+            parse_snapshot_session_output_format("json").expect("json should parse"),
+            SnapshotSessionOutputFormat::Json
+        );
+        assert_eq!(
+            parse_snapshot_session_output_format("plain").expect("plain should parse"),
+            SnapshotSessionOutputFormat::Plain
+        );
+    }
+
+    #[test]
+    fn parse_snapshot_session_output_format_rejects_unknown_values() {
+        let err = parse_snapshot_session_output_format("yaml").expect_err("yaml should fail");
+        assert!(err.to_string().contains("plain, json, or toon"));
+    }
+
+    #[test]
+    fn format_snapshot_session_structured_output_toon_roundtrips() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "checkpoint_id": 42,
+            "session_id": "sess-toon",
+            "count": 3,
+        });
+        let rendered =
+            format_snapshot_session_structured_output(&payload, SnapshotSessionOutputFormat::Toon)
+                .expect("toon formatting should succeed")
+                .expect("toon output should be present");
+
+        let decoded = toon_rust::try_decode(&rendered, None).expect("decode toon");
+        let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&json).expect("roundtrip json should parse");
+
+        assert_eq!(roundtripped["ok"], payload["ok"]);
+        assert_eq!(
+            roundtripped["checkpoint_id"].as_f64().map(|n| n as i64),
+            Some(42)
+        );
+        assert_eq!(roundtripped["session_id"], "sess-toon");
+        assert_eq!(roundtripped["count"].as_f64().map(|n| n as i64), Some(3));
     }
 
     #[test]
