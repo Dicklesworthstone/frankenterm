@@ -23,6 +23,13 @@ const FRAME_HEADER_LEN: usize = 14;
 /// Default keyframe interval (one keyframe every N output frames).
 const KEYFRAME_INTERVAL: usize = 50;
 
+/// Maximum size of a `.war` recording accepted by [`Recording::load`].
+///
+/// Blocks a repo-clone attacker from planting a huge recording that
+/// would OOM the process on `ft replay`. 256 MiB comfortably exceeds
+/// any realistic recording (typical sessions are single-digit MB).
+pub const MAX_RECORDING_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Parse a single [`RecordingFrame`] from a byte slice starting at `offset`.
 ///
 /// Returns the parsed frame and the offset immediately after it.
@@ -99,7 +106,18 @@ pub struct Recording {
 
 impl Recording {
     /// Load a recording from the given `.war` file path.
+    ///
+    /// Rejects files larger than [`MAX_RECORDING_BYTES`] before reading
+    /// to block repo-clone OOM attacks via hostile `.war` payloads.
     pub fn load(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_RECORDING_BYTES {
+            return Err(crate::Error::Runtime(format!(
+                "recording file {} bytes exceeds max {} bytes",
+                meta.len(),
+                MAX_RECORDING_BYTES
+            )));
+        }
         let mut file = std::fs::File::open(path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
@@ -936,9 +954,7 @@ pub fn export_asciinema<W: std::io::Write>(
                 })?;
                 event_count += 1;
             }
-            FrameType::Resize
-                if frame.payload.len() >= 4 =>
-            {
+            FrameType::Resize if frame.payload.len() >= 4 => {
                 let c = u16::from_le_bytes([frame.payload[0], frame.payload[1]]);
                 let r = u16::from_le_bytes([frame.payload[2], frame.payload[3]]);
                 let event = serde_json::json!([rel_secs, "r", format!("{c}x{r}")]);
@@ -1996,6 +2012,24 @@ mod tests {
     fn recording_load_nonexistent_file_errors() {
         let result = Recording::load(std::path::Path::new("/tmp/nonexistent_wa_test.war"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn recording_load_rejects_oversized_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.war");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_RECORDING_BYTES + 1).unwrap();
+        f.write_all(&[0u8]).unwrap();
+        drop(f);
+
+        let err = Recording::load(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds max"),
+            "oversize load should reject before read, got: {msg}"
+        );
     }
 
     #[test]
