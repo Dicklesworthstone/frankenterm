@@ -133,5 +133,17 @@ name = "toon_decode"
 path = "fuzz_targets/toon_decode.rs"
 doc = false
 
+[[bin]]
+name = "protocol_recovery_state"
+path = "fuzz_targets/protocol_recovery_state.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "ipc_auth_envelope"
+path = "fuzz_targets/ipc_auth_envelope.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
 [profile.release]
 debug = 1

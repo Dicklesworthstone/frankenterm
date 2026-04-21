@@ -536,6 +536,68 @@ impl IpcAuth {
     }
 }
 
+// ── Fuzz seams ───────────────────────────────────────────────────────
+//
+// [sec] Narrow, `#[doc(hidden)]` public wrappers expose the IPC auth
+// pipeline for fuzz harnesses in `fuzz/fuzz_targets/`. They are NOT
+// part of the public API — `#[doc(hidden)]` keeps them out of rustdoc,
+// and they return `&'static str` status tokens rather than exposing
+// `IpcAuthError` internals so the fuzz harness can't accidentally
+// become a public dependency on the private error enum.
+
+/// [fuzz seam] Constant-time equality over raw strings.
+///
+/// Exposed so `fuzz/fuzz_targets/ipc_auth_envelope.rs` can exercise
+/// `ipc_constant_time_eq` directly — malformed UTF-8 is already
+/// impossible at this boundary (both args are `&str`), but the fuzz
+/// harness explores every length, byte, and mismatch position in the
+/// operand space to pin the no-panic invariant and the length-difference
+/// short-circuit that would otherwise leak timing.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_constant_time_eq(a: &str, b: &str) -> bool {
+    ipc_constant_time_eq(a, b)
+}
+
+/// [fuzz seam] End-to-end parse + authorize pipeline.
+///
+/// Mirrors the wire-format path inside `handle_client_with_context_with_cx`:
+/// take a line of bytes, parse as `IpcEnvelope`, run `IpcAuth::authorize`
+/// with the envelope's token and the request's required scope, and
+/// return a short status token. Returns one of:
+///
+/// - `"not_utf8"`   — bytes aren't valid UTF-8.
+/// - `"parse_err"`  — `serde_json` rejected the envelope (malformed JSON,
+///   missing required fields, unknown tag, etc.).
+/// - `"allowed"`    — auth succeeded.
+/// - `"missing"`    — envelope omitted `token` but auth has tokens configured.
+/// - `"invalid"`    — token present but no candidate matched.
+/// - `"expired"`    — token matched but `expires_at_ms` is in the past.
+/// - `"scope"`      — token matched but scopes don't allow the request.
+///
+/// The fuzz harness never asserts on a particular return value — it
+/// asserts on the absence of panics and that the same bytes + same auth
+/// always produce the same status (determinism).
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_parse_envelope_and_authorize(line: &[u8], auth: &IpcAuth) -> &'static str {
+    let s = match std::str::from_utf8(line) {
+        Ok(s) => s,
+        Err(_) => return "not_utf8",
+    };
+    let envelope: IpcEnvelope = match serde_json::from_str(s) {
+        Ok(e) => e,
+        Err(_) => return "parse_err",
+    };
+    match auth.authorize(envelope.token.as_deref(), envelope.request.required_scope()) {
+        Ok(()) => "allowed",
+        Err(IpcAuthError::MissingToken) => "missing",
+        Err(IpcAuthError::InvalidToken) => "invalid",
+        Err(IpcAuthError::ExpiredToken) => "expired",
+        Err(IpcAuthError::InsufficientScope { .. }) => "scope",
+    }
+}
+
 #[derive(Debug)]
 // NOTE: Reserved for IPC auth enforcement (bd-3p06).
 #[allow(dead_code)]
