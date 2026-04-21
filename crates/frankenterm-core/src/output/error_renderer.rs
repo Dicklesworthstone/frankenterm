@@ -109,6 +109,7 @@ impl ErrorRenderer {
         }
 
         if let Some(remediation) = error.remediation() {
+            obj["hint"] = serde_json::json!(remediation.summary.clone());
             obj["remediation"] = serde_json::json!({
                 "summary": remediation.summary,
                 "commands": remediation.commands.iter().map(|c| {
@@ -717,9 +718,91 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         // WeztermError provides remediation
         assert!(parsed.get("remediation").is_some());
+        assert!(parsed["hint"].is_string());
         let rem = &parsed["remediation"];
         assert!(rem["summary"].is_string());
         assert!(rem["commands"].is_array());
+    }
+
+    #[test]
+    fn render_json_config_parse_error_hint_points_to_config_validate() {
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let error = Error::Config(ConfigError::ParseFailed("unexpected `]`".into()));
+        let output = renderer.render(&error);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            parsed["hint"].as_str(),
+            Some(
+                "Config parse failed. Run `ft config validate` to pinpoint the syntax error, then retry."
+            )
+        );
+        assert!(
+            parsed["remediation"]["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd["command"] == "ft config validate")
+        );
+    }
+
+    #[test]
+    fn render_json_invalid_regex_hint_points_to_rules_lint() {
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let error = Error::Pattern(PatternError::InvalidRegex(
+            "unterminated character class".into(),
+        ));
+        let output = renderer.render(&error);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            parsed["hint"].as_str(),
+            Some(
+                "Regex pattern invalid. Run the rule-pack linter to identify the failing rule before retrying."
+            )
+        );
+        assert!(
+            parsed["remediation"]["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd["command"] == "ft robot rules lint --fixtures --strict")
+        );
+    }
+
+    #[test]
+    fn render_json_corruption_hint_prefers_backup_recovery() {
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let error = Error::Storage(StorageError::Corruption {
+            details: "sqlite page checksum mismatch".into(),
+        });
+        let output = renderer.render(&error);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            parsed["hint"].as_str(),
+            Some(
+                "Database corruption detected. Capture diagnostics, then restore from a known-good backup before retrying."
+            )
+        );
+        let alternatives = parsed["remediation"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            alternatives
+                .iter()
+                .any(|alt| alt.contains("ft backup restore")),
+            "expected backup restore guidance in alternatives: {alternatives:?}"
+        );
+        assert!(
+            alternatives
+                .iter()
+                .all(|alt| !alt.contains("Delete the database file")),
+            "corruption hint should not recommend deleting the database: {alternatives:?}"
+        );
     }
 
     #[test]

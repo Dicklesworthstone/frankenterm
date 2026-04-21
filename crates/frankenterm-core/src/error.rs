@@ -452,10 +452,12 @@ impl StorageError {
                 .command("Example search", "ft search \"term\"")
                 .alternative("Review FTS5 query syntax and try again."),
             Self::Corruption { .. } => Remediation::new(
-                "Database corruption detected. Automatic recovery is not possible.",
+                "Database corruption detected. Capture diagnostics, then restore from a known-good backup before retrying.",
             )
             .command("Run diagnostics", "ft doctor")
-            .alternative("Delete the database file and restart with fresh data."),
+            .command("List backups", "ft backup list")
+            .alternative("If you have a recent backup, restore it with `ft backup restore <path>`.")
+            .alternative("If no backup exists, copy the database aside before attempting manual recovery."),
             Self::NotFound(_) => Remediation::new("The requested resource was not found.")
                 .command("List resources", "ft status")
                 .alternative("Verify the resource exists before accessing it."),
@@ -489,10 +491,10 @@ impl PatternError {
                     .alternative("Fix the rule definition in ft.toml.")
             }
             Self::InvalidRegex(_) => Remediation::new(
-                "Regex pattern invalid. Fix the regex or disable pattern detection.",
+                "Regex pattern invalid. Run the rule-pack linter to identify the failing rule before retrying.",
             )
-            .command("Disable patterns", "ft watch --no-patterns")
-            .alternative("Validate the regex syntax."),
+            .command("Lint rules", "ft robot rules lint --fixtures --strict")
+            .alternative("If the regex came from ft.toml, fix that rule or temporarily disable the affected pack."),
             Self::PackNotFound(_) => Remediation::new(
                 "Pattern pack not found. Enable the pack or disable pattern detection.",
             )
@@ -585,11 +587,11 @@ impl ConfigError {
             ))
             .command("Check permissions", format!("ls -l \"{path}\""))
             .alternative("Ensure the file is readable by the current user."),
-            Self::ParseError(_) | Self::ParseFailed(_) => {
-                Remediation::new("Config parse failed. Fix the syntax and retry.")
-                    .command("Diagnostics", "ft doctor")
-                    .alternative("Validate the config file format.")
-            }
+            Self::ParseError(_) | Self::ParseFailed(_) => Remediation::new(
+                "Config parse failed. Run `ft config validate` to pinpoint the syntax error, then retry.",
+            )
+            .command("Validate config", "ft config validate")
+            .alternative("If you passed --config, make sure it points at the file you intended to load."),
             Self::SerializeFailed(_) => {
                 Remediation::new("Failed to serialize configuration. Check config values.")
                     .command("Diagnostics", "ft doctor")

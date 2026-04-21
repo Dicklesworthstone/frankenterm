@@ -99,6 +99,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "snapshot_deserialize"
+path = "fuzz_targets/snapshot_deserialize.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "pdu_stream_decode"
 path = "fuzz_targets/pdu_stream_decode.rs"
 doc = false
