@@ -30,6 +30,17 @@ const OOM_CRASHER: &[u8] = &[
     0xFE,
 ];
 
+/// The 71-byte ASan crasher from `ft-y87lf`. The first frame is a crafted
+/// `GetLinesResponse`; the trailing bytes keep the fuzz target in its
+/// multi-step decode loop.
+const ASAN_ALLOCATION_TOO_BIG_CRASHER: &[u8] = &[
+    0x3A, 0x26, 0x17, 0x43, 0x22, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E,
+    0x01, 0x00, 0x0E, 0x44, 0x04, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0xFF, 0xFF, 0x03, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xE8, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x16, 0xFF, 0xFF, 0xFF, 0xFA,
+    0x00, 0x00, 0x04, 0x49, 0x03, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 0xFF, 0xFF, 0xFF, 0xFF, 0x02,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFB, 0x29,
+];
+
 #[test]
 fn oom_crasher_5c320deb_rejected_without_allocation() {
     // The test process has a normal 64-bit address space — the pre-fix
@@ -91,5 +102,38 @@ fn oom_crasher_5c320deb_completes_quickly() {
         "stream_decode on the OOM crasher took {:?} — expected sub-second rejection; \
          a slow path suggests the attacker-controlled length reached an allocator",
         elapsed
+    );
+}
+
+#[test]
+fn asan_crasher_22974e1f_completes_without_allocator_blowup() {
+    let mut buf = ASAN_ALLOCATION_TOO_BIG_CRASHER.to_vec();
+    let mut saw_progress = false;
+
+    for _ in 0..8 {
+        let before_len = buf.len();
+
+        match Pdu::stream_decode(&mut buf) {
+            Ok(Some(decoded)) => {
+                saw_progress = true;
+                let _ = decoded.serial;
+                let _ = decoded.pdu.pdu_name();
+                assert!(
+                    buf.len() < before_len,
+                    "stream_decode must consume bytes when it returns a frame"
+                );
+            }
+            Ok(None) => break,
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(!msg.is_empty(), "stream_decode returned an empty error");
+                return;
+            }
+        }
+    }
+
+    assert!(
+        saw_progress,
+        "ASan crasher made no decode progress and produced no error"
     );
 }

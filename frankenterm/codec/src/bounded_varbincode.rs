@@ -1,5 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use serde::de::{self, Error as _, IntoDeserializer};
+use std::convert::TryInto;
 use std::io::Read;
 use varbincode::error::{Error, Result};
 
@@ -38,8 +39,15 @@ impl<'a, R: Read> Deserializer<'a, R> {
         leb128::read::unsigned(&mut self.reader).map_err(Into::into)
     }
 
+    fn read_len_prefix(&mut self, kind: &str) -> Result<usize> {
+        let raw_len = self.read_unsigned()?;
+        raw_len
+            .try_into()
+            .map_err(|_| Error::custom(format!("{kind} length {raw_len} does not fit in usize")))
+    }
+
     fn read_container_len(&mut self, kind: &str) -> Result<usize> {
-        let len: usize = serde::Deserialize::deserialize(&mut *self)?;
+        let len = self.read_len_prefix(kind)?;
         if len > MAX_CONTAINER_ITEMS {
             return Err(Error::custom(format!(
                 "{kind} length {len} exceeds safe maximum {MAX_CONTAINER_ITEMS}"
@@ -49,13 +57,19 @@ impl<'a, R: Read> Deserializer<'a, R> {
     }
 
     fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let len: usize = serde::Deserialize::deserialize(&mut *self)?;
+        let len = self.read_len_prefix("byte buffer")?;
         if len > MAX_CONTAINER_BYTES {
             return Err(Error::custom(format!(
                 "byte buffer length {len} exceeds maximum {MAX_CONTAINER_BYTES}"
             )));
         }
-        let mut result = vec![0u8; len];
+        let mut result = Vec::new();
+        result.try_reserve_exact(len).map_err(|err| {
+            Error::custom(format!(
+                "byte buffer length {len} could not be allocated safely: {err}"
+            ))
+        })?;
+        result.resize(len, 0);
         self.reader.read_exact(&mut result)?;
         Ok(result)
     }

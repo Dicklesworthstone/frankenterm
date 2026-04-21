@@ -4,6 +4,8 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use fixedbitset::FixedBitSet;
 use frankenterm_cell::{Cell, CellAttributes};
 #[cfg(feature = "use_serde")]
+use serde::de::Error as _;
+#[cfg(feature = "use_serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 extern crate alloc;
@@ -41,6 +43,9 @@ pub(crate) struct ClusteredLine {
 }
 
 #[cfg(feature = "use_serde")]
+const MAX_DESERIALIZED_WIDE_CELL_BITS: usize = 16 * 1024 * 1024 * 8;
+
+#[cfg(feature = "use_serde")]
 fn deserialize_bitset<'de, D>(deserializer: D) -> Result<Option<Box<FixedBitSet>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -49,8 +54,16 @@ where
     if wide_indices.is_empty() {
         Ok(None)
     } else {
-        let max_idx = wide_indices.iter().max().unwrap_or(&1);
-        let mut bitset = FixedBitSet::with_capacity(max_idx + 1);
+        let max_idx = wide_indices.iter().copied().max().unwrap_or(1);
+        let bit_capacity = max_idx.checked_add(1).ok_or_else(|| {
+            D::Error::custom("clustered line wide-cell bitset length overflowed usize")
+        })?;
+        if bit_capacity > MAX_DESERIALIZED_WIDE_CELL_BITS {
+            return Err(D::Error::custom(format!(
+                "clustered line wide-cell bitset length {bit_capacity} exceeds maximum {MAX_DESERIALIZED_WIDE_CELL_BITS}"
+            )));
+        }
+        let mut bitset = FixedBitSet::with_capacity(bit_capacity);
         for idx in wide_indices {
             bitset.set(idx, true);
         }
