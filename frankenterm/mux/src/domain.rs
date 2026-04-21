@@ -17,7 +17,9 @@ use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtySize, PtySystem};
+use portable_pty::{
+    native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize, PtySystem,
+};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::OsString;
@@ -691,8 +693,28 @@ impl Domain for LocalDomain {
             },
             self.name
         );
-        let child_result = pair.slave.spawn_command(cmd);
-        let mut writer = WriterWrapper::new(pair.master.take_writer()?);
+        // [ft-s9oci] `SlavePty::spawn_command` wraps `fork + exec` on Unix
+        // (and `CreateProcess` on Windows). Both are fully synchronous
+        // syscall sequences that can stall for a long time — a slow
+        // program load, a hung NSS lookup reaching /etc/nsswitch.conf,
+        // an LD_PRELOAD hook that deadlocks in its own init. Calling it
+        // directly from this async fn parks the executor thread until
+        // the child is either up or the call fails; every other async
+        // task scheduled on that thread (IPC handlers, tmux event
+        // processing, UI repaint) stops making progress too.
+        //
+        // Hand the fork off to a dedicated OS thread via
+        // `promise::spawn::spawn_into_new_thread`. The slave pty and
+        // the CommandBuilder are both `Send`, and the slave is not
+        // referenced anywhere else on this code path after spawn —
+        // dropping it inside the worker thread once the spawn settles
+        // is correct. The worker thread returns the `child_result` so
+        // the original error reporting in the `Err(err)` arm below is
+        // unchanged.
+        let PtyPair { slave, master } = pair;
+        let child_result =
+            promise::spawn::spawn_into_new_thread(move || slave.spawn_command(cmd)).await;
+        let mut writer = WriterWrapper::new(master.take_writer()?);
 
         let mut terminal = frankenterm_term::Terminal::new(
             size,
@@ -710,7 +732,7 @@ impl Domain for LocalDomain {
                 pane_id,
                 terminal,
                 child,
-                pair.master,
+                master,
                 Box::new(writer),
                 self.id,
                 command_description,
@@ -732,7 +754,7 @@ impl Domain for LocalDomain {
                     terminal,
                     Box::new(FailedProcessSpawn {}),
                     Box::new(FailedSpawnPty {
-                        inner: Mutex::new(pair.master),
+                        inner: Mutex::new(master),
                     }),
                     Box::new(writer),
                     self.id,
