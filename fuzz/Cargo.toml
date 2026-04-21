@@ -13,12 +13,14 @@ core-fuzz-targets = ["dep:frankenterm-core"]
 codec-fuzz-targets = ["dep:codec"]
 
 [dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
 codec = { path = "../frankenterm/codec", optional = true }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 
 [[bin]]
@@ -72,6 +74,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "tuning_config_toml"
 path = "fuzz_targets/tuning_config_toml.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "workflow_yaml_descriptor"
+path = "fuzz_targets/workflow_yaml_descriptor.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
