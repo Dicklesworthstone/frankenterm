@@ -5736,6 +5736,7 @@ pub fn is_fallback_result(result: &StepResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn parse_audit_decision_context(serialized: Option<String>) -> crate::policy::DecisionContext {
         serde_json::from_str(&serialized.expect("decision context should serialize"))
@@ -7091,6 +7092,466 @@ mod tests {
         assert!(!HandleProcessTriageLifecycle::category_is_protected(
             "unknown"
         ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ProcessTriageBucket {
+        AutoSafe,
+        Protected,
+        Review,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProcessTriageEntrySpec {
+        category: String,
+        action: String,
+        bucket: ProcessTriageBucket,
+    }
+
+    fn protected_action_is_safe(action: &str) -> bool {
+        matches!(action, "protect" | "renice" | "flag_for_review")
+    }
+
+    fn process_triage_plan_from_specs(
+        specs: &[ProcessTriageEntrySpec],
+        explicit_counts: Option<(usize, usize, usize)>,
+    ) -> serde_json::Value {
+        let mut plan = serde_json::json!({
+            "entries": specs
+                .iter()
+                .map(|spec| serde_json::json!({
+                    "category": spec.category,
+                    "action": { "action": spec.action },
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        if let Some((auto_safe_count, review_count, protected_count)) = explicit_counts {
+            let obj = plan
+                .as_object_mut()
+                .expect("process triage plan must be an object");
+            obj.insert(
+                "auto_safe_count".to_string(),
+                serde_json::json!(auto_safe_count),
+            );
+            obj.insert("review_count".to_string(), serde_json::json!(review_count));
+            obj.insert(
+                "protected_count".to_string(),
+                serde_json::json!(protected_count),
+            );
+        }
+
+        plan
+    }
+
+    fn inferred_process_triage_stats(specs: &[ProcessTriageEntrySpec]) -> ProcessTriagePlanStats {
+        let mut auto_safe_count = 0usize;
+        let mut review_count = 0usize;
+        let mut protected_count = 0usize;
+        let mut has_protected_destructive = false;
+
+        for spec in specs {
+            match spec.bucket {
+                ProcessTriageBucket::AutoSafe => {
+                    auto_safe_count = auto_safe_count.saturating_add(1)
+                }
+                ProcessTriageBucket::Protected => {
+                    protected_count = protected_count.saturating_add(1);
+                    if !protected_action_is_safe(&spec.action) {
+                        has_protected_destructive = true;
+                    }
+                }
+                ProcessTriageBucket::Review => review_count = review_count.saturating_add(1),
+            }
+        }
+
+        ProcessTriagePlanStats {
+            entry_count: specs.len(),
+            auto_safe_count,
+            review_count,
+            protected_count,
+            has_protected_destructive,
+        }
+    }
+
+    fn arb_auto_safe_category() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("zombie".to_string()),
+            Just("stuck_test".to_string()),
+            Just("stuck_cli".to_string()),
+            Just("duplicate_build".to_string()),
+        ]
+    }
+
+    fn arb_protected_category() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("active_agent".to_string()),
+            Just("system_process".to_string()),
+        ]
+    }
+
+    fn arb_review_category() -> impl Strategy<Value = String> {
+        "[a-z_]{1,16}".prop_filter("exclude built-in triage categories", |value| {
+            !HandleProcessTriageLifecycle::category_is_auto_safe(value)
+                && !HandleProcessTriageLifecycle::category_is_protected(value)
+        })
+    }
+
+    fn arb_action_name() -> impl Strategy<Value = String> {
+        "[a-z_]{1,20}".prop_filter("non-empty action", |value| !value.is_empty())
+    }
+
+    fn arb_safe_protected_action() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("protect".to_string()),
+            Just("renice".to_string()),
+            Just("flag_for_review".to_string()),
+        ]
+    }
+
+    fn run_process_triage_step(
+        step_idx: usize,
+        capabilities: crate::policy::PaneCapabilities,
+        trigger: serde_json::Value,
+        pane_id: u64,
+        execution_id: impl Into<String>,
+    ) -> StepResult {
+        let execution_id = execution_id.into();
+        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build process triage proptest runtime");
+
+        runtime.block_on(async move {
+            let temp_dir = tempfile::TempDir::new().expect("tempdir");
+            let db_path = temp_dir.path().join("process_triage_proptest.db");
+            let storage = std::sync::Arc::new(
+                crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+                    .await
+                    .expect("storage"),
+            );
+            let mut ctx = WorkflowContext::new(storage, pane_id, capabilities, execution_id)
+                .with_trigger(trigger);
+            HandleProcessTriageLifecycle::new()
+                .execute_step(&mut ctx, step_idx)
+                .await
+        })
+    }
+
+    fn arb_process_triage_entry_spec() -> impl Strategy<Value = ProcessTriageEntrySpec> {
+        prop_oneof![
+            (arb_auto_safe_category(), arb_action_name()).prop_map(|(category, action)| {
+                ProcessTriageEntrySpec {
+                    category,
+                    action,
+                    bucket: ProcessTriageBucket::AutoSafe,
+                }
+            }),
+            (arb_protected_category(), arb_action_name()).prop_map(|(category, action)| {
+                ProcessTriageEntrySpec {
+                    category,
+                    action,
+                    bucket: ProcessTriageBucket::Protected,
+                }
+            }),
+            (arb_review_category(), arb_action_name()).prop_map(|(category, action)| {
+                ProcessTriageEntrySpec {
+                    category,
+                    action,
+                    bucket: ProcessTriageBucket::Review,
+                }
+            }),
+        ]
+    }
+
+    fn arb_invalid_count_value() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            Just(serde_json::json!(-1)),
+            "[a-z_]{1,8}".prop_map(serde_json::Value::String),
+            Just(serde_json::json!([])),
+            Just(serde_json::json!({ "bad": "count" })),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn proptest_process_triage_plan_stats_infers_counts_for_mixed_entries(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..24)
+        ) {
+            let plan = process_triage_plan_from_specs(&specs, None);
+            let stats = HandleProcessTriageLifecycle::plan_stats(&plan).expect("valid inferred plan");
+            let expected = inferred_process_triage_stats(&specs);
+
+            prop_assert_eq!(stats.entry_count, expected.entry_count);
+            prop_assert_eq!(stats.auto_safe_count, expected.auto_safe_count);
+            prop_assert_eq!(stats.review_count, expected.review_count);
+            prop_assert_eq!(stats.protected_count, expected.protected_count);
+            prop_assert_eq!(
+                stats.has_protected_destructive,
+                expected.has_protected_destructive
+            );
+        }
+
+        #[test]
+        fn proptest_process_triage_plan_stats_honors_process_triage_path(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..16)
+        ) {
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": process_triage_plan_from_specs(&specs, None),
+                }
+            });
+            let stats = HandleProcessTriageLifecycle::plan_stats_from_trigger(&trigger)
+                .expect("process_triage.plan should parse");
+            let expected = inferred_process_triage_stats(&specs);
+
+            prop_assert_eq!(stats.entry_count, expected.entry_count);
+            prop_assert_eq!(stats.auto_safe_count, expected.auto_safe_count);
+            prop_assert_eq!(stats.review_count, expected.review_count);
+            prop_assert_eq!(stats.protected_count, expected.protected_count);
+        }
+
+        #[test]
+        fn proptest_process_triage_plan_stats_explicit_counts_override_inferred(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..16),
+            auto_safe_count in 0usize..32,
+            review_count in 0usize..32,
+            protected_count in 0usize..32,
+        ) {
+            let plan = process_triage_plan_from_specs(
+                &specs,
+                Some((auto_safe_count, review_count, protected_count)),
+            );
+            let stats = HandleProcessTriageLifecycle::plan_stats(&plan)
+                .expect("explicit override counts should parse");
+
+            prop_assert_eq!(stats.entry_count, specs.len());
+            prop_assert_eq!(stats.auto_safe_count, auto_safe_count);
+            prop_assert_eq!(stats.review_count, review_count);
+            prop_assert_eq!(stats.protected_count, protected_count);
+        }
+
+        #[test]
+        fn proptest_process_triage_plan_stats_rejects_invalid_explicit_counts(
+            bad_value in arb_invalid_count_value()
+        ) {
+            let plan = serde_json::json!({
+                "entries": [],
+                "auto_safe_count": bad_value,
+            });
+            let err = HandleProcessTriageLifecycle::plan_stats(&plan)
+                .expect_err("invalid count payload must be rejected");
+            prop_assert!(err.contains("auto_safe_count"));
+        }
+
+        #[test]
+        fn proptest_process_triage_snapshot_step_respects_guard_state(
+            alt_screen in any::<bool>(),
+            command_running in any::<bool>(),
+        ) {
+            let mut capabilities = crate::policy::PaneCapabilities::default();
+            capabilities.alt_screen = Some(alt_screen);
+            capabilities.command_running = command_running;
+
+            let result = run_process_triage_step(
+                0,
+                capabilities,
+                serde_json::json!({}),
+                7,
+                "proptest-triage-snapshot",
+            );
+
+            match (alt_screen, command_running, result) {
+                (true, _, StepResult::Abort { reason }) => {
+                    prop_assert!(reason.contains("alt-screen"));
+                }
+                (false, true, StepResult::Abort { reason }) => {
+                    prop_assert!(reason.contains("command currently running"));
+                }
+                (false, false, result) => prop_assert!(result.is_continue()),
+                (true, _, other) => {
+                    prop_assert!(false, "expected alt-screen abort, got {other:?}");
+                }
+                (false, true, other) => {
+                    prop_assert!(false, "expected command-running abort, got {other:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_process_triage_apply_step_aborts_for_destructive_protected_action(
+            action in arb_action_name(),
+        ) {
+            prop_assume!(!protected_action_is_safe(&action));
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": {
+                        "entries": [
+                            {
+                                "category": "system_process",
+                                "action": { "action": action },
+                            }
+                        ]
+                    }
+                }
+            });
+
+            let result = run_process_triage_step(
+                2,
+                crate::policy::PaneCapabilities::default(),
+                trigger,
+                11,
+                "proptest-triage-apply-abort",
+            );
+
+            match result {
+                StepResult::Abort { reason } => {
+                    prop_assert!(reason.contains("protected category includes destructive action"));
+                }
+                other => prop_assert!(
+                    false,
+                    "expected protected-destructive abort, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn proptest_process_triage_apply_step_continues_for_safe_protected_action(
+            action in arb_safe_protected_action(),
+        ) {
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": {
+                        "entries": [
+                            {
+                                "category": "active_agent",
+                                "action": { "action": action },
+                            }
+                        ]
+                    }
+                }
+            });
+
+            let result = run_process_triage_step(
+                2,
+                crate::policy::PaneCapabilities::default(),
+                trigger,
+                12,
+                "proptest-triage-apply-continue",
+            );
+
+            prop_assert!(result.is_continue());
+        }
+
+        #[test]
+        fn proptest_process_triage_verify_step_continues_for_consistent_plan(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..16)
+        ) {
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": process_triage_plan_from_specs(&specs, None),
+                }
+            });
+
+            let result = run_process_triage_step(
+                3,
+                crate::policy::PaneCapabilities::default(),
+                trigger,
+                13,
+                "proptest-triage-verify-continue",
+            );
+
+            prop_assert!(result.is_continue());
+        }
+
+        #[test]
+        fn proptest_process_triage_verify_step_aborts_for_mismatched_counts(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..16),
+            delta in 1usize..8,
+        ) {
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": process_triage_plan_from_specs(
+                        &specs,
+                        Some((specs.len().saturating_add(delta), 0, 0)),
+                    ),
+                }
+            });
+
+            let result = run_process_triage_step(
+                3,
+                crate::policy::PaneCapabilities::default(),
+                trigger,
+                14,
+                "proptest-triage-verify-abort",
+            );
+
+            match result {
+                StepResult::Abort { reason } => {
+                    prop_assert!(reason.contains("triage plan counts mismatch"));
+                }
+                other => prop_assert!(false, "expected verify abort, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn proptest_process_triage_diff_step_aborts_when_apply_failed(
+            specs in proptest::collection::vec(arb_process_triage_entry_spec(), 0..8)
+        ) {
+            let trigger = serde_json::json!({
+                "process_triage": {
+                    "plan": process_triage_plan_from_specs(&specs, None),
+                    "apply": {
+                        "status": "failed",
+                    }
+                }
+            });
+
+            let result = run_process_triage_step(
+                4,
+                crate::policy::PaneCapabilities::default(),
+                trigger,
+                15,
+                "proptest-triage-diff-abort",
+            );
+
+            match result {
+                StepResult::Abort { reason } => {
+                    prop_assert!(reason.contains("triage apply status indicates failure"));
+                }
+                other => prop_assert!(false, "expected diff abort, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn proptest_process_triage_session_step_derives_fallback_ids(
+            pane_id in any::<u64>(),
+            execution_id in "[a-z0-9-]{1,16}",
+        ) {
+            let result = run_process_triage_step(
+                5,
+                crate::policy::PaneCapabilities::default(),
+                serde_json::json!({}),
+                pane_id,
+                execution_id.clone(),
+            );
+
+            match result {
+                StepResult::Done { result } => {
+                    let expected_ft_session_id = format!("ft-{pane_id}-{execution_id}");
+                    let expected_pt_session_id = format!("pt-{execution_id}");
+                    prop_assert_eq!(result["status"].as_str(), Some("completed"));
+                    prop_assert_eq!(result["session"]["ft_session_id"].as_str(), Some(expected_ft_session_id.as_str()));
+                    prop_assert_eq!(result["session"]["pt_session_id"].as_str(), Some(expected_pt_session_id.as_str()));
+                    prop_assert_eq!(result["session"]["provider"].as_str(), Some("heuristic"));
+                }
+                other => prop_assert!(false, "expected session done result, got {other:?}"),
+            }
+        }
     }
 
     // ========================================================================
