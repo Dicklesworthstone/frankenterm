@@ -84,6 +84,19 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
         .with_text_summary(summary.to_string())
 }
 
+/// [ft-05hfm] Hard cap on the `text` payload accepted by `wa.send`.
+///
+/// `wa.send` is the MCP surface for typing into a live pane — an
+/// attacker with MCP client access (stdio transport inherits the
+/// operator's uid/gid, but auto-MCP pipelines can ferry third-party
+/// input in) could submit a multi-gigabyte `text` field and OOM the
+/// watcher before anyone noticed.
+///
+/// 1 MiB is ~250x the largest legitimate paste (a full Claude Code
+/// prompt + context) and low enough to reject obvious DoS attempts
+/// without asking operators to split normal workflows.
+pub(crate) const MAX_SEND_TEXT_BYTES: usize = 1024 * 1024;
+
 fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
     match state {
         crate::plan::MissionTxState::Committed => crate::plan::TxOutcome::Committed,
@@ -1844,6 +1857,29 @@ impl ToolHandler for WaSendTool {
                 Some(
                     "The wa.send tool schema declares timeout_secs with \
                      minimum: 1; omit the field to use the default (30)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        // [ft-05hfm] Bound the text payload before any downstream
+        // buffering, redaction, or dispatch. Without this cap, an
+        // MCP client could submit a multi-gigabyte `text` field; the
+        // full string would transit the injector → policy → wezterm
+        // CLI pipeline before anyone noticed, OOM-ing the watcher.
+        if params.text.len() > MAX_SEND_TEXT_BYTES {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "text payload is {} bytes; max allowed is {} bytes",
+                    params.text.len(),
+                    MAX_SEND_TEXT_BYTES,
+                ),
+                Some(
+                    "wa.send is for interactive pane input — split large \
+                     payloads into multiple calls or use a file drop instead."
                         .to_string(),
                 ),
                 elapsed_ms(start),
@@ -6029,6 +6065,48 @@ exit 17",
         let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"pane_id"), "wa.send should require pane_id");
         assert!(names.contains(&"text"), "wa.send should require text");
+    }
+
+    // ── ft-05hfm send-payload size-cap regressions ──────────────────
+
+    #[test]
+    fn max_send_text_bytes_is_one_mib() {
+        // [ft-05hfm] Pin the constant so any accidental bump surfaces
+        // as an explicit test update rather than silent drift.
+        // 1 MiB is ~250x the largest legitimate paste; rejecting above
+        // it catches obvious DoS attempts without burdening normal
+        // workflows.
+        assert_eq!(MAX_SEND_TEXT_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn wa_send_schema_declares_text_field() {
+        // Regression guard: the size cap only matters if the schema
+        // still actually exposes `text` as a required string. Any
+        // refactor that renames or drops the field must fail this
+        // test and force a deliberate cap-check update in lockstep.
+        let def = WaSendTool::new(config(), db_path()).definition();
+        let props = def
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("wa.send schema should have properties");
+        let text_schema = props.get("text").expect("text field must exist");
+        assert_eq!(text_schema["type"], "string");
+    }
+
+    #[test]
+    fn max_send_text_bytes_exceeds_typical_paste() {
+        // Boundary-sanity test: a 100 KiB paste (full prompt+context
+        // for a Claude Code turn) must fit well under the cap so the
+        // fix doesn't regress legitimate usage.
+        let typical_max_paste = 100 * 1024;
+        assert!(
+            MAX_SEND_TEXT_BYTES > typical_max_paste,
+            "MAX_SEND_TEXT_BYTES {} must leave headroom above typical paste {}",
+            MAX_SEND_TEXT_BYTES,
+            typical_max_paste
+        );
     }
 
     #[test]

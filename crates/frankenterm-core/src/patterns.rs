@@ -975,6 +975,19 @@ fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> 
     Err(PatternError::PackNotFound(pack_id.to_string()).into())
 }
 
+/// [ft-05hfm] Hard cap on pattern-pack file size before parse.
+///
+/// Pattern packs are attacker-reachable via `.ft/patterns/*.{yaml,json,
+/// toml}` in a cloned repo. Without this cap, a hostile pack could
+/// exhaust the allocator (multi-GiB file into `read_to_string`) or
+/// stack-blow the YAML deserializer on deeply-nested input.
+///
+/// 1 MiB is three orders of magnitude larger than the biggest built-in
+/// pack (`builtin_claude_code_pack` serializes to ~10 KiB) so legitimate
+/// packs have ample headroom; rejecting anything above is a clear
+/// operator-error signal rather than a silent crash.
+pub(crate) const MAX_PACK_BYTES: u64 = 1024 * 1024;
+
 fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     let raw_path = PathBuf::from(path);
     let resolved = if raw_path.is_absolute() {
@@ -983,8 +996,37 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
         root.map(|r| r.join(&raw_path)).unwrap_or(raw_path)
     };
 
+    // [ft-05hfm] Stat before read — cheaper to reject oversize packs on
+    // the metadata path than to buffer the whole file into memory first.
+    if let Ok(meta) = std::fs::metadata(&resolved) {
+        if meta.len() > MAX_PACK_BYTES {
+            return Err(PatternError::InvalidRule(format!(
+                "pattern pack {} is {} bytes; max allowed is {} bytes \
+                 (see ft-05hfm — raise MAX_PACK_BYTES if a legitimate pack \
+                 ever exceeds this bound, but audit the source first)",
+                resolved.display(),
+                meta.len(),
+                MAX_PACK_BYTES,
+            ))
+            .into());
+        }
+    }
+
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| PatternError::PackNotFound(format!("{} ({})", resolved.display(), e)))?;
+
+    // [ft-05hfm] Second-line defense: the metadata check can be dodged on
+    // filesystems that misreport size (procfs-like pseudo files) or via a
+    // TOCTOU swap. Verify the actual bytes read fit the cap too.
+    if content.len() as u64 > MAX_PACK_BYTES {
+        return Err(PatternError::InvalidRule(format!(
+            "pattern pack {} read {} bytes; max allowed is {} bytes (ft-05hfm)",
+            resolved.display(),
+            content.len(),
+            MAX_PACK_BYTES,
+        ))
+        .into());
+    }
 
     let ext = resolved
         .extension()
@@ -2978,7 +3020,10 @@ mod tests {
                 r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining",
                 "less than 5% of your 5h limit remaining",
             ),
-            (r"try again at (?P<reset_time>[^.]+)", "try again at 9:00pm."),
+            (
+                r"try again at (?P<reset_time>[^.]+)",
+                "try again at 9:00pm.",
+            ),
             (
                 r"codex resume (?P<session_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
                 "codex resume 12345678-1234-1234-1234-123456789012",
@@ -2986,11 +3031,10 @@ mod tests {
         ];
 
         for (pattern, input) in fixtures {
-            let regex = compile_rule_regex(pattern)
-                .unwrap_or_else(|e| panic!("legitimate pattern {pattern:?} failed to compile: {e}"));
-            let any_match = regex
-                .captures_iter(input)
-                .any(|r| r.is_ok());
+            let regex = compile_rule_regex(pattern).unwrap_or_else(|e| {
+                panic!("legitimate pattern {pattern:?} failed to compile: {e}")
+            });
+            let any_match = regex.captures_iter(input).any(|r| r.is_ok());
             assert!(
                 any_match,
                 "pattern {pattern:?} should match input {input:?}"
@@ -5566,6 +5610,76 @@ rules:
         let path = dir.path().join("test.xml");
         fs::write(&path, "<rules/>").unwrap();
         assert!(load_pack_from_file(path.to_str().unwrap(), None).is_err());
+    }
+
+    // ── ft-05hfm size-cap regressions ───────────────────────────────
+
+    #[test]
+    fn load_pack_from_file_rejects_oversize_yaml() {
+        // [ft-05hfm] A hostile `.ft/patterns/huge.yaml` in a cloned
+        // repo must not be inhaled into memory. Stat-based reject
+        // before the allocator sees the bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.yaml");
+        // Write MAX_PACK_BYTES + 1 bytes of a valid-shaped YAML
+        // prefix followed by filler. The filler makes the body
+        // exceed the cap; shape doesn't matter because we never
+        // reach the parser.
+        let mut body = String::from(
+            "name: test\nversion: 1.0.0\nrules:\n  - id: x\n    agent_type: codex\n    event_type: e\n    severity: info\n    anchors: [\"",
+        );
+        body.push_str(&"a".repeat((MAX_PACK_BYTES as usize) + 64));
+        body.push_str("\"]\n");
+        fs::write(&path, body).unwrap();
+
+        let err = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect_err("oversize pack must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max allowed"),
+            "unexpected rejection message: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{MAX_PACK_BYTES}")),
+            "rejection must cite MAX_PACK_BYTES: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_pack_from_file_accepts_pack_at_cap_boundary() {
+        // At the boundary: a pack of exactly MAX_PACK_BYTES should
+        // pass the cap check and reach the parser (which may then
+        // reject for other reasons — that's out of scope here).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.yaml");
+        // Build a valid minimal pack padded with YAML comment bytes
+        // to land just under the cap.
+        let base = "name: boundary\nversion: 1.0.0\nrules: []\n";
+        let filler_count = (MAX_PACK_BYTES as usize) - base.len() - 10;
+        let mut body = String::from(base);
+        body.push_str(&format!("# {}\n", "f".repeat(filler_count.saturating_sub(3))));
+        assert!(
+            body.len() as u64 <= MAX_PACK_BYTES,
+            "test fixture mis-sized: {} > {}",
+            body.len(),
+            MAX_PACK_BYTES
+        );
+        fs::write(&path, body).unwrap();
+        let pack = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect("pack at the cap boundary must parse");
+        assert_eq!(pack.name, "boundary");
+    }
+
+    #[test]
+    fn load_pack_from_file_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        let payload = "{".to_string() + &"\"x\":0,".repeat((MAX_PACK_BYTES as usize) / 6 + 1024) + "\"y\":0}";
+        assert!(payload.len() as u64 > MAX_PACK_BYTES);
+        fs::write(&path, payload).unwrap();
+        let err = load_pack_from_file(path.to_str().unwrap(), None)
+            .expect_err("oversize JSON pack must be rejected");
+        assert!(format!("{err}").contains("max allowed"));
     }
 
     // --- MatchTrace serde round-trip ---
