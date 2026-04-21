@@ -455,6 +455,27 @@ pub type IpcRpcHandler = Arc<
         + Sync,
 >;
 
+/// Constant-time byte-wise equality over two strings.
+///
+/// Short-circuiting `==` on `String`/`&str` leaks byte-prefix equality via
+/// timing, which over a Unix socket is enough for a co-tenant process to
+/// recover an IPC auth token character by character. This helper always
+/// scans the longer of the two inputs and ORs every byte difference into a
+/// single accumulator, so the elapsed time is independent of where (or
+/// whether) a mismatch occurs. Mirrors `distributed::constant_time_eq`.
+fn ipc_constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for idx in 0..max_len {
+        let left = a.get(idx).copied().unwrap_or(0);
+        let right = b.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left ^ right);
+    }
+    diff == 0
+}
+
 /// Token-based authorization gate for IPC socket connections.
 #[derive(Debug, Clone)]
 pub struct IpcAuth {
@@ -473,11 +494,26 @@ impl IpcAuth {
         }
 
         let token = token.ok_or(IpcAuthError::MissingToken)?;
-        let record = self
-            .tokens
-            .iter()
-            .find(|candidate| candidate.token == token)
-            .ok_or(IpcAuthError::InvalidToken)?;
+        // [sec] Constant-time scan so a remote attacker cannot recover the
+        // stored token byte by byte via timing. `.find(|c| c.token == token)`
+        // previously short-circuited on the first byte-mismatch in the first
+        // candidate AND stopped iterating on the first candidate match — both
+        // leaks are closed by always iterating every candidate and always
+        // comparing every byte. The early-expiry/scope check is deferred until
+        // after the match so the presence-of-match decision itself is not
+        // leaked by subsequent branches.
+        let mut matched: Option<&IpcAuthToken> = None;
+        for candidate in &self.tokens {
+            if ipc_constant_time_eq(&candidate.token, token) {
+                // Don't break — keep scanning the rest of the vector so the
+                // authorize() runtime is independent of which candidate (if
+                // any) matched.
+                if matched.is_none() {
+                    matched = Some(candidate);
+                }
+            }
+        }
+        let record = matched.ok_or(IpcAuthError::InvalidToken)?;
 
         if let Some(expires_at) = record.expires_at_ms {
             if now_ms() >= expires_at {
@@ -3427,6 +3463,73 @@ mod tests {
         }]);
         assert!(auth.authorize(Some("secret"), IpcScope::Write).is_ok());
         assert!(auth.authorize(Some("secret"), IpcScope::Read).is_ok());
+    }
+
+    // ── [sec] constant-time token compare ───────────────────────────────
+    //
+    // Behavioural pins for `ipc_constant_time_eq` and the scan-every-candidate
+    // loop inside `IpcAuth::authorize`. We cannot make a proper statistical
+    // timing assertion in a unit test (CI noise dominates), so these tests
+    // lock the *contract* — equal-length inputs return equal bytes with
+    // accumulator-based comparison, and mismatched-prefix inputs still miss
+    // — and leave the timing property as a review-level invariant of the
+    // loop shape above.
+
+    #[test]
+    fn ipc_constant_time_eq_matches_on_equal_strings() {
+        assert!(ipc_constant_time_eq("correct-horse-battery-staple", "correct-horse-battery-staple"));
+    }
+
+    #[test]
+    fn ipc_constant_time_eq_rejects_first_byte_mismatch() {
+        assert!(!ipc_constant_time_eq("secret", "Xecret"));
+    }
+
+    #[test]
+    fn ipc_constant_time_eq_rejects_last_byte_mismatch() {
+        assert!(!ipc_constant_time_eq("secret", "secreX"));
+    }
+
+    #[test]
+    fn ipc_constant_time_eq_rejects_different_lengths() {
+        assert!(!ipc_constant_time_eq("short", "longer-string"));
+        assert!(!ipc_constant_time_eq("longer-string", "short"));
+    }
+
+    #[test]
+    fn ipc_constant_time_eq_empty_strings_match() {
+        assert!(ipc_constant_time_eq("", ""));
+        assert!(!ipc_constant_time_eq("", "a"));
+        assert!(!ipc_constant_time_eq("a", ""));
+    }
+
+    #[test]
+    fn ipc_auth_accepts_match_anywhere_in_vec() {
+        // Regression: with short-circuiting `.find()`, a token at the end of
+        // the vector took measurably longer than one at the front. The fix
+        // always scans the full vector, so a back-of-vec match is equally
+        // fast — functional side-effect: either ordering still authorizes.
+        let auth = IpcAuth::new(vec![
+            IpcAuthToken { token: "decoy-1".to_string(), scopes: vec![IpcScope::All], expires_at_ms: None },
+            IpcAuthToken { token: "decoy-2".to_string(), scopes: vec![IpcScope::All], expires_at_ms: None },
+            IpcAuthToken { token: "real".to_string(),    scopes: vec![IpcScope::All], expires_at_ms: None },
+        ]);
+        assert!(auth.authorize(Some("real"), IpcScope::Read).is_ok());
+    }
+
+    #[test]
+    fn ipc_auth_rejects_prefix_of_valid_token() {
+        // `==` on `String` would still fail to authorize here, but the
+        // timing *profile* leaked byte-prefix equality. This test
+        // co-locates with the fix as a functional regression guard: an
+        // attacker-supplied prefix of the real token must NOT authorize,
+        // AND the loop must scan every candidate (timing invariant is
+        // enforced by code review of the loop, not by measurement here).
+        let auth = build_auth("correct-horse", vec![IpcScope::All], None);
+        assert!(auth.authorize(Some("correct-hors"), IpcScope::Read).is_err());
+        assert!(auth.authorize(Some("correct-hor"), IpcScope::Read).is_err());
+        assert!(auth.authorize(Some("c"), IpcScope::Read).is_err());
+        assert!(auth.authorize(Some(""), IpcScope::Read).is_err());
     }
 
     #[test]
