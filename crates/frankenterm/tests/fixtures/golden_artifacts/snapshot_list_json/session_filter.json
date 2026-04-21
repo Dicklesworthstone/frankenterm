@@ -1,0 +1,24 @@
+{
+  "count": 2,
+  "ok": true,
+  "snapshots": [
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 2,
+      "checkpoint_type": "startup",
+      "pane_count": 6,
+      "session_id": "<uuid-session>",
+      "state_hash": "hash-keep-b",
+      "total_bytes": 16384
+    },
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 1,
+      "checkpoint_type": "periodic",
+      "pane_count": 5,
+      "session_id": "<uuid-session>",
+      "state_hash": "hash-keep-a",
+      "total_bytes": 8192
+    }
+  ]
+}

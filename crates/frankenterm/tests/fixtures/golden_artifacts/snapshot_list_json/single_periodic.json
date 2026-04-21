@@ -1,0 +1,15 @@
+{
+  "count": 1,
+  "ok": true,
+  "snapshots": [
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 1,
+      "checkpoint_type": "periodic",
+      "pane_count": 3,
+      "session_id": "<uuid-session>",
+      "state_hash": "hash-single",
+      "total_bytes": 2048
+    }
+  ]
+}

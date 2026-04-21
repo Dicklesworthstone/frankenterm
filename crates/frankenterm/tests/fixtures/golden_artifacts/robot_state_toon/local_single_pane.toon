@@ -1,0 +1,6 @@
+data[1]{cwd,domain,observed,pane_id,pane_uuid,tab_id,title,window_id}:
+  "file:///home/user",local,true,0,null,0,zsh,0
+elapsed_ms: 0
+now: 0
+ok: true
+version: 0.1.0

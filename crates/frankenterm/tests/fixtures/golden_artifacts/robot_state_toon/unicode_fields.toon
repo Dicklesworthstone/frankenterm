@@ -1,0 +1,6 @@
+data[1]{cwd,domain,observed,pane_id,pane_uuid,tab_id,title,window_id}:
+  "file:///home/用户/项目",local,true,42,null,7,编程终端,1
+elapsed_ms: 0
+now: 0
+ok: true
+version: 0.1.0

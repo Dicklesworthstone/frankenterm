@@ -1,0 +1,24 @@
+{
+  "count": 2,
+  "ok": true,
+  "snapshots": [
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 3,
+      "checkpoint_type": "shutdown",
+      "pane_count": 3,
+      "session_id": "limit-c",
+      "state_hash": "hash-c",
+      "total_bytes": 300
+    },
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 2,
+      "checkpoint_type": "periodic",
+      "pane_count": 2,
+      "session_id": "limit-b",
+      "state_hash": "hash-b",
+      "total_bytes": 200
+    }
+  ]
+}

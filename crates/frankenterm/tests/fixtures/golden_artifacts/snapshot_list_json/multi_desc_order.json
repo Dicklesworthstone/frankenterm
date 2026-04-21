@@ -1,0 +1,33 @@
+{
+  "count": 3,
+  "ok": true,
+  "snapshots": [
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 2,
+      "checkpoint_type": "startup",
+      "pane_count": 4,
+      "session_id": "alpha-session",
+      "state_hash": "hash-new",
+      "total_bytes": 4096
+    },
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 3,
+      "checkpoint_type": "shutdown",
+      "pane_count": 1,
+      "session_id": "beta-session",
+      "state_hash": "hash-mid",
+      "total_bytes": 128
+    },
+    {
+      "checkpoint_at": 0,
+      "checkpoint_id": 1,
+      "checkpoint_type": "periodic",
+      "pane_count": 2,
+      "session_id": "alpha-session",
+      "state_hash": "hash-old",
+      "total_bytes": 512
+    }
+  ]
+}
