@@ -1261,6 +1261,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "base91",
+ "byteorder",
  "config",
  "frankenterm-term",
  "leb128",
@@ -3386,12 +3387,18 @@ dependencies = [
 name = "frankenterm-fuzz"
 version = "0.0.0"
 dependencies = [
+ "arbitrary",
  "codec",
  "frankenterm-core",
+ "frankenterm-escape-parser",
+ "leb128",
  "libfuzzer-sys",
  "rusqlite",
  "serde",
+ "serde_json",
+ "serde_yaml",
  "toml 0.8.23",
+ "tru",
 ]
 
 [[package]]
@@ -6587,6 +6594,7 @@ dependencies = [
  "termwiz 0.24.0",
  "textwrap",
  "thiserror 2.0.18",
+ "tracing",
  "url",
  "winapi",
 ]
