@@ -389,59 +389,85 @@ impl From<Color> for SrgbaTuple {
 }
 
 #[cfg(feature = "std")]
-static NAMED_COLORS: LazyLock<HashMap<String, SrgbaTuple>> = LazyLock::new(build_colors);
+static NAMED_COLORS: LazyLock<Result<HashMap<String, SrgbaTuple>, String>> =
+    LazyLock::new(build_colors);
 
 const RGB_TXT: &str = core::include_str!("rgb.txt");
 
-fn iter_rgb_txt(mut func: impl FnMut(&str, SrgbaTuple) -> bool) {
+fn parse_rgb_txt_line(line: &str) -> Result<Option<(String, SrgbaTuple)>, String> {
+    let mut fields = line.split_ascii_whitespace();
+    let Some(red) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(green) = fields.next() else {
+        return Err(format!("missing green component in rgb.txt line {line:?}"));
+    };
+    let Some(blue) = fields.next() else {
+        return Err(format!("missing blue component in rgb.txt line {line:?}"));
+    };
+    let name = fields.collect::<Vec<&str>>().join(" ");
+    if name.is_empty() {
+        return Err(format!("missing color name in rgb.txt line {line:?}"));
+    }
+
+    let parse_component = |component: &str, label: &str| -> Result<f32, String> {
+        component
+            .parse::<f32>()
+            .map(|value| value / 255.0)
+            .map_err(|_| {
+                format!("invalid {label} component {component:?} in rgb.txt line {line:?}")
+            })
+    };
+
+    Ok(Some((
+        name.to_ascii_lowercase(),
+        SrgbaTuple(
+            parse_component(red, "red")?,
+            parse_component(green, "green")?,
+            parse_component(blue, "blue")?,
+            1.0,
+        ),
+    )))
+}
+
+fn iter_rgb_txt(mut func: impl FnMut(&str, SrgbaTuple) -> bool) -> Result<(), String> {
     let transparent = SrgbaTuple(0., 0., 0., 0.);
     for name in &["transparent", "none", "clear"] {
         if (func)(name, transparent) {
-            return;
+            return Ok(());
         }
     }
 
     for line in RGB_TXT.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let red = fields.next().unwrap();
-        let green = fields.next().unwrap();
-        let blue = fields.next().unwrap();
-        let name = fields.collect::<Vec<&str>>().join(" ");
-
-        let name = name.to_ascii_lowercase();
-        let color = SrgbaTuple(
-            red.parse::<f32>().unwrap() / 255.,
-            green.parse::<f32>().unwrap() / 255.,
-            blue.parse::<f32>().unwrap() / 255.,
-            1.0,
-        );
+        let Some((name, color)) = parse_rgb_txt_line(line)? else {
+            continue;
+        };
 
         if (func)(&name, color) {
-            return;
+            return Ok(());
         }
     }
+
+    Ok(())
 }
 
 #[cfg(feature = "std")]
-fn build_colors() -> HashMap<String, SrgbaTuple> {
+fn build_colors() -> Result<HashMap<String, SrgbaTuple>, String> {
     let mut map = HashMap::new();
 
     iter_rgb_txt(|name, color| {
         map.insert(name.to_string(), color);
         false
-    });
-    map
+    })?;
+    Ok(map)
 }
 
 impl SrgbaTuple {
-    /// Construct a color from an X11/SVG/CSS3 color name.
-    /// Returns None if the supplied name is not recognized.
-    /// The list of names can be found here:
-    /// <https://en.wikipedia.org/wiki/X11_color_names>
-    pub fn from_named(name: &str) -> Option<Self> {
+    pub fn try_from_named(name: &str) -> Result<Option<Self>, String> {
         #[cfg(feature = "std")]
         {
-            return NAMED_COLORS.get(&name.to_ascii_lowercase()).cloned();
+            let map = NAMED_COLORS.as_ref().map_err(Clone::clone)?;
+            return Ok(map.get(&name.to_ascii_lowercase()).copied());
         }
         #[cfg(not(feature = "std"))]
         {
@@ -453,9 +479,17 @@ impl SrgbaTuple {
                 } else {
                     false
                 }
-            });
-            result
+            })?;
+            Ok(result)
         }
+    }
+
+    /// Construct a color from an X11/SVG/CSS3 color name.
+    /// Returns None if the supplied name is not recognized.
+    /// The list of names can be found here:
+    /// <https://en.wikipedia.org/wiki/X11_color_names>
+    pub fn from_named(name: &str) -> Option<Self> {
+        Self::try_from_named(name).ok().flatten()
     }
 
     /// Returns self multiplied by the supplied alpha value.
@@ -903,7 +937,7 @@ impl FromStr for SrgbaTuple {
                     return Ok(Self(c.r as f32, c.g as f32, c.b as f32, c.a as f32));
                 }
             }
-            Self::from_named(s).ok_or(())
+            Self::try_from_named(s).map_err(|_| ())?.ok_or(())
         }
     }
 }
@@ -1439,6 +1473,26 @@ mod tests {
         let a = SrgbaTuple::from_named("Red").unwrap();
         let b = SrgbaTuple::from_named("red").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parse_rgb_txt_line_rejects_missing_components() {
+        let err = parse_rgb_txt_line("255 0").unwrap_err();
+        assert!(err.contains("missing blue component"));
+    }
+
+    #[test]
+    fn parse_rgb_txt_line_rejects_invalid_component() {
+        let err = parse_rgb_txt_line("255 nope 0 red").unwrap_err();
+        assert!(err.contains("invalid green component"));
+    }
+
+    #[test]
+    fn try_from_named_matches_from_named_for_valid_color() {
+        assert_eq!(
+            SrgbaTuple::try_from_named("red").unwrap(),
+            SrgbaTuple::from_named("red")
+        );
     }
 
     #[test]
