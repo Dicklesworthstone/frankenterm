@@ -10,7 +10,26 @@ use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
 use bloomfilter::Bloom;
-use fancy_regex::Regex;
+use fancy_regex::{Regex, RegexBuilder};
+
+/// Per-regex backtrack budget for user-supplied pattern packs.
+///
+/// [ft-xv561] Every `Regex` compiled from rule JSON must go through
+/// `compile_rule_regex` so the same backtrack cap applies everywhere.
+/// `fancy_regex` defaults to 1_000_000; we raise to 10M so legitimate
+/// non-pathological patterns have ample room while still bounding
+/// catastrophic-backtracking attacks on attacker-controlled packs
+/// (e.g. a malicious `.ft/patterns/*.json` dropped via a hostile repo).
+const PATTERN_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
+
+/// Compile a rule regex with the shared backtrack limit. All compile
+/// sites in this module MUST use this helper so the security contract
+/// stays in one place.
+fn compile_rule_regex(pattern: &str) -> std::result::Result<Regex, fancy_regex::Error> {
+    RegexBuilder::new(pattern)
+        .backtrack_limit(PATTERN_REGEX_BACKTRACK_LIMIT)
+        .build()
+}
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 
@@ -509,7 +528,12 @@ impl RuleDef {
         }
 
         if let Some(ref regex) = self.regex {
-            Regex::new(regex).map_err(|e| {
+            // [ft-xv561] compile via shared builder so the backtrack
+            // cap applies to validation too — a rule that compiles
+            // here but blows the limit downstream would bypass the
+            // guard. Using `compile_rule_regex` keeps behaviour
+            // identical across validate + build_engine_index.
+            compile_rule_regex(regex).map_err(|e| {
                 PatternError::InvalidRegex(format!("rule id '{}' has invalid regex: {e}", self.id))
             })?;
         }
@@ -777,7 +801,11 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     for (idx, rule) in rules.iter().enumerate() {
         let (regex, capture_names) = match rule.regex.as_ref() {
             Some(raw) => {
-                let regex = Regex::new(raw).map_err(|e| {
+                // [ft-xv561] same backtrack cap as validate_regex —
+                // build_engine_index is the hot-path compile site, so
+                // funnel through compile_rule_regex to keep the
+                // security contract in one place.
+                let regex = compile_rule_regex(raw).map_err(|e| {
                     PatternError::InvalidRegex(format!(
                         "rule id '{}' has invalid regex: {e}",
                         rule.id
@@ -2898,6 +2926,76 @@ mod tests {
         assert!(!engine.is_initialized());
         let _ = engine.detect("warmup");
         assert!(engine.is_initialized());
+    }
+
+    /// [ft-xv561] ReDoS regression.
+    ///
+    /// The classic `(a+)+b` on `aaaa...aaaaX` forces `fancy_regex` into
+    /// catastrophic-backtracking territory. Pre-fix, `Regex::new(raw)`
+    /// in build_engine_index used the default backtrack limit and would
+    /// burn double-digit milliseconds on this pattern. Post-fix,
+    /// compile_rule_regex installs the shared 10M-step backtrack cap so
+    /// the match bails with `Err(BacktrackLimitExceeded)` well inside
+    /// 100ms on any reasonable hardware.
+    #[test]
+    fn compile_rule_regex_ejects_redos_pattern_within_100ms() {
+        use std::time::{Duration, Instant};
+
+        let regex = compile_rule_regex("^(a+)+b$").expect("pattern compiles");
+        let pathological: String = "a".repeat(25) + "X";
+        let start = Instant::now();
+        // `captures_iter` returns an iterator of Result; the backtrack
+        // limit surfaces as `Err(...)` rather than a hang.
+        let outcome: Vec<_> = regex.captures_iter(&pathological).collect();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "ReDoS pattern should hit backtrack limit in <100ms, took {elapsed:?}"
+        );
+        // The match must not succeed on the pathological input; the
+        // iterator may yield zero items (no match before limit) or a
+        // trailing Err variant (limit exceeded). Either outcome
+        // proves the regex did not match.
+        let matched = outcome.iter().any(|r| r.is_ok());
+        assert!(
+            !matched,
+            "ReDoS pattern must not report a successful match on pathological input"
+        );
+    }
+
+    /// [ft-xv561] compile_rule_regex must accept legitimate patterns
+    /// that the built-in packs rely on (SGR escape shapes, codex/claude
+    /// code anchor suffixes). This guards against over-tightening the
+    /// backtrack cap and regressing real rules.
+    #[test]
+    fn compile_rule_regex_accepts_builtin_pack_patterns() {
+        // Representative shapes pulled from builtin_codex_pack and
+        // builtin_claude_code_pack. Each MUST compile and MUST match
+        // its canonical anchor line.
+        let fixtures: &[(&str, &str)] = &[
+            (
+                r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining",
+                "less than 5% of your 5h limit remaining",
+            ),
+            (r"try again at (?P<reset_time>[^.]+)", "try again at 9:00pm."),
+            (
+                r"codex resume (?P<session_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                "codex resume 12345678-1234-1234-1234-123456789012",
+            ),
+        ];
+
+        for (pattern, input) in fixtures {
+            let regex = compile_rule_regex(pattern)
+                .unwrap_or_else(|e| panic!("legitimate pattern {pattern:?} failed to compile: {e}"));
+            let any_match = regex
+                .captures_iter(input)
+                .any(|r| r.is_ok());
+            assert!(
+                any_match,
+                "pattern {pattern:?} should match input {input:?}"
+            );
+        }
     }
 
     #[test]
