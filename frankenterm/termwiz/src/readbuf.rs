@@ -29,7 +29,15 @@ impl ReadBuffer {
     /// Mark `len` bytes as consumed, discarding them and shunting
     /// the contents of the buffer such that the remainder of the
     /// bytes are available at the front of the buffer.
+    ///
+    /// If `len` exceeds the buffer's current length, the entire
+    /// buffer is consumed instead of panicking. Without this
+    /// saturation, `advance(buf_len + 1)` underflows
+    /// `self.storage.len() - len` (panics in debug, wraps in
+    /// release) and then panics in `rotate_left` — a foot-gun for
+    /// callers who compute `len` from an external offset.
     pub fn advance(&mut self, len: usize) {
+        let len = len.min(self.storage.len());
         let remain = self.storage.len() - len;
         self.storage.rotate_left(len);
         self.storage.truncate(remain);
@@ -42,7 +50,16 @@ impl ReadBuffer {
 
     /// Search for `needle` starting at `offset`.  Returns its offset
     /// into the buffer if found, else None.
+    ///
+    /// If `offset` is beyond the buffer's current length, returns
+    /// `None` rather than panicking on the out-of-range slice. This
+    /// matches the semantics a search on an empty suffix already has
+    /// (no match) and removes the hidden precondition that callers
+    /// must check the buffer size before calling.
     pub fn find_subsequence(&self, offset: usize, needle: &[u8]) -> Option<usize> {
+        if offset > self.storage.len() {
+            return None;
+        }
         let needle = TwoWaySearcher::new(needle);
         let haystack = &self.storage[offset..];
         needle.search_in(haystack).map(|x| x + offset)
@@ -138,6 +155,51 @@ mod tests {
         buf.extend_with(b"abc");
         // Start searching after the only occurrence
         assert_eq!(buf.find_subsequence(1, b"abc"), None);
+    }
+
+    #[test]
+    fn advance_saturates_when_len_exceeds_buffer() {
+        // Regression: advance(len) used to underflow
+        // `self.storage.len() - len` and panic in rotate_left when
+        // `len` exceeded the buffer size. Now it saturates.
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"abc");
+        buf.advance(usize::MAX);
+        assert!(buf.is_empty(), "over-advance must consume the buffer");
+    }
+
+    #[test]
+    fn advance_saturates_just_past_buffer_end() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"xyz");
+        buf.advance(4); // len + 1
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn advance_on_empty_buffer_is_noop() {
+        let mut buf = ReadBuffer::new();
+        buf.advance(0);
+        buf.advance(usize::MAX);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn find_subsequence_offset_past_end_returns_none() {
+        // Regression: offset beyond buffer used to panic on
+        // `&self.storage[offset..]`. Now it returns None.
+        let buf_slice: Vec<u8> = b"abc".to_vec();
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(&buf_slice);
+        assert_eq!(buf.find_subsequence(100, b"abc"), None);
+        assert_eq!(buf.find_subsequence(usize::MAX, b"abc"), None);
+    }
+
+    #[test]
+    fn find_subsequence_offset_equal_to_len_returns_none_gracefully() {
+        let mut buf = ReadBuffer::new();
+        buf.extend_with(b"abc");
+        assert_eq!(buf.find_subsequence(3, b"abc"), None);
     }
 
     #[test]
