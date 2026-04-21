@@ -43,6 +43,13 @@ const REAPABLE_SUBCOMMANDS: &[&str] = &[
     "get-pane-direction",
 ];
 
+/// `wezterm`/`wezterm cli` flags that take a separate value token before the
+/// subcommand position.
+///
+/// Keep this list conservative: only flags confirmed in the shipped CLI are
+/// enumerated here so that the orphan reaper remains allowlist-driven.
+const PRE_SUBCOMMAND_VALUE_FLAGS: &[&str] = &["--config-file", "--config", "--class"];
+
 /// Summary of a single orphan-reaper scan cycle.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReapReport {
@@ -77,46 +84,46 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
 
     #[cfg(not(feature = "asupersync-runtime"))]
     {
-    let interval = config.orphan_reap_interval_seconds;
-    if interval == 0 {
-        info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
-        return;
-    }
-
-    let max_age = config.orphan_max_age_seconds;
-    info!(
-        interval_s = interval,
-        max_age_s = max_age,
-        "orphan reaper started"
-    );
-
-    loop {
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            crate::runtime_compat::sleep(Duration::from_secs(interval)).await;
-        }
-
-        if shutdown_flag.load(Ordering::Relaxed) {
-            debug!("orphan reaper shutting down");
+        let interval = config.orphan_reap_interval_seconds;
+        if interval == 0 {
+            info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
             return;
         }
 
-        let report = reap_orphans(max_age).await;
-        if report.killed > 0 {
-            info!(
-                scanned = report.scanned,
-                killed = report.killed,
-                pids = ?report.killed_pids,
-                "orphan reaper cycle complete"
-            );
-        } else {
-            debug!(scanned = report.scanned, "orphan reaper cycle — no orphans");
-        }
+        let max_age = config.orphan_max_age_seconds;
+        info!(
+            interval_s = interval,
+            max_age_s = max_age,
+            "orphan reaper started"
+        );
 
-        for err in &report.errors {
-            warn!(error = %err, "orphan reaper error during scan");
+        loop {
+            #[cfg(not(feature = "asupersync-runtime"))]
+            {
+                crate::runtime_compat::sleep(Duration::from_secs(interval)).await;
+            }
+
+            if shutdown_flag.load(Ordering::Relaxed) {
+                debug!("orphan reaper shutting down");
+                return;
+            }
+
+            let report = reap_orphans(max_age).await;
+            if report.killed > 0 {
+                info!(
+                    scanned = report.scanned,
+                    killed = report.killed,
+                    pids = ?report.killed_pids,
+                    "orphan reaper cycle complete"
+                );
+            } else {
+                debug!(scanned = report.scanned, "orphan reaper cycle — no orphans");
+            }
+
+            for err in &report.errors {
+                warn!(error = %err, "orphan reaper error during scan");
+            }
         }
-    }
     }
 }
 
@@ -454,12 +461,23 @@ fn parse_ps_line_if_reapable(line: &str) -> Option<ProcessEntry> {
     // (e.g. `wezterm --config-file foo.toml cli list`), so we scan forward.
     let cli_pos = tokens.iter().position(|&t| t == "cli")?;
 
-    // Find the subcommand: the first token after "cli" that does not start
-    // with "-" (skip flags like `--prefer-mux` that appear between "cli" and
-    // the subcommand).
-    let subcommand = tokens[(cli_pos + 1)..]
-        .iter()
-        .find(|&&t| !t.starts_with('-'))?;
+    // Find the subcommand by walking tokens after `cli` and skipping:
+    // - boolean flags like `--prefer-mux`
+    // - the value token for known value-taking flags like `--config-file foo`
+    let mut idx = cli_pos + 1;
+    let subcommand = loop {
+        let token = *tokens.get(idx)?;
+        if !token.starts_with('-') {
+            break token;
+        }
+
+        if PRE_SUBCOMMAND_VALUE_FLAGS.contains(&token) {
+            idx += 2;
+            continue;
+        }
+
+        idx += 1;
+    };
 
     // Only reap subcommands on the explicit allowlist.
     if !REAPABLE_SUBCOMMANDS.contains(subcommand) {
@@ -528,6 +546,35 @@ mod tests {
     fn accepts_with_prefer_mux_flag_before_list() {
         // --prefer-mux is a flag to "cli", subcommand is "list" => reapable
         let line = "  500   70 wezterm cli --prefer-mux list";
+        let entry = parse_ps_line_if_reapable(line).expect("should match");
+        assert!(entry.command.contains("list"));
+    }
+
+    #[test]
+    fn accepts_with_config_file_flag_after_cli_before_subcommand() {
+        let line = "  501   70 wezterm cli --config-file /tmp/wez.toml list";
+        let entry = parse_ps_line_if_reapable(line).expect("should match");
+        assert!(entry.command.contains("list"));
+    }
+
+    #[test]
+    fn accepts_with_config_override_flag_after_cli_before_subcommand() {
+        let line = "  502   70 wezterm cli --config mux.enable_kitty_graphics=true list";
+        let entry = parse_ps_line_if_reapable(line).expect("should match");
+        assert!(entry.command.contains("list"));
+    }
+
+    #[test]
+    fn accepts_with_class_flag_after_cli_before_subcommand() {
+        let line = "  503   70 wezterm cli --class agent-fleet list";
+        let entry = parse_ps_line_if_reapable(line).expect("should match");
+        assert!(entry.command.contains("list"));
+    }
+
+    #[test]
+    fn accepts_with_multiple_value_taking_flags_after_cli_before_subcommand() {
+        let line =
+            "  504   70 wezterm cli --config-file /tmp/wez.toml --config mux.enabled=true list";
         let entry = parse_ps_line_if_reapable(line).expect("should match");
         assert!(entry.command.contains("list"));
     }
@@ -613,6 +660,12 @@ mod tests {
     #[test]
     fn rejects_wezterm_cli_with_only_flags() {
         let line = "  6001   40 wezterm cli --prefer-mux";
+        assert!(parse_ps_line_if_reapable(line).is_none());
+    }
+
+    #[test]
+    fn rejects_value_taking_flag_without_subcommand() {
+        let line = "  6002   40 wezterm cli --config-file /tmp/wez.toml";
         assert!(parse_ps_line_if_reapable(line).is_none());
     }
 
