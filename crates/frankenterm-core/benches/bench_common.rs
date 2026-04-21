@@ -47,6 +47,12 @@ pub const CI_BUDGETS: &[CiBudgetEntry] = &[
         max_median_ns: 5_000_000,
         note: "quick reject: observed ~100us-2.7ms, ceiling 5ms",
     },
+    // Dedicated quick_reject() API benchmark with larger size scaling.
+    CiBudgetEntry {
+        group_prefix: "patterns_quick_reject/",
+        max_median_ns: 5_000_000,
+        note: "quick_reject api: no-match and near-miss scaling, ceiling 5ms",
+    },
     // Pattern detection: observed ~300-400µs → ceiling 5ms
     CiBudgetEntry {
         group_prefix: "pattern_detection/",
