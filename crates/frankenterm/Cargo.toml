@@ -15,6 +15,10 @@ categories = ["command-line-utilities", "development-tools"]
 name = "ft"
 path = "src/main.rs"
 
+[[test]]
+name = "e2e_workflow_trigger"
+path = "../../tests/e2e_workflow_trigger.rs"
+
 [lints]
 workspace = true
 
