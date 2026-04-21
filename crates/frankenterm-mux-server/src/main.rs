@@ -119,6 +119,12 @@ struct Opt {
     #[arg(long = "daemonize", action = clap::ArgAction::Set, default_value_t = false)]
     daemonize: bool,
 
+    /// Select the mux dispatch reactor backend. `auto` prefers the
+    /// compiled io_uring wrapper on supported Linux kernels and
+    /// otherwise falls back to the existing readiness-based backend.
+    #[arg(long = "dispatch-io-backend", value_enum, default_value_t = DispatchIoBackendArg::Auto)]
+    dispatch_io_backend: DispatchIoBackendArg,
+
     /// Specify the current working directory for the initially
     /// spawned program
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
@@ -129,6 +135,27 @@ struct Opt {
     /// as if it were a login shell.
     #[arg(value_parser, value_hint=ValueHint::CommandWithArguments, num_args=1..)]
     prog: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DispatchIoBackendArg {
+    Auto,
+    IoUring,
+    Epoll,
+    Kqueue,
+    Poll,
+}
+
+impl From<DispatchIoBackendArg> for frankenterm_mux_server_impl::dispatch::DispatchIoPreference {
+    fn from(value: DispatchIoBackendArg) -> Self {
+        match value {
+            DispatchIoBackendArg::Auto => Self::Auto,
+            DispatchIoBackendArg::IoUring => Self::IoUring,
+            DispatchIoBackendArg::Epoll => Self::Epoll,
+            DispatchIoBackendArg::Kqueue => Self::Kqueue,
+            DispatchIoBackendArg::Poll => Self::Poll,
+        }
+    }
 }
 
 fn main() {
@@ -221,7 +248,11 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
-    spawn_listener().map_err(|e| {
+    let dispatch_config = frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::new(
+        opts.dispatch_io_backend.into(),
+    );
+
+    spawn_listener(dispatch_config).map_err(|e| {
         log::error!("problem spawning listeners: {:?}", e);
         e
     })?;
@@ -325,7 +356,17 @@ fn set_mux_socket_environment(config: &config::ConfigHandle) {
 }
 
 fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
-    let mut args = vec![OsString::from("--daemonize=false")];
+    let mut args = vec![
+        OsString::from("--daemonize=false"),
+        OsString::from("--dispatch-io-backend"),
+        OsString::from(match opts.dispatch_io_backend {
+            DispatchIoBackendArg::Auto => "auto",
+            DispatchIoBackendArg::IoUring => "io-uring",
+            DispatchIoBackendArg::Epoll => "epoll",
+            DispatchIoBackendArg::Kqueue => "kqueue",
+            DispatchIoBackendArg::Poll => "poll",
+        }),
+    ];
     if opts.skip_config {
         args.push(OsString::from("-n"));
     }
@@ -348,20 +389,24 @@ fn daemonized_child_args(opts: &Opt) -> Vec<OsString> {
     args
 }
 
-pub fn spawn_listener() -> anyhow::Result<()> {
+pub fn spawn_listener(
+    dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
+) -> anyhow::Result<()> {
     let config = configuration();
     set_mux_socket_environment(&config);
 
     for unix_dom in &config.unix_domains {
-        let mut listener =
-            frankenterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
+        let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
+            unix_dom,
+            dispatch_config,
+        )?;
         thread::spawn(move || {
             listener.run();
         });
     }
 
     for tls_server in &config.tls_servers {
-        ossl::spawn_tls_listener(tls_server)?;
+        ossl::spawn_tls_listener(tls_server, dispatch_config)?;
     }
 
     Ok(())
@@ -426,6 +471,7 @@ mod tests {
             config_file: None,
             config_override: Vec::new(),
             daemonize: false,
+            dispatch_io_backend: DispatchIoBackendArg::Auto,
             cwd: None,
             prog: Vec::new(),
         }
@@ -520,6 +566,7 @@ mod tests {
     fn daemonized_child_args_forward_cli_state_and_prog_separator() {
         let mut opts = make_opt();
         opts.skip_config = true;
+        opts.dispatch_io_backend = DispatchIoBackendArg::IoUring;
         opts.config_file = Some(OsString::from("/tmp/ft.toml"));
         opts.config_override = vec![
             ("mux.enabled".to_string(), "true".to_string()),
@@ -538,6 +585,8 @@ mod tests {
             args,
             vec![
                 OsString::from("--daemonize=false"),
+                OsString::from("--dispatch-io-backend"),
+                OsString::from("io-uring"),
                 OsString::from("-n"),
                 OsString::from("--config-file"),
                 OsString::from("/tmp/ft.toml"),
@@ -560,7 +609,14 @@ mod tests {
         let opts = make_opt();
         let args = daemonized_child_args(&opts);
 
-        assert_eq!(args, vec![OsString::from("--daemonize=false")]);
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--daemonize=false"),
+                OsString::from("--dispatch-io-backend"),
+                OsString::from("auto"),
+            ]
+        );
         assert!(
             !args.iter().any(|arg| arg == OsStr::new("--")),
             "separator should only appear when forwarding a child program"

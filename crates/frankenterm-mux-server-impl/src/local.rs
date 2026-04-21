@@ -5,27 +5,40 @@ use wezterm_uds::UnixListener;
 
 pub struct LocalListener {
     listener: UnixListener,
+    dispatch_config: crate::dispatch::DispatchRuntimeConfig,
 }
 
 impl LocalListener {
-    pub fn new(listener: UnixListener) -> Self {
-        Self { listener }
+    pub fn new(
+        listener: UnixListener,
+        dispatch_config: crate::dispatch::DispatchRuntimeConfig,
+    ) -> Self {
+        Self {
+            listener,
+            dispatch_config,
+        }
     }
 
-    pub fn with_domain(unix_dom: &UnixDomain) -> anyhow::Result<Self> {
+    pub fn with_domain(
+        unix_dom: &UnixDomain,
+        dispatch_config: crate::dispatch::DispatchRuntimeConfig,
+    ) -> anyhow::Result<Self> {
         let listener = safely_create_sock_path(unix_dom)?;
-        Ok(Self::new(listener))
+        Ok(Self::new(listener, dispatch_config))
     }
 
     pub fn run(&mut self) {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let dispatch_config = self.dispatch_config;
                     spawn_into_main_thread(async move {
-                        crate::dispatch::process(stream).await.map_err(|e| {
-                            log::error!("{:#}", e);
-                            e
-                        })
+                        crate::dispatch::process_with_config(stream, dispatch_config)
+                            .await
+                            .map_err(|e| {
+                                log::error!("{:#}", e);
+                                e
+                            })
                     })
                     .detach();
                 }

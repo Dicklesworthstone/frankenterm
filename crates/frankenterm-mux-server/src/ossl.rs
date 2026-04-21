@@ -12,13 +12,19 @@ use std::sync::Arc;
 struct OpenSSLNetListener {
     acceptor: Arc<SslAcceptor>,
     listener: TcpListener,
+    dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
 }
 
 impl OpenSSLNetListener {
-    pub fn new(listener: TcpListener, acceptor: SslAcceptor) -> Self {
+    pub fn new(
+        listener: TcpListener,
+        acceptor: SslAcceptor,
+        dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
+    ) -> Self {
         Self {
             listener,
             acceptor: Arc::new(acceptor),
+            dispatch_config,
         }
     }
 
@@ -75,6 +81,7 @@ impl OpenSSLNetListener {
                 Ok(stream) => {
                     stream.set_nodelay(true).ok();
                     let acceptor = self.acceptor.clone();
+                    let dispatch_config = self.dispatch_config;
 
                     match acceptor.accept(stream) {
                         Ok(stream) => {
@@ -84,9 +91,10 @@ impl OpenSSLNetListener {
                             }
                             spawn_into_main_thread(async move {
                                 log::error!("Making new AsyncSslStream");
-                                frankenterm_mux_server_impl::dispatch::process(AsyncSslStream::new(
-                                    stream,
-                                ))
+                                frankenterm_mux_server_impl::dispatch::process_with_config(
+                                    AsyncSslStream::new(stream),
+                                    dispatch_config,
+                                )
                                 .await
                                 .map_err(|e| {
                                     log::error!("process: {:?}", e);
@@ -109,7 +117,10 @@ impl OpenSSLNetListener {
     }
 }
 
-pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
+pub fn spawn_tls_listener(
+    tls_server: &TlsDomainServer,
+    dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
+) -> Result<(), Error> {
     openssl::init();
 
     let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
@@ -180,6 +191,7 @@ pub fn spawn_tls_listener(tls_server: &TlsDomainServer) -> Result<(), Error> {
             )
         })?,
         acceptor,
+        dispatch_config,
     );
     let _ = std::thread::spawn(move || {
         net_listener.run();

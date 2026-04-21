@@ -24,12 +24,8 @@ pub enum DispatchIoBackend {
 }
 
 impl DispatchIoBackend {
-    pub const fn current_default() -> Self {
-        #[cfg(all(feature = "io-uring", target_os = "linux"))]
-        {
-            return Self::IoUring;
-        }
-        #[cfg(all(not(feature = "io-uring"), target_os = "linux"))]
+    pub const fn readiness_default() -> Self {
+        #[cfg(target_os = "linux")]
         {
             return Self::Epoll;
         }
@@ -46,14 +42,272 @@ impl DispatchIoBackend {
         }
         Self::Poll
     }
+
+    pub const fn current_default() -> Self {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        {
+            return Self::IoUring;
+        }
+        Self::readiness_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchIoPreference {
+    Auto,
+    IoUring,
+    Epoll,
+    Kqueue,
+    Poll,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchRuntimeConfig {
+    preference: DispatchIoPreference,
+}
+
+impl DispatchRuntimeConfig {
+    #[must_use]
+    pub const fn new(preference: DispatchIoPreference) -> Self {
+        Self { preference }
+    }
+
+    #[must_use]
+    pub const fn preference(self) -> DispatchIoPreference {
+        self.preference
+    }
+}
+
+impl Default for DispatchRuntimeConfig {
+    fn default() -> Self {
+        Self::new(DispatchIoPreference::Auto)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchStreamKind {
+    Unix,
+    Tls,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchIoRuntimeAvailability {
+    io_uring_compiled: bool,
+    io_uring_runtime_available: bool,
+}
+
+impl DispatchIoRuntimeAvailability {
+    fn detect() -> Self {
+        Self {
+            io_uring_compiled: cfg!(all(feature = "io-uring", target_os = "linux")),
+            io_uring_runtime_available: io_uring_runtime_available(),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn for_conformance(
+        io_uring_compiled: bool,
+        io_uring_runtime_available: bool,
+    ) -> Self {
+        Self {
+            io_uring_compiled,
+            io_uring_runtime_available,
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoUringReactor {
+    _marker: std::marker::PhantomData<io_uring::IoUring>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchReactor {
+    requested: DispatchIoPreference,
+    backend: DispatchIoBackend,
+    fallback_reason: Option<&'static str>,
+}
+
+impl DispatchReactor {
+    #[must_use]
+    pub fn resolve(config: DispatchRuntimeConfig, stream_kind: DispatchStreamKind) -> Self {
+        Self::resolve_with_availability(
+            config,
+            stream_kind,
+            DispatchIoRuntimeAvailability::detect(),
+        )
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn resolve_with_availability(
+        config: DispatchRuntimeConfig,
+        stream_kind: DispatchStreamKind,
+        availability: DispatchIoRuntimeAvailability,
+    ) -> Self {
+        let fallback_backend = DispatchIoBackend::readiness_default();
+        let wants_io_uring = matches!(
+            config.preference,
+            DispatchIoPreference::Auto | DispatchIoPreference::IoUring
+        );
+
+        if wants_io_uring {
+            if stream_kind != DispatchStreamKind::Unix {
+                return Self {
+                    requested: config.preference,
+                    backend: fallback_backend,
+                    fallback_reason: Some(
+                        "io_uring mux dispatch currently supports UnixStream only; using readiness backend",
+                    ),
+                };
+            }
+
+            if !availability.io_uring_compiled {
+                return Self {
+                    requested: config.preference,
+                    backend: fallback_backend,
+                    fallback_reason: Some(
+                        "io_uring support was not compiled into this binary; using readiness backend",
+                    ),
+                };
+            }
+
+            if !availability.io_uring_runtime_available {
+                return Self {
+                    requested: config.preference,
+                    backend: fallback_backend,
+                    fallback_reason: Some(
+                        "io_uring unavailable on this kernel/runtime; using readiness backend",
+                    ),
+                };
+            }
+
+            return Self {
+                requested: config.preference,
+                backend: DispatchIoBackend::IoUring,
+                fallback_reason: None,
+            };
+        }
+
+        let selected = match config.preference {
+            DispatchIoPreference::Auto | DispatchIoPreference::IoUring => unreachable!(),
+            DispatchIoPreference::Epoll => {
+                #[cfg(target_os = "linux")]
+                {
+                    DispatchIoBackend::Epoll
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    fallback_backend
+                }
+            }
+            DispatchIoPreference::Kqueue => {
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                ))]
+                {
+                    DispatchIoBackend::Kqueue
+                }
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd"
+                )))]
+                {
+                    fallback_backend
+                }
+            }
+            DispatchIoPreference::Poll => DispatchIoBackend::Poll,
+        };
+
+        let fallback_reason = match (config.preference, selected) {
+            (DispatchIoPreference::Epoll, DispatchIoBackend::Epoll)
+            | (DispatchIoPreference::Kqueue, DispatchIoBackend::Kqueue)
+            | (DispatchIoPreference::Poll, DispatchIoBackend::Poll) => None,
+            (DispatchIoPreference::Epoll, _) | (DispatchIoPreference::Kqueue, _) => Some(
+                "requested dispatch backend is unavailable on this platform; using readiness backend",
+            ),
+            _ => None,
+        };
+
+        Self {
+            requested: config.preference,
+            backend: selected,
+            fallback_reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend(self) -> DispatchIoBackend {
+        self.backend
+    }
+
+    #[must_use]
+    pub const fn fallback_reason(self) -> Option<&'static str> {
+        self.fallback_reason
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_runtime_available() -> bool {
+    if !cfg!(feature = "io-uring") {
+        return false;
+    }
+
+    let Ok(osrelease) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return false;
+    };
+
+    let mut components = osrelease.trim().split(['.', '-']);
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    if (major, minor) < (5, 6) {
+        return false;
+    }
+
+    match std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled") {
+        Ok(flag) => flag.trim() == "0",
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn io_uring_runtime_available() -> bool {
+    false
 }
 
 pub trait DispatchStream: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug {
+    fn dispatch_stream_kind(&self) -> DispatchStreamKind {
+        DispatchStreamKind::Generic
+    }
+
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
 }
 
 impl DispatchStream for UnixStream {
+    fn dispatch_stream_kind(&self) -> DispatchStreamKind {
+        DispatchStreamKind::Unix
+    }
+
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(UnixStream::wait_for_readable(self))
     }
@@ -64,6 +318,10 @@ impl DispatchStream for UnixStream {
 }
 
 impl DispatchStream for AsyncSslStream {
+    fn dispatch_stream_kind(&self) -> DispatchStreamKind {
+        DispatchStreamKind::Tls
+    }
+
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(AsyncSslStream::wait_for_readable(self))
     }
@@ -159,7 +417,15 @@ where
     T: 'static,
     T: DispatchStream,
 {
-    process_async(stream).await
+    process_with_config(stream, DispatchRuntimeConfig::default()).await
+}
+
+pub async fn process_with_config<T>(stream: T, config: DispatchRuntimeConfig) -> anyhow::Result<()>
+where
+    T: 'static,
+    T: DispatchStream,
+{
+    process_async_with_config(stream, config).await
 }
 
 pub async fn process_async<T>(mut stream: T) -> anyhow::Result<()>
@@ -167,10 +433,32 @@ where
     T: 'static,
     T: DispatchStream,
 {
-    log::trace!(
-        "process_async called with backend {:?}",
-        DispatchIoBackend::current_default()
-    );
+    process_async_with_config(stream, DispatchRuntimeConfig::default()).await
+}
+
+async fn process_async_with_config<T>(
+    mut stream: T,
+    config: DispatchRuntimeConfig,
+) -> anyhow::Result<()>
+where
+    T: 'static,
+    T: DispatchStream,
+{
+    let reactor = DispatchReactor::resolve(config, stream.dispatch_stream_kind());
+    if let Some(reason) = reactor.fallback_reason() {
+        log::trace!(
+            "process_async configured backend {:?} resolved to {:?}: {}",
+            config.preference(),
+            reactor.backend(),
+            reason
+        );
+    } else {
+        log::trace!(
+            "process_async configured backend {:?} resolved to {:?}",
+            config.preference(),
+            reactor.backend()
+        );
+    }
 
     let (item_tx, item_rx) = unbounded::<Item>();
     let mut deferred_item = None;
@@ -599,5 +887,69 @@ mod tests {
             target_os = "openbsd"
         )))]
         assert_eq!(backend, DispatchIoBackend::Poll);
+    }
+
+    #[test]
+    fn auto_prefers_io_uring_for_unix_when_available() {
+        let reactor = DispatchReactor::resolve_with_availability(
+            DispatchRuntimeConfig::new(DispatchIoPreference::Auto),
+            DispatchStreamKind::Unix,
+            DispatchIoRuntimeAvailability {
+                io_uring_compiled: true,
+                io_uring_runtime_available: true,
+            },
+        );
+
+        assert_eq!(reactor.backend(), DispatchIoBackend::IoUring);
+        assert_eq!(reactor.fallback_reason(), None);
+    }
+
+    #[test]
+    fn auto_falls_back_when_io_uring_unavailable() {
+        let reactor = DispatchReactor::resolve_with_availability(
+            DispatchRuntimeConfig::new(DispatchIoPreference::Auto),
+            DispatchStreamKind::Unix,
+            DispatchIoRuntimeAvailability {
+                io_uring_compiled: true,
+                io_uring_runtime_available: false,
+            },
+        );
+
+        assert_eq!(reactor.backend(), DispatchIoBackend::readiness_default());
+        assert!(reactor.fallback_reason().is_some());
+    }
+
+    #[test]
+    fn tls_forces_readiness_even_when_io_uring_is_available() {
+        let reactor = DispatchReactor::resolve_with_availability(
+            DispatchRuntimeConfig::new(DispatchIoPreference::IoUring),
+            DispatchStreamKind::Tls,
+            DispatchIoRuntimeAvailability {
+                io_uring_compiled: true,
+                io_uring_runtime_available: true,
+            },
+        );
+
+        assert_eq!(reactor.backend(), DispatchIoBackend::readiness_default());
+        assert!(
+            reactor
+                .fallback_reason()
+                .is_some_and(|reason| reason.contains("UnixStream"))
+        );
+    }
+
+    #[test]
+    fn explicit_poll_stays_poll() {
+        let reactor = DispatchReactor::resolve_with_availability(
+            DispatchRuntimeConfig::new(DispatchIoPreference::Poll),
+            DispatchStreamKind::Generic,
+            DispatchIoRuntimeAvailability {
+                io_uring_compiled: false,
+                io_uring_runtime_available: false,
+            },
+        );
+
+        assert_eq!(reactor.backend(), DispatchIoBackend::Poll);
+        assert_eq!(reactor.fallback_reason(), None);
     }
 }

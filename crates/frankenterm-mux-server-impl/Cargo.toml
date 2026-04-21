@@ -11,7 +11,7 @@ publish = false
 
 [features]
 default = []
-io-uring = []
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 anyhow.workspace = true
@@ -23,6 +23,7 @@ config.workspace = true
 dns-lookup.workspace = true
 futures.workspace = true
 hostname.workspace = true
+io-uring = { version = "0.7.12", optional = true }
 lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
@@ -40,6 +41,13 @@ wezterm-uds = { workspace = true, default-features = false, features = ["async-a
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "dispatch_throughput"
+harness = false
 
 [lints]
 workspace = true
