@@ -141,7 +141,7 @@ The observation loop (discovery, capture, pattern detection) has **no side effec
 
 ### 2. Event-Driven, Not Time-Based
 
-No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. The `ft robot wait-for` command blocks until a specific rule fires, not until a timer expires.
+No `sleep(5)` loops hoping the agent is ready. Every wait is condition-based: wait for a pattern match, wait for pane idle, wait for an external signal. Deterministic, not probabilistic. The `ft robot wait-for` command blocks until a specific pattern appears in pane output, not until a timer expires.
 
 ### 3. Delta Extraction Over Full Capture
 
