@@ -10,7 +10,11 @@ fn arb_phys_key_code() -> impl Strategy<Value = PhysKeyCode> {
         Just(PhysKeyCode::A),
         Just(PhysKeyCode::B),
         Just(PhysKeyCode::Escape),
-        Just(PhysKeyCode::Enter),
+        // `PhysKeyCode` does not have an `Enter` variant — the enum
+        // spells it `Return` (with `KeypadEnter` as the keypad sibling).
+        // See input-types/src/lib.rs:868,843 + the `Self::Return |
+        // Self::KeypadEnter => KeyCode::Char('\r')` mapping.
+        Just(PhysKeyCode::Return),
         Just(PhysKeyCode::LeftShift),
         Just(PhysKeyCode::RightShift),
         Just(PhysKeyCode::LeftControl),

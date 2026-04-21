@@ -645,8 +645,7 @@ mod tests {
 
         // Manually set last_output to the past
         {
-            let mut panes = clf.panes.write().unwrap();
-            let state = panes.get_mut(&1).unwrap();
+            let mut state = clf.panes.get_mut(&1).unwrap();
             state.last_output = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         }
 
@@ -664,8 +663,7 @@ mod tests {
 
         // Set last_output well past dormant threshold
         {
-            let mut panes = clf.panes.write().unwrap();
-            let state = panes.get_mut(&1).unwrap();
+            let mut state = clf.panes.get_mut(&1).unwrap();
             state.last_output = Instant::now()
                 .checked_sub(Duration::from_secs(120))
                 .unwrap();
@@ -683,8 +681,7 @@ mod tests {
 
         // Force pane to Idle
         {
-            let mut panes = clf.panes.write().unwrap();
-            let state = panes.get_mut(&1).unwrap();
+            let mut state = clf.panes.get_mut(&1).unwrap();
             state.tier = PaneTier::Idle;
             state.last_output = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
         }
@@ -786,8 +783,7 @@ mod tests {
         clf.set_background(2, true);
 
         {
-            let mut panes = clf.panes.write().unwrap();
-            let state = panes.get_mut(&1).unwrap();
+            let mut state = clf.panes.get_mut(&1).unwrap();
             state.last_output = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         }
 

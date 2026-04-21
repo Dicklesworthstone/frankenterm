@@ -121,7 +121,13 @@ fn arb_renderable_dimensions() -> impl Strategy<Value = RenderableDimensions> {
 }
 
 fn arb_pane_tiered_scrollback_status() -> impl Strategy<Value = PaneTieredScrollbackStatus> {
-    (
+    // `Strategy` is only implemented for tuples up to arity 12, so the
+    // original 17-field tuple fails the `prop_map` bound (see
+    // ft-h9g0q). Split the fields into two nested tuples of ≤12
+    // elements each; the inner `prop_map` destructure mirrors the
+    // grouping so the assignment to `PaneTieredScrollbackStatus`
+    // remains readable.
+    let config_and_hot = (
         any::<bool>(),
         0usize..=100_000,
         0usize..=100_000,
@@ -130,6 +136,8 @@ fn arb_pane_tiered_scrollback_status() -> impl Strategy<Value = PaneTieredScroll
         0usize..=100_000,
         0usize..=100_000,
         0usize..=10_000_000,
+    );
+    let warm_cold = (
         any::<u64>(),
         any::<u64>(),
         any::<u64>(),
@@ -139,46 +147,50 @@ fn arb_pane_tiered_scrollback_status() -> impl Strategy<Value = PaneTieredScroll
         any::<u64>(),
         any::<u64>(),
         any::<u64>(),
+    );
+    (config_and_hot, warm_cold).prop_map(
+        |(
+            (
+                tiering_enabled,
+                configured_scrollback_rows,
+                configured_hot_lines,
+                configured_warm_max_bytes,
+                visible_rows,
+                in_memory_scrollback_rows,
+                warm_resident_lines,
+                warm_resident_bytes,
+            ),
+            (
+                warm_spill_lines_total,
+                warm_spill_bytes_total,
+                cold_spill_lines_total,
+                cold_spill_bytes_total,
+                cold_worker_peak_backlog_depth,
+                cold_worker_completion_throughput_lines_per_sec,
+                cold_worker_completed_lines_total,
+                cold_worker_completed_batches_total,
+                cold_worker_cancellation_count,
+            ),
+        )| PaneTieredScrollbackStatus {
+            tiering_enabled,
+            configured_scrollback_rows,
+            configured_hot_lines,
+            configured_warm_max_bytes,
+            visible_rows,
+            in_memory_scrollback_rows,
+            warm_resident_lines,
+            warm_resident_bytes,
+            warm_spill_lines_total,
+            warm_spill_bytes_total,
+            cold_spill_lines_total,
+            cold_spill_bytes_total,
+            cold_worker_peak_backlog_depth,
+            cold_worker_completion_throughput_lines_per_sec,
+            cold_worker_completed_lines_total,
+            cold_worker_completed_batches_total,
+            cold_worker_cancellation_count,
+        },
     )
-        .prop_map(
-            |(
-                tiering_enabled,
-                configured_scrollback_rows,
-                configured_hot_lines,
-                configured_warm_max_bytes,
-                visible_rows,
-                in_memory_scrollback_rows,
-                warm_resident_lines,
-                warm_resident_bytes,
-                warm_spill_lines_total,
-                warm_spill_bytes_total,
-                cold_spill_lines_total,
-                cold_spill_bytes_total,
-                cold_worker_peak_backlog_depth,
-                cold_worker_completion_throughput_lines_per_sec,
-                cold_worker_completed_lines_total,
-                cold_worker_completed_batches_total,
-                cold_worker_cancellation_count,
-            )| PaneTieredScrollbackStatus {
-                tiering_enabled,
-                configured_scrollback_rows,
-                configured_hot_lines,
-                configured_warm_max_bytes,
-                visible_rows,
-                in_memory_scrollback_rows,
-                warm_resident_lines,
-                warm_resident_bytes,
-                warm_spill_lines_total,
-                warm_spill_bytes_total,
-                cold_spill_lines_total,
-                cold_spill_bytes_total,
-                cold_worker_peak_backlog_depth,
-                cold_worker_completion_throughput_lines_per_sec,
-                cold_worker_completed_lines_total,
-                cold_worker_completed_batches_total,
-                cold_worker_cancellation_count,
-            },
-        )
 }
 
 proptest! {

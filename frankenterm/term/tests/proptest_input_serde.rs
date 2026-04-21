@@ -1,9 +1,11 @@
 #![cfg(feature = "use_serde")]
 
-use frankenterm_term::{
-    CursorPosition, CursorShape, CursorVisibility, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+// CursorShape / CursorVisibility live in frankenterm-surface now; the
+// frankenterm-term CursorPosition struct references them through that
+// crate (term/src/lib.rs:136-137) rather than re-exporting, so tests
+// have to import them from the canonical origin.
+use frankenterm_surface::{CursorShape, CursorVisibility};
+use frankenterm_term::{CursorPosition, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use proptest::prelude::*;
 
 fn arb_mouse_button() -> impl Strategy<Value = MouseButton> {

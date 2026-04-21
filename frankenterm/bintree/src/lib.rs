@@ -13,6 +13,14 @@ use std::fmt::Debug;
 /// Non-leaf nodes in the tree can be labelled with an optional node data type `N`,
 /// which defaults to `()`.
 /// Leaf nodes have a required leaf data type `L`.
+// `Clone` is needed so proptest's `Just(Tree::Empty)` and
+// `prop_recursive` generator (see `arb_tree` in the test module) can
+// own + shrink candidate trees. `derive(Clone)` with the standard
+// `L: Clone, N: Clone` bounds is additive — every existing call site
+// in the workspace (legacy_wezterm/mux/src/tab.rs) already satisfies
+// those bounds for its own `Tree<Arc<dyn Pane>, SplitDirectionAndSize>`
+// and `Tree<PaneEntry, SplitDirectionAndSize>` instantiations.
+#[derive(Clone)]
 pub enum Tree<L, N = ()> {
     Empty,
     Node {
@@ -1990,8 +1998,12 @@ mod tests {
 
         #[test]
         fn cursor_tree_roundtrip_preserves_structure_and_leaf_count(tree in arb_tree()) {
+            // `Tree::cursor` takes `self` by value, so we need to clone
+            // before consuming the original. `Tree: Clone` was added
+            // on the enum declaration above to support the proptest
+            // recursive generator.
             let expected_leaf_count = tree.num_leaves();
-            let roundtrip = tree.cursor().tree();
+            let roundtrip = tree.clone().cursor().tree();
             prop_assert_eq!(roundtrip.num_leaves(), expected_leaf_count);
             prop_assert_eq!(roundtrip, tree);
         }

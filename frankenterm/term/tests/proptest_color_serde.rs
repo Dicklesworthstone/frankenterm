@@ -1,5 +1,10 @@
 #![cfg(feature = "use_serde")]
 
+// frankenterm-term uses edition 2018; TryInto is prelude-level in 2021+
+// but has to be imported explicitly here. The `colors.try_into()` call
+// at `arb_palette256` needs this.
+use std::convert::TryInto;
+
 use frankenterm_term::color::{ColorPalette, Palette256, SrgbaTuple};
 use proptest::prelude::*;
 
