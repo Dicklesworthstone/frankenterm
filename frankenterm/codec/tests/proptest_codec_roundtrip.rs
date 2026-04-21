@@ -559,8 +559,8 @@ fn arb_get_pane_renderable_dimensions() -> impl Strategy<Value = GetPaneRenderab
     (0u64..=4096).prop_map(|pane_id| GetPaneRenderableDimensions { pane_id })
 }
 
-fn arb_get_pane_renderable_dimensions_response(
-) -> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
+fn arb_get_pane_renderable_dimensions_response()
+-> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
     (
         0u64..=4096,
         any::<bool>(),
@@ -793,6 +793,80 @@ fn arb_get_pane_render_changes_response() -> impl Strategy<Value = GetPaneRender
                     working_dir: None,
                     bonus_lines: SerializedLines::default(),
                     input_serial: None,
+                    seqno,
+                }
+            },
+        )
+}
+
+fn arb_rich_get_pane_render_changes_response() -> impl Strategy<Value = GetPaneRenderChangesResponse>
+{
+    (
+        0u64..=4096,
+        any::<bool>(),
+        any::<bool>(),
+        arb_small_string(),
+        1usize..=256,
+        1usize..=256,
+        1usize..=1024,
+        0u32..=960,
+        prop::option::of(any::<u64>()),
+        prop::option::of(0u64..=4096),
+        proptest::collection::vec(((-256isize)..=256isize, 0usize..=16), 0..=4),
+        any::<usize>(),
+    )
+        .prop_map(
+            |(
+                pane_id,
+                mouse_grabbed,
+                alt_screen_active,
+                title,
+                cols,
+                viewport_rows,
+                scrollback_rows,
+                dpi,
+                input_serial_ms,
+                spill_lines_total,
+                dirty_specs,
+                seqno,
+            )| {
+                let dirty_lines = dirty_specs
+                    .into_iter()
+                    .map(|(start, len)| start..(start + len as isize + 1))
+                    .collect();
+
+                GetPaneRenderChangesResponse {
+                    pane_id,
+                    mouse_grabbed,
+                    alt_screen_active,
+                    cursor_position: StableCursorPosition::default(),
+                    dimensions: RenderableDimensions {
+                        cols,
+                        viewport_rows,
+                        scrollback_rows,
+                        physical_top: -(scrollback_rows as isize),
+                        scrollback_top: -(scrollback_rows as isize),
+                        dpi,
+                        pixel_width: cols * 10,
+                        pixel_height: viewport_rows * 20,
+                        reverse_video: alt_screen_active,
+                    },
+                    tiered_scrollback_status: spill_lines_total.map(|cold_spill_lines_total| {
+                        PaneTieredScrollbackStatus {
+                            tiering_enabled: true,
+                            configured_scrollback_rows: scrollback_rows,
+                            visible_rows: viewport_rows,
+                            cold_spill_lines_total,
+                            ..PaneTieredScrollbackStatus::default()
+                        }
+                    }),
+                    dirty_lines,
+                    title,
+                    working_dir: None,
+                    bonus_lines: SerializedLines::default(),
+                    input_serial: input_serial_ms.map(|millis| {
+                        (std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)).into()
+                    }),
                     seqno,
                 }
             },
@@ -1477,6 +1551,18 @@ proptest! {
     }
 
     #[test]
+    fn pane_output_like_render_changes_response_pdu_roundtrip(
+        payload in arb_rich_get_pane_render_changes_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: GetPaneRenderChangesResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload.clone());
+
+        assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChangesResponse(payload));
+    }
+
+    #[test]
     fn write_to_pane_json_and_pdu_roundtrip(
         payload in arb_write_to_pane(),
         serial in any::<u64>(),
@@ -1569,4 +1655,3 @@ proptest! {
     }
 
 }
-
