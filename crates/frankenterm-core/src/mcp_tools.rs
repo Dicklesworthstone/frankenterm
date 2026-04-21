@@ -1126,6 +1126,25 @@ impl ToolHandler for WaWaitForTool {
             }
         };
 
+        // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
+        // bound at the server (ft-t62hq). serde_json::from_value accepts 0 for
+        // u64; many MCP clients don't validate inputs against the schema before
+        // sending, and a zero-duration Duration::from_secs(0) below turns the
+        // wait into an instant no-op that silently returns matched: false.
+        if params.timeout_secs == 0 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "timeout_secs must be >= 1 (got 0)".to_string(),
+                Some(
+                    "The wa.wait_for tool schema declares timeout_secs with \
+                     minimum: 1; omit the field to use the default (30)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
         let matcher = match crate::wezterm::compile_wait_matcher(&params.pattern, params.regex) {
             Ok(matcher) => matcher,
             Err(err) => {
@@ -1812,6 +1831,25 @@ impl ToolHandler for WaSendTool {
                 return envelope_to_content(envelope);
             }
         };
+
+        // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
+        // bound (ft-t62hq). Same gap + fix pattern as wa.wait_for above and
+        // wa.events at the `limit` site: serde does not honour JSON-Schema
+        // min/max, so a zero-timeout request silently degrades the wait_for
+        // stage of wa.send into an instant no-op.
+        if params.timeout_secs == 0 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "timeout_secs must be >= 1 (got 0)".to_string(),
+                Some(
+                    "The wa.send tool schema declares timeout_secs with \
+                     minimum: 1; omit the field to use the default (30)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
