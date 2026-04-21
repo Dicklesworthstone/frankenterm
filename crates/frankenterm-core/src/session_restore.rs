@@ -58,6 +58,22 @@ pub enum RestoreError {
 
     #[error("restore bookkeeping failed: {0}")]
     Bookkeeping(String),
+
+    /// [ft-qf3vk] Stored state_hash does not match the recomputed hash from
+    /// the same inputs — row was tampered with, or a pre-ft-ybtyg checkpoint
+    /// carrying the legacy `'restore'` literal is being re-read. Either way,
+    /// refuse to restore from it: a mismatched integrity witness is stronger
+    /// evidence against the row than silence.
+    #[error(
+        "state_hash mismatch on checkpoint {checkpoint_id} \
+         (session {session_id}): stored={stored}, recomputed={recomputed}"
+    )]
+    StateHashMismatch {
+        checkpoint_id: i64,
+        session_id: String,
+        stored: String,
+        recomputed: String,
+    },
 }
 
 impl From<rusqlite::Error> for RestoreError {
@@ -333,7 +349,8 @@ pub fn load_checkpoint_by_id(
     let conn = open_conn(db_path)?;
 
     let checkpoint = conn.query_row(
-        "SELECT session_id, checkpoint_at, checkpoint_type, pane_count
+        "SELECT session_id, checkpoint_at, checkpoint_type, pane_count,
+                state_hash, metadata_json
          FROM session_checkpoints
          WHERE id = ?1",
         [checkpoint_id],
@@ -343,17 +360,50 @@ pub fn load_checkpoint_by_id(
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         },
     );
 
-    let (session_id, checkpoint_at_raw, checkpoint_type, pane_count_raw) = match checkpoint {
+    let (
+        session_id,
+        checkpoint_at_raw,
+        checkpoint_type,
+        pane_count_raw,
+        stored_state_hash,
+        metadata_json,
+    ) = match checkpoint {
         Ok(c) => c,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(e) => return Err(RestoreError::Database(e.to_string())),
     };
     let checkpoint_at = decode_u64(checkpoint_at_raw, "session_checkpoints.checkpoint_at")?;
     let pane_count = decode_usize(pane_count_raw, "session_checkpoints.pane_count")?;
+
+    // [ft-qf3vk] Integrity check for restore-written checkpoints. ft-ybtyg
+    // stopped writing the `'restore'` literal and started writing a real
+    // SipHash — but never wired the verifier. Close that gap here: for
+    // `checkpoint_type = 'startup'` rows (the ones produced by
+    // `finalize_restore` / `save_restore_checkpoint`), recompute the hash
+    // from the same inputs that were fed to `compute_restore_state_hash` at
+    // write time — `(session_id, pane_id_map, now_ms)` — and refuse to
+    // return the checkpoint if they disagree. The pane_id_map is recovered
+    // from `metadata_json.old_to_new`, which both INSERT sites write.
+    //
+    // Capture checkpoints (checkpoint_type = 'periodic' etc.) use
+    // `snapshot_engine::compute_state_hash` over PaneInfo inputs that are
+    // not reconstructable from session_checkpoints alone, so they are not
+    // verified here — that remains a documented follow-up.
+    if checkpoint_type.as_deref() == Some("startup") {
+        verify_restore_state_hash(
+            checkpoint_id,
+            &session_id,
+            checkpoint_at_raw,
+            metadata_json.as_deref(),
+            &stored_state_hash,
+        )?;
+    }
 
     // Load pane states for this checkpoint ID.
     let mut stmt = conn.prepare(
@@ -479,6 +529,73 @@ pub(super) fn compute_restore_state_hash(
     }
 
     format!("{:016x}", hasher.finish())
+}
+
+/// [ft-qf3vk] Reconstruct the pane_id_map that was fed to
+/// `compute_restore_state_hash` at write time, recompute the hash, and assert
+/// it matches the stored value. Returns `StateHashMismatch` on tampering or
+/// any structural problem in the persisted metadata.
+///
+/// The write-time inputs are:
+///   * `session_id`           — carried verbatim in session_checkpoints
+///   * `pane_id_map`          — serialized as `metadata_json.old_to_new`
+///   * `now_ms`               — stored as `session_checkpoints.checkpoint_at`
+///
+/// A malformed or missing `metadata_json.old_to_new` is treated the same as
+/// a hash mismatch: the row's integrity witness is no longer reliable, so we
+/// refuse to restore from it rather than falling back to "restore anyway".
+fn verify_restore_state_hash(
+    checkpoint_id: i64,
+    session_id: &str,
+    checkpoint_at_raw: i64,
+    metadata_json: Option<&str>,
+    stored_state_hash: &str,
+) -> Result<(), RestoreError> {
+    let mismatch = |recomputed: String| RestoreError::StateHashMismatch {
+        checkpoint_id,
+        session_id: session_id.to_string(),
+        stored: stored_state_hash.to_string(),
+        recomputed,
+    };
+
+    let Some(metadata_json) = metadata_json else {
+        return Err(mismatch(String::from("<metadata_json is NULL>")));
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
+        Ok(v) => v,
+        Err(_) => return Err(mismatch(String::from("<metadata_json is not JSON>"))),
+    };
+
+    let old_to_new = match parsed.get("old_to_new").and_then(|v| v.as_object()) {
+        Some(map) => map,
+        None => {
+            return Err(mismatch(String::from(
+                "<metadata_json.old_to_new is missing or not an object>",
+            )));
+        }
+    };
+
+    let mut pane_id_map: HashMap<u64, u64> = HashMap::with_capacity(old_to_new.len());
+    for (old_key, new_value) in old_to_new {
+        let Ok(old_id) = old_key.parse::<u64>() else {
+            return Err(mismatch(format!(
+                "<metadata_json.old_to_new key is not u64: {old_key}>"
+            )));
+        };
+        let Some(new_id) = new_value.as_u64() else {
+            return Err(mismatch(format!(
+                "<metadata_json.old_to_new[{old_key}] is not u64>"
+            )));
+        };
+        pane_id_map.insert(old_id, new_id);
+    }
+
+    let recomputed = compute_restore_state_hash(session_id, &pane_id_map, checkpoint_at_raw);
+    if recomputed != stored_state_hash {
+        return Err(mismatch(recomputed));
+    }
+    Ok(())
 }
 
 /// Record the pane ID mapping from restore in a new startup checkpoint.
@@ -1847,6 +1964,175 @@ mod tests {
             restore_hash, naive,
             "domain separator should make hash distinct from naive session hash"
         );
+    }
+
+    // ── ft-qf3vk regression: load-time state_hash verification ──────
+    //
+    // finalize_restore / save_restore_checkpoint write compute_restore_state_hash
+    // into session_checkpoints.state_hash. load_checkpoint_by_id must recompute
+    // from the same inputs and refuse the row on mismatch — otherwise the hash
+    // column is a false integrity witness.
+
+    #[test]
+    fn load_checkpoint_by_id_accepts_unmodified_restore_checkpoint() {
+        // Baseline: a checkpoint written through finalize_restore loads clean,
+        // so the verification path is wired without breaking the happy case.
+        let (db_path, _conn, _dir) = setup_test_db();
+        insert_session(&_conn, "sess-ok", false);
+
+        let mut mapping = HashMap::new();
+        mapping.insert(11u64, 42u64);
+        mapping.insert(22, 43);
+
+        let cp_id =
+            finalize_restore(&db_path, "sess-ok", &mapping, true).expect("finalize restore");
+
+        let loaded = load_checkpoint_by_id(&db_path, cp_id).expect("load should not error");
+        assert!(loaded.is_some(), "unmodified startup checkpoint should load");
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_tampered_state_hash() {
+        // Tamper with the state_hash column only, leaving every other input
+        // that compute_restore_state_hash consumes intact. load_checkpoint_by_id
+        // must return StateHashMismatch — not a silent restore — because the
+        // attacker's goal is exactly this scenario: flip the hash (or some
+        // other field) and ride the "restore" flow.
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-tampered", false);
+
+        let mut mapping = HashMap::new();
+        mapping.insert(1u64, 100u64);
+
+        let cp_id = finalize_restore(&db_path, "sess-tampered", &mapping, true)
+            .expect("finalize restore");
+
+        conn.execute(
+            "UPDATE session_checkpoints SET state_hash = 'deadbeefdeadbeef' WHERE id = ?1",
+            [cp_id],
+        )
+        .unwrap();
+
+        let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("tampered hash must error");
+        match err {
+            RestoreError::StateHashMismatch {
+                checkpoint_id,
+                session_id,
+                stored,
+                ..
+            } => {
+                assert_eq!(checkpoint_id, cp_id);
+                assert_eq!(session_id, "sess-tampered");
+                assert_eq!(stored, "deadbeefdeadbeef");
+            }
+            other => panic!("expected StateHashMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_tampered_pane_id_mapping() {
+        // Flipping the pane_id_map in metadata_json without recomputing the
+        // hash must also fail: the mapping is part of the hashed input set,
+        // so a changed map against an unchanged hash is direct evidence of
+        // row-level tampering.
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-map-tamper", false);
+
+        let mut mapping = HashMap::new();
+        mapping.insert(1u64, 100u64);
+
+        let cp_id = finalize_restore(&db_path, "sess-map-tamper", &mapping, true)
+            .expect("finalize restore");
+
+        // Swap in a different old_to_new without touching state_hash.
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET metadata_json = '{\"old_to_new\":{\"1\":999}}'
+             WHERE id = ?1",
+            [cp_id],
+        )
+        .unwrap();
+
+        let err = load_checkpoint_by_id(&db_path, cp_id)
+            .expect_err("tampered pane map must error");
+        assert!(
+            matches!(err, RestoreError::StateHashMismatch { .. }),
+            "expected StateHashMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_legacy_restore_literal() {
+        // Pre-ft-ybtyg rows carry state_hash='restore'. That literal is
+        // not a real integrity witness and must not pass verification —
+        // accepting it would re-open the ft-ybtyg trust gap under a new
+        // name.
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-legacy", false);
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'startup', 'restore', 0, 0, ?3)",
+            params!["sess-legacy", 1_700_000_000_000i64, "{\"old_to_new\":{}}"],
+        )
+        .unwrap();
+        let cp_id = conn.last_insert_rowid();
+
+        let err =
+            load_checkpoint_by_id(&db_path, cp_id).expect_err("legacy literal must error");
+        match err {
+            RestoreError::StateHashMismatch { stored, .. } => {
+                assert_eq!(stored, "restore");
+            }
+            other => panic!("expected StateHashMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_rejects_missing_metadata_on_startup_row() {
+        // An attacker dropping metadata_json breaks the verifier's ability
+        // to reconstruct pane_id_map. That is itself a tampering signal —
+        // don't fall back to "oh well, load it anyway".
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-nometa", false);
+
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash,
+              pane_count, total_bytes, metadata_json)
+             VALUES (?1, ?2, 'startup', ?3, 0, 0, NULL)",
+            params![
+                "sess-nometa",
+                1_700_000_000_000i64,
+                compute_restore_state_hash("sess-nometa", &HashMap::new(), 1_700_000_000_000),
+            ],
+        )
+        .unwrap();
+        let cp_id = conn.last_insert_rowid();
+
+        let err = load_checkpoint_by_id(&db_path, cp_id).expect_err("null metadata must error");
+        assert!(
+            matches!(err, RestoreError::StateHashMismatch { .. }),
+            "expected StateHashMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_checkpoint_by_id_skips_verification_for_non_startup_checkpoints() {
+        // compute_restore_state_hash only applies to checkpoint_type='startup'.
+        // Capture checkpoints are written by snapshot_engine with a different
+        // input schema, and verifying THOSE is tracked as a separate follow-up.
+        // Make sure we don't accidentally reject them here.
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-capture", false);
+        // insert_checkpoint writes checkpoint_type='periodic', state_hash='hash123'.
+        let cp_id = insert_checkpoint(&conn, "sess-capture", 1000, 0);
+
+        let loaded = load_checkpoint_by_id(&db_path, cp_id)
+            .expect("periodic checkpoint must load without hash verification");
+        assert!(loaded.is_some());
     }
 
     fn run_async_test<F, T>(future: F) -> T
