@@ -38,7 +38,7 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 ### Platform Model
 
-`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native: structured, cancel-correct, and centered on `Cx`-aware orchestration across watch, search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces.
+`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native in the product-facing APIs: structured, cancel-correct, and centered on `Cx`-aware orchestration across search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces. The remaining watch-daemon/runtime startup path still crosses a named `runtime_compat` quarantine while the last task-spawn seams are being collapsed.
 
 Current implementation reality:
 
@@ -51,14 +51,14 @@ Current implementation reality:
 
 | Feature | What It Does |
 |---------|--------------|
-| **Perfect Observability** | Captures all terminal output across all panes with delta extraction (<50ms lag) |
+| **Perfect Observability** | Captures terminal output across panes with low-latency delta extraction; sub-50ms lag remains the target/benchmark lane rather than an always-on guarantee |
 | **Intelligent Detection** | Multi-agent pattern engine detects rate limits, errors, prompts, completions across Codex, Claude Code, and Gemini |
 | **Event-Driven Automation** | Workflows trigger on patterns, not sleep loops or polling heuristics |
 | **Robot Mode API** | JSON/TOON interface optimized for AI agents to control other AI agents |
 | **Lexical + Hybrid Search** | FTS5 lexical search plus semantic/hybrid retrieval modes across captured output |
 | **Policy Engine** | 21-subsystem policy framework with capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
-| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) keeps 200+ panes under 1GB vs 4GB+ in stock terminals |
+| **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; memory-envelope claims should be treated as benchmark-dependent until linked artifacts are published |
 | **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
 | **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
@@ -83,7 +83,7 @@ $ ft robot state
   }
 }
 
-# Compact TOON output (40-60% fewer tokens for AI-to-AI comms)
+# Compact TOON output (typically lower-token AI-to-AI output; exact savings depend on payload shape)
 $ ft robot --format toon state
 
 # Get recent output from a specific pane
@@ -125,7 +125,7 @@ The project needs an honest status table, not migration-era hand-waving.
 | Watch / status / triage / doctor / reproduce | Supported | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints. |
 | Search / events / audit / workflows / mission / tx | Supported | Backed by local storage, policy, and workflow subsystems. |
 | Robot mode | Supported | Core families are implemented: state, get-text, send, wait-for, search, events, rules, workflows, agents, accounts, reservations, mission, tx, health, approvals, and the NTM-aligned families listed by `ft robot help --json`. |
-| Session persistence | Supported with backend prerequisite | Snapshots, session inspection, restore, and `ft session doctor` are implemented, but live restore still depends on the current WezTerm mux interop boundary. |
+| Session persistence | Supported with backend prerequisite | Snapshots, session inspection, restore, and `ft session doctor` are implemented, but live restore still depends on the current WezTerm mux interop boundary. `ft restart` is currently Unix-only. |
 | Web API / SSE | Supported behind `--features web` | `/health`, `/panes`, `/events`, `/search`, and `/stream/*` are implemented; this is more than "health only". |
 | Distributed mode | Supported with explicit limitations | Remote panes persist into the same DB and surface through status/search/state, but live `get-text` for distributed panes is intentionally unavailable. |
 | Semantic search | Optional | Enabled only when built/configured for embeddings. |
@@ -153,7 +153,11 @@ A file-system lock (via `fs2`) ensures only one watcher can write to the databas
 
 ### 5. Agent-First Interface
 
-Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) output reduces token consumption by 40-60% for AI-to-AI communication. Built for machines to parse, not humans to read.
+Robot Mode returns structured JSON with consistent schemas. Every response includes `ok`, `data`, `error`, `elapsed_ms`, and `version`. TOON (Token-Optimized Object Notation) is the lower-token machine format; savings vary by payload and should be treated as workload-dependent until linked benchmark artifacts are published. Built for machines to parse, not humans to read.
+
+### 5.1 Marker Window Bound
+
+Some MCP/robot prompt-state derivation paths currently inspect only a bounded recent segment window when reconstructing OSC/OSC133 state. In long-quiet panes this can yield `unknown`/incomplete derived marker state instead of a full historical reconstruction; treat it as a bounded recent-state view, not an unbounded audit of all prior pane history.
 
 ### 6. Transactional Safety
 
