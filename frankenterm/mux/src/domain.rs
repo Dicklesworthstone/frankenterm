@@ -452,12 +452,39 @@ impl LocalDomain {
 
             if is_default_prog {
                 // We can't read $SHELL from inside the sandbox, so ask the host.
+                //
+                // Guard both failure modes the old code swallowed silently:
+                //   * non-zero exit from flatpak-spawn (missing host socket,
+                //     --host denied, etc.) — the earlier code dropped stderr
+                //     and still pushed stdout (often empty) as the shell
+                //     argument, producing a malformed `flatpak-spawn` argv
+                //     whose downstream spawn_command failure carried no
+                //     context pointing at the real cause;
+                //   * empty `$SHELL` — `echo $SHELL` can legitimately
+                //     return just `\n` if the host shell has no SHELL set,
+                //     in which case we'd push `""` as a program name and
+                //     exec() would fail with an opaque ENOENT.
                 let output = std::process::Command::new("flatpak-spawn")
                     .args(["--host", "sh", "-c", "echo $SHELL"])
-                    .output()?;
+                    .output()
+                    .context("invoking flatpak-spawn --host sh -c 'echo $SHELL'")?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "flatpak-spawn --host sh -c 'echo $SHELL' failed (status={:?}): {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim(),
+                    );
+                }
                 let shell = String::from_utf8_lossy(&output.stdout);
+                let shell = shell.trim();
+                if shell.is_empty() {
+                    anyhow::bail!(
+                        "flatpak-spawn --host reported an empty $SHELL; \
+                         set SHELL on the host or spawn an explicit program"
+                    );
+                }
 
-                args.push(shell.trim().to_string());
+                args.push(shell.to_string());
                 // Assume we can pass `-l` for a login shell
                 args.push("-l".to_string());
             }
