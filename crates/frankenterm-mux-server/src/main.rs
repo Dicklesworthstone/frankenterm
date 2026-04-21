@@ -166,6 +166,12 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // [ft-gqbpk] Install SIGTERM + SIGINT handlers before any startup path
+    // that allocates persistent state or spawns listeners. Otherwise a signal
+    // in the gap before the executor loop would still take the default
+    // terminate-immediately path and skip `clear_storage()` cleanup.
+    install_shutdown_signal_handlers();
+
     // Remove some environment variables that aren't super helpful or
     // that are potentially misleading when we're starting up the
     // server.
@@ -234,12 +240,6 @@ fn run() -> anyhow::Result<()> {
         drop(activity);
     })
     .detach();
-
-    // [ft-gqbpk] Register SIGTERM + SIGINT handlers BEFORE entering
-    // the tick loop so a signal that arrives during startup still
-    // routes through the flag-poll path instead of the default
-    // "terminate immediately" action.
-    install_shutdown_signal_handlers();
 
     while !shutdown_requested() {
         executor.tick()?;
@@ -668,6 +668,22 @@ mod tests {
         assert_eq!(
             ticks, shutdown_after,
             "poll loop must exit immediately once flag is set, not after one more tick"
+        );
+    }
+
+    #[test]
+    fn shutdown_poll_loop_skips_ticks_when_flag_already_set() {
+        let _g = fresh_shutdown_state();
+        request_shutdown();
+
+        let mut ticks = 0u32;
+        while !shutdown_requested() {
+            ticks += 1;
+        }
+
+        assert_eq!(
+            ticks, 0,
+            "if shutdown is requested before loop entry, the poll loop must not tick at all"
         );
     }
 
