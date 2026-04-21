@@ -198,8 +198,21 @@ struct SseRecvState {
 impl SseRecvState {
     fn new() -> Self {
         Self {
+            // Inherit the ambient handler Cx so a cancellation propagated
+            // from the web server's parent — an HTTP client disconnect, a
+            // graceful-shutdown signal from `shutdown_with_cx`, or a
+            // parent-scope cancel — reaches the inner `poll_recv` on this
+            // SSE stream. The earlier revision unconditionally called
+            // `crate::cx::for_request()`, which produces a detached
+            // request-scoped Cx with no parent chain; `poll_recv(&self.cx,
+            // …)` would then wait for events until the upstream Sender
+            // dropped, delaying cleanup of the mpsc receiver and its
+            // associated channels past the point where the HTTP client
+            // already gave up. Matches the inherit-or-fallback idiom at
+            // sse.rs:343 / :440 / :680, handlers.rs:208 / :317, and the
+            // tailer fix landed in dfbf0a31.
             #[cfg(feature = "asupersync-runtime")]
-            cx: crate::cx::for_request(),
+            cx: crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request),
         }
     }
 
