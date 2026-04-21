@@ -29,7 +29,7 @@ use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::backpressure::{BackpressureConfig, BackpressureManager, QueueDepths};
+use crate::backpressure::{BackpressureConfig, BackpressureManager, BackpressureMetrics, QueueDepths};
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
@@ -815,6 +815,13 @@ pub struct RuntimeMetrics {
     native_output_max_batch_events: ShardedMax,
     /// Maximum size (bytes) of one emitted batch.
     native_output_max_batch_bytes: ShardedMax,
+    /// [ft-0e179] Shared backpressure metrics exposing per-pane drop
+    /// attribution to the native event pipeline. The `BackpressureMetrics`
+    /// struct lives on `RuntimeMetrics` (not `BackpressureManager`) because
+    /// drop accounting happens in the native-event task, which does not
+    /// hold a `BackpressureManager` reference — the manager lives in the
+    /// parallel maintenance loop and operates on queue depth sampling.
+    backpressure: Arc<BackpressureMetrics>,
 }
 
 impl Default for RuntimeMetrics {
@@ -853,6 +860,7 @@ impl Default for RuntimeMetrics {
             native_output_emitted_bytes: ShardedCounter::new(),
             native_output_max_batch_events: ShardedMax::new(),
             native_output_max_batch_bytes: ShardedMax::new(),
+            backpressure: Arc::new(BackpressureMetrics::default()),
         }
     }
 }
@@ -911,6 +919,22 @@ impl RuntimeMetrics {
         self.native_output_max_batch_events
             .observe(u64::from(input_events));
         self.native_output_max_batch_bytes.observe(bytes as u64);
+    }
+
+    /// [ft-0e179] Borrow the shared backpressure metrics — used by the
+    /// native-event pipeline to record per-pane segment drops. Returns a
+    /// reference (not a clone) so the hot drop path is free of atomic
+    /// refcount traffic.
+    #[must_use]
+    pub fn backpressure_metrics(&self) -> &Arc<BackpressureMetrics> {
+        &self.backpressure
+    }
+
+    /// [ft-0e179] Convenience: record a backpressure-driven segment drop
+    /// from `pane_id`. Delegates to `BackpressureMetrics::record_segment_dropped`
+    /// so drop sites don't have to deref through `backpressure_metrics()`.
+    pub fn record_segment_dropped(&self, pane_id: u64) {
+        self.backpressure.record_segment_dropped(pane_id);
     }
 
     /// Get average ingest lag in milliseconds.
@@ -2792,6 +2816,7 @@ impl ObservationRuntime {
                             item.timestamp_ms,
                             &capture_tx,
                             &cursors,
+                            metrics.backpressure_metrics(),
                         )
                         .await;
                     }
@@ -2837,6 +2862,7 @@ impl ObservationRuntime {
                                         item.timestamp_ms,
                                         &capture_tx,
                                         &cursors,
+                                        metrics.backpressure_metrics(),
                                     )
                                     .await;
                                 }
@@ -2854,6 +2880,7 @@ impl ObservationRuntime {
                                         item.timestamp_ms,
                                         &capture_tx,
                                         &cursors,
+                                        metrics.backpressure_metrics(),
                                     )
                                     .await;
                                 }
@@ -2867,6 +2894,7 @@ impl ObservationRuntime {
                                     &storage,
                                     event_bus.as_ref(),
                                     &pane_filter,
+                                    metrics.backpressure_metrics(),
                                 )
                                 .await;
                             }
@@ -2880,6 +2908,7 @@ impl ObservationRuntime {
                                     &storage,
                                     event_bus.as_ref(),
                                     &pane_filter,
+                                    metrics.backpressure_metrics(),
                                 )
                                 .await;
                             }
@@ -2899,6 +2928,7 @@ impl ObservationRuntime {
                     item.timestamp_ms,
                     &capture_tx,
                     &cursors,
+                    metrics.backpressure_metrics(),
                 )
                 .await;
             }
@@ -3240,6 +3270,7 @@ async fn handle_native_event(
     storage: &StorageHandle,
     event_bus: Option<&Arc<EventBus>>,
     pane_filter: &PaneFilterConfig,
+    backpressure: &Arc<BackpressureMetrics>,
 ) {
     match event {
         NativeEvent::PaneOutput {
@@ -3247,7 +3278,7 @@ async fn handle_native_event(
             data,
             timestamp_ms,
         } => {
-            emit_native_output_delta(pane_id, data, timestamp_ms, capture_tx, cursors).await;
+            emit_native_output_delta(pane_id, data, timestamp_ms, capture_tx, cursors, backpressure).await;
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
             let mut gap_segment = None;
@@ -3270,6 +3301,12 @@ async fn handle_native_event(
 
             if let Some(segment) = gap_segment {
                 if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                    // [ft-0e179] Per-pane drop attribution. The aggregate
+                    // `segments_dropped` counter was unwired prior to this
+                    // change; both the aggregate and the per-pane map are
+                    // updated here so dashboards and 3am pivots see the
+                    // same drop at the same time.
+                    backpressure.record_segment_dropped(pane_id);
                     debug!(pane_id, "Native event queue full; dropping gap");
                 }
             }
@@ -3368,6 +3405,7 @@ async fn emit_native_output_delta(
     timestamp_ms: i64,
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    backpressure: &Arc<BackpressureMetrics>,
 ) {
     if data.is_empty() {
         return;
@@ -3383,6 +3421,12 @@ async fn emit_native_output_delta(
 
     if let Some(segment) = segment {
         if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+            // [ft-0e179] Output drop is the high-volume case — a pane
+            // producing faster than storage can drain saturates the
+            // capture queue first. Per-pane attribution lets operators
+            // answer "which pane is flooding?" from the drops histogram
+            // without having to cross-reference with rate counters.
+            backpressure.record_segment_dropped(pane_id);
             debug!(pane_id, "Native event queue full; dropping output");
         }
     } else {

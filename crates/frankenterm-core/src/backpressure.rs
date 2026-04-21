@@ -6,7 +6,7 @@
 //!
 //! See `docs/backpressure-policy.md` for the full design specification.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -216,15 +216,130 @@ pub struct BackpressureSnapshot {
 // ─── Metrics ─────────────────────────────────────────────────────────
 
 /// Counters tracked across the lifetime of the backpressure manager.
+///
+/// [ft-0e179] `segments_dropped` is the aggregate counter; the per-pane
+/// attribution lives in `segments_dropped_by_pane`. Both are updated
+/// atomically from a single call to [`record_segment_dropped`], so the
+/// aggregate and the per-pane sum always agree. A scalar view is cheap
+/// (dashboards, "total drops in last minute"); the per-pane view is what
+/// the 3am on-call needs to answer "were the drops from the pane I'm
+/// debugging?".
 #[derive(Debug, Default)]
 pub struct BackpressureMetrics {
     pub yellow_entries: AtomicU64,
     pub red_entries: AtomicU64,
     pub black_entries: AtomicU64,
+    /// Aggregate segments-dropped counter. Preserved for the existing
+    /// `wa_backpressure_segments_dropped_total` metric wire contract.
+    /// [ft-0e179] Update path is `record_segment_dropped(pane_id)`, not
+    /// raw `fetch_add` — that keeps the per-pane map in sync.
     pub segments_dropped: AtomicU64,
     pub gaps_emitted: AtomicU64,
     pub detection_skipped: AtomicU64,
     pub fts_deferred: AtomicU64,
+    /// [ft-0e179] Per-pane drop counter. Keyed by `pane_id`, value is the
+    /// cumulative count of segments dropped from that pane's capture
+    /// stream. Populated on-demand — a pane that has never been dropped
+    /// from contributes no entry.
+    ///
+    /// Access pattern: read-lock fast path for panes that already have an
+    /// entry (common case after the first drop), write-lock only on the
+    /// very first drop from a given pane. This keeps the hot drop path
+    /// contention-free once the map is warm.
+    dropped_by_pane: RwLock<HashMap<u64, AtomicU64>>,
+}
+
+impl BackpressureMetrics {
+    /// [ft-0e179] Record a segment drop with per-pane attribution.
+    ///
+    /// Increments both the aggregate `segments_dropped` counter and the
+    /// per-pane entry for `pane_id`. Callers should route every drop-site
+    /// through this method — a raw `segments_dropped.fetch_add(1, ...)`
+    /// would leave the per-pane view stale and silently reintroduce the
+    /// 3am-debugging gap ft-0e179 fixes.
+    pub fn record_segment_dropped(&self, pane_id: u64) {
+        self.segments_dropped.fetch_add(1, Ordering::Relaxed);
+
+        // Fast path: pane already in the map → one atomic increment, no
+        // write-lock contention with concurrent drops from other panes.
+        {
+            let guard = self
+                .dropped_by_pane
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(counter) = guard.get(&pane_id) {
+                counter.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Slow path: first drop from this pane. Upgrade to write-lock and
+        // `entry().or_insert_with()` handles the race with a concurrent
+        // writer that beats us here.
+        let mut guard = self
+            .dropped_by_pane
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry(pane_id)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [ft-0e179] Total drops across all panes (cheap, lock-free).
+    #[must_use]
+    pub fn segments_dropped_total(&self) -> u64 {
+        self.segments_dropped.load(Ordering::Relaxed)
+    }
+
+    /// [ft-0e179] Drops attributed to a single pane. `0` if the pane has
+    /// never had a segment dropped (either because it's healthy or because
+    /// it was never seen — the two cases are indistinguishable by design
+    /// to keep the map allocation-free on first-seen panes).
+    #[must_use]
+    pub fn segments_dropped_for_pane(&self, pane_id: u64) -> u64 {
+        let guard = self
+            .dropped_by_pane
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&pane_id)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// [ft-0e179] Snapshot of `(pane_id, drop_count)` for every pane that
+    /// has had at least one segment dropped. Returned as a `HashMap` so
+    /// the caller can render either a total, a per-pane histogram, or a
+    /// top-N offenders list without a second pass.
+    ///
+    /// Concurrency: acquires a write-lock briefly. The write-lock
+    /// (rather than read-lock) is intentional — it serialises against
+    /// concurrent first-drops so the returned snapshot is internally
+    /// consistent even if a drop is mid-flight for a pane that isn't yet
+    /// in the map.
+    #[must_use]
+    pub fn segments_dropped_by_pane(&self) -> HashMap<u64, u64> {
+        let guard = self
+            .dropped_by_pane
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .map(|(pane_id, counter)| (*pane_id, counter.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// [ft-0e179] Number of distinct panes that have had at least one
+    /// drop — useful for dashboard gauges ("dropping from 3 panes").
+    #[must_use]
+    pub fn panes_with_drops(&self) -> usize {
+        let guard = self
+            .dropped_by_pane
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.len()
+    }
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────
@@ -491,6 +606,141 @@ mod tests {
     fn initial_state_is_green() {
         let m = default_manager();
         assert_eq!(m.current_tier(), BackpressureTier::Green);
+    }
+
+    // ── [ft-0e179] per-pane drop attribution ───────────────────────────
+
+    #[test]
+    fn record_segment_dropped_bumps_aggregate_and_per_pane() {
+        let m = BackpressureMetrics::default();
+        assert_eq!(m.segments_dropped_total(), 0);
+        assert_eq!(m.segments_dropped_for_pane(42), 0);
+
+        m.record_segment_dropped(42);
+
+        assert_eq!(m.segments_dropped_total(), 1);
+        assert_eq!(m.segments_dropped_for_pane(42), 1);
+        // Other panes still read 0 — no entry created for them.
+        assert_eq!(m.segments_dropped_for_pane(7), 0);
+    }
+
+    #[test]
+    fn record_segment_dropped_attributes_distinct_panes_independently() {
+        let m = BackpressureMetrics::default();
+
+        // 3 drops from pane 4167, 1 drop from 4203, 2 from 4167 again.
+        m.record_segment_dropped(4167);
+        m.record_segment_dropped(4167);
+        m.record_segment_dropped(4167);
+        m.record_segment_dropped(4203);
+        m.record_segment_dropped(4167);
+        m.record_segment_dropped(4167);
+
+        assert_eq!(m.segments_dropped_total(), 6);
+        assert_eq!(m.segments_dropped_for_pane(4167), 5);
+        assert_eq!(m.segments_dropped_for_pane(4203), 1);
+        // Untouched pane still absent from the map.
+        assert_eq!(m.segments_dropped_for_pane(9999), 0);
+    }
+
+    #[test]
+    fn segments_dropped_by_pane_returns_full_snapshot() {
+        let m = BackpressureMetrics::default();
+        m.record_segment_dropped(1);
+        m.record_segment_dropped(1);
+        m.record_segment_dropped(2);
+        m.record_segment_dropped(3);
+        m.record_segment_dropped(3);
+        m.record_segment_dropped(3);
+
+        let snap = m.segments_dropped_by_pane();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.get(&1).copied(), Some(2));
+        assert_eq!(snap.get(&2).copied(), Some(1));
+        assert_eq!(snap.get(&3).copied(), Some(3));
+        // Aggregate matches the sum.
+        let sum: u64 = snap.values().sum();
+        assert_eq!(sum, m.segments_dropped_total());
+    }
+
+    #[test]
+    fn panes_with_drops_counts_distinct_keys() {
+        let m = BackpressureMetrics::default();
+        assert_eq!(m.panes_with_drops(), 0);
+
+        m.record_segment_dropped(10);
+        assert_eq!(m.panes_with_drops(), 1);
+
+        m.record_segment_dropped(10); // same pane again → still 1
+        assert_eq!(m.panes_with_drops(), 1);
+
+        m.record_segment_dropped(20);
+        assert_eq!(m.panes_with_drops(), 2);
+    }
+
+    #[test]
+    fn record_segment_dropped_concurrent_same_pane() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Hot-path stress: N threads, each recording K drops for the
+        // same pane. Final count must equal N×K (atomic fetch_add on
+        // the per-pane entry — no lost updates under contention).
+        let m = Arc::new(BackpressureMetrics::default());
+        let n_threads = 8;
+        let per_thread = 1000;
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    for _ in 0..per_thread {
+                        m.record_segment_dropped(12345);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let expected = (n_threads * per_thread) as u64;
+        assert_eq!(m.segments_dropped_total(), expected);
+        assert_eq!(m.segments_dropped_for_pane(12345), expected);
+    }
+
+    #[test]
+    fn record_segment_dropped_concurrent_many_panes_first_seen_race() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Stress the first-seen upgrade path: many threads, each
+        // targeting a distinct pane. The write-lock race in
+        // `record_segment_dropped` must land every drop; no pane's
+        // first drop can be silently lost if two threads happen to
+        // both hit the slow path at the same time for different keys.
+        let m = Arc::new(BackpressureMetrics::default());
+        let n_panes: u64 = 64;
+
+        let handles: Vec<_> = (0..n_panes)
+            .map(|pane_id| {
+                let m = Arc::clone(&m);
+                thread::spawn(move || {
+                    m.record_segment_dropped(pane_id);
+                    m.record_segment_dropped(pane_id);
+                    m.record_segment_dropped(pane_id);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(m.segments_dropped_total(), n_panes * 3);
+        assert_eq!(m.panes_with_drops(), n_panes as usize);
+        for pane in 0..n_panes {
+            assert_eq!(m.segments_dropped_for_pane(pane), 3);
+        }
     }
 
     #[test]
