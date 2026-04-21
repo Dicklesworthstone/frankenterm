@@ -2844,6 +2844,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_delta_small_overlap_falls_back_when_probe_anchor_absent() {
+        // Regression guard for f2c41fbd: if a future overlap-probe path picks
+        // a prefix byte that never appears in the search window, it still has
+        // to find the real 1-byte suffix/prefix overlap instead of reporting a
+        // gap. `tailx` → `xnext` exercises that shape directly.
+        let prev = "tailx";
+        let cur = "xnext";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "next"));
+    }
+
+    #[test]
     fn capture_snapshot_assigns_monotonic_seq() {
         let mut cursor = PaneCursor::new(7);
 
