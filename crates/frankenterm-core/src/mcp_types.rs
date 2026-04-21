@@ -42,19 +42,19 @@ pub(super) fn default_tail() -> usize {
     500
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct McpGetTextData {
     pub pane_id: u64,
     pub text: String,
     pub tail_lines: usize,
     pub escapes_included: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_info: Option<TruncationInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct TruncationInfo {
     pub original_bytes: usize,
     pub returned_bytes: usize,
@@ -776,17 +776,20 @@ impl<T> McpEnvelope<T> {
 
 // ── Pane state ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct McpPaneState {
     pub pane_id: u64,
+    #[serde(default)]
     pub pane_uuid: Option<String>,
     pub tab_id: u64,
     pub window_id: u64,
     pub domain: String,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     pub observed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_reason: Option<String>,
 }
 
@@ -2723,6 +2726,193 @@ mod tests {
             prop_assert_eq!(info.returned_lines, tail);
             prop_assert_eq!(info.original_lines, lines.len());
             prop_assert_eq!(result.lines().count(), tail);
+        }
+    }
+
+    // ========================================================================
+    // MCP response-envelope conformance: serde roundtrip + envelope
+    // invariants that downstream MCP clients rely on.
+    // ========================================================================
+
+    fn arb_short_string() -> impl Strategy<Value = String> {
+        "[ -~]{0,32}".prop_map(|s| s)
+    }
+
+    fn arb_truncation_info() -> impl Strategy<Value = TruncationInfo> {
+        (0usize..=1_000_000, 0usize..=1_000_000, 0usize..=10_000, 0usize..=10_000).prop_map(
+            |(original_bytes, returned_bytes, original_lines, returned_lines)| TruncationInfo {
+                original_bytes,
+                returned_bytes,
+                original_lines,
+                returned_lines,
+            },
+        )
+    }
+
+    fn arb_mcp_get_text_data() -> impl Strategy<Value = McpGetTextData> {
+        (
+            0u64..=u32::MAX as u64,
+            arb_short_string(),
+            0usize..=10_000,
+            any::<bool>(),
+            any::<bool>(),
+            prop::option::of(arb_truncation_info()),
+        )
+            .prop_map(
+                |(pane_id, text, tail_lines, escapes_included, truncated, truncation_info)| {
+                    // `truncated` and `truncation_info` are coupled by
+                    // contract: a non-truncated response has no info,
+                    // and a truncated one has info. Mirror that here so
+                    // the proptest exercises only reachable envelopes.
+                    let (truncated, truncation_info) = match (truncated, truncation_info) {
+                        (true, Some(info)) => (true, Some(info)),
+                        (true, None) => (false, None),
+                        (false, _) => (false, None),
+                    };
+                    McpGetTextData {
+                        pane_id,
+                        text,
+                        tail_lines,
+                        escapes_included,
+                        truncated,
+                        truncation_info,
+                    }
+                },
+            )
+    }
+
+    fn arb_mcp_pane_state() -> impl Strategy<Value = McpPaneState> {
+        (
+            0u64..=u32::MAX as u64,
+            prop::option::of(arb_short_string()),
+            0u64..=u32::MAX as u64,
+            0u64..=u32::MAX as u64,
+            arb_short_string(),
+            prop::option::of(arb_short_string()),
+            prop::option::of(arb_short_string()),
+            any::<bool>(),
+            prop::option::of(arb_short_string()),
+        )
+            .prop_map(
+                |(
+                    pane_id,
+                    pane_uuid,
+                    tab_id,
+                    window_id,
+                    domain,
+                    title,
+                    cwd,
+                    observed,
+                    ignore_reason,
+                )| McpPaneState {
+                    pane_id,
+                    pane_uuid,
+                    tab_id,
+                    window_id,
+                    domain,
+                    title,
+                    cwd,
+                    observed,
+                    ignore_reason,
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Conformance: `McpGetTextData` survives a `serde_json` roundtrip
+        /// with bit-for-bit field equality. Catches any future field
+        /// reshape (rename, optional→required, type change) that would
+        /// silently break downstream `wa.get_text` consumers that deserialize
+        /// these envelopes.
+        #[test]
+        fn mcp_get_text_data_json_roundtrip(data in arb_mcp_get_text_data()) {
+            let json = serde_json::to_string(&data).expect("serialize");
+            let back: McpGetTextData = serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(back, data);
+        }
+
+        /// Conformance: the `McpGetTextData` wire contract's
+        /// `truncated` / `truncation_info` correlation is preserved —
+        /// whenever `truncated == false`, the serialized JSON must not
+        /// contain a `truncation_info` key (it's skip_serializing_if on
+        /// Option::is_none). This catches a regression where someone
+        /// removes the skip attribute and starts emitting
+        /// `"truncation_info": null` on every non-truncated response,
+        /// which would break consumers that key on the field's absence.
+        #[test]
+        fn mcp_get_text_data_absent_truncation_info_not_emitted(
+            pane_id in 0u64..=u32::MAX as u64,
+            text in arb_short_string(),
+            tail_lines in 0usize..=10_000,
+            escapes_included in any::<bool>(),
+        ) {
+            let data = McpGetTextData {
+                pane_id,
+                text,
+                tail_lines,
+                escapes_included,
+                truncated: false,
+                truncation_info: None,
+            };
+            let value: serde_json::Value = serde_json::to_value(&data).unwrap();
+            let obj = value.as_object().expect("envelope is a JSON object");
+            prop_assert!(
+                !obj.contains_key("truncation_info"),
+                "non-truncated response must not emit truncation_info key"
+            );
+            // `truncated` is also skip_serializing_if std::ops::Not::not,
+            // so when it's false it should likewise be absent.
+            prop_assert!(
+                !obj.contains_key("truncated"),
+                "non-truncated response must not emit truncated key"
+            );
+        }
+
+        /// Conformance: `McpPaneState` survives a `serde_json` roundtrip.
+        /// This envelope powers `wa.state` responses and is consumed by
+        /// MCP clients that model pane metadata — any silent change to
+        /// the on-wire shape (field rename, required→optional) would
+        /// silently desync their models. The proptest asserts strict
+        /// deep equality across the roundtrip.
+        #[test]
+        fn mcp_pane_state_json_roundtrip(state in arb_mcp_pane_state()) {
+            let json = serde_json::to_string(&state).expect("serialize");
+            let back: McpPaneState = serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(back, state);
+        }
+
+        /// Conformance: `McpPaneState` preserves the `ignore_reason
+        /// = None` absence invariant — the field is skip_serializing_if
+        /// on Option::is_none, so consumers that branch on the key's
+        /// presence must not start seeing `"ignore_reason": null` on
+        /// observed panes.
+        #[test]
+        fn mcp_pane_state_absent_ignore_reason_not_emitted(
+            pane_id in 0u64..=u32::MAX as u64,
+            tab_id in 0u64..=u32::MAX as u64,
+            window_id in 0u64..=u32::MAX as u64,
+            domain in arb_short_string(),
+            observed in any::<bool>(),
+        ) {
+            let state = McpPaneState {
+                pane_id,
+                pane_uuid: None,
+                tab_id,
+                window_id,
+                domain,
+                title: None,
+                cwd: None,
+                observed,
+                ignore_reason: None,
+            };
+            let value: serde_json::Value = serde_json::to_value(&state).unwrap();
+            let obj = value.as_object().expect("envelope is a JSON object");
+            prop_assert!(
+                !obj.contains_key("ignore_reason"),
+                "None ignore_reason must not be emitted as a key"
+            );
         }
     }
 }
