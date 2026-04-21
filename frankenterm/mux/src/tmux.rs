@@ -59,36 +59,9 @@ fn append_backlog_payload(backlog: &mut Vec<u8>, payload: &[u8]) {
     }
 }
 
-/// Push a command onto the tmux cmd_queue while enforcing the CMD_QUEUE_MAX_DEPTH
-/// hard cap (ft-4qom2).
-///
-/// The cap was previously enforced only at the pop site (`send_next_command`),
-/// which early-returns when `state != Idle`. If tmux is stuck in
-/// `WaitingForResponse` during an event storm (remote tmux lag, server
-/// overload), the pop-site enforcement never runs and the queue grows
-/// unboundedly as LayoutChange/SessionChanged/WindowAdd/SplitPane events push
-/// new commands without a cap check. Enforcing on every push closes that gap.
-///
-/// Caller holds the cmd_queue lock, so this is atomic with the push.
-fn push_command_capped(queue: &mut TmuxCmdQueue, cmd: Box<dyn TmuxCommand>) {
-    queue.push_back(cmd);
-    if queue.len() > CMD_QUEUE_MAX_DEPTH {
-        let excess = queue.len() - CMD_QUEUE_MAX_DEPTH;
-        log::error!(
-            "tmux command queue ({}) exceeds hard cap {}; dropping {} oldest commands",
-            queue.len(),
-            CMD_QUEUE_MAX_DEPTH,
-            excess,
-        );
-        queue.drain(..excess);
-    } else if queue.len() > CMD_QUEUE_WARNING_DEPTH {
-        log::warn!(
-            "tmux command queue depth ({}) exceeds {} threshold; possible protocol churn",
-            queue.len(),
-            CMD_QUEUE_WARNING_DEPTH,
-        );
-    }
-}
+// [ft-wajba] Cap enforcement moved onto `TmuxDomainState` below so it
+// can consult `state` and skip index 0 (the in-flight command) when
+// draining under `WaitingForResponse`. See the method doc for why.
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum AttachState {
@@ -157,6 +130,87 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    /// Push a command onto the tmux cmd_queue while enforcing the
+    /// `CMD_QUEUE_MAX_DEPTH` hard cap (ft-4qom2), preserving the
+    /// in-flight head when the state machine is `WaitingForResponse`
+    /// (ft-wajba).
+    ///
+    /// ## Why cap on push
+    ///
+    /// The cap was previously enforced only at the pop site
+    /// (`send_next_command`), which early-returns when
+    /// `state != Idle`. If tmux is stuck in `WaitingForResponse`
+    /// during an event storm (remote tmux lag, server overload), the
+    /// pop-site enforcement never runs and the queue grows unboundedly
+    /// as LayoutChange/SessionChanged/WindowAdd/SplitPane events push
+    /// new commands without a cap check. Enforcing on every push
+    /// closes that gap (ft-4qom2).
+    ///
+    /// ## [ft-wajba] Why preserve index 0 under `WaitingForResponse`
+    ///
+    /// When the state machine is `WaitingForResponse`, index 0 of
+    /// `cmd_queue` is the **in-flight** command: `send_next_command`
+    /// wrote it to the pane but did NOT pop it — the pop happens in
+    /// the `Guarded` response handler, which peels `pop_front()` and
+    /// feeds the response to `cmd.process_result`. Dropping index 0
+    /// at cap-enforcement time would cross-wire the response payload
+    /// onto the WRONG pending command when the Guarded handler later
+    /// pops the new front, silently corrupting every subsequent
+    /// command parser that happens to be bumped into the head slot.
+    ///
+    /// So under `WaitingForResponse`, drain `1..=excess` (skip the
+    /// in-flight head). Under any other state (`Idle`,
+    /// `WaitForInitialGuard`, `Exit`) there is no in-flight command
+    /// at index 0, so `..excess` (drop-oldest) is correct.
+    ///
+    /// ## Lock ordering
+    ///
+    /// Caller holds `cmd_queue` lock. This method transiently acquires
+    /// `state` lock. The Guarded response handler
+    /// (`advance` → `Event::Guarded` → `State::WaitingForResponse`)
+    /// uses the same order: acquire `cmd_queue` first, then `state`.
+    /// No deadlock.
+    fn push_command_capped(&self, queue: &mut TmuxCmdQueue, cmd: Box<dyn TmuxCommand>) {
+        queue.push_back(cmd);
+        if queue.len() > CMD_QUEUE_MAX_DEPTH {
+            let excess = queue.len() - CMD_QUEUE_MAX_DEPTH;
+            let preserve_head = *self.state.lock() == State::WaitingForResponse;
+            if preserve_head {
+                log::error!(
+                    "tmux command queue ({}) exceeds hard cap {}; dropping {} oldest \
+                     after in-flight head (state=WaitingForResponse, ft-wajba)",
+                    queue.len(),
+                    CMD_QUEUE_MAX_DEPTH,
+                    excess,
+                );
+                // Drain `[1, excess+1)` — preserves index 0.
+                // `(excess + 1).min(queue.len())` guards against the
+                // degenerate case where `excess + 1 > queue.len()`,
+                // which is unreachable today (len > MAX implies
+                // excess >= 1 and len >= excess + MAX so there are
+                // always at least `excess` non-head entries), but
+                // belt-and-suspenders against future tuning of the
+                // cap that might invalidate the invariant.
+                let end = excess.saturating_add(1).min(queue.len());
+                queue.drain(1..end);
+            } else {
+                log::error!(
+                    "tmux command queue ({}) exceeds hard cap {}; dropping {} oldest commands",
+                    queue.len(),
+                    CMD_QUEUE_MAX_DEPTH,
+                    excess,
+                );
+                queue.drain(..excess);
+            }
+        } else if queue.len() > CMD_QUEUE_WARNING_DEPTH {
+            log::warn!(
+                "tmux command queue depth ({}) exceeds {} threshold; possible protocol churn",
+                queue.len(),
+                CMD_QUEUE_WARNING_DEPTH,
+            );
+        }
+    }
+
     pub fn advance(&self, events: Box<Vec<Event>>) {
         for event in events.iter() {
             let state = *self.state.lock();
@@ -237,7 +291,7 @@ impl TmuxDomainState {
                     raw_flags: _,
                 } => {
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    push_command_capped(
+                    self.push_command_capped(
                         &mut cmd_queue,
                         Box::new(ListAllPanes {
                             window_id: *window,
@@ -271,7 +325,7 @@ impl TmuxDomainState {
                 Event::SessionChanged { session, name: _ } => {
                     *self.tmux_session.lock() = Some(*session);
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    push_command_capped(&mut cmd_queue, Box::new(ListCommands));
+                    self.push_command_capped(&mut cmd_queue, Box::new(ListCommands));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -282,7 +336,7 @@ impl TmuxDomainState {
                         (self.gui_window.lock().is_some(), *self.tmux_session.lock())
                     {
                         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        push_command_capped(
+                        self.push_command_capped(
                             &mut cmd_queue,
                             Box::new(ListAllWindows {
                                 session_id: session,
@@ -426,7 +480,7 @@ impl TmuxDomainState {
 
         if let Some(id) = tmux_pane_id {
             let mut cmd_queue = self.cmd_queue.as_ref().lock();
-            push_command_capped(
+            self.push_command_capped(
                 &mut cmd_queue,
                 Box::new(SplitPane {
                     pane_id: id,
@@ -921,6 +975,164 @@ mod tests {
             "queue length {} should be at most {}",
             queue.len(),
             CMD_QUEUE_MAX_DEPTH,
+        );
+    }
+
+    /// [ft-wajba] When `push_command_capped` runs with state =
+    /// `WaitingForResponse`, the command at index 0 is the in-flight
+    /// command whose Guarded response is pending. If the cap drain
+    /// dropped that head, `pop_front()` in the Guarded handler would
+    /// pop the WRONG command and hand the response payload to a
+    /// parser that never issued the request.
+    ///
+    /// This regression test fills the cmd_queue past the hard cap
+    /// while state is `WaitingForResponse` and asserts that (a) the
+    /// head command is byte-for-byte unchanged (its `get_command`
+    /// output still matches the sentinel), and (b) the queue is
+    /// capped at the expected depth afterward — proving the drain
+    /// happened and that it consumed only `excess` entries strictly
+    /// AFTER the in-flight head.
+    #[test]
+    fn cmd_queue_cap_preserves_in_flight_head_under_waiting_for_response() {
+        use crate::tab::SplitDirection;
+
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-ft-wajba-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+
+        let launcher = RecordingPane::new(777, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+
+        let tmux_domain = TmuxDomain::new(777);
+        let inner = Arc::clone(&tmux_domain.inner);
+        let domain_id = inner.domain_id;
+
+        // Seat an "in-flight" head command at index 0 with a
+        // distinguishable command text. Then flip state to
+        // WaitingForResponse — this is the exact pre-condition of the
+        // ft-wajba race: `send_next_command` wrote the head, state
+        // transitioned to WaitingForResponse, but `pop_front()` has
+        // not yet happened (the Guarded response hasn't arrived).
+        let sentinel_head: Box<dyn TmuxCommand> = Box::new(SplitPane {
+            pane_id: 4242,
+            direction: SplitDirection::Horizontal,
+        });
+        let sentinel_cmd_text = sentinel_head.get_command(domain_id);
+        // Sanity: the sentinel's text is distinguishable from the
+        // bulk-fill command type so an accidental drop-and-shift
+        // cannot silently pass this test.
+        let bulk_sample_text = ListCommands.get_command(domain_id);
+        assert_ne!(
+            sentinel_cmd_text, bulk_sample_text,
+            "test setup broken: sentinel and bulk cmds produce identical text"
+        );
+
+        {
+            let mut queue = inner.cmd_queue.lock();
+            queue.push_back(sentinel_head);
+            assert_eq!(queue.len(), 1);
+        }
+
+        *inner.state.lock() = State::WaitingForResponse;
+
+        // Now push one more than the cap via the method under test.
+        // With MAX = 50_000 we need 50_001 entries total, so push
+        // (50_001 - 1) = 50_000 more ListCommands on top of the seated
+        // head. Each push re-runs cap enforcement; only the final
+        // push trips `len > MAX` and forces a drain.
+        for _ in 0..CMD_QUEUE_MAX_DEPTH {
+            let mut queue = inner.cmd_queue.lock();
+            inner.push_command_capped(&mut queue, Box::new(ListCommands));
+        }
+
+        let queue = inner.cmd_queue.lock();
+
+        // Invariant 1: Cap is respected.
+        assert!(
+            queue.len() <= CMD_QUEUE_MAX_DEPTH,
+            "[ft-wajba] cap exceeded after WaitingForResponse drain: got {}, expected <= {}",
+            queue.len(),
+            CMD_QUEUE_MAX_DEPTH,
+        );
+
+        // Invariant 2: Head is still the sentinel. If the pre-fix
+        // code had run, index 0 would have been drained out and
+        // this assertion would fail — the `head_text` would match
+        // `ListCommands`, not `SplitPane`.
+        let head = queue
+            .front()
+            .expect("[ft-wajba] queue must be non-empty after cap enforcement");
+        let head_text = head.get_command(domain_id);
+        assert_eq!(
+            head_text, sentinel_cmd_text,
+            "[ft-wajba] in-flight head was dropped during cap enforcement. \
+             A Guarded response would now pop_front() the wrong command and \
+             cross-wire response routing. Expected head text: {sentinel_cmd_text:?}, got: {head_text:?}"
+        );
+    }
+
+    /// [ft-wajba] Companion test to
+    /// `cmd_queue_cap_preserves_in_flight_head_under_waiting_for_response`:
+    /// when state is `Idle`, the drop-oldest branch (drain from
+    /// index 0) must remain the behavior — there is no in-flight
+    /// head to preserve.
+    #[test]
+    fn cmd_queue_cap_drops_oldest_when_not_waiting_for_response() {
+        use crate::tab::SplitDirection;
+
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-ft-wajba-idle-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+
+        let launcher = RecordingPane::new(778, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+
+        let tmux_domain = TmuxDomain::new(778);
+        let inner = Arc::clone(&tmux_domain.inner);
+        let domain_id = inner.domain_id;
+
+        let distinctive_head: Box<dyn TmuxCommand> = Box::new(SplitPane {
+            pane_id: 8888,
+            direction: SplitDirection::Vertical,
+        });
+        let distinctive_text = distinctive_head.get_command(domain_id);
+
+        {
+            let mut queue = inner.cmd_queue.lock();
+            queue.push_back(distinctive_head);
+        }
+
+        // Keep state as Idle (default after new() is WaitForInitialGuard;
+        // set explicitly).
+        *inner.state.lock() = State::Idle;
+
+        for _ in 0..CMD_QUEUE_MAX_DEPTH {
+            let mut queue = inner.cmd_queue.lock();
+            inner.push_command_capped(&mut queue, Box::new(ListCommands));
+        }
+
+        let queue = inner.cmd_queue.lock();
+
+        assert!(
+            queue.len() <= CMD_QUEUE_MAX_DEPTH,
+            "cap must be respected when state=Idle too"
+        );
+
+        // Under Idle, the drop-oldest behavior means our SplitPane
+        // head should have been drained out (it was the oldest), and
+        // the front is now a ListCommands.
+        let head = queue
+            .front()
+            .expect("queue must be non-empty after cap enforcement");
+        let head_text = head.get_command(domain_id);
+        assert_ne!(
+            head_text, distinctive_text,
+            "under state=Idle the oldest-at-front should have been dropped; \
+             the distinctive head must NOT survive"
         );
     }
 }
