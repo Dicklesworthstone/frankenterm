@@ -25,6 +25,7 @@ serde_json.workspace = true
 serde_yaml = "0.9.34"
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 toon_rust.workspace = true
+tempfile = "3.27.0"
 
 [[bin]]
 name = "fts_query"
@@ -41,6 +42,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "pattern_pack_parser"
 path = "fuzz_targets/pattern_pack_parser.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "pattern_pack_toml"
+path = "fuzz_targets/pattern_pack_toml.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
