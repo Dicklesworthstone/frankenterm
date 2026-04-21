@@ -19,10 +19,10 @@
 //! via multipliers: under system pressure, all intervals are scaled up.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::backpressure::BackpressureTier;
@@ -231,11 +231,17 @@ pub struct TierMetrics {
 
 /// Classifies panes into polling tiers based on activity.
 ///
-/// Thread-safe: classification and state updates are protected by an internal
-/// `RwLock`.
+/// Thread-safe: the per-pane state lives in a `DashMap`, so every mutator
+/// (`on_pane_output`, `set_background`, `classify`, …) acquires only the
+/// write lock for the single pane's shard, not a global exclusive lock
+/// (ft-x2fvv). On the 200+-pane fleet workload the classifier was
+/// designed for, `on_pane_output` is on the per-byte hot path of every
+/// pane simultaneously; the previous `RwLock<HashMap>` serialized all of
+/// them through one exclusive acquisition. DashMap keeps the public API
+/// unchanged while dropping the contention factor to ~N/shards.
 pub struct PaneTierClassifier {
     config: TierConfig,
-    panes: RwLock<HashMap<u64, PaneState>>,
+    panes: DashMap<u64, PaneState>,
     total_transitions: AtomicU64,
     total_promotions: AtomicU64,
 }
@@ -246,7 +252,7 @@ impl PaneTierClassifier {
     pub fn new(config: TierConfig) -> Self {
         Self {
             config,
-            panes: RwLock::new(HashMap::new()),
+            panes: DashMap::new(),
             total_transitions: AtomicU64::new(0),
             total_promotions: AtomicU64::new(0),
         }
@@ -254,20 +260,17 @@ impl PaneTierClassifier {
 
     /// Register a new pane. Starts at Active tier.
     pub fn register_pane(&self, pane_id: u64) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        panes.entry(pane_id).or_insert_with(PaneState::new);
+        self.panes.entry(pane_id).or_insert_with(PaneState::new);
     }
 
     /// Remove a pane from tracking.
     pub fn unregister_pane(&self, pane_id: u64) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        panes.remove(&pane_id);
+        self.panes.remove(&pane_id);
     }
 
     /// Notify that a pane produced output — instantly promotes to Active.
     pub fn on_pane_output(&self, pane_id: u64) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        if let Some(mut state) = self.panes.get_mut(&pane_id) {
             state.last_output = Instant::now();
             if state.tier != PaneTier::Active {
                 state.tier = PaneTier::Active;
@@ -280,24 +283,21 @@ impl PaneTierClassifier {
 
     /// Mark a pane as in a background/hidden tab.
     pub fn set_background(&self, pane_id: u64, is_background: bool) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        if let Some(mut state) = self.panes.get_mut(&pane_id) {
             state.is_background = is_background;
         }
     }
 
     /// Mark a pane as rate-limited.
     pub fn set_rate_limited(&self, pane_id: u64, is_rate_limited: bool) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        if let Some(mut state) = self.panes.get_mut(&pane_id) {
             state.is_rate_limited = is_rate_limited;
         }
     }
 
     /// Mark a pane as in thinking/processing state.
     pub fn set_thinking(&self, pane_id: u64, is_thinking: bool) {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        if let Some(state) = panes.get_mut(&pane_id) {
+        if let Some(mut state) = self.panes.get_mut(&pane_id) {
             state.is_thinking = is_thinking;
         }
     }
@@ -307,14 +307,12 @@ impl PaneTierClassifier {
     /// Updates the pane's tier and returns it. Records tier transitions.
     #[must_use]
     pub fn classify(&self, pane_id: u64) -> PaneTier {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        let state = match panes.get_mut(&pane_id) {
-            Some(s) => s,
-            None => return PaneTier::Active, // unknown pane treated as active
+        let Some(mut state) = self.panes.get_mut(&pane_id) else {
+            return PaneTier::Active; // unknown pane treated as active
         };
 
         let old_tier = state.tier;
-        let new_tier = self.compute_tier(state);
+        let new_tier = self.compute_tier(&state);
 
         if new_tier != old_tier {
             state.tier = new_tier;
@@ -328,10 +326,14 @@ impl PaneTierClassifier {
     /// Reclassify all panes. Returns the distribution of tiers.
     #[must_use]
     pub fn classify_all(&self) -> HashMap<u64, PaneTier> {
-        let mut panes = self.panes.write().expect("pane lock poisoned");
-        let mut result = HashMap::with_capacity(panes.len());
+        let mut result = HashMap::with_capacity(self.panes.len());
 
-        for (&pane_id, state) in panes.iter_mut() {
+        // DashMap's `iter_mut` locks one shard at a time, so concurrent
+        // `on_pane_output` calls on other shards are not blocked for the
+        // full sweep — only during the brief window a given shard is held.
+        for mut entry in self.panes.iter_mut() {
+            let pane_id = *entry.key();
+            let state = entry.value_mut();
             let old_tier = state.tier;
             let new_tier = self.compute_tier(state);
 
@@ -350,8 +352,7 @@ impl PaneTierClassifier {
     /// Get the current tier of a pane without reclassifying.
     #[must_use]
     pub fn current_tier(&self, pane_id: u64) -> PaneTier {
-        let panes = self.panes.read().expect("pane lock poisoned");
-        panes
+        self.panes
             .get(&pane_id)
             .map(|s| s.tier)
             .unwrap_or(PaneTier::Active)
@@ -372,28 +373,29 @@ impl PaneTierClassifier {
     /// Number of tracked panes.
     #[must_use]
     pub fn pane_count(&self) -> usize {
-        self.panes.read().expect("pane lock poisoned").len()
+        self.panes.len()
     }
 
     /// Aggregate metrics.
     #[must_use]
     pub fn metrics(&self) -> TierMetrics {
-        let panes = self.panes.read().expect("pane lock poisoned");
         let mut tier_counts = HashMap::new();
         let mut estimated_rps = 0.0;
+        let mut total_panes: u64 = 0;
 
-        for state in panes.values() {
-            let tier = self.compute_tier(state);
+        for entry in self.panes.iter() {
+            let tier = self.compute_tier(entry.value());
             *tier_counts.entry(tier.to_string()).or_insert(0u64) += 1;
             // RPS contribution: 1 / interval_seconds
             let interval = self.config.interval_for(tier);
             estimated_rps += 1.0 / interval.as_secs_f64();
+            total_panes += 1;
         }
 
         TierMetrics {
             tier_counts,
             total_transitions: self.total_transitions.load(Ordering::Relaxed),
-            total_panes: panes.len() as u64,
+            total_panes,
             estimated_rps,
         }
     }

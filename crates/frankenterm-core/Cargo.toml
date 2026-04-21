@@ -104,6 +104,10 @@ fr-config = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/fr
 fr-expire = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
 fr-persist = { version = "=0.1.0", git = "https://github.com/Dicklesworthstone/frankenredis", rev = "7b00450d924e8048073745736356ae0e45a592af", optional = true }
 
+# Sharded concurrent map — lock-free per-shard access for hot paths
+# like PaneTierClassifier::on_pane_output (ft-x2fvv).
+dashmap = "6.1"
+
 # Semantic search (optional, behind feature)
 tokenizers = { version = "0.21", optional = true }
 safetensors = { version = "0.5", optional = true }

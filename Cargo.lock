@@ -3270,6 +3270,7 @@ dependencies = [
  "criterion 0.7.0",
  "crossbeam",
  "crossterm",
+ "dashmap",
  "dirs",
  "fancy-regex 0.14.0",
  "fastapi-rust",
@@ -3541,11 +3542,13 @@ dependencies = [
  "async_ossl",
  "codec",
  "config",
+ "criterion 0.5.1",
  "dns-lookup",
  "frankenterm-term",
  "frankenterm-uds",
  "futures",
  "hostname",
+ "io-uring",
  "lazy_static",
  "libc",
  "log",
@@ -5693,6 +5696,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
 
 [[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7790,7 +7804,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
