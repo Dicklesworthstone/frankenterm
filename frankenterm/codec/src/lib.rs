@@ -39,7 +39,7 @@ use smol::prelude::*;
 
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +47,8 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, TextureCoordinate};
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
+
+mod bounded_varbincode;
 
 #[cfg(test)]
 mod runtime {
@@ -443,16 +445,15 @@ fn serialize_with_mode<T: serde::Serialize>(
 }
 
 fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
-    mut r: R,
+    r: R,
     is_compressed: bool,
 ) -> Result<T, Error> {
     if is_compressed {
-        let mut decompress = zstd::Decoder::new(r)?;
-        let mut decode = varbincode::Deserializer::new(&mut decompress);
-        serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
+        let mut decompress = zstd::Decoder::new(r)?.take((MAX_PDU_SIZE as u64) + 1);
+        bounded_varbincode::deserialize(&mut decompress).map_err(Into::into)
     } else {
-        let mut decode = varbincode::Deserializer::new(&mut r);
-        serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
+        let mut limited = r.take((MAX_PDU_SIZE as u64) + 1);
+        bounded_varbincode::deserialize(&mut limited).map_err(Into::into)
     }
 }
 
@@ -2005,6 +2006,20 @@ mod test {
         assert_eq!(decoded2.pdu, Pdu::Pong(Pong {}));
         assert_eq!(decoded2.serial, 2);
         assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn stream_decode_rejects_oversized_container_lengths_before_allocation() {
+        let mut buffer = vec![
+            0x0E, 0x44, 0x04, 0x00, 0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x71, 0x71, 0x71, 0x30,
+            0x71, 0x71, 0xFE,
+        ];
+        let err = Pdu::stream_decode(&mut buffer).expect_err("crafted input should be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("sequence length"),
+            "unexpected error message: {message}"
+        );
     }
 
     // --- SerializedLines tests ---

@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 asupersync = { workspace = true, optional = true }
+byteorder = "1.5.0"
 config.workspace = true
 leb128.workspace = true
 log.workspace = true

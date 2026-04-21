@@ -54,6 +54,7 @@ terminfo.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 url.workspace = true
 frankenterm-dynamic.workspace = true
 # Keep ssh backend selection explicit here so runtime selection is controlled
