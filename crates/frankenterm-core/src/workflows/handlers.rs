@@ -1332,10 +1332,8 @@ impl HandleSessionStartContext {
     }
 
     fn quote_for_shell_command(value: &str) -> String {
-        serde_json::to_string(value).unwrap_or_else(|_| {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{escaped}\"")
-        })
+        let escaped = value.replace('\'', "'\\''");
+        format!("'{escaped}'")
     }
 
     fn push_candidate(candidates: &mut Vec<String>, candidate: Option<String>) {
@@ -6064,9 +6062,60 @@ mod tests {
 
         let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
         assert!(
-            prompt
-                .contains("Try: ft robot cass search \"fix \\\"quoted\\\" regression\" --limit 3"),
+            prompt.contains("Try: ft robot cass search 'fix \"quoted\" regression' --limit 3"),
             "prompt must include shell-safe quoted query: {prompt}"
+        );
+    }
+
+    #[test]
+    fn handle_session_start_context_build_prompt_neutralizes_shell_metachars() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+        });
+        let lookup = SessionStartCassHintsLookup {
+            query: Some("$(rm -rf ~); `whoami`".to_string()),
+            query_candidates: vec!["$(rm -rf ~); `whoami`".to_string()],
+            workspace: None,
+            hints: vec![],
+            error: None,
+            bead_id: None,
+            pane_title: None,
+            pane_cwd: None,
+        };
+
+        let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
+        assert!(
+            prompt.contains("'$(rm -rf ~); `whoami`'"),
+            "prompt must wrap query in single quotes so $() and backticks do not expand: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Try: ft robot cass search $(rm -rf ~)"),
+            "prompt must NOT leave $() unquoted: {prompt}"
+        );
+    }
+
+    #[test]
+    fn handle_session_start_context_build_prompt_escapes_embedded_single_quote() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.start",
+        });
+        let lookup = SessionStartCassHintsLookup {
+            query: Some("it's broken; $(id)".to_string()),
+            query_candidates: vec!["it's broken; $(id)".to_string()],
+            workspace: None,
+            hints: vec![],
+            error: None,
+            bead_id: None,
+            pane_title: None,
+            pane_cwd: None,
+        };
+
+        let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
+        assert!(
+            prompt.contains("'it'\\''s broken; $(id)'"),
+            "prompt must escape embedded single quote as '\\'': {prompt}"
         );
     }
 
