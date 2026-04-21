@@ -2300,4 +2300,80 @@ proptest! {
         prop_assert_eq!(query.domain.is_some(), domain_some);
         prop_assert_eq!(query.denials_only, denials_only);
     }
+
+    /// Metamorphic relation: PolicyEngine::authorize is decision-idempotent
+    /// under repeated calls with no intervening policy edits.
+    ///
+    /// MR statement:
+    ///     For any PolicyInput `i` and any PolicyEngine `e`:
+    ///         let d1 = e.authorize(&i);
+    ///         let d2 = e.authorize(&i);
+    ///     Then `d1.kind == d2.kind` AND `d1.rule_id() == d2.rule_id()` AND
+    ///     `d1.denial_reason() == d2.denial_reason()`.
+    ///
+    /// Rationale: authorize() mutates internal state — it appends to the
+    /// decision log and bumps telemetry counters. But the *return value* is
+    /// a pure function of (engine_config, input). A repeat call on the same
+    /// input must resolve the same rule chain to the same terminal rule
+    /// (same kind + rule_id) and produce the same denial/approval reason.
+    ///
+    /// A failure of this MR would indicate one of:
+    ///   1. Non-deterministic rule ordering (HashMap iteration order leaking
+    ///      through),
+    ///   2. Internal state crossing the decision boundary (rate-limit
+    ///      counters reaching a threshold between the two calls, cached
+    ///      result drift, etc.),
+    ///   3. A clock-dependent rule firing on call 2 but not call 1.
+    ///
+    /// Calls 1 and 2 happen back-to-back so rate-limit windows and clocks
+    /// don't cross thresholds between them. We also skip rate-limited
+    /// actions entirely (is_rate_limited is true for SendText/SendCtrl*
+    /// etc.), since those are the one class where a second call legitimately
+    /// differs from the first — the rate-limiter's state transition from
+    /// Allowed to Limited is exactly the kind of non-idempotence we're
+    /// excluding from this MR.
+    #[test]
+    fn prop_authorize_decision_idempotent_on_repeat_call(
+        action in arb_action_kind(),
+        actor in arb_actor_kind(),
+        caps in arb_pane_capabilities(),
+        surface in arb_policy_surface(),
+        pane_id in 1u64..1000,
+    ) {
+        // Rate-limited actions are intentionally excluded — the rate limiter
+        // is the one documented source of legitimate decision drift across
+        // repeat calls within a single window. This MR covers the policy
+        // engine's *rule* evaluation path, not the rate-limiter's counter.
+        prop_assume!(!action.is_rate_limited());
+
+        let mut engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(action, actor)
+            .with_pane(pane_id)
+            .with_capabilities(caps)
+            .with_surface(surface);
+
+        let d1 = engine.authorize(&input);
+        let d2 = engine.authorize(&input);
+
+        // Variant kind must be stable.
+        prop_assert_eq!(d1.is_allowed(), d2.is_allowed(),
+            "allow-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+        prop_assert_eq!(d1.is_denied(), d2.is_denied(),
+            "deny-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+        prop_assert_eq!(d1.requires_approval(), d2.requires_approval(),
+            "approval-kind drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1, d2);
+
+        // Determining rule ID must be stable.
+        prop_assert_eq!(d1.rule_id(), d2.rule_id(),
+            "rule_id drift between repeat authorize calls: d1.rule_id={:?} d2.rule_id={:?}",
+            d1.rule_id(), d2.rule_id());
+
+        // Denial/approval reason must be stable for non-allow decisions.
+        prop_assert_eq!(d1.denial_reason(), d2.denial_reason(),
+            "denial_reason drift between repeat authorize calls: d1={:?} d2={:?}",
+            d1.denial_reason(), d2.denial_reason());
+    }
 }
