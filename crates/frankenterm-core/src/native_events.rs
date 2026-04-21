@@ -259,9 +259,33 @@ impl NativeEventListener {
             {
                 Ok(Ok((stream, _addr))) => {
                     let tx = event_tx.clone();
+                    let path = self.socket_path.display().to_string();
                     connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
                         if let Err(err) = handle_connection_with_cx(child_cx, stream, tx).await {
-                            debug!(error = %err, "native event connection closed with error");
+                            // Split by error kind: clean client disconnects
+                            // exit the handler loop via `Ok(None)` from
+                            // `next_line_with_cx`, so they never reach this
+                            // arm — but `Interrupted` here means the cx was
+                            // cancelled (shutdown / budget), which is
+                            // expected noise. Every other kind is a real
+                            // post-accept I/O fault that operators need to
+                            // see in production, where `debug!` is routinely
+                            // filtered. Promote those to `warn!` with
+                            // structured context.
+                            if err.kind() == std::io::ErrorKind::Interrupted {
+                                debug!(
+                                    error = %err,
+                                    path = %path,
+                                    "native event connection cancelled"
+                                );
+                            } else {
+                                warn!(
+                                    error = %err,
+                                    error_kind = ?err.kind(),
+                                    path = %path,
+                                    "native event connection closed with error"
+                                );
+                            }
                         }
                     });
                 }
@@ -278,13 +302,32 @@ impl NativeEventListener {
 
             while let Some(join_result) = connection_tasks.try_join_next() {
                 if let Err(err) = join_result {
-                    debug!(error = %err, "native event connection task failed");
+                    // Split by error kind: cancellation during the
+                    // steady-state accept loop is expected (cx-driven
+                    // budget) and stays at `debug!`; a panic propagating
+                    // out of `handle_connection_with_cx` is a real fault
+                    // that must not sink below warn-level for operators.
+                    if err.is_cancelled() {
+                        debug!(
+                            error = %err,
+                            "native event connection task cancelled"
+                        );
+                    } else {
+                        warn!(
+                            error = %err,
+                            path = %self.socket_path.display(),
+                            "native event connection task failed"
+                        );
+                    }
                 }
             }
         }
 
         while let Some(join_result) = connection_tasks.join_next().await {
             if let Err(err) = join_result {
+                // Kept at debug! — after shutdown_flag or cx cancel fires,
+                // outstanding tasks are intentionally cancelled and their
+                // JoinError surface is expected noise.
                 debug!(error = %err, "native event connection task failed during shutdown");
             }
         }
