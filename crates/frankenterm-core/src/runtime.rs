@@ -153,6 +153,33 @@ async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
     }
 }
 
+const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+async fn runtime_sleep_until_shutdown(
+    runtime_cx: &RuntimeLoopCx,
+    shutdown_flag: &AtomicBool,
+    duration: Duration,
+) -> bool {
+    let started_at = Instant::now();
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= duration {
+            return false;
+        }
+
+        let remaining = duration.saturating_sub(elapsed);
+        runtime_sleep(
+            runtime_cx,
+            remaining.min(SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL),
+        )
+        .await;
+    }
+}
+
 async fn runtime_timeout<F>(
     runtime_cx: &RuntimeLoopCx,
     duration: Duration,
@@ -1622,8 +1649,15 @@ impl ObservationRuntime {
             );
 
             loop {
-                if !first_tick {
-                    runtime_sleep(&loop_cx, maintenance_interval).await;
+                if !first_tick
+                    && runtime_sleep_until_shutdown(
+                        &loop_cx,
+                        shutdown_flag.as_ref(),
+                        maintenance_interval,
+                    )
+                    .await
+                {
+                    break;
                 }
                 first_tick = false;
                 heartbeats.record_maintenance();
@@ -4051,6 +4085,9 @@ impl RuntimeHandle {
                 let _ = native.await;
             }
             let _ = self.persistence.await;
+            if let Some(maintenance) = self.maintenance {
+                let _ = maintenance.await;
+            }
             if let Some(snapshot) = self.snapshot {
                 let _ = snapshot.await;
             }

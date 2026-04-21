@@ -23,7 +23,7 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::runtime_compat::{Mutex, RwLock, mpsc, sleep, watch};
+use frankenterm_core::runtime_compat::{Mutex, RwLock, mpsc, sleep, timeout, watch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -566,6 +566,39 @@ fn labruntime_shutdown_propagation_drains_all_tasks() {
             summary.clean,
             "all tasks should drain cleanly after shutdown flag: warnings={:?}",
             summary.warnings
+        );
+    });
+}
+
+#[test]
+fn labruntime_shutdown_does_not_wait_for_full_maintenance_interval() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let (_dir, db_path) = temp_db();
+        let storage = frankenterm_core::storage::StorageHandle::new(&db_path)
+            .await
+            .unwrap();
+        let engine = frankenterm_core::patterns::PatternEngine::new();
+        let config = test_config();
+        let (_mock, wezterm_handle) = make_mock_handle(&[0]).await;
+
+        let mut runtime = frankenterm_core::runtime::ObservationRuntime::new(
+            config,
+            storage,
+            Arc::new(RwLock::new(engine)),
+        )
+        .with_wezterm_handle(wezterm_handle);
+
+        let handle = runtime.start().await.expect("runtime should start");
+
+        // Let the immediate maintenance tick finish so the next loop iteration
+        // is parked in its interval sleep when shutdown begins.
+        sleep(Duration::from_millis(250)).await;
+
+        let shutdown = timeout(Duration::from_secs(1), handle.shutdown()).await;
+        assert!(
+            shutdown.is_ok(),
+            "shutdown should not block on the maintenance interval sleep"
         );
     });
 }
