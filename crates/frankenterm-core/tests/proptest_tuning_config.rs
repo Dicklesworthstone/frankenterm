@@ -503,4 +503,56 @@ proptest! {
             start.timeout_secs
         );
     }
+
+    /// Fuzz: arbitrary bytes fed to the TuningConfig TOML deserializer must
+    /// never panic. toml::from_str on hostile input must terminate with
+    /// either Ok(config) (with #[serde(default)] filling missing fields) or
+    /// Err(_) — never unwind through a panic, assertion failure, stack
+    /// overflow, or integer overflow.
+    ///
+    /// Rationale: TuningConfig lands on operator-supplied disk content
+    /// (`ft.toml`). A panic during parse would crash the daemon at startup
+    /// on malformed config. This fuzz test pins the robustness contract.
+    /// proptest propagates any panic as a test failure, so a single
+    /// reported failure here is a real parser defect (in toml-rs,
+    /// serde_derive, or a TuningConfig #[serde(...)] attribute).
+    #[test]
+    fn fuzz_tuning_config_toml_parse_never_panics(raw in ".{0,4096}") {
+        // Must never panic. Result discarded — we only care that the call
+        // returns rather than unwinding.
+        let _ = toml::from_str::<TuningConfig>(&raw);
+    }
+
+    /// Fuzz: structurally-valid TOML with arbitrary section/key/value
+    /// triples parses without panicking. This exercises the branch where
+    /// the TOML grammar accepts the input but serde has to decide whether
+    /// to populate a known field, silently discard an unknown one, or
+    /// reject a type mismatch.
+    ///
+    /// Three classes of structural TOML that random bytes rarely reach:
+    ///   (a) unknown top-level section with an integer value
+    ///   (b) known section (`runtime`) with an unknown key
+    ///   (c) known section and known key but an intentionally wrong type
+    ///       (string where an integer is expected)
+    ///
+    /// Classes (a) and (b) should Ok with the TuningConfig defaults intact
+    /// for all other fields. Class (c) should Err cleanly with a toml type
+    /// mismatch. None of the three may panic.
+    #[test]
+    fn fuzz_structured_toml_parse_never_panics(
+        section in "[a-z_]{1,20}",
+        key in "[a-z_]{1,20}",
+        int_value in any::<i64>(),
+        string_value in "[a-zA-Z0-9 _.-]{0,40}",
+        variant in 0u8..3,
+    ) {
+        let doc = match variant {
+            0 => format!("[{section}]\n{key} = {int_value}\n"),
+            1 => format!("[runtime]\n{key} = {int_value}\n"),
+            _ => format!(
+                "[runtime]\noutput_coalesce_window_ms = \"{string_value}\"\n"
+            ),
+        };
+        let _ = toml::from_str::<TuningConfig>(&doc);
+    }
 }
