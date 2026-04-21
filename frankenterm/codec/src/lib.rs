@@ -761,18 +761,18 @@ impl Pdu {
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct UnitResponse {}
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ErrorResponse {
     pub reason: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetCodecVersion {}
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetCodecVersionResponse {
     pub codec_vers: usize,
     pub version_string: String,
@@ -780,17 +780,17 @@ pub struct GetCodecVersionResponse {
     pub config_file_path: Option<PathBuf>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct Ping {}
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct Pong {}
 
 /// Requests a client certificate to authenticate against
 /// the TLS based server
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetTlsCreds {}
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetTlsCredsResponse {
     /// The signing certificate
     pub ca_cert_pem: String,
@@ -799,17 +799,17 @@ pub struct GetTlsCredsResponse {
     pub client_cert_pem: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanes {}
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesResponse {
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SplitPane {
     pub pane_id: PaneId,
     pub split_request: SplitRequest,
@@ -821,20 +821,20 @@ pub struct SplitPane {
     pub move_pane_id: Option<PaneId>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct MovePaneToNewTab {
     pub pane_id: PaneId,
     pub window_id: Option<WindowId>,
     pub workspace_for_new_window: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct MovePaneToNewTabResponse {
     pub tab_id: TabId,
     pub window_id: WindowId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SpawnV2 {
     pub domain: config::keyassignment::SpawnTabDomain,
     /// If None, create a new window for this new tab
@@ -845,17 +845,17 @@ pub struct SpawnV2 {
     pub workspace: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct PaneRemoved {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct KillPane {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SpawnResponse {
     pub tab_id: TabId,
     pub pane_id: PaneId,
@@ -863,26 +863,26 @@ pub struct SpawnResponse {
     pub size: TerminalSize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct WriteToPane {
     pub pane_id: PaneId,
     pub data: Vec<u8>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendPaste {
     pub pane_id: PaneId,
     pub data: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendKeyDown {
     pub pane_id: TabId,
     pub event: termwiz::input::KeyEvent,
     pub input_serial: InputSerial,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendKeyUp {
     pub pane_id: TabId,
     pub event: termwiz::input::KeyEvent,
@@ -922,32 +922,32 @@ impl From<std::time::SystemTime> for InputSerial {
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SendMouseEvent {
     pub pane_id: PaneId,
     pub event: frankenterm_term::input::MouseEvent,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetClipboard {
     pub pane_id: PaneId,
     pub clipboard: Option<String>,
     pub selection: ClipboardSelection,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetWindowWorkspace {
     pub window_id: WindowId,
     pub workspace: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct RenameWorkspace {
     pub old_workspace: String,
     pub new_workspace: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetActiveWorkspace {
     pub workspace: String,
 }
@@ -955,143 +955,143 @@ pub struct SetActiveWorkspace {
 /// This is used both as a notification from server->client
 /// and as a configuration request from client->server when
 /// the client's preferred configuration changes
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetPalette {
     pub pane_id: PaneId,
     pub palette: ColorPalette,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct NotifyAlert {
     pub pane_id: PaneId,
     pub alert: Alert,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct TabAddedToWindow {
     pub tab_id: TabId,
     pub window_id: WindowId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct TabResized {
     pub tab_id: TabId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct TabTitleChanged {
     pub tab_id: TabId,
     pub title: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct WindowTitleChanged {
     pub window_id: WindowId,
     pub title: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct PaneFocused {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct WindowWorkspaceChanged {
     pub window_id: WindowId,
     pub workspace: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetClientId {
     pub client_id: ClientId,
     pub is_proxy: bool,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetFocusedPane {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetClientList;
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetClientListResponse {
     pub clients: Vec<ClientInfo>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct Resize {
     pub containing_tab_id: TabId,
     pub pane_id: PaneId,
     pub size: TerminalSize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetPaneZoomed {
     pub containing_tab_id: TabId,
     pub pane_id: PaneId,
     pub zoomed: bool,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneDirection {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct AdjustPaneSize {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
     pub amount: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct CreateFloatingPane {
     pub tab_id: TabId,
     pub pane_id: PaneId,
     pub rect: FloatingPaneRect,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct MoveFloatingPane {
     pub pane_id: PaneId,
     pub rect: FloatingPaneRect,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetFloatingPaneZ {
     pub pane_id: PaneId,
     pub z_order: u32,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ToggleFloatingPane {
     pub pane_id: PaneId,
     pub visible: bool,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct RemoveFloatingPane {
     pub pane_id: PaneId,
 }
 
 // --- Swap layout and stack PDUs (ft-2dd4s.5) ---
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SwapToLayout {
     pub tab_id: TabId,
     pub layout_index: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SetLayoutCycle {
     pub tab_id: TabId,
     pub layout_names: Vec<String>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct CycleStack {
     pub tab_id: TabId,
     pub slot_index: usize,
@@ -1099,14 +1099,14 @@ pub struct CycleStack {
     pub forward: bool,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SelectStackPane {
     pub tab_id: TabId,
     pub slot_index: usize,
     pub pane_index: usize,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct UpdatePaneConstraints {
     pub pane_id: PaneId,
     pub min_width: Option<usize>,
@@ -1115,28 +1115,28 @@ pub struct UpdatePaneConstraints {
     pub max_height: Option<usize>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneDirectionResponse {
     pub pane_id: Option<PaneId>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ActivatePaneDirection {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderChanges {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderableDimensions {
     pub pane_id: PaneId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderableDimensionsResponse {
     pub pane_id: PaneId,
     pub cursor_position: StableCursorPosition,
@@ -1149,13 +1149,13 @@ pub struct GetPaneRenderableDimensionsResponse {
     pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct LivenessResponse {
     pub pane_id: PaneId,
     pub is_alive: bool,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetPaneRenderChangesResponse {
     pub pane_id: PaneId,
     pub mouse_grabbed: bool,
@@ -1181,19 +1181,19 @@ pub struct GetPaneRenderChangesResponse {
     pub seqno: SequenceNo,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetLines {
     pub pane_id: PaneId,
     pub lines: Vec<Range<StableRowIndex>>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 struct CellCoordinates {
     line_idx: usize,
     cols: Range<usize>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 struct LineHyperlink {
     link: Hyperlink,
     coords: Vec<CellCoordinates>,
@@ -1224,7 +1224,7 @@ pub struct SerializedImageCell {
 /// This section of code extracts the hyperlinks from the cells and builds
 /// up a mapping that can be used to restore the identity when the `lines()`
 /// method is called.
-#[derive(Deserialize, Serialize, PartialEq, Debug, Default)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Default, Clone)]
 pub struct SerializedLines {
     lines: Vec<(StableRowIndex, Line)>,
     hyperlinks: Vec<LineHyperlink>,
@@ -1357,19 +1357,19 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetLinesResponse {
     pub pane_id: PaneId,
     pub lines: SerializedLines,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct EraseScrollbackRequest {
     pub pane_id: PaneId,
     pub erase_mode: ScrollbackEraseMode,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SearchScrollbackRequest {
     pub pane_id: PaneId,
     pub pattern: mux::pane::Pattern,
@@ -1377,12 +1377,12 @@ pub struct SearchScrollbackRequest {
     pub limit: Option<u32>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SearchScrollbackResponse {
     pub results: Vec<mux::pane::SearchResult>,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetImageCell {
     pub pane_id: PaneId,
     pub line_idx: StableRowIndex,
@@ -1390,7 +1390,7 @@ pub struct GetImageCell {
     pub data_hash: [u8; 32],
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetImageCellResponse {
     pub pane_id: PaneId,
     pub data: Option<Arc<ImageData>>,

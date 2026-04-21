@@ -824,7 +824,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: CreateFloatingPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::CreateFloatingPane(payload));
     }
@@ -836,7 +836,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetClipboard = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetClipboard(payload));
     }
@@ -848,7 +848,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: UpdatePaneConstraints = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::UpdatePaneConstraints(payload));
     }
@@ -860,7 +860,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SendPaste = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SendPaste(payload));
     }
@@ -872,7 +872,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetLayoutCycle = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetLayoutCycle(payload));
     }
@@ -884,7 +884,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SwapToLayout = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SwapToLayout(payload));
     }
@@ -896,7 +896,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: CycleStack = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::CycleStack(payload));
     }
@@ -908,7 +908,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SelectStackPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SelectStackPane(payload));
     }
@@ -920,7 +920,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: ErrorResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::ErrorResponse(payload));
     }
@@ -932,7 +932,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetCodecVersionResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetCodecVersionResponse(payload));
     }
@@ -944,7 +944,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetTlsCredsResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetTlsCredsResponse(payload));
     }
@@ -991,7 +991,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetClientListResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetClientListResponse(payload));
     }
@@ -1003,7 +1003,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: ListPanesResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::ListPanesResponse(payload));
     }
@@ -1015,7 +1015,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: MovePaneToNewTabResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::MovePaneToNewTabResponse(payload));
     }
@@ -1027,7 +1027,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SpawnResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SpawnResponse(payload));
     }
@@ -1039,7 +1039,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SpawnV2 = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SpawnV2(payload));
     }
@@ -1051,7 +1051,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetPalette = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetPalette(payload));
     }
@@ -1063,7 +1063,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: NotifyAlert = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::NotifyAlert(payload));
     }
@@ -1075,7 +1075,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SendKeyDown = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SendKeyDown(payload));
     }
@@ -1087,7 +1087,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SendKeyUp = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SendKeyUp(payload));
     }
@@ -1099,7 +1099,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SendMouseEvent = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SendMouseEvent(payload));
     }
@@ -1111,7 +1111,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SplitPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SplitPane(payload));
     }
@@ -1123,7 +1123,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: PaneRemoved = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::PaneRemoved(payload));
     }
@@ -1135,7 +1135,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: KillPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::KillPane(payload));
     }
@@ -1147,7 +1147,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetFocusedPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetFocusedPane(payload));
     }
@@ -1159,7 +1159,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneDirectionResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneDirectionResponse(payload));
     }
@@ -1171,7 +1171,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: PaneFocused = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::PaneFocused(payload));
     }
@@ -1183,7 +1183,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: WindowWorkspaceChanged = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::WindowWorkspaceChanged(payload));
     }
@@ -1195,7 +1195,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetClientId = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetClientId(payload));
     }
@@ -1207,7 +1207,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: LivenessResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::LivenessResponse(payload));
     }
@@ -1219,7 +1219,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: Resize = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::Resize(payload));
     }
@@ -1231,7 +1231,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetPaneZoomed = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetPaneZoomed(payload));
     }
@@ -1243,7 +1243,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: TabAddedToWindow = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::TabAddedToWindow(payload));
     }
@@ -1255,7 +1255,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: TabResized = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::TabResized(payload));
     }
@@ -1267,7 +1267,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneDirection = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneDirection(payload));
     }
@@ -1279,7 +1279,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: AdjustPaneSize = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::AdjustPaneSize(payload));
     }
@@ -1291,7 +1291,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetFloatingPaneZ = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetFloatingPaneZ(payload));
     }
@@ -1303,7 +1303,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: ToggleFloatingPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::ToggleFloatingPane(payload));
     }
@@ -1315,7 +1315,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: MoveFloatingPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::MoveFloatingPane(payload));
     }
@@ -1327,7 +1327,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: RemoveFloatingPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::RemoveFloatingPane(payload));
     }
@@ -1339,7 +1339,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: ActivatePaneDirection = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::ActivatePaneDirection(payload));
     }
@@ -1351,7 +1351,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneRenderChanges = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChanges(payload));
     }
@@ -1363,7 +1363,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneRenderableDimensions = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderableDimensions(payload));
     }
@@ -1375,7 +1375,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneRenderableDimensionsResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderableDimensionsResponse(payload));
     }
@@ -1387,7 +1387,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: EraseScrollbackRequest = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::EraseScrollbackRequest(payload));
     }
@@ -1399,7 +1399,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SearchScrollbackRequest = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SearchScrollbackRequest(payload));
     }
@@ -1411,7 +1411,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SearchScrollbackResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SearchScrollbackResponse(payload));
     }
@@ -1423,7 +1423,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetLines = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetLines(payload));
     }
@@ -1435,7 +1435,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetImageCell = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetImageCell(payload));
     }
@@ -1447,7 +1447,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetImageCellResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetImageCellResponse(payload));
     }
@@ -1459,7 +1459,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetLinesResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetLinesResponse(payload));
     }
@@ -1471,7 +1471,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: GetPaneRenderChangesResponse = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::GetPaneRenderChangesResponse(payload));
     }
@@ -1483,7 +1483,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: WriteToPane = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::WriteToPane(payload));
     }
@@ -1495,7 +1495,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: RenameWorkspace = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::RenameWorkspace(payload));
     }
@@ -1507,7 +1507,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetWindowWorkspace = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetWindowWorkspace(payload));
     }
@@ -1519,7 +1519,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: SetActiveWorkspace = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::SetActiveWorkspace(payload));
     }
@@ -1531,7 +1531,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: TabTitleChanged = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::TabTitleChanged(payload));
     }
@@ -1543,7 +1543,7 @@ proptest! {
     ) {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: WindowTitleChanged = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::WindowTitleChanged(payload));
     }
@@ -1555,7 +1555,7 @@ proptest! {
 
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: InputSerial = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload);
+        prop_assert_eq!(decoded_json, payload.clone());
     }
 
     #[test]
@@ -1567,4 +1567,6 @@ proptest! {
 
         prop_assert_eq!(left.cmp(&right), a.cmp(&b));
     }
+
 }
+
