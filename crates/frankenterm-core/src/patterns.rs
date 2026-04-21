@@ -3043,6 +3043,51 @@ mod tests {
         }
     }
 
+    /// [ft-xv561 regression — session 2026-04-21]
+    ///
+    /// Victory-lap review of 070117a0 surfaced one gap in the existing
+    /// test coverage: `compile_rule_regex_accepts_builtin_pack_patterns`
+    /// only matches against short canonical anchor lines, so it
+    /// doesn't prove legitimate patterns have budget headroom when
+    /// applied to realistic pane-scrollback-length input.
+    ///
+    /// The 10M-step backtrack cap must comfortably accommodate a
+    /// legitimate non-pathological regex (`\d+%` style) against a
+    /// 100 KiB input — a realistic cap on a single segment of pane
+    /// output — without exhausting the budget. Regressing toward a
+    /// tighter cap would cause false positives in production: real
+    /// rules would start returning `Err(BacktrackLimitExceeded)` and
+    /// detection would silently stop firing.
+    #[test]
+    fn compile_rule_regex_budget_accommodates_legitimate_large_input() {
+        // Regex from builtin_codex_pack — structurally linear, NOT
+        // susceptible to catastrophic backtracking. Must complete
+        // against a 100 KiB pane-tail-shaped input without running
+        // the backtrack budget dry.
+        let regex = compile_rule_regex(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining")
+            .expect("legitimate pattern must compile");
+        let mut padding = "filler content ".repeat(100 * 1024 / 15);
+        padding.push_str("less than 5% of your 5h limit remaining");
+        padding.push_str(&" more filler ".repeat(100));
+
+        // Iterate eagerly; any backtrack-limit hit would surface as
+        // `Err(BacktrackLimitExceeded)` on a `captures_iter` step.
+        // The legitimate pattern MUST produce at least one Ok match
+        // on this large-but-realistic input.
+        let results: Vec<_> = regex.captures_iter(&padding).collect();
+        let ok_matches: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        let err_matches: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+        assert!(
+            !ok_matches.is_empty(),
+            "legitimate pattern must match the canonical anchor embedded in large input"
+        );
+        assert!(
+            err_matches.is_empty(),
+            "legitimate pattern must not exhaust backtrack budget on realistic input; got {} errors",
+            err_matches.len()
+        );
+    }
+
     #[test]
     fn pack_for_rule_returns_pack_name() {
         let engine = PatternEngine::new();

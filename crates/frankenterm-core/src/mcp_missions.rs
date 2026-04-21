@@ -1227,4 +1227,76 @@ mod tests {
             .expect("absolute path inside root must be accepted");
         assert!(resolved.ends_with("mission/inside.json"));
     }
+
+    /// [ft-security-mcp-path-traversal regression — session 2026-04-21]
+    ///
+    /// Victory-lap review of 30988e53 surfaced one branch not yet
+    /// covered: a symlink that lives INSIDE the workspace but points
+    /// OUTSIDE. `Path::canonicalize()` resolves symlinks, so the
+    /// nearest-existing-ancestor walk must notice the escape when the
+    /// canonicalized target is not prefixed by `workspace_root
+    /// .canonicalize()`. This test pins that behavior.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_symlink_escape_to_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+
+        // Target outside the workspace — canonicalize must resolve
+        // the symlink to this, and the containment check must reject.
+        let outside_target = outer.path().join("secret.json");
+        std::fs::write(&outside_target, "{}").expect("write outside target");
+
+        // Attacker-planted symlink INSIDE the workspace pointing out.
+        std::fs::create_dir_all(workspace_root.join("mission"))
+            .expect("mkdir mission/ in workspace");
+        let symlink_path = workspace_root.join("mission/escape.json");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        // User supplies the relative path the symlink lives at — a
+        // path that *looks* workspace-scoped but canonicalizes out.
+        let err = resolve_workspace_scoped_path(workspace_root, "mission/escape.json")
+            .expect_err("symlink pointing outside workspace must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("escapes workspace root"),
+            "unexpected rejection message: {}",
+            err.message
+        );
+    }
+
+    /// [ft-security-mcp-path-traversal regression — session 2026-04-21]
+    ///
+    /// Confirms the containment check remains tight against an
+    /// absolute path whose canonical form escapes via symlink. Guards
+    /// against a future refactor that might accept absolute paths
+    /// without canonicalizing the target.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_absolute_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+
+        let outside_target = outer.path().join("id_rsa");
+        std::fs::write(&outside_target, "PRIVATE KEY").expect("write target");
+
+        std::fs::create_dir_all(workspace_root.join("mission")).expect("mkdir");
+        let symlink_path = workspace_root.join("mission/link.json");
+        symlink(&outside_target, &symlink_path).expect("create symlink");
+
+        // User supplies the ABSOLUTE path of the symlink inside the
+        // workspace. Without canonicalize+containment, an attacker
+        // could exfiltrate arbitrary files.
+        let err =
+            resolve_workspace_scoped_path(workspace_root, &symlink_path.to_string_lossy())
+                .expect_err("absolute symlink escape must be rejected");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(err.message.contains("escapes workspace root"));
+    }
 }
