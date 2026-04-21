@@ -1325,15 +1325,41 @@ pub mod task {
 
 /// Re-export `join!` macro for concurrent future evaluation.
 pub use futures::join;
-/// Re-export `select!` macro for multiplexing futures.
+/// Two-branch `select!` macro — polls two futures concurrently and
+/// executes the handler of whichever completes first.
 ///
-/// Uses `tokio::select!` as a poll combinator — it operates on standard
-/// `Future::poll` and does not require a live tokio runtime. All channel
-/// types use asupersync primitives; only the select macro itself remains
-/// from tokio.
-// TODO(asupersync): replace with `asupersync::select!` or
-// `futures::select!` once available to fully decouple from tokio.
-pub use tokio::select;
+/// Syntax mirrors `tokio::select!` for the 2-branch case:
+/// ```ignore
+/// select! {
+///     val = future_a => { /* handle val */ }
+///     val = future_b => { /* handle val */ }
+/// }
+/// ```
+///
+/// Implemented via `futures::future::select` — no tokio dependency.
+/// The first branch listed gets a slight bias (left-side of `Either`)
+/// but both are polled on every waker notification.
+macro_rules! select {
+    // Two-branch, block bodies, no trailing comma between branches
+    ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block) => {{
+        ::futures::pin_mut!($fut1);
+        ::futures::pin_mut!($fut2);
+        match ::futures::future::select($fut1, $fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
+    // Two-branch, expression bodies, comma-separated
+    ($pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
+        ::futures::pin_mut!($fut1);
+        ::futures::pin_mut!($fut2);
+        match ::futures::future::select($fut1, $fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
+}
+pub(crate) use select;
 
 /// Unix socket aliases/helpers for the active runtime.
 pub mod unix {
