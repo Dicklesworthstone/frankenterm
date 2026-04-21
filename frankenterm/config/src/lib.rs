@@ -571,7 +571,31 @@ impl ConfigInner {
         if self.watcher.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
             const DELAY: Duration = Duration::from_millis(200);
-            let watcher = notify::recommended_watcher(tx).unwrap();
+            // `notify::recommended_watcher` can fail on platforms where
+            // filesystem change notifications are unavailable — CI
+            // sandboxes without inotify, minimal Linux containers, WSL1
+            // edge cases, and the stripped-down mount namespaces some
+            // Docker / Kubernetes images ship with. The earlier
+            // revision called `.unwrap()` on this Result, which made a
+            // missing kernel feature fatal to the whole config
+            // subsystem: every caller of `reload()` / `subscribe_to_
+            // config_reload()` / the `common_init` path would panic the
+            // process. Fall back to no-watcher mode instead — the
+            // process can still reload via SIGHUP or an explicit
+            // `config::reload()` call, which is exactly how mux-server
+            // and headless deployments already trigger reloads.
+            let watcher = match notify::recommended_watcher(tx) {
+                Ok(w) => w,
+                Err(err) => {
+                    log::warn!(
+                        "unable to install filesystem watcher for config reload \
+                         (path {:?}): {err:#}; running without fs-watch, \
+                         explicit reload()/SIGHUP still works",
+                        path
+                    );
+                    return;
+                }
+            };
             let path = path.clone();
 
             std::thread::spawn(move || {
