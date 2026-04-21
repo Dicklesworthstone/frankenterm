@@ -38,12 +38,12 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 ### Platform Model
 
-`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native in the product-facing APIs: structured, cancel-correct, and centered on `Cx`-aware orchestration across search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces. The remaining watch-daemon/runtime startup path still crosses a named `runtime_compat` quarantine while the last task-spawn seams are being collapsed.
+`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native in the product-facing APIs: structured, cancel-correct, and centered on `Cx`-aware orchestration across search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces. The dual-runtime fallback is gone, but several production seams still route through the named `runtime_compat` boundary for runtime bootstrap, channels, time, blocking work, IPC, and mux interoperability while the remaining compat helpers are being collapsed.
 
 Current implementation reality:
 
 - Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems.
-- `runtime_compat` remains as an audited boundary for runtime lifecycle, channel, time, and blocking semantics; it is not the product story.
+- `runtime_compat` remains as an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics; it is not the product story.
 - Live pane/session interoperability is currently WezTerm-backed. Treat that as the present mux boundary, not as a claim that `ft` is "just a WezTerm wrapper".
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
