@@ -46,6 +46,37 @@ fn cap_backlog_payload(payload: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Push a command onto the tmux cmd_queue while enforcing the CMD_QUEUE_MAX_DEPTH
+/// hard cap (ft-4qom2).
+///
+/// The cap was previously enforced only at the pop site (`send_next_command`),
+/// which early-returns when `state != Idle`. If tmux is stuck in
+/// `WaitingForResponse` during an event storm (remote tmux lag, server
+/// overload), the pop-site enforcement never runs and the queue grows
+/// unboundedly as LayoutChange/SessionChanged/WindowAdd/SplitPane events push
+/// new commands without a cap check. Enforcing on every push closes that gap.
+///
+/// Caller holds the cmd_queue lock, so this is atomic with the push.
+fn push_command_capped(queue: &mut TmuxCmdQueue, cmd: Box<dyn TmuxCommand>) {
+    queue.push_back(cmd);
+    if queue.len() > CMD_QUEUE_MAX_DEPTH {
+        let excess = queue.len() - CMD_QUEUE_MAX_DEPTH;
+        log::error!(
+            "tmux command queue ({}) exceeds hard cap {}; dropping {} oldest commands",
+            queue.len(),
+            CMD_QUEUE_MAX_DEPTH,
+            excess,
+        );
+        queue.drain(..excess);
+    } else if queue.len() > CMD_QUEUE_WARNING_DEPTH {
+        log::warn!(
+            "tmux command queue depth ({}) exceeds {} threshold; possible protocol churn",
+            queue.len(),
+            CMD_QUEUE_WARNING_DEPTH,
+        );
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum AttachState {
     Init,
@@ -193,15 +224,18 @@ impl TmuxDomainState {
                     raw_flags: _,
                 } => {
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    cmd_queue.push_back(Box::new(ListAllPanes {
-                        window_id: *window,
-                        prune: true,
-                        layout_csum: if let Some(l) = layout.get(0..4) {
-                            l.to_string()
-                        } else {
-                            "".to_string()
-                        },
-                    }));
+                    push_command_capped(
+                        &mut cmd_queue,
+                        Box::new(ListAllPanes {
+                            window_id: *window,
+                            prune: true,
+                            layout_csum: if let Some(l) = layout.get(0..4) {
+                                l.to_string()
+                            } else {
+                                "".to_string()
+                            },
+                        }),
+                    );
                 }
                 Event::Output { pane, text } => {
                     let pane_map = self.remote_panes.lock();
@@ -220,7 +254,7 @@ impl TmuxDomainState {
                 Event::SessionChanged { session, name: _ } => {
                     *self.tmux_session.lock() = Some(*session);
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                    cmd_queue.push_back(Box::new(ListCommands));
+                    push_command_capped(&mut cmd_queue, Box::new(ListCommands));
 
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
@@ -231,10 +265,13 @@ impl TmuxDomainState {
                         (self.gui_window.lock().is_some(), *self.tmux_session.lock())
                     {
                         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        cmd_queue.push_back(Box::new(ListAllWindows {
-                            session_id: session,
-                            window_id: Some(*window),
-                        }));
+                        push_command_capped(
+                            &mut cmd_queue,
+                            Box::new(ListAllWindows {
+                                session_id: session,
+                                window_id: Some(*window),
+                            }),
+                        );
                         log::info!("tmux window add: {}:{}", session, window);
                     }
                 }
@@ -372,10 +409,13 @@ impl TmuxDomainState {
 
         if let Some(id) = tmux_pane_id {
             let mut cmd_queue = self.cmd_queue.as_ref().lock();
-            cmd_queue.push_back(Box::new(SplitPane {
-                pane_id: id,
-                direction: split_request.direction,
-            }));
+            push_command_capped(
+                &mut cmd_queue,
+                Box::new(SplitPane {
+                    pane_id: id,
+                    direction: split_request.direction,
+                }),
+            );
             TmuxDomainState::schedule_send_next_command(self.domain_id);
             return Ok(());
         } else {
