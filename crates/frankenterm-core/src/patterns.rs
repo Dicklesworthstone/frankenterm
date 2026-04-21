@@ -1007,9 +1007,11 @@ fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     // pack-loading surface. Symlink escape (a link inside root pointing
     // out) is also blocked because `fs::canonicalize` follows symlinks.
     //
-    // Callers that pass `root: None` (currently `discover_packs_from_dir`)
-    // have already vetted the path via directory iteration inside a known
-    // prefix, so the sandbox check is skipped on that path.
+    // Callers that pass `root: None` have either already vetted the path
+    // (e.g. a caller that passes an absolute path built from a trusted
+    // config field) or are a test harness. `discover_packs_from_dir` now
+    // passes `Some(dir)` so symlinks inside `.ft/patterns/` cannot escape
+    // the pack root.
     let resolved = if let Some(root) = root {
         sandbox_resolve(&candidate, root)?
     } else {
@@ -1128,8 +1130,14 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
 
     for entry in sorted {
         let path = entry.path();
+        // [ft-05hfm follow-up] Pin the sandbox root to `dir` so a symlink
+        // inside `.ft/patterns/` pointing out of tree (e.g.
+        // `config.yaml -> ~/.ssh/id_rsa`) is rejected by `sandbox_resolve`
+        // before `read_to_string` follows it. Without this root, a hostile
+        // repo could smuggle outside-of-tree file contents into the pack
+        // parser and leak excerpts through the `tracing::warn!` below.
         if path.is_file() && is_pack_file(&path) {
-            match load_pack_from_file(path.to_str().unwrap_or_default(), None) {
+            match load_pack_from_file(path.to_str().unwrap_or_default(), Some(dir)) {
                 Ok(pack) => packs.push(pack),
                 Err(e) => {
                     tracing::warn!("Skipping invalid user pack {}: {e}", path.display());
@@ -1138,7 +1146,7 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
         } else if path.is_dir() {
             let rules_file = path.join("rules.toml");
             if rules_file.is_file() {
-                match load_pack_from_file(rules_file.to_str().unwrap_or_default(), None) {
+                match load_pack_from_file(rules_file.to_str().unwrap_or_default(), Some(dir)) {
                     Ok(pack) => packs.push(pack),
                     Err(e) => {
                         tracing::warn!("Skipping invalid user pack {}: {e}", rules_file.display());
@@ -4937,6 +4945,32 @@ description = "Health check rule"
         fs::write(dir.path().join("broken.toml"), "this is not valid TOML{{{").unwrap();
         let packs = discover_packs_from_dir(dir.path()).unwrap();
         assert!(packs.is_empty());
+    }
+
+    /// [ft-05hfm follow-up] A symlink inside `.ft/patterns/` pointing
+    /// outside the pack root must be rejected by `sandbox_resolve`,
+    /// not followed into the user's home directory. Pre-fix,
+    /// `discover_packs_from_dir` passed `root: None`, so a hostile
+    /// repo could place `patterns/config.yaml -> ~/.ssh/id_rsa` and
+    /// have its contents fed to `serde_yaml`, leaking excerpts via
+    /// the parse-error `tracing::warn!`.
+    #[cfg(unix)]
+    #[test]
+    fn discover_packs_rejects_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.yaml");
+        fs::write(&target, "secret: exfiltrated\n").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert!(
+            packs.is_empty(),
+            "symlink escape must be rejected, got {} packs",
+            packs.len()
+        );
     }
 
     #[test]
