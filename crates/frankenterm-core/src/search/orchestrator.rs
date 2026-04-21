@@ -288,9 +288,7 @@ impl fmt::Display for EmbedderAvailability {
 pub struct ManagedEmbedderStack {
     /// Quality-tier embedder (e.g. FastEmbed ONNX). Optional.
     quality: Option<Arc<dyn Embedder>>,
-    /// Fast-tier embedder (distilled sentence encoder). Optional.
-    /// `model2vec` was retired as a Fast-tier backend candidate
-    /// (see `search::daemon::worker::build_embedder_rejects_retired_model2vec_selector`).
+    /// Fast-tier embedder (e.g. Model2Vec distilled). Optional.
     fast: Option<Arc<dyn Embedder>>,
     /// Hash-tier embedder (always available).
     hash: Arc<dyn Embedder>,
