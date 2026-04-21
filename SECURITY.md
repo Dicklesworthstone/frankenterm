@@ -7,18 +7,24 @@ model, and the audit trail of shipped security fixes.
 
 ## Reporting a vulnerability
 
-**Please do not open a public GitHub issue for suspected security bugs.**
+**Please do not open a public GitHub issue with vulnerability
+details.**
 
-Preferred reporting channels, in order:
+Preferred reporting channel:
 
-1. **GitHub Security Advisories** — open a private advisory in this
-   repository's Security tab. This is the default channel for
-   coordinated disclosure and gets routed to the project maintainer
-   without exposing details to the public.
-2. **Email** — if GitHub advisories are unavailable, contact the
-   maintainer at the address published on the project's GitHub
-   profile. Mark the subject line `[ft-security]` so it routes to
-   the security triage queue.
+1. **GitHub Security Advisories** — open a private advisory under
+   the repository's Security tab (`Report a vulnerability` button).
+   This routes to the project maintainer without exposing details
+   publicly.
+
+   Private vulnerability reporting is enabled on a best-effort
+   basis. If the `Report a vulnerability` button is not visible on
+   this repo at the time you need it, open a *minimal* public issue
+   titled `[ft-security] request private channel` — **without any
+   vulnerability details** — and the maintainer will re-enable the
+   private channel and follow up. The maintainer's GitHub profile
+   does not currently publish a public email; do not send writeups
+   to guessed addresses.
 
 When reporting, please include:
 
