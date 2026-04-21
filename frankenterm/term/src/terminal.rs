@@ -188,6 +188,168 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::ColorPalette;
+    use crate::{CellAttributes, CursorPosition, Line};
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct PropTermConfig;
+
+    impl TerminalConfiguration for PropTermConfig {
+        fn scrollback_size(&self) -> usize {
+            64
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct LineSnapshot {
+        text: String,
+        wrapped: bool,
+        cells: Vec<(String, usize, CellAttributes)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TerminalSnapshot {
+        cursor: CursorPosition,
+        title: String,
+        current_dir: Option<String>,
+        progress: Progress,
+        palette: ColorPalette,
+        all_lines: Vec<LineSnapshot>,
+    }
+
+    fn make_prop_term(rows: usize, cols: usize) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            },
+            Arc::new(PropTermConfig),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn snapshot_line(line: &Line) -> LineSnapshot {
+        LineSnapshot {
+            text: line.as_str().to_string(),
+            wrapped: line.last_cell_was_wrapped(),
+            cells: line
+                .visible_cells()
+                .map(|cell| (cell.str().to_string(), cell.width(), cell.attrs().clone()))
+                .collect(),
+        }
+    }
+
+    fn snapshot_term(term: &Terminal) -> TerminalSnapshot {
+        let mut cursor = term.cursor_pos();
+        cursor.seqno = 0;
+        TerminalSnapshot {
+            cursor,
+            title: term.get_title().to_string(),
+            current_dir: term.get_current_dir().map(|url| url.to_string()),
+            progress: term.get_progress(),
+            palette: term.palette(),
+            all_lines: term
+                .screen()
+                .all_lines()
+                .iter()
+                .map(snapshot_line)
+                .collect(),
+        }
+    }
+
+    fn chunked_snapshot(payload: &[u8], chunk_sizes: &[usize]) -> TerminalSnapshot {
+        let mut term = make_prop_term(8, 16);
+        let mut offset = 0;
+        for size in chunk_sizes {
+            if offset >= payload.len() {
+                break;
+            }
+            let end = (offset + (*size).max(1)).min(payload.len());
+            term.advance_bytes(&payload[offset..end]);
+            offset = end;
+        }
+        if offset < payload.len() {
+            term.advance_bytes(&payload[offset..]);
+        }
+        snapshot_term(&term)
+    }
+
+    fn single_snapshot(payload: &[u8]) -> TerminalSnapshot {
+        let mut term = make_prop_term(8, 16);
+        term.advance_bytes(payload);
+        snapshot_term(&term)
+    }
+
+    fn arb_chunk_sizes() -> impl Strategy<Value = Vec<usize>> {
+        proptest::collection::vec(1usize..8, 0..24)
+    }
+
+    fn arb_ascii_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(0x20u8..=0x7Eu8, 0..48)
+            .prop_map(|bytes| bytes.into_iter().map(char::from).collect())
+    }
+
+    fn arb_safe_label() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                (b'A'..=b'Z').prop_map(char::from),
+                (b'a'..=b'z').prop_map(char::from),
+                (b'0'..=b'9').prop_map(char::from),
+                Just(' '),
+                Just('_'),
+                Just('.'),
+                Just('/'),
+                Just(':'),
+                Just('-'),
+            ],
+            0..24,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_multibyte_text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just("a"),
+                Just("b"),
+                Just(" "),
+                Just("\u{00e9}"),
+                Just("\u{03bb}"),
+                Just("\u{4e2d}"),
+                Just("\u{8a9e}"),
+                Just("\u{1f980}"),
+            ],
+            0..32,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    fn arb_control_stream() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just("a"),
+                Just("b"),
+                Just("c"),
+                Just("\r"),
+                Just("\n"),
+                Just("\x08"),
+                Just("\t"),
+            ],
+            0..40,
+        )
+        .prop_map(|parts| parts.concat())
+    }
 
     #[test]
     fn clipboard_selection_equality() {
@@ -271,13 +433,11 @@ mod tests {
             body: "message".to_string(),
             focus: false,
         };
-        match &alert {
-            Alert::ToastNotification { title, body, focus } => {
-                assert!(title.is_none());
-                assert_eq!(body, "message");
-                assert!(!focus);
-            }
-            _ => panic!("expected ToastNotification"),
+        assert!(matches!(&alert, Alert::ToastNotification { .. }));
+        if let Alert::ToastNotification { title, body, focus } = &alert {
+            assert!(title.is_none());
+            assert_eq!(body, "message");
+            assert!(!focus);
         }
     }
 
@@ -383,5 +543,169 @@ mod tests {
         assert!(dbg.contains("TerminalSize"));
         assert!(dbg.contains("24"));
         assert!(dbg.contains("80"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn incremental_ascii_text_matches_single_shot(
+            text in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = text.into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_multibyte_text_matches_single_shot(
+            text in arb_multibyte_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = text.into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_control_stream_matches_single_shot(
+            text in arb_control_stream(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = text.into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_cursor_csi_sequences_match_single_shot(
+            row in 1u8..=6,
+            col in 1u8..=12,
+            right in 1u8..=6,
+            left in 1u8..=6,
+            text in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "home\x1b[{row};{col}H{text}\x1b[{right}C>\x1b[{left}D<"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_sgr_palette_sequences_match_single_shot(
+            fg in 30u8..=37,
+            bg in 40u8..=47,
+            text in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!("\x1b[{fg};{bg};1m{text}Z\x1b[0m!").into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_sgr_truecolor_sequences_match_single_shot(
+            fg_r in any::<u8>(),
+            fg_g in any::<u8>(),
+            fg_b in any::<u8>(),
+            bg_r in any::<u8>(),
+            bg_g in any::<u8>(),
+            bg_b in any::<u8>(),
+            text in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "\x1b[38;2;{fg_r};{fg_g};{fg_b};48;2;{bg_r};{bg_g};{bg_b}m{text}Q\x1b[0m!"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_osc_title_st_sequences_match_single_shot(
+            title in arb_safe_label(),
+            body in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!("\x1b]0;{title}\x1b\\{body}").into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_osc_title_bel_sequences_match_single_shot(
+            title in arb_safe_label(),
+            body in arb_ascii_text(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!("\x1b]2;{title}\x07{body}").into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_osc_palette_change_sequences_match_single_shot(
+            index in any::<u8>(),
+            red in any::<u8>(),
+            green in any::<u8>(),
+            blue in any::<u8>(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "\x1b]4;{index};rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\X"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_osc_palette_reset_sequences_match_single_shot(
+            index in any::<u8>(),
+            red in any::<u8>(),
+            green in any::<u8>(),
+            blue in any::<u8>(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "\x1b]4;{index};rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\\x1b]104;{index}\x1b\\X"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_osc_dynamic_color_sequences_match_single_shot(
+            fg_r in any::<u8>(),
+            fg_g in any::<u8>(),
+            fg_b in any::<u8>(),
+            bg_r in any::<u8>(),
+            bg_g in any::<u8>(),
+            bg_b in any::<u8>(),
+            cursor_r in any::<u8>(),
+            cursor_g in any::<u8>(),
+            cursor_b in any::<u8>(),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "\x1b]10;rgb:{fg_r:02x}/{fg_g:02x}/{fg_b:02x}\x1b\\\
+                 \x1b]11;rgb:{bg_r:02x}/{bg_g:02x}/{bg_b:02x}\x1b\\\
+                 \x1b]12;rgb:{cursor_r:02x}/{cursor_g:02x}/{cursor_b:02x}\x1b\\X"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn incremental_mixed_escape_stream_matches_single_shot(
+            title in arb_safe_label(),
+            body in arb_multibyte_text(),
+            index in any::<u8>(),
+            red in any::<u8>(),
+            green in any::<u8>(),
+            blue in any::<u8>(),
+            row in 1u8..=6,
+            col in 1u8..=12,
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            let payload = format!(
+                "\x1b]0;{title}\x1b\\{body}\n\
+                 \x1b[31;47mZ\x1b[0m\
+                 \x1b]4;{index};rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\\
+                 \x1b[{row};{col}H\u{4e2d}"
+            ).into_bytes();
+            prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
     }
 }
