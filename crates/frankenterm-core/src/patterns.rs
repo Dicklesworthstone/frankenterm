@@ -934,12 +934,44 @@ fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Resul
     let mut user_pack_names = HashSet::new();
 
     // Discover user packs from config dir (e.g. ~/.config/wa/patterns/)
+    //
+    // [ft-qhyfh] Route this branch through `sandbox_resolve_dir` the same
+    // way `.ft/patterns` (the ft-6mxfs fix site below) does. Unlike the
+    // repo-clone case, `user_dir` is under the user's own control, so the
+    // threat model is narrower — the attacker would need the user to
+    // already have write access. However:
+    //
+    //   * Shared-dotfile setups where `~/.config/wa/patterns` is a symlink
+    //     valid on one machine but dangling / redirected on another can
+    //     silently widen a `wa` invocation's read scope on the second
+    //     machine.
+    //   * The inner per-file `sandbox_resolve` uses the passed-in dir as
+    //     its root, so if `user_dir` itself redirects (e.g.
+    //     `~/.config/wa/patterns -> /etc`), every per-file check gets
+    //     rooted at `/etc` and passes — the escape is one level up from
+    //     where the existing gate fires.
+    //
+    // Fix: use the parent of `user_dir` as the sandbox root. A stealth
+    // redirect at the directory boundary (canonical form escapes the
+    // parent) is rejected; an explicit absolute configuration
+    // (`user_packs_dir = /opt/company/patterns`) remains accepted because
+    // the canonical form trivially starts with its own parent. A missing
+    // directory or dangling symlink returns `Ok(None)` and is skipped
+    // silently — matching the prior behavior where
+    // `discover_packs_from_dir` returned an empty vec for the 99% case
+    // where no user_packs_dir is populated.
     if config.user_packs_enabled {
         if let Some(user_dir) = config.resolved_user_packs_dir() {
-            let discovered = discover_packs_from_dir(&user_dir)?;
-            for pack in discovered {
-                user_pack_names.insert(pack.name.clone());
-                packs.push(pack);
+            let sandbox_root = user_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| user_dir.clone());
+            if let Some(safe_user_dir) = sandbox_resolve_dir(&user_dir, &sandbox_root)? {
+                let discovered = discover_packs_from_dir(&safe_user_dir)?;
+                for pack in discovered {
+                    user_pack_names.insert(pack.name.clone());
+                    packs.push(pack);
+                }
             }
         }
     }
@@ -5116,6 +5148,130 @@ description = "Health check rule"
         assert!(
             msg.contains("resolves outside sandbox root") || msg.contains("ft-6mxfs"),
             "error should cite sandbox escape: {msg}"
+        );
+    }
+
+    /// [ft-qhyfh] The sibling vector on the user-packs branch: if the
+    /// configured `user_packs_dir` is itself a symlink whose canonical
+    /// form escapes its parent directory (the dotfile-sharing gotcha —
+    /// `~/.config/wa/patterns` valid on one machine, redirected on
+    /// another), `load_packs_from_config` must refuse the load rather
+    /// than silently widen its read scope. The parent of `user_dir` is
+    /// used as the sandbox root so an explicit absolute configuration
+    /// (`user_packs_dir = /opt/company/patterns`) still passes while a
+    /// cross-parent escape is blocked.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_refuses_user_packs_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        // Stage a pack inside `outside`. If the sandbox gate fails open,
+        // the pack would load and `LoadedPacks.packs.len()` would be > 0,
+        // so a false negative is unambiguous.
+        fs::write(
+            outside.path().join("escape.toml"),
+            r#"
+name = "user:escape"
+version = "1.0.0"
+[[rules]]
+id = "exfil.escape"
+agent_type = "codex"
+event_type = "exfil.event"
+severity = "info"
+anchors = ["[escape]"]
+description = "escape"
+"#,
+        )
+        .unwrap();
+
+        // Build a separate "user config home" dir and place a symlink
+        // inside it pointing at `outside`. The symlink path is what the
+        // user has configured as `user_packs_dir`. Canonicalizing the
+        // symlink path follows the redirect to `outside`, which is
+        // NOT under the symlink's parent — so sandbox_resolve_dir must
+        // reject it.
+        let user_home = tempfile::tempdir().unwrap();
+        let user_packs_symlink = user_home.path().join("patterns");
+        std::os::unix::fs::symlink(outside.path(), &user_packs_symlink).unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(user_packs_symlink.to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        match load_packs_from_config(&config, None) {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("outside sandbox root") || msg.contains("ft-6mxfs"),
+                    "error should cite sandbox escape at the user_packs dir \
+                     boundary: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "symlinked user_packs_dir that escapes its parent must cause \
+                 load to fail, but load_packs_from_config returned Ok — \
+                 ft-qhyfh regression"
+            ),
+        }
+    }
+
+    /// [ft-qhyfh] Companion test: a user_packs_dir that is a real
+    /// directory (no symlink at the boundary) still loads successfully
+    /// after the gate is added. Guards against an over-tight fix that
+    /// breaks the 99% case where users just drop files into a normal
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_accepts_normal_user_packs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("normal.toml"),
+            r#"
+name = "user:normal"
+version = "1.0.0"
+[[rules]]
+id = "myorg.normal"
+agent_type = "codex"
+event_type = "normal.event"
+severity = "info"
+anchors = ["[normal]"]
+description = "normal"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded = load_packs_from_config(&config, None)
+            .expect("[ft-qhyfh] normal user_packs_dir must still load after the sandbox gate");
+        assert!(
+            loaded.packs.iter().any(|p| p.name == "user:normal"),
+            "[ft-qhyfh] user:normal pack must be present in loaded packs"
+        );
+    }
+
+    /// [ft-qhyfh] Missing / never-populated user_packs_dir is the 99%
+    /// case. It must continue to return Ok with no user packs — matching
+    /// the prior behavior where `discover_packs_from_dir` early-returned
+    /// on `!dir.exists()`.
+    #[test]
+    fn load_packs_from_config_missing_user_packs_dir_is_silent() {
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some("/nonexistent/path/for/ft-qhyfh/test".to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded = load_packs_from_config(&config, None)
+            .expect("[ft-qhyfh] missing user_packs_dir must not error");
+        assert!(
+            !loaded.packs.iter().any(|p| p.name.starts_with("user:")),
+            "[ft-qhyfh] missing user_packs_dir should yield no user packs"
         );
     }
 
