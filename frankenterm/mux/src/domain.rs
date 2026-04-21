@@ -5,19 +5,19 @@
 //! container or actually remote, running on the other end
 //! of an ssh session somewhere.
 
+use crate::Mux;
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, Pane, PaneId};
+use crate::pane::{Pane, PaneId, alloc_pane_id};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::WindowId;
-use crate::Mux;
-use anyhow::{bail, Context, Error};
+use anyhow::{Context, Error, bail};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
-use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
-use downcast_rs::{impl_downcast, Downcast};
+use config::{ExecDomain, SerialDomain, ValueOrFunc, WslDomain, configuration};
+use downcast_rs::{Downcast, impl_downcast};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtySize, PtySystem};
+use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, PtySystem, native_pty_system};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::OsString;
@@ -717,7 +717,14 @@ impl Domain for LocalDomain {
             )),
             Err(err) => {
                 // Show the error to the user in the new pane
-                write!(writer, "{err:#}").ok();
+                let display_result = write!(writer, "{err:#}").and_then(|_| writer.flush());
+                if display_result.is_err() {
+                    tracing::warn!(
+                        spawn_error = ?err,
+                        pane_error_display = ?display_result,
+                        "failed to surface local pane spawn error"
+                    );
+                }
 
                 // and return a dummy pane that has exited
                 Arc::new(LocalPane::new(
