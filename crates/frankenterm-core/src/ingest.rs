@@ -1652,6 +1652,62 @@ fn hash_text(text: &str) -> u64 {
 ///
 /// This is designed for the "sliding window" case (polling successive snapshots):
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
+const DELTA_OVERLAP_PROBE_LEN: usize = 8;
+
+#[inline]
+fn delta_result_from_overlap(current: &str, overlap_len: usize) -> DeltaResult {
+    let delta = &current[overlap_len..];
+    if delta.is_empty() {
+        DeltaResult::Gap {
+            reason: "content_changed_without_append".to_string(),
+            content: current.to_string(),
+        }
+    } else {
+        DeltaResult::Content(delta.to_string())
+    }
+}
+
+#[inline]
+fn try_overlap_match(search_window: &str, current: &str, pos: usize) -> Option<DeltaResult> {
+    if !search_window.is_char_boundary(pos) {
+        return None;
+    }
+    let overlap_len = search_window.len() - pos;
+
+    if overlap_len > current.len() || !current.is_char_boundary(overlap_len) {
+        return None;
+    }
+
+    if search_window[pos..] != current[..overlap_len] {
+        return None;
+    }
+
+    Some(delta_result_from_overlap(current, overlap_len))
+}
+
+#[inline]
+fn overlap_anchor_offset(prefix: &[u8], search_bytes: &[u8]) -> usize {
+    let mut best_offset = 0;
+    let mut best_count = usize::MAX;
+
+    for (offset, &byte) in prefix.iter().enumerate() {
+        if prefix[..offset].contains(&byte) {
+            continue;
+        }
+
+        let count = memchr::memchr_iter(byte, search_bytes).count();
+        if count < best_count {
+            best_count = count;
+            best_offset = offset;
+            if count <= 1 {
+                break;
+            }
+        }
+    }
+
+    best_offset
+}
+
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
     if previous == current {
@@ -1689,36 +1745,53 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     }
     let search_window = &previous[search_start..];
 
-    // Safety: current is known not to be empty from check above
-    let first_char = current.as_bytes()[0];
+    let search_bytes = search_window.as_bytes();
+    let current_bytes = current.as_bytes();
+    let probe_len = DELTA_OVERLAP_PROBE_LEN
+        .min(search_window.len())
+        .min(current.len());
 
-    // Find all occurrences of first_char in search_window using memchr (SIMD-optimized)
-    // We iterate from left to right (smallest pos -> largest overlap)
-    for pos in memchr::memchr_iter(first_char, search_window.as_bytes()) {
-        // memchr returns byte offsets — skip if not on a char boundary
-        if !search_window.is_char_boundary(pos) {
-            continue;
-        }
-        // Candidate overlap starts at pos relative to search_window
-        let overlap_len = search_window.len() - pos;
+    if probe_len > 1 {
+        let prefix = &current_bytes[..probe_len];
+        let anchor_offset = overlap_anchor_offset(prefix, search_bytes);
+        let anchor_byte = prefix[anchor_offset];
 
-        if overlap_len > current.len() || !current.is_char_boundary(overlap_len) {
-            continue;
-        }
-
-        // Check full match
-        // search_window[pos..] has length overlap_len
-        // current[..overlap_len] has length overlap_len
-        if search_window[pos..] == current[..overlap_len] {
-            let delta = &current[overlap_len..];
-            if delta.is_empty() {
-                return DeltaResult::Gap {
-                    reason: "content_changed_without_append".to_string(),
-                    content: current.to_string(),
-                };
+        // Probe on a rarer prefix byte first so repeated prompt prefixes don't
+        // force a full suffix/prefix compare for every candidate line in the window.
+        for anchor_pos in memchr::memchr_iter(anchor_byte, search_bytes) {
+            if anchor_pos < anchor_offset {
+                continue;
             }
+            let pos = anchor_pos - anchor_offset;
+            if pos + probe_len > search_bytes.len() {
+                continue;
+            }
+            if &search_bytes[pos..pos + probe_len] != prefix {
+                continue;
+            }
+            if let Some(result) = try_overlap_match(search_window, current, pos) {
+                return result;
+            }
+        }
 
-            return DeltaResult::Content(delta.to_string());
+        // If the true overlap is shorter than the probe window, there is only
+        // one candidate suffix for each overlap length to check.
+        for overlap_len in (1..probe_len).rev() {
+            let pos = search_window.len() - overlap_len;
+            if !current.is_char_boundary(overlap_len) || !search_window.is_char_boundary(pos) {
+                continue;
+            }
+            if search_bytes[pos..] == current_bytes[..overlap_len] {
+                return delta_result_from_overlap(current, overlap_len);
+            }
+        }
+    } else {
+        // Safety: current is known not to be empty from check above
+        let first_char = current_bytes[0];
+        for pos in memchr::memchr_iter(first_char, search_bytes) {
+            if let Some(result) = try_overlap_match(search_window, current, pos) {
+                return result;
+            }
         }
     }
 
@@ -2856,6 +2929,22 @@ mod tests {
         let result = extract_delta(prev, cur, 7);
         // After snapping, search_window="bcdef" matches cur[..5], delta="XYZ"
         assert!(matches!(result, DeltaResult::Content(ref s) if s == "XYZ"));
+    }
+
+    #[test]
+    fn extract_delta_repeated_prefix_overlap_uses_late_candidate() {
+        let prev = "aaaaab";
+        let cur = "aaabZ";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "Z"));
+    }
+
+    #[test]
+    fn extract_delta_small_overlap_falls_back_below_probe_width() {
+        let prev = "tailx";
+        let cur = "xnext";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == "next"));
     }
 
     #[test]
