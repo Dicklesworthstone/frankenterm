@@ -580,6 +580,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_when_value_taking_flag_value_matches_reapable_subcommand_name() {
+        let line = "  505   70 wezterm cli --config-file list get-text --pane-id 1";
+        let entry = parse_ps_line_if_reapable(line).expect("should match");
+        assert!(entry.command.contains("get-text"));
+    }
+
+    #[test]
     fn accepts_all_allowlisted_subcommands() {
         for sub in REAPABLE_SUBCOMMANDS {
             let line = format!("  999   40 wezterm cli {sub}");

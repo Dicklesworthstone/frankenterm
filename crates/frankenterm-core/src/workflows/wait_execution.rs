@@ -878,6 +878,14 @@ mod tests {
         assert_eq!(truncate_for_log("xyz", 2), "...");
     }
 
+    #[test]
+    fn truncate_for_log_exact_utf8_boundary_preserves_budgeted_prefix() {
+        // `max_len - 3` lands exactly on a valid UTF-8 boundary here:
+        // "пр" is 4 bytes. We should preserve that full prefix rather
+        // than backing off an extra character.
+        assert_eq!(truncate_for_log("привет", 7), "пр...");
+    }
+
     // ========================================================================
     // heuristic_idle_check Tests
     // ========================================================================

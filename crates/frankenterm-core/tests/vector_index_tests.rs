@@ -212,6 +212,34 @@ fn ftvi_writer_tracks_count() {
 }
 
 #[test]
+fn writer_finish_restores_end_position_after_nonzero_offset() {
+    let mut cursor = std::io::Cursor::new(Vec::from(b"prefix".as_slice()));
+    cursor.set_position(cursor.get_ref().len() as u64);
+
+    let mut writer = FtviWriter::new(cursor, 2).unwrap();
+    writer.push(1, &[1.0, 0.0]).unwrap();
+    let mut cursor = writer.finish().unwrap();
+
+    let end_after_finish = cursor.position();
+    cursor.write_all(b"tail").unwrap();
+    let buf = cursor.into_inner();
+
+    let prefix_len = b"prefix".len();
+    let header_count_offset = prefix_len + 8;
+    let header_count = u32::from_le_bytes([
+        buf[header_count_offset],
+        buf[header_count_offset + 1],
+        buf[header_count_offset + 2],
+        buf[header_count_offset + 3],
+    ]);
+    assert_eq!(
+        header_count, 1,
+        "finish() must patch count at nonzero offset"
+    );
+    assert_eq!(&buf[end_after_finish as usize..], b"tail");
+}
+
+#[test]
 fn ftvi_large_index_search() {
     let dim = 64;
     let n = 1000;
