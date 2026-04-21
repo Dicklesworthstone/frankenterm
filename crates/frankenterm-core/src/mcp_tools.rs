@@ -92,10 +92,12 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// input in) could submit a multi-gigabyte `text` field and OOM the
 /// watcher before anyone noticed.
 ///
-/// 1 MiB is ~250x the largest legitimate paste (a full Claude Code
-/// prompt + context) and low enough to reject obvious DoS attempts
-/// without asking operators to split normal workflows.
-pub(crate) const MAX_SEND_TEXT_BYTES: usize = 1024 * 1024;
+/// 4 MiB is roughly 40x the largest legitimate paste (a full Claude
+/// Code prompt + context). High enough to accommodate uncommon but
+/// valid bulk-input scenarios (paste of a long generated artifact,
+/// for instance), low enough to reject obvious DoS attempts before
+/// the payload reaches the injector / policy / wezterm pipeline.
+pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
     match state {
@@ -6070,13 +6072,13 @@ exit 17",
     // ── ft-05hfm send-payload size-cap regressions ──────────────────
 
     #[test]
-    fn max_send_text_bytes_is_one_mib() {
+    fn max_send_text_bytes_is_four_mib() {
         // [ft-05hfm] Pin the constant so any accidental bump surfaces
         // as an explicit test update rather than silent drift.
-        // 1 MiB is ~250x the largest legitimate paste; rejecting above
-        // it catches obvious DoS attempts without burdening normal
-        // workflows.
-        assert_eq!(MAX_SEND_TEXT_BYTES, 1024 * 1024);
+        // 4 MiB is ~40x the largest typical paste; rejecting above
+        // it catches obvious DoS attempts without burdening bulk-
+        // input workflows.
+        assert_eq!(MAX_SEND_TEXT_BYTES, 4 * 1024 * 1024);
     }
 
     #[test]

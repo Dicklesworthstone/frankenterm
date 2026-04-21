@@ -982,11 +982,12 @@ fn load_pack_from_id(pack_id: &str, root: Option<&Path>) -> Result<PatternPack> 
 /// exhaust the allocator (multi-GiB file into `read_to_string`) or
 /// stack-blow the YAML deserializer on deeply-nested input.
 ///
-/// 1 MiB is three orders of magnitude larger than the biggest built-in
-/// pack (`builtin_claude_code_pack` serializes to ~10 KiB) so legitimate
-/// packs have ample headroom; rejecting anything above is a clear
-/// operator-error signal rather than a silent crash.
-pub(crate) const MAX_PACK_BYTES: u64 = 1024 * 1024;
+/// 16 MiB is roughly four orders of magnitude larger than the biggest
+/// built-in pack (`builtin_claude_code_pack` serializes to ~10 KiB) so
+/// legitimate packs have ample headroom even for very large user packs
+/// while still rejecting obvious DoS payloads long before they reach
+/// the serde_yaml / serde_json / toml deserializer.
+pub(crate) const MAX_PACK_BYTES: u64 = 16 * 1024 * 1024;
 
 fn load_pack_from_file(path: &str, root: Option<&Path>) -> Result<PatternPack> {
     let raw_path = PathBuf::from(path);
