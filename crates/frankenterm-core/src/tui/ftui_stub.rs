@@ -1571,42 +1571,6 @@ fn render_tab_bar(frame: &mut ftui::Frame, row: u16, width: u16, active: View) {
     }
 }
 
-/// Render a placeholder for the view content area.
-///
-/// Individual view rendering will be migrated in FTUI-05.2 through FTUI-05.7.
-#[allow(dead_code)] // Will be used when remaining views are migrated (FTUI-05.2+)
-fn render_view_placeholder(frame: &mut ftui::Frame, y: u16, width: u16, height: u16, view: View) {
-    if height == 0 {
-        return;
-    }
-
-    // Title line
-    let title = format!("  {} view", view.name());
-    let title_style = CellStyle::new().bold();
-    write_styled(frame, 0, y, &title, title_style);
-    // Fill rest of title
-    let title_len = title.len() as u16;
-    if title_len < width {
-        let fill = " ".repeat((width - title_len) as usize);
-        write_styled(frame, title_len, y, &fill, CellStyle::new());
-    }
-
-    // Placeholder body
-    if height > 1 {
-        let msg = format!(
-            "  [FTUI migration in progress — {view} view not yet ported]",
-            view = view.name(),
-        );
-        write_styled(frame, 0, y + 1, &msg, CellStyle::new().dim());
-    }
-
-    // Blank remaining rows
-    for row in (y + 2)..y.saturating_add(height) {
-        let blank = " ".repeat(width as usize);
-        write_styled(frame, 0, row, &blank, CellStyle::new());
-    }
-}
-
 /// Render the Home dashboard view.
 ///
 /// Layout (rows from content_y):
