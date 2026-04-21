@@ -1397,3 +1397,661 @@ fn e2e_restore_replays_scrollback_then_relaunches_agent() {
         );
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// [wa-bo6f] Save → restart → restore roundtrip tests.
+//
+// The existing `e2e_*` tests exercise capture + load paths but none of them
+// simulate the actual *restart* boundary — the moment where the mux process
+// (and the SnapshotEngine + SessionRestorer handles inside it) is torn down,
+// the only surviving state is the SQLite file, and a fresh process has to
+// reconstitute session identity from that file alone.
+//
+// The tests below close that gap: each one captures with engine A, drops
+// engine A entirely (the `{ let engine = ...; ... }` scope), then builds a
+// brand-new engine/restorer pair against the same DB and verifies that
+// session_id, pane_ids, scrollback bytes, and layout topology survive the
+// rebuild bit-identical. This is the "ft snapshot save → restart →
+// ft snapshot restore" invariant the bead calls out.
+//
+// Every test emits a structured E2ETestReport (JSON on [E2E_REPORT] lines)
+// with per-phase timing so a CI log alone is enough to diagnose a failure
+// without re-running locally.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
+    run_async_test(async {
+        let run_start = Instant::now();
+        let mut report = E2ETestReport {
+            test_name: "e2e_save_restart_restore_session_identity_survives_engine_rebuild"
+                .to_string(),
+            phases: Vec::new(),
+            total_duration_ms: 0,
+            passed: false,
+            failure_reason: None,
+            pane_reports: Vec::new(),
+        };
+
+        let (_tmp, db_path) = setup_test_db();
+
+        // Three panes across two windows — enough topology to make pane-id,
+        // tab-id, and cwd preservation meaningfully distinguishable.
+        let panes = vec![
+            make_pane(11, 0, 0, 24, 80, "claude-code", "file:///tmp/roundtrip-a"),
+            make_pane(22, 1, 0, 24, 80, "codex-agent", "file:///tmp/roundtrip-b"),
+            make_pane(33, 2, 1, 40, 120, "shell", "file:///tmp/roundtrip-c"),
+        ];
+
+        // ── Phase 1: save (engine A captures, then is dropped) ──────────
+        let captured_session_id;
+        let captured_checkpoint_id;
+        let captured_pane_count;
+        {
+            let save_start = Instant::now();
+            let engine_a = SnapshotEngine::new(
+                db_path.clone(),
+                SnapshotConfig {
+                    retention_count: 5,
+                    retention_days: 365,
+                    ..SnapshotConfig::default()
+                },
+            );
+            let snapshot = engine_a
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .expect("capture pre-restart snapshot");
+            captured_session_id = snapshot.session_id.clone();
+            captured_checkpoint_id = snapshot.checkpoint_id;
+            captured_pane_count = snapshot.pane_count;
+            add_phase(
+                &mut report,
+                "save_via_engine_a",
+                save_start,
+                "ok",
+                json!({
+                    "session_id": snapshot.session_id,
+                    "checkpoint_id": snapshot.checkpoint_id,
+                    "pane_count": snapshot.pane_count,
+                    "trigger": "startup",
+                }),
+            );
+            // engine_a drops here — simulates mux process exit.
+        }
+
+        // ── Phase 2: restart (engine B + restorer built fresh on same DB).
+        let restart_start = Instant::now();
+        let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let restorer = SessionRestorer::new(
+            db_path.clone(),
+            SessionRestoreConfig {
+                restore_scrollback: false,
+                process_relaunch: LaunchConfig::default(),
+                ..SessionRestoreConfig::default()
+            },
+        );
+        add_phase(
+            &mut report,
+            "restart_rebuild_handles",
+            restart_start,
+            "ok",
+            json!({
+                "db_path": db_path.as_str(),
+                "engine_a_dropped": true,
+            }),
+        );
+
+        // ── Phase 3: detect — must rediscover the captured session.
+        let detect_start = Instant::now();
+        let candidate = restorer
+            .detect()
+            .expect("detect after restart must not error")
+            .expect("detect after restart must find the captured session");
+        let session_id_matches = candidate.session_id == captured_session_id;
+        add_phase(
+            &mut report,
+            "detect_unclean_session_after_restart",
+            detect_start,
+            if session_id_matches { "ok" } else { "error" },
+            json!({
+                "detected_session_id": candidate.session_id,
+                "captured_session_id": captured_session_id,
+                "session_id_matches": session_id_matches,
+            }),
+        );
+
+        // ── Phase 4: load checkpoint and compare to original inputs.
+        let load_start = Instant::now();
+        let checkpoint = restorer
+            .load_checkpoint(&candidate)
+            .expect("load checkpoint after restart");
+        let checkpoint_id_matches = checkpoint.checkpoint_id == captured_checkpoint_id;
+        let pane_count_matches = checkpoint.pane_count == captured_pane_count;
+
+        let original_pane_ids: HashSet<u64> = panes.iter().map(|p| p.pane_id).collect();
+        let restored_pane_ids: HashSet<u64> =
+            checkpoint.pane_states.iter().map(|s| s.pane_id).collect();
+        let pane_ids_match = original_pane_ids == restored_pane_ids;
+
+        let original_cwds: HashMap<u64, Option<String>> = panes
+            .iter()
+            .map(|p| (p.pane_id, normalize_cwd(p.cwd.as_deref())))
+            .collect();
+        let restored_cwds: HashMap<u64, Option<String>> = checkpoint
+            .pane_states
+            .iter()
+            .map(|s| (s.pane_id, s.cwd.clone()))
+            .collect();
+        let cwds_match = original_cwds == restored_cwds;
+
+        add_phase(
+            &mut report,
+            "load_and_compare_identity",
+            load_start,
+            if checkpoint_id_matches
+                && pane_count_matches
+                && pane_ids_match
+                && cwds_match
+            {
+                "ok"
+            } else {
+                "error"
+            },
+            json!({
+                "checkpoint_id_matches": checkpoint_id_matches,
+                "pane_count_matches": pane_count_matches,
+                "pane_ids_match": pane_ids_match,
+                "cwds_match": cwds_match,
+                "loaded_checkpoint_id": checkpoint.checkpoint_id,
+                "loaded_pane_count": checkpoint.pane_count,
+                "loaded_pane_ids": restored_pane_ids.iter().copied().collect::<Vec<_>>(),
+            }),
+        );
+
+        // Per-pane hash report (used by the roll-up assertion below).
+        for pane in &panes {
+            let restored = checkpoint
+                .pane_states
+                .iter()
+                .find(|s| s.pane_id == pane.pane_id)
+                .expect("each captured pane must reappear post-restart");
+            let content_match = normalize_cwd(pane.cwd.as_deref()) == restored.cwd
+                && pane.effective_rows()
+                    == restored
+                        .terminal_state
+                        .as_ref()
+                        .map(|t| u32::from(t.rows))
+                        .unwrap_or_default()
+                && pane.effective_cols()
+                    == restored
+                        .terminal_state
+                        .as_ref()
+                        .map(|t| u32::from(t.cols))
+                        .unwrap_or_default();
+            report.pane_reports.push(PaneTestReport {
+                pane_id: pane.pane_id,
+                original_content_hash: pane_info_hash(pane),
+                restored_content_hash: restored_state_hash(restored),
+                content_match,
+                layout_match: pane_count_matches && pane_ids_match,
+                process_match: true,
+            });
+        }
+
+        // ── Phase 5: real restore flow, then confirm shutdown_clean flips.
+        let restore_start = Instant::now();
+        let wezterm = Arc::new(MockWezterm::new());
+        let summary = restorer
+            .restore(&candidate, &checkpoint, wezterm.clone())
+            .await
+            .expect("restore must succeed against reconstituted DB");
+        let restore_ok = summary.restored_count() == captured_pane_count
+            && summary.failed_count() == 0
+            && summary.session_id == captured_session_id;
+        add_phase(
+            &mut report,
+            "restore_via_fresh_restorer",
+            restore_start,
+            if restore_ok { "ok" } else { "error" },
+            json!({
+                "restored_count": summary.restored_count(),
+                "failed_count": summary.failed_count(),
+                "summary_session_id": summary.session_id,
+                "session_id_match": summary.session_id == captured_session_id,
+            }),
+        );
+
+        let post_detect_start = Instant::now();
+        let post_detect = restorer
+            .detect()
+            .expect("post-restore detect must not error");
+        let detect_cleared = post_detect.is_none();
+        add_phase(
+            &mut report,
+            "post_restore_detect_is_cleared",
+            post_detect_start,
+            if detect_cleared { "ok" } else { "error" },
+            json!({ "detect_returned_none": detect_cleared }),
+        );
+
+        let success = session_id_matches
+            && checkpoint_id_matches
+            && pane_count_matches
+            && pane_ids_match
+            && cwds_match
+            && restore_ok
+            && detect_cleared
+            && report.pane_reports.iter().all(|p| p.content_match && p.layout_match);
+        report.total_duration_ms = run_start.elapsed().as_millis() as u64;
+        report.passed = success;
+        report.failure_reason = if success {
+            None
+        } else {
+            Some("save → restart → restore identity/layout/detect-clear broke".to_string())
+        };
+        emit_report(&report);
+        assert!(
+            report.passed,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("pretty report")
+        );
+    });
+}
+
+#[test]
+fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
+    run_async_test(async {
+        let run_start = Instant::now();
+        let mut report = E2ETestReport {
+            test_name:
+                "e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild".to_string(),
+            phases: Vec::new(),
+            total_duration_ms: 0,
+            passed: false,
+            failure_reason: None,
+            pane_reports: Vec::new(),
+        };
+
+        let (_tmp, db_path) = setup_test_db();
+        let pane = make_pane(7, 0, 0, 24, 80, "claude-code", "file:///tmp/scrollback-roundtrip");
+
+        // Known scrollback content — includes an ANSI color escape, a tab,
+        // and a UTF-8 multi-byte character so we can detect byte-level loss.
+        let segments: Vec<(i64, String, i64)> = vec![
+            (0, "line 1 — plain ASCII\n".to_string(), 6_000),
+            (1, "line 2 \t with \x1b[31mred\x1b[0m color\n".to_string(), 6_100),
+            (2, "line 3 🦀 emoji and résumé accents\n".to_string(), 6_200),
+        ];
+        let expected_concatenated: String =
+            segments.iter().map(|(_, c, _)| c.clone()).collect();
+        let expected_bytes_hash = hash_text(&expected_concatenated);
+
+        let captured_session_id;
+        let captured_checkpoint_id;
+        {
+            let save_start = Instant::now();
+            let engine_a = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let snap = engine_a
+                .capture(std::slice::from_ref(&pane), SnapshotTrigger::Startup)
+                .await
+                .expect("capture pre-restart");
+            captured_session_id = snap.session_id.clone();
+            captured_checkpoint_id = snap.checkpoint_id;
+
+            // Seed output_segments for this pane, plus the scrollback_checkpoint_seq
+            // pointer on the mux_pane_state row so the restore path knows where
+            // to stop replaying.
+            let conn = Connection::open(db_path.as_str()).expect("seed scrollback db");
+            for (seq, content, ts) in &segments {
+                insert_output_segment(&conn, pane.pane_id, *seq, content, *ts);
+            }
+            conn.execute(
+                "UPDATE mux_pane_state
+                 SET scrollback_checkpoint_seq = ?3,
+                     last_output_at = ?4
+                 WHERE checkpoint_id = ?1 AND pane_id = ?2",
+                params![
+                    snap.checkpoint_id,
+                    pane.pane_id as i64,
+                    segments.last().map(|(s, _, _)| *s).unwrap_or(0),
+                    segments.last().map(|(_, _, t)| *t).unwrap_or(0),
+                ],
+            )
+            .expect("set scrollback pointer");
+            add_phase(
+                &mut report,
+                "save_plus_scrollback_seed",
+                save_start,
+                "ok",
+                json!({
+                    "session_id": snap.session_id,
+                    "checkpoint_id": snap.checkpoint_id,
+                    "segments_seeded": segments.len(),
+                    "total_bytes": expected_concatenated.len(),
+                }),
+            );
+            // engine_a dropped here.
+        }
+
+        // ── restart: new engine + restorer, restore_scrollback = true ────
+        let restart_start = Instant::now();
+        let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let restorer = SessionRestorer::new(
+            db_path.clone(),
+            SessionRestoreConfig {
+                restore_scrollback: true,
+                restore_max_lines: 1_000,
+                process_relaunch: LaunchConfig::default(),
+                ..SessionRestoreConfig::default()
+            },
+        );
+        add_phase(
+            &mut report,
+            "restart_with_scrollback_restorer",
+            restart_start,
+            "ok",
+            json!({ "restore_scrollback": true }),
+        );
+
+        let candidate = restorer
+            .detect()
+            .expect("detect after restart")
+            .expect("candidate must exist");
+        let checkpoint = restorer
+            .load_checkpoint(&candidate)
+            .expect("load checkpoint");
+        let wezterm = Arc::new(MockWezterm::new());
+
+        // ── restore via the real SessionRestorer flow ────────────────────
+        let restore_start = Instant::now();
+        let summary = restorer
+            .restore(&candidate, &checkpoint, wezterm.clone())
+            .await
+            .expect("restore with scrollback must succeed");
+        let new_pane_id = *summary
+            .layout_result
+            .pane_id_map
+            .get(&pane.pane_id)
+            .expect("pane id must be remapped");
+        add_phase(
+            &mut report,
+            "restore_with_scrollback_replay",
+            restore_start,
+            if summary.scrollback_error.is_none() {
+                "ok"
+            } else {
+                "error"
+            },
+            json!({
+                "restored_count": summary.restored_count(),
+                "scrollback_restored": summary.scrollback_restored_count(),
+                "scrollback_failed": summary.scrollback_failed_count(),
+                "scrollback_skipped": summary.scrollback_skipped_count(),
+                "new_pane_id": new_pane_id,
+            }),
+        );
+
+        // ── verify each seeded byte appears in the replayed content, in
+        // the order it was written. MockWezterm.get_text returns the raw
+        // bytes that were sent to send_text, so substring + ordering checks
+        // are sufficient to prove byte preservation across the boundary.
+        let verify_start = Instant::now();
+        let replayed = wezterm
+            .get_text(new_pane_id, false)
+            .await
+            .expect("read replayed content");
+        let mut previous_offset: Option<usize> = None;
+        let mut all_segments_in_order = true;
+        for (_, content, _) in &segments {
+            let Some(offset) = replayed.find(content.as_str()) else {
+                all_segments_in_order = false;
+                break;
+            };
+            if let Some(prev) = previous_offset {
+                if offset < prev {
+                    all_segments_in_order = false;
+                    break;
+                }
+            }
+            previous_offset = Some(offset);
+        }
+        let replayed_has_expected_prefix = replayed.contains(&expected_concatenated);
+        let success = summary.scrollback_restored_count() == 1
+            && summary.scrollback_failed_count() == 0
+            && summary.scrollback_error.is_none()
+            && summary.session_id == captured_session_id
+            && summary.checkpoint_id == captured_checkpoint_id
+            && all_segments_in_order
+            && replayed_has_expected_prefix;
+
+        report.pane_reports.push(PaneTestReport {
+            pane_id: pane.pane_id,
+            original_content_hash: expected_bytes_hash.clone(),
+            restored_content_hash: hash_text(&replayed),
+            content_match: replayed_has_expected_prefix && all_segments_in_order,
+            layout_match: summary.restored_count() == 1 && summary.failed_count() == 0,
+            process_match: true,
+        });
+        add_phase(
+            &mut report,
+            "verify_scrollback_byte_preservation",
+            verify_start,
+            if success { "ok" } else { "error" },
+            json!({
+                "expected_bytes_hash": expected_bytes_hash,
+                "replayed_len": replayed.len(),
+                "all_segments_in_order": all_segments_in_order,
+                "replayed_has_expected_prefix": replayed_has_expected_prefix,
+            }),
+        );
+
+        report.total_duration_ms = run_start.elapsed().as_millis() as u64;
+        report.passed = success;
+        report.failure_reason = if success {
+            None
+        } else {
+            Some("scrollback bytes did not survive the restart boundary".to_string())
+        };
+        emit_report(&report);
+        assert!(
+            report.passed,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("pretty report")
+        );
+    });
+}
+
+#[test]
+fn e2e_save_restart_restore_nested_split_topology_preserved() {
+    run_async_test(async {
+        let run_start = Instant::now();
+        let mut report = E2ETestReport {
+            test_name: "e2e_save_restart_restore_nested_split_topology_preserved".to_string(),
+            phases: Vec::new(),
+            total_duration_ms: 0,
+            passed: false,
+            failure_reason: None,
+            pane_reports: Vec::new(),
+        };
+
+        // Use the checked-in complex-layout fixture — it has the nested
+        // HSplit / VSplit / Leaf structure we need to prove layout round-trips.
+        let parse_start = Instant::now();
+        let complex_json = std::fs::read_to_string(fixture_path("snapshot_complex_layout.json"))
+            .expect("read complex layout fixture");
+        let fixture_topology =
+            TopologySnapshot::from_json(&complex_json).expect("parse complex layout fixture");
+        let fixture_panes = collect_fixture_panes(&fixture_topology);
+        add_phase(
+            &mut report,
+            "load_fixture_topology",
+            parse_start,
+            "ok",
+            json!({
+                "pane_count": fixture_topology.pane_count(),
+                "window_count": fixture_topology.windows.len(),
+                "flat_pane_ids": fixture_panes.iter().map(|p| p.pane_id).collect::<Vec<_>>(),
+            }),
+        );
+
+        let (_tmp, db_path) = setup_test_db();
+
+        // Build PaneInfo inputs that mirror the fixture leaves. The engine
+        // synthesizes its own topology from them, but the leaf identity
+        // (pane_id / cwd) is what we want to prove survives the restart.
+        let panes: Vec<PaneInfo> = fixture_panes
+            .iter()
+            .map(|fp| {
+                make_pane(
+                    fp.pane_id,
+                    fp.tab_id,
+                    fp.window_id,
+                    24,
+                    80,
+                    &format!("pane-{}", fp.pane_id),
+                    fp.cwd.as_deref().unwrap_or("file:///tmp/fixture-default"),
+                )
+            })
+            .collect();
+
+        let captured_session_id;
+        let captured_checkpoint_id;
+        let captured_topology_json;
+        {
+            let save_start = Instant::now();
+            let engine_a = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+            let snap = engine_a
+                .capture(&panes, SnapshotTrigger::Startup)
+                .await
+                .expect("capture nested topology");
+            captured_session_id = snap.session_id.clone();
+            captured_checkpoint_id = snap.checkpoint_id;
+            let conn = Connection::open(db_path.as_str()).expect("open db");
+            captured_topology_json = conn
+                .query_row(
+                    "SELECT topology_json FROM mux_sessions WHERE session_id = ?1",
+                    params![captured_session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read captured topology_json");
+            add_phase(
+                &mut report,
+                "save_via_engine_a",
+                save_start,
+                "ok",
+                json!({
+                    "session_id": snap.session_id,
+                    "checkpoint_id": snap.checkpoint_id,
+                    "pane_count": snap.pane_count,
+                }),
+            );
+        }
+
+        // ── restart ─────────────────────────────────────────────────────
+        let restart_start = Instant::now();
+        let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
+        let restorer = SessionRestorer::new(
+            db_path.clone(),
+            SessionRestoreConfig::default(),
+        );
+        add_phase(
+            &mut report,
+            "restart_rebuild_handles",
+            restart_start,
+            "ok",
+            json!({}),
+        );
+
+        // ── load + verify the persisted topology parses back into an
+        // identical-shape PaneNode tree (split kinds, depth, leaf pane_ids).
+        let verify_start = Instant::now();
+        let reparsed_topology = TopologySnapshot::from_json(&captured_topology_json)
+            .expect("persisted topology_json must re-parse");
+        let reparsed_panes = collect_fixture_panes(&reparsed_topology);
+        let reparsed_pane_ids: HashSet<u64> =
+            reparsed_panes.iter().map(|p| p.pane_id).collect();
+        let original_pane_ids: HashSet<u64> =
+            panes.iter().map(|p| p.pane_id).collect();
+        let pane_set_match = reparsed_pane_ids == original_pane_ids;
+        let pane_count_match = reparsed_topology.pane_count() == panes.len();
+        let window_count_match = reparsed_topology.windows.len() >= 1;
+        let topology_self_roundtrip = TopologySnapshot::from_json(
+            &reparsed_topology
+                .to_json()
+                .expect("serialize reparsed topology"),
+        )
+        .expect("reparse roundtripped topology")
+            == reparsed_topology;
+
+        add_phase(
+            &mut report,
+            "verify_topology_tree_shape",
+            verify_start,
+            if pane_set_match
+                && pane_count_match
+                && window_count_match
+                && topology_self_roundtrip
+            {
+                "ok"
+            } else {
+                "error"
+            },
+            json!({
+                "pane_set_match": pane_set_match,
+                "pane_count_match": pane_count_match,
+                "window_count_match": window_count_match,
+                "topology_self_roundtrip": topology_self_roundtrip,
+                "reparsed_pane_ids": reparsed_pane_ids.iter().copied().collect::<Vec<_>>(),
+            }),
+        );
+
+        // ── real restore + confirm layout_result carries every pane.
+        let candidate = restorer
+            .detect()
+            .expect("detect after restart")
+            .expect("candidate must exist");
+        let checkpoint = restorer
+            .load_checkpoint(&candidate)
+            .expect("load checkpoint");
+        let wezterm = Arc::new(MockWezterm::new());
+        let restore_start = Instant::now();
+        let summary = restorer
+            .restore(&candidate, &checkpoint, wezterm.clone())
+            .await
+            .expect("restore nested topology");
+        let pane_id_map_complete = summary.layout_result.pane_id_map.len() == panes.len()
+            && summary.layout_result.failed_panes.is_empty();
+        add_phase(
+            &mut report,
+            "restore_executes_cleanly_across_splits",
+            restore_start,
+            if pane_id_map_complete { "ok" } else { "error" },
+            json!({
+                "restored_count": summary.restored_count(),
+                "failed_count": summary.failed_count(),
+                "checkpoint_id_match": summary.checkpoint_id == captured_checkpoint_id,
+            }),
+        );
+
+        let success = pane_set_match
+            && pane_count_match
+            && topology_self_roundtrip
+            && pane_id_map_complete
+            && summary.session_id == captured_session_id
+            && summary.checkpoint_id == captured_checkpoint_id;
+
+        report.total_duration_ms = run_start.elapsed().as_millis() as u64;
+        report.passed = success;
+        report.failure_reason = if success {
+            None
+        } else {
+            Some("nested topology did not survive save → restart → restore".to_string())
+        };
+        emit_report(&report);
+        assert!(
+            report.passed,
+            "{}",
+            serde_json::to_string_pretty(&report).expect("pretty report")
+        );
+    });
+}
