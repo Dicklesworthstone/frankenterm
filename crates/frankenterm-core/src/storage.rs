@@ -606,7 +606,7 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
     checkpoint_at INTEGER NOT NULL,        -- epoch ms
     checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
-    state_hash TEXT NOT NULL,              -- BLAKE3 of serialized state for dedup
+    state_hash TEXT NOT NULL,              -- [ft-ybtyg] SipHash-24 (16-hex-char u64) over the serialized state/inputs; used for dedup-skip + restore-path state witness. Not a cryptographic integrity hash.
     pane_count INTEGER NOT NULL,
     total_bytes INTEGER NOT NULL,          -- serialized size for budget tracking
     metadata_json TEXT                     -- trigger reason for 'event' type
@@ -6460,9 +6460,7 @@ impl StorageHandle {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self
-                .remove_event_label_with_cx(&cx, event_id, label)
-                .await;
+            return self.remove_event_label_with_cx(&cx, event_id, label).await;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -7055,7 +7053,9 @@ impl StorageHandle {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.purge_audit_actions_before_with_cx(&cx, before_ts).await;
+            return self
+                .purge_audit_actions_before_with_cx(&cx, before_ts)
+                .await;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -7432,15 +7432,15 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let name = name.to_string();
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_saved_search_by_name(&conn, &name)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            let name = name.to_string();
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_saved_search_by_name(&conn, &name)
+            })
+            .await
         }
     }
 
@@ -7475,14 +7475,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            list_saved_searches_sync(&conn)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                list_saved_searches_sync(&conn)
+            })
+            .await
         }
     }
 
@@ -7614,15 +7614,15 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let alias = alias.to_string();
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_pane_bookmark_by_alias(&conn, &alias)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            let alias = alias.to_string();
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_pane_bookmark_by_alias(&conn, &alias)
+            })
+            .await
         }
     }
 
@@ -7657,14 +7657,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            list_pane_bookmarks_sync(&conn)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                list_pane_bookmarks_sync(&conn)
+            })
+            .await
         }
     }
 
@@ -7697,15 +7697,15 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let tag = tag.to_string();
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            list_pane_bookmarks_by_tag_sync(&conn, &tag)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            let tag = tag.to_string();
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                list_pane_bookmarks_by_tag_sync(&conn, &tag)
+            })
+            .await
         }
     }
 
@@ -7765,16 +7765,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::PruneSegments {
-                before_ts,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::PruneSegments {
+                    before_ts,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -8317,7 +8317,9 @@ impl StorageHandle {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.purge_notification_history_with_cx(&cx, before_ts).await;
+            return self
+                .purge_notification_history_with_cx(&cx, before_ts)
+                .await;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -8507,7 +8509,9 @@ impl StorageHandle {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.count_audit_actions_before_with_cx(&cx, before_ts).await;
+            return self
+                .count_audit_actions_before_with_cx(&cx, before_ts)
+                .await;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -8548,7 +8552,9 @@ impl StorageHandle {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            return self.count_usage_metrics_before_with_cx(&cx, before_ts).await;
+            return self
+                .count_usage_metrics_before_with_cx(&cx, before_ts)
+                .await;
         }
 
         #[cfg(not(feature = "asupersync-runtime"))]
@@ -8771,14 +8777,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            query_notification_history_sync(&conn, &query)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                query_notification_history_sync(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -8812,14 +8818,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            get_notification_sync(&conn, id)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                get_notification_sync(&conn, id)
+            })
+            .await
         }
     }
 
@@ -8918,14 +8924,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            database_page_stats_sync(&conn)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                database_page_stats_sync(&conn)
+            })
+            .await
         }
     }
 
@@ -8958,14 +8964,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            get_pane_indexing_stats_sync(&conn)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                get_pane_indexing_stats_sync(&conn)
+            })
+            .await
         }
     }
 
@@ -8998,16 +9004,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            let stats = get_pane_indexing_stats_sync(&conn)?;
-            let fts_ok = check_fts_integrity_sync(&conn)?;
-            Ok(build_indexing_health_report(stats, fts_ok))
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                let stats = get_pane_indexing_stats_sync(&conn)?;
+                let fts_ok = check_fts_integrity_sync(&conn)?;
+                Ok(build_indexing_health_report(stats, fts_ok))
+            })
+            .await
         }
     }
 
@@ -9049,14 +9055,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            sync_fts_on_startup(&conn, &config)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                sync_fts_on_startup(&conn, &config)
+            })
+            .await
         }
     }
 
@@ -9092,14 +9098,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            full_fts_rebuild_sync(&conn, &config)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                full_fts_rebuild_sync(&conn, &config)
+            })
+            .await
         }
     }
 
@@ -9132,14 +9138,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            get_fts_index_state_sync(&conn)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                get_fts_index_state_sync(&conn)
+            })
+            .await
         }
     }
 
@@ -9172,13 +9178,13 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertApprovalToken { token, respond: tx })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertApprovalToken { token, respond: tx })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9228,20 +9234,20 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::ConsumeApprovalToken {
-                code_hash: code_hash.to_string(),
-                workspace_id: workspace_id.to_string(),
-                action_kind: action_kind.to_string(),
-                pane_id,
-                action_fingerprint: action_fingerprint.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::ConsumeApprovalToken {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    action_kind: action_kind.to_string(),
+                    pane_id,
+                    action_fingerprint: action_fingerprint.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9294,17 +9300,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::GetApprovalTokenByCode {
-                code_hash: code_hash.to_string(),
-                workspace_id: workspace_id.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::GetApprovalTokenByCode {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9356,17 +9362,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::ConsumeApprovalTokenByCode {
-                code_hash: code_hash.to_string(),
-                workspace_id: workspace_id.to_string(),
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::ConsumeApprovalTokenByCode {
+                    code_hash: code_hash.to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9407,13 +9413,13 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpsertPane { pane, respond: tx })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpsertPane { pane, respond: tx })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9452,16 +9458,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpsertWorkflow {
-                workflow,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpsertWorkflow {
+                    workflow,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9510,17 +9516,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let record = action_plan_record_from_plan(workflow_id, plan)?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpsertActionPlan {
-                record,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let record = action_plan_record_from_plan(workflow_id, plan)?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpsertActionPlan {
+                    record,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9561,16 +9567,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertPreparedPlan {
-                record,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertPreparedPlan {
+                    record,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9615,17 +9621,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::ConsumePreparedPlan {
-                plan_id: plan_id.to_string(),
-                now_ms,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::ConsumePreparedPlan {
+                    plan_id: plan_id.to_string(),
+                    now_ms,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9699,28 +9705,28 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertStepLog {
-                workflow_id: workflow_id.to_string(),
-                audit_action_id,
-                step_index,
-                step_name: step_name.to_string(),
-                step_id,
-                step_kind,
-                result_type: result_type.to_string(),
-                result_data,
-                policy_summary,
-                verification_refs,
-                error_code,
-                started_at,
-                completed_at,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertStepLog {
+                    workflow_id: workflow_id.to_string(),
+                    audit_action_id,
+                    step_index,
+                    step_name: step_name.to_string(),
+                    step_id,
+                    step_kind,
+                    result_type: result_type.to_string(),
+                    result_data,
+                    policy_summary,
+                    verification_refs,
+                    error_code,
+                    started_at,
+                    completed_at,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9799,18 +9805,18 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertMuxSession {
-                session_id,
-                topology_json,
-                ft_version,
-                host_id,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertMuxSession {
+                    session_id,
+                    topology_json,
+                    ft_version,
+                    host_id,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9876,21 +9882,21 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InsertSessionCheckpoint {
-                session_id,
-                checkpoint_type,
-                state_hash,
-                pane_count,
-                total_bytes,
-                metadata_json,
-                pane_states,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::InsertSessionCheckpoint {
+                    session_id,
+                    checkpoint_type,
+                    state_hash,
+                    pane_count,
+                    total_bytes,
+                    metadata_json,
+                    pane_states,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -9990,15 +9996,15 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::MarkSessionShutdownClean {
-                session_id,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::MarkSessionShutdownClean {
+                    session_id,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -10039,14 +10045,14 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            get_latest_checkpoint_hash(&conn, &session_id)
-        })
-        .await
+            let db_path = Arc::clone(&self.db_path);
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                get_latest_checkpoint_hash(&conn, &session_id)
+            })
+            .await
         }
     }
 
@@ -10079,16 +10085,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::UpsertSession {
-                session,
-                respond: tx,
-            })
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            self.write_tx
+                .send(WriteCommand::UpsertSession {
+                    session,
+                    respond: tx,
+                })
+                .await
+                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
 
-        Self::recv_writer_response(rx).await
+            Self::recv_writer_response(rx).await
         }
     }
 
@@ -10127,16 +10133,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_agent_session(&conn, session_id)
-        })
-        .await
+                query_agent_session(&conn, session_id)
+            })
+            .await
         }
     }
 
@@ -10171,16 +10177,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_active_sessions(&conn)
-        })
-        .await
+                query_active_sessions(&conn)
+            })
+            .await
         }
     }
 
@@ -10215,16 +10221,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage(move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_sessions_for_pane(&conn, pane_id)
-        })
-        .await
+                query_sessions_for_pane(&conn, pane_id)
+            })
+            .await
         }
     }
 
@@ -10332,17 +10338,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let query = query.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let query = query.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            search_fts_with_snippets(&conn, &query, &options)
-        })
-        .await
+                search_fts_with_snippets(&conn, &query, &options)
+            })
+            .await
         }
     }
 
@@ -10392,11 +10398,11 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let embedder_id = embedder_id.to_string();
-        let vector = vector.to_vec();
+            let db_path = Arc::clone(&self.db_path);
+            let embedder_id = embedder_id.to_string();
+            let vector = vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open connection: {e}"))
             })?;
@@ -10412,8 +10418,8 @@ impl StorageHandle {
         })
         .await?;
 
-        self.invalidate_semantic_cache();
-        Ok(())
+            self.invalidate_semantic_cache();
+            Ok(())
         }
     }
 
@@ -10469,34 +10475,35 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let embedder_id = embedder_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let embedder_id = embedder_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open connection: {e}"))
+                })?;
 
-            let mut stmt = conn
-                .prepare(
-                    "SELECT s.id FROM output_segments s
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT s.id FROM output_segments s
                      LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
                      WHERE se.segment_id IS NULL
                      ORDER BY s.id ASC
                      LIMIT ?2",
-                )
-                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
+                    )
+                    .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
 
-            let ids: Vec<i64> = stmt
-                .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
-                .filter_map(|r| r.ok())
-                .collect();
+                let ids: Vec<i64> = stmt
+                    .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
+                    .filter_map(|r| r.ok())
+                    .collect();
 
-            Ok(ids)
-        })
-        .await
+                Ok(ids)
+            })
+            .await
         }
     }
 
@@ -10557,10 +10564,10 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let embedder_id = embedder_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let embedder_id = embedder_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
             let conn = Connection::open(db_path.as_str()).map_err(|e| {
                 StorageError::Database(format!("Failed to open connection: {e}"))
             })?;
@@ -10622,38 +10629,39 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open connection: {e}"))
+                })?;
 
-            let mut stmt = conn
-                .prepare(
-                    "SELECT embedder_id, dimension, COUNT(*) as count,
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT embedder_id, dimension, COUNT(*) as count,
                             MIN(embedded_at) as earliest, MAX(embedded_at) as latest
                      FROM segment_embeddings
                      GROUP BY embedder_id, dimension",
-                )
-                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
+                    )
+                    .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
 
-            let stats: Vec<EmbeddingStats> = stmt
-                .query_map([], |row| {
-                    Ok(EmbeddingStats {
-                        embedder_id: row.get(0)?,
-                        dimension: row.get(1)?,
-                        count: row.get(2)?,
-                        earliest_at: row.get(3)?,
-                        latest_at: row.get(4)?,
+                let stats: Vec<EmbeddingStats> = stmt
+                    .query_map([], |row| {
+                        Ok(EmbeddingStats {
+                            embedder_id: row.get(0)?,
+                            dimension: row.get(1)?,
+                            count: row.get(2)?,
+                            earliest_at: row.get(3)?,
+                            latest_at: row.get(4)?,
+                        })
                     })
-                })
-                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
-                .filter_map(|r| r.ok())
-                .collect();
+                    .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
+                    .filter_map(|r| r.ok())
+                    .collect();
 
-            Ok(stats)
-        })
-        .await
+                Ok(stats)
+            })
+            .await
         }
     }
 
@@ -10763,17 +10771,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let embedder_id = embedder_id.to_string();
-        let query_vector = query_vector.to_vec();
+            let db_path = Arc::clone(&self.db_path);
+            let embedder_id = embedder_id.to_string();
+            let query_vector = query_vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
-        })
-        .await
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
+            })
+            .await
         }
     }
 
@@ -10838,31 +10846,31 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
-        let query = query.to_string();
-        let embedder_id = embedder_id.to_string();
-        let query_vector = query_vector.to_vec();
+            let db_path = Arc::clone(&self.db_path);
+            let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
+            let query = query.to_string();
+            let embedder_id = embedder_id.to_string();
+            let query_vector = query_vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
-            hybrid_search_with_results_sync(
-                &conn,
-                &query,
-                &options,
-                &embedder_id,
-                &query_vector,
-                mode,
-                rrf_k,
-                lexical_weight,
-                semantic_weight,
-                fusion_backend,
-                &semantic_budget_state,
-            )
-        })
-        .await
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
+                hybrid_search_with_results_sync(
+                    &conn,
+                    &query,
+                    &options,
+                    &embedder_id,
+                    &query_vector,
+                    mode,
+                    rrf_k,
+                    lexical_weight,
+                    semantic_weight,
+                    fusion_backend,
+                    &semantic_budget_state,
+                )
+            })
+            .await
         }
     }
 
@@ -10922,16 +10930,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_unhandled_events(&conn, limit)
-        })
-        .await
+                query_unhandled_events(&conn, limit)
+            })
+            .await
         }
     }
 
@@ -10967,16 +10975,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_events(&conn, &query)
-        })
-        .await
+                query_events(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11014,16 +11022,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_events_stream(&conn, &query)
-        })
-        .await
+                query_events_stream(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11061,16 +11069,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_timeline(&conn, &query)
-        })
-        .await
+                query_timeline(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11109,16 +11117,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_unhandled_event_counts(&conn)
-        })
-        .await
+                query_unhandled_event_counts(&conn)
+            })
+            .await
         }
     }
 
@@ -11155,16 +11163,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_last_activity_by_pane(&conn)
-        })
-        .await
+                query_last_activity_by_pane(&conn)
+            })
+            .await
         }
     }
 
@@ -11199,16 +11207,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            crate::storage::query_audit_actions(&conn, &query)
-        })
-        .await
+                crate::storage::query_audit_actions(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11252,16 +11260,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            crate::storage::query_audit_actions_stream(&conn, &query)
-        })
-        .await
+                crate::storage::query_audit_actions_stream(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11300,16 +11308,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            crate::storage::query_action_history(&conn, &query)
-        })
-        .await
+                crate::storage::query_action_history(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11347,17 +11355,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let workspace_id = workspace_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let workspace_id = workspace_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_active_approvals_count(&conn, &workspace_id, now_ms)
-        })
-        .await
+                query_active_approvals_count(&conn, &workspace_id, now_ms)
+            })
+            .await
         }
     }
 
@@ -11398,17 +11406,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let code_hash = code_hash.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let code_hash = code_hash.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_approval_token_by_hash(&conn, &code_hash)
-        })
-        .await
+                query_approval_token_by_hash(&conn, &code_hash)
+            })
+            .await
         }
     }
 
@@ -11445,16 +11453,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_max_seq(&conn, pane_id)
-        })
-        .await
+                query_max_seq(&conn, pane_id)
+            })
+            .await
         }
     }
 
@@ -11489,16 +11497,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_panes(&conn)
-        })
-        .await
+                query_panes(&conn)
+            })
+            .await
         }
     }
 
@@ -11529,16 +11537,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_pane(&conn, pane_id)
-        })
-        .await
+                query_pane(&conn, pane_id)
+            })
+            .await
         }
     }
 
@@ -11583,36 +11591,36 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let mmap_mirror_dir = self
-            .mmap_mirror_dir
-            .as_ref()
-            .map(|dir| dir.as_ref().clone());
+            let db_path = Arc::clone(&self.db_path);
+            let mmap_mirror_dir = self
+                .mmap_mirror_dir
+                .as_ref()
+                .map(|dir| dir.as_ref().clone());
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
-                match query_segments_from_mmap(mmap_dir, pane_id, limit) {
-                    Ok(Some(segments)) => return Ok(segments),
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            pane_id,
-                            limit,
-                            path = %mmap_dir.display(),
-                            error = %error,
-                            "mmap segment read failed; falling back to sqlite"
-                        );
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
+                    match query_segments_from_mmap(mmap_dir, pane_id, limit) {
+                        Ok(Some(segments)) => return Ok(segments),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                pane_id,
+                                limit,
+                                path = %mmap_dir.display(),
+                                error = %error,
+                                "mmap segment read failed; falling back to sqlite"
+                            );
+                        }
                     }
                 }
-            }
 
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_segments(&conn, pane_id, limit)
-        })
-        .await
+                query_segments(&conn, pane_id, limit)
+            })
+            .await
         }
     }
 
@@ -11668,16 +11676,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_scan_segments(&conn, &query)
-        })
-        .await
+                query_scan_segments(&conn, &query)
+            })
+            .await
         }
     }
 
@@ -11717,17 +11725,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let scope_hash = scope_hash.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let scope_hash = scope_hash.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_latest_secret_scan_report(&conn, &scope_hash)
-        })
-        .await
+                query_latest_secret_scan_report(&conn, &scope_hash)
+            })
+            .await
         }
     }
 
@@ -11764,17 +11772,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let workflow_id = workflow_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_workflow(&conn, &workflow_id)
-        })
-        .await
+                query_workflow(&conn, &workflow_id)
+            })
+            .await
         }
     }
 
@@ -11812,17 +11820,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let workflow_id = workflow_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_step_logs(&conn, &workflow_id)
-        })
-        .await
+                query_step_logs(&conn, &workflow_id)
+            })
+            .await
         }
     }
 
@@ -11866,17 +11874,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let workflow_id = workflow_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_latest_step_log(&conn, &workflow_id)
-        })
-        .await
+                query_latest_step_log(&conn, &workflow_id)
+            })
+            .await
         }
     }
 
@@ -11916,17 +11924,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let workflow_id = workflow_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_action_plan(&conn, &workflow_id)
-        })
-        .await
+                query_action_plan(&conn, &workflow_id)
+            })
+            .await
         }
     }
 
@@ -11962,17 +11970,17 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
-        let plan_id = plan_id.to_string();
+            let db_path = Arc::clone(&self.db_path);
+            let plan_id = plan_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_prepared_plan(&conn, &plan_id)
-        })
-        .await
+                query_prepared_plan(&conn, &plan_id)
+            })
+            .await
         }
     }
 
@@ -12011,16 +12019,16 @@ impl StorageHandle {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let db_path = Arc::clone(&self.db_path);
+            let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+                let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                    StorageError::Database(format!("Failed to open read connection: {e}"))
+                })?;
 
-            query_incomplete_workflows(&conn)
-        })
-        .await
+                query_incomplete_workflows(&conn)
+            })
+            .await
         }
     }
 

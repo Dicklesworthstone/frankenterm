@@ -11,7 +11,13 @@
 //!   ├── WeztermClient::list_panes()  → Vec<PaneInfo>
 //!   ├── TopologySnapshot::from_panes()  → layout tree
 //!   ├── PaneStateSnapshot::from_pane_info()  → per-pane state
-//!   ├── BLAKE3 hash  → dedup (skip if unchanged)
+//!   ├── SipHash-24 (16-hex-char u64) → dedup (skip if unchanged)
+//!     [ft-ybtyg] doc aligned to reality: `compute_state_hash` uses
+//!     `std::collections::hash_map::DefaultHasher` (currently
+//!     SipHash-24), not BLAKE3. The hash is used for dedup-skip only,
+//!     not cryptographic integrity; see `session_restore::
+//!     compute_restore_state_hash` for the analogous restore-path
+//!     helper.
 //!   └── SQLite  → mux_sessions + session_checkpoints + mux_pane_state
 //! ```
 //!
@@ -28,9 +34,9 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
 #[cfg(not(feature = "asupersync-runtime"))]
 use crate::runtime_compat::timeout;
+use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -369,135 +375,135 @@ impl SnapshotEngine {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        self.telemetry
-            .captures_attempted
-            .fetch_add(1, Ordering::Relaxed);
-
-        // 1. Guard: prevent concurrent captures
-        if self.in_progress.swap(true, Ordering::SeqCst) {
             self.telemetry
-                .capture_errors
+                .captures_attempted
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(SnapshotError::InProgress);
-        }
-        // Reset guard on all exit paths via Drop
-        struct InProgressGuard<'a>(&'a AtomicBool);
-        impl Drop for InProgressGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+
+            // 1. Guard: prevent concurrent captures
+            if self.in_progress.swap(true, Ordering::SeqCst) {
+                self.telemetry
+                    .capture_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SnapshotError::InProgress);
             }
-        }
-        let _guard = InProgressGuard(&self.in_progress);
-
-        if panes.is_empty() {
-            self.telemetry
-                .capture_errors
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(SnapshotError::NoPanes);
-        }
-
-        let now_ms = epoch_ms();
-
-        // 2. Build topology snapshot
-        let (topology, _report) = TopologySnapshot::from_panes(panes, now_ms);
-        let topology_json = topology
-            .to_json()
-            .map_err(|e: serde_json::Error| SnapshotError::Serialization(e.to_string()))?;
-
-        // 3. Correlate agent identity/state (best-effort) and build per-pane snapshots
-        let mut correlator = AgentCorrelator::new();
-        let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
-        let db_path_for_detections = Arc::clone(&self.db_path);
-        let cutoff_ms: i64 =
-            i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
-                .unwrap_or(i64::MAX);
-
-        let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
-            load_latest_detections_by_pane_sync(
-                db_path_for_detections.as_str(),
-                &pane_ids,
-                cutoff_ms,
-            )
-        })
-        .await;
-
-        for (pane_id, detections) in detections_by_pane {
-            correlator.ingest_detections(pane_id, &detections);
-        }
-        for pane in panes {
-            correlator.update_from_pane_info(pane);
-        }
-
-        let pane_states: Vec<PaneStateSnapshot> = panes
-            .iter()
-            .map(|p| {
-                let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
-                if let Some(agent) = correlator.get_metadata(p.pane_id) {
-                    snapshot = snapshot.with_agent(agent);
+            // Reset guard on all exit paths via Drop
+            struct InProgressGuard<'a>(&'a AtomicBool);
+            impl Drop for InProgressGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
                 }
-                snapshot
-            })
-            .collect();
-
-        // 4. Compute state hash for dedup (from raw pane data, not timestamps)
-        let state_hash = compute_state_hash(panes);
-
-        // 5. Skip if periodic-like and unchanged
-        if matches!(
-            trigger,
-            SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
-        ) {
-            let last = self.last_state_hash.read().await;
-            if last.as_deref() == Some(&state_hash) {
-                self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
-                return Err(SnapshotError::NoChanges);
             }
-        }
+            let _guard = InProgressGuard(&self.in_progress);
 
-        // 6. Ensure session exists
-        let session_id = self.ensure_session(&topology_json, now_ms).await?;
+            if panes.is_empty() {
+                self.telemetry
+                    .capture_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(SnapshotError::NoPanes);
+            }
 
-        // 7. Persist checkpoint + pane states in a transaction
-        let checkpoint_type = trigger.as_db_str().to_string();
-        let pane_count = pane_states.len();
+            let now_ms = epoch_ms();
 
-        let db_path = Arc::clone(&self.db_path);
-        let state_hash_clone = state_hash.clone();
+            // 2. Build topology snapshot
+            let (topology, _report) = TopologySnapshot::from_panes(panes, now_ms);
+            let topology_json = topology
+                .to_json()
+                .map_err(|e: serde_json::Error| SnapshotError::Serialization(e.to_string()))?;
 
-        let result = Self::spawn_blocking_db(move || {
-            save_checkpoint_sync(
-                &db_path,
-                &session_id,
-                now_ms,
-                &checkpoint_type,
-                &state_hash_clone,
-                &topology_json,
-                &pane_states,
-            )
-        })
-        .await?;
+            // 3. Correlate agent identity/state (best-effort) and build per-pane snapshots
+            let mut correlator = AgentCorrelator::new();
+            let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
+            let db_path_for_detections = Arc::clone(&self.db_path);
+            let cutoff_ms: i64 =
+                i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
+                    .unwrap_or(i64::MAX);
 
-        // 8. Update last hash
-        *self.last_state_hash.write().await = Some(state_hash);
+            let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
+                load_latest_detections_by_pane_sync(
+                    db_path_for_detections.as_str(),
+                    &pane_ids,
+                    cutoff_ms,
+                )
+            })
+            .await;
 
-        // 9. Record success telemetry
-        self.telemetry
-            .captures_succeeded
-            .fetch_add(1, Ordering::Relaxed);
-        self.telemetry
-            .panes_captured
-            .fetch_add(pane_count as u64, Ordering::Relaxed);
-        self.telemetry
-            .bytes_persisted
-            .fetch_add(result.2 as u64, Ordering::Relaxed);
+            for (pane_id, detections) in detections_by_pane {
+                correlator.ingest_detections(pane_id, &detections);
+            }
+            for pane in panes {
+                correlator.update_from_pane_info(pane);
+            }
 
-        Ok(SnapshotResult {
-            session_id: result.0,
-            checkpoint_id: result.1,
-            pane_count,
-            total_bytes: result.2,
-            trigger,
-        })
+            let pane_states: Vec<PaneStateSnapshot> = panes
+                .iter()
+                .map(|p| {
+                    let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
+                    if let Some(agent) = correlator.get_metadata(p.pane_id) {
+                        snapshot = snapshot.with_agent(agent);
+                    }
+                    snapshot
+                })
+                .collect();
+
+            // 4. Compute state hash for dedup (from raw pane data, not timestamps)
+            let state_hash = compute_state_hash(panes);
+
+            // 5. Skip if periodic-like and unchanged
+            if matches!(
+                trigger,
+                SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
+            ) {
+                let last = self.last_state_hash.read().await;
+                if last.as_deref() == Some(&state_hash) {
+                    self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
+                    return Err(SnapshotError::NoChanges);
+                }
+            }
+
+            // 6. Ensure session exists
+            let session_id = self.ensure_session(&topology_json, now_ms).await?;
+
+            // 7. Persist checkpoint + pane states in a transaction
+            let checkpoint_type = trigger.as_db_str().to_string();
+            let pane_count = pane_states.len();
+
+            let db_path = Arc::clone(&self.db_path);
+            let state_hash_clone = state_hash.clone();
+
+            let result = Self::spawn_blocking_db(move || {
+                save_checkpoint_sync(
+                    &db_path,
+                    &session_id,
+                    now_ms,
+                    &checkpoint_type,
+                    &state_hash_clone,
+                    &topology_json,
+                    &pane_states,
+                )
+            })
+            .await?;
+
+            // 8. Update last hash
+            *self.last_state_hash.write().await = Some(state_hash);
+
+            // 9. Record success telemetry
+            self.telemetry
+                .captures_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .panes_captured
+                .fetch_add(pane_count as u64, Ordering::Relaxed);
+            self.telemetry
+                .bytes_persisted
+                .fetch_add(result.2 as u64, Ordering::Relaxed);
+
+            Ok(SnapshotResult {
+                session_id: result.0,
+                checkpoint_id: result.1,
+                pane_count,
+                total_bytes: result.2,
+                trigger,
+            })
         }
     }
 
@@ -683,20 +689,20 @@ impl SnapshotEngine {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
+            self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
 
-        let db_path = Arc::clone(&self.db_path);
-        let retention_count = self.config.retention_count;
-        let retention_days = self.config.retention_days;
+            let db_path = Arc::clone(&self.db_path);
+            let retention_count = self.config.retention_count;
+            let retention_days = self.config.retention_days;
 
-        let removed = Self::spawn_blocking_db(move || {
-            cleanup_sync(&db_path, retention_count, retention_days)
-        })
-        .await?;
-        self.telemetry
-            .cleanup_removed
-            .fetch_add(removed as u64, Ordering::Relaxed);
-        Ok(removed)
+            let removed = Self::spawn_blocking_db(move || {
+                cleanup_sync(&db_path, retention_count, retention_days)
+            })
+            .await?;
+            self.telemetry
+                .cleanup_removed
+                .fetch_add(removed as u64, Ordering::Relaxed);
+            Ok(removed)
         }
     }
 
@@ -903,7 +909,8 @@ impl SnapshotEngine {
         #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_periodic_with_cx(&cx, shutdown, pane_provider).await;
+            self.run_periodic_with_cx(&cx, shutdown, pane_provider)
+                .await;
         }
         #[cfg(not(feature = "asupersync-runtime"))]
         {
@@ -1470,12 +1477,12 @@ impl SnapshotEngine {
 
         #[cfg(not(feature = "asupersync-runtime"))]
         {
-        let session_id = { self.session_id.read().await.clone() };
-        if let Some(id) = session_id {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
-        }
-        Ok(())
+            let session_id = { self.session_id.read().await.clone() };
+            if let Some(id) = session_id {
+                let db_path = Arc::clone(&self.db_path);
+                Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
+            }
+            Ok(())
         }
     }
 

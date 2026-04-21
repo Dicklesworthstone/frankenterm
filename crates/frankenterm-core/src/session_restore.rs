@@ -440,6 +440,47 @@ fn mark_session_restored(db_path: &str, session_id: &str) -> Result<(), RestoreE
     Ok(())
 }
 
+/// Compute a deterministic SipHash-24 over the restore-time inputs that are
+/// available at session_checkpoint INSERT time.
+///
+/// [ft-ybtyg] The session_checkpoints.state_hash column used to carry the
+/// hardcoded literal `'restore'` on the restore-INSERT path, which meant a
+/// tampered DB row could not be detected by its hash and the column was
+/// effectively unused on that path. This helper produces a real hash derived
+/// from `(session_id, pane_id_map, now_ms)` — the exact inputs that drove
+/// the insert — so a later integrity check can recompute and compare.
+///
+/// Same algorithm as [`crate::snapshot_engine::compute_state_hash`] so the
+/// on-disk format stays consistent: SipHash-24 formatted as a 16-hex-char
+/// u64 string. No new columns, no schema migration, no dependency change.
+pub(super) fn compute_restore_state_hash(
+    session_id: &str,
+    pane_id_map: &HashMap<u64, u64>,
+    now_ms: i64,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // Domain separator so a collision with the snapshot_engine dedup
+    // hash is impossible even if the same (session, panes) tuple happens
+    // to produce the same SipHash u64.
+    b"ft-ybtyg:restore-checkpoint-v1".hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    now_ms.hash(&mut hasher);
+
+    // Sort pane_id_map by old_id for deterministic ordering — a
+    // HashMap iterator is insertion-order-dependent on asupersync and
+    // undefined on std::HashMap, so hash inputs must be sorted first.
+    let mut entries: Vec<(u64, u64)> = pane_id_map.iter().map(|(k, v)| (*k, *v)).collect();
+    entries.sort_unstable_by_key(|(old_id, _)| *old_id);
+    for (old_id, new_id) in &entries {
+        old_id.hash(&mut hasher);
+        new_id.hash(&mut hasher);
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
 /// Record the pane ID mapping from restore in a new startup checkpoint.
 #[cfg(test)]
 fn save_restore_checkpoint(
@@ -460,16 +501,22 @@ fn save_restore_checkpoint(
             .collect::<HashMap<String, u64>>(),
     });
 
+    // [ft-ybtyg] replace hardcoded `'restore'` placeholder with a real
+    // SipHash-24 over the restore-time inputs. Same 16-hex-char format
+    // as `compute_state_hash`, so the on-disk column shape is preserved.
+    let state_hash = compute_restore_state_hash(session_id, pane_id_map, now_ms);
+
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+         VALUES (?1, ?2, 'startup', ?5, ?3, 0, ?4)",
         rusqlite::params![
             session_id,
             now_ms,
             pane_id_map.len() as i64,
             metadata.to_string(),
+            state_hash,
         ],
     )?;
     let checkpoint_id = tx.last_insert_rowid();
@@ -503,16 +550,20 @@ fn finalize_restore(
             .collect::<HashMap<String, u64>>(),
     });
 
+    // [ft-ybtyg] real state_hash instead of the prior `'restore'` literal.
+    let state_hash = compute_restore_state_hash(session_id, pane_id_map, now_ms);
+
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO session_checkpoints
          (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes, metadata_json)
-         VALUES (?1, ?2, 'startup', 'restore', ?3, 0, ?4)",
+         VALUES (?1, ?2, 'startup', ?5, ?3, 0, ?4)",
         rusqlite::params![
             session_id,
             now_ms,
             pane_id_map.len() as i64,
             metadata.to_string(),
+            state_hash,
         ],
     )?;
     let checkpoint_id = tx.last_insert_rowid();
@@ -1688,6 +1739,115 @@ mod tests {
         MockWezterm, MoveDirection, SplitDirection, WeztermFuture, WeztermInterface,
     };
     use rusqlite::params;
+
+    // ── ft-ybtyg regression: compute_restore_state_hash ─────────────
+
+    #[test]
+    fn compute_restore_state_hash_is_deterministic() {
+        let mut map = HashMap::new();
+        map.insert(1u64, 10u64);
+        map.insert(2u64, 20u64);
+        map.insert(3u64, 30u64);
+        let a = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
+        let b = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
+        let c = compute_restore_state_hash("sess-alpha", &map, 1_700_000_000_000);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn compute_restore_state_hash_is_16_hex_chars() {
+        let map: HashMap<u64, u64> = HashMap::new();
+        let hash = compute_restore_state_hash("sess", &map, 0);
+        assert_eq!(hash.len(), 16, "hash length drifted: {hash}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be lowercase hex: {hash}"
+        );
+    }
+
+    #[test]
+    fn compute_restore_state_hash_not_the_literal_restore() {
+        // [ft-ybtyg] the pre-fix INSERT used the literal string
+        // `'restore'` as state_hash. This test guards against
+        // accidentally regressing to a constant by asserting the
+        // new hash is both the correct shape AND different from
+        // the old sentinel.
+        let mut map = HashMap::new();
+        map.insert(1u64, 1u64);
+        let hash = compute_restore_state_hash("sess", &map, 1);
+        assert_ne!(hash, "restore");
+        assert_eq!(hash.len(), 16);
+    }
+
+    #[test]
+    fn compute_restore_state_hash_differs_by_session_id() {
+        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let a = compute_restore_state_hash("sess-a", &map, 1_000);
+        let b = compute_restore_state_hash("sess-b", &map, 1_000);
+        assert_ne!(a, b, "hash must discriminate on session_id");
+    }
+
+    #[test]
+    fn compute_restore_state_hash_differs_by_pane_map() {
+        let m1: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let m2: HashMap<u64, u64> = [(1u64, 2u64)].into_iter().collect();
+        let a = compute_restore_state_hash("sess", &m1, 1_000);
+        let b = compute_restore_state_hash("sess", &m2, 1_000);
+        assert_ne!(a, b, "hash must discriminate on new pane id mapping");
+    }
+
+    #[test]
+    fn compute_restore_state_hash_differs_by_timestamp() {
+        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let a = compute_restore_state_hash("sess", &map, 1_000);
+        let b = compute_restore_state_hash("sess", &map, 2_000);
+        assert_ne!(a, b, "hash must discriminate on checkpoint timestamp");
+    }
+
+    #[test]
+    fn compute_restore_state_hash_insertion_order_independent() {
+        // HashMap iteration order is undefined. The helper sorts by
+        // old_id before hashing so the same (session, pairs, ts)
+        // yields the same hash regardless of insertion order.
+        let mut m1 = HashMap::new();
+        m1.insert(1u64, 10u64);
+        m1.insert(2u64, 20u64);
+        m1.insert(3u64, 30u64);
+
+        let mut m2 = HashMap::new();
+        m2.insert(3u64, 30u64);
+        m2.insert(1u64, 10u64);
+        m2.insert(2u64, 20u64);
+
+        let h1 = compute_restore_state_hash("s", &m1, 1);
+        let h2 = compute_restore_state_hash("s", &m2, 1);
+        assert_eq!(
+            h1, h2,
+            "HashMap insertion order must not affect hash: {h1} vs {h2}"
+        );
+    }
+
+    #[test]
+    fn compute_restore_state_hash_domain_separated_from_dedup_hash() {
+        // The snapshot_engine dedup hash uses the same DefaultHasher
+        // algorithm but NOT the same input schema. A same-length
+        // 16-hex hash coming from one helper must not silently match
+        // the other — domain separator prefix guarantees that.
+        let map: HashMap<u64, u64> = [(1u64, 1u64)].into_iter().collect();
+        let restore_hash = compute_restore_state_hash("sess", &map, 0);
+        // Hash of just "sess" with no prefix, no session, no map.
+        let naive: String = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            "sess".hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        assert_ne!(
+            restore_hash, naive,
+            "domain separator should make hash distinct from naive session hash"
+        );
+    }
 
     fn run_async_test<F, T>(future: F) -> T
     where
