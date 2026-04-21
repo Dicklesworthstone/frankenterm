@@ -1344,7 +1344,7 @@ impl DirectMuxClient {
                 );
                 return Err(DirectMuxError::Io(err));
             }
-            Err(_) => {
+            Err(timeout_err) => {
                 tracing::warn!(
                     connection_id = self.connection_id,
                     request_serial = serial,
