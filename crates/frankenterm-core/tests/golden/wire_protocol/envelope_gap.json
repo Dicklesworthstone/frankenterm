@@ -1,0 +1,1 @@
+{"version":1,"seq":3,"sender":"agent-alpha","sent_at_ms":1700000000000,"payload":{"type":"gap","pane_id":42,"seq_before":5,"seq_after":10,"reason":"daemon_restart","detected_at_ms":1700000002000}}
