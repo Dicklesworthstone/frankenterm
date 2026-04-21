@@ -414,13 +414,18 @@ pub fn is_retryable(error: &Error) -> bool {
         // Runtime errors might be transient
         Error::Runtime(_) => true,
         // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
-        // 79702a50. Mirror the deprecated Runtime retry semantics
-        // (generally transient / retryable) for backwards-compatible
-        // behaviour until per-variant retry decisions can be keyed off
-        // the inner `source` field. Conservative default: treat as
-        // retryable, same as the Runtime fallback. A follow-up can
-        // inspect `source` on each variant and flip non-transient
-        // failures (e.g. PermissionDenied) to false.
+        // 79702a50. Retry decisions now key off the inner `source`
+        // so they stay consistent with `error_kind()`'s
+        // NetworkErrorKind classification in error.rs:
+        //   PaneOperation { PaneNotFound } → Permanent → not retryable
+        //   everything else here            → Transient / Degraded → retryable
+        // Returning `true` on PaneNotFound (the previous blanket default)
+        // burns retries and budgets on a permanent failure; the pane
+        // won't come back just because the caller tries again.
+        Error::PaneOperation {
+            source: crate::error::PaneOperationSource::PaneNotFound,
+            ..
+        } => false,
         Error::RuntimeOperation { .. }
         | Error::PaneOperation { .. }
         | Error::WatchdogWarningRead { .. } => true,
@@ -1168,6 +1173,68 @@ mod tests {
         assert!(!is_retryable(&Error::Wezterm(WeztermError::PaneNotFound(
             42
         ))));
+    }
+
+    // [review] Mirror the long-standing WeztermError::PaneNotFound ruling
+    // onto the structured `Error::PaneOperation { PaneNotFound }` variant
+    // added in 79702a50. Previously `is_retryable` blanket-approved all
+    // PaneOperation variants, which disagreed with `error_kind()` in
+    // error.rs (that classifies PaneNotFound as NetworkErrorKind::Permanent)
+    // and meant the `with_retry` harness would spin on a pane that
+    // literally does not exist, burning budget for no outcome.
+    #[test]
+    fn not_retryable_pane_operation_pane_not_found() {
+        use crate::error::PaneOperationSource;
+        let err = Error::PaneOperation {
+            pane_id: 42,
+            operation: "inject",
+            source: PaneOperationSource::PaneNotFound,
+        };
+        assert!(
+            !is_retryable(&err),
+            "PaneOperation {{ PaneNotFound }} must NOT be retryable — \
+             error_kind() classifies it as Permanent"
+        );
+    }
+
+    #[test]
+    fn is_retryable_pane_operation_backend() {
+        // The Backend variant is the "don't know yet — safe default =
+        // transient" bucket; retryable to match the generic Runtime
+        // fallback.
+        use crate::error::PaneOperationSource;
+        let err = Error::PaneOperation {
+            pane_id: 42,
+            operation: "inject",
+            source: PaneOperationSource::Backend("socket churn".into()),
+        };
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn is_retryable_runtime_operation_watch_closed() {
+        // RuntimeOperation is transient by default (same as the deprecated
+        // Runtime variant). Watch-channel-closed is a legit transient —
+        // the caller may recover after re-arming the watcher.
+        use crate::error::RuntimeOperationSource;
+        let err = Error::RuntimeOperation {
+            operation: "apply_config_update",
+            source: RuntimeOperationSource::WatchChannelClosed,
+        };
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn is_retryable_watchdog_warning_read() {
+        // Watchdog-warning read failures are "degraded" — we retry to
+        // get visibility back even though the underlying system is
+        // still up.
+        use crate::error::WatchdogWarningSource;
+        let err = Error::WatchdogWarningRead {
+            backend: "mock",
+            source: WatchdogWarningSource::Backend("read timed out".into()),
+        };
+        assert!(is_retryable(&err));
     }
 
     #[test]
