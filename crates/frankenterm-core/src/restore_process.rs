@@ -629,13 +629,17 @@ impl ProcessLauncher {
         cwd: &Path,
         agent_type: &str,
     ) -> Result<(), String> {
+        // [ft-kegvt] reject CR/LF/ESC/other C0 before typing into the
+        // interactive shell. Restored `command` originates from the
+        // session DB and must not be trusted to be newline-free.
+        let safe_command = sanitize_restored_command(command)?;
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         self.wezterm
             .send_text(pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
         crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-        let full_cmd = format!("{command}\r");
+        let full_cmd = format!("{safe_command}\r");
         self.wezterm
             .send_text(pane_id, &full_cmd)
             .await
@@ -653,6 +657,10 @@ impl ProcessLauncher {
         cwd: &Path,
         agent_type: &str,
     ) -> Result<(), String> {
+        // [ft-kegvt] mirror launch_agent_legacy: sanitize before any
+        // send_text hits the interactive shell. Both code paths must
+        // share the same defense-in-depth contract.
+        let safe_command = sanitize_restored_command(command)?;
         let cd_cmd = format!("cd {}\r", shell_escape(cwd));
         // ft-xbnl0.2.3 tick 294: cx-first send_text in launch_agent_cx.
         self.wezterm
@@ -660,7 +668,7 @@ impl ProcessLauncher {
             .await
             .map_err(|e| format!("send cd: {e}"))?;
         let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
-        let full_cmd = format!("{command}\r");
+        let full_cmd = format!("{safe_command}\r");
         self.wezterm
             .send_text_with_cx(cx, pane_id, &full_cmd)
             .await
@@ -736,6 +744,57 @@ fn shell_escape(path: &Path) -> String {
     } else {
         s.into_owned()
     }
+}
+
+/// Sanitize a restored agent command before it's typed into the pane's
+/// interactive shell.
+///
+/// [ft-kegvt] `launch_agent_legacy` and `launch_agent_cx` both send the
+/// restored `command` string into an active pane via
+/// `wezterm.send_text(pane_id, format!("{command}\r"))`. That helper
+/// types characters into the interactive shell rather than invoking
+/// argv-isolated exec, so any CR/LF in the command injects additional
+/// shell lines. `mux_pane_state.command` is loaded from the session DB
+/// and may be attacker-reachable through snapshot/diag-bundle import
+/// or tampered state.
+///
+/// This helper rejects any command that contains a control character
+/// that would break the "one command, one CR" assumption:
+/// - `\r` / `\n` — the defense-in-depth primary concern.
+/// - `\x1b` (ESC) — prevents re-injected ANSI escape sequences that
+///   could re-arm Kitty keyboard protocol or trigger OSC handlers.
+/// - other C0 controls (`\x00..=\x1f` except `\t`) — reserved/rarely
+///   legitimate in a restored agent command; reject to stay conservative.
+///
+/// Returns `Ok(command)` unchanged on success. Errors are stringly
+/// typed to match the surrounding `Result<(), String>` convention of
+/// the restore path.
+fn sanitize_restored_command<'a>(command: &'a str) -> Result<&'a str, String> {
+    for (idx, ch) in command.char_indices() {
+        match ch {
+            '\r' | '\n' => {
+                return Err(format!(
+                    "refusing to launch: restored command contains CR/LF at byte {idx} \
+                     (ft-kegvt; see `launch_agent` sanitizer docs)",
+                ));
+            }
+            '\x1b' => {
+                return Err(format!(
+                    "refusing to launch: restored command contains ESC (0x1b) at byte {idx} \
+                     (ft-kegvt; ANSI-escape re-injection is refused at the sanitizer)",
+                ));
+            }
+            c if (c as u32) < 0x20 && c != '\t' => {
+                return Err(format!(
+                    "refusing to launch: restored command contains C0 control {:#04x} at byte {idx} \
+                     (ft-kegvt; only TAB is permitted in the C0 range)",
+                    c as u32,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(command)
 }
 
 /// Get the default shell for the platform.
@@ -1200,6 +1259,96 @@ mod tests {
             shell_escape(&PathBuf::from("/foo/my project")),
             "'/foo/my project'"
         );
+    }
+
+    // ── ft-kegvt sanitizer regression suite ───────────────────────────
+
+    #[test]
+    fn sanitize_restored_command_passes_legitimate_input() {
+        // Canonical agent restart commands from the built-in packs —
+        // none of these should be rejected.
+        for fixture in [
+            "claude-code",
+            "/usr/local/bin/claude-code --resume",
+            "codex resume 12345678-1234-1234-1234-123456789012",
+            "env CLAUDE_API_KEY=sk-xxxx claude-code",
+            "gemini -m gemini-2.5-pro --context session.md",
+            "\tindented-but-ok", // TAB is explicitly permitted.
+        ] {
+            let result = sanitize_restored_command(fixture);
+            assert!(
+                result.is_ok(),
+                "legitimate command {fixture:?} rejected: {:?}",
+                result.err()
+            );
+            assert_eq!(result.unwrap(), fixture);
+        }
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_newline_injection() {
+        // The concrete attack payload from the bead: attacker stashes
+        // a multi-line command in mux_pane_state.command. Pre-fix,
+        // send_text would type both lines into the shell.
+        let payload = "claude-code\ninnocent_payload\r";
+        let err = sanitize_restored_command(payload).expect_err("CR/LF injection must be rejected");
+        assert!(
+            err.contains("CR/LF") && err.contains("ft-kegvt"),
+            "unexpected rejection message: {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_bare_carriage_return() {
+        let err = sanitize_restored_command("cmd\rrm -rf ~").expect_err("bare CR must be rejected");
+        assert!(err.contains("CR/LF"));
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_bare_newline() {
+        let err = sanitize_restored_command("cmd\nevil").expect_err("bare LF must be rejected");
+        assert!(err.contains("CR/LF"));
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_ansi_escape() {
+        // ESC (0x1b) can re-arm terminal modes or trigger OSC
+        // handlers. Reject so the restored command cannot smuggle
+        // in terminal-protocol payloads alongside the agent name.
+        let payload = "claude-code\x1b]0;pwned\x07";
+        let err = sanitize_restored_command(payload).expect_err("ESC (0x1b) must be rejected");
+        assert!(
+            err.contains("ESC") && err.contains("ft-kegvt"),
+            "unexpected rejection message: {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_c0_control() {
+        // NUL through BS/FF/etc. — anything in the C0 range other
+        // than TAB must be rejected.
+        let err = sanitize_restored_command("cmd\x07bell").expect_err("BEL must be rejected");
+        assert!(err.contains("C0 control"));
+        let err = sanitize_restored_command("cmd\x00nul").expect_err("NUL must be rejected");
+        assert!(err.contains("C0 control"));
+    }
+
+    #[test]
+    fn sanitize_restored_command_preserves_utf8() {
+        // Multi-byte UTF-8 is fine — reject only the explicit control
+        // set, never legitimate text.
+        let fixture = "claude-код-代码";
+        assert_eq!(sanitize_restored_command(fixture).unwrap(), fixture);
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_lf_then_cr() {
+        // Defense in depth: the order of CR/LF shouldn't matter; any
+        // occurrence at any byte index rejects.
+        let payload = "a\n\rwhatever";
+        let err =
+            sanitize_restored_command(payload).expect_err("LF-then-CR combo must be rejected");
+        assert!(err.contains("CR/LF at byte 1"));
     }
 
     #[test]
