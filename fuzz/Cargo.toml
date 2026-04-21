@@ -7,10 +7,16 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+default = []
+core-fuzz-targets = ["dep:frankenterm-core"]
+codec-fuzz-targets = ["dep:codec"]
+
 [dependencies]
 libfuzzer-sys = "0.4.10"
-frankenterm-core = { path = "../crates/frankenterm-core" }
-codec = { path = "../frankenterm/codec" }
+frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
+frankenterm-escape-parser = { workspace = true, features = ["std"] }
+codec = { path = "../frankenterm/codec", optional = true }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
@@ -19,55 +25,71 @@ rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 name = "fts_query"
 path = "fuzz_targets/fts_query.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "osc_marker_parser"
 path = "fuzz_targets/osc_marker_parser.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pattern_pack_parser"
 path = "fuzz_targets/pattern_pack_parser.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "resize_scheduler_lifecycle"
 path = "fuzz_targets/resize_scheduler_lifecycle.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "config_toml_parser"
 path = "fuzz_targets/config_toml_parser.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "ntm_importer_json"
 path = "fuzz_targets/ntm_importer_json.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "recorder_event_json"
 path = "fuzz_targets/recorder_event_json.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "scan_pipeline_quick"
 path = "fuzz_targets/scan_pipeline_quick.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "tuning_config_toml"
 path = "fuzz_targets/tuning_config_toml.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "string_parsers"
 path = "fuzz_targets/string_parsers.rs"
 doc = false
+required-features = ["core-fuzz-targets"]
 
 [[bin]]
 name = "pdu_stream_decode"
 path = "fuzz_targets/pdu_stream_decode.rs"
+doc = false
+required-features = ["codec-fuzz-targets"]
+
+[[bin]]
+name = "termwiz_csi_parser"
+path = "fuzz_targets/termwiz_csi_parser.rs"
 doc = false
 
 [profile.release]
