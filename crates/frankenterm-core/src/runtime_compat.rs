@@ -1,14 +1,15 @@
-//! Temporary dual-runtime compatibility surface for the tokio -> asupersync migration.
+//! Asupersync runtime surface — wrappers and ergonomic helpers.
 //!
-//! This module intentionally keeps the API small and explicit:
-//! - sync primitive type aliases (`Mutex`, `RwLock`, `Semaphore`, ...)
-//! - channel module aliases (`mpsc`, `watch`, `broadcast`)
-//! - runtime lifecycle wrappers (`RuntimeBuilder`, `Runtime`, `CompatRuntime`)
-//! - time helpers (`sleep`, `timeout`)
+//! This module provides the project's standard async API surface built on
+//! asupersync primitives:
+//! - sync primitive wrappers (`Mutex`, `RwLock`, `Semaphore`, ...)
+//! - channel modules (`mpsc`, `watch`, `broadcast`, `oneshot`)
+//! - runtime lifecycle (`RuntimeBuilder`, `Runtime`, `CompatRuntime`)
+//! - time helpers (`sleep`, `timeout`, `sleep_with_cx`, `timeout_with_cx`)
 //!
-//! The scaffold is expected to be removed once migration is complete.
-//! Remaining raw tokio-backed exports stay quarantined here on purpose; bead
-//! `wa-2h1ha.1` tracks shrinking this seam until direct tokio is gone entirely.
+//! The dual-runtime Tokio fallback was removed in ft-xbnl0.2.5. Asupersync
+//! is now the sole async runtime. The `asupersync-runtime` feature flag is
+//! retained as a no-op for backward compatibility with test target metadata.
 
 use std::future::Future;
 use std::time::Duration;
@@ -155,27 +156,18 @@ pub const SURFACE_CONTRACT_V1: &[SurfaceContractEntry] = &[
     },
 ];
 
-/// Explicit inventory of the raw tokio runtime-builder constructors that
-/// remain intentionally quarantined inside `RuntimeBuilder`.
+/// Historical quarantine inventory — kept for audit trail.
 ///
-/// The migration contract allows these call-sites only in the
-/// `#[cfg(not(feature = \"asupersync-runtime\"))]` fallback builder path. Any
-/// additional `tokio::runtime::Builder::*` constructor is a regression that
-/// should fail the surface guard tests.
-pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[
-    "tokio::runtime::Builder::new_current_thread",
-    "tokio::runtime::Builder::new_multi_thread",
-];
+/// The Tokio runtime builder fallback was removed in ft-xbnl0.2.5.
+/// This constant is retained only for surface guard test compatibility.
+pub const RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1: &[&str] = &[];
 
-#[cfg(feature = "asupersync-runtime")]
 use std::ops::{Deref, DerefMut};
-#[cfg(feature = "asupersync-runtime")]
 use std::sync::Arc;
 
 // Thread-local storage for the asupersync `RuntimeHandle`, installed by
 // `Runtime::block_on` and consumed by `task::spawn` to provide ambient
 // runtime context (analogous to tokio's internal CONTEXT thread-local).
-#[cfg(feature = "asupersync-runtime")]
 thread_local! {
     static ASUPERSYNC_HANDLE: std::cell::RefCell<Option<asupersync::runtime::RuntimeHandle>> =
         const { std::cell::RefCell::new(None) };
@@ -186,35 +178,27 @@ thread_local! {
 ///
 /// The `runtime_compat::Runtime::block_on` wrapper calls this automatically.
 /// Test fixtures using the raw asupersync runtime should call this manually.
-#[cfg(feature = "asupersync-runtime")]
 pub fn install_runtime_handle(handle: asupersync::runtime::RuntimeHandle) {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
 }
 
 /// Return the currently installed asupersync `RuntimeHandle`, if any.
-#[cfg(feature = "asupersync-runtime")]
 #[must_use]
 pub fn current_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
     ASUPERSYNC_HANDLE.with(|cell| cell.borrow().as_ref().cloned())
 }
 
 /// Remove the asupersync `RuntimeHandle` from thread-local storage.
-#[cfg(feature = "asupersync-runtime")]
 pub fn clear_runtime_handle() {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(None));
 }
 
 /// No-op for builds that do not install an asupersync runtime handle.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub fn clear_runtime_handle() {}
-
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct Mutex<T> {
     inner: asupersync::sync::Mutex<T>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> Mutex<T> {
     #[must_use]
     pub fn new(value: T) -> Self {
@@ -269,12 +253,10 @@ impl<T> Mutex<T> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 pub struct MutexGuard<'a, T> {
     inner: asupersync::sync::MutexGuard<'a, T>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
 
@@ -283,20 +265,17 @@ impl<T> Deref for MutexGuard<'_, T> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.deref_mut()
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct RwLock<T> {
     inner: asupersync::sync::RwLock<T>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> RwLock<T> {
     #[must_use]
     pub fn new(value: T) -> Self {
@@ -363,12 +342,10 @@ impl<T> RwLock<T> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 pub struct RwLockReadGuard<'a, T> {
     inner: asupersync::sync::RwLockReadGuard<'a, T>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
@@ -377,12 +354,10 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 pub struct RwLockWriteGuard<'a, T> {
     inner: asupersync::sync::RwLockWriteGuard<'a, T>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
@@ -391,21 +366,18 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.deref_mut()
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryAcquireError {
     NoPermits,
     Closed,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl std::fmt::Display for TryAcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -415,10 +387,8 @@ impl std::fmt::Display for TryAcquireError {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl std::error::Error for TryAcquireError {}
 
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireError {
     Closed,
@@ -426,7 +396,6 @@ pub enum AcquireError {
     PolledAfterCompletion,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl std::fmt::Display for AcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -439,16 +408,13 @@ impl std::fmt::Display for AcquireError {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl std::error::Error for AcquireError {}
 
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct Semaphore {
     inner: Arc<asupersync::sync::Semaphore>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl Semaphore {
     fn map_acquire_error(err: asupersync::sync::AcquireError) -> AcquireError {
         match err {
@@ -576,12 +542,10 @@ impl Semaphore {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 pub struct SemaphorePermit<'a> {
     inner: asupersync::sync::SemaphorePermit<'a>,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl SemaphorePermit<'_> {
     #[must_use]
     pub fn count(&self) -> usize {
@@ -589,7 +553,6 @@ impl SemaphorePermit<'_> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl std::fmt::Debug for SemaphorePermit<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SemaphorePermit")
@@ -598,25 +561,17 @@ impl std::fmt::Debug for SemaphorePermit<'_> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug)]
 pub struct OwnedSemaphorePermit {
     inner: asupersync::sync::OwnedSemaphorePermit,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl OwnedSemaphorePermit {
     #[must_use]
     pub fn count(&self) -> usize {
         self.inner.count()
     }
 }
-
-#[cfg(not(feature = "asupersync-runtime"))]
-pub use tokio::sync::{
-    AcquireError, Mutex, MutexGuard, OwnedSemaphorePermit, RwLock, RwLockReadGuard,
-    RwLockWriteGuard, Semaphore, SemaphorePermit, TryAcquireError,
-};
 
 /// MPSC channel aliases for the active runtime.
 ///
@@ -631,7 +586,6 @@ pub use tokio::sync::{
 /// `futures::future::select` against a poll-sleep watcher (same
 /// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick
 /// 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
-#[cfg(feature = "asupersync-runtime")]
 pub mod mpsc {
     pub use asupersync::channel::mpsc::{
         Receiver, RecvError, SendError, SendPermit, Sender, channel,
@@ -662,15 +616,6 @@ pub mod mpsc {
 }
 
 /// MPSC channel aliases for the active runtime.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod mpsc {
-    pub use tokio::sync::mpsc::{
-        Receiver, Sender, channel,
-        error::{SendError, TryRecvError, TrySendError},
-        unbounded_channel,
-    };
-}
-
 /// Watch channel aliases for the active runtime.
 ///
 /// Under asupersync the receiver's `changed(cx)` method observes
@@ -688,27 +633,17 @@ pub mod mpsc {
 /// against a poll-sleep watcher (same pattern as
 /// `DistributedHttpClient::race_with_cx_cancel`, tick 387). See
 /// `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
-#[cfg(feature = "asupersync-runtime")]
 pub mod watch {
     pub use asupersync::channel::watch::{Receiver, RecvError, SendError, Sender, channel};
 }
 
 /// Watch channel aliases for the active runtime.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod watch {
-    pub use tokio::sync::watch::{
-        Receiver, Sender, channel,
-        error::{RecvError, SendError},
-    };
-}
-
 /// Broadcast channel aliases for the active runtime.
 ///
 /// When `asupersync-runtime` is enabled, provides wrapper types around
 /// `asupersync::channel::broadcast` that acquire a `Cx` internally, keeping
 /// the tokio-compatible call-site signatures so that existing callers
 /// (event bus, telemetry, etc.) need no changes.
-#[cfg(feature = "asupersync-runtime")]
 pub mod broadcast {
     use asupersync::channel::broadcast as inner;
 
@@ -894,14 +829,6 @@ pub mod broadcast {
 }
 
 /// Broadcast channel aliases for the active runtime (tokio fallback).
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod broadcast {
-    pub use tokio::sync::broadcast::{
-        Receiver, Sender, channel,
-        error::{RecvError, SendError, TryRecvError},
-    };
-}
-
 /// Oneshot channel aliases for the active runtime.
 ///
 /// When `asupersync-runtime` is enabled, provides wrapper types around
@@ -912,7 +839,6 @@ pub mod broadcast {
 ///
 /// `Receiver` does **not** impl `Future` under asupersync — callers that
 /// previously used `rx.await` must go through [`oneshot_recv`] instead.
-#[cfg(feature = "asupersync-runtime")]
 pub mod oneshot {
     use asupersync::channel::oneshot as inner;
 
@@ -988,13 +914,7 @@ pub mod oneshot {
 }
 
 /// Oneshot channel aliases for the active runtime (tokio fallback).
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod oneshot {
-    pub use tokio::sync::oneshot::{Receiver, Sender, channel, error::RecvError};
-}
-
 /// Async notification primitive for the active runtime.
-#[cfg(feature = "asupersync-runtime")]
 pub mod notify {
     pub use asupersync::sync::Notify;
 }
@@ -1003,66 +923,16 @@ pub mod notify {
 ///
 /// Note: this remains tokio-backed only for non-asupersync builds; production
 /// migration targets should route through the active runtime backend here.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod notify {
-    pub use tokio::sync::Notify;
-}
-
 /// Task primitives used during runtime migration.
 ///
 /// When `asupersync-runtime` is enabled, spawns on the asupersync runtime
 /// via the thread-local handle installed by `Runtime::block_on`. Otherwise,
 /// delegates to tokio.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod task {
-    pub use tokio::task::{JoinError, JoinHandle, JoinSet};
-
-    pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-    where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        tokio::spawn(future)
-    }
-
-    pub fn spawn_with_cx<C, F, Fut, T>(cx: &C, task: F) -> JoinHandle<T>
-    where
-        C: Clone + Send + 'static,
-        F: FnOnce(C) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let child_cx = cx.clone();
-        tokio::spawn(async move { task(child_cx).await })
-    }
-
-    /// Spawns blocking work on the runtime's dedicated blocking thread pool,
-    /// returning a `JoinHandle` that can be awaited, aborted, or used in
-    /// `select!`.
-    ///
-    /// Use this when callers need direct `JoinHandle` control (e.g. `.abort()`).
-    /// For fire-and-forget blocking work, prefer the top-level
-    /// [`super::spawn_blocking`] helper which returns `Result<T, String>`.
-    pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        tokio::task::spawn_blocking(f)
-    }
-
-    /// Yields execution back to the runtime, allowing other tasks to progress.
-    pub async fn yield_now() {
-        tokio::task::yield_now().await;
-    }
-}
-
 /// Task primitives for the asupersync runtime backend.
 ///
 /// Provides API-compatible wrappers around asupersync's spawn/join
 /// infrastructure, using the thread-local `ASUPERSYNC_HANDLE` installed
 /// by `Runtime::block_on` to support ambient spawning.
-#[cfg(feature = "asupersync-runtime")]
 pub mod task {
     use std::future::Future;
     use std::pin::Pin;
@@ -1454,55 +1324,18 @@ pub mod task {
 }
 
 /// Re-export `join!` macro for concurrent future evaluation.
-///
-/// Uses `futures::join!` under asupersync-runtime (runtime-agnostic),
-/// and `tokio::join!` otherwise.
-#[cfg(feature = "asupersync-runtime")]
 pub use futures::join;
-#[cfg(not(feature = "asupersync-runtime"))]
-pub use tokio::join;
-
 /// Re-export `select!` macro for multiplexing futures.
 ///
-/// # Status: all channel types migrated
-///
-/// Under `asupersync-runtime`, all channel types (mpsc, watch, broadcast,
-/// oneshot, notify) now use asupersync primitives. `tokio::select!` is
-/// retained as the poll combinator because it operates on standard
-/// `Future::poll` and does not require a live tokio runtime.
+/// Uses `tokio::select!` as a poll combinator — it operates on standard
+/// `Future::poll` and does not require a live tokio runtime. All channel
+/// types use asupersync primitives; only the select macro itself remains
+/// from tokio.
 // TODO(asupersync): replace with `asupersync::select!` or
 // `futures::select!` once available to fully decouple from tokio.
-#[cfg(feature = "asupersync-runtime")]
 pub use tokio::select;
-#[cfg(not(feature = "asupersync-runtime"))]
-pub use tokio::select;
-
-/// Time-control primitives for deterministic test scheduling.
-///
-/// These are primarily used in `#[tokio::test(start_paused = true)]` tests
-/// to drive time manually. Requires tokio's `test-util` feature, which is
-/// only available in test builds.
-#[cfg(test)]
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod time {
-    use std::time::Duration;
-
-    /// Pauses the runtime's time driver so that `sleep` and `timeout`
-    /// only resolve when time is manually advanced.
-    pub fn pause() {
-        tokio::time::pause();
-    }
-
-    /// Advances the runtime clock by the given duration.
-    ///
-    /// Only effective after `pause()` has been called.
-    pub async fn advance(duration: Duration) {
-        tokio::time::advance(duration).await;
-    }
-}
 
 /// Unix socket aliases/helpers for the active runtime.
-#[cfg(feature = "asupersync-runtime")]
 pub mod unix {
     use std::io;
     use std::path::Path;
@@ -1579,72 +1412,6 @@ pub mod unix {
 }
 
 /// Unix socket aliases/helpers for the active runtime.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod unix {
-    use std::io;
-    use std::path::Path;
-
-    pub use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-    pub use tokio::net::{UnixListener, UnixStream};
-
-    pub type LineReader<T> = tokio::io::Lines<BufReader<T>>;
-
-    pub async fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-        let path = path.as_ref();
-        let _ = std::fs::remove_file(path);
-        UnixListener::bind(path)
-    }
-
-    pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-        UnixStream::connect(path).await
-    }
-
-    #[must_use]
-    pub fn buffered<T: AsyncRead>(stream: T) -> BufReader<T> {
-        BufReader::new(stream)
-    }
-
-    pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
-    where
-        T: AsyncRead + Unpin,
-    {
-        use tokio::io::AsyncBufReadExt;
-        reader.lines()
-    }
-
-    pub async fn next_line<T>(lines: &mut LineReader<T>) -> io::Result<Option<String>>
-    where
-        T: AsyncRead + Unpin,
-    {
-        lines.next_line().await
-    }
-
-    /// ft-xbnl0.2.3 Cx-first sibling of [`next_line`].
-    ///
-    /// Pre-flight `cx.checkpoint()` folded into
-    /// `io::ErrorKind::Interrupted` so a cancelled IPC client
-    /// handler (or any line-reading loop) bails from the read
-    /// instead of blocking on the next newline. The underlying
-    /// `tokio::io::AsyncBufReadExt::next_line` does not itself
-    /// observe cx — this seam gates entry to the wait.
-    #[cfg(feature = "asupersync-runtime")]
-    pub async fn next_line_with_cx<T>(
-        cx: &crate::cx::Cx,
-        lines: &mut LineReader<T>,
-    ) -> io::Result<Option<String>>
-    where
-        T: AsyncRead + Unpin,
-    {
-        cx.checkpoint().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("next_line cancelled: {err}"),
-            )
-        })?;
-        lines.next_line().await
-    }
-}
-
 /// Async process primitives routed through the compat boundary.
 ///
 /// This wraps `std::process::Command` and runs blocking process I/O on the
@@ -1766,7 +1533,6 @@ pub mod process {
         /// KillOnDropGuard still fires the cancel flag. The cx
         /// watcher sets `watcher_done` on normal-path exit so it
         /// never leaks past the body.
-        #[cfg(feature = "asupersync-runtime")]
         pub async fn output_with_cx(&mut self, cx: &crate::cx::Cx) -> std::io::Result<Output> {
             cx.checkpoint().map_err(|err| {
                 std::io::Error::new(
@@ -1931,7 +1697,6 @@ pub mod process {
 ///
 /// Re-exports the extension traits needed for TCP stream I/O.
 /// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
-#[cfg(feature = "asupersync-runtime")]
 pub mod io {
     pub use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1960,24 +1725,9 @@ pub mod io {
 ///
 /// Re-exports the extension traits needed for TCP stream I/O.
 /// For Unix-specific I/O (BufReader, lines, etc.) see the `unix` module.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod io {
-    pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// Read some bytes from an async reader into `buf`, returning how many
-    /// bytes were read. Delegates to `AsyncReadExt::read`.
-    pub async fn read<R: tokio::io::AsyncRead + Unpin>(
-        reader: &mut R,
-        buf: &mut [u8],
-    ) -> std::io::Result<usize> {
-        <R as tokio::io::AsyncReadExt>::read(reader, buf).await
-    }
-}
-
 /// Async networking primitives for the active runtime.
 ///
 /// For Unix sockets, see the `unix` module.
-#[cfg(feature = "asupersync-runtime")]
 pub mod net {
     pub use asupersync::net::{TcpListener, TcpStream};
 }
@@ -1985,15 +1735,9 @@ pub mod net {
 /// Async networking primitives for the active runtime.
 ///
 /// For Unix sockets, see the `unix` module.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod net {
-    pub use tokio::net::{TcpListener, TcpStream};
-}
-
 /// Signal handling primitives for graceful shutdown.
 ///
 /// Wraps `asupersync::signal` for the asupersync runtime.
-#[cfg(feature = "asupersync-runtime")]
 pub mod signal {
     /// Completes when a Ctrl+C (SIGINT) signal is received.
     ///
@@ -2052,55 +1796,7 @@ pub mod signal {
     }
 }
 
-/// Signal handling primitives for graceful shutdown.
-///
-/// Wraps `tokio::signal` in the default build for eventual asupersync swap.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub mod signal {
-    /// Completes when a Ctrl+C (SIGINT) signal is received.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the signal handler could not be registered.
-    pub async fn ctrl_c() -> std::io::Result<()> {
-        tokio::signal::ctrl_c().await
-    }
-
-    /// Unix-specific signal handling.
-    #[cfg(unix)]
-    pub mod unix {
-        pub use tokio::signal::unix::SignalKind;
-
-        /// A stream of signals of a specific kind.
-        pub struct Signal {
-            inner: tokio::signal::unix::Signal,
-        }
-
-        impl Signal {
-            /// Receives the next signal notification.
-            ///
-            /// Returns `None` if the signal stream is terminated.
-            pub async fn recv(&mut self) -> Option<()> {
-                self.inner.recv().await
-            }
-        }
-
-        /// Creates a new listener for the given signal kind.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error if the signal handler could not be registered.
-        pub fn signal(kind: SignalKind) -> std::io::Result<Signal> {
-            tokio::signal::unix::signal(kind).map(|inner| Signal { inner })
-        }
-    }
-}
-
-/// Re-export of `tokio::task::JoinError` for task join handle error handling.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub use tokio::task::JoinError;
-
-/// Unified runtime trait used during migration.
+/// Unified runtime trait for async lifecycle management.
 pub trait CompatRuntime {
     /// Runs a future to completion.
     fn block_on<F>(&self, future: F) -> F::Output
@@ -2114,18 +1810,11 @@ pub trait CompatRuntime {
 }
 
 /// Runtime wrapper for the active runtime backend.
-#[cfg(feature = "asupersync-runtime")]
 pub struct Runtime {
     inner: asupersync::runtime::Runtime,
 }
 
 /// Runtime wrapper for the active runtime backend.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub struct Runtime {
-    inner: tokio::runtime::Runtime,
-}
-
-#[cfg(feature = "asupersync-runtime")]
 impl CompatRuntime for Runtime {
     fn block_on<F>(&self, future: F) -> F::Output
     where
@@ -2165,30 +1854,11 @@ impl CompatRuntime for Runtime {
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-impl CompatRuntime for Runtime {
-    fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        self.inner.block_on(future)
-    }
-
-    fn spawn_detached<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        std::mem::drop(self.inner.spawn(future));
-    }
-}
-
 /// Runtime builder wrapper for the active backend.
-#[cfg(feature = "asupersync-runtime")]
 pub struct RuntimeBuilder {
     inner: asupersync::runtime::RuntimeBuilder,
 }
 
-#[cfg(feature = "asupersync-runtime")]
 impl RuntimeBuilder {
     #[must_use]
     pub fn current_thread() -> Self {
@@ -2239,88 +1909,13 @@ impl RuntimeBuilder {
 }
 
 /// Runtime builder wrapper for the active backend.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub struct RuntimeBuilder {
-    inner: tokio::runtime::Builder,
-    supports_worker_threads: bool,
-}
-
-#[cfg(not(feature = "asupersync-runtime"))]
-impl RuntimeBuilder {
-    #[must_use]
-    pub fn current_thread() -> Self {
-        // Raw tokio runtime constructors stay quarantined here until wa-e34d9
-        // retires the fallback backend entirely.
-        let mut inner = tokio::runtime::Builder::new_current_thread();
-        inner.enable_all();
-        Self {
-            inner,
-            supports_worker_threads: false,
-        }
-    }
-
-    #[must_use]
-    pub fn multi_thread() -> Self {
-        // Raw tokio runtime constructors stay quarantined here until wa-e34d9
-        // retires the fallback backend entirely.
-        let mut inner = tokio::runtime::Builder::new_multi_thread();
-        inner.enable_all();
-        Self {
-            inner,
-            supports_worker_threads: true,
-        }
-    }
-
-    #[must_use]
-    pub fn worker_threads(mut self, n: usize) -> Self {
-        if self.supports_worker_threads {
-            self.inner.worker_threads(n);
-        }
-        self
-    }
-
-    /// No-op: `enable_all()` is already called in the constructors.
-    #[must_use]
-    pub fn enable_all(self) -> Self {
-        self
-    }
-
-    /// Starts the test runtime with tokio's paused clock when requested.
-    #[cfg(test)]
-    #[must_use]
-    pub fn start_paused(mut self, start_paused: bool) -> Self {
-        self.inner.start_paused(start_paused);
-        self
-    }
-
-    /// Sets the thread name for spawned worker threads.
-    #[must_use]
-    pub fn thread_name(mut self, name: &str) -> Self {
-        self.inner.thread_name(name);
-        self
-    }
-
-    pub fn build(mut self) -> Result<Runtime, String> {
-        self.inner
-            .build()
-            .map(|inner| Runtime { inner })
-            .map_err(|err| err.to_string())
-    }
-}
-
 /// Sleep for the specified duration using the active runtime backend.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn sleep(duration: Duration) {
     let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
     let _ = sleep_with_cx(&cx, duration).await;
 }
 
 /// Sleep for the specified duration using the active runtime backend.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub async fn sleep(duration: Duration) {
-    tokio::time::sleep(duration).await;
-}
-
 /// Sleep for the requested duration while respecting the provided `Cx`.
 ///
 /// This is the Cx-first sleep seam used by the ft-xbnl0.2.2 migration. Call
@@ -2342,7 +1937,6 @@ pub async fn sleep(duration: Duration) {
 /// at loop iteration boundaries when using this inside a polling loop.
 /// Every cx-first accept/poll loop in this crate that uses `sleep_with_cx`
 /// already follows this pattern (e.g. watchdog.rs, backpressure polling).
-#[cfg(feature = "asupersync-runtime")]
 pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(), String> {
     asupersync::time::budget_sleep(cx, duration, cx_timer_now(cx))
         .await
@@ -2350,7 +1944,6 @@ pub async fn sleep_with_cx(cx: &crate::cx::Cx, duration: Duration) -> Result<(),
 }
 
 /// Runs `future` with a timeout using the active runtime backend.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, String>
 where
     F: Future,
@@ -2385,7 +1978,6 @@ where
 /// the wrapped future whose primitives *themselves* honour cx cancel
 /// (e.g. `sleep_with_cx`, `broadcast_recv_with_cx`) — it is not
 /// otherwise observed by `timeout_with_cx`'s own polling.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn timeout_with_cx<F>(
     cx: &crate::cx::Cx,
     duration: Duration,
@@ -2399,23 +1991,12 @@ where
         .map_err(|err| err.to_string())
 }
 
-#[cfg(feature = "asupersync-runtime")]
 fn cx_timer_now(cx: &crate::cx::Cx) -> asupersync::Time {
     cx.timer_driver()
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
 }
 
 /// Runs `future` with a timeout using the active runtime backend.
-#[cfg(not(feature = "asupersync-runtime"))]
-pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, String>
-where
-    F: Future,
-{
-    tokio::time::timeout(duration, future)
-        .await
-        .map_err(|err| err.to_string())
-}
-
 /// Runs blocking work on the active runtime's blocking executor.
 ///
 /// Returns the closure output when successful, or a stringified join/runtime
@@ -2425,17 +2006,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         Ok(asupersync::runtime::spawn_blocking(work).await)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tokio::task::spawn_blocking(work)
-            .await
-            .map_err(|err| err.to_string())
-    }
 }
 
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
@@ -2447,16 +2021,11 @@ where
 /// Transitional helper retained for migration-era tests. New production
 /// call-sites should prefer explicit receive semantics.
 pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
         rx.recv(&cx).await.ok()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.recv().await
-    }
 }
 
 /// Sends one message through an mpsc sender using the active runtime semantics.
@@ -2464,16 +2033,11 @@ pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
 /// Transitional helper retained for migration-era tests. New production
 /// call-sites should prefer explicit send semantics.
 pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
         tx.send(&cx, value).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tx.send(value).await
-    }
 }
 
 /// Reserves one mpsc slot and commits `value`, returning whether delivery was
@@ -2482,7 +2046,6 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
 /// Transitional helper retained for migration-era tests. New production
 /// call-sites should prefer explicit reserve/commit semantics.
 pub async fn mpsc_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
         if let Ok(permit) = tx.reserve(&cx).await {
@@ -2492,14 +2055,6 @@ pub async fn mpsc_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
         false
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        if let Ok(permit) = tx.reserve().await {
-            permit.send(value);
-            return true;
-        }
-        false
-    }
 }
 
 /// Attempts an immediate reserve/commit send and reports whether delivery was
@@ -2519,29 +2074,19 @@ pub fn mpsc_try_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
 ///
 /// Returns `false` if the channel has closed.
 pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         rx.has_changed()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.has_changed().unwrap_or(false)
-    }
 }
 
 /// Borrows the latest watch value and clones it while marking the update as
 /// consumed where required by the active runtime backend.
 pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
-    #[cfg(feature = "asupersync-runtime")]
     {
         rx.borrow_and_clone()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.borrow_and_update().clone()
-    }
 }
 
 /// Waits until the watch receiver observes a change, abstracting the
@@ -2551,16 +2096,11 @@ pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T
 pub async fn watch_changed<T: Send + Sync>(
     rx: &mut watch::Receiver<T>,
 ) -> Result<(), watch::RecvError> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
         rx.changed(&cx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.changed().await
-    }
 }
 
 /// Send a value on a broadcast channel using the active runtime backend.
@@ -2606,7 +2146,6 @@ pub async fn broadcast_recv<T: Clone>(
 /// wrap this call in `futures::future::select` against a poll-sleep
 /// watcher (same pattern as `DistributedHttpClient::race_with_cx_cancel`,
 /// tick 387). See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn broadcast_recv_with_cx<T: Clone>(
     cx: &crate::cx::Cx,
     rx: &mut broadcast::Receiver<T>,
@@ -2670,16 +2209,11 @@ pub fn oneshot_send<T>(tx: oneshot::Sender<T>, value: T) -> Result<(), String> {
 /// and calls the asupersync `.recv()` method. Under tokio, awaits the
 /// receiver directly (since tokio `Receiver` impls `Future`).
 pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         oneshot_recv_with_cx(&cx, rx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.await.map_err(|e| e.to_string())
-    }
 }
 
 /// Receive from a oneshot channel under an explicit `&Cx` (ft-xbnl0.2.x
@@ -2706,7 +2240,6 @@ pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
 /// `futures::future::select` against a poll-sleep watcher (same
 /// pattern as `DistributedHttpClient::race_with_cx_cancel`, tick 387).
 /// See `docs/ft-xbnl0-2-4-completion-evidence.md` §2.6.1.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn oneshot_recv_with_cx<T>(
     cx: &crate::cx::Cx,
     rx: oneshot::Receiver<T>,
@@ -2783,7 +2316,6 @@ mod tests {
         assert!(rt.is_ok());
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn current_runtime_handle_tracks_install_and_clear() {
         clear_runtime_handle();
@@ -2797,7 +2329,6 @@ mod tests {
         assert!(current_runtime_handle().is_none());
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_async_test_clears_runtime_handle_tls() {
         clear_runtime_handle();
@@ -2861,7 +2392,6 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
-        #[cfg(feature = "asupersync-runtime")]
         clear_runtime_handle();
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
@@ -2887,7 +2417,6 @@ mod tests {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drop(runtime);
                 }));
-                #[cfg(feature = "asupersync-runtime")]
                 clear_runtime_handle();
                 if let Err(payload) = test_result {
                     std::panic::resume_unwind(payload);
@@ -2898,18 +2427,6 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    fn run_paused_async_test<F>(future: F)
-    where
-        F: std::future::Future<Output = ()>,
-    {
-        let runtime = RuntimeBuilder::current_thread()
-            .start_paused(true)
-            .build()
-            .expect("failed to build paused runtime for async test");
-        runtime.block_on(future);
     }
 
     #[test]
@@ -2943,7 +2460,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn sleep_with_cx_returns_elapsed_when_budget_is_exhausted() {
         run_async_test(async {
@@ -2957,7 +2473,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn sleep_uses_active_cx_virtual_time_under_labruntime() {
         let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3005,7 +2520,6 @@ mod tests {
         assert!(report.invariant_violations.is_empty());
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn timeout_uses_active_cx_budget_under_labruntime() {
         let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3049,12 +2563,10 @@ mod tests {
         assert!(report.invariant_violations.is_empty());
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn arb_labruntime_timer_deadlines_ms() -> impl Strategy<Value = Vec<u64>> {
         prop::collection::vec(0_u64..=50, 1..10)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -3297,17 +2809,10 @@ mod tests {
     fn mpsc_send_recv() {
         run_async_test(async {
             let (tx, mut rx) = mpsc::channel(10);
-            #[cfg(feature = "asupersync-runtime")]
             {
                 let cx = asupersync::Cx::for_testing();
                 tx.send(&cx, 42).await.expect("send");
                 let val = rx.recv(&cx).await.expect("recv");
-                assert_eq!(val, 42);
-            }
-            #[cfg(not(feature = "asupersync-runtime"))]
-            {
-                tx.send(42).await.expect("send");
-                let val = rx.recv().await.expect("recv");
                 assert_eq!(val, 42);
             }
         });
@@ -3317,29 +2822,16 @@ mod tests {
     fn mpsc_multiple_messages_fifo() {
         run_async_test(async {
             let (tx, mut rx) = mpsc::channel(10);
-            #[cfg(feature = "asupersync-runtime")]
             {
                 let cx = asupersync::Cx::for_testing();
                 for i in 0..5 {
                     tx.send(&cx, i).await.expect("send");
                 }
             }
-            #[cfg(not(feature = "asupersync-runtime"))]
-            {
-                for i in 0..5 {
-                    tx.send(i).await.expect("send");
-                }
-            }
             for i in 0..5 {
-                #[cfg(feature = "asupersync-runtime")]
                 {
                     let cx = asupersync::Cx::for_testing();
                     let val = rx.recv(&cx).await.expect("recv");
-                    assert_eq!(val, i);
-                }
-                #[cfg(not(feature = "asupersync-runtime"))]
-                {
-                    let val = rx.recv().await.expect("recv");
                     assert_eq!(val, i);
                 }
             }
@@ -3366,7 +2858,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn compat_channel_bridge_mpsc_try_send_error_maps_full_variant() {
         let err = mpsc::TrySendError::from(mpsc::SendError::Full("full"));
@@ -3378,7 +2869,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn compat_channel_bridge_mpsc_try_send_error_maps_closed_equivalents() {
         let disconnected = mpsc::TrySendError::from(mpsc::SendError::Disconnected("gone"));
@@ -4041,7 +3531,6 @@ mod tests {
             assert!(err.is_err());
             // The SendError should contain the value that could not be sent
             let send_err = err.unwrap_err();
-            #[cfg(feature = "asupersync-runtime")]
             assert!(
                 matches!(
                     send_err,
@@ -4050,8 +3539,6 @@ mod tests {
                 "expected disconnected send error carrying original value",
             );
 
-            #[cfg(not(feature = "asupersync-runtime"))]
-            assert_eq!(send_err.0, "lost");
         });
     }
 
@@ -4765,7 +4252,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn task_spawn_with_cx_receives_explicit_context() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
@@ -4787,7 +4273,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn joinset_spawn_with_cx_receives_explicit_context() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
@@ -5203,21 +4688,6 @@ mod tests {
     // IO module tests
     // ========================================================================
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn io_async_read_ext_available() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            use io::AsyncReadExt;
-            let data: &[u8] = b"hello world";
-            let mut cursor = std::io::Cursor::new(data);
-            let mut buf = [0u8; 5];
-            let n = cursor.read(&mut buf).await.expect("read should succeed");
-            assert_eq!(n, 5);
-            assert_eq!(&buf, b"hello");
-        });
-    }
-
     #[test]
     fn io_async_write_ext_available() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
@@ -5226,23 +4696,6 @@ mod tests {
             let mut buf = Vec::new();
             buf.write_all(b"test").await.expect("write should succeed");
             assert_eq!(&buf, b"test");
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn io_read_to_end_via_ext() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            use io::AsyncReadExt;
-            let data: &[u8] = b"abcdef";
-            let mut cursor = std::io::Cursor::new(data);
-            let mut buf = Vec::new();
-            cursor
-                .read_to_end(&mut buf)
-                .await
-                .expect("read_to_end should succeed");
-            assert_eq!(&buf, b"abcdef");
         });
     }
 
@@ -5387,7 +4840,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn task_abort_wakes_pending_waiter() {
         use futures::task::{ArcWake, waker_ref};
@@ -5448,116 +4900,9 @@ mod tests {
     // join! macro tests
     // ========================================================================
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn join_two_futures() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (a, b) = join!(async { 1 }, async { 2 });
-            assert_eq!(a, 1);
-            assert_eq!(b, 2);
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn join_three_futures() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (a, b, c) = join!(async { "x" }, async { "y" }, async { "z" });
-            assert_eq!(a, "x");
-            assert_eq!(b, "y");
-            assert_eq!(c, "z");
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn join_with_sleep() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (a, b) = join!(
-                async {
-                    sleep(Duration::from_millis(1)).await;
-                    10
-                },
-                async {
-                    sleep(Duration::from_millis(1)).await;
-                    20
-                }
-            );
-            assert_eq!(a + b, 30);
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn join_single_future() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (result,) = join!(async { 99 });
-            assert_eq!(result, 99);
-        });
-    }
-
     // ========================================================================
     // select! macro tests
     // ========================================================================
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn select_first_branch_ready() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let result = select! {
-                val = async { 1 } => val,
-                () = sleep(Duration::from_secs(10)) => 0,
-            };
-            assert_eq!(result, 1);
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn select_sleep_branch() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let result = select! {
-                () = sleep(Duration::from_millis(1)) => "timer",
-                () = sleep(Duration::from_secs(60)) => "never",
-            };
-            assert_eq!(result, "timer");
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn select_with_channel() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (tx, mut rx) = mpsc::channel(1);
-            tx.send(42).await.expect("send");
-            let result = select! {
-                val = rx.recv() => val.unwrap_or(0),
-                () = sleep(Duration::from_secs(10)) => 0,
-            };
-            assert_eq!(result, 42);
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn select_biased_picks_first_ready() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let result = select! {
-                biased;
-                val = async { "first" } => val,
-                val = async { "second" } => val,
-            };
-            assert_eq!(result, "first");
-        });
-    }
 
     // ========================================================================
     // task::yield_now tests
@@ -5587,7 +4932,6 @@ mod tests {
     /// pre-cancelled cx with a never-completing task must yield
     /// `Some(Err(JoinError { is_cancelled: true }))` immediately
     /// instead of blocking forever.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn join_next_with_cx_short_circuits_on_precancelled_cx() {
         let rt = RuntimeBuilder::current_thread()
@@ -5636,7 +4980,6 @@ mod tests {
     /// inner future never resolves, so without budget observation the
     /// call would wait the full 30 seconds. With budget observation, it
     /// must return Err promptly.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn timeout_with_cx_observes_budget_deadline() {
         let rt = RuntimeBuilder::current_thread()
@@ -5686,7 +5029,6 @@ mod tests {
     /// snapshot: that pins budget-aware behavior at the HTTP client
     /// layer (transitively via asupersync's HTTP client); this pins
     /// it at the foundational runtime_compat primitive level.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn sleep_with_cx_observes_budget_deadline() {
         let rt = RuntimeBuilder::current_thread()
@@ -5735,7 +5077,6 @@ mod tests {
     /// - `sleep_with_cx`: budget ✓, direct-cancel ✗
     /// - `timeout_with_cx`: budget ✓, direct-cancel ✗
     /// - `yield_now_with_cx`: direct-cancel ✓ (this tick)
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn yield_now_with_cx_observes_cx_cancel_checkpoint() {
         let rt = RuntimeBuilder::current_thread()
@@ -5776,7 +5117,6 @@ mod tests {
     /// Pair with `yield_now_with_cx_observes_cx_cancel_checkpoint`:
     /// together they pin both branches of the `cx.checkpoint()?`
     /// pre-guard.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn yield_now_with_cx_yields_on_live_cx() {
         let rt = RuntimeBuilder::current_thread()
@@ -5840,7 +5180,6 @@ mod tests {
     /// as `true` via the "aborted" substring test — pins that check
     /// too so downstream error-handling code can fold cx-cancel into
     /// its abort path cleanly.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn join_set_join_next_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -5922,7 +5261,6 @@ mod tests {
     /// Like mpsc, watch is re-exported directly (no runtime_compat wrapper).
     /// Watch channels underpin config-change notification and
     /// snapshot-version signalling — pinning cx-cancel guards those sites.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn watch_changed_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -5974,7 +5312,6 @@ mod tests {
     /// cancel-waker gap with the four channel types. Together with
     /// tick 439b (JoinSet) this completes the mid-flight matrix
     /// across all six long-lived-wait primitives in runtime_compat.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6047,7 +5384,6 @@ mod tests {
     /// `Some(Err(JoinError))`. If no external wake happens, the
     /// watcher branch catches it. Both outcomes are acceptable;
     /// both converge on fast observation.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn join_set_join_next_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6119,7 +5455,6 @@ mod tests {
     /// upgraded to "confirmed" — all four asupersync channel types
     /// observe pre-cancel via per-poll checkpoint but do NOT
     /// register cx-cancel-wakers for already-suspended recvs.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn watch_changed_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6194,7 +5529,6 @@ mod tests {
     /// layer (`events.rs`, `ipc.rs`), so cx-cancel mid-flight on a
     /// broadcast subscriber wouldn't be observed without the
     /// select-race pattern.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6271,7 +5605,6 @@ mod tests {
     /// confirming the same gap applies to oneshot_recv_with_cx as to
     /// mpsc. Callers needing mid-flight cancel on oneshot must use
     /// the same `futures::future::select` race pattern.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6360,7 +5693,6 @@ mod tests {
     ///   watcher that returns `Err("cancelled")` when `cx.is_cancel_requested()`.
     /// - Assert elapsed < 500 ms (the poll-sleep watcher catches the
     ///   cancel within its 50 ms poll interval) AND Err.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn mpsc_recv_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -6447,7 +5779,6 @@ mod tests {
     ///
     /// mpsc is heavily used across `ipc.rs` for shutdown signals and
     /// subscription plumbing — pinning cx-cancel guards those patterns.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn mpsc_recv_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -6692,7 +6023,6 @@ mod tests {
     /// change in asupersync (the two delegate to different asupersync
     /// acquire entry points: `Semaphore::acquire(cx, n)` vs
     /// `OwnedSemaphorePermit::acquire(Arc<Semaphore>, cx, n)`).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn semaphore_acquire_owned_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -6751,7 +6081,6 @@ mod tests {
     /// (ticks 418-420) with the semaphore concurrency primitive. Used
     /// across the core for rate limiting and bounded-concurrency work
     /// queues — pinning cx-cancel guards those call sites.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn semaphore_acquire_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -6813,7 +6142,6 @@ mod tests {
     /// used throughout the event fanout path
     /// (`crates/frankenterm-core/src/events.rs`) — pinning cx-cancel
     /// here guards against regressions in the async fanout plumbing.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_recv_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -6870,7 +6198,6 @@ mod tests {
     /// (tick 418) and pins the same direct-cancel observability on the
     /// oneshot receive path used throughout the core for single-fire
     /// event signalling.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn oneshot_recv_with_cx_observes_pre_cancel() {
         let rt = RuntimeBuilder::current_thread()
@@ -6915,172 +6242,14 @@ mod tests {
     // time module tests
     // ========================================================================
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn time_advance_moves_clock() {
-        run_paused_async_test(async {
-            let start = std::time::Instant::now();
-            time::advance(Duration::from_secs(60)).await;
-            // In paused mode, wall-clock barely moves but tokio's clock advances.
-            // We just verify no panic.
-            let _ = start.elapsed();
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn time_pause_enables_deterministic_sleep() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            time::pause();
-            // After pausing, sleeps resolve as time is auto-advanced in single-threaded
-            // runtime. Verify a long sleep completes quickly.
-            let start = std::time::Instant::now();
-            sleep(Duration::from_secs(300)).await;
-            let wall_elapsed = start.elapsed();
-            // Wall-clock should be well under 300 seconds.
-            assert!(wall_elapsed < Duration::from_secs(5));
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn time_advance_then_sleep_resolves() {
-        run_paused_async_test(async {
-            let (tx, mut rx) = mpsc::channel(1);
-            task::spawn(async move {
-                sleep(Duration::from_millis(100)).await;
-                let _ = tx.send(42).await;
-            });
-            time::advance(Duration::from_millis(200)).await;
-            task::yield_now().await;
-            let val = rx.recv().await;
-            assert_eq!(val, Some(42));
-        });
-    }
-
     // ── Signal module tests ──────────────────────────────────────────────
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_ctrl_c_is_constructible() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            // Verify ctrl_c() returns a future that can be selected against.
-            // We cannot actually send SIGINT in a test, so we verify it compiles
-            // and that the select! with an immediate timeout works.
-            let result = timeout(Duration::from_millis(1), signal::ctrl_c()).await;
-            // Should timeout since no SIGINT is sent.
-            assert!(result.is_err(), "ctrl_c should not resolve without signal");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_terminate_is_constructible() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            // Verify we can create a SIGTERM listener via the compat layer.
-            let listener = signal::unix::signal(signal::unix::SignalKind::terminate());
-            assert!(listener.is_ok(), "SIGTERM listener creation should succeed");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_hangup_is_constructible() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let listener = signal::unix::signal(signal::unix::SignalKind::hangup());
-            assert!(listener.is_ok(), "SIGHUP listener creation should succeed");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_recv_times_out_without_signal() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let mut sig = signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("create SIGTERM listener");
-            let result = timeout(Duration::from_millis(5), sig.recv()).await;
-            assert!(result.is_err(), "recv should timeout without actual signal");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_usr1_is_constructible() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let listener = signal::unix::signal(signal::unix::SignalKind::user_defined1());
-            assert!(listener.is_ok(), "SIGUSR1 listener creation should succeed");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_usr2_is_constructible() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let listener = signal::unix::signal(signal::unix::SignalKind::user_defined2());
-            assert!(listener.is_ok(), "SIGUSR2 listener creation should succeed");
-        });
-    }
-
     #[cfg(unix)]
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn signal_unix_recv_delivers_sent_signal() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            use std::sync::Arc;
-            use std::sync::atomic::{AtomicBool, Ordering};
-
-            let mut sig = signal::unix::signal(signal::unix::SignalKind::user_defined1())
-                .expect("create SIGUSR1 listener");
-
-            let received = Arc::new(AtomicBool::new(false));
-            let received_clone = received.clone();
-
-            // Spawn a task that waits for the signal.
-            let handle = task::spawn(async move {
-                if sig.recv().await == Some(()) {
-                    received_clone.store(true, Ordering::SeqCst);
-                }
-            });
-
-            // Give the listener a moment to register.
-            task::yield_now().await;
-            sleep(Duration::from_millis(10)).await;
-
-            // Send SIGUSR1 to ourselves via Command (no unsafe).
-            let pid = std::process::id();
-            let _ = std::process::Command::new("kill")
-                .args(["-USR1", &pid.to_string()])
-                .status();
-
-            // Wait for delivery.
-            let _ = timeout(Duration::from_secs(2), handle).await;
-            assert!(
-                received.load(Ordering::SeqCst),
-                "SIGUSR1 should have been received"
-            );
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn join_error_type_is_reexported() {
-        // Verify the JoinError re-export compiles and is usable as a type.
-        fn _accept_join_error(_e: JoinError) {}
-    }
-
     // -------------------------------------------------------------------------
     // LabRuntime deterministic tests for the Cx-first Mutex/RwLock primitives
     // (ft-xbnl0.2.x slice). Pin that lock_with_cx / read_with_cx /
@@ -7088,7 +6257,6 @@ mod tests {
     // rather than falling back to cx::for_request() via the legacy path.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_sync_primitives_cx {
         use super::*;
 
@@ -7281,21 +6449,18 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_recv_error_display_lagged() {
         let err = broadcast::RecvError::Lagged(42);
         assert_eq!(err.to_string(), "receiver lagged by 42 messages");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_recv_error_display_closed() {
         let err = broadcast::RecvError::Closed;
         assert_eq!(err.to_string(), "broadcast channel closed");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_try_recv_error_display_all_variants() {
         let empty = broadcast::TryRecvError::Empty;
@@ -7308,14 +6473,12 @@ mod tests {
         assert_eq!(lagged.to_string(), "receiver lagged by 7 messages");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_send_error_display() {
         let err = broadcast::SendError(99);
         assert_eq!(err.to_string(), "sending on a closed broadcast channel");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn try_acquire_error_display_variant_text() {
         let no_permits = TryAcquireError::NoPermits;
@@ -7325,14 +6488,12 @@ mod tests {
         assert_eq!(closed.to_string(), "semaphore closed");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn acquire_error_display_cancelled() {
         let err = AcquireError::Cancelled;
         assert_eq!(err.to_string(), "semaphore acquire cancelled");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn acquire_error_display_polled_after_completion() {
         let err = AcquireError::PolledAfterCompletion;
@@ -7342,7 +6503,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn broadcast_try_recv_error_is_std_error() {
         let empty: &dyn std::error::Error = &broadcast::TryRecvError::Empty;
