@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -126,13 +127,14 @@ impl fmt::Display for NodeId {
 ///
 /// Receives a slice of input values (one per incoming edge, in edge order)
 /// and returns the new output value for the node.
-pub type ComputeFn = Box<dyn Fn(&[Value]) -> Value + Send + Sync>;
+pub type ComputeFn = Arc<dyn Fn(&[Value]) -> Value + Send + Sync>;
 
 // =============================================================================
 // Node kinds
 // =============================================================================
 
 /// The kind of computation a node performs.
+#[derive(Clone)]
 enum NodeKind {
     /// External input — updated via `update_source`.
     Source,
@@ -376,7 +378,7 @@ impl DataflowGraph {
         let node = Node {
             id,
             label: label.to_string(),
-            kind: NodeKind::Compute(Box::new(compute)),
+            kind: NodeKind::Compute(Arc::new(compute)),
             value: Value::None,
             inputs,
             outputs: Vec::new(),
@@ -438,7 +440,7 @@ impl DataflowGraph {
                 window,
                 last_change: None,
                 pending: None,
-                compute: Box::new(compute),
+                compute: Arc::new(compute),
             },
             value: Value::None,
             inputs,
@@ -962,14 +964,13 @@ impl DataflowGraph {
     /// All node IDs in `other` are remapped to avoid conflicts. Returns a
     /// mapping from old IDs (in `other`) to new IDs (in `self`).
     ///
-    /// **Limitation**: Compute functions (`ComputeFn`) are not clonable, so
-    /// merged compute/debounce nodes become inert sources retaining their
-    /// last-computed value. Callers must re-register compute functions on
-    /// the remapped IDs if dynamic behavior is needed.
+    /// Compute and debounce functions are shared across the merged graph, so
+    /// remapped nodes retain their runtime behavior as well as their current
+    /// values and debounce state.
     pub fn merge(&mut self, other: &DataflowGraph) -> HashMap<NodeId, NodeId> {
         let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
 
-        // First pass: create nodes with new IDs (sources and compute).
+        // First pass: create nodes with new IDs and cloned node kinds.
         for (&old_id, node) in &other.nodes {
             let new_id = self.alloc_id();
             id_map.insert(old_id, new_id);
@@ -977,7 +978,7 @@ impl DataflowGraph {
             let new_node = Node {
                 id: new_id,
                 label: node.label.clone(),
-                kind: NodeKind::Source, // placeholder
+                kind: node.kind.clone(),
                 value: node.value.clone(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
@@ -2106,14 +2107,79 @@ mod tests {
         let mut g2 = DataflowGraph::new();
         let a = g2.add_source("a", Value::Int(10));
         let _b = g2.add_map("b", vec![a], |i| i[0].clone());
+        g2.propagate();
 
         let id_map = g1.merge(&g2);
         assert_eq!(g1.node_count(), 2);
         assert_eq!(g1.edge_count(), 1);
 
-        // Merged nodes are sources (compute fns not cloneable), so values stay
         let new_b = id_map[&_b];
-        assert_eq!(g1.get_value(new_b), Some(&Value::None)); // was compute, now source with None
+        assert_eq!(g1.get_value(new_b), Some(&Value::Int(10)));
+    }
+
+    #[test]
+    fn merge_preserves_compute_node_behavior() {
+        let mut g1 = DataflowGraph::new();
+
+        let mut g2 = DataflowGraph::new();
+        let source = g2.add_source("source", Value::Int(10));
+        let mapped = g2.add_map("mapped", vec![source], |inputs| match &inputs[0] {
+            Value::Int(value) => Value::Int(value + 1),
+            _ => Value::None,
+        });
+        g2.propagate();
+
+        let id_map = g1.merge(&g2);
+        let merged_source = id_map[&source];
+        let merged_mapped = id_map[&mapped];
+
+        assert_eq!(g1.get_value(merged_mapped), Some(&Value::Int(11)));
+        let snapshot = g1.snapshot();
+        let merged_node = snapshot
+            .nodes
+            .into_iter()
+            .find(|node| node.id == merged_mapped.0)
+            .expect("merged compute node should exist");
+        assert_eq!(merged_node.kind, "Compute");
+
+        g1.update_source(merged_source, Value::Int(41)).unwrap();
+        g1.propagate();
+        assert_eq!(g1.get_value(merged_mapped), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn merge_preserves_debounce_node_behavior() {
+        let mut g1 = DataflowGraph::new();
+
+        let mut g2 = DataflowGraph::new();
+        let source = g2.add_source("source", Value::Int(0));
+        let debounced = g2.add_debounce(
+            "debounced",
+            vec![source],
+            Duration::from_secs(1),
+            |inputs| inputs[0].clone(),
+        );
+        g2.propagate();
+
+        let id_map = g1.merge(&g2);
+        let merged_source = id_map[&source];
+        let merged_debounced = id_map[&debounced];
+
+        let snapshot = g1.snapshot();
+        let merged_node = snapshot
+            .nodes
+            .into_iter()
+            .find(|node| node.id == merged_debounced.0)
+            .expect("merged debounce node should exist");
+        assert!(merged_node.kind.starts_with("Debounce("));
+
+        g1.update_source(merged_source, Value::Int(5)).unwrap();
+        g1.propagate();
+        assert_eq!(g1.get_value(merged_debounced), Some(&Value::Int(0)));
+
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(g1.flush_debounced(), 1);
+        assert_eq!(g1.get_value(merged_debounced), Some(&Value::Int(5)));
     }
 
     #[test]
