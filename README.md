@@ -59,7 +59,7 @@ Current implementation reality:
 | **Policy Engine** | 21-subsystem policy framework with capability gates, rate limiting, audit trails, and approval tokens |
 | **Mission Orchestration** | Transactional multi-pane execution with prepare/commit/compensate lifecycle, idempotency guards, and deterministic replay |
 | **Tiered Scrollback** | Three-tier memory management (hot/warm/cold) is designed for 200+ pane fleets; memory-envelope claims should be treated as benchmark-dependent until linked artifacts are published |
-| **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing |
+| **Replay & Forensics** | Capture, replay, and diff decision graphs for post-incident analysis and regression testing; the shipped recorder backend is currently `append_log`, while `frankensqlite` remains rollout/test-only until live bootstrap support lands |
 | **Fleet Memory Controller** | Coordinated backpressure across queue depth, system memory, and per-pane budgets with hysteresis |
 | **Distributed Mode** | Optional agent-to-aggregator streaming with per-agent dedup, wire protocol versioning, and stale-session pruning |
 

@@ -147,12 +147,17 @@ Norms:
 ## Configuration model (backend-gated runtime selection)
 
 ### Proposed config shape
+
+Current shipped behavior note:
+- `append_log` is the only recorder backend that `bootstrap_recorder_storage(...)` can open today.
+- `frankensqlite` remains a design/rollout target under `ft-oegrb.3.3`; selecting it in live config currently returns `BackendUnavailable` instead of silently falling back.
+
 ```toml
 [recorder]
 enabled = false
 
 [recorder.storage]
-backend = "append_log"           # append_log | frankensqlite
+backend = "append_log"           # shipped today; frankensqlite is rollout/test-only for now
 fallback_backend = "append_log"  # deterministic fallback target
 startup_policy = "fail_closed"   # fail_closed | fallback
 runtime_error_policy = "degrade" # degrade | fallback | stop_capture
