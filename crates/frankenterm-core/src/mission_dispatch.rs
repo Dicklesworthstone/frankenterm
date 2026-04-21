@@ -245,18 +245,10 @@ impl MissionDispatcher {
 
         // Emit completion/failure event
         if let Some(bus) = event_bus {
-            if result.accepted {
-                let _ = bus.publish(crate::events::Event::WorkflowCompleted {
-                    workflow_id: format!("mission.dispatch.{}", contract.assignment_id),
-                    success: true,
-                    reason: None,
-                });
-            } else {
-                let _ = bus.publish(crate::events::Event::WorkflowCompleted {
-                    workflow_id: format!("mission.dispatch.{}", contract.assignment_id),
-                    success: false,
-                    reason: result.reason.clone(),
-                });
+            if let Some(event) =
+                self.make_completion_event_for_result(&contract.assignment_id, &result)
+            {
+                let _ = bus.publish(event);
             }
         }
 
@@ -305,6 +297,29 @@ impl MissionDispatcher {
             details: details.into_iter().collect(),
             workspace: self.config.workspace.clone(),
             track: self.config.track.clone(),
+        }
+    }
+
+    /// Map a dispatch result to a workflow completion event.
+    ///
+    /// A successful dispatch only means the workflow runner accepted the
+    /// detection; execution has not completed yet. Emitting a synthetic
+    /// `WorkflowCompleted { success: true }` here would incorrectly trigger
+    /// downstream "work completed" handling before any pane I/O runs.
+    fn make_completion_event_for_result(
+        &self,
+        assignment_id: &str,
+        result: &DispatchResult,
+    ) -> Option<crate::events::Event> {
+        let _ = self;
+        if result.accepted {
+            None
+        } else {
+            Some(crate::events::Event::WorkflowCompleted {
+                workflow_id: format!("mission.dispatch.{assignment_id}"),
+                success: false,
+                reason: result.reason.clone(),
+            })
         }
     }
 }
@@ -486,5 +501,51 @@ mod tests {
         );
         assert_eq!(event.workspace, "ws-prod");
         assert_eq!(event.track, "fast-lane");
+    }
+
+    #[test]
+    fn accepted_dispatch_does_not_emit_completion_event() {
+        let dispatcher = MissionDispatcher::default();
+        let result = DispatchResult {
+            assignment_id: "a1".to_string(),
+            target_agent: "agent1".to_string(),
+            accepted: true,
+            execution_id: Some("exec-123".to_string()),
+            reason: None,
+            dispatch_ms: 1,
+        };
+
+        assert!(
+            dispatcher
+                .make_completion_event_for_result("a1", &result)
+                .is_none(),
+            "accepted dispatch should not report workflow completion before execution runs"
+        );
+    }
+
+    #[test]
+    fn rejected_dispatch_emits_failure_completion_event() {
+        let dispatcher = MissionDispatcher::default();
+        let result = DispatchResult {
+            assignment_id: "a1".to_string(),
+            target_agent: "agent1".to_string(),
+            accepted: false,
+            execution_id: None,
+            reason: Some("no workflow".to_string()),
+            dispatch_ms: 1,
+        };
+
+        let event = dispatcher
+            .make_completion_event_for_result("a1", &result)
+            .expect("rejected dispatch should emit a failure event");
+
+        assert_eq!(
+            event,
+            crate::events::Event::WorkflowCompleted {
+                workflow_id: "mission.dispatch.a1".to_string(),
+                success: false,
+                reason: Some("no workflow".to_string()),
+            }
+        );
     }
 }
