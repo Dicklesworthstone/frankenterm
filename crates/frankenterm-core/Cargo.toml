@@ -84,7 +84,7 @@ toon_rust = { workspace = true, optional = true }
 # Web server (optional, behind feature)
 fastapi = { workspace = true, optional = true }
 # Sync (optional, behind feature)
-asupersync = { workspace = true, optional = true, features = ["tls"] }
+asupersync = { workspace = true, features = ["tls"] }
 # Distributed mode (optional, behind feature)
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
@@ -649,7 +649,7 @@ vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
 mcp-client = ["dep:fastmcp"]
-web = ["dep:fastapi", "dep:asupersync", "asupersync-runtime"]
+web = ["dep:fastapi"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
 ftui = ["dep:ftui"]
@@ -657,15 +657,14 @@ tui-widgets = ["dep:ftui-render", "dep:ftui-layout", "dep:ftui-style", "dep:ftui
 tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-backend"]
 rollout = ["tui", "ftui"]
 metrics = []
-native-wezterm = ["asupersync-runtime"]
+native-wezterm = []
 distributed = [
-    "dep:asupersync",
     "dep:rustls",
     "dep:rustls-pemfile",
     "dep:x509-parser",
 ]
-sync = ["dep:asupersync"]
-asupersync-runtime = ["dep:asupersync"]
+sync = []
+asupersync-runtime = []  # no-op: asupersync is now always-on (ft-xbnl0.2.5)
 recorder-lexical = ["dep:tantivy"]
 disk-pressure = ["dep:nix"]
 semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastembed", "dep:rmp-serde"]
