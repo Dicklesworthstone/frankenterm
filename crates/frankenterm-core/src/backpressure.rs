@@ -340,6 +340,30 @@ impl BackpressureMetrics {
             .unwrap_or_else(|e| e.into_inner());
         guard.len()
     }
+
+    /// Remove the drop-attribution entry for `pane_id`, returning `true`
+    /// if an entry was actually removed.
+    ///
+    /// Must be called from `PaneDestroyed` teardown paths (mirrors the
+    /// ft-l6v1r fix that added cleanup for `pane_activity_tracker` in
+    /// `runtime.rs`). Without this, the `dropped_by_pane` HashMap grows
+    /// monotonically on long-running aggregators — every pane that has
+    /// ever seen a drop leaves an `AtomicU64` behind for the life of the
+    /// runtime, and worse, if a pane_id is reused by the mux after
+    /// teardown the new pane inherits the dead pane's drop count.
+    ///
+    /// Found during a review pass over the last-20-commits swarm diff:
+    /// bd8a715e landed the per-pane attribution map without wiring a
+    /// teardown hook; handle_native_event's `NativeEvent::PaneDestroyed`
+    /// arm and the `diff.closed_panes` loop in `ObservationRuntime::run`
+    /// now call this helper alongside `remove_runtime_pane_state_for_pane`.
+    pub fn cleanup_pane(&self, pane_id: u64) -> bool {
+        let mut guard = self
+            .dropped_by_pane
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.remove(&pane_id).is_some()
+    }
 }
 
 // ─── Manager ─────────────────────────────────────────────────────────
@@ -676,6 +700,38 @@ mod tests {
 
         m.record_segment_dropped(20);
         assert_eq!(m.panes_with_drops(), 2);
+    }
+
+    // [review] Pin the teardown invariant that the PaneDestroyed path in
+    // runtime.rs relies on: cleanup_pane(X) removes only X's attribution
+    // entry, leaves every other pane's counter untouched, is idempotent
+    // on panes that were never inserted (the 99% "healthy pane"
+    // equivalence class), and preserves the aggregate
+    // `segments_dropped_total()` so post-mortem accounting across a
+    // pane's lifetime still sums correctly after the pane is gone.
+    #[test]
+    fn cleanup_pane_removes_only_target_pane() {
+        let m = BackpressureMetrics::default();
+        m.record_segment_dropped(1);
+        m.record_segment_dropped(1);
+        m.record_segment_dropped(2);
+        m.record_segment_dropped(3);
+        assert_eq!(m.panes_with_drops(), 3);
+        assert_eq!(m.segments_dropped_total(), 4);
+
+        assert!(m.cleanup_pane(2));
+        assert_eq!(m.panes_with_drops(), 2);
+        assert_eq!(m.segments_dropped_for_pane(1), 2);
+        assert_eq!(m.segments_dropped_for_pane(2), 0);
+        assert_eq!(m.segments_dropped_for_pane(3), 1);
+        // Aggregate is preserved — it's a monotonic lifetime counter, not
+        // a by-pane sum, so cleanup does NOT rewrite the total.
+        assert_eq!(m.segments_dropped_total(), 4);
+
+        // Idempotent on a pane that was never inserted (healthy-pane case).
+        assert!(!m.cleanup_pane(999));
+        // Idempotent on a pane that was just removed.
+        assert!(!m.cleanup_pane(2));
     }
 
     #[test]

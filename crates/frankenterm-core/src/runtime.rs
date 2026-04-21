@@ -2125,6 +2125,7 @@ impl ObservationRuntime {
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
+        let backpressure = Arc::clone(self.metrics.backpressure_metrics());
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
@@ -2307,6 +2308,10 @@ impl ObservationRuntime {
                                 &pane_activity_tracker,
                             )
                             .await;
+                            // [review] Mirror ft-l6v1r teardown into
+                            // bd8a715e's per-pane drop attribution map
+                            // so it doesn't leak on pane closure.
+                            backpressure.cleanup_pane(*pane_id);
 
                             if let Some(ref adapter) = replay_capture {
                                 adapter.capture_lifecycle(
@@ -3385,6 +3390,13 @@ async fn handle_native_event(
                 pane_activity_tracker,
             )
             .await;
+            // [review] Mirror the ft-l6v1r teardown into the
+            // per-pane drop attribution map introduced by bd8a715e.
+            // Without this the `dropped_by_pane` HashMap leaks an
+            // `AtomicU64` per pane that ever dropped a segment, for
+            // the life of the runtime. See BackpressureMetrics::
+            // cleanup_pane for the full rationale.
+            backpressure.cleanup_pane(pane_id);
         }
     }
 }
