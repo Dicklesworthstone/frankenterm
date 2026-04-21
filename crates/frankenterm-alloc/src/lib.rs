@@ -6,8 +6,25 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Recover from `std::sync::Mutex` poisoning by taking the inner guard.
+///
+/// The pane-arena registry stores a `HashMap<u64, PaneArenaState>` where
+/// every value is `Copy` (plain u64 counters) and all mutations go through
+/// atomic `HashMap::insert` / `HashMap::remove` calls. A panic inside any
+/// of those mutations cannot leave the map structurally corrupted in safe
+/// Rust, so the correct response to lock poisoning is to proceed with the
+/// recovered guard rather than panic-cascade every subsequent caller of
+/// `reserve` / `release` / `stats` / `snapshot` (8 sites below). This
+/// mirrors the `unwrap_or_else(PoisonError::into_inner)` idiom used
+/// throughout the workspace (runtime.rs, events.rs).
+fn recover_poisoned<'a, T>(
+    result: Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>,
+) -> MutexGuard<'a, T> {
+    result.unwrap_or_else(PoisonError::into_inner)
+}
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -274,10 +291,7 @@ impl PaneArenaRegistry {
 
     /// Reserve (or reuse) a logical arena for the given pane.
     pub fn reserve(&self, pane_id: u64) -> ReserveOutcome {
-        let mut guard = self
-            .arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned");
+        let mut guard = recover_poisoned(self.arenas_by_pane.lock());
 
         if let Some(existing) = guard.get(&pane_id).copied() {
             return ReserveOutcome::Existing(existing.arena);
@@ -290,36 +304,28 @@ impl PaneArenaRegistry {
 
     /// Release a pane reservation.
     pub fn release(&self, pane_id: u64) -> Option<PaneArena> {
-        self.arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        recover_poisoned(self.arenas_by_pane.lock())
             .remove(&pane_id)
             .map(|state| state.arena)
     }
 
     /// Update the logical tracked byte count for a pane arena.
     pub fn set_tracked_bytes(&self, pane_id: u64, tracked_bytes: usize) -> Option<PaneArenaStats> {
-        self.arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        recover_poisoned(self.arenas_by_pane.lock())
             .get_mut(&pane_id)
             .map(|state| state.update_tracked_bytes(tracked_bytes))
     }
 
     /// Lookup the accounting state for a pane reservation.
     pub fn stats(&self, pane_id: u64) -> Option<PaneArenaStats> {
-        self.arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        recover_poisoned(self.arenas_by_pane.lock())
             .get(&pane_id)
             .map(|state| state.stats)
     }
 
     /// Lookup an existing pane reservation.
     pub fn get(&self, pane_id: u64) -> Option<PaneArena> {
-        self.arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        recover_poisoned(self.arenas_by_pane.lock())
             .get(&pane_id)
             .map(|state| state.arena)
     }
@@ -327,9 +333,7 @@ impl PaneArenaRegistry {
     /// Number of tracked pane reservations.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        recover_poisoned(self.arenas_by_pane.lock())
             .len()
     }
 
@@ -342,10 +346,7 @@ impl PaneArenaRegistry {
     /// Sorted snapshot of all pane reservations.
     #[must_use]
     pub fn snapshot(&self) -> Vec<PaneArena> {
-        let mut values: Vec<_> = self
-            .arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        let mut values: Vec<_> = recover_poisoned(self.arenas_by_pane.lock())
             .values()
             .map(|state| state.arena)
             .collect();
@@ -356,10 +357,7 @@ impl PaneArenaRegistry {
     /// Sorted snapshot of all pane reservations with accounting state.
     #[must_use]
     pub fn stats_snapshot(&self) -> Vec<PaneArenaSnapshot> {
-        let mut values: Vec<_> = self
-            .arenas_by_pane
-            .lock()
-            .expect("pane arena registry lock poisoned")
+        let mut values: Vec<_> = recover_poisoned(self.arenas_by_pane.lock())
             .values()
             .map(|state| PaneArenaSnapshot {
                 arena: state.arena,
