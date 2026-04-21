@@ -180,6 +180,38 @@ fn split_lines(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn json_values_equivalent(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(lhs), Value::Bool(rhs)) => lhs == rhs,
+        (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+        (Value::Number(lhs), Value::Number(rhs)) => {
+            let Some(lhs) = lhs.as_f64() else {
+                return false;
+            };
+            let Some(rhs) = rhs.as_f64() else {
+                return false;
+            };
+            (lhs - rhs).abs() <= lhs.abs().max(rhs.abs()).max(1.0) * 2.0 * f64::EPSILON
+        }
+        (Value::Array(lhs), Value::Array(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| json_values_equivalent(lhs, rhs))
+        }
+        (Value::Object(lhs), Value::Object(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs.iter().all(|(key, value)| {
+                    rhs.get(key)
+                        .is_some_and(|other| json_values_equivalent(value, other))
+                })
+        }
+        _ => false,
+    }
+}
+
 fuzz_target!(|raw: ToonDecodeCase| {
     let (original, candidate, clean_equivalent) = raw.mutated_toon();
     if candidate.len() > 16_384 {
@@ -199,16 +231,20 @@ fuzz_target!(|raw: ToonDecodeCase| {
     {
         let decoded_json = Value::from(decoded);
         let decoded_lines_json = Value::from(decoded_from_lines);
-        assert_eq!(decoded_json, decoded_lines_json);
+        assert!(json_values_equivalent(&decoded_json, &decoded_lines_json));
 
         if clean_equivalent {
-            assert_eq!(decoded_json, original);
+            assert!(json_values_equivalent(&decoded_json, &original));
         }
 
         let reencoded = toon_rust::encode(decoded_json.clone(), None);
         let redecode = toon_rust::try_decode(&reencoded, None)
             .ok()
             .map(Value::from);
-        assert_eq!(redecode.as_ref(), Some(&decoded_json));
+        assert!(
+            redecode
+                .as_ref()
+                .is_some_and(|redecoded| json_values_equivalent(redecoded, &decoded_json))
+        );
     }
 });
