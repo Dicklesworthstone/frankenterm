@@ -82,9 +82,40 @@ pub fn daemonize(config: &config::ConfigHandle) -> anyhow::Result<Option<RawFd>>
 
     match fork()? {
         Fork::Parent(pid) => {
-            let mut status = 0;
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-            std::process::exit(0);
+            // Propagate the intermediate child's exit status to the
+            // invoking shell so a failure anywhere in the child's
+            // post-fork setup (setsid, the second fork, pidfile write,
+            // stdio redirection) surfaces as a non-zero exit on the
+            // grandparent — not silent success.
+            //
+            // Earlier revisions ignored both the waitpid return value
+            // and the status word: a failing intermediate child would
+            // still see the grandparent exit(0), leaving the user
+            // thinking "daemon started" when nothing was actually
+            // running.
+            let mut status: libc::c_int = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == -1 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "frankenterm-mux-server: waitpid({pid}) on daemonize \
+                     intermediate failed: {err}; exit status unknown"
+                );
+                std::process::exit(1);
+            }
+            if libc::WIFEXITED(status) {
+                std::process::exit(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                let sig = libc::WTERMSIG(status);
+                eprintln!(
+                    "frankenterm-mux-server: daemonize intermediate child \
+                     killed by signal {sig}"
+                );
+                // Conventional encoding: 128 + signal number.
+                std::process::exit(128 + sig);
+            }
+            std::process::exit(1);
         }
         Fork::Child(_) => {}
     }
