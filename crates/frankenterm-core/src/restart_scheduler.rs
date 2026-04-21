@@ -211,13 +211,18 @@ pub fn activity_minimum(activity: f64) -> f64 {
 
 /// Compute recency penalty: penalize if too soon after last restart.
 ///
-/// Returns a value in (0, 1) that increases as more time passes since last restart.
+/// Returns a value in `[0, 1)` that increases as more time passes since last
+/// restart. Negative `hours_since_last` (clock skew / NTP regression leaving
+/// `current_ms < last_restart_ms`) is treated as "just restarted" — clamped
+/// to `0` so the output stays in bounds and the scheduler never ranks a
+/// skewed-clock window above a well-behaved one.
 #[must_use]
 pub fn recency_penalty(hours_since_last: f64, cooldown_hours: f64) -> f64 {
     if cooldown_hours <= 0.0 {
         return 1.0;
     }
-    1.0 - (-hours_since_last / cooldown_hours).exp()
+    let clamped = hours_since_last.max(0.0);
+    1.0 - (-clamped / cooldown_hours).exp()
 }
 
 /// Score a single candidate window.
@@ -556,6 +561,44 @@ mod tests {
     #[test]
     fn recency_penalty_zero_cooldown() {
         assert!((recency_penalty(5.0, 0.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn recency_penalty_clock_regression_clamped_to_zero() {
+        // NTP / clock-skew regression can produce a negative `hours_since_last`.
+        // Before the clamp, `1 - exp(-(-x)/c)` returned a number > 1, which
+        // flipped the penalty to a NEGATIVE value, propagated through
+        // `score_window` as a negative score, and corrupted ranking.
+        // Pin the invariant: negative input is treated as "just restarted"
+        // (penalty 0) so the output is always in [0, 1).
+        let p = recency_penalty(-5.0, 12.0);
+        assert!(
+            (p - 0.0).abs() < f64::EPSILON,
+            "negative hours_since_last must clamp to 0 penalty, got {p}"
+        );
+        // Large negative should also clamp — no unbounded exp() blow-up.
+        let p_big = recency_penalty(-1_000.0, 12.0);
+        assert!(
+            (p_big - 0.0).abs() < f64::EPSILON,
+            "large negative hours_since_last must clamp to 0 penalty, got {p_big}"
+        );
+    }
+
+    #[test]
+    fn score_window_nonnegative_under_clock_regression() {
+        // Guard: a clock regression must not push `score_window` below zero.
+        // Before the fix, recency_penalty went negative and the score
+        // followed, silently corrupting the sort in `evaluate`.
+        let config = RestartSchedulerConfig {
+            hazard_threshold: 0.5,
+            cooldown_hours: 12.0,
+            ..Default::default()
+        };
+        let s = score_window(0.9, 0.1, -10.0, &config);
+        assert!(
+            s >= 0.0,
+            "score under clock regression must not be negative: {s}"
+        );
     }
 
     #[test]
