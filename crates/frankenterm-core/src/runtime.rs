@@ -29,7 +29,9 @@ use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::backpressure::{BackpressureConfig, BackpressureManager, BackpressureMetrics, QueueDepths};
+use crate::backpressure::{
+    BackpressureConfig, BackpressureManager, BackpressureMetrics, QueueDepths,
+};
 use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
@@ -78,10 +80,7 @@ use crate::wezterm::{
 };
 
 fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
-    {
-        rx.has_changed()
-    }
-
+    { rx.has_changed() }
 }
 
 type RuntimeLoopCx = crate::cx::Cx;
@@ -95,25 +94,18 @@ async fn persist_captured_segment_for_runtime(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    {
-        persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await
-    }
-
+    { persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
-    {
-        rx.borrow_and_clone()
-    }
-
+    { rx.borrow_and_clone() }
 }
 
 async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
     {
         let _ = crate::runtime_compat::sleep_with_cx(runtime_cx, duration).await;
     }
-
 }
 
 const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -151,10 +143,7 @@ async fn runtime_timeout<F>(
 where
     F: Future,
 {
-    {
-        crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await
-    }
-
+    { crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await }
 }
 
 fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
@@ -163,10 +152,7 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    {
-        crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
-    }
-
+    { crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn) }
 }
 
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
@@ -228,10 +214,7 @@ impl Drop for StreamingTasks {
 }
 
 async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
-    {
-        rx.recv(runtime_cx).await.ok()
-    }
-
+    { rx.recv(runtime_cx).await.ok() }
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -240,10 +223,7 @@ async fn send_runtime_channel<T>(
     tx: &mpsc::Sender<T>,
     value: T,
 ) -> bool {
-    {
-        tx.send(runtime_cx, value).await.is_ok()
-    }
-
+    { tx.send(runtime_cx, value).await.is_ok() }
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,15 +2300,13 @@ impl ObservationRuntime {
 
                         // Handle closed panes
                         for pane_id in &diff.closed_panes {
-                            {
-                                let mut cursors = cursors.write().await;
-                                cursors.remove(pane_id);
-                            }
-
-                            {
-                                let mut contexts = detection_contexts.write().await;
-                                contexts.remove(pane_id);
-                            }
+                            remove_runtime_pane_state_for_pane(
+                                *pane_id,
+                                &cursors,
+                                &detection_contexts,
+                                &pane_activity_tracker,
+                            )
+                            .await;
 
                             if let Some(ref adapter) = replay_capture {
                                 adapter.capture_lifecycle(
@@ -2761,6 +2739,7 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
+        let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
         let storage = self.storage.clone();
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
@@ -2891,6 +2870,7 @@ impl ObservationRuntime {
                                     &capture_tx,
                                     &cursors,
                                     &detection_contexts,
+                                    &pane_activity_tracker,
                                     &storage,
                                     event_bus.as_ref(),
                                     &pane_filter,
@@ -2905,6 +2885,7 @@ impl ObservationRuntime {
                                     &capture_tx,
                                     &cursors,
                                     &detection_contexts,
+                                    &pane_activity_tracker,
                                     &storage,
                                     event_bus.as_ref(),
                                     &pane_filter,
@@ -3267,6 +3248,7 @@ async fn handle_native_event(
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
+    pane_activity_tracker: &Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     storage: &StorageHandle,
     event_bus: Option<&Arc<EventBus>>,
     pane_filter: &PaneFilterConfig,
@@ -3278,7 +3260,15 @@ async fn handle_native_event(
             data,
             timestamp_ms,
         } => {
-            emit_native_output_delta(pane_id, data, timestamp_ms, capture_tx, cursors, backpressure).await;
+            emit_native_output_delta(
+                pane_id,
+                data,
+                timestamp_ms,
+                capture_tx,
+                cursors,
+                backpressure,
+            )
+            .await;
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
             let mut gap_segment = None;
@@ -3388,12 +3378,13 @@ async fn handle_native_event(
             }
         }
         NativeEvent::PaneDestroyed { pane_id, .. } => {
-            let mut cursors_guard = cursors.write().await;
-            cursors_guard.remove(&pane_id);
-            drop(cursors_guard);
-
-            let mut contexts = detection_contexts.write().await;
-            contexts.remove(&pane_id);
+            remove_runtime_pane_state_for_pane(
+                pane_id,
+                cursors,
+                detection_contexts,
+                pane_activity_tracker,
+            )
+            .await;
         }
     }
 }
@@ -3558,6 +3549,52 @@ struct RuntimePaneStateCompaction {
     cursors: CacheCompactionStats,
     detection_contexts: CacheCompactionStats,
     pane_activity_tracker: CacheCompactionStats,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimePaneStateRemoval {
+    cursor_removed: bool,
+    detection_context_removed: bool,
+    pane_activity_removed: bool,
+}
+
+fn remove_runtime_pane_state(
+    pane_id: u64,
+    cursors: &mut HashMap<u64, PaneCursor>,
+    detection_contexts: &mut HashMap<u64, DetectionContext>,
+    pane_activity_tracker: &mut HashMap<u64, PaneActivityState>,
+) -> RuntimePaneStateRemoval {
+    RuntimePaneStateRemoval {
+        cursor_removed: cursors.remove(&pane_id).is_some(),
+        detection_context_removed: detection_contexts.remove(&pane_id).is_some(),
+        pane_activity_removed: pane_activity_tracker.remove(&pane_id).is_some(),
+    }
+}
+
+async fn remove_runtime_pane_state_for_pane(
+    pane_id: u64,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
+    pane_activity_tracker: &Arc<RwLock<HashMap<u64, PaneActivityState>>>,
+) -> RuntimePaneStateRemoval {
+    let mut cursors_guard = cursors.write().await;
+    let mut contexts_guard = detection_contexts.write().await;
+    let mut tracker_guard = pane_activity_tracker.write().await;
+    let removal = remove_runtime_pane_state(
+        pane_id,
+        &mut cursors_guard,
+        &mut contexts_guard,
+        &mut tracker_guard,
+    );
+
+    debug_assert!(
+        !cursors_guard.contains_key(&pane_id)
+            && !contexts_guard.contains_key(&pane_id)
+            && !tracker_guard.contains_key(&pane_id),
+        "pane {pane_id} leaked runtime pane state after teardown: {removal:?}"
+    );
+
+    removal
 }
 
 fn compact_runtime_pane_state(
@@ -3937,10 +3974,7 @@ fn classify_backpressure_tier(
 }
 
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
-    {
-        tx.capacity()
-    }
-
+    { tx.capacity() }
 }
 
 impl RuntimeHandle {
@@ -5540,6 +5574,60 @@ mod tests {
         assert_eq!(stats.cursors.removed_entries, 1);
         assert_eq!(stats.detection_contexts.removed_entries, 1);
         assert_eq!(stats.pane_activity_tracker.removed_entries, 1);
+        assert!(cursors.contains_key(&1));
+        assert!(!cursors.contains_key(&2));
+        assert!(detection_contexts.contains_key(&1));
+        assert!(!detection_contexts.contains_key(&2));
+        assert!(pane_activity_tracker.contains_key(&1));
+        assert!(!pane_activity_tracker.contains_key(&2));
+    }
+
+    #[test]
+    fn ft_l6v1r_pane_cleanup_removes_destroyed_pane_from_runtime_maps() {
+        let mut cursors = HashMap::from([
+            (1_u64, PaneCursor::from_seq(1, 4)),
+            (2_u64, PaneCursor::from_seq(2, 9)),
+        ]);
+        let mut detection_contexts = HashMap::from([
+            (1_u64, DetectionContext::new()),
+            (2_u64, DetectionContext::new()),
+        ]);
+        let mut pane_activity_tracker = HashMap::from([
+            (
+                1_u64,
+                PaneActivityState {
+                    last_seq: 4,
+                    last_output_at_ms: 1_000,
+                    generation: 1,
+                    first_seen_at_ms: 1_000,
+                },
+            ),
+            (
+                2_u64,
+                PaneActivityState {
+                    last_seq: 9,
+                    last_output_at_ms: 2_000,
+                    generation: 1,
+                    first_seen_at_ms: 2_000,
+                },
+            ),
+        ]);
+
+        let removed = remove_runtime_pane_state(
+            2,
+            &mut cursors,
+            &mut detection_contexts,
+            &mut pane_activity_tracker,
+        );
+
+        assert_eq!(
+            removed,
+            RuntimePaneStateRemoval {
+                cursor_removed: true,
+                detection_context_removed: true,
+                pane_activity_removed: true,
+            }
+        );
         assert!(cursors.contains_key(&1));
         assert!(!cursors.contains_key(&2));
         assert!(detection_contexts.contains_key(&1));
