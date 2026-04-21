@@ -812,7 +812,26 @@ rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+### When rch is down: the exit-143 failure mode
+
+The fails-open story is **aspirational**, not current. When `force_remote=true` is set in `~/.config/rch/config.toml` and the remote workers are unhealthy, the intercepted cargo subprocess receives **SIGTERM (exit 143)** with no diagnostic. Operators see `cargo test foo ... exit 143` and have to know the bypass recipe exists — new agents routinely lose 30 minutes rediscovering it (ft-45805).
+
+**Symptoms:**
+- `cargo <anything>` exits with code 143 and no stderr explanation
+- `rch doctor` shows workers down or timing out
+- `rch workers probe --all` shows most/all workers unreachable
+
+**Bypass recipe — use this whenever you see exit 143 from cargo:**
+
+```bash
+scripts/cargo-local.sh test -p frankenterm-core --lib
+scripts/cargo-local.sh build --release
+scripts/cargo-local.sh clippy --all-targets
+```
+
+The script hardcodes the known-good local recipe: unique per-agent `CARGO_TARGET_DIR` under `/tmp`, Homebrew clang for `CC`/`CXX` (aws-lc-sys and other native deps fail without this — the `cc` shell alias on this machine maps to `claude`, not the C compiler), and a python `fork()+setsid()` that breaks out of the Claude-Code-owned process group so the rch hook cannot SIGTERM the cargo subprocess. Override knobs (target dir, compiler paths, disable the fork) are documented in the script header.
+
+The long-term fix lives in rch itself (catch worker-SIGTERM, fall back to local, mark worker unhealthy) — rch is not in this repo, so ft-45805 closes out with the documented bypass rather than a code change.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
