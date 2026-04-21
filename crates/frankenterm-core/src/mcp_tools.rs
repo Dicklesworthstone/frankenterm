@@ -1794,11 +1794,29 @@ impl ToolHandler for WaEventsTool {
 pub(super) struct WaSendTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    wezterm: crate::wezterm::WeztermHandle,
 }
 
 impl WaSendTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        Self {
+            config,
+            db_path,
+            wezterm: default_wezterm_handle(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_wezterm_handle(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        wezterm: crate::wezterm::WeztermHandle,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            wezterm,
+        }
     }
 }
 
@@ -1900,7 +1918,7 @@ impl ToolHandler for WaSendTool {
             let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             let storage =
                 StorageHandle::new_with_cx(&wezterm_cx, &db_path.to_string_lossy()).await?;
-            let wezterm = default_wezterm_handle();
+            let wezterm = Arc::clone(&self.wezterm);
             let pane_info = wezterm
                 .get_pane_with_cx(&wezterm_cx, params.pane_id)
                 .await?;
@@ -4696,14 +4714,15 @@ mod tests {
     #[cfg(unix)]
     use super::set_cass_test_binary_override;
     use super::{
-        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content, McpContext,
-        PaneCapabilities, PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler,
-        WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool,
-        WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool,
-        WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool,
-        WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
-        WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-        WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
+        ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content,
+        MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
+        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
+        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
+        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
+        WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool,
+        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
+        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
+        WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
         mcp_event_mutation_decision_context, mcp_get_text_policy_input,
         mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
         mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
@@ -6109,6 +6128,48 @@ exit 17",
             MAX_SEND_TEXT_BYTES,
             typical_max_paste
         );
+    }
+
+    #[test]
+    fn wa_send_dry_run_reports_terminal_control_byte_risk() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let tool = WaSendTool::with_wezterm_handle(
+                config(),
+                Arc::clone(&db),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": 42,
+                        "text": "npm test\u{0003}",
+                        "dry_run": true
+                    }),
+                )
+                .expect("wa.send dry-run call"),
+            );
+
+            assert_eq!(envelope["ok"], true);
+            assert_eq!(envelope["data"]["dry_run"], true);
+            let factor_ids: Vec<&str> =
+                envelope["data"]["injection"]["decision"]["context"]["risk"]["factors"]
+                    .as_array()
+                    .expect("risk factors array")
+                    .iter()
+                    .filter_map(|factor| factor["id"].as_str())
+                    .collect();
+            assert!(
+                factor_ids.contains(&"content.terminal_control_bytes"),
+                "dry-run policy preview should surface terminal-control-byte risk, got {:?}",
+                factor_ids
+            );
+        });
     }
 
     #[test]

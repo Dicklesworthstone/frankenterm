@@ -4855,6 +4855,20 @@ impl PolicyEngine {
                 "Complex piped command chain",
             );
         }
+
+        // Terminal control bytes
+        if text
+            .bytes()
+            .any(|byte| matches!(byte, 0x03 | 0x04 | 0x1a | 0x1b))
+        {
+            self.add_factor(
+                factors,
+                "content.terminal_control_bytes",
+                RiskCategory::Content,
+                25,
+                "Payload contains terminal-control bytes (Ctrl+C/D/Z or ESC)",
+            );
+        }
     }
 
     /// Map a risk score to a policy decision
@@ -9915,6 +9929,71 @@ mod tests {
             risk.factors
                 .iter()
                 .any(|f| f.id == "content.sudo_elevation")
+        );
+    }
+
+    #[test]
+    fn risk_score_flags_terminal_control_bytes_for_ctrl_c() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("npm test\x03");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.terminal_control_bytes")
+        );
+    }
+
+    #[test]
+    fn risk_score_plain_text_does_not_flag_terminal_control_bytes() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("npm test");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            !risk
+                .factors
+                .iter()
+                .any(|f| f.id == "content.terminal_control_bytes")
+        );
+    }
+
+    #[test]
+    fn risk_score_flags_terminal_control_bytes_for_escape_prefix() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("\x1bc");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.terminal_control_bytes")
+        );
+    }
+
+    #[test]
+    fn risk_score_flags_terminal_control_bytes_for_bracketed_paste() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("\x1b[200~echo forged\x1b[201~");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.terminal_control_bytes")
         );
     }
 
