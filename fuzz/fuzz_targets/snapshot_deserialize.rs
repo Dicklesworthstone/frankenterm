@@ -36,6 +36,7 @@ enum MissingField {
     CapturedAt,
     Windows,
     PaneTree,
+    Children,
 }
 
 #[derive(Arbitrary, Debug, Clone)]
@@ -45,6 +46,7 @@ enum WrongField {
     Windows,
     ActiveTabIndex,
     PaneTree,
+    Children,
 }
 
 #[derive(Arbitrary, Debug, Clone)]
@@ -342,6 +344,11 @@ fn apply_missing_field(json: &mut Value, field: &MissingField) {
                 tab.remove("pane_tree");
             }
         }
+        MissingField::Children => {
+            if let Some(pane_tree) = first_pane_tree_object_mut(root) {
+                pane_tree.remove("children");
+            }
+        }
     }
 }
 
@@ -376,6 +383,11 @@ fn apply_mistyped_field(json: &mut Value, field: &WrongField) {
                 tab.insert("pane_tree".to_string(), Value::String("wrong".to_string()));
             }
         }
+        WrongField::Children => {
+            if let Some(pane_tree) = first_pane_tree_object_mut(root) {
+                pane_tree.insert("children".to_string(), Value::String("wrong".to_string()));
+            }
+        }
     }
 }
 
@@ -391,6 +403,12 @@ fn first_tab_object_mut(root: &mut Map<String, Value>) -> Option<&mut Map<String
         .get_mut("tabs")?
         .as_array_mut()?
         .first_mut()?
+        .as_object_mut()
+}
+
+fn first_pane_tree_object_mut(root: &mut Map<String, Value>) -> Option<&mut Map<String, Value>> {
+    first_tab_object_mut(root)?
+        .get_mut("pane_tree")?
         .as_object_mut()
 }
 
