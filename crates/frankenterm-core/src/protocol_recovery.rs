@@ -1582,6 +1582,78 @@ mod tests {
         }
     }
 
+    // [ft-7axpo] Regression: jitter must NOT be deterministic across calls.
+    // The pre-fix implementation derived jitter from `sin(attempt * 7.13)`,
+    // which produced byte-identical delays in every RecoveryEngine for a
+    // given attempt number — defeating the whole point of jitter. In a
+    // fleet that lost connectivity at the same moment, all engines would
+    // retry at the same instants, stacking the thundering herd we claimed
+    // to be smoothing.
+    #[test]
+    fn delay_for_attempt_jitter_is_randomized_across_calls() {
+        let config = RecoveryConfig {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_fraction: 0.3,
+            ..RecoveryConfig::default()
+        };
+
+        // Sample many times at the SAME attempt index. With real
+        // randomness + jitter_fraction=0.3 + capped_ms=100ms, the
+        // jittered output spans [70ms, 130ms]. We should see at least
+        // 10 distinct millisecond values in 256 samples; the pre-fix
+        // deterministic sin()-derived jitter would produce exactly 1.
+        let mut seen: std::collections::HashSet<u128> =
+            std::collections::HashSet::with_capacity(256);
+        for _ in 0..256 {
+            seen.insert(config.delay_for_attempt(3).as_millis());
+        }
+        assert!(
+            seen.len() >= 10,
+            "expected ≥10 distinct jittered delays across 256 samples, \
+             got {} (pre-fix regression: deterministic sin() jitter)",
+            seen.len()
+        );
+
+        // Every sampled delay must stay within the jitter band
+        // capped_ms * (1 ± jitter_fraction), with clamping at 1ms.
+        // For attempt=3, capped_ms = 100 * 2^3 = 800ms (within 10s cap),
+        // jitter_range = 800 * 0.3 = 240ms, band = [560ms, 1040ms].
+        let capped_ms = 800u128;
+        let jitter_range = 240u128;
+        for d_ms in &seen {
+            assert!(
+                *d_ms >= capped_ms.saturating_sub(jitter_range).max(1),
+                "delay {}ms below expected lower bound",
+                d_ms
+            );
+            assert!(
+                *d_ms <= capped_ms + jitter_range,
+                "delay {}ms above expected upper bound",
+                d_ms
+            );
+        }
+    }
+
+    // [ft-7axpo] Complementary guarantee: when jitter_fraction is zero,
+    // output IS deterministic. Tests that pin exact ms values rely on
+    // this, and the `if jitter_range > 0.0` fast-path preserves it.
+    #[test]
+    fn delay_for_attempt_zero_jitter_is_deterministic() {
+        let config = RecoveryConfig {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_fraction: 0.0,
+            ..RecoveryConfig::default()
+        };
+        let first = config.delay_for_attempt(3);
+        for _ in 0..64 {
+            assert_eq!(config.delay_for_attempt(3), first);
+        }
+    }
+
     #[test]
     fn recovery_error_display_all_variants() {
         let e1 = RecoveryError::CircuitOpen;
