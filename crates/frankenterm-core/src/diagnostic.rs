@@ -35,6 +35,14 @@ pub struct DiagnosticOptions {
     pub workflow_limit: usize,
     /// Output directory override (defaults to workspace diag_dir).
     pub output: Option<PathBuf>,
+    /// [ft-lokam] Include the caller's full absolute working
+    /// directory in `environment.json`. Default `false`: the diag
+    /// bundle only embeds the workspace *basename*, which is enough
+    /// for support triage without leaking `/Users/<name>/projects/<
+    /// secret-project-name>` into a shared bundle. Operators who
+    /// explicitly need the full path (e.g. reproducing a mount-point
+    /// issue) can flip this to `true` at bundle time.
+    pub include_full_cwd: bool,
 }
 
 impl Default for DiagnosticOptions {
@@ -44,6 +52,8 @@ impl Default for DiagnosticOptions {
             audit_limit: 50,
             workflow_limit: 50,
             output: None,
+            // [ft-lokam] secure default: only leak the basename.
+            include_full_cwd: false,
         }
     }
 }
@@ -71,11 +81,37 @@ struct EnvironmentInfo {
     arch: String,
     /// Rust version used to compile wa.
     rust_version: Option<String>,
-    /// Current working directory.
+    /// Current working directory (scrubbed to basename by default; full
+    /// absolute path only when DiagnosticOptions.include_full_cwd is true).
     cwd: Option<String>,
 }
 
-fn gather_environment() -> EnvironmentInfo {
+/// [ft-lokam] Reduce an absolute path to its final component so diag
+/// bundles don't silently exfil user home/project segments. For a path
+/// the scrubber cannot split (root, prefix-only, or non-Unicode leaf),
+/// falls back to a constant `<scrubbed>` marker rather than leaking
+/// the raw value.
+pub(crate) fn scrub_path_to_basename(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "<scrubbed>".to_string())
+}
+
+/// [ft-lokam] Compose the `cwd` field for the diag bundle's
+/// environment.json. Honors `DiagnosticOptions.include_full_cwd` so
+/// operators with a legitimate reason can still opt into the absolute
+/// path.
+fn gather_cwd(include_full: bool) -> Option<String> {
+    let full = std::env::current_dir().ok()?;
+    if include_full {
+        Some(full.display().to_string())
+    } else {
+        Some(scrub_path_to_basename(&full))
+    }
+}
+
+fn gather_environment(opts: &DiagnosticOptions) -> EnvironmentInfo {
     EnvironmentInfo {
         wa_version: crate::VERSION.to_string(),
         schema_version: SCHEMA_VERSION,
@@ -84,9 +120,7 @@ fn gather_environment() -> EnvironmentInfo {
         rust_version: option_env!("FT_RUSTC_VERSION")
             .or(option_env!("RUSTC_VERSION"))
             .map(String::from),
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string()),
+        cwd: gather_cwd(opts.include_full_cwd),
     }
 }
 
@@ -511,8 +545,9 @@ pub async fn generate_bundle(
 
     let mut file_count = 0usize;
 
-    // 1. Environment info
-    let env_info = gather_environment();
+    // 1. Environment info — [ft-lokam] pass caller's opts so
+    //    include_full_cwd flows through; default hides absolute cwd.
+    let env_info = gather_environment(opts);
     write_json_file(&output_dir, "environment.json", &env_info)?;
     file_count += 1;
 
@@ -755,7 +790,9 @@ pub async fn generate_bundle_with_cx(
 
     let mut file_count = 0usize;
 
-    let env_info = gather_environment();
+    // [ft-lokam] cx-first path must honor include_full_cwd same as
+    // the legacy generate_bundle above.
+    let env_info = gather_environment(opts);
     write_json_file(&output_dir, "environment.json", &env_info)?;
     file_count += 1;
 
@@ -1040,7 +1077,7 @@ mod tests {
 
     #[test]
     fn environment_info_populated() {
-        let env = gather_environment();
+        let env = gather_environment(&DiagnosticOptions::default());
         assert!(!env.wa_version.is_empty());
         assert!(!env.os.is_empty());
         assert!(!env.arch.is_empty());
@@ -1827,7 +1864,7 @@ mod tests {
 
     #[test]
     fn environment_info_serializes() {
-        let env = gather_environment();
+        let env = gather_environment(&DiagnosticOptions::default());
         let json = serde_json::to_string_pretty(&env).expect("serialize");
         assert!(json.contains("\"wa_version\""));
         assert!(json.contains("\"schema_version\""));
@@ -1837,7 +1874,7 @@ mod tests {
 
     #[test]
     fn environment_info_has_cwd() {
-        let env = gather_environment();
+        let env = gather_environment(&DiagnosticOptions::default());
         assert!(env.cwd.is_some(), "cwd should be available in test env");
     }
 
@@ -2740,7 +2777,7 @@ mod tests {
 
     #[test]
     fn environment_info_schema_version_matches_constant() {
-        let env = gather_environment();
+        let env = gather_environment(&DiagnosticOptions::default());
         assert_eq!(
             env.schema_version, SCHEMA_VERSION,
             "schema_version should always match SCHEMA_VERSION"
@@ -2749,7 +2786,7 @@ mod tests {
 
     #[test]
     fn environment_info_os_and_arch_are_known_values() {
-        let env = gather_environment();
+        let env = gather_environment(&DiagnosticOptions::default());
         // OS should be one of the standard Rust targets
         let known_os = ["linux", "macos", "windows", "freebsd", "android", "ios"];
         assert!(
@@ -3118,5 +3155,106 @@ mod tests {
         assert!(content.len() > 50_000, "should be a substantial file");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── ft-lokam path-scrubbing regressions ─────────────────────────
+
+    #[test]
+    fn scrub_path_to_basename_strips_home_and_project_segments() {
+        let scrubbed = scrub_path_to_basename(std::path::Path::new(
+            "/Users/alice/projects/secret-startup-pitch-deck",
+        ));
+        // Only the final component survives; the username, project
+        // path, and mount point must all be gone.
+        assert_eq!(scrubbed, "secret-startup-pitch-deck");
+        assert!(!scrubbed.contains('/'));
+        assert!(!scrubbed.contains("Users"));
+        assert!(!scrubbed.contains("alice"));
+    }
+
+    #[test]
+    fn scrub_path_to_basename_handles_root_and_empty() {
+        // Root `/` has no file_name — sentinel fallback MUST be used
+        // rather than returning the absolute root or panicking.
+        let scrubbed = scrub_path_to_basename(std::path::Path::new("/"));
+        assert_eq!(scrubbed, "<scrubbed>");
+        let scrubbed_empty = scrub_path_to_basename(std::path::Path::new(""));
+        assert_eq!(scrubbed_empty, "<scrubbed>");
+    }
+
+    #[test]
+    fn scrub_path_to_basename_handles_relative_path() {
+        let scrubbed =
+            scrub_path_to_basename(std::path::Path::new("relative/to/cwd/some-dir"));
+        assert_eq!(scrubbed, "some-dir");
+    }
+
+    #[test]
+    fn gather_cwd_default_is_not_absolute_path() {
+        // include_full=false: output must be a single path
+        // component, not an absolute path starting with `/` or a
+        // Windows drive letter.
+        let cwd = gather_cwd(false).expect("process cwd must be readable");
+        assert!(
+            !cwd.starts_with('/') && !cwd.contains(":\\"),
+            "default diag cwd must not leak absolute path: {cwd}"
+        );
+        assert!(
+            !cwd.contains('/') && !cwd.contains('\\'),
+            "default diag cwd must be a single component, got {cwd}"
+        );
+    }
+
+    #[test]
+    fn gather_cwd_full_opt_in_returns_absolute_path() {
+        // include_full=true: explicit opt-in for operators who need
+        // the absolute path (mount-point bugs, cross-host support).
+        let cwd = gather_cwd(true).expect("process cwd must be readable");
+        // On Unix the absolute path starts with `/`; on Windows it
+        // contains a drive letter prefix. Accept either.
+        let looks_absolute = cwd.starts_with('/') || cwd.contains(":\\");
+        assert!(
+            looks_absolute,
+            "include_full=true must return absolute path, got {cwd}"
+        );
+    }
+
+    #[test]
+    fn gather_environment_default_cwd_is_basename_only() {
+        let env = gather_environment(&DiagnosticOptions::default());
+        let cwd = env.cwd.expect("cwd must be populated");
+        assert!(
+            !cwd.starts_with('/') && !cwd.contains(":\\"),
+            "default environment.json must not emit absolute cwd: {cwd}"
+        );
+    }
+
+    #[test]
+    fn gather_environment_full_cwd_opt_in_emits_absolute_path() {
+        let opts = DiagnosticOptions {
+            include_full_cwd: true,
+            ..DiagnosticOptions::default()
+        };
+        let env = gather_environment(&opts);
+        let cwd = env.cwd.expect("cwd must be populated");
+        let looks_absolute = cwd.starts_with('/') || cwd.contains(":\\");
+        assert!(
+            looks_absolute,
+            "include_full_cwd=true must restore absolute path, got {cwd}"
+        );
+    }
+
+    #[test]
+    fn gather_environment_default_does_not_leak_home_username_segment() {
+        // Strongest guarantee of the fix: whatever the operator's
+        // cwd happens to be when they run `ft diag bundle`, the
+        // default environment.json output cannot contain the
+        // "/Users/<name>/" or "/home/<name>/" segment.
+        let env = gather_environment(&DiagnosticOptions::default());
+        let cwd = env.cwd.expect("cwd must be populated");
+        assert!(
+            !cwd.contains("/Users/") && !cwd.contains("/home/"),
+            "scrubbed cwd must not include home-segment: {cwd}"
+        );
     }
 }
