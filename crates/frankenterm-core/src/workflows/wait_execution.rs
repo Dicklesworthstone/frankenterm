@@ -623,12 +623,24 @@ pub(super) fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, Stri
 }
 
 /// Truncate string for logging, adding ellipsis if truncated.
+///
+/// `max_len` is measured in bytes. When `s` exceeds the budget the
+/// prefix is cut at the largest UTF-8 char boundary at or below
+/// `max_len - 3` so multi-byte codepoints (Cyrillic, CJK, emoji) do
+/// not panic the slice. `truncate_for_log` is called with arbitrary
+/// pane output (see `no_prompt_detected(last=…)` at wait_execution
+/// line 621), so adversarial UTF-8 from the user's terminal must
+/// never crash the workflow runner.
 pub(super) fn truncate_for_log(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        return s.to_string();
     }
+    let budget = max_len.saturating_sub(3).min(s.len());
+    let mut boundary = budget;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}...", &s[..boundary])
 }
 
 #[cfg(test)]
@@ -809,6 +821,61 @@ mod tests {
         // max_len=3 means saturating_sub(3)=0, so we get "..."
         let result = truncate_for_log("hello", 3);
         assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_emoji_at_boundary() {
+        // Regression: the prior implementation sliced by byte index
+        // at `max_len - 3`, which on a 4-byte codepoint landed mid-
+        // char and panicked with "byte index is not a char boundary".
+        // The fix snaps `boundary` down to the largest valid
+        // char-boundary at or below `max_len - 3`.
+        let result = truncate_for_log("🎉ab", 5);
+        assert!(
+            result.ends_with("..."),
+            "emoji input must truncate to suffix '...'; got {result:?}"
+        );
+        // The fix snaps to byte 0 (below the 🎉's 4-byte footprint)
+        // and emits just the ellipsis rather than panicking.
+        assert!(
+            !result.contains('\u{FFFD}'),
+            "truncation must not introduce replacement chars"
+        );
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_cyrillic_at_boundary() {
+        // Cyrillic chars are 2 bytes. Pick a max_len that lands
+        // mid-char to exercise the boundary snap.
+        let input = "привет мир"; // 19 bytes
+        for max_len in 4..=19 {
+            let result = truncate_for_log(input, max_len);
+            // Either the full string or a truncated prefix + "..."
+            assert!(
+                result == input || result.ends_with("..."),
+                "truncate_for_log({input:?}, {max_len}) produced unexpected output {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_for_log_does_not_panic_on_cjk_at_boundary() {
+        // CJK chars are 3 bytes. Walk every possible boundary.
+        let input = "日本語テスト"; // 6 chars × 3 bytes = 18 bytes
+        for max_len in 0..=20 {
+            let _ = truncate_for_log(input, max_len);
+        }
+    }
+
+    #[test]
+    fn truncate_for_log_max_len_below_ellipsis_emits_ellipsis_only() {
+        // max_len < 3 previously produced "..." (length 3, greater
+        // than the requested budget). The fix keeps the same output
+        // — this is acceptable for a logging helper — but cements it
+        // as a regression guard.
+        assert_eq!(truncate_for_log("x", 0), "...");
+        assert_eq!(truncate_for_log("xy", 1), "...");
+        assert_eq!(truncate_for_log("xyz", 2), "...");
     }
 
     // ========================================================================
