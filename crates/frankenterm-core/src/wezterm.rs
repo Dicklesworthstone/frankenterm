@@ -975,14 +975,24 @@ impl WeztermClient {
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            #[cfg(feature = "asupersync-runtime")]
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if self.mux_circuit_guard() {
-                match pool.list_panes().await {
+                #[cfg(feature = "asupersync-runtime")]
+                let mux_result = pool.list_panes_with_cx(&cx).await;
+                #[cfg(not(feature = "asupersync-runtime"))]
+                let mux_result = pool.list_panes().await;
+
+                match mux_result {
                     Ok(response) => {
                         self.mux_circuit_record_success();
                         return Ok(pane_info_from_mux_response(&response));
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("list_panes", e));
+                        }
                         tracing::debug!(
                             error = %e,
                             "mux pool list_panes failed, falling back to CLI"
@@ -1058,6 +1068,9 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("list_panes_with_cx", e));
+                        }
                         tracing::debug!(
                             error = %e,
                             "mux pool list_panes_with_cx failed, falling back to CLI"
@@ -1129,15 +1142,25 @@ impl WeztermClient {
         // extraction; fall back to CLI for `--escapes`.
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            #[cfg(feature = "asupersync-runtime")]
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if escapes {
                 tracing::debug!("mux pool get_text does not support escapes; falling back to CLI");
             } else if self.mux_circuit_guard() {
                 let mut pool_text: Option<String> = None;
                 'mux_text: {
-                    let changes = match pool.get_pane_render_changes(pane_id).await {
+                    #[cfg(feature = "asupersync-runtime")]
+                    let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
+                    #[cfg(not(feature = "asupersync-runtime"))]
+                    let changes_result = pool.get_pane_render_changes(pane_id).await;
+
+                    let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
                             self.mux_circuit_record_failure(&e);
+                            if !Self::mux_error_should_fallback_to_cli(&e) {
+                                return Err(Self::mux_cancelled_error("get_text", e));
+                            }
                             tracing::debug!(
                                 error = %e,
                                 "mux pool get_text: render_changes failed; falling back to CLI"
@@ -1188,7 +1211,14 @@ impl WeztermClient {
                             .min(scrollback_end);
 
                         #[allow(clippy::single_range_in_vec_init)]
-                        match pool.get_lines(pane_id, vec![start..chunk_end]).await {
+                        #[cfg(feature = "asupersync-runtime")]
+                        let lines_result = pool
+                            .get_lines_with_cx(&cx, pane_id, vec![start..chunk_end])
+                            .await;
+                        #[cfg(not(feature = "asupersync-runtime"))]
+                        let lines_result = pool.get_lines(pane_id, vec![start..chunk_end]).await;
+
+                        match lines_result {
                             Ok(resp) => {
                                 let (mut lines, _images) = resp.lines.extract_data();
                                 lines.sort_by_key(|(idx, _)| *idx);
@@ -1199,6 +1229,9 @@ impl WeztermClient {
                             }
                             Err(e) => {
                                 self.mux_circuit_record_failure(&e);
+                                if !Self::mux_error_should_fallback_to_cli(&e) {
+                                    return Err(Self::mux_cancelled_error("get_text", e));
+                                }
                                 tracing::debug!(
                                     error = %e,
                                     "mux pool get_text: get_lines failed; falling back to CLI"
@@ -1379,8 +1412,15 @@ impl WeztermClient {
     ) -> Result<PaneTieredScrollbackSummary> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            #[cfg(feature = "asupersync-runtime")]
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if self.mux_circuit_guard() {
-                match pool.get_pane_render_changes(pane_id).await {
+                #[cfg(feature = "asupersync-runtime")]
+                let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
+                #[cfg(not(feature = "asupersync-runtime"))]
+                let changes_result = pool.get_pane_render_changes(pane_id).await;
+
+                match changes_result {
                     Ok(changes) => {
                         return self.map_mux_tiered_scrollback_summary(
                             pane_id,
@@ -1389,6 +1429,12 @@ impl WeztermClient {
                     }
                     Err(err) => {
                         self.mux_circuit_record_failure(&err);
+                        if !Self::mux_error_should_fallback_to_cli(&err) {
+                            return Err(Self::mux_cancelled_error(
+                                "pane_tiered_scrollback_summary",
+                                err,
+                            ));
+                        }
                         return Err(WeztermError::CommandFailed(format!(
                             "failed to read tiered scrollback status for pane {pane_id}: {err}"
                         ))
@@ -1438,6 +1484,12 @@ impl WeztermClient {
                     }
                     Err(err) => {
                         self.mux_circuit_record_failure(&err);
+                        if !Self::mux_error_should_fallback_to_cli(&err) {
+                            return Err(Self::mux_cancelled_error(
+                                "pane_tiered_scrollback_summary_with_cx",
+                                err,
+                            ));
+                        }
                         return Err(WeztermError::CommandFailed(format!(
                             "failed to read tiered scrollback status for pane {pane_id}: {err}"
                         ))
@@ -1961,6 +2013,8 @@ impl WeztermClient {
     ) -> Result<()> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
+            #[cfg(feature = "asupersync-runtime")]
+            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if !self.mux_circuit_guard() {
                 tracing::debug!("mux connection circuit open; falling back to CLI send");
             } else {
@@ -1969,6 +2023,14 @@ impl WeztermClient {
                 } else {
                     format!("{text}\n")
                 };
+                #[cfg(feature = "asupersync-runtime")]
+                let pool_result = if no_paste {
+                    pool.write_to_pane_with_cx(&cx, pane_id, data.into_bytes())
+                        .await
+                } else {
+                    pool.send_paste_with_cx(&cx, pane_id, data).await
+                };
+                #[cfg(not(feature = "asupersync-runtime"))]
                 let pool_result = if no_paste {
                     pool.write_to_pane(pane_id, data.into_bytes()).await
                 } else {
@@ -1981,6 +2043,9 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("send_text", e));
+                        }
                         tracing::debug!(error = %e, "mux pool send failed, falling back to CLI");
                     }
                 }
@@ -2038,6 +2103,9 @@ impl WeztermClient {
                     }
                     Err(e) => {
                         self.mux_circuit_record_failure(&e);
+                        if !Self::mux_error_should_fallback_to_cli(&e) {
+                            return Err(Self::mux_cancelled_error("send_text_with_cx", e));
+                        }
                         tracing::debug!(
                             error = %e,
                             "mux pool send_with_cx failed, falling back to CLI"
@@ -2287,6 +2355,20 @@ impl WeztermClient {
                     && !mux.is_cancelled()
             }
         }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_error_should_fallback_to_cli(err: &crate::vendored::MuxPoolError) -> bool {
+        match err {
+            crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled) => false,
+            crate::vendored::MuxPoolError::Pool(_) => true,
+            crate::vendored::MuxPoolError::Mux(mux) => !mux.is_cancelled(),
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    fn mux_cancelled_error(op: &str, err: crate::vendored::MuxPoolError) -> crate::Error {
+        crate::Error::Cancelled(format!("wezterm mux {op} cancelled: {err}"))
     }
 
     #[cfg(all(feature = "vendored", unix))]
@@ -5267,6 +5349,42 @@ mod tests {
             ),
         ));
         assert!(!WeztermClient::mux_error_is_circuit_breaker_trigger(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_cancelled_does_not_fallback_to_cli() {
+        let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
+        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_transport_cancellation_does_not_fallback_to_cli() {
+        let err = crate::vendored::MuxPoolError::Mux(crate::vendored::DirectMuxError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "mux response_read_wait cancelled: test cancellation",
+            ),
+        ));
+        assert!(!WeztermClient::mux_error_should_fallback_to_cli(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_acquire_timeout_still_falls_back_to_cli() {
+        let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::AcquireTimeout);
+        assert!(WeztermClient::mux_error_should_fallback_to_cli(&err));
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_cancelled_error_maps_to_cancelled_core_error() {
+        let err = crate::vendored::MuxPoolError::Pool(crate::pool::PoolError::Cancelled);
+        let mapped = WeztermClient::mux_cancelled_error("list_panes", err);
+        assert!(
+            matches!(mapped, crate::Error::Cancelled(message) if message.contains("list_panes"))
+        );
     }
 
     // =====================================================================
