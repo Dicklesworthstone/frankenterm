@@ -414,6 +414,10 @@ name = "pattern_trigger"
 harness = false
 
 [[bench]]
+name = "patterns_quick_reject"
+harness = false
+
+[[bench]]
 name = "scan_pipeline"
 harness = false
 
