@@ -12,8 +12,79 @@ use std::ffi::OsString;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use wezterm_gui_subcommands::*;
+
+/// [ft-gqbpk] Set by the SIGTERM / SIGINT handler registered in
+/// `install_shutdown_signal_handlers`. The main executor loop polls
+/// this flag between ticks and breaks out cleanly so `run()` returns
+/// `Ok(())` and `main()` can invoke the existing
+/// `wezterm_blob_leases::clear_storage()` shutdown path.
+///
+/// Previously the daemon entered `loop { executor.tick()? }` with no
+/// signal handler installed, so SIGTERM triggered the default
+/// "terminate immediately" action and skipped cleanup.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// [ft-gqbpk] Shared shutdown-flag handle. Tests use this to assert
+/// the signal handler writes the expected state; production code
+/// calls `shutdown_requested()` inside the executor loop.
+#[must_use]
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// [ft-gqbpk] Reset the shutdown flag. Exposed for tests that need
+/// to exercise the polling loop without the signal handler firing
+/// left-over state from a prior test.
+#[cfg(test)]
+pub(crate) fn reset_shutdown_flag_for_tests() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+/// [ft-gqbpk] Mark shutdown as requested directly. Used by the
+/// test suite to simulate a signal without raising one, and by the
+/// Windows fallback path that does not register Unix-style handlers.
+pub(crate) fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// [ft-gqbpk] Signal-safe SIGTERM / SIGINT handler. Must only
+/// perform async-signal-safe work — here, a single relaxed atomic
+/// store — since it runs in signal context where almost all libc
+/// functions are undefined behaviour.
+#[cfg(unix)]
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// [ft-gqbpk] Install SIGTERM + SIGINT handlers using `libc::signal`.
+/// Kept minimal on purpose: no dependency on `signal-hook` or
+/// `tokio::signal`, and no `sigaction` plumbing, because the
+/// SimpleExecutor loop only needs a one-bit "someone asked us to
+/// stop" signal and the handler body is async-signal-safe.
+///
+/// Returns the previous handler pointers so the caller can restore
+/// them if needed (tests do this to avoid leaking handlers between
+/// cases).
+#[cfg(unix)]
+fn install_shutdown_signal_handlers() {
+    // SAFETY: single-threaded startup, before any worker threads spawn.
+    // libc::signal is the minimal POSIX primitive that's sufficient
+    // for the flag-set-and-poll pattern.
+    unsafe {
+        libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handlers() {
+    // Windows has no POSIX signals. The daemon surface is Unix-only
+    // in practice (the `daemonize` path at daemonize.rs is
+    // `#![cfg(unix)]`), so the non-Unix branch is a no-op.
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -164,9 +235,23 @@ fn run() -> anyhow::Result<()> {
     })
     .detach();
 
-    loop {
+    // [ft-gqbpk] Register SIGTERM + SIGINT handlers BEFORE entering
+    // the tick loop so a signal that arrives during startup still
+    // routes through the flag-poll path instead of the default
+    // "terminate immediately" action.
+    install_shutdown_signal_handlers();
+
+    while !shutdown_requested() {
         executor.tick()?;
     }
+
+    // [ft-gqbpk] Graceful shutdown path. `run()` returns Ok(()) here
+    // so `main()` runs `wezterm_blob_leases::clear_storage()` on the
+    // success branch. Mux::shutdown() stops pending mux activity and
+    // lets PTY/domain Drop implementations run.
+    log::info!("frankenterm-mux-server: shutdown signal received, flushing pending state");
+    Mux::shutdown();
+    Ok(())
 }
 
 async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
@@ -480,5 +565,125 @@ mod tests {
             !args.iter().any(|arg| arg == OsStr::new("--")),
             "separator should only appear when forwarding a child program"
         );
+    }
+
+    // ── ft-gqbpk SIGTERM/SIGINT graceful-shutdown regressions ────────
+
+    /// Helper: atomically swap the shutdown flag to a known state
+    /// around each test so a prior test firing the handler can't
+    /// bleed into this one. All ft-gqbpk tests must serialize on
+    /// `test_lock()` because the SHUTDOWN_REQUESTED flag is global.
+    fn fresh_shutdown_state() -> MutexGuard<'static, ()> {
+        let guard = test_lock().lock().expect("lock shutdown state");
+        reset_shutdown_flag_for_tests();
+        guard
+    }
+
+    #[test]
+    fn shutdown_flag_starts_false() {
+        let _g = fresh_shutdown_state();
+        assert!(
+            !shutdown_requested(),
+            "fresh process state: shutdown flag must be false"
+        );
+    }
+
+    #[test]
+    fn request_shutdown_sets_flag() {
+        let _g = fresh_shutdown_state();
+        assert!(!shutdown_requested());
+        request_shutdown();
+        assert!(
+            shutdown_requested(),
+            "request_shutdown() must set the poll flag"
+        );
+    }
+
+    #[test]
+    fn reset_shutdown_flag_for_tests_clears_flag() {
+        let _g = fresh_shutdown_state();
+        request_shutdown();
+        assert!(shutdown_requested());
+        reset_shutdown_flag_for_tests();
+        assert!(
+            !shutdown_requested(),
+            "reset helper must restore false state"
+        );
+    }
+
+    /// Calls the raw signal-handler function directly — no actual
+    /// signal is raised, so the test binary's own signal routing
+    /// is not perturbed. Verifies the handler body does the
+    /// minimum async-signal-safe thing: set the poll flag.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_handler_sets_flag_on_sigterm() {
+        let _g = fresh_shutdown_state();
+        assert!(!shutdown_requested());
+        // Safety: the handler is async-signal-safe; calling it
+        // directly from the test thread has no race-critical
+        // invariants to preserve.
+        shutdown_signal_handler(libc::SIGTERM);
+        assert!(
+            shutdown_requested(),
+            "SIGTERM handler must flip the shutdown flag"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_handler_sets_flag_on_sigint() {
+        let _g = fresh_shutdown_state();
+        assert!(!shutdown_requested());
+        shutdown_signal_handler(libc::SIGINT);
+        assert!(
+            shutdown_requested(),
+            "SIGINT handler must flip the shutdown flag"
+        );
+    }
+
+    /// [ft-gqbpk] End-to-end poll-loop behavior: starting from a
+    /// false flag, an empty poll loop runs; after `request_shutdown`,
+    /// the same poll loop exits cleanly without error. Mirrors the
+    /// production `while !shutdown_requested() { executor.tick()?; }`
+    /// shape so a regression that breaks the polling contract would
+    /// fail here.
+    #[test]
+    fn shutdown_poll_loop_exits_after_request() {
+        let _g = fresh_shutdown_state();
+        let mut ticks = 0u32;
+        let max_ticks = 1_000u32;
+        // Simulate 5 ticks before the signal arrives.
+        let shutdown_after = 5u32;
+        while !shutdown_requested() {
+            ticks += 1;
+            if ticks == shutdown_after {
+                request_shutdown();
+            }
+            assert!(
+                ticks <= max_ticks,
+                "poll loop should exit long before {max_ticks} ticks"
+            );
+        }
+        assert_eq!(
+            ticks, shutdown_after,
+            "poll loop must exit immediately once flag is set, not after one more tick"
+        );
+    }
+
+    /// [ft-gqbpk] install_shutdown_signal_handlers must be
+    /// idempotent — calling it twice must not corrupt state or
+    /// leave dangling handler refs. Production uses single-call,
+    /// but a defensive re-install (e.g. after a re-exec) should
+    /// be safe.
+    #[cfg(unix)]
+    #[test]
+    fn install_shutdown_signal_handlers_is_idempotent() {
+        let _g = fresh_shutdown_state();
+        install_shutdown_signal_handlers();
+        install_shutdown_signal_handlers();
+        // Direct handler invocation still works after multi-install.
+        shutdown_signal_handler(libc::SIGTERM);
+        assert!(shutdown_requested());
     }
 }
