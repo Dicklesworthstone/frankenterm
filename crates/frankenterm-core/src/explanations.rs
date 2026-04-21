@@ -434,6 +434,28 @@ This factor adds moderate weight (default: 30) because:
     see_also: &["ft policy"],
 };
 
+/// Explanation for terminal-control-byte risk factor.
+pub static RISK_FACTOR_TERMINAL_CONTROL_BYTES: ExplanationTemplate = ExplanationTemplate {
+    id: "risk.factor.terminal_control_bytes",
+    scenario: "Terminal-control bytes detected in payload",
+    brief: "Payload contains Ctrl+C, Ctrl+D, Ctrl+Z, or ESC bytes",
+    detailed: r"The payload contains terminal-control bytes that can alter or interrupt
+the target pane beyond ordinary printable input. This includes:
+- Ctrl+C interrupting a foreground task
+- Ctrl+D closing a REPL or shell
+- Ctrl+Z backgrounding another agent's work
+- ESC-prefixed control sequences such as forged bracketed-paste wrappers
+
+This factor adds moderate weight (default: 25) so automation that needs
+to send control bytes becomes visible in policy review and audit trails.",
+    suggestions: &[
+        "Prefer printable text when ordinary input is sufficient",
+        "Review whether the target pane should accept control-byte input",
+        "Use approval-gated workflows for interrupt or escape-sequence actions",
+    ],
+    see_also: &["ft policy", "wa.send"],
+};
+
 // ============================================================================
 // Template Registry
 // ============================================================================
@@ -467,6 +489,10 @@ pub static EXPLANATION_TEMPLATES: LazyLock<HashMap<&'static str, &'static Explan
         m.insert(RISK_FACTOR_ALT_SCREEN.id, &RISK_FACTOR_ALT_SCREEN);
         m.insert(RISK_FACTOR_DESTRUCTIVE.id, &RISK_FACTOR_DESTRUCTIVE);
         m.insert(RISK_FACTOR_SUDO.id, &RISK_FACTOR_SUDO);
+        m.insert(
+            RISK_FACTOR_TERMINAL_CONTROL_BYTES.id,
+            &RISK_FACTOR_TERMINAL_CONTROL_BYTES,
+        );
 
         m
     });
@@ -822,6 +848,7 @@ mod tests {
             "risk.factor.alt_screen",
             "risk.factor.destructive_tokens",
             "risk.factor.sudo_elevation",
+            "risk.factor.terminal_control_bytes",
         ];
         for id in risk_ids {
             let tmpl = get_explanation(id);
@@ -836,11 +863,11 @@ mod tests {
 
     #[test]
     fn template_registry_has_expected_count() {
-        // 6 deny + 4 workflow + 2 event + 5 risk = 17
+        // 6 deny + 4 workflow + 2 event + 6 risk = 18
         assert_eq!(
             EXPLANATION_TEMPLATES.len(),
-            17,
-            "Registry should have exactly 17 templates"
+            18,
+            "Registry should have exactly 18 templates"
         );
     }
 
@@ -1114,6 +1141,10 @@ mod tests {
         assert!(
             RISK_FACTOR_SUDO.detailed.contains("30"),
             "Sudo factor should mention weight 30"
+        );
+        assert!(
+            RISK_FACTOR_TERMINAL_CONTROL_BYTES.detailed.contains("25"),
+            "Terminal control bytes factor should mention weight 25"
         );
     }
 

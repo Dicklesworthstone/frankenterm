@@ -530,6 +530,7 @@ fn all_static_constants_registered() {
         "risk.factor.alt_screen",
         "risk.factor.destructive_tokens",
         "risk.factor.sudo_elevation",
+        "risk.factor.terminal_control_bytes",
     ];
     for id in &expected_ids {
         assert!(
@@ -543,10 +544,10 @@ fn all_static_constants_registered() {
 #[test]
 fn registered_count_matches_static_constants() {
     let ids = list_template_ids();
-    // At minimum, the 17 known statics should be registered
+    // At minimum, the 18 known statics should be registered
     assert!(
-        ids.len() >= 17,
-        "expected >= 17 templates, got {}",
+        ids.len() >= 18,
+        "expected >= 18 templates, got {}",
         ids.len()
     );
 }
