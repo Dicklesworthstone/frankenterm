@@ -945,12 +945,33 @@ fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Resul
     }
 
     // Discover workspace-local packs from .ft/patterns/
+    //
+    // [ft-6mxfs] Defend against a top-level symlink replacing the pack
+    // directory itself. ft-fbee5 closed the case of a symlink file *inside*
+    // `.ft/patterns/` escaping the sandbox, but the *parent* path was still
+    // just a `root.join(...)`. A hostile repo can ship
+    //
+    //     .ft/patterns -> /etc
+    //
+    // so `ws_dir` pointed at `/etc`, `discover_packs_from_dir` iterated it,
+    // and every per-file sandbox check passed because the inner loop used
+    // `Some(ws_dir)` — i.e. `/etc` — as its own canonicalized root. The
+    // escape was one level up from where the sandbox gate was applied.
+    //
+    // Fix: canonicalize `ws_dir` *before* walking it, and require the
+    // canonical form to start with the canonical repo root. A missing
+    // directory (the normal case — most repos don't ship `.ft/patterns/`)
+    // is treated as "no packs" without raising an error, matching the old
+    // behavior where `discover_packs_from_dir` early-returned on
+    // `!dir.exists()`.
     if let Some(root_path) = root {
         let ws_dir = root_path.join(".ft").join("patterns");
-        let discovered = discover_packs_from_dir(&ws_dir)?;
-        for pack in discovered {
-            user_pack_names.insert(pack.name.clone());
-            packs.push(pack);
+        if let Some(safe_ws_dir) = sandbox_resolve_dir(&ws_dir, root_path)? {
+            let discovered = discover_packs_from_dir(&safe_ws_dir)?;
+            for pack in discovered {
+                user_pack_names.insert(pack.name.clone());
+                packs.push(pack);
+            }
         }
     }
 
@@ -1106,6 +1127,74 @@ fn sandbox_resolve(candidate: &Path, root: &Path) -> Result<PathBuf> {
         .into());
     }
     Ok(candidate_canonical)
+}
+
+/// Directory-level sibling of [`sandbox_resolve`] for the pack-discovery
+/// entry point.
+///
+/// [ft-6mxfs] `load_packs_from_config` constructs
+/// `root_path.join(".ft").join("patterns")` for each workspace. That path
+/// is attacker-controlled at the directory level: a hostile repo can ship
+/// `.ft/patterns` itself as a symlink pointing anywhere the frankenterm
+/// process can read (e.g. `/etc`, `~/.ssh`). Without canonicalization,
+/// `discover_packs_from_dir` was happy to iterate the target and the
+/// per-file `sandbox_resolve` call treated the *symlinked-to* directory
+/// as its own sandbox root — so every file inside looked "in-sandbox"
+/// even though the whole tree was outside `root_path`.
+///
+/// This helper canonicalizes both the candidate directory and the root,
+/// then requires the candidate to be contained in the root. Semantics:
+///
+/// * **Missing directory** (the 99% case — no `.ft/patterns/` in the
+///   repo) → `Ok(None)`. Callers skip discovery. This matches the old
+///   `discover_packs_from_dir` behavior of returning an empty vec when
+///   the dir doesn't exist, so no legitimate workflow sees a new error.
+/// * **Exists, canonicalizes inside root** → `Ok(Some(canonical))`. The
+///   caller uses the canonical path for discovery, which means every
+///   subsequent `std::fs::read_dir` call operates on the already-resolved
+///   path (no second TOCTOU opportunity to swap in a symlink).
+/// * **Exists, canonicalizes outside root** → `Err(InvalidRule)`. The
+///   symlink escape is refused at the directory boundary, before any
+///   file content is read.
+///
+/// Centralizing this here (rather than inlining it at every workspace-
+/// relative load site) means future callers — workflows, policy files,
+/// other `.ft/**` loaders — can reuse the same gate.
+fn sandbox_resolve_dir(candidate: &Path, root: &Path) -> Result<Option<PathBuf>> {
+    // Cheap early-out: if the candidate doesn't exist even as a symlink,
+    // there's nothing to canonicalize or validate. symlink_metadata (as
+    // opposed to metadata) avoids following a dangling symlink and lets
+    // us distinguish "missing" from "broken link."
+    if std::fs::symlink_metadata(candidate).is_err() {
+        return Ok(None);
+    }
+
+    let root_canonical = root.canonicalize().map_err(|e| {
+        PatternError::InvalidRule(format!(
+            "sandbox root {} is not accessible: {e}",
+            root.display()
+        ))
+    })?;
+    let candidate_canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        // A dangling symlink (symlink_metadata succeeded, but canonicalize
+        // failed because the target is gone) is indistinguishable from a
+        // hostile escape attempt that happens to point at a now-deleted
+        // file. Treat it as "nothing to load" rather than erroring — the
+        // attack surface here is read-side, and a dangling link can't
+        // exfiltrate anything.
+        Err(_) => return Ok(None),
+    };
+    if !candidate_canonical.starts_with(&root_canonical) {
+        return Err(PatternError::InvalidRule(format!(
+            "pack directory {} resolves outside sandbox root {} \
+             (likely a symlink escape — see ft-6mxfs)",
+            candidate_canonical.display(),
+            root_canonical.display()
+        ))
+        .into());
+    }
+    Ok(Some(candidate_canonical))
 }
 
 fn is_pack_file(path: &Path) -> bool {
@@ -4971,6 +5060,114 @@ description = "Health check rule"
             "symlink escape must be rejected, got {} packs",
             packs.len()
         );
+    }
+
+    // ── ft-6mxfs regression: sandbox_resolve_dir ────────────────────
+
+    /// [ft-6mxfs] A missing `.ft/patterns` directory (normal case — most
+    /// repos don't ship one) must return `Ok(None)` so the caller skips
+    /// discovery silently. No error, no panic.
+    #[test]
+    fn sandbox_resolve_dir_missing_returns_none() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join(".ft").join("patterns");
+        let resolved = sandbox_resolve_dir(&missing, root.path()).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    /// [ft-6mxfs] A real directory inside the sandbox root canonicalizes
+    /// and returns `Ok(Some(canonical))`. The canonical form is what the
+    /// caller should walk to close the TOCTOU window.
+    #[test]
+    fn sandbox_resolve_dir_inside_returns_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join(".ft").join("patterns");
+        fs::create_dir_all(&inside).unwrap();
+
+        let resolved = sandbox_resolve_dir(&inside, root.path()).unwrap();
+        let resolved = resolved.expect("existing in-sandbox dir should resolve");
+        assert!(resolved.starts_with(root.path().canonicalize().unwrap()));
+    }
+
+    /// [ft-6mxfs] The headline vector: `.ft/patterns` itself is a symlink
+    /// to a directory outside the workspace (e.g. `/etc`). The per-file
+    /// `sandbox_resolve` gate in `discover_packs_from_dir` does NOT catch
+    /// this because it uses the symlinked-to path as its own root — so
+    /// every file inside looks in-sandbox. `sandbox_resolve_dir` must
+    /// reject the directory itself before any walk happens.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_resolve_dir_rejects_toplevel_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        // Create some content in the "attacker-pointed-at" directory so
+        // a canonicalize() on the symlink doesn't fail for a reason
+        // other than the one we're testing.
+        fs::write(outside.path().join("decoy.yaml"), "x: 1\n").unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        let ws_dir = ft_dir.join("patterns");
+        std::os::unix::fs::symlink(outside.path(), &ws_dir).unwrap();
+
+        let err = sandbox_resolve_dir(&ws_dir, root.path())
+            .expect_err("symlink-escaped pack dir must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resolves outside sandbox root") || msg.contains("ft-6mxfs"),
+            "error should cite sandbox escape: {msg}"
+        );
+    }
+
+    /// [ft-6mxfs] End-to-end: `load_packs_from_config` must refuse a
+    /// repo that ships `.ft/patterns -> /elsewhere`. This is the real
+    /// entry point that attacker-controlled repos reach.
+    #[cfg(unix)]
+    #[test]
+    fn load_packs_from_config_refuses_symlinked_patterns_dir() {
+        let outside = tempfile::tempdir().unwrap();
+        // Stage a pack that WOULD load if the symlink check failed,
+        // so a false negative (packs.len() > 0) is unambiguous.
+        fs::write(
+            outside.path().join("exfil.toml"),
+            r#"
+name = "user:exfil"
+version = "1.0.0"
+[[rules]]
+id = "exfil.rule"
+agent_type = "codex"
+event_type = "exfil.event"
+severity = "info"
+anchors = ["[exfil]"]
+description = "exfil"
+"#,
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ft_dir.join("patterns")).unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: false,
+            ..PatternsConfig::default()
+        };
+        // `LoadedPacks` has no Debug impl, so we can't call `.expect_err`
+        // directly — match the Result by hand instead.
+        match load_packs_from_config(&config, Some(root.path())) {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("outside sandbox root") || msg.contains("ft-6mxfs"),
+                    "error should cite sandbox escape: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "symlinked .ft/patterns must cause load to fail, but load_packs_from_config \
+                 returned Ok — ft-6mxfs regression"
+            ),
+        }
     }
 
     #[test]
