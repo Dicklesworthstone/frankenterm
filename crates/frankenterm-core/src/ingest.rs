@@ -2082,19 +2082,25 @@ impl Osc133State {
 pub fn parse_osc133_markers(text: &str) -> Vec<Osc133Marker> {
     let mut markers = Vec::new();
     let bytes = text.as_bytes();
-    let mut i = 0;
+    let mut base = 0;
 
-    while i < bytes.len() {
+    while base < bytes.len() {
+        let Some(offset) = memchr::memchr(0x1b, &bytes[base..]) else {
+            break;
+        };
+        let pos = base + offset;
+
         // Look for ESC ] (OSC start)
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+        if pos + 1 < bytes.len() && bytes[pos + 1] == b']' {
             // Found OSC start, look for "133;"
-            if let Some(marker) = try_parse_osc133(&bytes[i..]) {
-                markers.push(marker.0);
-                i += marker.1; // Skip past the parsed sequence
+            if let Some((marker, consumed)) = try_parse_osc133(&bytes[pos..]) {
+                markers.push(marker);
+                base = pos + consumed; // Skip past the parsed sequence
                 continue;
             }
         }
-        i += 1;
+
+        base = pos + 1;
     }
 
     markers

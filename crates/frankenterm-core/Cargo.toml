@@ -137,6 +137,10 @@ name = "alt_screen_detection"
 harness = false
 
 [[bench]]
+name = "osc133_markers"
+harness = false
+
+[[bench]]
 name = "replay_capture"
 harness = false
 

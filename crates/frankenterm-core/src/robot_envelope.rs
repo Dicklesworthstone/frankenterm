@@ -5,6 +5,59 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Normalize a JSON value for deterministic golden-file comparison.
+///
+/// The transformation is idempotent and applied recursively:
+/// - Any object field named `timestamp` whose value is a string is replaced
+///   with the constant `"[TIMESTAMP]"` so wall-clock drift does not cause
+///   spurious diffs.
+/// - Arrays whose parent key is `agents`, `tags`, or `pane_ids` are sorted
+///   by their serialized JSON text — these are treated as set-valued
+///   fields where order is not semantically meaningful.
+/// - Non-integer JSON numbers are rounded to 4 decimal places to absorb
+///   floating-point noise across platforms and libc versions. Integers
+///   pass through unchanged.
+/// - Every other value kind is passed through as-is.
+pub fn canonicalize_json(value: &mut Value, parent_key: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let child = map.get_mut(&key).expect("key exists");
+                if key == "timestamp" && child.is_string() {
+                    *child = Value::String("[TIMESTAMP]".to_string());
+                } else {
+                    canonicalize_json(child, Some(&key));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                canonicalize_json(item, parent_key);
+            }
+            if matches!(parent_key, Some("agents" | "tags" | "pane_ids")) {
+                items.sort_by(|left, right| {
+                    serde_json::to_string(left)
+                        .expect("serialize left")
+                        .cmp(&serde_json::to_string(right).expect("serialize right"))
+                });
+            }
+        }
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if float.fract() != 0.0 {
+                    let rounded = (float * 10_000.0).round() / 10_000.0;
+                    *value = Value::Number(
+                        serde_json::Number::from_f64(rounded).expect("rounded float"),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Standardized JSON envelope for subprocess bridge outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,7 +100,7 @@ impl<T> RobotEnvelope<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
 
@@ -61,45 +114,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden_robot_envelope")
             .join(format!("{name}.json"))
-    }
-
-    fn canonicalize_json(value: &mut Value, parent_key: Option<&str>) {
-        match value {
-            Value::Object(map) => {
-                let keys: Vec<String> = map.keys().cloned().collect();
-                for key in keys {
-                    let child = map.get_mut(&key).expect("key exists");
-                    if key == "timestamp" && child.is_string() {
-                        *child = Value::String("[TIMESTAMP]".to_string());
-                    } else {
-                        canonicalize_json(child, Some(&key));
-                    }
-                }
-            }
-            Value::Array(items) => {
-                for item in items.iter_mut() {
-                    canonicalize_json(item, parent_key);
-                }
-                if matches!(parent_key, Some("agents" | "tags" | "pane_ids")) {
-                    items.sort_by(|left, right| {
-                        serde_json::to_string(left)
-                            .expect("serialize left")
-                            .cmp(&serde_json::to_string(right).expect("serialize right"))
-                    });
-                }
-            }
-            Value::Number(number) => {
-                if let Some(float) = number.as_f64() {
-                    if float.fract() != 0.0 {
-                        let rounded = (float * 10_000.0).round() / 10_000.0;
-                        *value = Value::Number(
-                            serde_json::Number::from_f64(rounded).expect("rounded float"),
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     fn assert_golden_json(name: &str, envelope: &RobotEnvelope<Value>) {
