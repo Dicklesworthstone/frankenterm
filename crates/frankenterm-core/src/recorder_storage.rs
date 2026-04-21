@@ -295,7 +295,6 @@ pub trait RecorderStorage: Send + Sync {
     /// backends with internal cancellation support (e.g. a
     /// `timeout_with_cx`-aware write path) SHOULD override to
     /// thread cx deeper.
-    #[cfg(feature = "asupersync-runtime")]
     async fn append_batch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -315,7 +314,6 @@ pub trait RecorderStorage: Send + Sync {
     /// Cx-first [`Self::flush`] (ft-xbnl0.2.3). Default
     /// implementation checks caller cancellation before
     /// delegating to the non-cx `flush`.
-    #[cfg(feature = "asupersync-runtime")]
     async fn flush_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -337,7 +335,6 @@ pub trait RecorderStorage: Send + Sync {
     /// Cx-first [`Self::read_checkpoint`] (ft-xbnl0.2.3). Default
     /// implementation checks caller cancellation before
     /// delegating to the non-cx `read_checkpoint`.
-    #[cfg(feature = "asupersync-runtime")]
     async fn read_checkpoint_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -359,7 +356,6 @@ pub trait RecorderStorage: Send + Sync {
     /// Cx-first [`Self::commit_checkpoint`] (ft-xbnl0.2.3).
     /// Default implementation checks caller cancellation before
     /// delegating to the non-cx `commit_checkpoint`.
-    #[cfg(feature = "asupersync-runtime")]
     async fn commit_checkpoint_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -380,7 +376,6 @@ pub trait RecorderStorage: Send + Sync {
     /// delegating to the non-cx `health`. On cancellation, returns
     /// a degraded health snapshot (the health call itself has no
     /// error surface — it always returns a snapshot).
-    #[cfg(feature = "asupersync-runtime")]
     async fn health_with_cx(&self, cx: &crate::cx::Cx) -> RecorderStorageHealth {
         if cx.checkpoint().is_err() {
             return RecorderStorageHealth {
@@ -400,7 +395,6 @@ pub trait RecorderStorage: Send + Sync {
     /// Cx-first [`Self::lag_metrics`] (ft-xbnl0.2.3). Default
     /// implementation checks caller cancellation before
     /// delegating to the non-cx `lag_metrics`.
-    #[cfg(feature = "asupersync-runtime")]
     async fn lag_metrics_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1416,7 +1410,6 @@ mod tests {
     /// observationally equivalent. This test pins the contract
     /// so that overriding backends (when added) won't
     /// accidentally regress the default-delegation parity.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn trait_append_batch_with_cx_matches_legacy() {
         run_async_test(async {
@@ -1467,7 +1460,6 @@ mod tests {
     /// must round-trip correctly for uncancelled cx. Writes a
     /// checkpoint via the Cx-first commit variant, reads it
     /// back via the Cx-first read variant, asserts parity.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn trait_checkpoint_cx_variants_round_trip() {
         run_async_test(async {

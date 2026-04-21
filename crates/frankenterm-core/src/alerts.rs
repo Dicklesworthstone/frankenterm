@@ -398,7 +398,6 @@ impl AlertMonitor {
     /// operator cancel a slow alert sweep cleanly; triggered
     /// alerts from rules already evaluated are discarded on
     /// cancel (cancellation returns Err, not partial Vec).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn check_alerts_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -522,7 +521,6 @@ impl AlertMonitor {
     /// earliest boundary rather than completing a full metric scan.
     /// Branch structure is preserved byte-for-byte with the legacy
     /// path; only the inner storage calls change.
-    #[cfg(feature = "asupersync-runtime")]
     async fn get_current_value_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -611,7 +609,6 @@ mod tests {
     /// `check_alerts` on a manager with 0 enabled rules — both
     /// return empty Vec without touching storage. Uses raw
     /// block_on because alerts::tests is sync fixtures.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn check_alerts_with_cx_empty_rules_matches_legacy() {
         use crate::runtime_compat::CompatRuntime;

@@ -114,7 +114,6 @@ pub async fn list_pane_bookmarks(storage: &StorageHandle) -> crate::Result<Vec<P
 /// written before tick 149's 140/140 completion. The sibling is
 /// available now, so a caller-cancelled cx lands at the storage
 /// pre-flight checkpoint instead of after the DB read returns.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn list_pane_bookmarks_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -137,7 +136,6 @@ pub async fn list_saved_searches(storage: &StorageHandle) -> crate::Result<Vec<S
 /// cx-threaded. Routes the storage read through
 /// `list_saved_searches_with_cx` so a caller-cancelled cx lands at
 /// the storage pre-flight checkpoint instead of after the DB read.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn list_saved_searches_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -208,7 +206,6 @@ mod tests {
     /// must match `list_pane_bookmarks` on an empty storage.
     /// Proves the pre-flight checkpoint doesn't short-circuit
     /// uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_pane_bookmarks_with_cx_matches_legacy_on_empty_db() {
         use crate::runtime_compat::CompatRuntime;

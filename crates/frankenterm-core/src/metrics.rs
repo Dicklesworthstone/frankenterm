@@ -404,7 +404,6 @@ impl MetricsServerHandle {
     /// A cx-cancelled caller returns immediately but must still
     /// flip the external `shutdown_flag` to make the background
     /// task exit.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn wait_with_cx(self, cx: &crate::cx::Cx) {
         if cx.checkpoint().is_err() {
             return;
@@ -467,7 +466,6 @@ impl MetricsServer {
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        #[cfg(feature = "asupersync-runtime")]
         let join = {
             let server_cx = crate::cx::for_request();
             crate::runtime_compat::task::spawn_with_cx(&server_cx, move |accept_cx| async move {
@@ -513,33 +511,6 @@ impl MetricsServer {
             })
         };
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let join = crate::runtime_compat::task::spawn(async move {
-            let accept_poll_interval = Duration::from_millis(250);
-            loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                match crate::runtime_compat::timeout(accept_poll_interval, listener.accept()).await
-                {
-                    Ok(Ok((socket, peer))) => {
-                        let collector = Arc::clone(&collector);
-                        let prefix = prefix.clone();
-                        crate::runtime_compat::task::spawn(async move {
-                            if let Err(err) = handle_connection(socket, &prefix, collector).await {
-                                debug!(error = %err, peer = %peer, "Metrics connection failed");
-                            }
-                        });
-                    }
-                    Ok(Err(err)) => {
-                        warn!(error = %err, "Metrics listener accept failed");
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-
         Ok(MetricsServerHandle { join, local_addr })
     }
 
@@ -561,7 +532,6 @@ impl MetricsServer {
     ///
     /// The legacy [`start`](Self::start) entry point is preserved for
     /// non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn start_with_cx(self, cx: &crate::cx::Cx) -> Result<MetricsServerHandle> {
         if cx.is_cancel_requested() {
             return Err(crate::Error::Runtime(
@@ -633,21 +603,6 @@ impl MetricsServer {
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn handle_connection(
-    mut socket: TcpStream,
-    prefix: &str,
-    collector: Arc<dyn MetricsCollector>,
-) -> Result<()> {
-    let mut buf = [0_u8; 8192];
-    let read_len = crate::runtime_compat::io::read(&mut socket, &mut buf).await?;
-    if read_len == 0 {
-        return Ok(());
-    }
-    let request_bytes = buf[..read_len].to_vec();
-    handle_connection_impl(socket, prefix, collector, request_bytes).await
-}
-
 /// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
 ///
 /// Pre-flight `cx.checkpoint()` folded into `crate::Error::Runtime`
@@ -657,7 +612,6 @@ async fn handle_connection(
 /// cancel arriving between the accept in `start_with_cx` and the
 /// read will now bail the handler instead of reading 8KB from a
 /// dying connection.
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_connection_with_cx(
     cx: &crate::cx::Cx,
     mut socket: TcpStream,
@@ -723,15 +677,9 @@ async fn handle_connection_impl(
 
     // Explicitly shut down the write half to ensure the TCP connection is
     // terminated cleanly rather than relying on implicit drop.
-    #[cfg(feature = "asupersync-runtime")]
     {
         let _ = socket.shutdown(std::net::Shutdown::Both);
     }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = socket.shutdown().await;
-    }
-
     Ok(())
 }
 
@@ -1403,7 +1351,6 @@ mod tests {
     /// `Error::Runtime` describing the cancellation. An operator who
     /// has already abandoned the server should not leave a socket in
     /// LISTEN state.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn metrics_server_start_with_cx_pre_cancelled_refuses_to_bind() {
         run_async_test(async {
@@ -1441,7 +1388,6 @@ mod tests {
     /// Cx spawns the accept loop, serves a request, and shuts down
     /// cleanly via the shutdown flag. Pins no-regression on the normal
     /// path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn metrics_server_start_with_cx_happy_path_serves_request() {
         run_async_test(async {
@@ -1495,7 +1441,6 @@ mod tests {
     /// worst case is one poll + task cleanup). Complements ticks 319
     /// (pre-cancel-refuses-bind) and 320 (wait_with_cx on pre-cancel),
     /// which exercise other timings of the cancel signal.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn metrics_server_start_with_cx_mid_flight_cancel_stops_accept_loop() {
         run_async_test(async {
@@ -1545,7 +1490,6 @@ mod tests {
     /// the shutdown flag to make the task exit; the handle
     /// method only decouples the caller's blocking wait from
     /// the task's eventual shutdown.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn metrics_server_wait_with_precancelled_cx_returns_quickly() {
         run_async_test(async {

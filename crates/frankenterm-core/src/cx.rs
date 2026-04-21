@@ -197,13 +197,9 @@ impl<F: Future> Future for HandleContextFuture<F> {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 fn install_runtime_handle_for_poll(handle: RuntimeHandle) {
     crate::runtime_compat::install_runtime_handle(handle);
 }
-
-#[cfg(not(feature = "asupersync-runtime"))]
-fn install_runtime_handle_for_poll(_handle: RuntimeHandle) {}
 
 /// Spawn a runtime task after cloning and threading a `Cx` into the task body.
 pub fn spawn_with_cx<F, Fut, T>(handle: &RuntimeHandle, cx: &Cx, task: F) -> JoinHandle<T>
@@ -286,15 +282,10 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         crate::runtime_compat::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        crate::runtime_compat::timeout(timeout, spawn_with_cx(handle, cx, task)).await
-    }
 }
 
 #[cfg(test)]
@@ -571,7 +562,6 @@ mod tests {
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_cx_installs_runtime_handle_for_child_polls() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
@@ -587,7 +577,6 @@ mod tests {
         assert!(result);
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_cx_supports_nested_runtime_compat_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
@@ -623,7 +612,6 @@ mod tests {
         assert_eq!(result, "spawned");
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn try_spawn_with_cx_preserves_runtime_handle_for_nested_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
@@ -887,7 +875,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     #[allow(clippy::type_complexity)]
     fn spawn_bounded_supports_nested_runtime_compat_spawn() {
@@ -949,7 +936,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_timeout_uses_tighter_cx_budget() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
@@ -975,7 +961,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_timeout_supports_nested_runtime_compat_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
@@ -994,7 +979,6 @@ mod tests {
         assert_eq!(result.unwrap(), 41);
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     #[allow(clippy::type_complexity)]
     fn spawn_with_timeout_supports_nested_spawn_bounded_with_cx() {

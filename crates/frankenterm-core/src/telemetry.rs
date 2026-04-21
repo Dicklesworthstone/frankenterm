@@ -20,8 +20,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::sleep;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info_span, warn};
@@ -762,14 +760,9 @@ impl TelemetryCollector {
     ///
     /// Samples resource metrics at `config.sample_interval`.
     pub async fn run(&self) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.run_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.run_legacy().await;
         }
     }
 
@@ -781,7 +774,6 @@ impl TelemetryCollector {
     /// Cx-aware sleep between samples, and an explicit `cx.checkpoint()`
     /// at the top of every iteration so a canceled caller exits the loop
     /// even if the shutdown flag has not been set.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_cx(&self, cx: &crate::cx::Cx) {
         let interval = self.config.sample_interval.max(Duration::from_secs(1));
         let mut first_tick = true;
@@ -826,42 +818,6 @@ impl TelemetryCollector {
     /// Owner: `ft-xbnl0.2.5`.
     /// Removal path: drop this helper once the workspace no longer supports
     /// non-`asupersync-runtime` telemetry sampling.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_legacy(&self) {
-        let interval = self.config.sample_interval.max(Duration::from_secs(1));
-        let mut first_tick = true;
-
-        loop {
-            if !first_tick {
-                sleep(interval).await;
-            }
-            first_tick = false;
-
-            if self.shutdown.load(Ordering::SeqCst) {
-                debug!("Telemetry collector shutting down");
-                break;
-            }
-
-            let pid = self.config.mux_server_pid;
-            let snap_opt =
-                crate::runtime_compat::spawn_blocking(move || ResourceSnapshot::collect(pid))
-                    .await
-                    .unwrap_or(None);
-
-            if let Some(snap) = snap_opt {
-                self.buffer.push(snap);
-                self.sample_count.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    pid,
-                    samples = self.sample_count.load(Ordering::Relaxed),
-                    "Telemetry sample collected"
-                );
-            } else {
-                warn!(pid, "Failed to collect telemetry sample");
-            }
-        }
-    }
-
     /// Produce a serializable telemetry snapshot.
     #[must_use]
     pub fn snapshot(&self) -> TelemetrySnapshot {
@@ -1304,7 +1260,6 @@ mod tests {
     /// on iteration 1, and returns — all without consuming real time. If
     /// the sleep seam ever re-acquires a wall-clock assumption, this test
     /// burns real seconds or step-explodes.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn telemetry_collector_run_cx_honors_shutdown_under_labruntime() {
         use std::sync::atomic::{AtomicBool, Ordering};

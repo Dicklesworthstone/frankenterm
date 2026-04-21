@@ -975,14 +975,9 @@ impl WeztermClient {
     pub async fn list_panes(&self) -> Result<Vec<PaneInfo>> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            #[cfg(feature = "asupersync-runtime")]
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if self.mux_circuit_guard() {
-                #[cfg(feature = "asupersync-runtime")]
                 let mux_result = pool.list_panes_with_cx(&cx).await;
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let mux_result = pool.list_panes().await;
-
                 match mux_result {
                     Ok(response) => {
                         self.mux_circuit_record_success();
@@ -1097,11 +1092,6 @@ impl WeztermClient {
         self.list_panes().await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn list_panes_with_cx(&self, _cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
-        self.list_panes().await
-    }
-
     /// Get a specific pane by ID
     ///
     /// Returns the pane info if found, or `WeztermError::PaneNotFound` if not.
@@ -1118,18 +1108,12 @@ impl WeztermClient {
     ///
     /// Delegates to [`list_panes_with_cx`](Self::list_panes_with_cx)
     /// so the underlying pane listing respects caller Cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
         let panes = self.list_panes_with_cx(cx).await?;
         panes
             .into_iter()
             .find(|p| p.pane_id == pane_id)
             .ok_or_else(|| WeztermError::PaneNotFound(pane_id).into())
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn get_pane_with_cx(&self, _cx: &crate::cx::Cx, pane_id: u64) -> Result<PaneInfo> {
-        self.get_pane(pane_id).await
     }
 
     /// Get text content from a pane
@@ -1142,18 +1126,13 @@ impl WeztermClient {
         // extraction; fall back to CLI for `--escapes`.
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            #[cfg(feature = "asupersync-runtime")]
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if escapes {
                 tracing::debug!("mux pool get_text does not support escapes; falling back to CLI");
             } else if self.mux_circuit_guard() {
                 let mut pool_text: Option<String> = None;
                 'mux_text: {
-                    #[cfg(feature = "asupersync-runtime")]
                     let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    let changes_result = pool.get_pane_render_changes(pane_id).await;
-
                     let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
@@ -1211,13 +1190,9 @@ impl WeztermClient {
                             .min(scrollback_end);
 
                         #[allow(clippy::single_range_in_vec_init)]
-                        #[cfg(feature = "asupersync-runtime")]
                         let lines_result = pool
                             .get_lines_with_cx(&cx, pane_id, vec![start..chunk_end])
                             .await;
-                        #[cfg(not(feature = "asupersync-runtime"))]
-                        let lines_result = pool.get_lines(pane_id, vec![start..chunk_end]).await;
-
                         match lines_result {
                             Ok(resp) => {
                                 let (mut lines, _images) = resp.lines.extract_data();
@@ -1391,16 +1366,6 @@ impl WeztermClient {
         self.get_text(pane_id, escapes).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn get_text_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-        escapes: bool,
-    ) -> Result<String> {
-        self.get_text(pane_id, escapes).await
-    }
-
     /// Read the mux-side tiered scrollback summary for a pane when available.
     ///
     /// This is a best-effort telemetry path used by runtime maintenance. It
@@ -1412,14 +1377,9 @@ impl WeztermClient {
     ) -> Result<PaneTieredScrollbackSummary> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            #[cfg(feature = "asupersync-runtime")]
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if self.mux_circuit_guard() {
-                #[cfg(feature = "asupersync-runtime")]
                 let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let changes_result = pool.get_pane_render_changes(pane_id).await;
-
                 match changes_result {
                     Ok(changes) => {
                         return self.map_mux_tiered_scrollback_summary(
@@ -1522,15 +1482,6 @@ impl WeztermClient {
         self.pane_tiered_scrollback_summary(pane_id).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn pane_tiered_scrollback_summary_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-    ) -> Result<PaneTieredScrollbackSummary> {
-        self.pane_tiered_scrollback_summary(pane_id).await
-    }
-
     /// Send text to a pane using paste mode (default, faster for multi-char input)
     ///
     /// This uses WezTerm's paste mode which is efficient for sending multiple
@@ -1600,7 +1551,6 @@ impl WeztermClient {
     /// The mux-pool fast path uses `pool.send_paste_with_cx(cx)` /
     /// `pool.write_to_pane_with_cx(cx)`; CLI fallback delegates to the
     /// legacy [`send_text`](Self::send_text) path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_text_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1612,7 +1562,6 @@ impl WeztermClient {
     }
 
     /// Cx-first send_text_no_paste (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_text_no_paste_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1624,7 +1573,6 @@ impl WeztermClient {
     }
 
     /// Cx-first send_text_with_options (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_text_with_options_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1639,7 +1587,6 @@ impl WeztermClient {
 
     /// Cx-first send_control (ft-xbnl0.2.3). Control characters always
     /// use no-paste + no-newline mode.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_control_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1651,14 +1598,12 @@ impl WeztermClient {
     }
 
     /// Cx-first send_ctrl_c (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_ctrl_c_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
         self.send_control_with_cx(cx, pane_id, control::CTRL_C)
             .await
     }
 
     /// Cx-first send_ctrl_d (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_ctrl_d_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
         self.send_control_with_cx(cx, pane_id, control::CTRL_D)
             .await
@@ -1684,7 +1629,6 @@ impl WeztermClient {
     /// Cx-first [`spawn`] (ft-xbnl0.2.3). Delegates to
     /// [`Self::spawn_targeted_with_cx`] so caller `&Cx` propagates
     /// into the underlying `wezterm cli spawn` invocation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn spawn_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1737,7 +1681,6 @@ impl WeztermClient {
     /// construction (window targeting, domain, cwd) is identical to
     /// the legacy path so both variants produce the exact same
     /// command line for the same inputs.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn spawn_targeted_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1827,7 +1770,6 @@ impl WeztermClient {
     /// percent clamp to 10-90) is identical to the legacy path so
     /// both variants produce the exact same command line for the
     /// same inputs.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn split_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1882,7 +1824,6 @@ impl WeztermClient {
     /// underlying `wezterm cli activate-pane` invocation honors
     /// cancellation, budget, and virtual time from the caller's
     /// context rather than the ambient thread-local one.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn activate_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "activate-pane", "--pane-id", &pane_id_str];
@@ -1918,7 +1859,6 @@ impl WeztermClient {
     /// The neighbor-selection geometry is a pure function
     /// ([`find_neighbor_pane`]) so the legacy and Cx paths produce
     /// bit-for-bit identical neighbor decisions.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_direction_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1945,7 +1885,6 @@ impl WeztermClient {
     /// through [`Self::run_cli_with_pane_check_with_cx`] so the
     /// `wezterm cli kill-pane` subprocess honors caller cancellation,
     /// budget, and virtual time.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn kill_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> Result<()> {
         let pane_id_str = pane_id.to_string();
         let args = ["cli", "kill-pane", "--pane-id", &pane_id_str];
@@ -1974,7 +1913,6 @@ impl WeztermClient {
     /// `wezterm cli zoom-pane` subprocess honors caller cancellation,
     /// budget, and virtual time. The `--unzoom` arg selection logic is
     /// identical to the legacy path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn zoom_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2013,7 +1951,6 @@ impl WeztermClient {
     ) -> Result<()> {
         #[cfg(all(feature = "vendored", unix))]
         if let Some(ref pool) = self.mux_pool {
-            #[cfg(feature = "asupersync-runtime")]
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             if !self.mux_circuit_guard() {
                 tracing::debug!("mux connection circuit open; falling back to CLI send");
@@ -2023,17 +1960,12 @@ impl WeztermClient {
                 } else {
                     format!("{text}\n")
                 };
-                #[cfg(feature = "asupersync-runtime")]
                 let pool_result = if no_paste {
                     pool.write_to_pane_with_cx(&cx, pane_id, data.into_bytes())
                         .await
                 } else {
                     pool.send_paste_with_cx(&cx, pane_id, data).await
                 };
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let pool_result = if no_paste {
-                    pool.write_to_pane(pane_id, data.into_bytes()).await
-                } else {
                     pool.send_paste(pane_id, data).await
                 };
                 match pool_result {
@@ -2153,7 +2085,6 @@ impl WeztermClient {
     /// Threads `cx` through [`Self::run_cli_with_cx`] and applies the
     /// same pane-level error mapping so `PaneNotFound` is surfaced
     /// consistently between the legacy and Cx paths.
-    #[cfg(feature = "asupersync-runtime")]
     async fn run_cli_with_pane_check_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2172,16 +2103,6 @@ impl WeztermClient {
             }
             Err(e) => Err(e),
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_cli_with_pane_check_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        args: &[&str],
-        pane_id: u64,
-    ) -> Result<String> {
-        self.run_cli_with_pane_check(args, pane_id).await
     }
 
     /// Run a WezTerm CLI command with timeout
@@ -2229,7 +2150,6 @@ impl WeztermClient {
     /// [`Self::finalize_cli_output`] so the legacy and Cx paths produce
     /// bit-for-bit identical error surfaces for the same subprocess
     /// output.
-    #[cfg(feature = "asupersync-runtime")]
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
         use crate::runtime_compat::process::Command;
 
@@ -2260,11 +2180,6 @@ impl WeztermClient {
         };
 
         Self::finalize_cli_output(output)
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_cli_with_cx(&self, _cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
-        self.run_cli(args).await
     }
 
     /// Shared post-timeout validation: checks exit status, stderr
@@ -2679,7 +2594,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::list_panes(self).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move { WeztermClient::list_panes_with_cx(self, cx).await })
     }
@@ -2688,7 +2602,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_pane(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2701,7 +2614,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_text(self, pane_id, escapes).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2716,7 +2628,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_text(self, pane_id, &text).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2732,7 +2643,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_text_no_paste(self, pane_id, &text).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_no_paste_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2758,7 +2668,6 @@ impl WeztermInterface for WeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_options_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2781,7 +2690,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_control(self, pane_id, &control_char).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_control_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2798,7 +2706,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_ctrl_c(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_c_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2811,7 +2718,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::send_ctrl_d(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_d_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2826,7 +2732,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::spawn(self, cwd.as_deref(), domain.as_deref()).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2853,7 +2758,6 @@ impl WeztermInterface for WeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_targeted_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2888,7 +2792,6 @@ impl WeztermInterface for WeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn split_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2908,7 +2811,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::activate_pane(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn activate_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2925,7 +2827,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::get_pane_direction(self, pane_id, direction).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_direction_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2941,7 +2842,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::kill_pane(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn kill_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2954,7 +2854,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::zoom_pane(self, pane_id, zoom).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn zoom_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2998,7 +2897,6 @@ impl WeztermInterface for WeztermClient {
         Box::pin(async move { WeztermClient::pane_tiered_scrollback_summary(self, pane_id).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3122,12 +3020,10 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
     // (e.g. WeztermClient::list_panes_with_cx routing to
     // MuxPool::list_panes_with_cx) actually runs.
 
-    #[cfg(feature = "asupersync-runtime")]
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.as_ref().list_panes_with_cx(cx)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3136,7 +3032,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().get_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3146,7 +3041,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().get_text_with_cx(cx, pane_id, escapes)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3156,7 +3050,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().send_text_with_cx(cx, pane_id, text)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_no_paste_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3166,7 +3059,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().send_text_no_paste_with_cx(cx, pane_id, text)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_options_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3179,7 +3071,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .send_text_with_options_with_cx(cx, pane_id, text, no_paste, no_newline)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_control_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3190,7 +3081,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .send_control_with_cx(cx, pane_id, control_char)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_c_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3199,7 +3089,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().send_ctrl_c_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_d_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3208,7 +3097,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().send_ctrl_d_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_direction_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3219,7 +3107,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .get_pane_direction_with_cx(cx, pane_id, direction)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn activate_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3228,7 +3115,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().activate_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn kill_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3237,7 +3123,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().kill_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn zoom_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3247,7 +3132,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().zoom_pane_with_cx(cx, pane_id, zoom)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3257,7 +3141,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
         self.as_ref().spawn_with_cx(cx, cwd, domain_name)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_targeted_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3269,7 +3152,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .spawn_targeted_with_cx(cx, cwd, domain_name, target)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn split_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3282,7 +3164,6 @@ impl WeztermInterface for Arc<dyn WeztermInterface> {
             .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3649,7 +3530,6 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
     ///
     /// The legacy [`wait_for`](Self::wait_for) entry point is
     /// preserved for non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn wait_for_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3860,7 +3740,6 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
 /// The `PaneTextSource::get_text` call still uses ambient Cx
 /// (trait is not Cx-aware yet); the Cx-first wait here delivers
 /// meaningful cancellation for the between-poll sleep portion.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?Sized>(
     cx: &crate::cx::Cx,
     source: &S,
@@ -4047,9 +3926,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::Arc;
-    #[cfg(not(feature = "asupersync-runtime"))]
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -4059,33 +3935,6 @@ mod tests {
             .enable_all()
             .build()
             .expect("failed to build wezterm test runtime");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(future);
-        }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    fn run_async_test_paused<F>(future: F)
-    where
-        F: std::future::Future<Output = ()>,
-    {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .expect("failed to build wezterm paused test runtime");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(future);
         }));
@@ -4287,7 +4136,6 @@ mod tests {
     /// path, this test would surface a different error variant —
     /// CliNotFound, Timeout, or CommandFailed — instead of the
     /// expected SocketNotFound).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn activate_pane_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -4328,7 +4176,6 @@ mod tests {
     /// short-circuit contract as `activate_pane_with_cx` — a missing
     /// socket must surface as `SocketNotFound` via
     /// `run_cli_with_pane_check_with_cx`, not as a subprocess error.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn kill_pane_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -4369,7 +4216,6 @@ mod tests {
     /// short-circuit contract, and exercises both `zoom=true` and
     /// `zoom=false` (the `--unzoom` branch) so a regression in arg
     /// construction on the Cx path would be caught.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn zoom_pane_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -4427,7 +4273,6 @@ mod tests {
     /// tick 150's sibling trio (`retry_with_with_cx`,
     /// `run_cli_with_retry_with_cx`,
     /// `run_cli_with_pane_check_retry_with_cx`) is wired correctly.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn retry_with_with_cx_short_circuits_on_precancelled_cx() {
         run_async_test(async {
@@ -4474,7 +4319,6 @@ mod tests {
     /// `spawn_targeted_with_cx`, this test also transitively covers
     /// the delegation chain (if a future refactor broke the delegate,
     /// a different error variant would surface).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -4516,7 +4360,6 @@ mod tests {
     /// window and new window). Exercises the full `SpawnTarget`
     /// parameter surface to catch regressions in argv construction on
     /// the Cx path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_targeted_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -4604,7 +4447,6 @@ mod tests {
     /// diverge. This test pins the invariant that invoking the
     /// trait's `_with_cx` method on Arc<dyn> and UnifiedClient reaches
     /// the concrete impl's Cx-first entry point.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn activate_pane_with_cx_forwards_through_arc_and_unified() {
         run_async_test(async {
@@ -4668,7 +4510,6 @@ mod tests {
     /// must route through Arc<dyn> and UnifiedClient wrappers to the
     /// concrete `WeztermClient::kill_pane_with_cx` short-circuit.
     /// Parallel to tick 44's activate_pane_with_cx trait-path test.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn kill_pane_with_cx_forwards_through_arc_and_unified() {
         run_async_test(async {
@@ -4727,7 +4568,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `zoom_pane_with_cx` trait extension
     /// must route through Arc<dyn> and UnifiedClient wrappers for
     /// both `zoom=true` and `zoom=false` (--unzoom) branches.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn zoom_pane_with_cx_forwards_through_arc_and_unified() {
         run_async_test(async {
@@ -4803,7 +4643,6 @@ mod tests {
     /// Arc<dyn> wrapper to the concrete `WeztermClient` short-circuit.
     /// Covers the final 3 pane-lifecycle methods on the trait surface
     /// (parallel to tick 44's activate and tick 45's kill/zoom).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_split_with_cx_forward_through_arc() {
         run_async_test(async {
@@ -4878,7 +4717,6 @@ mod tests {
     /// variants along with cwd/percent options so a regression in
     /// argv construction on the Cx path surfaces as an error-variant
     /// mismatch rather than silently succeeding the wrong command.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn split_pane_with_cx_short_circuits_on_missing_socket() {
         run_async_test(async {
@@ -5055,139 +4893,6 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let wez_err = WeztermClient::categorize_io_error(&e);
         assert!(matches!(wez_err, WeztermError::CommandFailed(_)));
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[derive(Clone)]
-    struct TestTextSource {
-        sequence: Arc<Vec<String>>,
-        index: Arc<AtomicUsize>,
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    impl TestTextSource {
-        fn new(sequence: Vec<&str>) -> Self {
-            Self {
-                sequence: Arc::new(sequence.into_iter().map(str::to_string).collect()),
-                index: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    impl PaneTextSource for TestTextSource {
-        type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
-
-        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
-            let idx = self.index.fetch_add(1, Ordering::SeqCst);
-            let text = self
-                .sequence
-                .get(idx)
-                .cloned()
-                .or_else(|| self.sequence.last().cloned())
-                .unwrap_or_default();
-            Box::pin(async move { Ok(text) })
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn waiter_matches_substring() {
-        run_async_test_paused(async {
-            let source = TestTextSource::new(vec!["booting...", "ready: prompt"]);
-            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-                tail_lines: 50,
-                escapes: false,
-                poll_initial: Duration::from_secs(1),
-                poll_max: Duration::from_secs(1),
-                max_polls: 10,
-            });
-
-            let matcher = WaitMatcher::substring("ready");
-            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(5)));
-
-            for _ in 0..3 {
-                crate::runtime_compat::select! {
-                    result = &mut fut => {
-                        let result = result.expect("wait_for");
-                        match result {
-                            WaitResult::Matched { polls, .. } => {
-                                assert!(polls >= 2, "expected at least two polls");
-                            }
-                            WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
-                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
-                        }
-                        return;
-                    }
-                    () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
-                }
-                crate::runtime_compat::task::yield_now().await;
-            }
-
-            let result = fut.await.expect("wait_for");
-            match result {
-                WaitResult::Matched { polls, .. } => {
-                    assert!(polls >= 2, "expected at least two polls");
-                }
-                WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
-                WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
-            }
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn waiter_times_out() {
-        run_async_test_paused(async {
-            let source = TestTextSource::new(vec!["still waiting"]);
-            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-                tail_lines: 10,
-                escapes: false,
-                poll_initial: Duration::from_secs(1),
-                poll_max: Duration::from_secs(1),
-                max_polls: 100,
-            });
-
-            let matcher = WaitMatcher::substring("never");
-            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(2)));
-
-            for _ in 0..4 {
-                crate::runtime_compat::select! {
-                    result = &mut fut => {
-                        let result = result.expect("wait_for");
-                        match result {
-                            WaitResult::TimedOut {
-                                polls,
-                                last_tail_hash,
-                                ..
-                            } => {
-                                assert!(polls >= 1);
-                                assert!(last_tail_hash.is_some());
-                            }
-                            WaitResult::Matched { .. } => panic!("unexpected match"),
-                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
-                        }
-                        return;
-                    }
-                    () = crate::runtime_compat::time::advance(Duration::from_secs(1)) => {}
-                }
-                crate::runtime_compat::task::yield_now().await;
-            }
-
-            let result = fut.await.expect("wait_for");
-            match result {
-                WaitResult::TimedOut {
-                    polls,
-                    last_tail_hash,
-                    ..
-                } => {
-                    assert!(polls >= 1);
-                    assert!(last_tail_hash.is_some());
-                }
-                WaitResult::Matched { .. } => panic!("unexpected match"),
-                WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
-            }
-        });
     }
 
     #[test]
@@ -5915,46 +5620,6 @@ mod tests {
     // =====================================================================
     // PaneWaiter with max_polls limit
     // =====================================================================
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn waiter_stops_at_max_polls() {
-        run_async_test_paused(async {
-            let source = TestTextSource::new(vec!["no match"]);
-            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
-                tail_lines: 50,
-                escapes: false,
-                poll_initial: Duration::from_millis(1),
-                poll_max: Duration::from_millis(1),
-                max_polls: 3,
-            });
-
-            let matcher = WaitMatcher::substring("never-found");
-            let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(60)));
-
-            // Advance time enough for polling
-            for _ in 0..10 {
-                crate::runtime_compat::select! {
-                    result = &mut fut => {
-                        let result = result.unwrap();
-                        match result {
-                            WaitResult::TimedOut { polls, .. } => {
-                                assert!(polls <= 3);
-                            }
-                            WaitResult::Matched { .. } => panic!("unexpected match"),
-                            WaitResult::Cancelled { .. } => panic!("unexpected cancellation"),
-                        }
-                        return;
-                    }
-                    () = crate::runtime_compat::time::advance(Duration::from_millis(5)) => {}
-                }
-                crate::runtime_compat::task::yield_now().await;
-            }
-
-            let result = fut.await.unwrap();
-            assert!(matches!(result, WaitResult::TimedOut { .. }));
-        });
-    }
 
     // Batch: DarkBadger wa-1u90p.7.1
 
@@ -6699,12 +6364,10 @@ impl WeztermInterface for UnifiedClient {
     // correctly per tick 30) reaches the concrete WeztermClient
     // Cx-first override.
 
-    #[cfg(feature = "asupersync-runtime")]
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         self.inner.list_panes_with_cx(cx)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6713,7 +6376,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.get_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6723,7 +6385,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.get_text_with_cx(cx, pane_id, escapes)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6733,7 +6394,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.send_text_with_cx(cx, pane_id, text)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_no_paste_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6743,7 +6403,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.send_text_no_paste_with_cx(cx, pane_id, text)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_options_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6756,7 +6415,6 @@ impl WeztermInterface for UnifiedClient {
             .send_text_with_options_with_cx(cx, pane_id, text, no_paste, no_newline)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_control_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6766,7 +6424,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.send_control_with_cx(cx, pane_id, control_char)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_c_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6775,7 +6432,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.send_ctrl_c_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_ctrl_d_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6784,7 +6440,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.send_ctrl_d_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_direction_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6795,7 +6450,6 @@ impl WeztermInterface for UnifiedClient {
             .get_pane_direction_with_cx(cx, pane_id, direction)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn activate_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6804,7 +6458,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.activate_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn kill_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6813,7 +6466,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.kill_pane_with_cx(cx, pane_id)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn zoom_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6823,7 +6475,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.zoom_pane_with_cx(cx, pane_id, zoom)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6833,7 +6484,6 @@ impl WeztermInterface for UnifiedClient {
         self.inner.spawn_with_cx(cx, cwd, domain_name)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_targeted_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6845,7 +6495,6 @@ impl WeztermInterface for UnifiedClient {
             .spawn_targeted_with_cx(cx, cwd, domain_name, target)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn split_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6858,7 +6507,6 @@ impl WeztermInterface for UnifiedClient {
             .split_pane_with_cx(cx, pane_id, direction, cwd, percent)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -6984,7 +6632,6 @@ impl MockWezterm {
     /// `write_with_cx(cx)` so a caller-cancelled cx interrupts the
     /// lock wait. Used by `Scenario::setup_with_cx` for the
     /// simulation-harness setup loop.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn add_pane_with_cx(&self, cx: &crate::cx::Cx, pane: MockPane) {
         let mut panes = self.panes.write_with_cx(cx).await;
         let id = pane.pane_id;
@@ -7047,7 +6694,6 @@ impl MockWezterm {
     /// migrations (`TutorialSandbox::trigger_exercise_events_with_cx`
     /// already uses this pattern via `execute_all_with_cx`; the resize
     /// timeline helpers on Scenario can now follow suit).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7080,7 +6726,6 @@ impl MockWezterm {
     ///
     /// Routes through `inject_with_cx` so caller cancellation
     /// propagates all the way to the RwLock acquire.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn inject_output_with_cx(
         &self,
         cx: &crate::cx::Cx,

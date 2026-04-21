@@ -142,7 +142,6 @@ impl LayoutRestorer {
     /// checkpoint between iterations makes cancellation
     /// responsive for multi-window restores where each window
     /// involves multiple expensive spawn operations.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn restore_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -852,7 +851,6 @@ mod tests {
     /// the same RestoreResult shape (pane/window/tab counts,
     /// pane_id_map coverage, no failures) as `restore` for an
     /// uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn restore_with_cx_matches_legacy() {
         run_async_test(async {

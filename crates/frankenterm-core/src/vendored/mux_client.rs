@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config as wa_config;
-#[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
 use crate::runtime_compat::mpsc_reserve_send;
@@ -167,7 +166,26 @@ impl DirectMuxError {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
+fn cancelled_mux_io(phase: &'static str, detail: impl std::fmt::Display) -> DirectMuxError {
+    DirectMuxError::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        format!("mux {phase} cancelled: {detail}"),
+    ))
+}
+
+fn classify_cx_timeout(
+    cx: &Cx,
+    phase: &'static str,
+    timeout_err: String,
+    on_timeout: DirectMuxError,
+) -> DirectMuxError {
+    if cx.is_cancel_requested() {
+        cancelled_mux_io(phase, timeout_err)
+    } else {
+        on_timeout
+    }
+}
+
 fn checkpoint_mux_cx(
     cx: &Cx,
     connection_id: u64,
@@ -181,10 +199,7 @@ fn checkpoint_mux_cx(
             error = %err,
             "mux operation cancelled before transport boundary"
         );
-        DirectMuxError::Io(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            format!("mux {phase} cancelled: {err}"),
-        ))
+        cancelled_mux_io(phase, err)
     })
 }
 
@@ -216,7 +231,6 @@ impl std::fmt::Debug for DirectMuxClient {
 
 impl DirectMuxClient {
     pub async fn connect(config: DirectMuxClientConfig) -> Result<Self, DirectMuxError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             // Keep the ambient entry point for compatibility, but route the
             // actual transport work through the explicit-Cx path so connect,
@@ -226,47 +240,9 @@ impl DirectMuxClient {
             return Self::connect_with_cx(&cx, config).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let socket_path = resolve_socket_path(&config)?;
-            if !socket_path.exists() {
-                return Err(DirectMuxError::SocketNotFound(socket_path));
-            }
-
-            let preferred_mode = resolve_compression_mode(config.compression_mode, &socket_path);
-            tracing::debug!(
-                socket_path = %socket_path.display(),
-                configured_compression_mode = ?config.compression_mode,
-                preferred_compression_mode = ?preferred_mode,
-                "connecting direct mux client"
-            );
-            match Self::connect_with_mode(socket_path.clone(), config.clone(), preferred_mode).await
-            {
-                Ok(client) => Ok(client),
-                Err(err)
-                    if should_auto_fallback_to_always(
-                        config.compression_mode,
-                        preferred_mode,
-                        &err,
-                    ) =>
-                {
-                    tracing::warn!(
-                        socket_path = %socket_path.display(),
-                        preferred_compression_mode = ?preferred_mode,
-                        fallback_compression_mode = ?CompressionMode::Always,
-                        error_kind = ?err.protocol_error_kind(),
-                        error = %err,
-                        "retrying direct mux connection with compression fallback"
-                    );
-                    Self::connect_with_mode(socket_path, config, CompressionMode::Always).await
-                }
-                Err(err) => Err(err),
-            }
-        }
     }
 
     /// Connect using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn connect_with_cx(
         cx: &Cx,
         config: DirectMuxClientConfig,
@@ -316,7 +292,6 @@ impl DirectMuxClient {
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn connect_with_mode_with_cx(
         cx: &Cx,
         socket_path: PathBuf,
@@ -337,7 +312,14 @@ impl DirectMuxClient {
             compat_unix::connect(&socket_path),
         )
         .await
-        .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
+        .map_err(|timeout_err| {
+            classify_cx_timeout(
+                cx,
+                "connect_wait",
+                timeout_err,
+                DirectMuxError::ConnectTimeout(socket_path.clone()),
+            )
+        })??;
 
         let mut client = Self {
             connection_id,
@@ -390,65 +372,6 @@ impl DirectMuxClient {
         Ok(client)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn connect_with_mode(
-        socket_path: PathBuf,
-        config: DirectMuxClientConfig,
-        compression_mode: CompressionMode,
-    ) -> Result<Self, DirectMuxError> {
-        let connection_id = next_connection_id();
-        let stream = timeout(config.connect_timeout, compat_unix::connect(&socket_path))
-            .await
-            .map_err(|_| DirectMuxError::ConnectTimeout(socket_path.clone()))??;
-
-        let mut client = Self {
-            connection_id,
-            stream,
-            compression_mode,
-            socket_path,
-            read_buf: Vec::new(),
-            serial: 0,
-            pending_responses: HashMap::new(),
-            pending_render_changes: VecDeque::new(),
-            render_change_snapshots: HashMap::new(),
-            config,
-        };
-
-        if let Err(err) = client.verify_codec_version().await {
-            tracing::warn!(
-                connection_id = client.connection_id,
-                socket_path = %client.socket_path.display(),
-                phase = "codec_version_handshake",
-                error_kind = ?err.protocol_error_kind(),
-                error = %err,
-                "direct mux codec verification failed"
-            );
-            return Err(err);
-        }
-        if let Err(err) = client.register_client().await {
-            tracing::warn!(
-                connection_id = client.connection_id,
-                socket_path = %client.socket_path.display(),
-                phase = "register_client",
-                error_kind = ?err.protocol_error_kind(),
-                error = %err,
-                "direct mux client registration failed"
-            );
-            return Err(err);
-        }
-        tracing::debug!(
-            connection_id = client.connection_id,
-            socket_path = %client.socket_path.display(),
-            compression_mode = ?client.compression_mode,
-            connect_timeout_ms = duration_to_ms_u64(client.config.connect_timeout),
-            read_timeout_ms = duration_to_ms_u64(client.config.read_timeout),
-            write_timeout_ms = duration_to_ms_u64(client.config.write_timeout),
-            phase = "connected",
-            "direct mux client connected"
-        );
-        Ok(client)
-    }
-
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -465,7 +388,6 @@ impl DirectMuxClient {
     }
 
     /// List panes using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_panes_with_cx(
         &mut self,
         cx: &Cx,
@@ -497,7 +419,6 @@ impl DirectMuxClient {
     }
 
     /// Poll render changes using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_with_cx(
         &mut self,
         cx: &Cx,
@@ -537,7 +458,6 @@ impl DirectMuxClient {
     }
 
     /// Fetch pane lines using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_lines_with_cx(
         &mut self,
         cx: &Cx,
@@ -584,7 +504,6 @@ impl DirectMuxClient {
     }
 
     /// Write raw bytes to a pane using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn write_to_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -771,7 +690,6 @@ impl DirectMuxClient {
     }
 
     /// Send paste text using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_paste_with_cx(
         &mut self,
         cx: &Cx,
@@ -796,7 +714,6 @@ impl DirectMuxClient {
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn expect_unit_response_with_cx(
         &mut self,
         cx: &Cx,
@@ -812,7 +729,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`create_floating_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn create_floating_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -832,7 +748,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`move_floating_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn move_floating_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -850,7 +765,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_floating_pane_z`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_floating_pane_z_with_cx(
         &mut self,
         cx: &Cx,
@@ -868,7 +782,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`toggle_floating_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn toggle_floating_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -886,7 +799,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_floating_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn remove_floating_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -902,7 +814,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`swap_to_layout`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn swap_to_layout_with_cx(
         &mut self,
         cx: &Cx,
@@ -920,7 +831,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_layout_cycle`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_layout_cycle_with_cx(
         &mut self,
         cx: &Cx,
@@ -938,7 +848,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`cycle_stack`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn cycle_stack_with_cx(
         &mut self,
         cx: &Cx,
@@ -958,7 +867,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`select_stack_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn select_stack_pane_with_cx(
         &mut self,
         cx: &Cx,
@@ -978,7 +886,6 @@ impl DirectMuxClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_pane_constraints`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_pane_constraints_with_cx(
         &mut self,
         cx: &Cx,
@@ -1001,30 +908,6 @@ impl DirectMuxClient {
         .await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn verify_codec_version(&mut self) -> Result<GetCodecVersionResponse, DirectMuxError> {
-        let response = self
-            .send_request(Pdu::GetCodecVersion(GetCodecVersion {}))
-            .await?;
-        match response {
-            Pdu::GetCodecVersionResponse(payload) => {
-                if payload.codec_vers != CODEC_VERSION {
-                    return Err(DirectMuxError::IncompatibleCodec {
-                        local: CODEC_VERSION,
-                        remote: payload.codec_vers,
-                        remote_version: payload.version_string.clone(),
-                    });
-                }
-                Ok(payload)
-            }
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "GetCodecVersionResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
     async fn verify_codec_version_with_cx(
         &mut self,
         cx: &Cx,
@@ -1050,25 +933,6 @@ impl DirectMuxClient {
         }
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn register_client(&mut self) -> Result<UnitResponse, DirectMuxError> {
-        let client_id = ClientId::new();
-        let response = self
-            .send_request(Pdu::SetClientId(SetClientId {
-                client_id,
-                is_proxy: false,
-            }))
-            .await?;
-        match response {
-            Pdu::UnitResponse(payload) => Ok(payload),
-            other => Err(DirectMuxError::UnexpectedResponse {
-                expected: "UnitResponse".to_string(),
-                got: other.pdu_name().to_string(),
-            }),
-        }
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
     async fn register_client_with_cx(&mut self, cx: &Cx) -> Result<UnitResponse, DirectMuxError> {
         let client_id = ClientId::new();
         let response = self
@@ -1130,7 +994,6 @@ impl DirectMuxClient {
     }
 
     /// Batch render-change requests using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_batch_with_cx(
         &mut self,
         cx: &Cx,
@@ -1196,7 +1059,6 @@ impl DirectMuxClient {
     /// internally by `get_pane_render_changes_batch_with_cx`;
     /// elevated to `pub` so external callers have a Cx-first
     /// entry point for general PDU batching.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn batch_with_cx(
         &mut self,
         cx: &Cx,
@@ -1212,7 +1074,14 @@ impl DirectMuxClient {
             self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
         )
         .await
-        .map_err(|_| DirectMuxError::BatchTimeout { timeout_ms })?
+        .map_err(|timeout_err| {
+            classify_cx_timeout(
+                cx,
+                "batch_wait",
+                timeout_err,
+                DirectMuxError::BatchTimeout { timeout_ms },
+            )
+        })?
     }
 
     async fn batch_inner(
@@ -1282,7 +1151,6 @@ impl DirectMuxClient {
         Ok(ordered)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn batch_inner_with_cx(
         &mut self,
         cx: &Cx,
@@ -1358,7 +1226,6 @@ impl DirectMuxClient {
         self.await_response(serial).await
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn send_request_with_cx(&mut self, cx: &Cx, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
         let serial = self.send_request_only_with_cx(cx, pdu).await?;
         self.await_response_with_cx(cx, serial).await
@@ -1402,7 +1269,7 @@ impl DirectMuxClient {
                 );
                 return Err(DirectMuxError::Io(err));
             }
-            Err(_) => {
+            Err(timeout_err) => {
                 tracing::warn!(
                     connection_id = self.connection_id,
                     request_serial = serial,
@@ -1418,7 +1285,6 @@ impl DirectMuxClient {
         Ok(serial)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn send_request_only_with_cx(
         &mut self,
         cx: &Cx,
@@ -1489,7 +1355,12 @@ impl DirectMuxClient {
                     phase = "write_timeout",
                     "mux request write timed out"
                 );
-                return Err(DirectMuxError::WriteTimeout);
+                return Err(classify_cx_timeout(
+                    cx,
+                    "request_write_wait",
+                    timeout_err,
+                    DirectMuxError::WriteTimeout,
+                ));
             }
         }
         Ok(serial)
@@ -1525,7 +1396,6 @@ impl DirectMuxClient {
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn await_response_with_cx(
         &mut self,
         cx: &Cx,
@@ -1742,7 +1612,6 @@ impl DirectMuxClient {
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn read_next_pdu_with_cx(&mut self, cx: &Cx) -> Result<DecodedPdu, DirectMuxError> {
         loop {
             if let Some(decoded) =
@@ -1779,7 +1648,7 @@ impl DirectMuxClient {
                     );
                     return Err(DirectMuxError::Io(err));
                 }
-                Err(_) => {
+                Err(timeout_err) => {
                     tracing::warn!(
                         connection_id = self.connection_id,
                         timeout_ms = duration_to_ms_u64(self.config.read_timeout),
@@ -1787,7 +1656,12 @@ impl DirectMuxClient {
                         phase = "read_timeout",
                         "mux response read timed out"
                     );
-                    return Err(DirectMuxError::ReadTimeout);
+                    return Err(classify_cx_timeout(
+                        cx,
+                        "response_read_wait",
+                        timeout_err,
+                        DirectMuxError::ReadTimeout,
+                    ));
                 }
             };
             if read == 0 {
@@ -1817,7 +1691,6 @@ impl DirectMuxClient {
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 fn ambient_mux_cx() -> Cx {
     Cx::current().unwrap_or_else(crate::cx::for_request)
 }
@@ -1937,7 +1810,6 @@ async fn unix_stream_read(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::R
 /// so a cancelled caller surfaces as an IO error rather than panicking
 /// or blocking on the underlying poll_read. Used from
 /// `read_next_pdu_with_cx` where the parent Cx is already in scope.
-#[cfg(feature = "asupersync-runtime")]
 async fn unix_stream_read_with_cx(
     cx: &Cx,
     stream: &mut UnixStream,
@@ -2008,7 +1880,6 @@ impl Default for SubscriptionConfig {
 /// A handle to a running pane output subscription.
 ///
 /// Dropping this handle cancels the subscription.
-#[cfg(feature = "asupersync-runtime")]
 enum SubscriptionTask {
     Scoped(cx::JoinHandle<()>),
 }
@@ -2016,86 +1887,27 @@ enum SubscriptionTask {
 pub struct PaneOutputSubscription {
     receiver: mpsc::Receiver<PaneDelta>,
     cancel: watch::Sender<bool>,
-    #[cfg(feature = "asupersync-runtime")]
     task: Option<SubscriptionTask>,
-    #[cfg(not(feature = "asupersync-runtime"))]
-    task: Option<task::JoinHandle<()>>,
-}
-
-#[cfg(feature = "asupersync-runtime")]
-async fn pane_delta_recv_with_cx(cx: &Cx, rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
-    rx.recv(cx).await.ok()
-}
-
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
-    rx.recv().await
-}
-
-#[cfg(all(test, feature = "asupersync-runtime"))]
-async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
-    let cx = crate::cx::for_testing();
-    rx.recv(&cx).await.ok()
-}
-
-#[cfg(test)]
-async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
-    let _ = mpsc_reserve_send(tx, delta).await;
-}
-
-fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
-    mpsc_try_reserve_send(tx, delta)
-}
-
-fn pane_delta_try_emit_ended(
-    tx: &mpsc::Sender<PaneDelta>,
-    pane_id: u64,
-    reason: impl Into<String>,
-) {
-    let _ = pane_delta_try_send(
-        tx,
-        PaneDelta::Ended {
-            pane_id,
-            reason: reason.into(),
-        },
     );
 }
 
-#[cfg(feature = "asupersync-runtime")]
 async fn join_subscription_task(task: SubscriptionTask) {
     let SubscriptionTask::Scoped(handle) = task;
     handle.await;
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn join_subscription_task(task: task::JoinHandle<()>) {
-    let _ = task.await;
-}
-
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for the update-taking watch path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         cancel_rx.borrow_and_clone()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        *cancel_rx.borrow_and_update()
-    }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn wait_for_cancel_change(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    cancel_rx.changed().await.is_ok()
-}
-
-#[cfg(feature = "asupersync-runtime")]
 async fn wait_for_cancel_change_with_cx(cx: &Cx, cancel_rx: &mut watch::Receiver<bool>) -> bool {
     cancel_rx.changed(cx).await.is_ok()
 }
 
-#[cfg(feature = "asupersync-runtime")]
 async fn run_subscription_loop(
     cx: &Cx,
     mut client: DirectMuxClient,
@@ -2203,116 +2015,19 @@ async fn run_subscription_loop(
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn run_subscription_loop(
-    mut client: DirectMuxClient,
-    pane_id: u64,
-    config: SubscriptionConfig,
-    tx: mpsc::Sender<PaneDelta>,
-    mut cancel_rx: watch::Receiver<bool>,
-) {
-    let mut last_seqno: Option<u64> = None;
-
-    loop {
-        if cancel_requested(&mut cancel_rx) {
-            pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
-            break;
-        }
-
-        let result = client.get_pane_render_changes(pane_id).await;
-
-        let saw_dirty_output = match result {
-            Ok(changes) => {
-                let seqno = changes.seqno as u64;
-                let has_dirty = !changes.dirty_lines.is_empty();
-
-                if let Some(prev) = last_seqno {
-                    if seqno > prev + 1 {
-                        let _ = pane_delta_try_send(
-                            &tx,
-                            PaneDelta::Gap {
-                                pane_id,
-                                reason: format!(
-                                    "seqno jump: {} -> {} (missed {})",
-                                    prev,
-                                    seqno,
-                                    seqno - prev - 1
-                                ),
-                            },
-                        );
-                    }
-                }
-                last_seqno = Some(seqno);
-
-                if has_dirty {
-                    let delta_text = bonus_lines_to_text(changes.bonus_lines);
-                    let dirty_row_count = total_dirty_rows(&changes.dirty_lines);
-                    let delta = PaneDelta::Output {
-                        pane_id,
-                        seqno,
-                        delta_text,
-                        title: changes.title,
-                        dirty_range_count: changes.dirty_lines.len(),
-                        dirty_row_count,
-                    };
-
-                    if !pane_delta_try_send(&tx, delta) {
-                        let _ = pane_delta_try_send(
-                            &tx,
-                            PaneDelta::Gap {
-                                pane_id,
-                                reason: "slow consumer: channel full".to_string(),
-                            },
-                        );
-                    }
-                }
-
-                has_dirty
-            }
-            Err(DirectMuxError::Disconnected) => {
-                pane_delta_try_emit_ended(&tx, pane_id, "mux socket disconnected");
-                break;
-            }
-            Err(DirectMuxError::ReadTimeout) => {
-                tracing::debug!(pane_id, "subscription poll timeout, retrying");
-                false
-            }
-            Err(err) => {
-                pane_delta_try_emit_ended(&tx, pane_id, format!("subscription error: {err}"));
-                break;
-            }
-        };
-
-        let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
-        if let Ok(changed_ok) = timeout(wait_interval, wait_for_cancel_change(&mut cancel_rx)).await
-        {
-            if !changed_ok || cancel_requested(&mut cancel_rx) {
-                pane_delta_try_emit_ended(&tx, pane_id, "cancelled");
-                break;
-            }
-        }
-    }
-}
-
 impl PaneOutputSubscription {
     /// Receive the next delta using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn next_with_cx(&mut self, cx: &Cx) -> Option<PaneDelta> {
         pane_delta_recv_with_cx(cx, &mut self.receiver).await
     }
 
     /// Receive the next delta. Returns `None` when the subscription ends.
     pub async fn next(&mut self) -> Option<PaneDelta> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = ambient_mux_cx();
             self.next_with_cx(&cx).await
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            pane_delta_recv(&mut self.receiver).await
-        }
     }
 
     /// Cancel the subscription.
@@ -2341,7 +2056,6 @@ impl PaneOutputSubscription {
     /// own, but the caller does not block. This lets a cancelled
     /// parent scope bail fast while preserving the "cancel
     /// before return" guarantee that the legacy shutdown gives.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_with_cx(mut self, cx: &Cx) {
         self.cancel();
         if cx.checkpoint().is_err() {
@@ -2361,7 +2075,6 @@ fn subscription_poll_delay(config: &SubscriptionConfig, saw_dirty_output: bool) 
     }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 fn spawn_subscription_task_with_cx(
     handle: &RuntimeHandle,
     cx: &Cx,
@@ -2377,7 +2090,6 @@ fn spawn_subscription_task_with_cx(
     SubscriptionTask::Scoped(task)
 }
 
-#[cfg(feature = "asupersync-runtime")]
 fn inherited_subscription_runtime_handle() -> RuntimeHandle {
     crate::runtime_compat::current_runtime_handle()
         .expect("pane output subscription started without an installed runtime handle")
@@ -2397,7 +2109,6 @@ impl Drop for PaneOutputSubscription {
 ///
 /// The poller tracks the last seen `seqno` and emits a `PaneDelta::Gap`
 /// if the mux-side seqno jumps by more than 1.
-#[cfg(feature = "asupersync-runtime")]
 #[allow(dead_code)]
 pub fn subscribe_pane_output_with_cx(
     handle: &RuntimeHandle,
@@ -2422,7 +2133,6 @@ pub fn subscribe_pane_output_with_cx(
 ///
 /// Under `asupersync-runtime`, prefer [`subscribe_pane_output_with_cx`] so the
 /// background poller and receiver path share an explicit caller-owned `Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub fn subscribe_pane_output_with_inherited_cx(
     cx: &Cx,
     client: DirectMuxClient,
@@ -2447,26 +2157,11 @@ pub fn subscribe_pane_output(
     pane_id: u64,
     config: SubscriptionConfig,
 ) -> PaneOutputSubscription {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = ambient_mux_cx();
         subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let (tx, rx) = mpsc::channel(config.channel_capacity);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let task = task::spawn(async move {
-            run_subscription_loop(client, pane_id, config, tx, cancel_rx).await;
-        });
-
-        PaneOutputSubscription {
-            receiver: rx,
-            cancel: cancel_tx,
-            task: Some(task),
-        }
-    }
 }
 
 fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {
@@ -2612,7 +2307,6 @@ mod tests {
         stream.flush().await
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn cancelled_test_cx(message: &'static str) -> Cx {
         let budget = crate::cx::Budget::new().with_poll_quota(0);
         let cx = Cx::for_testing_with_budget(budget);
@@ -2620,7 +2314,6 @@ mod tests {
         cx
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn assert_cancelled_mux_io(err: &DirectMuxError) {
         match err {
             DirectMuxError::Io(io_err) => {
@@ -2724,7 +2417,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_panes_with_cx_roundtrip() {
         run_async_test(async {
@@ -2794,7 +2486,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn request_methods_with_cx_roundtrip() {
         run_async_test(async {
@@ -2959,7 +2650,6 @@ mod tests {
     /// helper + the 9 sibling pane/layout ops that share it)
     /// roundtrips through the mux codec correctly when given a
     /// fresh, uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn create_floating_pane_with_cx_roundtrip() {
         run_async_test(async {
@@ -3048,7 +2738,6 @@ mod tests {
     /// an external caller and returns responses in request
     /// order. Uses two ListPanes requests so the server can
     /// count how many it saw before responding.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn batch_with_cx_pub_entry_returns_responses_in_request_order() {
         run_async_test(async {
@@ -3137,7 +2826,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_request_only_with_precancelled_cx_fails_before_writing_frame() {
         run_async_test(async {
@@ -3237,7 +2925,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn await_response_with_precancelled_cx_fails_before_reading_frame() {
         run_async_test(async {
@@ -3632,7 +3319,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn request_methods_with_cx_reject_unexpected_response_types() {
         run_async_test(async {
@@ -3971,7 +3657,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn batch_render_changes_with_cx_preserves_request_order_with_out_of_order_responses() {
         run_async_test(async {
@@ -4185,7 +3870,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn batch_render_changes_with_cx_zero_pipeline_depth_is_clamped_and_succeeds() {
         run_async_test(async {
@@ -4726,7 +4410,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn batch_render_changes_with_cx_times_out_when_server_stalls_mid_batch() {
         run_async_test(async {
@@ -4841,6 +4524,133 @@ mod tests {
             }
 
             drop(client);
+            server.await.expect("server task");
+        });
+    }
+
+    #[test]
+    fn batch_render_changes_with_cx_cancellation_during_stalled_batch_surfaces_cancelled_io() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("batch-cancel-with-cx.sock");
+            let listener = compat_unix::bind(&socket_path)
+                .await
+                .expect("bind listener");
+            let (stall_tx, stall_rx) = std::sync::mpsc::channel();
+
+            let server = task::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut read_buf = Vec::new();
+                let mut responded_once = false;
+
+                loop {
+                    let mut temp = vec![0u8; 4096];
+                    let read = unix_stream_read(&mut stream, &mut temp)
+                        .await
+                        .expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    read_buf.extend_from_slice(&temp[..read]);
+
+                    while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                        match decoded.pdu {
+                            Pdu::GetCodecVersion(_) => {
+                                let response =
+                                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                        codec_vers: CODEC_VERSION,
+                                        version_string: "batch-cancel-with-cx-test".to_string(),
+                                        executable_path: PathBuf::from("/bin/wezterm"),
+                                        config_file_path: None,
+                                    });
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write codec response");
+                            }
+                            Pdu::SetClientId(_) => {
+                                let response = Pdu::UnitResponse(UnitResponse {});
+                                write_response_pdu(&mut stream, &response, decoded.serial)
+                                    .await
+                                    .expect("write client response");
+                            }
+                            Pdu::GetPaneRenderChanges(request) => {
+                                if !responded_once {
+                                    responded_once = true;
+                                    let response = Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: request.pane_id,
+                                            mouse_grabbed: false,
+                                            alt_screen_active: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            tiered_scrollback_status: None,
+                                            dirty_lines: Vec::new(),
+                                            title: "pane-cancel-with-cx".to_string(),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: 1,
+                                        },
+                                    );
+                                    let mut out = Vec::new();
+                                    response
+                                        .encode_with_mode(
+                                            &mut out,
+                                            decoded.serial,
+                                            CompressionMode::Always,
+                                        )
+                                        .expect("encode compressed response");
+                                    stream.write_all(&out).await.expect("write response");
+                                } else {
+                                    stall_tx.send(()).expect("signal stalled batch");
+                                    sleep(Duration::from_millis(200)).await;
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+            client.config.read_timeout = Duration::from_millis(500);
+
+            let cancel_cx = cx.clone();
+            let cancel = std::thread::spawn(move || {
+                stall_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("server should enter stalled batch state");
+                std::thread::sleep(Duration::from_millis(5));
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel during batch wait"),
+                );
+            });
+
+            let err = client
+                .get_pane_render_changes_batch_with_cx(&cx, &[10, 20], 2, Duration::from_millis(40))
+                .await
+                .expect_err("batch with cx should surface cancellation");
+            assert_cancelled_mux_io(&err);
+
+            drop(client);
+            cancel.join().expect("cancel thread");
             server.await.expect("server task");
         });
     }
@@ -5480,7 +5290,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn connect_with_cx_to_missing_socket_returns_error() {
         run_async_test(async {
@@ -5497,7 +5306,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn connect_with_precancelled_cx_fails_before_opening_socket() {
         run_async_test(async {
@@ -5574,7 +5382,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn connect_with_cx_times_out_when_server_stalls_during_codec_handshake() {
         run_async_test(async {
@@ -5620,6 +5427,102 @@ mod tests {
                 "expected ReadTimeout, got: {err}"
             );
 
+            server.join().expect("server thread should exit cleanly");
+        });
+    }
+
+    #[test]
+    fn list_panes_with_cx_cancellation_during_response_read_surfaces_cancelled_io() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("read-cancel-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for read cancel with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "read-cancel-with-cx-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write codec response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let response = Pdu::UnitResponse(UnitResponse {});
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write client response");
+                                }
+                                Pdu::ListPanes(_) => {
+                                    request_seen_tx.send(()).expect("signal list panes request");
+                                    sleep(Duration::from_millis(250)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(40);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+
+            let cancel_cx = cx.clone();
+            let cancel = std::thread::spawn(move || {
+                request_seen_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("server should observe list panes request");
+                std::thread::sleep(Duration::from_millis(5));
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel during response read"),
+                );
+            });
+
+            let err = client
+                .list_panes_with_cx(&cx)
+                .await
+                .expect_err("list_panes_with_cx should surface cancellation");
+            assert_cancelled_mux_io(&err);
+
+            drop(client);
+            cancel.join().expect("cancel thread");
             server.join().expect("server thread should exit cleanly");
         });
     }
@@ -5707,7 +5610,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_paste_with_cx_write_timeout_when_server_stops_reading_after_handshake() {
         run_async_test(async {
@@ -5796,6 +5698,97 @@ mod tests {
     }
 
     #[test]
+    fn send_paste_with_cx_cancellation_during_write_surfaces_cancelled_io() {
+        run_async_test(async {
+            let cx = crate::cx::for_testing();
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("write-cancel-with-cx.sock");
+            let server_socket_path = socket_path.clone();
+            let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime for write cancel with-cx test server");
+                CompatRuntime::block_on(&runtime, async move {
+                    let listener = compat_unix::bind(&server_socket_path).await.expect("bind");
+                    server_ready_tx.send(()).expect("send server ready signal");
+
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut read_buf = Vec::new();
+
+                    loop {
+                        let mut temp = vec![0u8; 4096];
+                        let read = unix_stream_read(&mut stream, &mut temp)
+                            .await
+                            .expect("read");
+                        if read == 0 {
+                            break;
+                        }
+                        read_buf.extend_from_slice(&temp[..read]);
+                        while let Ok(Some(decoded)) = codec::Pdu::stream_decode(&mut read_buf) {
+                            match decoded.pdu {
+                                Pdu::GetCodecVersion(_) => {
+                                    let response =
+                                        Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                            codec_vers: CODEC_VERSION,
+                                            version_string: "write-cancel-with-cx-test".to_string(),
+                                            executable_path: PathBuf::from("/bin/wezterm"),
+                                            config_file_path: None,
+                                        });
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write codec response");
+                                }
+                                Pdu::SetClientId(_) => {
+                                    let response = Pdu::UnitResponse(UnitResponse {});
+                                    write_response_pdu(&mut stream, &response, decoded.serial)
+                                        .await
+                                        .expect("write client response");
+                                    sleep(Duration::from_millis(500)).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+
+            server_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server should be ready before client connects");
+
+            let mut config = DirectMuxClientConfig::default();
+            config.socket_path = Some(socket_path);
+            config.read_timeout = Duration::from_millis(200);
+            let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+                .await
+                .expect("connect with cx");
+            client.config.write_timeout = Duration::from_millis(40);
+
+            let cancel_cx = cx.clone();
+            let cancel = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("cancel during request write"),
+                );
+            });
+
+            let payload = "x".repeat(32 * 1024 * 1024);
+            let err = client
+                .send_paste_with_cx(&cx, 0, payload)
+                .await
+                .expect_err("send_paste_with_cx should surface cancellation");
+            assert_cancelled_mux_io(&err);
+
+            drop(client);
+            cancel.join().expect("cancel thread");
+            server.join().expect("server thread");
+        });
+    }
+
+    #[test]
     fn list_panes_read_timeout_when_server_stalls_after_handshake() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -5876,7 +5869,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_panes_with_cx_read_timeout_when_server_stalls_after_handshake() {
         run_async_test(async {
@@ -6042,7 +6034,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_panes_with_cx_disconnected_when_server_closes_after_request() {
         run_async_test(async {
@@ -6367,7 +6358,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_panes_with_cx_handles_partial_frame_reads() {
         run_async_test(async {
@@ -6474,7 +6464,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn get_pane_render_changes_with_cx_handles_partial_compressed_frame_reads() {
         run_async_test(async {
@@ -6732,7 +6721,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn list_panes_with_cx_rejects_oversized_response_frame() {
         run_async_test(async {
@@ -6957,7 +6945,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn incompatible_codec_version_rejected_with_cx() {
         run_async_test(async {
@@ -7368,7 +7355,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn subscription_with_cx_receives_output_delta() {
         let runtime = crate::cx::CxRuntimeBuilder::current_thread()
@@ -7497,7 +7483,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn subscription_with_inherited_cx_receives_output_delta() {
         run_async_test(async {
@@ -7614,7 +7599,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn subscription_with_cx_shutdown_waits_for_poller_exit() {
         let runtime = crate::cx::CxRuntimeBuilder::current_thread()
@@ -8270,7 +8254,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn subscription_with_cx_cancel_closes_connection_when_channel_full() {
         let runtime = crate::cx::CxRuntimeBuilder::current_thread()
@@ -8540,7 +8523,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn subscription_with_cx_cancel_closes_connection_when_seq_gap_emit_is_backpressured() {
         let runtime = crate::cx::CxRuntimeBuilder::current_thread()
@@ -8943,7 +8925,6 @@ mod tests {
     // `asupersync-runtime` feature is enabled (default).
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_mux_client {
         use super::*;
         use crate::runtime_compat::{mpsc as compat_mpsc, watch as compat_watch};

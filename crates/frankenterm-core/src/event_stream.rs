@@ -520,16 +520,11 @@ impl EventWaiter {
     /// Subscribes to the bus and blocks until the condition is met or
     /// timeout expires. Returns the matching event or timeout result.
     pub async fn wait(self, bus: &EventBus) -> WaitResult {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.wait_with_cx(&cx, bus).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            return self.wait_legacy(bus).await;
-        }
     }
 
     /// Explicit quarantine for legacy non-asupersync event waits.
@@ -537,64 +532,6 @@ impl EventWaiter {
     /// Owner: `ft-xbnl0.2.5`.
     /// Removal path: drop this helper once the workspace no longer supports
     /// non-`asupersync-runtime` event-stream waits.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn wait_legacy(self, bus: &EventBus) -> WaitResult {
-        let Self {
-            condition,
-            filter,
-            timeout,
-        } = self;
-        let start = std::time::Instant::now();
-        let mut subscriber = bus.subscribe();
-
-        let recv_loop = async move {
-            match condition {
-                WaitCondition::AllOf { conditions } => {
-                    let mut tracker = AllOfTracker::new(conditions);
-                    loop {
-                        match subscriber.recv().await {
-                            Ok(event) => {
-                                if filter.matches_event(&event) && tracker.check(&event) {
-                                    return Some(event);
-                                }
-                            }
-                            Err(crate::events::RecvError::Lagged { .. }) => {
-                                // Subscriber fell behind — continue from new position.
-                            }
-                            Err(crate::events::RecvError::Closed) => return None,
-                        }
-                    }
-                }
-                condition => loop {
-                    match subscriber.recv().await {
-                        Ok(event) => {
-                            if filter.matches_event(&event) && condition.matches(&event) {
-                                return Some(event);
-                            }
-                        }
-                        Err(crate::events::RecvError::Lagged { .. }) => {
-                            // Subscriber fell behind — continue from new position.
-                        }
-                        Err(crate::events::RecvError::Closed) => return None,
-                    }
-                },
-            }
-        };
-
-        match crate::runtime_compat::timeout(timeout, recv_loop).await {
-            Ok(Some(event)) => WaitResult::Matched {
-                event: Box::new(event),
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            },
-            Ok(None) => WaitResult::Cancelled {
-                reason: "event bus closed".to_string(),
-            },
-            Err(_) => WaitResult::Timeout {
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            },
-        }
-    }
-
     /// Execute the wait against an event bus using the caller's asupersync
     /// capability context (ft-xbnl0.2.3 / ft-xbnl0.2.2 Cx-first entry
     /// point).
@@ -610,7 +547,6 @@ impl EventWaiter {
     /// `WorkflowRunner::handle_detection_with_cx`,
     /// `SearchBridge::search_with_asupersync_cx`, and
     /// `CautClient::run_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn wait_with_cx(self, cx: &crate::cx::Cx, bus: &EventBus) -> WaitResult {
         if cx.is_cancel_requested() {
             return WaitResult::Cancelled {
@@ -848,7 +784,6 @@ impl FilteredEventStream {
     /// or cx cancellation — the two paths are indistinguishable
     /// from the caller's perspective, matching the legacy
     /// close-returns-None contract.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn next_cx(&mut self, cx: &crate::cx::Cx) -> Option<Event> {
         loop {
             match self.subscriber.recv_cx(cx).await {
@@ -1825,7 +1760,6 @@ mod tests {
     // LabRuntime tests cover the deterministic contract pieces.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_event_stream {
         use super::*;
 
@@ -1976,7 +1910,6 @@ mod tests {
     /// deliver a matching event identically to the legacy `next`
     /// when given a fresh cx. Verified by publishing one matching
     /// event and confirming the cx-first next returns it.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn event_filter_stream_next_cx_delivers_matching_event() {
         run_async_test(async {

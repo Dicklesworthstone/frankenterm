@@ -11,8 +11,6 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::timeout;
 use crate::runtime_compat::{mpsc, select, sleep, task};
 use crate::storage::{SegmentScanQuery, StorageHandle};
 use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
@@ -191,7 +189,6 @@ struct SseByteStream {
 }
 
 struct SseRecvState {
-    #[cfg(feature = "asupersync-runtime")]
     cx: asupersync::Cx,
 }
 
@@ -211,12 +208,10 @@ impl SseRecvState {
             // already gave up. Matches the inherit-or-fallback idiom at
             // sse.rs:343 / :440 / :680, handlers.rs:208 / :317, and the
             // tailer fix landed in dfbf0a31.
-            #[cfg(feature = "asupersync-runtime")]
             cx: crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request),
         }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn poll_recv(
         &self,
         rx: &mut mpsc::Receiver<SseEvent>,
@@ -234,18 +229,6 @@ impl SseRecvState {
     /// Owner: `ft-xbnl0.2.5`.
     /// Removal path: drop this method once the workspace no longer supports
     /// non-`asupersync-runtime` SSE builds.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    fn poll_recv(
-        &self,
-        rx: &mut mpsc::Receiver<SseEvent>,
-        poll_cx: &mut Context<'_>,
-    ) -> Poll<Option<SseEvent>> {
-        match rx.poll_recv(poll_cx) {
-            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
 }
 
 impl SseByteStream {
@@ -448,7 +431,6 @@ pub(super) fn handle_stream_events(
         };
 
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-        #[cfg(feature = "asupersync-runtime")]
         {
             let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             task::spawn_with_cx(&stream_cx, move |child_cx| async move {
@@ -560,113 +542,6 @@ pub(super) fn handle_stream_events(
             });
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        task::spawn(async move {
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-            let mut next_emit_at = Instant::now();
-            let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
-
-            seq += 1;
-            let ready = make_stream_frame(
-                "events",
-                "ready",
-                seq,
-                json!({
-                    "channel": format!("{channel:?}").to_lowercase(),
-                    "max_hz": max_hz,
-                    "pane_id": pane_filter
-                }),
-            );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
-                if !send_rate_limited_sse(
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                    &mut consecutive_drops,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            loop {
-                let recv_result = select! {
-                    () = sender_closed(&tx) => break,
-                    recv = timeout(
-                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
-                        subscriber.recv(),
-                    ) => recv,
-                };
-
-                match recv_result {
-                    Ok(Ok(event)) => {
-                        if !event_matches_pane(&event, pane_filter) {
-                            continue;
-                        }
-
-                        let mut event_json = serde_json::to_value(&event).unwrap_or_else(|_| {
-                            json!({
-                                "error": "event_serialization_failed"
-                            })
-                        });
-                        redact_json_value(&mut event_json, &redactor);
-
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "events",
-                            "event",
-                            seq,
-                            json!({ "event": event_json }),
-                        );
-                        if let Some(event) = frame_to_sse("event", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "events",
-                            "lag",
-                            seq,
-                            json!({ "missed_count": missed_count }),
-                        );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Err(RecvError::Closed)) => break,
-                    Err(_) => {
-                        if tx.try_send(SseEvent::comment("keepalive")).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
         SseResponse::new(SseByteStream::new(rx)).into_response()
     })
 }
@@ -689,7 +564,6 @@ pub(super) fn handle_stream_deltas(
         let mut subscriber = event_bus.subscribe_deltas();
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
         let started_at_ms = epoch_ms_now();
-        #[cfg(feature = "asupersync-runtime")]
         {
             let stream_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             task::spawn_with_cx(&stream_cx, move |child_cx| async move {
@@ -841,155 +715,6 @@ pub(super) fn handle_stream_deltas(
                 }
             });
         }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        task::spawn(async move {
-            let min_interval = Duration::from_millis((1000 / max_hz.max(1)).max(1));
-            let mut next_emit_at = Instant::now();
-            let mut seq = 0_u64;
-            let mut consecutive_drops = 0_u64;
-            let mut after_id: Option<i64> = None;
-
-            seq += 1;
-            let ready = make_stream_frame(
-                "deltas",
-                "ready",
-                seq,
-                json!({
-                    "max_hz": max_hz,
-                    "pane_id": pane_filter
-                }),
-            );
-            if let Some(event) = frame_to_sse("ready", seq, ready) {
-                if !send_rate_limited_sse(
-                    &tx,
-                    event,
-                    &mut next_emit_at,
-                    min_interval,
-                    &mut consecutive_drops,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            loop {
-                let recv_result = select! {
-                    () = sender_closed(&tx) => break,
-                    recv = timeout(
-                        Duration::from_secs(STREAM_KEEPALIVE_SECS),
-                        subscriber.recv(),
-                    ) => recv,
-                };
-
-                match recv_result {
-                    Ok(Ok(Event::SegmentCaptured { pane_id, .. })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-                        if !emit_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Ok(Event::GapDetected {
-                        pane_id,
-                        seq_before,
-                        seq_after,
-                        reason,
-                        detected_at_ms,
-                    })) => {
-                        if pane_filter.is_some_and(|pid| pid != pane_id) {
-                            continue;
-                        }
-
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "gap",
-                            seq,
-                            json!({
-                                "pane_id": pane_id,
-                                "seq_before": seq_before,
-                                "seq_after": seq_after,
-                                "reason": redactor.redact(&reason),
-                                "detected_at_ms": detected_at_ms,
-                            }),
-                        );
-                        if let Some(event) = frame_to_sse("gap", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(RecvError::Lagged { missed_count })) => {
-                        seq += 1;
-                        let frame = make_stream_frame(
-                            "deltas",
-                            "lag",
-                            seq,
-                            json!({ "missed_count": missed_count }),
-                        );
-                        if let Some(event) = frame_to_sse("lag", seq, frame) {
-                            if !send_rate_limited_sse(
-                                &tx,
-                                event,
-                                &mut next_emit_at,
-                                min_interval,
-                                &mut consecutive_drops,
-                            )
-                            .await
-                            {
-                                break;
-                            }
-                        }
-
-                        if !emit_new_segment_frames(
-                            &storage,
-                            pane_filter,
-                            started_at_ms,
-                            &mut after_id,
-                            &redactor,
-                            &tx,
-                            &mut seq,
-                            &mut next_emit_at,
-                            min_interval,
-                            &mut consecutive_drops,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Err(RecvError::Closed)) => break,
-                    Err(_) => {
-                        let _ = tx.try_send(SseEvent::comment("keepalive"));
-                    }
-                }
-            }
-        });
 
         SseResponse::new(SseByteStream::new(rx)).into_response()
     })

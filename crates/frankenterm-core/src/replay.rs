@@ -510,32 +510,12 @@ impl Player {
             }
             PlayerControl::Pause => {
                 self.state = PlayerState::Paused;
-                #[cfg(feature = "asupersync-runtime")]
                 let watch_cx = crate::cx::for_request();
                 loop {
-                    #[cfg(feature = "asupersync-runtime")]
                     control_rx
                         .changed(&watch_cx)
                         .await
                         .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
-                    #[cfg(not(feature = "asupersync-runtime"))]
-                    control_rx
-                        .changed()
-                        .await
-                        .map_err(|_| crate::Error::Runtime("control channel closed".into()))?;
-                    let sig = *control_rx.borrow();
-                    match sig {
-                        PlayerControl::Play => {
-                            self.state = PlayerState::Playing;
-                            return Ok(false);
-                        }
-                        PlayerControl::Stop => {
-                            self.state = PlayerState::Stopped;
-                            return Ok(true);
-                        }
-                        PlayerControl::SetSpeed(s) => self.speed = s,
-                        PlayerControl::Pause => {}
-                    }
                 }
             }
             PlayerControl::SetSpeed(s) => {
@@ -561,7 +541,6 @@ impl Player {
     /// should return from its play loop). `Ok(false)` means
     /// "continue". `Err(...)` folds both control-channel-closed
     /// and cx-cancellation into `crate::Error::Runtime(...)`.
-    #[cfg(feature = "asupersync-runtime")]
     async fn handle_control_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -683,7 +662,6 @@ impl Player {
     /// signals (a Stop/Pause control that arrives during a
     /// sleep is still respected because both `check_control`
     /// and the cx checkpoint fire on every loop iteration).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn play_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -757,7 +735,6 @@ impl Player {
     /// Cx-first [`Self::play_simple`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::play_with_cx`] with an
     /// unsubscribed-sender control channel.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn play_simple_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -771,7 +748,6 @@ impl Player {
 /// Poll the control channel for the latest signal (non-blocking).
 #[allow(clippy::needless_pass_by_ref_mut)] // &mut required by the update-taking watch path
 fn check_control(rx: &mut watch::Receiver<PlayerControl>) -> Option<PlayerControl> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         if rx.has_changed() {
             Some(rx.borrow_and_clone())
@@ -780,15 +756,6 @@ fn check_control(rx: &mut watch::Receiver<PlayerControl>) -> Option<PlayerContro
         }
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        // has_changed() returns Err if sender is dropped; treat as no change.
-        if rx.has_changed().unwrap_or(false) {
-            Some(*rx.borrow_and_update())
-        } else {
-            None
-        }
-    }
 }
 
 /// Route a decoded frame to the appropriate sink method.
@@ -1502,7 +1469,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `play_simple_with_cx` must match
     /// the legacy `play_simple` — same final state, same emitted
     /// output, same markers.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn play_simple_with_cx_matches_legacy() {
         run_async_test(async {
@@ -1549,53 +1515,6 @@ mod tests {
             assert_eq!(player.state(), PlayerState::Stopped);
             // Stop arrived before any frames were output.
             assert!(sink.output.is_empty());
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn play_deterministic_timing() {
-        run_async_test(async {
-            // Pause the runtime clock for deterministic timing tests.
-            crate::runtime_compat::time::pause();
-
-            let data = build_recording(&[
-                (0, FrameType::Output, b"A".to_vec()),
-                (100, FrameType::Output, b"B".to_vec()),
-                (200, FrameType::Output, b"C".to_vec()),
-            ]);
-            let recording = Recording::from_bytes(&data).unwrap();
-            let mut player = Player::new(recording);
-            // Normal speed (1x).
-            let mut sink = CollectorSink::new();
-
-            player.play_simple(&mut sink).await.unwrap();
-
-            assert_eq!(player.state(), PlayerState::Finished);
-            assert_eq!(sink.output, b"ABC");
-            assert_eq!(player.position().frame_index, 3);
-        });
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn play_double_speed() {
-        run_async_test(async {
-            crate::runtime_compat::time::pause();
-
-            let data = build_recording(&[
-                (0, FrameType::Output, b"A".to_vec()),
-                (1000, FrameType::Output, b"B".to_vec()),
-            ]);
-            let recording = Recording::from_bytes(&data).unwrap();
-            let mut player = Player::new(recording);
-            player.set_speed(PlaybackSpeed::DOUBLE);
-            let mut sink = CollectorSink::new();
-
-            player.play_simple(&mut sink).await.unwrap();
-
-            assert_eq!(sink.output, b"AB");
-            assert_eq!(player.state(), PlayerState::Finished);
         });
     }
 
@@ -2213,37 +2132,6 @@ mod tests {
         let rec = Recording::from_bytes(&data).unwrap();
         assert_eq!(rec.frames.len(), 1);
         assert_eq!(rec.frames[0].payload, large);
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    #[test]
-    fn play_with_pause_then_resume() {
-        run_async_test(async {
-            crate::runtime_compat::time::pause();
-
-            let data = build_recording(&[
-                (0, FrameType::Output, b"A".to_vec()),
-                (5000, FrameType::Output, b"B".to_vec()),
-                (10000, FrameType::Output, b"C".to_vec()),
-            ]);
-            let recording = Recording::from_bytes(&data).unwrap();
-            let mut player = Player::new(recording);
-
-            let (tx, rx) = watch::channel(PlayerControl::Play);
-            let mut sink = CollectorSink::new();
-
-            crate::runtime_compat::task::spawn(async move {
-                // Pause at 1s, resume at 2s
-                sleep(Duration::from_secs(1)).await;
-                let _ = tx.send(PlayerControl::Pause);
-                sleep(Duration::from_secs(1)).await;
-                let _ = tx.send(PlayerControl::Play);
-            });
-
-            player.play(&mut sink, rx).await.unwrap();
-            assert_eq!(player.state(), PlayerState::Finished);
-            assert_eq!(sink.output, b"ABC");
-        });
     }
 
     #[test]

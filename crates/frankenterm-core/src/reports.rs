@@ -247,7 +247,6 @@ pub async fn generate_session_report(
 /// Each section's storage query is the slow part; the Markdown
 /// formatting between them is CPU-only and doesn't need a
 /// checkpoint.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn generate_session_report_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -899,7 +898,6 @@ mod tests {
     /// cx on an empty DB. Both should produce identical Markdown
     /// (same sections, same "No X detected" placeholder text,
     /// same footer).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn report_empty_db_with_cx_matches_legacy() {
         run_async_test(async {

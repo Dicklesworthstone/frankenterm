@@ -194,7 +194,6 @@ impl WeztermInfo {
     /// ceremony without much value. The cx-aware seam is the
     /// `list_panes` call which can be slow on a loaded
     /// wezterm instance.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn detect_with_cx(
         cx: &crate::cx::Cx,
         wezterm: Option<&WeztermHandle>,
@@ -297,7 +296,6 @@ impl DetectedEnvironment {
     /// so the `list_panes` call honors caller cancellation. All
     /// other detection steps (shell, agents, remotes, system)
     /// are pure-sync and don't need cx threading.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn detect_with_cx(cx: &crate::cx::Cx, wezterm: Option<&WeztermHandle>) -> Self {
         let shell = ShellInfo::detect();
         let (wezterm_info, panes) = WeztermInfo::detect_with_cx(cx, wezterm, &shell).await;
@@ -762,7 +760,6 @@ mod tests {
     /// the legacy `detect` for an uncancelled cx. Uses a mock
     /// wezterm handle with 2 panes to verify agent detection
     /// runs through the Cx-first path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn detect_with_cx_matches_legacy_with_mock_wezterm() {
         use crate::runtime_compat::CompatRuntime;

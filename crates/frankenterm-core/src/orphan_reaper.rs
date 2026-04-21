@@ -76,55 +76,11 @@ struct ProcessEntry {
 /// Run the orphan reaper loop.  Returns when `shutdown_flag` is set or the
 /// reap interval is configured to zero (disabled).
 pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>) {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let interval = config.orphan_reap_interval_seconds;
-        if interval == 0 {
-            info!("orphan reaper disabled (orphan_reap_interval_seconds = 0)");
-            return;
-        }
-
-        let max_age = config.orphan_max_age_seconds;
-        info!(
-            interval_s = interval,
-            max_age_s = max_age,
-            "orphan reaper started"
-        );
-
-        loop {
-            #[cfg(not(feature = "asupersync-runtime"))]
-            {
-                crate::runtime_compat::sleep(Duration::from_secs(interval)).await;
-            }
-
-            if shutdown_flag.load(Ordering::Relaxed) {
-                debug!("orphan reaper shutting down");
-                return;
-            }
-
-            let report = reap_orphans(max_age).await;
-            if report.killed > 0 {
-                info!(
-                    scanned = report.scanned,
-                    killed = report.killed,
-                    pids = ?report.killed_pids,
-                    "orphan reaper cycle complete"
-                );
-            } else {
-                debug!(scanned = report.scanned, "orphan reaper cycle — no orphans");
-            }
-
-            for err in &report.errors {
-                warn!(error = %err, "orphan reaper error during scan");
-            }
-        }
-    }
 }
 
 /// Run the orphan reaper loop against the caller's asupersync capability
@@ -142,7 +98,6 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
 ///
 /// The legacy [`run_orphan_reaper`] entry point is preserved for
 /// non-migrated callers; this is strictly additive.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn run_orphan_reaper_with_cx(
     cx: &crate::cx::Cx,
     config: CliConfig,
@@ -219,7 +174,6 @@ pub async fn reap_orphans(max_age_seconds: u64) -> ReapReport {
 ///   Scan errors and individual kill errors are captured in the
 ///   report (not short-circuited) so the caller always gets a
 ///   coherent snapshot of what did get reaped.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn reap_orphans_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
     scan_and_reap_with_cx(cx, max_age_seconds).await
 }
@@ -283,7 +237,6 @@ async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
 }
 
 /// Cx-first implementation of a single orphan-reaper cycle.
-#[cfg(feature = "asupersync-runtime")]
 async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> ReapReport {
     let mut report = ReapReport::default();
 
@@ -411,7 +364,6 @@ async fn list_wezterm_cli_processes_via_ps() -> Result<Vec<ProcessEntry>, String
 /// spawn_blocking), but this sibling at least lets callers bail
 /// from the reaper scan loop without kicking off another full
 /// `ps` fan-out when parent cancellation is already requested.
-#[cfg(feature = "asupersync-runtime")]
 async fn list_wezterm_cli_processes_via_ps_with_cx(
     cx: &crate::cx::Cx,
 ) -> Result<Vec<ProcessEntry>, String> {
@@ -683,7 +635,6 @@ mod tests {
     // OS process table which is outside the scope of a deterministic test.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_orphan_reaper {
         use super::*;
 

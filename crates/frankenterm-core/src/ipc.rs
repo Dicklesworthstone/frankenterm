@@ -107,28 +107,18 @@ fn allocator_status_payload() -> serde_json::Value {
 enum MpscRecvState<T> {
     Value(T),
     Disconnected,
-    #[cfg(feature = "asupersync-runtime")]
     Cancelled,
 }
 
 #[cfg(any(not(unix), not(feature = "asupersync-runtime")))]
 async fn mpsc_recv_state<T>(rx: &mut mpsc::Receiver<T>) -> MpscRecvState<T> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         mpsc_recv_state_with_cx(rx, &cx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        match rx.recv().await {
-            Some(value) => MpscRecvState::Value(value),
-            None => MpscRecvState::Disconnected,
-        }
-    }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 async fn mpsc_recv_state_with_cx<T>(
     rx: &mut mpsc::Receiver<T>,
     cx: &crate::cx::Cx,
@@ -145,7 +135,6 @@ async fn mpsc_recv_state_with_cx<T>(
 
 #[cfg(test)]
 async fn mpsc_send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::SendError<T>> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::for_testing();
         match tx.reserve(&cx).await {
@@ -159,10 +148,6 @@ async fn mpsc_send_value<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::
         }
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tx.send(value).await
-    }
 }
 
 fn resolve_search_index_dir(raw: &str) -> PathBuf {
@@ -662,7 +647,6 @@ impl IpcServer {
     /// creation) or listener setup. CLI startup paths that are
     /// already cancelled can bail before touching the socket
     /// directory.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn bind_with_cx(
         cx: &crate::cx::Cx,
         socket_path: impl AsRef<Path>,
@@ -682,38 +666,11 @@ impl IpcServer {
         socket_path: impl AsRef<Path>,
         permissions: Option<u32>,
     ) -> std::io::Result<Self> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return Self::bind_with_permissions_with_cx(&cx, socket_path, permissions).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let socket_path = socket_path.as_ref().to_path_buf();
-
-            // Remove stale socket file if it exists
-            if socket_path.exists() {
-                std::fs::remove_file(&socket_path)?;
-            }
-
-            // Create parent directory if needed
-            if let Some(parent) = socket_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let listener = compat_unix::bind(&socket_path).await?;
-            if let Some(mode) = permissions {
-                let perms = std::fs::Permissions::from_mode(mode);
-                std::fs::set_permissions(&socket_path, perms)?;
-            }
-            tracing::info!(path = %socket_path.display(), "IPC server listening");
-
-            Ok(Self {
-                socket_path,
-                listener,
-            })
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind_with_permissions`].
@@ -724,7 +681,6 @@ impl IpcServer {
     /// Responsive cancellation during socket setup — a cx-driven
     /// CLI that was cancelled mid-startup won't leave behind
     /// empty parent dirs or touch files it doesn't need to.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn bind_with_permissions_with_cx(
         cx: &crate::cx::Cx,
         socket_path: impl AsRef<Path>,
@@ -822,7 +778,6 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             // ft-xbnl0.2.3: keep a single request-rooted Cx for the
             // server lifetime, then immediately hand off to the
@@ -833,12 +788,6 @@ impl IpcServer {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let mut shutdown_rx = shutdown_rx;
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let ctx = Arc::new(IpcHandlerContext::with_auth(event_bus, None, auth));
-        #[cfg(not(feature = "asupersync-runtime"))]
-        self.run_with_context(ctx, &mut shutdown_rx).await;
     }
 
     /// Run the IPC server with registry and optional auth configuration.
@@ -849,121 +798,10 @@ impl IpcServer {
         auth: Option<IpcAuth>,
         shutdown_rx: mpsc::Receiver<()>,
     ) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_with_registry_and_auth_with_cx(&cx, event_bus, registry, auth, shutdown_rx)
                 .await;
-        }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let mut shutdown_rx = shutdown_rx;
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let ctx = Arc::new(IpcHandlerContext::with_auth(
-            event_bus,
-            Some(registry),
-            auth,
-        ));
-        #[cfg(not(feature = "asupersync-runtime"))]
-        self.run_with_context(ctx, &mut shutdown_rx).await;
-    }
-
-    /// Run the IPC server with registry, auth, and RPC handler.
-    pub async fn run_with_registry_auth_and_rpc(
-        self,
-        event_bus: Arc<EventBus>,
-        registry: Arc<RwLock<PaneRegistry>>,
-        auth: Option<IpcAuth>,
-        rpc_handler: Option<IpcRpcHandler>,
-        shutdown_rx: mpsc::Receiver<()>,
-    ) {
-        self.run_with_registry_auth_rpc_and_search_config(
-            event_bus,
-            registry,
-            auth,
-            rpc_handler,
-            None,
-            shutdown_rx,
-        )
-        .await;
-    }
-
-    /// Run the IPC server with registry, auth, RPC handler, and search config.
-    pub async fn run_with_registry_auth_rpc_and_search_config(
-        self,
-        event_bus: Arc<EventBus>,
-        registry: Arc<RwLock<PaneRegistry>>,
-        auth: Option<IpcAuth>,
-        rpc_handler: Option<IpcRpcHandler>,
-        search_config: Option<SearchConfig>,
-        shutdown_rx: mpsc::Receiver<()>,
-    ) {
-        #[cfg(feature = "asupersync-runtime")]
-        {
-            let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-            self.run_with_registry_auth_rpc_and_search_config_with_cx(
-                &cx,
-                event_bus,
-                registry,
-                auth,
-                rpc_handler,
-                search_config,
-                shutdown_rx,
-            )
-            .await;
-        }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let mut shutdown_rx = shutdown_rx;
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let ctx = Arc::new(IpcHandlerContext::with_auth_rpc_and_search_config(
-            event_bus,
-            Some(registry),
-            auth,
-            rpc_handler,
-            search_config,
-        ));
-        #[cfg(not(feature = "asupersync-runtime"))]
-        self.run_with_context(ctx, &mut shutdown_rx).await;
-    }
-
-    /// Internal run method with context.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_with_context(
-        self,
-        ctx: Arc<IpcHandlerContext>,
-        shutdown_rx: &mut mpsc::Receiver<()>,
-    ) {
-        let mut connection_tasks = crate::runtime_compat::task::JoinSet::new();
-
-        loop {
-            if shutdown_signal_pending(shutdown_rx).await {
-                tracing::info!("IPC server shutting down");
-                break;
-            }
-
-            match crate::runtime_compat::timeout(IPC_ACCEPT_POLL_INTERVAL, self.listener.accept())
-                .await
-            {
-                Ok(Ok((stream, _addr))) => {
-                    let ctx = ctx.clone();
-                    connection_tasks.spawn(async move {
-                        if let Err(e) = handle_client_with_context(stream, ctx).await {
-                            tracing::warn!(error = %e, "IPC client error");
-                        }
-                    });
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "Failed to accept IPC connection");
-                }
-                Err(_elapsed) => {}
-            }
-
-            while let Some(join_result) = connection_tasks.try_join_next() {
-                if let Err(join_err) = join_result {
-                    tracing::debug!(error = %join_err, "IPC client task failed");
-                }
-            }
         }
 
         // Abort active client handlers so shutdown cannot hang on a client
@@ -987,7 +825,6 @@ impl IpcServer {
     ///   cancellation propagates into the shutdown-poll path.
     /// - Socket-cleanup is always run (safety invariant) so a
     ///   cancelled cx cannot leak the socket file.
-    #[cfg(feature = "asupersync-runtime")]
     async fn run_with_context_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1055,7 +892,6 @@ impl IpcServer {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1067,7 +903,6 @@ impl IpcServer {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_registry_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1080,7 +915,6 @@ impl IpcServer {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_auth`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_auth_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1094,7 +928,6 @@ impl IpcServer {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry_and_auth`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_registry_and_auth_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1113,7 +946,6 @@ impl IpcServer {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`run_with_registry_auth_and_rpc`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_registry_auth_and_rpc_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1137,7 +969,6 @@ impl IpcServer {
 
     /// ft-xbnl0.2.3 Cx-first sibling of
     /// [`run_with_registry_auth_rpc_and_search_config`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_registry_auth_rpc_and_search_config_with_cx(
         self,
         cx: &crate::cx::Cx,
@@ -1163,24 +994,11 @@ impl IpcServer {
 #[cfg(unix)]
 #[cfg(any(not(feature = "asupersync-runtime"), test))]
 async fn shutdown_signal_pending(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return shutdown_signal_pending_with_cx(shutdown_rx, &cx).await;
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        match crate::runtime_compat::timeout(
-            IPC_SHUTDOWN_POLL_INTERVAL,
-            mpsc_recv_state(shutdown_rx),
-        )
-        .await
-        {
-            Ok(MpscRecvState::Value(()) | MpscRecvState::Disconnected) => true,
-            Err(_elapsed) => false,
-        }
-    }
 }
 
 #[cfg(all(unix, feature = "asupersync-runtime"))]
@@ -1312,65 +1130,6 @@ impl IpcServer {
 
 /// Handle a single client connection with full context.
 #[cfg(unix)]
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn handle_client_with_context(
-    stream: UnixStream,
-    ctx: Arc<IpcHandlerContext>,
-) -> std::io::Result<()> {
-    let start = Instant::now();
-    let (reader, mut writer) = stream.into_split();
-
-    // Prevent OOM from unbounded line reading by wrapping with `take`.
-    // We allow MAX_MESSAGE_SIZE + 1 so we can detect if it was truncated by the limit.
-    use crate::runtime_compat::unix::AsyncReadExt;
-    let bounded_reader = reader.take((MAX_MESSAGE_SIZE + 1) as u64);
-
-    // Read one request per connection (simple request-response)
-    let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
-    let Some(line) = compat_unix::next_line(&mut lines).await? else {
-        return Ok(()); // Client disconnected
-    };
-
-    // Check message size
-    if line.len() > MAX_MESSAGE_SIZE {
-        let response = IpcResponse::error("message too large");
-        let response_json = serde_json::to_string(&response)
-            .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        return Ok(());
-    }
-
-    // Parse and handle request
-    let response = match serde_json::from_str::<IpcEnvelope>(&line) {
-        Ok(envelope) => {
-            if let Some(auth) = ctx.auth.as_ref() {
-                if let Err(err) =
-                    auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
-                {
-                    IpcResponse::error(err.message())
-                } else {
-                    handle_request_with_context(envelope, &ctx).await
-                }
-            } else {
-                handle_request_with_context(envelope, &ctx).await
-            }
-        }
-        Err(e) => IpcResponse::error(format!("invalid request: {e}")),
-    };
-
-    let response = response.with_timing(start);
-
-    // Send response
-    let response_json = serde_json::to_string(&response)
-        .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
-    writer.write_all(response_json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    Ok(())
-}
-
 /// ft-xbnl0.2.3 Cx-first sibling of [`handle_client_with_context`].
 ///
 /// Threads the caller's cx into the request dispatcher so registry
@@ -1593,7 +1352,6 @@ async fn handle_request_with_context(
 /// they don't benefit from cx threading at this layer (Status does
 /// have a registry read but the telemetry-friendly path is
 /// best-effort — cancel-surfaces-as-delay is acceptable there).
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_request_with_context_with_cx(
     cx: &crate::cx::Cx,
     envelope: IpcEnvelope,
@@ -1667,7 +1425,6 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
 /// Threads caller cx through the registry RwLock `read_with_cx`
 /// acquire so a client-disconnection-cancelled cx interrupts the
 /// lock wait cleanly rather than blocking.
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_pane_state_with_cx(
     cx: &crate::cx::Cx,
     pane_id: u64,
@@ -1748,7 +1505,6 @@ async fn handle_set_pane_priority(
 ///
 /// Threads caller cx through the registry RwLock `write_with_cx`
 /// acquire.
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_set_pane_priority_with_cx(
     cx: &crate::cx::Cx,
     pane_id: u64,
@@ -1823,7 +1579,6 @@ async fn handle_clear_pane_priority(pane_id: u64, ctx: &IpcHandlerContext) -> Ip
 ///
 /// Threads caller cx through the registry RwLock `write_with_cx`
 /// acquire.
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_clear_pane_priority_with_cx(
     cx: &crate::cx::Cx,
     pane_id: u64,
@@ -1934,7 +1689,6 @@ impl IpcClient {
     /// ping through [`Self::send_request_with_cx`] so caller
     /// cancellation can abort the round-trip at any of the 4
     /// await points (connect, write, flush, read).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn ping_with_cx(&self, cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
         self.send_request_with_cx(cx, IpcRequest::Ping).await
     }
@@ -1942,7 +1696,6 @@ impl IpcClient {
     /// Cx-first [`Self::send_user_var`] (ft-xbnl0.2.3). Routes
     /// the user-var update through [`Self::send_request_with_cx`]
     /// so the IPC round-trip honors caller cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_user_var_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1968,7 +1721,6 @@ impl IpcClient {
 
     /// Cx-first [`Self::status`] (ft-xbnl0.2.3). Routes the IPC
     /// status round-trip through [`Self::send_request_with_cx`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn status_with_cx(&self, cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
         self.send_request_with_cx(cx, IpcRequest::Status).await
     }
@@ -1982,7 +1734,6 @@ impl IpcClient {
     }
 
     /// Cx-first [`Self::pane_state`] (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn pane_state_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2008,7 +1759,6 @@ impl IpcClient {
     }
 
     /// Cx-first [`Self::set_pane_priority`] (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_pane_priority_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2034,7 +1784,6 @@ impl IpcClient {
     }
 
     /// Cx-first [`Self::clear_pane_priority`] (ft-xbnl0.2.3).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn clear_pane_priority_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2061,7 +1810,6 @@ impl IpcClient {
     /// [`Self::send_request_with_id_with_cx`] directly (not
     /// [`Self::send_request_with_cx`]) because RPC calls carry a
     /// caller-supplied `request_id` for response correlation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn call_rpc_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2083,7 +1831,6 @@ impl IpcClient {
     /// to [`Self::send_request_with_id_with_cx`] with `None`
     /// request_id, mirroring the legacy `send_request` →
     /// `send_request_with_id` chain.
-    #[cfg(feature = "asupersync-runtime")]
     async fn send_request_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2108,7 +1855,6 @@ impl IpcClient {
     ///
     /// All cancellation errors wrap into `UserVarError::IpcSendFailed`
     /// with "cancelled" prefix for pattern-matching.
-    #[cfg(feature = "asupersync-runtime")]
     async fn send_request_with_id_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2313,7 +2059,6 @@ impl IpcClient {
     // cross-platform call sites. Each always returns
     // `unsupported()` just like the legacy counterparts.
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_user_var_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2324,17 +2069,14 @@ impl IpcClient {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn ping_with_cx(&self, _cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn status_with_cx(&self, _cx: &crate::cx::Cx) -> Result<IpcResponse, UserVarError> {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn pane_state_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2343,7 +2085,6 @@ impl IpcClient {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_pane_priority_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2354,7 +2095,6 @@ impl IpcClient {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn clear_pane_priority_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2363,7 +2103,6 @@ impl IpcClient {
         Err(Self::unsupported())
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn call_rpc_with_cx(
         &self,
         _cx: &crate::cx::Cx,
@@ -2639,7 +2378,6 @@ mod tests {
     /// cx-first run path reaches completion, removes the socket
     /// file, and releases the bound path (a follow-up bind must
     /// succeed).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn ipc_server_run_with_cx_exits_cleanly_on_shutdown() {
         run_async_test(async {
@@ -2671,7 +2409,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn ipc_server_run_with_auth_legacy_entry_exits_cleanly_on_shutdown() {
         run_async_test(async {
@@ -2700,7 +2437,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must successfully
     /// bind when given a fresh, uncancelled cx — producing a
     /// server with the same socket path as the legacy `bind`.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn ipc_server_bind_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2720,7 +2456,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must return a
     /// cancellation error when given a pre-cancelled cx,
     /// without creating the socket or parent directory.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn ipc_server_bind_with_precancelled_cx_fails_before_filesystem_mutation() {
         run_async_test(async {
@@ -2750,7 +2485,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn shutdown_signal_pending_with_cx_ignores_cancelled_receive() {
         run_async_test(async {
@@ -4089,7 +3823,6 @@ mod tests {
     // shutdown_signal_pending outcomes (true = shutdown, false = continue).
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_ipc {
         use super::*;
 

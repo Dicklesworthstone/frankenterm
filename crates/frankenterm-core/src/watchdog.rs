@@ -352,7 +352,6 @@ impl WatchdogHandle {
     /// signal — the watchdog will still wind down on its own, but
     /// the caller does not block on the join. Matches the
     /// `PaneOutputSubscription::shutdown_with_cx` pattern.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn join_with_cx(self, cx: &crate::cx::Cx) {
         self.signal_shutdown();
         if cx.checkpoint().is_err() {
@@ -382,7 +381,6 @@ pub fn spawn_watchdog(
     let internal_flag = Arc::clone(&internal_shutdown);
     let check_interval = config.check_interval;
 
-    #[cfg(feature = "asupersync-runtime")]
     let task = {
         let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         task::spawn_with_cx(&parent_cx, move |watchdog_cx| async move {
@@ -442,52 +440,6 @@ pub fn spawn_watchdog(
             }
         })
     };
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    let task = task::spawn(async move {
-        loop {
-            if shutdown_flag.load(Ordering::SeqCst) || internal_flag.load(Ordering::SeqCst) {
-                info!("Watchdog: shutdown signal received");
-                break;
-            }
-
-            let report = heartbeats.check_health(&config);
-
-            match report.overall {
-                HealthStatus::Healthy => {
-                    // Everything fine — nothing to log at info level.
-                }
-                HealthStatus::Degraded => {
-                    for ch in report.unhealthy_components() {
-                        warn!(
-                            component = %ch.component,
-                            status = %ch.status,
-                            age_ms = ch.age_ms,
-                            threshold_ms = ch.threshold_ms,
-                            "Watchdog: component heartbeat is stale"
-                        );
-                    }
-                }
-                HealthStatus::Critical | HealthStatus::Hung => {
-                    for ch in report.unhealthy_components() {
-                        error!(
-                            component = %ch.component,
-                            status = %ch.status,
-                            age_ms = ch.age_ms,
-                            threshold_ms = ch.threshold_ms,
-                            "Watchdog: component heartbeat critically stale"
-                        );
-                    }
-
-                    if let Ok(json) = serde_json::to_string_pretty(&report) {
-                        error!(diagnostic = %json, "Watchdog: diagnostic dump");
-                    }
-                }
-            }
-
-            crate::runtime_compat::sleep(check_interval).await;
-        }
-    });
 
     WatchdogHandle {
         task,
@@ -639,14 +591,9 @@ impl MuxWatchdog {
 
     /// Run a single health check and return the sample.
     pub async fn check(&mut self) -> MuxHealthSample {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.check_cx(&cx).await
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.check_inner().await
         }
     }
 
@@ -656,7 +603,6 @@ impl MuxWatchdog {
     /// Both the WezTerm pane-list ping and the watchdog-warnings probe use
     /// [`crate::runtime_compat::timeout_with_cx`] so cancellation, budget,
     /// and virtual time flow through the caller's capability context.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn check_cx(&mut self, cx: &crate::cx::Cx) -> MuxHealthSample {
         self.total_checks += 1;
         let now = epoch_ms();
@@ -700,45 +646,6 @@ impl MuxWatchdog {
             cx,
             self.config.ping_timeout,
             self.wezterm.watchdog_warnings_with_cx(cx),
-        )
-        .await
-        {
-            Ok(Ok(lines)) => WarningProbeOutcome::Ok(lines),
-            Ok(Err(err)) => WarningProbeOutcome::Error(format!(
-                "failed to query backend watchdog warnings: {err}"
-            )),
-            Err(_) => WarningProbeOutcome::Error(format!(
-                "timed out querying backend watchdog warnings after {} ms",
-                self.config.ping_timeout.as_millis()
-            )),
-        };
-
-        self.finalize_sample(now, ping_ok, ping_latency_ms, rss_bytes, warning_probe)
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn check_inner(&mut self) -> MuxHealthSample {
-        self.total_checks += 1;
-        let now = epoch_ms();
-        let start = std::time::Instant::now();
-
-        let ping_ok = matches!(
-            crate::runtime_compat::timeout(self.config.ping_timeout, self.wezterm.list_panes())
-                .await,
-            Ok(Ok(_))
-        );
-
-        let ping_latency_ms = if ping_ok {
-            Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
-        } else {
-            None
-        };
-
-        let rss_bytes = get_mux_server_rss().await;
-
-        let warning_probe = match crate::runtime_compat::timeout(
-            self.config.ping_timeout,
-            self.wezterm.watchdog_warnings(),
         )
         .await
         {
@@ -840,7 +747,6 @@ pub fn spawn_mux_watchdog(
     let check_interval = config.check_interval;
     let failure_threshold = config.failure_threshold;
 
-    #[cfg(feature = "asupersync-runtime")]
     {
         let parent_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         task::spawn_with_cx(&parent_cx, move |mux_watchdog_cx| async move {
@@ -923,76 +829,6 @@ pub fn spawn_mux_watchdog(
         })
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        task::spawn(async move {
-            let mut watchdog = MuxWatchdog::new(config, wezterm);
-
-            info!("Mux watchdog started");
-
-            loop {
-                if shutdown_flag.load(Ordering::SeqCst) {
-                    info!("Mux watchdog shutting down");
-                    break;
-                }
-
-                let sample = watchdog.check().await;
-
-                match sample.status {
-                    HealthStatus::Healthy => {
-                        if watchdog.total_checks % 10 == 0 {
-                            info!(
-                                ping_ms = sample.ping_latency_ms,
-                                rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                                warning_count = sample.warning_count,
-                                warning_details = sample.watchdog_warnings.join(" | "),
-                                "Mux watchdog: healthy"
-                            );
-                        }
-                    }
-                    HealthStatus::Degraded => {
-                        warn!(
-                            consecutive_failures = watchdog.consecutive_failures,
-                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                            ping_ok = sample.ping_ok,
-                            warning_count = sample.warning_count,
-                            warning_details = sample.watchdog_warnings.join(" | "),
-                            "Mux watchdog: degraded"
-                        );
-                        crate::degradation::enter_degraded(
-                            crate::degradation::Subsystem::WeztermCli,
-                            format!(
-                                "Mux health degraded: {} consecutive failures, warnings={}",
-                                watchdog.consecutive_failures, sample.warning_count
-                            ),
-                        );
-                    }
-                    HealthStatus::Critical | HealthStatus::Hung => {
-                        error!(
-                            consecutive_failures = watchdog.consecutive_failures,
-                            rss_mb = sample.rss_bytes.map(|b| b / (1024 * 1024)),
-                            ping_ok = sample.ping_ok,
-                            threshold = failure_threshold,
-                            warning_count = sample.warning_count,
-                            warning_details = sample.watchdog_warnings.join(" | "),
-                            "Mux watchdog: CRITICAL — mux server unresponsive or memory critical"
-                        );
-                        crate::degradation::enter_degraded(
-                            crate::degradation::Subsystem::WeztermCli,
-                            format!(
-                                "Mux health critical: {} consecutive failures, RSS={} MB, warnings={}",
-                                watchdog.consecutive_failures,
-                                sample.rss_bytes.map_or(0, |b| b / (1024 * 1024)),
-                                sample.warning_count
-                            ),
-                        );
-                    }
-                }
-
-                crate::runtime_compat::sleep(check_interval).await;
-            }
-        })
-    }
 }
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.
@@ -1019,7 +855,6 @@ async fn get_mux_server_rss() -> Option<u64> {
 /// still std::process::Command — cx isn't threaded inside — but
 /// adding the pre-flight seam means a cancelled watchdog.check
 /// sweep bails before triggering another pgrep shell-out.
-#[cfg(feature = "asupersync-runtime")]
 async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
     if cx.checkpoint().is_err() {
         return None;
@@ -1121,7 +956,6 @@ mod tests {
     /// scheduling. The mock handle returns an empty pane list immediately
     /// so the timeout path is not exercised (we only care that the
     /// timeout_with_cx plumbing doesn't panic or block the scheduler).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn mux_watchdog_check_cx_runs_under_labruntime() {
         const SEED: u64 = 0xD0C8_D06C_C410_00AF;
@@ -1320,7 +1154,6 @@ mod tests {
     /// must signal shutdown + await the task normally when
     /// given a fresh, uncancelled cx. Equivalent to the legacy
     /// join path's happy flow.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn watchdog_join_with_cx_shuts_down_cleanly() {
         run_async_test(async {
@@ -1351,7 +1184,6 @@ mod tests {
     /// cx must return quickly without blocking on the task join.
     /// The internal shutdown signal is still issued so the
     /// background task can exit cleanly on its own.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn watchdog_join_with_precancelled_cx_returns_quickly() {
         run_async_test(async {

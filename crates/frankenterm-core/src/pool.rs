@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
 use crate::runtime_compat::{Mutex, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
@@ -109,7 +108,6 @@ pub struct Pool<C> {
 }
 
 impl<C: Send + 'static> Pool<C> {
-    #[cfg(feature = "asupersync-runtime")]
     fn checkpoint_explicit_cx(cx: &Cx) -> Result<(), PoolError> {
         cx.checkpoint().map_err(|_| PoolError::Cancelled)
     }
@@ -135,14 +133,9 @@ impl<C: Send + 'static> Pool<C> {
     /// available, or `Err` if no slots are free. If `result.conn` is `None`,
     /// the caller should create a new connection.
     pub async fn try_acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.try_acquire_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.try_acquire_inner().await
         }
     }
 
@@ -155,7 +148,6 @@ impl<C: Send + 'static> Pool<C> {
     /// (ft-xbnl0.2.3). Without this, a cancelled caller could be
     /// blocked on the ambient mutex acquire for the full `lock` budget
     /// even though the caller had already abandoned the operation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn try_acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
         match self.semaphore.clone().try_acquire_owned() {
@@ -180,39 +172,14 @@ impl<C: Send + 'static> Pool<C> {
     /// `asupersync-runtime` the Cx-first `try_acquire_with_cx` inlines the
     /// semaphore + idle-lock dance directly so the caller's Cx can be
     /// threaded into the idle mutex acquire.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn try_acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => {
-                let conn = {
-                    let mut idle = self.idle.lock().await;
-                    self.evict_expired(&mut idle);
-                    idle.pop_front().map(|e| e.conn)
-                };
-                self.stats_acquired.fetch_add(1, Ordering::Relaxed);
-                Ok(PoolAcquireResult {
-                    conn,
-                    permit: Some(permit),
-                })
-            }
-            Err(TryAcquireError::NoPermits) => Err(PoolError::AcquireTimeout),
-            Err(TryAcquireError::Closed) => Err(PoolError::Closed),
-        }
-    }
-
     /// Acquire a connection from the pool, waiting up to `acquire_timeout`.
     ///
     /// Returns an idle connection if available, or `None` as the connection
     /// value if the caller needs to create a fresh one (a permit is still held).
     pub async fn acquire(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.acquire_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.acquire_inner().await
         }
     }
 
@@ -225,7 +192,6 @@ impl<C: Send + 'static> Pool<C> {
     /// cancellation on the caller's Cx cuts the semaphore wait
     /// deterministically instead of being pulled from
     /// `Cx::current()` thread-local state.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
 
@@ -279,56 +245,14 @@ impl<C: Send + 'static> Pool<C> {
     }
 
     /// Inner implementation for acquire without cx.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn acquire_inner(&self) -> Result<PoolAcquireResult<C>, PoolError> {
-        let acquire_result = crate::runtime_compat::timeout(
-            self.config.acquire_timeout,
-            self.semaphore.clone().acquire_owned(),
-        )
-        .await;
-
-        let permit = match acquire_result {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_closed)) => return Err(PoolError::Closed),
-            Err(_timeout_err) => {
-                self.stats_timeouts.fetch_add(1, Ordering::Relaxed);
-                return Err(PoolError::AcquireTimeout);
-            }
-        };
-
-        let conn = {
-            let mut idle = self.idle.lock().await;
-            self.evict_expired(&mut idle);
-            idle.pop_front().map(|e| e.conn)
-        };
-        self.stats_acquired.fetch_add(1, Ordering::Relaxed);
-        Ok(PoolAcquireResult {
-            conn,
-            permit: Some(permit),
-        })
-    }
-
     /// Return a connection to the pool for reuse.
     ///
     /// If the pool's idle queue is already at capacity, the connection is
     /// dropped instead.
     pub async fn put(&self, conn: C) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.put_with_cx(&cx, conn).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut idle = self.idle.lock().await;
-            self.evict_expired(&mut idle);
-            if idle.len() < self.config.max_size {
-                idle.push_back(PooledEntry {
-                    conn,
-                    returned_at: Instant::now(),
-                });
-                self.stats_returned.fetch_add(1, Ordering::Relaxed);
-            }
         }
     }
 
@@ -337,7 +261,6 @@ impl<C: Send + 'static> Pool<C> {
     /// mutex acquire is bound to the caller's `Cx` via
     /// `Mutex::lock_with_cx` so a caller-cancelled wait propagates
     /// cleanly through the return path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn put_with_cx(&self, cx: &Cx, conn: C) {
         let mut idle = self.idle.lock_with_cx(cx).await;
         self.evict_expired(&mut idle);
@@ -353,21 +276,14 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Evict idle connections that have exceeded the idle timeout.
     pub async fn evict_idle(&self) -> usize {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.evict_idle_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut idle = self.idle.lock().await;
-            self.evict_expired(&mut idle)
         }
     }
 
     /// Evict expired idle connections under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn evict_idle_with_cx(&self, cx: &Cx) -> usize {
         let mut idle = self.idle.lock_with_cx(cx).await;
         self.evict_expired(&mut idle)
@@ -375,31 +291,14 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Get current pool statistics.
     pub async fn stats(&self) -> PoolStats {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.stats_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let idle_count = self.idle.lock().await.len();
-            let acquired = self.stats_acquired.load(Ordering::Relaxed);
-            let returned = self.stats_returned.load(Ordering::Relaxed);
-            PoolStats {
-                max_size: self.config.max_size,
-                idle_count,
-                active_count: self.config.max_size - self.semaphore.available_permits(),
-                total_acquired: acquired,
-                total_returned: returned,
-                total_evicted: self.stats_evicted.load(Ordering::Relaxed),
-                total_timeouts: self.stats_timeouts.load(Ordering::Relaxed),
-            }
         }
     }
 
     /// Get current pool statistics under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn stats_with_cx(&self, cx: &Cx) -> PoolStats {
         let idle_count = self.idle.lock_with_cx(cx).await.len();
         let acquired = self.stats_acquired.load(Ordering::Relaxed);
@@ -417,23 +316,14 @@ impl<C: Send + 'static> Pool<C> {
 
     /// Drain all idle connections from the pool.
     pub async fn clear(&self) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.clear_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut idle = self.idle.lock().await;
-            let count = idle.len() as u64;
-            idle.clear();
-            self.stats_evicted.fetch_add(count, Ordering::Relaxed);
         }
     }
 
     /// Drain all idle connections under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn clear_with_cx(&self, cx: &Cx) {
         let mut idle = self.idle.lock_with_cx(cx).await;
         let count = idle.len() as u64;
@@ -563,7 +453,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_acquire_with_cx_returns_none_when_empty() {
         run_async_test(async {
@@ -714,7 +603,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_try_acquire_with_cx_returns_idle() {
         run_async_test(async {
@@ -1710,7 +1598,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_try_acquire_with_precancelled_cx_returns_cancelled_without_taking_idle() {
         run_async_test(async {
@@ -1739,7 +1626,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_acquire_with_precancelled_cx_returns_cancelled_without_timeout() {
         run_async_test(async {
@@ -1768,7 +1654,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_acquire_with_cx_cancelled_while_waiting_returns_cancelled() {
         run_async_test(async {
@@ -1824,7 +1709,6 @@ mod tests {
     /// future — only the inner `acquire_owned_with_cx` saw it. The fix
     /// (commit ???) plumbs caller Cx through the timeout so the
     /// cancellation path is consistent.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_acquire_with_cx_timeout_surface_bound_to_caller_cx() {
         run_async_test(async {
@@ -1867,7 +1751,6 @@ mod tests {
     /// through the idle queue under an explicit caller `&Cx`. Pins
     /// no-regression on the Cx-first variants of the remaining four
     /// pool methods.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_non_acquire_methods_with_cx_full_roundtrip() {
         run_async_test(async {

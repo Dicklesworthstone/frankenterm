@@ -45,9 +45,6 @@ use crate::fleet_scrollback_coordinator::{
     CoordinatorConfig, FleetScrollbackCoordinator, SnapshotPaneScrollbackAccess,
 };
 use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::ingest::persist_captured_segment;
-#[cfg(feature = "asupersync-runtime")]
 use crate::ingest::persist_captured_segment_with_cx;
 use crate::ingest::{
     CapturedSegment, PaneCursor, PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
@@ -59,8 +56,6 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -84,30 +79,15 @@ use crate::wezterm::{
 };
 
 fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         rx.has_changed()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.has_changed().unwrap_or(false)
-    }
 }
 
-#[cfg(feature = "asupersync-runtime")]
 type RuntimeLoopCx = crate::cx::Cx;
-#[cfg(not(feature = "asupersync-runtime"))]
-type RuntimeLoopCx = crate::cx::Cx;
-
-#[cfg(feature = "asupersync-runtime")]
 fn runtime_loop_cx() -> RuntimeLoopCx {
     crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request)
-}
-
-#[cfg(not(feature = "asupersync-runtime"))]
-fn runtime_loop_cx() -> RuntimeLoopCx {
-    crate::cx::for_request()
 }
 
 async fn persist_captured_segment_for_runtime(
@@ -116,42 +96,25 @@ async fn persist_captured_segment_for_runtime(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = runtime_cx;
-        persist_captured_segment(storage, captured, max_segment_bytes).await
-    }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
-    #[cfg(feature = "asupersync-runtime")]
     {
         rx.borrow_and_clone()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        rx.borrow_and_update().clone()
-    }
 }
 
 async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let _ = crate::runtime_compat::sleep_with_cx(runtime_cx, duration).await;
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = runtime_cx;
-        crate::runtime_compat::sleep(duration).await;
-    }
 }
 
 const SHUTDOWN_AWARE_SLEEP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -189,16 +152,10 @@ async fn runtime_timeout<F>(
 where
     F: Future,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = runtime_cx;
-        crate::runtime_compat::timeout(duration, future).await
-    }
 }
 
 fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
@@ -207,15 +164,10 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
-    }
 }
 
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
@@ -277,16 +229,10 @@ impl Drop for StreamingTasks {
 }
 
 async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         rx.recv(runtime_cx).await.ok()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = runtime_cx;
-        rx.recv().await
-    }
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -295,16 +241,10 @@ async fn send_runtime_channel<T>(
     tx: &mpsc::Sender<T>,
     value: T,
 ) -> bool {
-    #[cfg(feature = "asupersync-runtime")]
     {
         tx.send(runtime_cx, value).await.is_ok()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        let _ = runtime_cx;
-        tx.send(value).await.is_ok()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3472,17 +3412,7 @@ async fn run_vendored_streaming_capture(
     let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
     client_config.compression_mode = compression_mode;
 
-    #[cfg(feature = "asupersync-runtime")]
     let client = match DirectMuxClient::connect_with_cx(&runtime_cx, client_config).await {
-        Ok(client) => client,
-        Err(err) => {
-            bridge.record_fallback();
-            return format!("connect error: {err}");
-        }
-    };
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    let client = match DirectMuxClient::connect(client_config).await {
         Ok(client) => client,
         Err(err) => {
             bridge.record_fallback();
@@ -3497,52 +3427,12 @@ async fn run_vendored_streaming_capture(
         "Started vendored pane streaming subscription"
     );
 
-    #[cfg(feature = "asupersync-runtime")]
     let mut subscription = subscribe_pane_output_with_inherited_cx(
         &runtime_cx,
         client,
         subscription_pane_id,
         subscription_config.clone(),
     );
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    let mut subscription =
-        subscribe_pane_output(client, subscription_pane_id, subscription_config.clone());
-    let mut exit_reason = "subscription receiver closed".to_string();
-
-    loop {
-        #[cfg(feature = "asupersync-runtime")]
-        let delta = subscription.next_with_cx(&runtime_cx).await;
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let delta = subscription.next().await;
-
-        let Some(delta) = delta else {
-            break;
-        };
-
-        let ended_reason = match &delta {
-            PaneDelta::Ended { reason, .. } => Some(reason.clone()),
-            _ => None,
-        };
-
-        let segments = bridge.process_delta(delta);
-        for segment in segments {
-            if !send_runtime_channel(&runtime_cx, &capture_tx, CaptureEvent { segment }).await {
-                exit_reason = "capture ingress closed".to_string();
-                break;
-            }
-        }
-
-        if exit_reason == "capture ingress closed" {
-            break;
-        }
-
-        if let Some(reason) = ended_reason {
-            exit_reason = reason;
-            break;
-        }
-    }
 
     if should_record_streaming_fallback(&exit_reason) {
         bridge.record_fallback();
@@ -4007,15 +3897,10 @@ fn classify_backpressure_tier(
 }
 
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
-    #[cfg(feature = "asupersync-runtime")]
     {
         tx.capacity()
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        tx.max_capacity()
-    }
 }
 
 impl RuntimeHandle {
@@ -4540,7 +4425,6 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
-        #[cfg(feature = "asupersync-runtime")]
         crate::runtime_compat::clear_runtime_handle();
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
@@ -4576,7 +4460,6 @@ mod tests {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drop(runtime);
                 }));
-                #[cfg(feature = "asupersync-runtime")]
                 crate::runtime_compat::clear_runtime_handle();
 
                 // Re-raise test assertion panics after cleanup.
@@ -4600,14 +4483,10 @@ mod tests {
         }
         #[cfg(not(all(feature = "vendored", unix)))]
         {
-            #[cfg(feature = "asupersync-runtime")]
             let sent = {
                 let cx = crate::cx::for_testing();
                 tx.send(&cx, value).await
             };
-
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let sent = tx.send(value).await;
 
             assert!(sent.is_ok(), "test mpsc send should succeed");
         }
@@ -4636,14 +4515,9 @@ mod tests {
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
             rx.recv(&cx).await.expect("test mpsc recv should succeed")
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            rx.recv().await.expect("test mpsc recv should succeed")
         }
     }
 
@@ -5865,17 +5739,11 @@ mod tests {
             send_mpsc(&tx, 2).await;
             send_mpsc(&tx, 3).await;
 
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let depth = max_cap - tx.capacity();
-            #[cfg(feature = "asupersync-runtime")]
             let depth = rx.len();
             assert_eq!(depth, 3);
 
             // Drain one item, depth should decrease
             let _ = recv_mpsc(&mut rx).await;
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let depth = max_cap - tx.capacity();
-            #[cfg(feature = "asupersync-runtime")]
             let depth = rx.len();
             assert_eq!(depth, 2);
         });
@@ -7672,7 +7540,6 @@ mod tests {
     // provided by asupersync::LabRuntime.
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_observation {
         use super::*;
         use std::sync::atomic::{AtomicU64, AtomicUsize};

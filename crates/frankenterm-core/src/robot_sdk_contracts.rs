@@ -556,7 +556,6 @@ impl RustSdkTransport {
         payload: serde_json::Value,
     ) -> Result<T, RustSdkTransportError> {
         let args = build_rust_sdk_ipc_args(command, &payload)?;
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = crate::cx::Cx::current() {
             let response = self
                 .ipc
@@ -592,7 +591,6 @@ impl RustSdkTransport {
     /// socket round-trip — the 4 await points inside
     /// `send_request_with_id_with_cx` (connect, write, flush,
     /// read) all honor cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn call_with_cx<T: DeserializeOwned>(
         &self,
         cx: &crate::cx::Cx,
@@ -611,7 +609,6 @@ impl RustSdkTransport {
     /// Cx-first [`Self::call_value`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::call_with_cx`] with
     /// `T = serde_json::Value`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn call_value_with_cx(
         &self,
         cx: &crate::cx::Cx,

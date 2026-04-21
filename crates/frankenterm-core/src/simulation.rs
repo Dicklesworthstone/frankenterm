@@ -623,7 +623,6 @@ impl Scenario {
     /// returns with the pane index embedded in the error; panes
     /// added before the cancellation remain on the mock (no
     /// rollback — MockWezterm has no transactional bulk-add).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn setup_with_cx(&self, cx: &crate::cx::Cx, mock: &MockWezterm) -> Result<()> {
         cx.checkpoint().map_err(|err| {
             crate::Error::Runtime(format!("simulation.setup cancelled pre-start: {err}"))
@@ -722,7 +721,6 @@ impl Scenario {
     /// mid-iteration cancel returns an `Err` via Error::Runtime
     /// with the event index embedded so the caller knows how far
     /// the scenario progressed before cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_until_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -768,7 +766,6 @@ impl Scenario {
     /// to [`Self::execute_until_with_cx`] with the scenario's
     /// full duration, mirroring the legacy `execute_all` →
     /// `execute_until` delegation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_all_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -968,7 +965,6 @@ impl Scenario {
     /// The returned Err variant mirrors the shape of
     /// `execute_until_with_cx` cancellation errors so callers can
     /// unify their error paths.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_until_with_resize_timeline_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -987,7 +983,6 @@ impl Scenario {
     /// [`Scenario::execute_all_with_resize_timeline`].
     ///
     /// Thin composite over `execute_until_with_resize_timeline_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_all_with_resize_timeline_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1053,7 +1048,6 @@ impl TutorialSandbox {
     /// (tick 65) so caller cancellation during a slow mock-setup
     /// (e.g. many pane injections) surfaces cleanly rather than
     /// swallowing cancel as a setup-failure tracing::warn.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn new_with_cx(cx: &crate::cx::Cx) -> Self {
         let mock = MockWezterm::new();
         let scenario = Self::default_scenario();
@@ -1086,7 +1080,6 @@ impl TutorialSandbox {
     /// ft-xbnl0.2.3 Cx-first sibling of [`TutorialSandbox::with_scenario`].
     ///
     /// Routes the scenario setup through `Scenario::setup_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn with_scenario_with_cx(cx: &crate::cx::Cx, scenario: Scenario) -> Result<Self> {
         let mock = MockWezterm::new();
         scenario.setup_with_cx(cx, &mock).await?;
@@ -1163,7 +1156,6 @@ impl TutorialSandbox {
     /// additional checkpoint is needed at the sandbox wrapper
     /// boundary — the inner `execute_all_with_cx` already gates
     /// at pre-flight and per-event.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn trigger_exercise_events_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
         match &self.scenario {
             Some(s) => s.execute_all_with_cx(cx, &self.mock).await,
@@ -1197,7 +1189,6 @@ impl TutorialSandbox {
     /// returning `false` on timeout/cancellation. Cancellation is
     /// folded into the `false` return path to preserve the existing
     /// "expectation failed or unknown → false" contract.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn check_expectation_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1254,7 +1245,6 @@ impl TutorialSandbox {
     /// cancellation point). This matches the expected operator
     /// UX: if a test run is aborted, the caller can still see
     /// which expectations were evaluated before the abort.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn check_all_expectations_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2002,7 +1992,6 @@ events:
     /// the legacy `execute_all` — same event count, same pane
     /// text output (proving the injection went through cleanly
     /// under the Cx-first path).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_all_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2777,7 +2766,6 @@ events: []
     /// tutorial sandbox (which `TutorialSandbox::new()` wires up
     /// with 2 panes + 2 events + 2 contains expectations) as the
     /// fixture.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn sandbox_cx_first_trail_matches_legacy() {
         run_async_test(async {
@@ -2813,7 +2801,6 @@ events: []
     /// setup is called from inside TutorialSandbox::new() which
     /// uses the legacy setup. This test exercises setup_with_cx
     /// directly on a bare MockWezterm.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn scenario_setup_with_cx_matches_legacy() {
         run_async_test(async {

@@ -713,7 +713,6 @@ impl<S> InstrumentedStorage<S> {
     /// On cancellation, returns the original append result
     /// unchanged (telemetry simply is not recorded for this call)
     /// so the caller's error semantics are preserved.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::future_not_send)]
     pub async fn append_batch_instrumented_with_cx(
         &self,
@@ -1415,7 +1414,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `append_batch_instrumented_with_cx`
     /// must record the same telemetry as
     /// `append_batch_instrumented` for an uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn append_batch_instrumented_with_cx_matches_legacy() {
         use crate::recorder_storage::{

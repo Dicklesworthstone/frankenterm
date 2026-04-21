@@ -506,136 +506,11 @@ impl RecoveryEngine {
         Fut: std::future::Future<Output = Result<T, E>>,
         C: Fn(&E) -> ProtocolErrorKind,
     {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.execute_with_cx(&cx, operation, classify).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut operation = operation;
-            self.counters
-                .total_operations
-                .fetch_add(1, Ordering::Relaxed);
-
-            if !self.config.enabled {
-                return RecoveryOutcome {
-                    result: Err(RecoveryError::Disabled),
-                    attempts: 0,
-                    error_kinds: vec![],
-                };
-            }
-
-            let consecutive = self.counters.consecutive_permanent.load(Ordering::Relaxed);
-            if consecutive >= u64::from(self.config.permanent_failure_limit) {
-                return RecoveryOutcome {
-                    result: Err(RecoveryError::PermanentLimitReached {
-                        limit: self.config.permanent_failure_limit,
-                    }),
-                    attempts: 0,
-                    error_kinds: vec![],
-                };
-            }
-
-            if !self.circuit.allow() {
-                self.counters
-                    .circuit_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                return RecoveryOutcome {
-                    result: Err(RecoveryError::CircuitOpen),
-                    attempts: 0,
-                    error_kinds: vec![],
-                };
-            }
-
-            let max_attempts = self.config.max_retries + 1;
-            let mut error_kinds = Vec::new();
-            let mut last_error_msg = String::new();
-            let mut last_kind = ProtocolErrorKind::Recoverable;
-
-            for attempt in 0..max_attempts {
-                match operation(attempt).await {
-                    Ok(value) => {
-                        self.circuit.record_success();
-                        self.counters
-                            .consecutive_permanent
-                            .store(0, Ordering::Relaxed);
-                        if attempt == 0 {
-                            self.counters
-                                .first_try_successes
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            self.counters
-                                .retry_successes
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        return RecoveryOutcome {
-                            result: Ok(value),
-                            attempts: attempt + 1,
-                            error_kinds,
-                        };
-                    }
-                    Err(err) => {
-                        let kind = classify(&err);
-                        last_error_msg = err.to_string();
-                        last_kind = kind;
-                        error_kinds.push(kind);
-
-                        match kind {
-                            ProtocolErrorKind::Permanent => {
-                                self.circuit.record_failure();
-                                self.counters
-                                    .permanent_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                                self.counters
-                                    .consecutive_permanent
-                                    .fetch_add(1, Ordering::Relaxed);
-                                if self.config.report_degradation {
-                                    report_mux_degradation(&last_error_msg);
-                                }
-                                return RecoveryOutcome {
-                                    result: Err(RecoveryError::Permanent(last_error_msg)),
-                                    attempts: attempt + 1,
-                                    error_kinds,
-                                };
-                            }
-                            ProtocolErrorKind::Recoverable => {
-                                self.circuit.record_failure();
-                                self.counters
-                                    .recoverable_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            ProtocolErrorKind::Transient => {
-                                self.counters
-                                    .transient_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-
-                        if attempt + 1 < max_attempts {
-                            self.counters.total_retries.fetch_add(1, Ordering::Relaxed);
-                            let delay = self.config.delay_for_attempt(attempt);
-                            crate::runtime_compat::sleep(delay).await;
-                        }
-                    }
-                }
-            }
-
-            if self.config.report_degradation {
-                report_mux_degradation(&last_error_msg);
-            }
-
-            RecoveryOutcome {
-                result: Err(RecoveryError::RetriesExhausted {
-                    attempts: max_attempts,
-                    last_error: last_error_msg,
-                    last_kind,
-                }),
-                attempts: max_attempts,
-                error_kinds,
-            }
-        }
     }
 
     /// Execute the retry policy against the caller's asupersync capability
@@ -659,7 +534,6 @@ impl RecoveryEngine {
     ///
     /// The legacy [`execute`](Self::execute) entry point is preserved
     /// for non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_with_cx<T, E, F, Fut, C>(
         &mut self,
         cx: &crate::cx::Cx,
@@ -2114,7 +1988,6 @@ mod tests {
     /// Pre-flight cancellation: if the Cx is already cancelled on entry,
     /// `execute_with_cx` must return immediately with `Cancelled` and
     /// the operation closure must never be called.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_pre_cancelled_short_circuits() {
         run_async_test(async {
@@ -2171,7 +2044,6 @@ mod tests {
     /// Happy path: `execute_with_cx` with a live Cx on a first-try-success
     /// behaves identically to `execute`. Pins that the Cx entry point does
     /// not regress the success path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_happy_path_first_try() {
         run_async_test(async {
@@ -2202,7 +2074,6 @@ mod tests {
 
     /// Disabled path: when `config.enabled = false`, `execute_with_cx`
     /// must return `Disabled` like `execute` does, even with a live Cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_disabled_returns_disabled() {
         run_async_test(async {

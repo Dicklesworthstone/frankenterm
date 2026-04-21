@@ -796,16 +796,8 @@ where
                 // cancelled. Matches the inherit-or-fallback idiom already
                 // used in native_events.rs, cpu_pressure.rs, storage.rs,
                 // etc.
-                #[cfg(feature = "asupersync-runtime")]
                 let $reserve_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                #[cfg(feature = "asupersync-runtime")]
                 let $permit = match timeout($send_timeout, $tx.reserve(&$reserve_cx)).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => return ($pane_id, PollOutcome::ChannelClosed),
-                    Err(_) => return ($pane_id, PollOutcome::Backpressure),
-                };
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let $permit = match timeout($send_timeout, $tx.reserve()).await {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => return ($pane_id, PollOutcome::ChannelClosed),
                     Err(_) => return ($pane_id, PollOutcome::Backpressure),
@@ -1487,16 +1479,11 @@ mod tests {
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
             rx.recv(&cx).await.ok()
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            rx.recv().await
-        }
     }
 
     fn make_pane(id: u64) -> PaneInfo {
@@ -3662,7 +3649,6 @@ mod tests {
     //   - TailerConfig / SchedulerSnapshot data contracts
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_tailer {
         use super::*;
 

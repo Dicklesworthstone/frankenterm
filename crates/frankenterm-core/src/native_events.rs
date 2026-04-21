@@ -154,30 +154,11 @@ pub struct NativeEventListener {
 
 impl NativeEventListener {
     pub async fn bind(socket_path: PathBuf) -> Result<Self, NativeEventError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return Self::bind_with_cx(&cx, socket_path).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            if socket_path.as_os_str().is_empty() {
-                return Err(NativeEventError::EmptySocketPath);
-            }
-
-            maybe_cleanup_stale_socket(&socket_path)?;
-
-            if let Some(parent) = socket_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let listener = compat_unix::bind(&socket_path).await?;
-            Ok(Self {
-                socket_path,
-                listener,
-            })
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind`].
@@ -189,7 +170,6 @@ impl NativeEventListener {
     /// mid-startup won't touch files it doesn't need to.
     /// Cancellation surfaces as `NativeEventError::Io(Interrupted)`
     /// so the caller's existing error-match arms continue to hold.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn bind_with_cx(
         cx: &crate::cx::Cx,
         socket_path: PathBuf,
@@ -226,7 +206,6 @@ impl NativeEventListener {
     }
 
     pub async fn run(self, event_tx: mpsc::Sender<NativeEvent>, shutdown_flag: Arc<AtomicBool>) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             // ft-xbnl0.2.3: route the legacy entry point through the
             // explicit-Cx accept loop so the listener keeps a single
@@ -235,44 +214,6 @@ impl NativeEventListener {
             self.run_with_cx(&cx, event_tx, shutdown_flag).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let mut connection_tasks = JoinSet::new();
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        loop {
-            if shutdown_flag.load(Ordering::SeqCst) {
-                break;
-            }
-
-            match crate::runtime_compat::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept()).await
-            {
-                Ok(Ok((stream, _addr))) => {
-                    let tx = event_tx.clone();
-                    connection_tasks.spawn(async move {
-                        if let Err(err) = handle_connection(stream, tx).await {
-                            debug!(error = %err, "native event connection closed with error");
-                        }
-                    });
-                }
-                Ok(Err(err)) => {
-                    warn!(error = %err, path = %self.socket_path.display(), "native event accept failed");
-                }
-                Err(_) => {} // timeout, loop to check shutdown flag
-            }
-
-            while let Some(join_result) = connection_tasks.try_join_next() {
-                if let Err(err) = join_result {
-                    debug!(error = %err, "native event connection task failed");
-                }
-            }
-        }
-
-        #[cfg(not(feature = "asupersync-runtime"))]
-        while let Some(join_result) = connection_tasks.join_next().await {
-            if let Err(err) = join_result {
-                debug!(error = %err, "native event connection task failed during shutdown");
-            }
-        }
     }
 
     /// Run the accept loop against the caller's asupersync capability
@@ -414,50 +355,6 @@ fn maybe_cleanup_stale_socket(socket_path: &PathBuf) -> Result<(), NativeEventEr
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn handle_connection(
-    stream: UnixStream,
-    event_tx: mpsc::Sender<NativeEvent>,
-) -> Result<(), std::io::Error> {
-    debug!("native event connection accepted");
-    let mut lines = compat_unix::lines(compat_unix::buffered(stream));
-
-    while let Some(line) = compat_unix::next_line(&mut lines).await? {
-        if line.len() > MAX_EVENT_LINE_BYTES {
-            warn!(len = line.len(), "native event line too large; dropping");
-            continue;
-        }
-
-        match decode_wire_event(&line) {
-            Ok(Some(event)) => {
-                let (event_kind, pane_id) = event_metadata(&event);
-                match dispatch_event(&event_tx, event).await {
-                    EventDispatchOutcome::Sent => {
-                        debug!(event_kind, pane_id, "native event dispatched");
-                    }
-                    EventDispatchOutcome::Backpressure => {
-                        debug!(
-                            event_kind,
-                            pane_id, "native event queue full; dropping event"
-                        );
-                    }
-                    EventDispatchOutcome::Closed => {
-                        debug!(event_kind, pane_id, "native event channel closed");
-                        break;
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                debug!(error = %err, "failed to decode native event");
-            }
-        }
-    }
-
-    debug!("native event connection closed");
-    Ok(())
-}
-
 /// ft-xbnl0.2.3 Cx-first sibling of [`handle_connection`].
 ///
 /// Plugs the orphan-cx hole documented in tick 165's lesson:
@@ -471,7 +368,6 @@ async fn handle_connection(
 /// `next_line_with_cx` (tick 160) replaces the line-read so a
 /// cancelled parent can also interrupt a slow client. The pre-
 /// flight checkpoint gates the handler's first iteration.
-#[cfg(feature = "asupersync-runtime")]
 async fn handle_connection_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
@@ -532,16 +428,7 @@ fn event_metadata(event: &NativeEvent) -> (&'static str, u64) {
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn dispatch_event(
-    event_tx: &mpsc::Sender<NativeEvent>,
-    event: NativeEvent,
-) -> EventDispatchOutcome {
-    dispatch_event_with_timeout(event_tx, event, EVENT_SEND_TIMEOUT).await
-}
-
 /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event`].
-#[cfg(feature = "asupersync-runtime")]
 async fn dispatch_event_with_cx(
     cx: &crate::cx::Cx,
     event_tx: &mpsc::Sender<NativeEvent>,
@@ -556,26 +443,11 @@ async fn dispatch_event_with_timeout(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return dispatch_event_with_timeout_with_cx(&cx, event_tx, event, send_timeout).await;
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    // Native asupersync reserve/commit path. The `native-wezterm` feature
-    // requires `asupersync-runtime` (wa-k0tk5); there is no longer a tokio
-    // fallback branch.
-    let reserve_cx = crate::cx::for_request();
-    #[cfg(not(feature = "asupersync-runtime"))]
-    match crate::runtime_compat::timeout(send_timeout, event_tx.reserve(&reserve_cx)).await {
-        Ok(Ok(permit)) => {
-            permit.send(event);
-            EventDispatchOutcome::Sent
-        }
-        Ok(Err(_)) => EventDispatchOutcome::Closed,
-        Err(_) => EventDispatchOutcome::Backpressure,
-    }
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`dispatch_event_with_timeout`].
@@ -585,7 +457,6 @@ async fn dispatch_event_with_timeout(
 /// cancellation chain from `run_with_cx`'s parent. Also uses
 /// `timeout_with_cx` so a cx-cancel unblocks the reserve wait
 /// immediately rather than waiting for the full `send_timeout`.
-#[cfg(feature = "asupersync-runtime")]
 async fn dispatch_event_with_timeout_with_cx(
     cx: &crate::cx::Cx,
     event_tx: &mpsc::Sender<NativeEvent>,
@@ -1087,7 +958,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must successfully
     /// bind when given a fresh, uncancelled cx — producing a
     /// listener on the same socket path as the legacy `bind`.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn bind_with_cx_succeeds_on_fresh_cx() {
         run_async_test(async {
@@ -1107,7 +977,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `bind_with_cx` must return an
     /// `Io(Interrupted)` error on a pre-cancelled cx, without
     /// creating the socket file.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn bind_with_precancelled_cx_returns_interrupted() {
         run_async_test(async {
@@ -1598,7 +1467,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn dispatch_event_with_timeout_with_precancelled_cx_drops_event() {
         run_async_test(async {

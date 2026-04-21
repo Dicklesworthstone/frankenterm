@@ -276,7 +276,6 @@ impl<T> TxProducer<T> {
     /// `Err(Closed)` too — matches the close-while-waiting
     /// return shape so existing callers that handle `Closed`
     /// don't need to special-case cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn reserve_with_cx(&self, cx: &crate::cx::Cx) -> Result<Reservation, TxChannelError> {
         loop {
             if cx.checkpoint().is_err() {
@@ -474,7 +473,6 @@ impl<T> TxConsumer<T> {
     /// pre-cancel or mid-wait cancel — matches the
     /// closed-and-drained return shape so existing callers
     /// that check `None` need no changes.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<ReceivedValue<T>> {
         loop {
             if cx.checkpoint().is_err() {
@@ -726,7 +724,6 @@ mod tests {
     /// (reserve, commit, recv). Uses run_async_test-equivalent
     /// raw block_on because cancellation_safe_channel tests
     /// use sync fixtures.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn tx_channel_with_cx_round_trip() {
         use crate::runtime_compat::CompatRuntime;

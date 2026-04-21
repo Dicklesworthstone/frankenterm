@@ -156,7 +156,6 @@ pub async fn check_step_idempotency(
 /// cancelled idempotency check is indistinguishable from a step
 /// that has truly not run; the cancellation itself will surface
 /// at the next `cx.checkpoint()` (e.g. tick 181's per-step seam).
-#[cfg(feature = "asupersync-runtime")]
 pub async fn check_step_idempotency_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -248,7 +247,6 @@ pub async fn check_step_idempotency_maybe_cx(
     idempotency_key: &crate::plan::IdempotencyKey,
     step_index: usize,
 ) -> IdempotencyCheckResult {
-    #[cfg(feature = "asupersync-runtime")]
     if let Some(cx) = cx {
         return check_step_idempotency_with_cx(
             cx,
@@ -259,8 +257,6 @@ pub async fn check_step_idempotency_maybe_cx(
         )
         .await;
     }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    let _ = cx;
     check_step_idempotency(storage, execution_id, idempotency_key, step_index).await
 }
 

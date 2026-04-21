@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -397,40 +395,11 @@ impl MemoryBudgetManager {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.run_with_cx(&cx, shutdown).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let interval =
-                std::time::Duration::from_millis(self.config.sample_interval_ms.max(1000));
-            let mut first_tick = true;
-
-            loop {
-                if !first_tick {
-                    sleep(interval).await;
-                }
-                first_tick = false;
-
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                let summary = self.sample_all();
-                if summary.throttled_count > 0 || summary.over_budget_count > 0 {
-                    tracing::warn!(
-                        throttled = summary.throttled_count,
-                        over_budget = summary.over_budget_count,
-                        worst_pane = ?summary.worst_pane_id,
-                        worst_ratio = format!("{:.2}", summary.worst_usage_ratio),
-                        "Memory budget pressure detected"
-                    );
-                }
-            }
-        }
     }
 
     /// Run the monitoring loop against the caller's asupersync capability
@@ -450,7 +419,6 @@ impl MemoryBudgetManager {
     ///
     /// The legacy [`run`](Self::run) entry point is preserved for
     /// non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1387,7 +1355,6 @@ mod tests {
     // cpu_pressure.rs labruntime_cpu_pressure tests.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_memory_budget {
         use super::*;
         use std::sync::Arc;

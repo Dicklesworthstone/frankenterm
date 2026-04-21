@@ -178,7 +178,6 @@ pub async fn build_explain_context(
 /// storage calls now route through their cx-first siblings so
 /// caller cancellation propagates into storage's pre-flight
 /// checkpoints.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn build_explain_context_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
@@ -2086,7 +2085,6 @@ mod tests {
     /// must produce a context equivalent to
     /// `build_explain_context` on an empty DB (same pane count,
     /// same indexing stats, same gaps, same retention cleanup).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn build_explain_context_with_cx_matches_legacy() {
         use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};

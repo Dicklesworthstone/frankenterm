@@ -187,14 +187,9 @@ impl ProcessLauncher {
     /// Plans are executed sequentially with `launch_delay_ms` between each
     /// to prevent resource spikes.
     pub async fn execute(&self, plans: &[ProcessPlan]) -> LaunchReport {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.execute_cx(&cx, plans).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.execute_legacy(plans).await
         }
     }
 
@@ -204,7 +199,6 @@ impl ProcessLauncher {
     /// Inter-launch sleeps and per-pane command delays bind to the provided
     /// capability context so cancellation, budget, and virtual time propagate
     /// cleanly through the launch sequence.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_cx(&self, cx: &crate::cx::Cx, plans: &[ProcessPlan]) -> LaunchReport {
         let mut report = LaunchReport::default();
         let delay = Duration::from_millis(self.config.launch_delay_ms);
@@ -272,69 +266,6 @@ impl ProcessLauncher {
     /// Owner: `ft-xbnl0.2.5`.
     /// Removal path: drop this helper once the workspace no longer supports
     /// non-`asupersync-runtime` restore execution.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn execute_legacy(&self, plans: &[ProcessPlan]) -> LaunchReport {
-        let mut report = LaunchReport::default();
-        let delay = Duration::from_millis(self.config.launch_delay_ms);
-
-        for (i, plan) in plans.iter().enumerate() {
-            if i > 0 && !delay.is_zero() {
-                crate::runtime_compat::sleep(delay).await;
-            }
-
-            let result = match &plan.action {
-                LaunchAction::LaunchShell { shell, cwd } => {
-                    self.launch_shell_legacy(plan.new_pane_id, shell, cwd).await
-                }
-                LaunchAction::LaunchAgent {
-                    command,
-                    cwd,
-                    agent_type,
-                } => {
-                    self.launch_agent_legacy(plan.new_pane_id, command, cwd, agent_type)
-                        .await
-                }
-                LaunchAction::Skip { reason } => {
-                    debug!(pane = plan.new_pane_id, reason = %reason, "skipping pane");
-                    report.skipped += 1;
-                    report.results.push(LaunchResult {
-                        old_pane_id: plan.old_pane_id,
-                        new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
-                        success: true,
-                        error: None,
-                    });
-                    continue;
-                }
-                LaunchAction::Manual { hint, .. } => {
-                    info!(pane = plan.new_pane_id, hint = %hint, "manual restart required");
-                    report.manual += 1;
-                    report.results.push(LaunchResult {
-                        old_pane_id: plan.old_pane_id,
-                        new_pane_id: plan.new_pane_id,
-                        action: plan.action.clone(),
-                        success: true,
-                        error: None,
-                    });
-                    continue;
-                }
-            };
-
-            self.record_result(&mut report, plan, result);
-        }
-
-        info!(
-            shells = report.shells_launched,
-            agents = report.agents_launched,
-            skipped = report.skipped,
-            manual = report.manual,
-            failed = report.failed,
-            "process re-launch complete"
-        );
-
-        report
-    }
-
     /// Shared result recording logic used by both execute_cx and execute_legacy.
     #[allow(clippy::unused_self)]
     fn record_result(
@@ -568,32 +499,6 @@ impl ProcessLauncher {
     // -------------------------------------------------------------------------
 
     /// Send shell launch commands to a pane.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn launch_shell_legacy(
-        &self,
-        pane_id: u64,
-        shell: &str,
-        cwd: &Path,
-    ) -> Result<(), String> {
-        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
-        self.wezterm
-            .send_text(pane_id, &cd_cmd)
-            .await
-            .map_err(|e| format!("send cd: {e}"))?;
-        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-        let current_shell = default_shell();
-        if shell != current_shell && !shell.is_empty() {
-            let exec_cmd = format!("exec {shell}\r");
-            self.wezterm
-                .send_text(pane_id, &exec_cmd)
-                .await
-                .map_err(|e| format!("send exec: {e}"))?;
-        }
-        info!(pane = pane_id, shell = %shell, cwd = %cwd.display(), "shell launched");
-        Ok(())
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
     async fn launch_shell_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -621,34 +526,6 @@ impl ProcessLauncher {
     }
 
     /// Send agent launch command to a pane.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn launch_agent_legacy(
-        &self,
-        pane_id: u64,
-        command: &str,
-        cwd: &Path,
-        agent_type: &str,
-    ) -> Result<(), String> {
-        // [ft-kegvt] reject CR/LF/ESC/other C0 before typing into the
-        // interactive shell. Restored `command` originates from the
-        // session DB and must not be trusted to be newline-free.
-        let safe_command = sanitize_restored_command(command)?;
-        let cd_cmd = format!("cd {}\r", shell_escape(cwd));
-        self.wezterm
-            .send_text(pane_id, &cd_cmd)
-            .await
-            .map_err(|e| format!("send cd: {e}"))?;
-        crate::runtime_compat::sleep(Duration::from_millis(50)).await;
-        let full_cmd = format!("{safe_command}\r");
-        self.wezterm
-            .send_text(pane_id, &full_cmd)
-            .await
-            .map_err(|e| format!("send agent command: {e}"))?;
-        info!(pane = pane_id, agent = %agent_type, cwd = %cwd.display(), "agent launched");
-        Ok(())
-    }
-
-    #[cfg(feature = "asupersync-runtime")]
     async fn launch_agent_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -890,7 +767,6 @@ mod tests {
     /// test verifies the execute_cx orchestration loop and its sleep_with_cx
     /// plumbing run under the LabRuntime scheduler without wall-clock
     /// dependence.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_cx_runs_under_labruntime() {
         use std::sync::atomic::{AtomicBool, Ordering};

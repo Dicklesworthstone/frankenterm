@@ -129,7 +129,6 @@ impl<'a> ApprovalStore<'a> {
     /// pre-flight boundaries.
     ///
     /// Semantics identical to [`Self::issue`] for uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn issue_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -255,7 +254,6 @@ impl<'a> ApprovalStore<'a> {
     /// their cx-first siblings. The plan_hash/plan_version/
     /// risk_summary semantics are identical to the legacy
     /// `issue_for_plan`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn issue_for_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -383,7 +381,6 @@ impl<'a> ApprovalStore<'a> {
     /// Cx-first [`Self::consume_for_plan`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::consume_for_plan_with_context_with_cx`]
     /// with `None` audit context, mirroring the legacy delegation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_for_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -414,7 +411,6 @@ impl<'a> ApprovalStore<'a> {
     /// window on a MISMATCHED-hash token would happen AFTER the
     /// storage consume but before the `return Ok(None)` — which
     /// is fine because no audit is attempted on that branch.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_for_plan_with_context_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -495,7 +491,6 @@ impl<'a> ApprovalStore<'a> {
     /// require approval, returns the decision unchanged without
     /// touching storage — no checkpoint needed on that branch
     /// because it's a pure decision transformation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn attach_to_decision_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -553,7 +548,6 @@ impl<'a> ApprovalStore<'a> {
     /// to [`Self::consume_with_context_with_cx`] with `None`
     /// audit context, mirroring the legacy `consume` → `consume_with_context`
     /// delegation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -584,7 +578,6 @@ impl<'a> ApprovalStore<'a> {
     /// mid-flight — the checkpoint window here is narrow (between
     /// two storage calls). The error wraps the reason so the
     /// caller can distinguish cancellation from other failures.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_with_context_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -670,7 +663,6 @@ impl<'a> ApprovalStore<'a> {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::audit_approval_grant`].
     /// Routes the audit write through the cx-first storage sibling.
-    #[cfg(feature = "asupersync-runtime")]
     async fn audit_approval_grant_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1530,7 +1522,6 @@ mod tests {
     ///   4. `attach_to_decision_with_cx` with a decision that
     ///      doesn't require approval is a pure pass-through (no
     ///      storage calls, no checkpoint).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn approval_rs_cx_first_trail_complete() {
         run_async_test(async {
@@ -1671,7 +1662,6 @@ mod tests {
     /// Also exercises `consume_with_context_with_cx` by passing
     /// an explicit audit_context to verify the delegation hop
     /// (`consume_with_cx` → `consume_with_context_with_cx`) works.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn consume_with_cx_matches_legacy_and_exhausts_token() {
         run_async_test(async {
@@ -1759,7 +1749,6 @@ mod tests {
     /// presented (TOCTOU protection preserved), and a mismatched
     /// plan_hash must still fail even though the token itself is
     /// valid.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn issue_for_plan_with_cx_preserves_plan_binding() {
         run_async_test(async {
@@ -1868,7 +1857,6 @@ mod tests {
     /// Cx-first-issued token is consumable by the legacy
     /// `consume` — proving the checkpoint seams don't corrupt any
     /// token state.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn issue_with_cx_matches_legacy_and_is_consumable() {
         run_async_test(async {

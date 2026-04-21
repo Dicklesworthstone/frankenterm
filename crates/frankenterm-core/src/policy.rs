@@ -6305,7 +6305,6 @@ where
     /// `send_text_with_options_with_cx` so a cancelled parent (e.g.
     /// a shutting-down policy engine) bails before pumping the
     /// trauma-feedback text into the pane.
-    #[cfg(feature = "asupersync-runtime")]
     async fn maybe_inject_trauma_feedback_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6342,7 +6341,6 @@ where
     ///
     /// Returns the same `InjectionResult` shape as the legacy
     /// `send_text` for easy drop-in replacement.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_text_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6372,7 +6370,6 @@ where
     /// `inject` — no cx propagation there because they're either
     /// synchronous (policy eval, decision capture) or already
     /// bounded by their own timeouts (audit storage writes).
-    #[cfg(feature = "asupersync-runtime")]
     async fn inject_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6668,7 +6665,6 @@ where
     /// delegate to [`Self::inject_with_cx`] with
     /// `ActionKind::SendCtrlC`, mirroring the legacy send_ctrl_c
     /// → inject delegation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_ctrl_c_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6692,7 +6688,6 @@ where
     /// Cx-first [`Self::send_ctrl_d`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::inject_with_cx`] with
     /// `ActionKind::SendCtrlD`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_ctrl_d_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6716,7 +6711,6 @@ where
     /// Cx-first [`Self::send_ctrl_z`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::inject_with_cx`] with
     /// `ActionKind::SendCtrlZ`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_ctrl_z_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6740,7 +6734,6 @@ where
     /// Cx-first [`Self::send_control`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::inject_with_cx`] with
     /// `ActionKind::SendControl`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_control_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -6798,7 +6791,6 @@ where
     /// Cx-first `inject_with_cx` variants will call this helper
     /// to get cancellation-aware dispatch without duplicating the
     /// ActionKind match.
-    #[cfg(feature = "asupersync-runtime")]
     async fn dispatch_wezterm_send_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7087,7 +7079,6 @@ async fn find_workflow_start_action_id(
 /// honours cancellation. Returns `None` on cancellation (matching
 /// the legacy "swallow errors → None" contract), so callers in the
 /// decision-context capture path degrade gracefully.
-#[cfg(feature = "asupersync-runtime")]
 async fn find_workflow_start_action_id_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
@@ -7606,7 +7597,6 @@ mod tests {
     /// `send_text_with_cx_matches_legacy_deny_path`. Consolidated
     /// test covers all 4 remaining entry points with one
     /// fixture.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_and_control_with_cx_match_legacy_deny_path() {
         run_async_test(async {
@@ -7701,7 +7691,6 @@ mod tests {
     ///   * never dispatches to the wezterm send (dispatch_with_cx
     ///     is only called on the Allow branch, which doesn't fire
     ///     here)
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_text_with_cx_matches_legacy_deny_path() {
         run_async_test(async {

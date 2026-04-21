@@ -5794,16 +5794,11 @@ impl WriteCommandSender {
         &self,
         command: WriteCommand,
     ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_request();
             self.inner.send(&cx, command).await
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.inner.send(command).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
@@ -5822,7 +5817,6 @@ impl WriteCommandSender {
     /// can progressively migrate the remaining ~50+ `_with_cx`
     /// storage methods. Legacy `send` stays available for
     /// ambient-cx callers.
-    #[cfg(feature = "asupersync-runtime")]
     async fn send_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -5832,15 +5826,10 @@ impl WriteCommandSender {
     }
 
     fn max_capacity(&self) -> usize {
-        #[cfg(feature = "asupersync-runtime")]
         {
             self.inner.capacity()
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.inner.max_capacity()
-        }
     }
 
     fn capacity(&self) -> usize {
@@ -5951,7 +5940,6 @@ impl StorageHandle {
     /// open, schema init, writer thread spawn). CLI startup
     /// paths that are cx-driven can bail before taking the DB
     /// lock and spawning the writer thread.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn new_with_cx(cx: &crate::cx::Cx, db_path: &str) -> Result<Self> {
         Self::with_config_with_cx(cx, db_path, StorageConfig::default()).await
     }
@@ -5963,7 +5951,6 @@ impl StorageHandle {
     /// - Between schema init and writer-thread spawn (so a
     ///   cancelled caller doesn't leak a background thread
     ///   after the DB open succeeded).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn with_config_with_cx(
         cx: &crate::cx::Cx,
         db_path: &str,
@@ -6031,7 +6018,6 @@ impl StorageHandle {
         content: &str,
         content_hash: Option<String>,
     ) -> Result<Segment> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -6039,21 +6025,6 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::AppendSegment {
-                    pane_id,
-                    content: content.to_string(),
-                    content_hash,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`append_segment`].
@@ -6067,7 +6038,6 @@ impl StorageHandle {
     /// Tick 175: inlined to route the mpsc send through
     /// `send_with_cx` — segment writes are the highest-volume
     /// per-pane ingest path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn append_segment_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6098,26 +6068,11 @@ impl StorageHandle {
     /// Indicates a discontinuity in capture for the given pane.
     /// Returns `None` if the gap was skipped (e.g. at start of stream).
     pub async fn record_gap(&self, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_gap_with_cx(&cx, pane_id, reason).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordGap {
-                    pane_id,
-                    reason: reason.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_gap`].
@@ -6127,7 +6082,6 @@ impl StorageHandle {
     /// common.
     ///
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_gap_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6155,22 +6109,11 @@ impl StorageHandle {
     ///
     /// Returns the event ID.
     pub async fn record_event(&self, event: StoredEvent) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_event_with_cx(&cx, event).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordEvent { event, respond: tx })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_event`].
@@ -6183,7 +6126,6 @@ impl StorageHandle {
     /// Tick 174: inlined to route the mpsc send through
     /// `send_with_cx` so a backpressured writer queue releases
     /// immediately under caller cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_event_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6199,15 +6141,6 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn record_event_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        event: StoredEvent,
-    ) -> Result<i64> {
-        self.record_event(event).await
-    }
-
     /// Mark an event as handled
     pub async fn mark_event_handled(
         &self,
@@ -6215,7 +6148,6 @@ impl StorageHandle {
         workflow_id: Option<String>,
         status: &str,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -6223,21 +6155,6 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::MarkEventHandled {
-                    event_id,
-                    workflow_id,
-                    status: status.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_event_handled`].
@@ -6248,7 +6165,6 @@ impl StorageHandle {
     /// which under asupersync-runtime reserves with an orphan
     /// `cx::for_request()` — a latent hole in the cancellation
     /// chain when the writer queue is backpressured.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_event_handled_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6284,7 +6200,6 @@ impl StorageHandle {
         triage_state: Option<String>,
         updated_by: Option<String>,
     ) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -6292,26 +6207,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::SetEventTriageState {
-                    event_id,
-                    triage_state,
-                    updated_by,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_triage_state`].
     /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_event_triage_state_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6347,7 +6246,6 @@ impl StorageHandle {
         note: Option<String>,
         updated_by: Option<String>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -6355,26 +6253,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::SetEventNote {
-                    event_id,
-                    note,
-                    updated_by,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_event_note`].
     /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn set_event_note_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6409,7 +6291,6 @@ impl StorageHandle {
         label: String,
         created_by: Option<String>,
     ) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -6417,26 +6298,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::AddEventLabel {
-                    event_id,
-                    label,
-                    created_by,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_label`].
     /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn add_event_label_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6466,31 +6331,15 @@ impl StorageHandle {
     ///
     /// Returns true if a label row was deleted.
     pub async fn remove_event_label(&self, event_id: i64, label: String) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.remove_event_label_with_cx(&cx, event_id, label).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RemoveEventLabel {
-                    event_id,
-                    label,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_label`].
     /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn remove_event_label_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6517,27 +6366,14 @@ impl StorageHandle {
 
     /// Fetch triage state, note, and labels for an event.
     pub async fn get_event_annotations(&self, event_id: i64) -> Result<Option<EventAnnotations>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_event_annotations_with_cx(&cx, event_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_event_annotations_sync(&conn, event_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_annotations`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_event_annotations_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6558,30 +6394,15 @@ impl StorageHandle {
 
     /// Add or update a persistent event mute by identity key.
     pub async fn add_event_mute(&self, record: EventMuteRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.add_event_mute_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertEventMute {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`add_event_mute`].
     /// Tick 169: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn add_event_mute_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6605,29 +6426,14 @@ impl StorageHandle {
 
     /// Remove a persistent event mute by identity key.
     pub async fn remove_event_mute(&self, identity_key: &str) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.remove_event_mute_with_cx(&cx, identity_key).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeleteEventMute {
-                    identity_key: identity_key.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`remove_event_mute`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn remove_event_mute_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6652,30 +6458,14 @@ impl StorageHandle {
 
     /// Check whether an identity key is muted (and not expired).
     pub async fn is_event_muted(&self, identity_key: &str, now_ms: i64) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.is_event_muted_with_cx(&cx, identity_key, now_ms).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let identity_key = identity_key.to_string();
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_event_mute(&conn, &identity_key, now_ms)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`is_event_muted`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn is_event_muted_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6699,29 +6489,14 @@ impl StorageHandle {
 
     /// List all active (non-expired) mutes.
     pub async fn list_active_mutes(&self, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.list_active_mutes_with_cx(&cx, now_ms).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                list_active_mutes_sync(&conn, now_ms)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_mutes`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_active_mutes_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6743,29 +6518,14 @@ impl StorageHandle {
 
     /// Fetch an event's dedupe/identity key by ID.
     pub async fn get_event_identity_key(&self, event_id: i64) -> Result<Option<String>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_event_identity_key_with_cx(&cx, event_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_event_identity_key(&conn, event_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_event_identity_key`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_event_identity_key_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6788,25 +6548,11 @@ impl StorageHandle {
 
     /// Record an audit action
     pub async fn record_audit_action(&self, action: AuditActionRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_audit_action_with_cx(&cx, action).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordAuditAction {
-                    action,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action`].
@@ -6816,7 +6562,6 @@ impl StorageHandle {
     /// caller bails before enqueuing the write if cancelled.
     ///
     /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_audit_action_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6841,26 +6586,17 @@ impl StorageHandle {
 
     /// Record an audit action after applying redaction
     pub async fn record_audit_action_redacted(&self, action: AuditActionRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_audit_action_redacted_with_cx(&cx, action).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut action = action;
-            let redactor = Redactor::new();
-            action.redact_fields(&redactor);
-            self.record_audit_action(action).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
     ///
     /// Redacts in-process (synchronous), then routes through the
     /// cx-first record_audit_action path. 11+ callsites.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_audit_action_redacted_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6873,30 +6609,15 @@ impl StorageHandle {
 
     /// Upsert undo metadata for an audit action
     pub async fn upsert_action_undo(&self, record: ActionUndoRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_action_undo_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertActionUndo {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_action_undo_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6921,19 +6642,11 @@ impl StorageHandle {
 
     /// Upsert undo metadata after applying redaction
     pub async fn upsert_action_undo_redacted(&self, record: ActionUndoRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_action_undo_redacted_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut record = record;
-            let redactor = Redactor::new();
-            record.redact_fields(&redactor);
-            self.upsert_action_undo(record).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_undo_redacted`].
@@ -6941,7 +6654,6 @@ impl StorageHandle {
     /// Routes the post-redaction persistence through
     /// `upsert_action_undo_with_cx` so the full composite honours
     /// cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_action_undo_redacted_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -6957,29 +6669,14 @@ impl StorageHandle {
 
     /// Fetch undo metadata for a specific audit action ID.
     pub async fn get_action_undo(&self, audit_action_id: i64) -> Result<Option<ActionUndoRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_action_undo_with_cx(&cx, audit_action_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_action_undo_sync(&conn, audit_action_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_undo`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_action_undo_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7004,7 +6701,6 @@ impl StorageHandle {
     /// Returns `true` when the row was updated and `false` when the target
     /// action was already undone, non-undoable, or missing undo metadata.
     pub async fn mark_action_undone(&self, audit_action_id: i64, undone_by: &str) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -7012,25 +6708,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::MarkActionUndone {
-                    audit_action_id,
-                    undone_at: now_ms(),
-                    undone_by: undone_by.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_action_undone`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_action_undone_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7059,7 +6739,6 @@ impl StorageHandle {
 
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -7067,23 +6746,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::PurgeAuditActions {
-                    before_ts,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_audit_actions_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn purge_audit_actions_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7109,39 +6774,15 @@ impl StorageHandle {
 
     /// Record a maintenance event
     pub async fn record_maintenance(&self, record: MaintenanceRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_maintenance_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordMaintenance {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn purge_audit_actions_before_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        before_ts: i64,
-    ) -> Result<usize> {
-        self.purge_audit_actions_before(before_ts).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_maintenance`].
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_maintenance_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7166,29 +6807,14 @@ impl StorageHandle {
 
     /// Record a secret scan report (checkpoint + payload).
     pub async fn record_secret_scan_report(&self, record: SecretScanReportRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_secret_scan_report_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordSecretScanReport {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_secret_scan_report`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_secret_scan_report_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7214,30 +6840,15 @@ impl StorageHandle {
 
     /// Insert a saved search definition.
     pub async fn insert_saved_search(&self, record: SavedSearchRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.insert_saved_search_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertSavedSearch {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_saved_search`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_saved_search_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7268,7 +6879,6 @@ impl StorageHandle {
         last_result_count: Option<i64>,
         last_error: Option<String>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -7282,27 +6892,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpdateSavedSearchRun {
-                    id: id.to_string(),
-                    last_run_at,
-                    last_result_count,
-                    last_error,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_run`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_saved_search_run_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7338,7 +6931,6 @@ impl StorageHandle {
         enabled: bool,
         schedule_interval_ms: Option<i64>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -7346,26 +6938,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpdateSavedSearchSchedule {
-                    id: id.to_string(),
-                    enabled,
-                    schedule_interval_ms,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_saved_search_schedule`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_saved_search_schedule_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7394,30 +6970,15 @@ impl StorageHandle {
 
     /// Delete a saved search by name. Returns number of rows deleted.
     pub async fn delete_saved_search(&self, name: &str) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.delete_saved_search_with_cx(&cx, name).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeleteSavedSearch {
-                    name: name.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_saved_search`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_saved_search_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7442,28 +7003,14 @@ impl StorageHandle {
 
     /// Fetch a saved search by name.
     pub async fn get_saved_search_by_name(&self, name: &str) -> Result<Option<SavedSearchRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_saved_search_by_name_with_cx(&cx, name).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let name = name.to_string();
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_saved_search_by_name(&conn, &name)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_saved_search_by_name`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_saved_search_by_name_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7485,27 +7032,14 @@ impl StorageHandle {
 
     /// List saved searches in deterministic order.
     pub async fn list_saved_searches(&self) -> Result<Vec<SavedSearchRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.list_saved_searches_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                list_saved_searches_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_saved_searches`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_saved_searches_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7525,30 +7059,15 @@ impl StorageHandle {
 
     /// Insert a pane bookmark. Returns the row ID.
     pub async fn insert_pane_bookmark(&self, record: PaneBookmarkRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.insert_pane_bookmark_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertPaneBookmark {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_pane_bookmark`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_pane_bookmark_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7573,30 +7092,15 @@ impl StorageHandle {
 
     /// Delete a pane bookmark by alias. Returns true if a row was deleted.
     pub async fn delete_pane_bookmark(&self, alias: &str) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.delete_pane_bookmark_with_cx(&cx, alias).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeletePaneBookmark {
-                    alias: alias.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_pane_bookmark`].
     /// Tick 170: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_pane_bookmark_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7624,28 +7128,14 @@ impl StorageHandle {
         &self,
         alias: &str,
     ) -> Result<Option<PaneBookmarkRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_pane_bookmark_by_alias_with_cx(&cx, alias).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let alias = alias.to_string();
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_pane_bookmark_by_alias(&conn, &alias)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_bookmark_by_alias`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_bookmark_by_alias_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7667,27 +7157,14 @@ impl StorageHandle {
 
     /// List all pane bookmarks in alias order.
     pub async fn list_pane_bookmarks(&self) -> Result<Vec<PaneBookmarkRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.list_pane_bookmarks_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                list_pane_bookmarks_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_pane_bookmarks_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7707,28 +7184,14 @@ impl StorageHandle {
 
     /// List pane bookmarks filtered by tag.
     pub async fn list_pane_bookmarks_by_tag(&self, tag: &str) -> Result<Vec<PaneBookmarkRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.list_pane_bookmarks_by_tag_with_cx(&cx, tag).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let tag = tag.to_string();
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                list_pane_bookmarks_by_tag_sync(&conn, &tag)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_pane_bookmarks_by_tag`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_pane_bookmarks_by_tag_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7749,7 +7212,6 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_segments_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn prune_segments_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7775,25 +7237,11 @@ impl StorageHandle {
 
     /// Prune output segments older than a cutoff timestamp
     pub async fn prune_segments_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.prune_segments_before_with_cx(&cx, before_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::PruneSegments {
-                    before_ts,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// Run retention cleanup and log the maintenance event
@@ -7819,7 +7267,6 @@ impl StorageHandle {
     ///
     /// Routes both the prune and the maintenance-log write through their
     /// cx-first siblings so the full composite honours cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn retention_cleanup_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7846,30 +7293,15 @@ impl StorageHandle {
 
     /// Record a usage metric for analytics tracking.
     pub async fn record_usage_metric(&self, record: UsageMetricRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_usage_metric_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordUsageMetric {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metric`].
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_usage_metric_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7899,29 +7331,14 @@ impl StorageHandle {
         &self,
         records: Vec<UsageMetricRecord>,
     ) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_usage_metrics_batch_with_cx(&cx, records).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordUsageMetricsBatch {
-                    records,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_usage_metrics_batch`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_usage_metrics_batch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7947,29 +7364,14 @@ impl StorageHandle {
 
     /// Purge usage metrics older than a cutoff timestamp.
     pub async fn purge_usage_metrics(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.purge_usage_metrics_with_cx(&cx, before_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::PurgeUsageMetrics {
-                    before_ts,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_usage_metrics`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn purge_usage_metrics_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -7995,27 +7397,14 @@ impl StorageHandle {
 
     /// Query usage metrics with filters (read-only, uses read connection).
     pub async fn query_usage_metrics(&self, query: MetricQuery) -> Result<Vec<UsageMetricRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.query_usage_metrics_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_usage_metrics_sync(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`query_usage_metrics`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn query_usage_metrics_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8036,27 +7425,14 @@ impl StorageHandle {
 
     /// Get daily aggregated metric summaries since a given timestamp.
     pub async fn aggregate_daily_metrics(&self, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.aggregate_daily_metrics_with_cx(&cx, since_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                aggregate_daily_sync(&conn, since_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_daily_metrics`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn aggregate_daily_metrics_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8077,27 +7453,14 @@ impl StorageHandle {
 
     /// Get per-agent metric breakdown since a given timestamp.
     pub async fn aggregate_by_agent(&self, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.aggregate_by_agent_with_cx(&cx, since_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                aggregate_by_agent_sync(&conn, since_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`aggregate_by_agent`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn aggregate_by_agent_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8120,30 +7483,15 @@ impl StorageHandle {
 
     /// Record a notification in the persistent history log.
     pub async fn record_notification(&self, record: NotificationHistoryRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_notification_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::RecordNotification {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_notification`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_notification_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8166,15 +7514,6 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn record_usage_metrics_batch_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        records: Vec<UsageMetricRecord>,
-    ) -> Result<usize> {
-        self.record_usage_metrics_batch(records).await
-    }
-
     /// Update the delivery status of a notification.
     pub async fn update_notification_status(
         &self,
@@ -8182,7 +7521,6 @@ impl StorageHandle {
         status: NotificationStatus,
         error_message: Option<String>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8190,26 +7528,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpdateNotificationStatus {
-                    id,
-                    status,
-                    error_message,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_notification_status`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_notification_status_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8243,7 +7565,6 @@ impl StorageHandle {
         acknowledged_by: String,
         action_taken: Option<String>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8251,26 +7572,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::AcknowledgeNotification {
-                    id,
-                    acknowledged_by,
-                    action_taken,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`acknowledge_notification`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn acknowledge_notification_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8299,27 +7604,15 @@ impl StorageHandle {
 
     /// Increment the retry count for a notification and reset its status to pending.
     pub async fn increment_notification_retry(&self, id: i64) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.increment_notification_retry_with_cx(&cx, id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::IncrementNotificationRetry { id, respond: tx })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`increment_notification_retry`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn increment_notification_retry_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8341,7 +7634,6 @@ impl StorageHandle {
 
     /// Purge notification history older than the given timestamp.
     pub async fn purge_notification_history(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8349,23 +7641,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::PurgeNotificationHistory {
-                    before_ts,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`purge_notification_history`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn purge_notification_history_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8395,27 +7673,14 @@ impl StorageHandle {
 
     /// Count output_segments older than a cutoff (read-path).
     pub async fn count_segments_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.count_segments_before_with_cx(&cx, before_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_segments_before_sync(&conn, before_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_segments_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_segments_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8436,27 +7701,14 @@ impl StorageHandle {
 
     /// Count events older than a cutoff (flat, no tier filters; read-path).
     pub async fn count_events_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.count_events_before_with_cx(&cx, before_ts).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_events_before_sync(&conn, before_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_events_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8483,7 +7735,6 @@ impl StorageHandle {
         event_types: &[String],
         handled: Option<bool>,
     ) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8491,23 +7742,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let severities = severities.to_vec();
-            let event_types = event_types.to_vec();
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_events_by_tier`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_events_by_tier_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8533,7 +7770,6 @@ impl StorageHandle {
 
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8541,21 +7777,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_audit_actions_before_sync(&conn, before_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_audit_actions_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_audit_actions_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8576,7 +7800,6 @@ impl StorageHandle {
 
     /// Count usage_metrics older than a cutoff (read-path).
     pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8584,21 +7807,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_usage_metrics_before_sync(&conn, before_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_usage_metrics_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_usage_metrics_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8619,7 +7830,6 @@ impl StorageHandle {
 
     /// Count notification_history older than a cutoff (read-path).
     pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8627,21 +7837,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                count_notification_history_before_sync(&conn, before_ts)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_notification_history_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_notification_history_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8664,7 +7862,6 @@ impl StorageHandle {
 
     /// Delete events older than a cutoff (flat, no tier; write-path).
     pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8672,24 +7869,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeleteEventsBefore {
-                    before_ts,
-                    batch_size,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_before`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_events_before_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8724,7 +7906,6 @@ impl StorageHandle {
         handled: Option<bool>,
         batch_size: usize,
     ) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -8739,27 +7920,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeleteEventsByTier {
-                    before_ts,
-                    severities: severities.to_vec(),
-                    event_types: event_types.to_vec(),
-                    handled,
-                    batch_size,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_by_tier`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_events_by_tier_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8796,27 +7959,14 @@ impl StorageHandle {
         &self,
         query: NotificationHistoryQuery,
     ) -> Result<Vec<NotificationHistoryRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.query_notification_history_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_notification_history_sync(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`query_notification_history`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn query_notification_history_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8837,27 +7987,14 @@ impl StorageHandle {
 
     /// Get a single notification by ID.
     pub async fn get_notification(&self, id: i64) -> Result<NotificationHistoryRecord> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_notification_with_cx(&cx, id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                get_notification_sync(&conn, id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_notification`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_notification_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8901,7 +8038,6 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`vacuum`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn vacuum_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("vacuum cancelled: {err}")))?;
@@ -8929,7 +8065,6 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`checkpoint`].
     /// Tick 171: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn checkpoint_with_cx(&self, cx: &crate::cx::Cx) -> Result<CheckpointResult> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("checkpoint cancelled: {err}")))?;
@@ -8943,27 +8078,14 @@ impl StorageHandle {
 
     /// Read SQLite page statistics used to decide whether VACUUM is worthwhile.
     pub async fn database_page_stats(&self) -> Result<DatabasePageStats> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.database_page_stats_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                database_page_stats_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`database_page_stats`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn database_page_stats_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -8983,27 +8105,14 @@ impl StorageHandle {
 
     /// Get per-pane indexing statistics (read-only, uses read connection).
     pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_pane_indexing_stats_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                get_pane_indexing_stats_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane_indexing_stats`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_indexing_stats_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9023,29 +8132,14 @@ impl StorageHandle {
 
     /// Get a full indexing health report (per-pane stats + FTS integrity).
     pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_indexing_health_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                let stats = get_pane_indexing_stats_sync(&conn)?;
-                let fts_ok = check_fts_integrity_sync(&conn)?;
-                Ok(build_indexing_health_report(stats, fts_ok))
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_indexing_health`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_indexing_health_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9074,27 +8168,14 @@ impl StorageHandle {
     ///
     /// Returns a result describing what was synced.
     pub async fn sync_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.sync_fts_with_cx(&cx, config).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                sync_fts_on_startup(&conn, &config)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`sync_fts`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn sync_fts_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9117,27 +8198,14 @@ impl StorageHandle {
     /// This drops the FTS index and reindexes all segments with batched progress.
     /// Use this for recovery or when a clean rebuild is needed.
     pub async fn rebuild_fts(&self, config: FtsSyncConfig) -> Result<FtsSyncResult> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.rebuild_fts_with_cx(&cx, config).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                full_fts_rebuild_sync(&conn, &config)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`rebuild_fts`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn rebuild_fts_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9157,27 +8225,14 @@ impl StorageHandle {
 
     /// Get the current FTS index state (version, last rebuild time).
     pub async fn get_fts_index_state(&self) -> Result<Option<FtsIndexState>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_fts_index_state_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                get_fts_index_state_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_fts_index_state`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_fts_index_state_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9197,27 +8252,15 @@ impl StorageHandle {
 
     /// Insert an approval token
     pub async fn insert_approval_token(&self, token: ApprovalTokenRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.insert_approval_token_with_cx(&cx, token).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertApprovalToken { token, respond: tx })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_approval_token`].
     /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_approval_token_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9244,7 +8287,6 @@ impl StorageHandle {
         pane_id: Option<u64>,
         action_fingerprint: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9259,28 +8301,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::ConsumeApprovalToken {
-                    code_hash: code_hash.to_string(),
-                    workspace_id: workspace_id.to_string(),
-                    action_kind: action_kind.to_string(),
-                    pane_id,
-                    action_fingerprint: action_fingerprint.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_approval_token_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9317,7 +8341,6 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9325,25 +8348,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::GetApprovalTokenByCode {
-                    code_hash: code_hash.to_string(),
-                    workspace_id: workspace_id.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token_by_code`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_approval_token_by_code_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9379,7 +8387,6 @@ impl StorageHandle {
         code_hash: &str,
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9387,25 +8394,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::ConsumeApprovalTokenByCode {
-                    code_hash: code_hash.to_string(),
-                    workspace_id: workspace_id.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token_by_code`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_approval_token_by_code_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9432,22 +8424,11 @@ impl StorageHandle {
 
     /// Upsert a pane record
     pub async fn upsert_pane(&self, pane: PaneRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_pane_with_cx(&cx, pane).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertPane { pane, respond: tx })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_pane`].
@@ -9463,7 +8444,6 @@ impl StorageHandle {
     /// `send_with_cx` — closes the orphan-cx hole in the hottest
     /// storage write in the tree. A backpressured writer queue
     /// under a cancelled observation loop now releases immediately.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_pane_with_cx(&self, cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("upsert_pane cancelled: {err}")))?;
@@ -9475,32 +8455,13 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn upsert_pane_with_cx(&self, _cx: &crate::cx::Cx, pane: PaneRecord) -> Result<()> {
-        self.upsert_pane(pane).await
-    }
-
     /// Upsert a workflow execution record
     pub async fn upsert_workflow(&self, workflow: WorkflowRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_workflow_with_cx(&cx, workflow).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertWorkflow {
-                    workflow,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_workflow`].
@@ -9510,7 +8471,6 @@ impl StorageHandle {
     /// after upsert_pane.
     ///
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_workflow_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9538,7 +8498,6 @@ impl StorageHandle {
         workflow_id: &str,
         plan: &crate::plan::ActionPlan,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9546,25 +8505,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let record = action_plan_record_from_plan(workflow_id, plan)?;
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertActionPlan {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_action_plan`].
     /// Tick 175: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_action_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9591,30 +8535,15 @@ impl StorageHandle {
 
     /// Insert a prepared plan preview for later commit
     pub async fn insert_prepared_plan(&self, record: PreparedPlanRecord) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.insert_prepared_plan_with_cx(&cx, record).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertPreparedPlan {
-                    record,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_prepared_plan`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_prepared_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9643,7 +8572,6 @@ impl StorageHandle {
         plan_id: &str,
         now_ms: i64,
     ) -> Result<Option<PreparedPlanRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9651,25 +8579,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::ConsumePreparedPlan {
-                    plan_id: plan_id.to_string(),
-                    now_ms,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_prepared_plan`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn consume_prepared_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9712,7 +8625,6 @@ impl StorageHandle {
         started_at: i64,
         completed_at: i64,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9735,36 +8647,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertStepLog {
-                    workflow_id: workflow_id.to_string(),
-                    audit_action_id,
-                    step_index,
-                    step_name: step_name.to_string(),
-                    step_id,
-                    step_kind,
-                    result_type: result_type.to_string(),
-                    result_data,
-                    policy_summary,
-                    verification_refs,
-                    error_code,
-                    started_at,
-                    completed_at,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_step_log`].
     /// Tick 174: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_step_log_with_cx(
         &self,
@@ -9827,7 +8713,6 @@ impl StorageHandle {
         ft_version: String,
         host_id: Option<String>,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9835,26 +8720,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertMuxSession {
-                    session_id,
-                    topology_json,
-                    ft_version,
-                    host_id,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_mux_session`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn insert_mux_session_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -9895,7 +8764,6 @@ impl StorageHandle {
         metadata_json: Option<String>,
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -9912,29 +8780,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::InsertSessionCheckpoint {
-                    session_id,
-                    checkpoint_type,
-                    state_hash,
-                    pane_count,
-                    total_bytes,
-                    metadata_json,
-                    pane_states,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_session_checkpoint_with_cx(
         &self,
@@ -9991,7 +8840,6 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`prune_session_checkpoints`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn prune_session_checkpoints_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10018,7 +8866,6 @@ impl StorageHandle {
 
     /// Mark a session as cleanly shut down.
     pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10026,23 +8873,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::MarkSessionShutdownClean {
-                    session_id,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_session_shutdown_clean`].
     /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_session_shutdown_clean_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10067,7 +8901,6 @@ impl StorageHandle {
 
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10075,21 +8908,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                get_latest_checkpoint_hash(&conn, &session_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_checkpoint_hash`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_latest_checkpoint_hash_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10109,29 +8930,14 @@ impl StorageHandle {
     }
 
     pub async fn upsert_agent_session(&self, session: AgentSessionRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_agent_session_with_cx(&cx, session).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertSession {
-                    session,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_agent_session`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_agent_session_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10157,29 +8963,14 @@ impl StorageHandle {
 
     /// Get an agent session by ID
     pub async fn get_agent_session(&self, session_id: i64) -> Result<Option<AgentSessionRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_agent_session_with_cx(&cx, session_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_agent_session(&conn, session_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_agent_session`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_agent_session_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10201,29 +8992,14 @@ impl StorageHandle {
 
     /// Get active agent sessions (those without an ended_at timestamp)
     pub async fn get_active_sessions(&self) -> Result<Vec<AgentSessionRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_active_sessions_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_active_sessions(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_sessions`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_active_sessions_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10245,29 +9021,14 @@ impl StorageHandle {
 
     /// Get agent sessions for a specific pane
     pub async fn get_sessions_for_pane(&self, pane_id: u64) -> Result<Vec<AgentSessionRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_sessions_for_pane_with_cx(&cx, pane_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage(move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_sessions_for_pane(&conn, pane_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_sessions_for_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_sessions_for_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10302,7 +9063,6 @@ impl StorageHandle {
     ///
     /// Routes through `search_with_results_with_cx` so the inner call
     /// honours cancellation as well.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_with_cx(&self, cx: &crate::cx::Cx, query: &str) -> Result<Vec<Segment>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("search cancelled: {err}")))?;
@@ -10326,7 +9086,6 @@ impl StorageHandle {
     ///
     /// Routes through `search_with_results_with_cx` so the inner call
     /// honours cancellation as well.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_with_options_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10362,30 +9121,14 @@ impl StorageHandle {
         query: &str,
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.search_with_results_with_cx(&cx, query, options).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let query = query.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                search_fts_with_snippets(&conn, &query, &options)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`search_with_results`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_with_results_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10420,7 +9163,6 @@ impl StorageHandle {
         dimension: i32,
         vector: &[u8],
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10428,35 +9170,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let embedder_id = embedder_id.to_string();
-            let vector = vector.to_vec();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
-
-            conn.execute(
-                "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
-                 VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
-                rusqlite::params![segment_id, embedder_id, dimension, vector],
-            )
-            .map_err(|e| StorageError::Database(format!("store_embedding: {e}")))?;
-
-            Ok(())
-        })
-        .await?;
-
-            self.invalidate_semantic_cache();
-            Ok(())
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`store_embedding`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn store_embedding_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10497,7 +9213,6 @@ impl StorageHandle {
         embedder_id: &str,
         limit: usize,
     ) -> Result<Vec<i64>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10505,42 +9220,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let embedder_id = embedder_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open connection: {e}"))
-                })?;
-
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT s.id FROM output_segments s
-                     LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
-                     WHERE se.segment_id IS NULL
-                     ORDER BY s.id ASC
-                     LIMIT ?2",
-                    )
-                    .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
-
-                let ids: Vec<i64> = stmt
-                    .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
-                        row.get(0)
-                    })
-                    .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                Ok(ids)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_unembedded_segments`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_unembedded_segments_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10586,7 +9268,6 @@ impl StorageHandle {
         segment_id: i64,
         embedder_id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10594,33 +9275,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let embedder_id = embedder_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
-
-            let result: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
-                    rusqlite::params![segment_id, embedder_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| StorageError::Database(format!("get_embedding: {e}")))?;
-
-            Ok(result)
-        })
-        .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_embedding`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_embedding_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10653,52 +9310,14 @@ impl StorageHandle {
 
     /// Get embedding statistics per embedder.
     pub async fn embedding_stats(&self) -> Result<Vec<EmbeddingStats>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.embedding_stats_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open connection: {e}"))
-                })?;
-
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT embedder_id, dimension, COUNT(*) as count,
-                            MIN(embedded_at) as earliest, MAX(embedded_at) as latest
-                     FROM segment_embeddings
-                     GROUP BY embedder_id, dimension",
-                    )
-                    .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
-
-                let stats: Vec<EmbeddingStats> = stmt
-                    .query_map([], |row| {
-                        Ok(EmbeddingStats {
-                            embedder_id: row.get(0)?,
-                            dimension: row.get(1)?,
-                            count: row.get(2)?,
-                            earliest_at: row.get(3)?,
-                            latest_at: row.get(4)?,
-                        })
-                    })
-                    .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                Ok(stats)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`embedding_stats`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn embedding_stats_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<EmbeddingStats>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
@@ -10760,7 +9379,6 @@ impl StorageHandle {
     ///
     /// Composite: packs f32 → bytes, then routes through
     /// `store_embedding_with_cx` so the inner write honours cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn store_embedding_f32_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10793,7 +9411,6 @@ impl StorageHandle {
         query_vector: &[f32],
         options: SearchOptions,
     ) -> Result<Vec<SemanticSearchHit>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10801,24 +9418,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let embedder_id = embedder_id.to_string();
-            let query_vector = query_vector.to_vec();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`semantic_search`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn semantic_search_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10857,7 +9459,6 @@ impl StorageHandle {
         semantic_weight: f32,
         fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -10876,38 +9477,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let semantic_budget_state = Arc::clone(&self.semantic_budget_state);
-            let query = query.to_string();
-            let embedder_id = embedder_id.to_string();
-            let query_vector = query_vector.to_vec();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                hybrid_search_with_results_sync(
-                    &conn,
-                    &query,
-                    &options,
-                    &embedder_id,
-                    &query_vector,
-                    mode,
-                    rrf_k,
-                    lexical_weight,
-                    semantic_weight,
-                    fusion_backend,
-                    &semantic_budget_state,
-                )
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`hybrid_search_with_results`].
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search_with_results_with_cx(
         &self,
@@ -10954,29 +9526,14 @@ impl StorageHandle {
 
     /// Get unhandled events
     pub async fn get_unhandled_events(&self, limit: usize) -> Result<Vec<StoredEvent>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_unhandled_events_with_cx(&cx, limit).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_unhandled_events(&conn, limit)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_unhandled_events`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_unhandled_events_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -10999,29 +9556,14 @@ impl StorageHandle {
 
     /// Query events with filters
     pub async fn get_events(&self, query: EventQuery) -> Result<Vec<StoredEvent>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_events_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_events(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_events`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_events_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11046,29 +9588,14 @@ impl StorageHandle {
     /// Results are ordered by ascending event ID so callers can checkpoint using
     /// the last seen `id` and resume with `after_id`.
     pub async fn get_events_stream(&self, query: EventStreamQuery) -> Result<Vec<StoredEvent>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_events_stream_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_events_stream(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_events_stream`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_events_stream_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11093,29 +9620,14 @@ impl StorageHandle {
     /// Returns events enriched with pane info and correlations,
     /// sorted chronologically with pagination support.
     pub async fn get_timeline(&self, query: TimelineQuery) -> Result<Timeline> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_timeline_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_timeline(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_timeline`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_timeline_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11141,29 +9653,14 @@ impl StorageHandle {
     pub async fn count_unhandled_events_by_pane(
         &self,
     ) -> Result<std::collections::HashMap<u64, u32>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.count_unhandled_events_by_pane_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_unhandled_event_counts(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_unhandled_events_by_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_unhandled_events_by_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11187,29 +9684,14 @@ impl StorageHandle {
     ///
     /// Returns a map from pane_id to the most recent segment captured_at timestamp.
     pub async fn get_last_activity_by_pane(&self) -> Result<std::collections::HashMap<u64, i64>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_last_activity_by_pane_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_last_activity_by_pane(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_last_activity_by_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_last_activity_by_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11231,25 +9713,11 @@ impl StorageHandle {
 
     /// Query audit actions with filters
     pub async fn get_audit_actions(&self, query: AuditQuery) -> Result<Vec<AuditActionRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_audit_actions_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                crate::storage::query_audit_actions(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions`].
@@ -11257,7 +9725,6 @@ impl StorageHandle {
     /// Pre-flight checkpoint gates the audit query before
     /// spawn_blocking. 14+ call sites on the operator-facing
     /// audit-history read path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_audit_actions_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11284,29 +9751,14 @@ impl StorageHandle {
         &self,
         query: AuditStreamQuery,
     ) -> Result<AuditStreamPage> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_audit_actions_stream_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                crate::storage::query_audit_actions_stream(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_audit_actions_stream`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_audit_actions_stream_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11332,29 +9784,14 @@ impl StorageHandle {
         &self,
         query: ActionHistoryQuery,
     ) -> Result<Vec<ActionHistoryRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_action_history_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                crate::storage::query_action_history(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_history`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_action_history_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11377,7 +9814,6 @@ impl StorageHandle {
 
     /// Count active (unused + unexpired) approval tokens for a workspace
     pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -11385,24 +9821,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let workspace_id = workspace_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_active_approvals_count(&conn, &workspace_id, now_ms)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`count_active_approvals`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn count_active_approvals_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11430,30 +9851,14 @@ impl StorageHandle {
     /// Returns the token record if found, regardless of whether it's expired or consumed.
     /// Use this for validation and dry-run checks.
     pub async fn get_approval_token(&self, code_hash: &str) -> Result<Option<ApprovalTokenRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_approval_token_with_cx(&cx, code_hash).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let code_hash = code_hash.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_approval_token_by_hash(&conn, &code_hash)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_approval_token_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11477,29 +9882,14 @@ impl StorageHandle {
 
     /// Get the maximum sequence number for a pane (to resume capture).
     pub async fn get_max_seq(&self, pane_id: u64) -> Result<Option<u64>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_max_seq_with_cx(&cx, pane_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_max_seq(&conn, pane_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_max_seq`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_max_seq_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11519,40 +9909,16 @@ impl StorageHandle {
         .await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn get_max_seq_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-    ) -> Result<Option<u64>> {
-        self.get_max_seq(pane_id).await
-    }
-
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_panes_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_panes(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_panes`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneRecord>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_panes cancelled: {err}")))?;
@@ -11570,29 +9936,14 @@ impl StorageHandle {
 
     /// Get a specific pane
     pub async fn get_pane(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_pane_with_cx(&cx, pane_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_pane(&conn, pane_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_pane`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11612,15 +9963,6 @@ impl StorageHandle {
         .await
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn get_pane_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-    ) -> Result<Option<PaneRecord>> {
-        self.get_pane(pane_id).await
-    }
-
     /// Get a specific pane using a synchronous read path.
     ///
     /// This is intended for prepare-phase policy evaluation, where the caller
@@ -11633,49 +9975,14 @@ impl StorageHandle {
 
     /// Get recent segments for a pane
     pub async fn get_segments(&self, pane_id: u64, limit: usize) -> Result<Vec<Segment>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_segments_with_cx(&cx, pane_id, limit).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let mmap_mirror_dir = self
-                .mmap_mirror_dir
-                .as_ref()
-                .map(|dir| dir.as_ref().clone());
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
-                    match query_segments_from_mmap(mmap_dir, pane_id, limit) {
-                        Ok(Some(segments)) => return Ok(segments),
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                pane_id,
-                                limit,
-                                path = %mmap_dir.display(),
-                                error = %error,
-                                "mmap segment read failed; falling back to sqlite"
-                            );
-                        }
-                    }
-                }
-
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_segments(&conn, pane_id, limit)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_segments`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_segments_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11718,29 +10025,14 @@ impl StorageHandle {
 
     /// Scan segments in ascending id order with incremental paging.
     pub async fn scan_segments(&self, query: SegmentScanQuery) -> Result<Vec<Segment>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.scan_segments_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_scan_segments(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`scan_segments`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn scan_segments_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11765,7 +10057,6 @@ impl StorageHandle {
         &self,
         scope_hash: &str,
     ) -> Result<Option<SecretScanReportRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -11773,24 +10064,9 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let scope_hash = scope_hash.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_latest_secret_scan_report(&conn, &scope_hash)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`latest_secret_scan_report`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn latest_secret_scan_report_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11814,30 +10090,14 @@ impl StorageHandle {
 
     /// Get workflow by ID
     pub async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_workflow_with_cx(&cx, workflow_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let workflow_id = workflow_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_workflow(&conn, &workflow_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_workflow`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_workflow_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11862,26 +10122,11 @@ impl StorageHandle {
     ///
     /// Returns all step logs for the given workflow, ordered by step index.
     pub async fn get_step_logs(&self, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_step_logs_with_cx(&cx, workflow_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let workflow_id = workflow_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_step_logs(&conn, &workflow_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_step_logs`].
@@ -11890,7 +10135,6 @@ impl StorageHandle {
     /// spawn_blocking. 16+ call sites on the workflow
     /// observability read path (diagnostic bundles, CLI step
     /// history, etc.).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_step_logs_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11916,30 +10160,14 @@ impl StorageHandle {
         &self,
         workflow_id: &str,
     ) -> Result<Option<WorkflowStepLogRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_latest_step_log_with_cx(&cx, workflow_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let workflow_id = workflow_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_latest_step_log(&conn, &workflow_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_latest_step_log`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_latest_step_log_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -11966,30 +10194,14 @@ impl StorageHandle {
         &self,
         workflow_id: &str,
     ) -> Result<Option<WorkflowActionPlanRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_action_plan_with_cx(&cx, workflow_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let workflow_id = workflow_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_action_plan(&conn, &workflow_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_action_plan`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_action_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12012,30 +10224,14 @@ impl StorageHandle {
 
     /// Get a prepared plan preview by plan_id
     pub async fn get_prepared_plan(&self, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_prepared_plan_with_cx(&cx, plan_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            let plan_id = plan_id.to_string();
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_prepared_plan(&conn, &plan_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_prepared_plan`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_prepared_plan_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12061,29 +10257,14 @@ impl StorageHandle {
     /// Returns all workflows with status 'running' or 'waiting', ordered by started_at.
     /// These are workflows that were interrupted and should be resumed.
     pub async fn find_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.find_incomplete_workflows_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-
-                query_incomplete_workflows(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`find_incomplete_workflows`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn find_incomplete_workflows_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12119,7 +10300,6 @@ impl StorageHandle {
     /// surfaces before the channel state is inspected. Note the underlying
     /// check is infallible, so we return `Ok(bool)` and fold cancellation
     /// into the error path.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn is_writable_with_cx(&self, cx: &crate::cx::Cx) -> Result<bool> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("is_writable cancelled: {err}")))?;
@@ -12134,30 +10314,15 @@ impl StorageHandle {
     ///
     /// Returns the row ID of the upserted account.
     pub async fn upsert_account(&self, account: crate::accounts::AccountRecord) -> Result<i64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.upsert_account_with_cx(&cx, account).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpsertAccount {
-                    account,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`upsert_account`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn upsert_account_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12188,7 +10353,6 @@ impl StorageHandle {
         account_id: &str,
         last_used_at: i64,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -12196,26 +10360,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::UpdateAccountLastUsed {
-                    service: service.to_string(),
-                    account_id: account_id.to_string(),
-                    last_used_at,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`update_account_last_used`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_account_last_used_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12246,31 +10394,15 @@ impl StorageHandle {
     ///
     /// Returns true if an account was deleted, false if not found.
     pub async fn delete_account(&self, service: &str, account_id: &str) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.delete_account_with_cx(&cx, service, account_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::DeleteAccount {
-                    service: service.to_string(),
-                    account_id: account_id.to_string(),
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_account`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn delete_account_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12301,29 +10433,14 @@ impl StorageHandle {
         &self,
         service: &str,
     ) -> Result<Vec<crate::accounts::AccountRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_accounts_by_service_with_cx(&cx, service).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let db_path = self.db_path.clone();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let service = service.to_string();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str())
-                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-                get_accounts_by_service_sync(&conn, &service)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_accounts_by_service`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_accounts_by_service_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12348,31 +10465,14 @@ impl StorageHandle {
         service: &str,
         account_id: &str,
     ) -> Result<Option<crate::accounts::AccountRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_account_with_cx(&cx, service, account_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let db_path = self.db_path.clone();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let service = service.to_string();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let account_id = account_id.to_string();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str())
-                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-                get_account_sync(&conn, &service, &account_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_account`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_account_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12401,24 +10501,17 @@ impl StorageHandle {
         service: &str,
         config: &crate::accounts::AccountSelectionConfig,
     ) -> Result<crate::accounts::AccountSelectionResult> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.select_account_with_cx(&cx, service, config).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let accounts = self.get_accounts_by_service(service).await?;
-            Ok(crate::accounts::select_account(&accounts, config))
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`select_account`].
     ///
     /// Composite that routes through `get_accounts_by_service_with_cx` so
     /// the full selection flow honours cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn select_account_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12447,7 +10540,6 @@ impl StorageHandle {
         reason: Option<&str>,
         ttl_ms: i64,
     ) -> Result<PaneReservation> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
@@ -12455,28 +10547,10 @@ impl StorageHandle {
                 .await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::CreateReservation {
-                    pane_id,
-                    owner_kind: owner_kind.to_string(),
-                    owner_id: owner_id.to_string(),
-                    reason: reason.map(String::from),
-                    ttl_ms,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`create_reservation`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn create_reservation_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12511,30 +10585,15 @@ impl StorageHandle {
     ///
     /// Returns true if released, false if not found or already released.
     pub async fn release_reservation(&self, reservation_id: i64) -> Result<bool> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.release_reservation_with_cx(&cx, reservation_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::ReleaseReservation {
-                    reservation_id,
-                    respond: tx,
-                })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`release_reservation`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn release_reservation_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12559,26 +10618,14 @@ impl StorageHandle {
 
     /// Get the active reservation for a pane (read-only).
     pub async fn get_active_reservation(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_active_reservation_with_cx(&cx, pane_id).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = self.db_path.clone();
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str())
-                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-                get_active_reservation_sync(&conn, pane_id)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_active_reservation`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_active_reservation_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12605,26 +10652,14 @@ impl StorageHandle {
 
     /// List all active (unexpired) pane reservations (read-only).
     pub async fn list_active_reservations(&self) -> Result<Vec<PaneReservation>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.list_active_reservations_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = self.db_path.clone();
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str())
-                    .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
-                list_active_reservations_sync(&conn)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`list_active_reservations`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_active_reservations_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12669,27 +10704,14 @@ impl StorageHandle {
 
     /// Export segments with optional pane/time/limit filters
     pub async fn export_segments(&self, query: ExportQuery) -> Result<Vec<Segment>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.export_segments_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_export_segments(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_segments`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn export_segments_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12709,27 +10731,14 @@ impl StorageHandle {
 
     /// Export output gaps with optional pane/time/limit filters
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.export_gaps_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_export_gaps(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_gaps`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn export_gaps_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12749,49 +10758,14 @@ impl StorageHandle {
 
     /// Get all output gaps (for search explain diagnostics)
     pub async fn get_gaps(&self) -> Result<Vec<Gap>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_gaps_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error(
-                "Task join error",
-                move || -> Result<Vec<Gap>> {
-                    let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                        StorageError::Database(format!("Failed to open read connection: {e}"))
-                    })?;
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
-                         FROM output_gaps ORDER BY detected_at DESC",
-                        )
-                        .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok(Gap {
-                                id: row.get(0)?,
-                                pane_id: row.get::<_, i64>(1)? as u64,
-                                seq_before: row.get::<_, i64>(2)? as u64,
-                                seq_after: row.get::<_, i64>(3)? as u64,
-                                reason: row.get(4)?,
-                                detected_at: row.get(5)?,
-                            })
-                        })
-                        .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
-                    rows.collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
-                },
-            )
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_gaps`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_gaps_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<Gap>> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
@@ -12829,34 +10803,14 @@ impl StorageHandle {
 
     /// Count retention cleanup events (for search explain diagnostics)
     pub async fn get_retention_cleanup_count(&self) -> Result<u64> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_retention_cleanup_count_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| StorageError::Database(format!("Count retention cleanups: {e}")))?;
-                Ok(count as u64)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_retention_cleanup_count`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_retention_cleanup_count_with_cx(&self, cx: &crate::cx::Cx) -> Result<u64> {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
@@ -12880,39 +10834,14 @@ impl StorageHandle {
 
     /// Get the min/max captured_at timestamps across all segments (for search explain diagnostics)
     pub async fn get_segment_time_range(&self) -> Result<(Option<i64>, Option<i64>)> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.get_segment_time_range_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error(
-                "Task join error",
-                move || -> Result<(Option<i64>, Option<i64>)> {
-                    let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                        StorageError::Database(format!("Failed to open read connection: {e}"))
-                    })?;
-                    let (earliest, latest): (Option<i64>, Option<i64>) = conn
-                        .query_row(
-                            "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
-                            [],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .map_err(|e| {
-                            StorageError::Database(format!("Query segment time range: {e}"))
-                        })?;
-                    Ok((earliest, latest))
-                },
-            )
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_segment_time_range`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_segment_time_range_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12944,27 +10873,14 @@ impl StorageHandle {
 
     /// Export workflow executions with optional pane/time/limit filters
     pub async fn export_workflows(&self, query: ExportQuery) -> Result<Vec<WorkflowRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.export_workflows_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_export_workflows(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_workflows`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn export_workflows_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -12984,27 +10900,14 @@ impl StorageHandle {
 
     /// Export agent sessions with optional pane/time/limit filters
     pub async fn export_sessions(&self, query: ExportQuery) -> Result<Vec<AgentSessionRecord>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.export_sessions_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_export_sessions(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_sessions`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn export_sessions_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -13024,27 +10927,14 @@ impl StorageHandle {
 
     /// Export pane reservations (active + historical) with optional pane/time/limit filters
     pub async fn export_reservations(&self, query: ExportQuery) -> Result<Vec<PaneReservation>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.export_reservations_with_cx(&cx, query).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let db_path = Arc::clone(&self.db_path);
-            Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
-                query_export_reservations(&conn, &query)
-            })
-            .await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`export_reservations`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn export_reservations_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -13067,27 +10957,15 @@ impl StorageHandle {
     ///
     /// Returns the number of reservations expired.
     pub async fn expire_stale_reservations(&self) -> Result<usize> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.expire_stale_reservations_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let (tx, rx) = oneshot::channel();
-            self.write_tx
-                .send(WriteCommand::ExpireStaleReservations { respond: tx })
-                .await
-                .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-
-            Self::recv_writer_response(rx).await
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`expire_stale_reservations`].
     /// Tick 173: inlined to route the mpsc send through `send_with_cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn expire_stale_reservations_with_cx(&self, cx: &crate::cx::Cx) -> Result<usize> {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("expire_stale_reservations cancelled: {err}"))
@@ -13152,7 +11030,6 @@ impl StorageHandle {
     /// immediately instead of holding it until backpressure
     /// drains, which matters if callers race shutdown against
     /// a saturating writer queue.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -14205,20 +12082,14 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
-    #[cfg(feature = "asupersync-runtime")]
     let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
         .build()
         .expect("failed to build writer runtime");
-    #[cfg(feature = "asupersync-runtime")]
     let recv_cx = crate::cx::for_request();
 
     loop {
-        #[cfg(feature = "asupersync-runtime")]
         let first_cmd =
             crate::runtime_compat::CompatRuntime::block_on(&runtime, rx.recv(&recv_cx)).ok();
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let first_cmd = rx.blocking_recv();
-
         let Some(first_cmd) = first_cmd else {
             break;
         };
@@ -24292,7 +22163,6 @@ where
 /// open the DB identically to `new` when given a fresh cx —
 /// producing a handle that supports the same upsert/shutdown
 /// lifecycle as the legacy path.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
     run_async_test(async {
@@ -24331,7 +22201,6 @@ fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
 /// return a `StorageError::Database` containing "cancelled"
 /// when given a pre-cancelled cx, without creating the DB file
 /// or spawning the writer thread.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
     run_async_test(async {
@@ -24368,7 +22237,6 @@ fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
 
 /// ft-xbnl0.2.3 Cx-first: `upsert_pane_with_cx` with a fresh
 /// cx must insert the pane identically to the legacy path.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_upsert_pane_with_cx_succeeds_on_fresh_cx() {
     run_async_test(async {
@@ -24412,7 +22280,6 @@ fn storage_upsert_pane_with_cx_succeeds_on_fresh_cx() {
 /// ft-xbnl0.2.3 Cx-first: `upsert_pane_with_cx` with a
 /// pre-cancelled cx must return error WITHOUT enqueuing the
 /// write (observable via the pane not being queryable).
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
     run_async_test(async {
@@ -24478,7 +22345,6 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
 /// `set_event_note_with_cx`, `add_event_label_with_cx`,
 /// `remove_event_label_with_cx`, `add_event_mute_with_cx`,
 /// `get_event_identity_key_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick136_event_annotation_cluster_roundtrip() {
     run_async_test(async {
@@ -24619,7 +22485,6 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
 /// `get_unembedded_segments_with_cx`, `get_embedding_with_cx`,
 /// `embedding_stats_with_cx`, `store_embedding_f32_with_cx`,
 /// `semantic_search_with_cx`, `hybrid_search_with_results_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick149_search_semantic_cluster_roundtrip() {
     run_async_test(async {
@@ -24756,7 +22621,6 @@ fn storage_tick149_search_semantic_cluster_roundtrip() {
 /// `upsert_action_undo_with_cx` and
 /// `upsert_action_undo_redacted_with_cx` (composite that applies
 /// redaction then routes through `upsert_action_undo_with_cx`).
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick148_action_undo_cluster_roundtrip() {
     run_async_test(async {
@@ -24878,7 +22742,6 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
 /// `get_audit_actions_stream_with_cx`, `get_approval_token_with_cx`,
 /// `get_segments_with_cx`, `get_action_plan_with_cx`,
 /// `get_prepared_plan_with_cx`, `is_writable_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
     run_async_test(async {
@@ -25006,7 +22869,6 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
 /// `get_unhandled_events_with_cx`, `get_events_stream_with_cx`,
 /// `get_timeline_with_cx`, `count_unhandled_events_by_pane_with_cx`,
 /// `get_last_activity_by_pane_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick146_event_reads_cluster_roundtrip() {
     run_async_test(async {
@@ -25131,7 +22993,6 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
 /// 3 new storage cx-first siblings exercised end-to-end:
 /// `create_reservation_with_cx`, `release_reservation_with_cx`,
 /// `expire_stale_reservations_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick145_reservation_cluster_roundtrip() {
     run_async_test(async {
@@ -25211,7 +23072,6 @@ fn storage_tick145_reservation_cluster_roundtrip() {
 /// `delete_account_with_cx`, `get_account_with_cx`,
 /// `select_account_with_cx` (composite routing via
 /// `get_accounts_by_service_with_cx`).
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick144_account_cluster_roundtrip() {
     run_async_test(async {
@@ -25330,7 +23190,6 @@ fn storage_tick144_account_cluster_roundtrip() {
 /// `mark_session_shutdown_clean_with_cx`,
 /// `get_latest_checkpoint_hash_with_cx`,
 /// `get_active_sessions_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
     run_async_test(async {
@@ -25422,7 +23281,6 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
 /// `get_approval_token_by_code_with_cx`,
 /// `consume_approval_token_by_code_with_cx`,
 /// `insert_prepared_plan_with_cx`, `consume_prepared_plan_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick142_token_lifecycle_clusters_roundtrip() {
     run_async_test(async {
@@ -25548,7 +23406,6 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
 /// `aggregate_daily_metrics_with_cx`, `aggregate_by_agent_with_cx`,
 /// `vacuum_with_cx`, `checkpoint_with_cx`,
 /// `database_page_stats_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick141_maintenance_cluster_roundtrip() {
     run_async_test(async {
@@ -25600,7 +23457,6 @@ fn storage_tick141_maintenance_cluster_roundtrip() {
 /// 4 new storage cx-first siblings exercised end-to-end:
 /// `get_indexing_health_with_cx`, `sync_fts_with_cx`,
 /// `rebuild_fts_with_cx`, `get_fts_index_state_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick140_fts_cluster_roundtrip() {
     run_async_test(async {
@@ -25645,7 +23501,6 @@ fn storage_tick140_fts_cluster_roundtrip() {
 /// `increment_notification_retry_with_cx`,
 /// `query_notification_history_with_cx`,
 /// `get_notification_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick139_notification_cluster_roundtrip() {
     run_async_test(async {
@@ -25739,7 +23594,6 @@ fn storage_tick139_notification_cluster_roundtrip() {
 /// `get_pane_bookmark_by_alias_with_cx`,
 /// `list_pane_bookmarks_with_cx`,
 /// `list_pane_bookmarks_by_tag_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick138_pane_bookmark_cluster_roundtrip() {
     run_async_test(async {
@@ -25835,7 +23689,6 @@ fn storage_tick138_pane_bookmark_cluster_roundtrip() {
 /// `update_saved_search_schedule_with_cx`,
 /// `delete_saved_search_with_cx`, `get_saved_search_by_name_with_cx`,
 /// `list_saved_searches_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick137_saved_search_cluster_roundtrip() {
     run_async_test(async {
@@ -25937,7 +23790,6 @@ fn storage_tick137_saved_search_cluster_roundtrip() {
 /// ft-xbnl0.2.3 Cx-first: tick 121 hot-path batch smoke test —
 /// 10 more storage cx-first siblings exercised end-to-end on a
 /// fresh DB with pane 1 seeded for FK constraints.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick121_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26066,7 +23918,6 @@ fn storage_tick121_hot_path_siblings_roundtrip() {
 
 /// ft-xbnl0.2.3 Cx-first: tick 120 hot-path batch smoke test —
 /// 8 more storage cx-first siblings exercised end-to-end.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick120_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26183,7 +24034,6 @@ fn storage_tick120_hot_path_siblings_roundtrip() {
 /// ft-xbnl0.2.3 Cx-first: tick 119 hot-path batch smoke test —
 /// 7 more storage cx-first siblings exercised end-to-end:
 /// count/list/undo reads and a purge/usage-metric write.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick119_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26266,7 +24116,6 @@ fn storage_tick119_hot_path_siblings_roundtrip() {
 /// `append_segment_with_cx`, `record_gap_with_cx`,
 /// `get_panes_with_cx`, `get_workflow_with_cx`,
 /// `find_incomplete_workflows_with_cx`, `export_workflows_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick118_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26382,7 +24231,6 @@ fn storage_tick118_hot_path_siblings_roundtrip() {
 /// `insert_approval_token_with_cx`,
 /// `record_audit_action_redacted_with_cx`,
 /// `is_event_muted_with_cx`, `get_events_with_cx`.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick117_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26495,7 +24343,6 @@ fn storage_tick117_hot_path_siblings_roundtrip() {
 /// `upsert_workflow_with_cx`, `record_audit_action_with_cx`,
 /// `get_audit_actions_with_cx`, and `get_step_logs_with_cx`
 /// must each round-trip cleanly with a fresh cx.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_tick116_hot_path_siblings_roundtrip() {
     run_async_test(async {
@@ -26595,7 +24442,6 @@ fn storage_tick116_hot_path_siblings_roundtrip() {
 /// ft-xbnl0.2.3 Cx-first: `shutdown_with_cx` must complete the
 /// full shutdown (including writer thread join) when given a
 /// fresh cx — identical to the legacy `shutdown` path.
-#[cfg(feature = "asupersync-runtime")]
 #[test]
 fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
     run_async_test(async {
@@ -30221,28 +28067,17 @@ mod backpressure_integration_tests {
     }
 
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
             let sent = tx.send(&cx, value).await;
             assert!(sent.is_ok(), "test mpsc send should succeed");
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let sent = tx.send(value).await;
-            assert!(sent.is_ok(), "test mpsc send should succeed");
-        }
     }
 
     async fn recv_mpsc<T>(rx: &mut mpsc::Receiver<T>) -> T {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
             rx.recv(&cx).await.expect("test mpsc recv should succeed")
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            rx.recv().await.expect("test mpsc recv should succeed")
         }
     }
 
@@ -30270,9 +28105,6 @@ mod backpressure_integration_tests {
             assert!(result.is_err(), "Should timeout when channel is full");
 
             // Verify depth
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let depth = max_cap - tx.capacity();
-            #[cfg(feature = "asupersync-runtime")]
             let depth = rx.len();
             assert_eq!(depth, 2, "Queue should be at capacity");
         });
@@ -30292,9 +28124,6 @@ mod backpressure_integration_tests {
             send_mpsc(&tx, 2).await;
             send_mpsc(&tx, 3).await;
 
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let depth_before = max_cap - tx.capacity();
-            #[cfg(feature = "asupersync-runtime")]
             let depth_before = rx.len();
             assert_eq!(depth_before, 3);
 
@@ -30306,9 +28135,6 @@ mod backpressure_integration_tests {
             // Small yield for channel state to update
             crate::runtime_compat::sleep(Duration::from_millis(1)).await;
 
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let depth_after = max_cap - tx.capacity();
-            #[cfg(feature = "asupersync-runtime")]
             let depth_after = rx.len();
             assert_eq!(depth_after, 0, "Queue should drain when consumer resumes");
         });

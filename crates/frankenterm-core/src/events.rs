@@ -708,25 +708,11 @@ impl EventSubscriber {
     /// - `RecvError::Closed` if the event bus was dropped
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.recv_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        match crate::runtime_compat::broadcast_recv(&mut self.receiver).await {
-            Ok(event) => Ok(event),
-            Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
-            Err(broadcast::RecvError::Lagged(n)) => {
-                // Track lag and return an error so caller knows they missed events
-                self.lagged_count += n;
-                self.metrics
-                    .subscriber_lag_events
-                    .fetch_add(n, Ordering::Relaxed);
-                Err(RecvError::Lagged { missed_count: n })
-            }
-        }
     }
 
     /// Receive the next event under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first
@@ -739,7 +725,6 @@ impl EventSubscriber {
     /// # Errors
     /// - `RecvError::Closed` if the event bus was dropped
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn recv_cx(&mut self, cx: &crate::cx::Cx) -> Result<Event, RecvError> {
         match crate::runtime_compat::broadcast_recv_with_cx(cx, &mut self.receiver).await {
             Ok(event) => Ok(event),
@@ -1410,7 +1395,6 @@ mod tests {
     /// real time. If the broadcast recv ever re-acquires a tokio-shaped
     /// (real-time) assumption, this test either step-explodes or burns
     /// real seconds.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn event_subscriber_recv_cx_runs_under_labruntime() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -312,25 +312,11 @@ impl RecordingManager {
         path: &Path,
         started_at_ms: i64,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .start_recording_with_cx(&cx, pane_id, path, started_at_ms)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut guard = self.recorders.lock().await;
-            if guard.contains_key(&pane_id) {
-                return Err(crate::Error::Runtime(format!(
-                    "Recorder already active for pane {pane_id}"
-                )));
-            }
-            let mut recorder = Recorder::new(pane_id, path, self.options.flush_threshold)?;
-            recorder.start(started_at_ms);
-            guard.insert(pane_id, recorder);
-            Ok(())
         }
     }
 
@@ -339,7 +325,6 @@ impl RecordingManager {
     /// is bound to the caller's `Cx` via `Mutex::lock_with_cx`, so a
     /// caller-cancelled wait propagates through the mutex wait
     /// instead of being pulled from `Cx::current()` thread-local.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn start_recording_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -361,25 +346,14 @@ impl RecordingManager {
 
     /// Stop recording a pane and flush any buffered frames.
     pub async fn stop_recording(&self, pane_id: u64) -> Result<Option<RecorderStats>> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.stop_recording_with_cx(&cx, pane_id).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut guard = self.recorders.lock().await;
-            if let Some(mut recorder) = guard.remove(&pane_id) {
-                recorder.stop()?;
-                return Ok(Some(recorder.stats()));
-            }
-            Ok(None)
         }
     }
 
     /// Stop recording a pane under an explicit `&Cx` (ft-xbnl0.2.3
     /// Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn stop_recording_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -395,31 +369,9 @@ impl RecordingManager {
 
     /// Record a captured output segment (redacted if configured).
     pub async fn record_segment(&self, segment: &CapturedSegment) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.record_segment_with_cx(&cx, segment).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut guard = self.recorders.lock().await;
-            let Some(recorder) = guard.get_mut(&segment.pane_id) else {
-                return Ok(());
-            };
-            if !recorder.is_recording() {
-                return Ok(());
-            }
-
-            let payload = if self.options.redact_output {
-                let redacted = self.redactor.redact(&segment.content);
-                redacted.into_bytes()
-            } else {
-                segment.content.as_bytes().to_vec()
-            };
-
-            let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
-            recorder.bytes_raw += segment.content.len() as u64;
-            recorder.record_output(segment.captured_at, is_gap, &payload)
         }
     }
 
@@ -433,7 +385,6 @@ impl RecordingManager {
     /// and the synchronous `record_output` write; concurrent callers
     /// targeting *other* panes are no longer serialized behind this
     /// pane's regex-scan + allocation work.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_segment_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -459,15 +410,6 @@ impl RecordingManager {
         recorder.record_output(segment.captured_at, is_gap, &payload)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn record_segment_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        segment: &CapturedSegment,
-    ) -> Result<()> {
-        self.record_segment(segment).await
-    }
-
     /// Record a detection event (redacted if configured).
     pub async fn record_event(
         &self,
@@ -475,28 +417,11 @@ impl RecordingManager {
         detection: &Detection,
         captured_at_ms: i64,
     ) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let mut guard = self.recorders.lock().await;
-            let Some(recorder) = guard.get_mut(&pane_id) else {
-                return Ok(());
-            };
-            if !recorder.is_recording() {
-                return Ok(());
-            }
-
-            let mut detection = detection.clone();
-            if self.options.redact_events {
-                detection = redact_detection(&detection, &self.redactor);
-            }
-            recorder.record_event(&detection, captured_at_ms)
         }
     }
 
@@ -506,7 +431,6 @@ impl RecordingManager {
     /// Mirrors the critical-section reduction in `record_segment_with_cx`:
     /// the redaction step is a pure function over `&self.redactor` and
     /// does not touch the `recorders` mutex, so it runs above the lock.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn record_event_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -531,16 +455,6 @@ impl RecordingManager {
         recorder.record_event(detection_ref, captured_at_ms)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn record_event_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-        detection: &Detection,
-        captured_at_ms: i64,
-    ) -> Result<()> {
-        self.record_event(pane_id, detection, captured_at_ms).await
-    }
 }
 
 fn redact_detection(detection: &Detection, redactor: &Redactor) -> Detection {
@@ -1535,7 +1449,6 @@ mod tests {
     /// via the explicit `&Cx` API. Pins end-to-end no-regression on
     /// the Cx-first path so all four `_with_cx` variants produce the
     /// same observable behavior as their legacy counterparts.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn recording_manager_with_cx_full_cycle_matches_legacy() {
         run_async_test(async {
@@ -1580,7 +1493,6 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: stop_recording_with_cx on a pane that was
     /// never started returns None, matching the legacy contract.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn recording_manager_stop_with_cx_nonexistent_returns_none() {
         run_async_test(async {
@@ -1596,7 +1508,6 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: record_event_with_cx records a detection event
     /// into an active recording, then verifies the event appears in replay.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn recording_manager_record_event_with_cx_captures_detection() {
         run_async_test(async {
@@ -1636,7 +1547,6 @@ mod tests {
 
     /// ft-xbnl0.2.3 Cx-first: record_event_with_cx on an unrecorded pane
     /// is a no-op — returns Ok(()) without error.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn recording_manager_record_event_with_cx_unknown_pane_noop() {
         run_async_test(async {

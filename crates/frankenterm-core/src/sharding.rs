@@ -599,7 +599,6 @@ impl ShardedWeztermClient {
     /// [`crate::runtime_compat::RwLock::write_with_cx`], so caller
     /// cancellation/budget/virtual time propagate end-to-end through
     /// the entire spawn pipeline.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn spawn_with_hints_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -675,7 +674,6 @@ impl ShardedWeztermClient {
     /// backends without a Cx-aware path, and overridden by
     /// `WeztermClient` to propagate Cx through to
     /// `MuxPool::list_panes_with_cx`).
-    #[cfg(feature = "asupersync-runtime")]
     async fn collect_panes_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -723,7 +721,6 @@ impl ShardedWeztermClient {
     /// routes to `MuxPool::list_panes_with_cx` on the fast path.
     /// The internal `pane_routes` RwLock acquire uses
     /// `write_with_cx(cx)` (the primitive from tick 9).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_all_panes_with_cx(&self, cx: &crate::cx::Cx) -> Result<Vec<PaneInfo>> {
         self.telemetry.pane_listings.fetch_add(1, Ordering::Relaxed);
         let (panes, routes) = self.collect_panes_with_cx(cx).await?;
@@ -782,7 +779,6 @@ impl ShardedWeztermClient {
     /// Per-shard checkpoint between iterations lets a caller
     /// abort partway through a large fleet health scan and
     /// return a partial report marked as potentially incomplete.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shard_health_report_with_cx(&self, cx: &crate::cx::Cx) -> ShardHealthReport {
         self.telemetry
             .health_reports
@@ -834,7 +830,6 @@ impl ShardedWeztermClient {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`shard_watchdog_warnings`].
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shard_watchdog_warnings_with_cx(&self, cx: &crate::cx::Cx) -> Vec<String> {
         self.shard_health_report_with_cx(cx)
             .await
@@ -884,7 +879,6 @@ impl ShardedWeztermClient {
     /// have already-Cx-first `_with_cx` handle methods should use this
     /// internal helper to avoid breaking the Cx-first chain at the
     /// route-lookup boundary.
-    #[cfg(feature = "asupersync-runtime")]
     async fn route_for_global_pane_id_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -948,7 +942,6 @@ impl ShardedWeztermClient {
     /// `resolve_window_shard` matcher with the legacy
     /// `route_for_window_id` so both variants produce bit-for-bit
     /// identical decisions for the same shard state.
-    #[cfg(feature = "asupersync-runtime")]
     async fn route_for_window_id_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1313,12 +1306,10 @@ impl WeztermInterface for ShardedWeztermClient {
     // has cx in hand at this dispatch point. Follow-up: thread cx
     // through route_for_global_pane_id too.
 
-    #[cfg(feature = "asupersync-runtime")]
     fn list_panes_with_cx<'a>(&'a self, cx: &'a crate::cx::Cx) -> WeztermFuture<'a, Vec<PaneInfo>> {
         Box::pin(async move { self.list_all_panes_with_cx(cx).await })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1345,7 +1336,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn get_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1363,7 +1353,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1382,7 +1371,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_no_paste_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1403,7 +1391,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_text_with_options_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1432,7 +1419,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_control_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1453,7 +1439,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn pane_tiered_scrollback_summary_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1477,7 +1462,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn activate_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1496,7 +1480,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn kill_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1513,7 +1496,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn zoom_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1531,7 +1513,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1544,7 +1525,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn spawn_targeted_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1580,7 +1560,6 @@ impl WeztermInterface for ShardedWeztermClient {
         })
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn split_pane_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1846,7 +1825,6 @@ mod tests {
     /// work end-to-end when cx is threaded through both the
     /// subprocess hop AND the `pane_routes.write_with_cx` RwLock
     /// acquire.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_with_hints_with_cx_routes_and_records() {
         run_async_test(async {
@@ -1950,7 +1928,6 @@ mod tests {
     /// regressed the matcher semantics (matching_shards set
     /// construction, 0/1/many branches), this test would diverge
     /// from the legacy one.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spawn_targeted_with_cx_routes_existing_window_to_matching_shard() {
         run_async_test(async {
@@ -2416,7 +2393,6 @@ mod tests {
     /// produce an equivalent report to `shard_health_report` on
     /// a 2-shard topology (healthy + failing), returning the
     /// same overall status, shard count, and watchdog warnings.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn shard_health_report_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2458,7 +2434,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `shard_health_report_with_cx` must
     /// bail early on a pre-cancelled cx, returning a report
     /// with 0 shards (never touched any backend).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn shard_health_report_with_cx_bails_on_precancelled_cx() {
         run_async_test(async {

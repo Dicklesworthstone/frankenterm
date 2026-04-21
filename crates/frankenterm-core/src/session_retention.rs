@@ -258,14 +258,9 @@ pub async fn cleanup_sessions_async(
     db_path: Arc<String>,
     config: SessionRetentionConfig,
 ) -> Result<CleanupResult, String> {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         cleanup_sessions_async_cx(&cx, db_path, config).await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        cleanup_sessions_async_inner(db_path, config).await
     }
 }
 
@@ -276,7 +271,6 @@ pub async fn cleanup_sessions_async(
 /// spawn lets a canceled caller skip the blocking handoff entirely; a
 /// checkpoint after the join lets the caller abort before returning the
 /// result into the wider call graph.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn cleanup_sessions_async_cx(
     cx: &crate::cx::Cx,
     db_path: Arc<String>,
@@ -306,24 +300,6 @@ pub async fn cleanup_sessions_async_cx(
     outcome
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn cleanup_sessions_async_inner(
-    db_path: Arc<String>,
-    config: SessionRetentionConfig,
-) -> Result<CleanupResult, String> {
-    crate::runtime_compat::spawn_blocking(move || {
-        let conn = Connection::open(db_path.as_str())
-            .map_err(|e| format!("Failed to open database: {e}"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-        )
-        .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
-        cleanup_sessions(&conn, &config).map_err(|e| format!("Cleanup failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
-}
-
 /// Get current epoch time in milliseconds.
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -347,7 +323,6 @@ mod tests {
     /// so no real SQLite work is done and no real time elapses; the
     /// test asserts the spawn_blocking handoff + result plumbing run
     /// under the LabRuntime scheduler without wall-clock dependence.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cleanup_sessions_async_cx_runs_under_labruntime() {
         use std::sync::atomic::{AtomicBool, Ordering};

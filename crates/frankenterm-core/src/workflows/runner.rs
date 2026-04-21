@@ -9,7 +9,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-#[cfg(feature = "asupersync-runtime")]
 fn spawn_runner_child_with_cx<F, Fut>(cx: &crate::cx::Cx, task: F)
 where
     F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
@@ -24,7 +23,6 @@ fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Err
     )))
 }
 
-#[cfg(feature = "asupersync-runtime")]
 async fn wait_duration_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     duration: Duration,
@@ -48,16 +46,6 @@ async fn wait_duration_maybe_cx(
         }
     }
 
-    sleep(duration).await;
-    Ok(())
-}
-
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn wait_duration_maybe_cx(
-    _cx: Option<&crate::cx::Cx>,
-    duration: Duration,
-    _label: &str,
-) -> Result<(), crate::Error> {
     sleep(duration).await;
     Ok(())
 }
@@ -475,7 +463,6 @@ impl WorkflowRunner {
     /// the persist threads cx into `upsert_workflow_with_cx` (tick 189).
     /// Legacy `handle_detection` preserved verbatim; this variant no
     /// longer delegates so the storage insert is cancel-observant.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn handle_detection_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -633,7 +620,6 @@ impl WorkflowRunner {
         // A workflow with N steps should never need more than N*10 jumps.
         let max_total_jumps = step_count.saturating_mul(10).max(100);
         let start_action_id = if start_step == 0 {
-            #[cfg(feature = "asupersync-runtime")]
             let rec = if let Some(cx) = cx {
                 record_workflow_start_action_with_cx(
                     cx,
@@ -656,30 +642,11 @@ impl WorkflowRunner {
                 )
                 .await
             };
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let rec = {
-                let _ = cx;
-                record_workflow_start_action(
-                    &self.storage,
-                    &workflow_name,
-                    execution_id,
-                    pane_id,
-                    step_count,
-                    start_step,
-                )
-                .await
-            };
             rec
         } else {
-            #[cfg(feature = "asupersync-runtime")]
             let fetched = if let Some(cx) = cx {
                 fetch_workflow_start_action_id_with_cx(cx, &self.storage, execution_id).await
             } else {
-                fetch_workflow_start_action_id(&self.storage, execution_id).await
-            };
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let fetched = {
-                let _ = cx;
                 fetch_workflow_start_action_id(&self.storage, execution_id).await
             };
             fetched
@@ -699,28 +666,22 @@ impl WorkflowRunner {
         .with_injector(self.injector.clone());
 
         // Attach persisted trigger context (if any) so workflows can interpret extracted fields.
-        #[cfg(feature = "asupersync-runtime")]
         let maybe_wf = if let Some(cx) = cx {
             self.storage.get_workflow_with_cx(cx, execution_id).await
         } else {
             self.storage.get_workflow(execution_id).await
         };
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let maybe_wf = self.storage.get_workflow(execution_id).await;
         if let Ok(Some(record)) = maybe_wf {
             if let Some(trigger) = record.context {
                 ctx = ctx.with_trigger(trigger);
             }
         }
 
-        #[cfg(feature = "asupersync-runtime")]
         let maybe_pane = if let Some(cx) = cx {
             self.storage.get_pane_with_cx(cx, pane_id).await
         } else {
             self.storage.get_pane(pane_id).await
         };
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let maybe_pane = self.storage.get_pane(pane_id).await;
         if let Ok(Some(record)) = maybe_pane {
             ctx.set_pane_meta(PaneMetadata::from_record(&record));
         }
@@ -793,7 +754,6 @@ impl WorkflowRunner {
             }
 
             // ft-xbnl0.2.3 tick 259: cx-first action-plan persist with maybe-cx fallback.
-            #[cfg(feature = "asupersync-runtime")]
             let persist_result = if let Some(cx) = cx {
                 self.storage
                     .upsert_action_plan_with_cx(cx, execution_id, &plan)
@@ -801,8 +761,6 @@ impl WorkflowRunner {
             } else {
                 self.storage.upsert_action_plan(execution_id, &plan).await
             };
-            #[cfg(not(feature = "asupersync-runtime"))]
-            let persist_result = self.storage.upsert_action_plan(execution_id, &plan).await;
             if let Err(e) = persist_result {
                 tracing::warn!(
                     execution_id,
@@ -822,7 +780,6 @@ impl WorkflowRunner {
             // lock and trigger state don't leak under a cancelled
             // parent. No-op when cx is None (legacy caller) or
             // healthy.
-            #[cfg(feature = "asupersync-runtime")]
             if let Some(cx) = cx {
                 if let Err(err) = cx.checkpoint() {
                     let reason = format!("run_workflow cancelled at step {current_step}: {err}");
@@ -923,15 +880,9 @@ impl WorkflowRunner {
                 // caller cancellation mid-step. Implementors that use
                 // the default trait impl still receive ambient semantics
                 // — the default delegates to execute_step unchanged.
-                #[cfg(feature = "asupersync-runtime")]
                 let step_outcome = if let Some(cx) = cx {
                     workflow.execute_step_cx(cx, &mut ctx, current_step).await
                 } else {
-                    workflow.execute_step(&mut ctx, current_step).await
-                };
-                #[cfg(not(feature = "asupersync-runtime"))]
-                let step_outcome = {
-                    let _ = cx;
                     workflow.execute_step(&mut ctx, current_step).await
                 };
                 step_outcome
@@ -1927,7 +1878,6 @@ impl WorkflowRunner {
     /// Using the `Error` variant (not a new variant) keeps the
     /// match surface stable — every `run_workflow` caller already
     /// handles Error.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_workflow_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2152,7 +2102,6 @@ impl WorkflowRunner {
     /// cx-observing await.
     ///
     /// Legacy [`run`](Self::run) preserved unchanged.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx(&self, cx: &crate::cx::Cx, event_bus: &crate::events::EventBus) {
         let resumed = self.resume_incomplete_with_cx(cx).await;
         if !resumed.is_empty() {
@@ -2453,7 +2402,6 @@ impl WorkflowRunner {
     ///
     /// A cancel fired mid-restart-resume cleanly aborts between
     /// workflow records instead of resuming all N incomplete ones.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn resume_incomplete_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2594,14 +2542,11 @@ impl WorkflowRunner {
         execution_id: &str,
         step: usize,
     ) -> crate::Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
             return self
                 .update_execution_step_with_cx(cx, execution_id, step)
                 .await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let _ = cx;
         self.update_execution_step(execution_id, step).await
     }
 
@@ -2618,7 +2563,6 @@ impl WorkflowRunner {
     /// (non-error) path. Threading cx here means a cancelled
     /// parent cx releases the writer-queue reserve immediately
     /// under backpressure instead of waiting for drain.
-    #[cfg(feature = "asupersync-runtime")]
     async fn update_execution_step_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2688,7 +2632,6 @@ impl WorkflowRunner {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`set_execution_waiting`].
     /// Tick 184: routes get_workflow + upsert_workflow through _with_cx.
-    #[cfg(feature = "asupersync-runtime")]
     async fn set_execution_waiting_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2731,14 +2674,11 @@ impl WorkflowRunner {
         step: usize,
         condition: &WaitCondition,
     ) -> crate::Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
             return self
                 .set_execution_waiting_with_cx(cx, execution_id, step, condition)
                 .await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let _ = cx;
         self.set_execution_waiting(execution_id, step, condition)
             .await
     }
@@ -2801,7 +2741,6 @@ impl WorkflowRunner {
     /// Tick 184: routes get_workflow + upsert_workflow + record_usage_metric
     /// through _with_cx. Metric-write failure stays warn-only (matches
     /// tick 183's fail_execution_with_cx contract).
-    #[cfg(feature = "asupersync-runtime")]
     async fn complete_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2864,14 +2803,11 @@ impl WorkflowRunner {
         execution_id: &str,
         result: Option<serde_json::Value>,
     ) -> crate::Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
             return self
                 .complete_execution_with_cx(cx, execution_id, result)
                 .await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let _ = cx;
         self.complete_execution(execution_id, result).await
     }
 
@@ -2932,7 +2868,6 @@ impl WorkflowRunner {
     ///   Keeps the "metric-write failure is warn-only" contract — the
     ///   metric write uses `if let Err` on the cx-first path same as
     ///   legacy, so a cx-cancelled metric write logs-and-continues.
-    #[cfg(feature = "asupersync-runtime")]
     async fn fail_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2995,12 +2930,9 @@ impl WorkflowRunner {
         execution_id: &str,
         error: &str,
     ) -> crate::Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
             return self.fail_execution_with_cx(cx, execution_id, error).await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let _ = cx;
         self.fail_execution(execution_id, error).await
     }
 
@@ -3040,7 +2972,6 @@ impl WorkflowRunner {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_trigger_event_handled`].
     /// Tick 184: routes get_workflow + mark_event_handled through _with_cx.
-    #[cfg(feature = "asupersync-runtime")]
     async fn mark_trigger_event_handled_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3079,14 +3010,11 @@ impl WorkflowRunner {
         execution_id: &str,
         status: &str,
     ) -> crate::Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         if let Some(cx) = cx {
             return self
                 .mark_trigger_event_handled_with_cx(cx, execution_id, status)
                 .await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let _ = cx;
         self.mark_trigger_event_handled(execution_id, status).await
     }
 
@@ -3227,7 +3155,6 @@ impl WorkflowRunner {
     /// the `handle_detection_with_cx` contract so a cancelled operator
     /// request cannot accidentally mutate workflow state during
     /// teardown.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn abort_execution_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3401,7 +3328,6 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
-        #[cfg(feature = "asupersync-runtime")]
         crate::runtime_compat::clear_runtime_handle();
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
@@ -3777,7 +3703,6 @@ mod tests {
     // contracts: result predicates, serde shapes, config defaults.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_runner {
         use super::*;
 

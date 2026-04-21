@@ -34,8 +34,6 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::timeout;
 use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
@@ -367,144 +365,11 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.capture_with_cx(&cx, panes, trigger).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.telemetry
-                .captures_attempted
-                .fetch_add(1, Ordering::Relaxed);
-
-            // 1. Guard: prevent concurrent captures
-            if self.in_progress.swap(true, Ordering::SeqCst) {
-                self.telemetry
-                    .capture_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(SnapshotError::InProgress);
-            }
-            // Reset guard on all exit paths via Drop
-            struct InProgressGuard<'a>(&'a AtomicBool);
-            impl Drop for InProgressGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = InProgressGuard(&self.in_progress);
-
-            if panes.is_empty() {
-                self.telemetry
-                    .capture_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(SnapshotError::NoPanes);
-            }
-
-            let now_ms = epoch_ms();
-
-            // 2. Build topology snapshot
-            let (topology, _report) = TopologySnapshot::from_panes(panes, now_ms);
-            let topology_json = topology
-                .to_json()
-                .map_err(|e: serde_json::Error| SnapshotError::Serialization(e.to_string()))?;
-
-            // 3. Correlate agent identity/state (best-effort) and build per-pane snapshots
-            let mut correlator = AgentCorrelator::new();
-            let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
-            let db_path_for_detections = Arc::clone(&self.db_path);
-            let cutoff_ms: i64 =
-                i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
-                    .unwrap_or(i64::MAX);
-
-            let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
-                load_latest_detections_by_pane_sync(
-                    db_path_for_detections.as_str(),
-                    &pane_ids,
-                    cutoff_ms,
-                )
-            })
-            .await;
-
-            for (pane_id, detections) in detections_by_pane {
-                correlator.ingest_detections(pane_id, &detections);
-            }
-            for pane in panes {
-                correlator.update_from_pane_info(pane);
-            }
-
-            let pane_states: Vec<PaneStateSnapshot> = panes
-                .iter()
-                .map(|p| {
-                    let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
-                    if let Some(agent) = correlator.get_metadata(p.pane_id) {
-                        snapshot = snapshot.with_agent(agent);
-                    }
-                    snapshot
-                })
-                .collect();
-
-            // 4. Compute state hash for dedup (from raw pane data, not timestamps)
-            let state_hash = compute_state_hash(panes);
-
-            // 5. Skip if periodic-like and unchanged
-            if matches!(
-                trigger,
-                SnapshotTrigger::Periodic | SnapshotTrigger::PeriodicFallback
-            ) {
-                let last = self.last_state_hash.read().await;
-                if last.as_deref() == Some(&state_hash) {
-                    self.telemetry.dedup_skips.fetch_add(1, Ordering::Relaxed);
-                    return Err(SnapshotError::NoChanges);
-                }
-            }
-
-            // 6. Ensure session exists
-            let session_id = self.ensure_session(&topology_json, now_ms).await?;
-
-            // 7. Persist checkpoint + pane states in a transaction
-            let checkpoint_type = trigger.as_db_str().to_string();
-            let pane_count = pane_states.len();
-
-            let db_path = Arc::clone(&self.db_path);
-            let state_hash_clone = state_hash.clone();
-
-            let result = Self::spawn_blocking_db(move || {
-                save_checkpoint_sync(
-                    &db_path,
-                    &session_id,
-                    now_ms,
-                    &checkpoint_type,
-                    &state_hash_clone,
-                    &topology_json,
-                    &pane_states,
-                )
-            })
-            .await?;
-
-            // 8. Update last hash
-            *self.last_state_hash.write().await = Some(state_hash);
-
-            // 9. Record success telemetry
-            self.telemetry
-                .captures_succeeded
-                .fetch_add(1, Ordering::Relaxed);
-            self.telemetry
-                .panes_captured
-                .fetch_add(pane_count as u64, Ordering::Relaxed);
-            self.telemetry
-                .bytes_persisted
-                .fetch_add(result.2 as u64, Ordering::Relaxed);
-
-            Ok(SnapshotResult {
-                session_id: result.0,
-                checkpoint_id: result.1,
-                pane_count,
-                total_bytes: result.2,
-                trigger,
-            })
-        }
     }
 
     /// Capture a full mux state snapshot bound to the caller's asupersync
@@ -528,7 +393,6 @@ impl SnapshotEngine {
     ///
     /// The legacy [`capture`](Self::capture) entry point is preserved
     /// for non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn capture_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -681,29 +545,11 @@ impl SnapshotEngine {
 
     /// Run retention cleanup: remove old checkpoints exceeding limits.
     pub async fn cleanup(&self) -> std::result::Result<usize, SnapshotError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.cleanup_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.telemetry.cleanup_runs.fetch_add(1, Ordering::Relaxed);
-
-            let db_path = Arc::clone(&self.db_path);
-            let retention_count = self.config.retention_count;
-            let retention_days = self.config.retention_days;
-
-            let removed = Self::spawn_blocking_db(move || {
-                cleanup_sync(&db_path, retention_count, retention_days)
-            })
-            .await?;
-            self.telemetry
-                .cleanup_removed
-                .fetch_add(removed as u64, Ordering::Relaxed);
-            Ok(removed)
-        }
     }
 
     /// Run retention cleanup bound to the caller's asupersync capability
@@ -723,7 +569,6 @@ impl SnapshotEngine {
     ///
     /// The legacy [`cleanup`](Self::cleanup) entry point is preserved
     /// for non-migrated callers; this is strictly additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn cleanup_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -848,7 +693,6 @@ impl SnapshotEngine {
     /// The pane provider is awaited directly — it's a caller-supplied
     /// future that doesn't inherently know about cx; if a caller
     /// needs cx threaded there they can capture one in the closure.
-    #[cfg(feature = "asupersync-runtime")]
     async fn capture_from_provider_with_cx<F, Fut>(
         &self,
         cx: &crate::cx::Cx,
@@ -906,15 +750,10 @@ impl SnapshotEngine {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_periodic_with_cx(&cx, shutdown, pane_provider)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.scheduler_body_legacy(shutdown, pane_provider).await;
         }
     }
 
@@ -932,7 +771,6 @@ impl SnapshotEngine {
     /// `scheduler_body(&cx, ...)` helper (via internal
     /// refactor); the legacy path passes `cx::for_request()` to
     /// preserve its prior semantics.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_periodic_with_cx<F, Fut>(
         &self,
         cx: &crate::cx::Cx,
@@ -953,7 +791,6 @@ impl SnapshotEngine {
     /// `run_periodic_with_cx`. The caller's cx is threaded into
     /// both `shutdown.changed(&cx)` and `trigger_rx.recv(&cx)`
     /// so cancellation propagates into both poll sites.
-    #[cfg(feature = "asupersync-runtime")]
     async fn scheduler_body<F, Fut>(
         &self,
         cx: &crate::cx::Cx,
@@ -1129,172 +966,7 @@ impl SnapshotEngine {
     /// Legacy non-cx scheduler body for builds without
     /// `asupersync-runtime`. Preserves the exact prior behavior
     /// — shutdown.changed() and trigger_rx.recv() without cx.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn scheduler_body_legacy<F, Fut>(
-        &self,
-        mut shutdown: watch::Receiver<bool>,
-        pane_provider: F,
-    ) where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
-    {
-        match self.config.scheduling.mode {
-            SnapshotSchedulingMode::Periodic => {
-                let interval_secs = self.config.interval_seconds.max(30);
-                let interval = Duration::from_secs(interval_secs);
-                let mut is_first = true;
-
-                loop {
-                    if !is_first {
-                        let shutdown_fut = shutdown.changed();
-                        if timeout(interval, shutdown_fut).await.is_ok() {
-                            tracing::info!("snapshot engine shutting down");
-                            break;
-                        }
-                    }
-
-                    let trigger = if is_first {
-                        is_first = false;
-                        SnapshotTrigger::Startup
-                    } else {
-                        SnapshotTrigger::Periodic
-                    };
-                    let _ = self.capture_from_provider(&pane_provider, trigger).await;
-                }
-            }
-            SnapshotSchedulingMode::Intelligent => {
-                let mut trigger_rx = {
-                    let mut guard = self.trigger_rx.lock().await;
-                    match guard.take() {
-                        Some(rx) => rx,
-                        None => {
-                            tracing::warn!(
-                                "snapshot intelligent scheduler: receiver already taken"
-                            );
-                            return;
-                        }
-                    }
-                };
-
-                let _ = self
-                    .capture_from_provider(&pane_provider, SnapshotTrigger::Startup)
-                    .await;
-
-                let fallback_secs = self
-                    .config
-                    .scheduling
-                    .periodic_fallback_minutes
-                    .max(1)
-                    .saturating_mul(60);
-                let fallback_interval = Duration::from_secs(fallback_secs);
-                let mut next_fallback_at = Instant::now() + fallback_interval;
-
-                let mut accumulated_value = 0.0_f64;
-                let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
-
-                enum TriggerPoll {
-                    Ready(SnapshotTrigger),
-                    Closed,
-                    TimedOut,
-                }
-
-                loop {
-                    let shutdown_check_fut = shutdown.changed();
-                    if timeout(Duration::ZERO, shutdown_check_fut).await.is_ok() {
-                        tracing::info!("snapshot engine shutting down");
-                        break;
-                    }
-
-                    let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
-
-                    let trigger_poll = if fallback_wait.is_zero() {
-                        TriggerPoll::TimedOut
-                    } else {
-                        let wait_step = fallback_wait.min(Duration::from_millis(250));
-                        let recv_fut = trigger_rx.recv();
-                        let recv_result = timeout(wait_step, recv_fut).await;
-
-                        match recv_result {
-                            Ok(Some(trigger)) => TriggerPoll::Ready(trigger),
-                            Ok(None) => TriggerPoll::Closed,
-                            Err(_) => TriggerPoll::TimedOut,
-                        }
-                    };
-
-                    match trigger_poll {
-                        TriggerPoll::Ready(trigger) => {
-                            let tv = self.trigger_value(trigger);
-                            if tv > 0.0 {
-                                accumulated_value += tv;
-                            }
-
-                            let immediate = self.is_immediate_trigger(trigger);
-                            let should_capture = immediate
-                                || snapshot_threshold <= 0.0
-                                || accumulated_value >= snapshot_threshold;
-
-                            if should_capture {
-                                let captured =
-                                    self.capture_from_provider(&pane_provider, trigger).await;
-                                if captured || immediate || snapshot_threshold <= 0.0 {
-                                    accumulated_value = 0.0;
-                                }
-                            }
-                        }
-                        TriggerPoll::Closed => {
-                            tracing::info!(
-                                "trigger channel closed; intelligent scheduler stopping"
-                            );
-                            break;
-                        }
-                        TriggerPoll::TimedOut => {
-                            if Instant::now() < next_fallback_at {
-                                continue;
-                            }
-                            let captured = self
-                                .capture_from_provider(
-                                    &pane_provider,
-                                    SnapshotTrigger::PeriodicFallback,
-                                )
-                                .await;
-                            if captured {
-                                accumulated_value = 0.0;
-                            }
-                            next_fallback_at = Instant::now() + fallback_interval;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Get or create the session ID.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn ensure_session(
-        &self,
-        topology_json: &str,
-        now_ms: u64,
-    ) -> std::result::Result<String, SnapshotError> {
-        let existing_session_id = { self.session_id.read().await.clone() };
-        if let Some(id) = existing_session_id {
-            return Ok(id);
-        }
-
-        // Create new session
-        let session_id = generate_session_id();
-        let db_path = Arc::clone(&self.db_path);
-        let id = session_id.clone();
-        let topo = topology_json.to_string();
-        let version = crate::VERSION.to_string();
-        Self::spawn_blocking_db(move || {
-            create_session_sync(&db_path, &id, now_ms, &topo, &version)
-        })
-        .await?;
-
-        *self.session_id.write().await = Some(session_id.clone());
-        Ok(session_id)
-    }
-
     /// Get or create the session ID, bound to the caller's asupersync
     /// capability context (ft-xbnl0.2.3 Cx-first internal helper).
     ///
@@ -1302,7 +974,6 @@ impl SnapshotEngine {
     /// `read_with_cx` / `write_with_cx` and checkpoints before the
     /// blocking DB handoff so a canceled caller skips session
     /// creation cleanly.
-    #[cfg(feature = "asupersync-runtime")]
     async fn ensure_session_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1340,42 +1011,11 @@ impl SnapshotEngine {
         panes: &[PaneInfo],
         timeout: Duration,
     ) -> std::result::Result<Option<SnapshotResult>, SnapshotError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.shutdown_checkpoint_with_cx(&cx, panes, timeout).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let result = crate::runtime_compat::timeout(timeout, async {
-                let capture_result = self.capture(panes, SnapshotTrigger::Shutdown).await;
-                if let Err(e) = self.mark_shutdown().await {
-                    tracing::warn!(error = %e, "Failed to mark session as clean shutdown");
-                }
-                capture_result
-            })
-            .await;
-
-            match result {
-                Ok(Ok(snap)) => Ok(Some(snap)),
-                Ok(Err(SnapshotError::NoChanges)) => {
-                    // No changes but still mark shutdown
-                    let _ = self.mark_shutdown().await;
-                    Ok(None)
-                }
-                Ok(Err(e)) => {
-                    // Capture failed, still try to mark shutdown
-                    let _ = self.mark_shutdown().await;
-                    Err(e)
-                }
-                Err(_) => {
-                    tracing::warn!("Shutdown checkpoint timed out after {timeout:?}");
-                    let _ = self.mark_shutdown().await;
-                    Ok(None)
-                }
-            }
-        }
     }
 
     /// Capture a final shutdown checkpoint, bound to the caller's asupersync
@@ -1396,7 +1036,6 @@ impl SnapshotEngine {
     /// The legacy [`shutdown_checkpoint`](Self::shutdown_checkpoint) entry
     /// point is preserved for non-migrated callers; this is strictly
     /// additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_checkpoint_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1469,21 +1108,11 @@ impl SnapshotEngine {
 
     /// Mark current session as cleanly shut down.
     pub async fn mark_shutdown(&self) -> std::result::Result<(), SnapshotError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.mark_shutdown_with_cx(&cx).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let session_id = { self.session_id.read().await.clone() };
-            if let Some(id) = session_id {
-                let db_path = Arc::clone(&self.db_path);
-                Self::spawn_blocking_db(move || mark_shutdown_sync(&db_path, &id)).await?;
-            }
-            Ok(())
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`mark_shutdown`].
@@ -1492,7 +1121,6 @@ impl SnapshotEngine {
     /// session-id read lock, (2) after the spawn_blocking DB
     /// update returns (so a late-cancelled caller gets the
     /// cancel surface without dropping the DB work in-flight).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn mark_shutdown_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1892,16 +1520,9 @@ mod tests {
     use crate::wezterm::PaneSize;
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::for_testing();
             rx.recv(&cx)
-                .await
-                .expect("snapshot trigger recv should succeed")
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            rx.recv()
                 .await
                 .expect("snapshot trigger recv should succeed")
         }
@@ -2375,7 +1996,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `mark_shutdown_with_cx` must set
     /// the shutdown_clean flag identically to the legacy path
     /// when given a fresh, uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn mark_shutdown_with_cx_sets_flag() {
         run_async_test(async {
@@ -2412,7 +2032,6 @@ mod tests {
     /// between iterations; a mid-flight cx-cancel must cut the
     /// shutdown-watcher `shutdown.changed(&cx)` poll so the task
     /// exits in <500ms.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_periodic_with_cx_mid_flight_cancel_exits_quickly() {
         // Thread-isolated to prevent TLS interference from 25K+ parallel tests.
@@ -2464,7 +2083,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `mark_shutdown_with_cx` must
     /// return `SnapshotError::Cancelled` when given a
     /// pre-cancelled cx, without touching the DB.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn mark_shutdown_with_precancelled_cx_returns_cancelled() {
         run_async_test(async {
@@ -3525,7 +3143,6 @@ mod tests {
     /// but the session must still be marked as cleanly shut down so a
     /// subsequent restart does not offer an unclean-shutdown recovery
     /// prompt for a session the operator intentionally ended.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn shutdown_checkpoint_with_cx_pre_cancelled_marks_shutdown_without_capture() {
         run_async_test(async {
@@ -3594,7 +3211,6 @@ mod tests {
     /// captures a Shutdown-triggered snapshot and marks the session
     /// clean. Pins the contract that the Cx entry point doesn't regress
     /// the existing operational behavior.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn shutdown_checkpoint_with_cx_happy_path_captures_and_marks() {
         run_async_test(async {
@@ -3638,7 +3254,6 @@ mod tests {
     /// must NOT delete any checkpoints and must return `Ok(0)`. The
     /// `cleanup_runs` counter MUST still increment so observability
     /// stays honest about how many cleanup *attempts* the engine saw.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cleanup_with_cx_pre_cancelled_skips_db_work() {
         run_async_test(async {
@@ -3706,7 +3321,6 @@ mod tests {
     /// fresh Cx behaves identically to `cleanup`: removes the retention
     /// overflow and increments both counters. Pins no-regression on the
     /// success path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cleanup_with_cx_happy_path_removes_overflow() {
         run_async_test(async {
@@ -3753,7 +3367,6 @@ mod tests {
     /// in-progress guard or touching panes/storage. The
     /// `captures_attempted` counter still increments (parity with the
     /// legacy observability surface).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn capture_with_cx_pre_cancelled_returns_cancelled() {
         run_async_test(async {
@@ -3805,7 +3418,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: capture_with_cx happy path with a live Cx
     /// produces the same snapshot shape as legacy capture(). No
     /// regression on the success path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn capture_with_cx_happy_path_matches_legacy_capture() {
         run_async_test(async {

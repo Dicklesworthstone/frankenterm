@@ -120,7 +120,6 @@ pub async fn cleanup_preview(
 ///
 /// Identical semantics to [`cleanup_preview`] for uncancelled cx —
 /// only the await points gain cancellation awareness.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn cleanup_preview_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -341,7 +340,6 @@ pub async fn cleanup_apply(
 ///
 /// Identical scan + delete logic to [`cleanup_apply`] for
 /// uncancelled cx.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn cleanup_apply_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -522,7 +520,6 @@ async fn preview_events_by_tier(
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`preview_events_by_tier`].
-#[cfg(feature = "asupersync-runtime")]
 async fn preview_events_by_tier_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -620,7 +617,6 @@ async fn apply_events_by_tier(
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`apply_events_by_tier`].
-#[cfg(feature = "asupersync-runtime")]
 async fn apply_events_by_tier_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -971,7 +967,6 @@ mod tests {
     /// the preview-side parity test. Uses a separate empty DB so the
     /// apply path can run its delete statements + maintenance record
     /// writes without interference from the preview test.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cleanup_apply_with_cx_matches_legacy_on_empty_db() {
         run_async_test(async {
@@ -1015,7 +1010,6 @@ mod tests {
     /// storage queries; the table scan logic is identical. Proves
     /// the Cx-first variant produces bit-for-bit identical plan
     /// shapes for an empty DB.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cleanup_preview_with_cx_matches_legacy_on_empty_db() {
         run_async_test(async {

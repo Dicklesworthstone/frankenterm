@@ -104,7 +104,6 @@ impl WorkflowEngine {
     /// boundaries of the persist operation so a canceled caller skips the
     /// storage write entirely (pre-checkpoint) or abandons the returned
     /// execution cleanly (post-checkpoint).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn start_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -175,7 +174,6 @@ impl WorkflowEngine {
     /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
     /// `upsert_workflow_with_cx` storage call rather than delegating to the
     /// ambient-cx `start_with_id`. Legacy `start_with_id` preserved.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn start_with_id_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -226,7 +224,6 @@ impl WorkflowEngine {
     /// Tick 188 (ft-xbnl0.2.3): threads cx into the inner storage calls
     /// (`get_workflow_with_cx` + `get_step_logs_with_cx`) instead of
     /// delegating to the ambient-cx `resume`. Legacy `resume` preserved.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn resume_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -317,7 +314,6 @@ impl WorkflowEngine {
     /// Tick 188 (ft-xbnl0.2.3): routes to `find_incomplete_workflows_with_cx`
     /// so the inner storage call threads cx instead of running under ambient
     /// cx. Legacy `find_incomplete` preserved.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn find_incomplete_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -337,7 +333,6 @@ impl WorkflowEngine {
     /// `get_workflow_with_cx` + `upsert_workflow_with_cx` storage calls
     /// rather than delegating to the ambient-cx `update_status`. Legacy
     /// `update_status` preserved.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn update_status_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -444,7 +439,6 @@ impl WorkflowEngine {
     /// Tick 189 (ft-xbnl0.2.3): threads cx into the inner
     /// `insert_step_log_with_cx` storage call rather than delegating to the
     /// ambient-cx `log_step`. Legacy `log_step` preserved.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn log_step_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -928,7 +922,6 @@ async fn record_workflow_action(
 /// so callers in the startup path degrade gracefully — the
 /// workflow continues without a linked audit id rather than
 /// aborting.
-#[cfg(feature = "asupersync-runtime")]
 #[allow(clippy::too_many_arguments)]
 async fn record_workflow_action_with_cx(
     cx: &crate::cx::Cx,
@@ -1094,7 +1087,6 @@ pub(super) async fn record_workflow_start_action(
 /// cancellation the return is `None` (legacy contract: a failed
 /// audit write returns None and the workflow continues without a
 /// linked action id) so the startup path degrades gracefully.
-#[cfg(feature = "asupersync-runtime")]
 pub(super) async fn record_workflow_start_action_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
@@ -1177,7 +1169,6 @@ pub(super) async fn fetch_workflow_start_action_id(
 /// Returns `None` on cancellation (matches legacy "storage error
 /// → None" contract) so workflow resume paths degrade gracefully
 /// without a new error variant.
-#[cfg(feature = "asupersync-runtime")]
 pub(super) async fn fetch_workflow_start_action_id_with_cx(
     cx: &crate::cx::Cx,
     storage: &crate::storage::StorageHandle,
@@ -1298,7 +1289,6 @@ pub(super) async fn record_workflow_terminal_action(
 /// siblings. Preserves the "fire-and-forget on error" contract
 /// that matches the legacy helper — every audit/undo failure
 /// is warn-and-continue, not fail-fast.
-#[cfg(feature = "asupersync-runtime")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn record_workflow_terminal_action_with_cx(
     cx: &crate::cx::Cx,
@@ -1376,7 +1366,6 @@ pub(super) async fn record_workflow_terminal_action_maybe_cx(
     steps_executed: Option<usize>,
     start_action_id: Option<i64>,
 ) {
-    #[cfg(feature = "asupersync-runtime")]
     if let Some(cx) = cx {
         record_workflow_terminal_action_with_cx(
             cx,
@@ -1394,8 +1383,6 @@ pub(super) async fn record_workflow_terminal_action_maybe_cx(
         .await;
         return;
     }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    let _ = cx;
     record_workflow_terminal_action(
         storage,
         workflow_name,
@@ -1474,7 +1461,6 @@ mod tests {
     /// sleeps or timeouts to bind to virtual time — the Cx-first pattern
     /// here is boundary checkpoints on storage-backed operations, which
     /// are tested via the real storage path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn find_incomplete_cx_returns_empty_for_fresh_db_ft_xbnl0_2_2() {
         let (_tmp, db_path) = temp_db_path();

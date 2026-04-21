@@ -135,7 +135,6 @@ impl<T> SpscProducer<T> {
     /// a blocked `notified.await` breaks the caller out of the
     /// loop and surfaces as `Err(value)` — value is returned so
     /// the caller can retry with a different channel or drop.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_with_cx(&self, cx: &crate::cx::Cx, mut value: T) -> Result<(), T> {
         loop {
             if cx.checkpoint().is_err() {
@@ -160,11 +159,6 @@ impl<T> SpscProducer<T> {
                 }
             }
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn send_with_cx(&self, _cx: &crate::cx::Cx, value: T) -> Result<(), T> {
-        self.send(value).await
     }
 
     /// Try to send a value without waiting.
@@ -249,7 +243,6 @@ impl<T> SpscConsumer<T> {
     /// return shape, so callers already handle it correctly —
     /// they just see "channel ended" rather than blocking
     /// forever.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<T> {
         loop {
             if cx.checkpoint().is_err() {
@@ -338,7 +331,6 @@ impl<T: Clone> SpmcProducer<T> {
     /// `&Cx` through the notify-wait loop. A pre-cancelled cx
     /// or cancel during a blocked `notified.await` returns
     /// `Err(value)`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_with_cx(&self, cx: &crate::cx::Cx, value: T) -> Result<(), T> {
         loop {
             if cx.checkpoint().is_err() {
@@ -360,11 +352,6 @@ impl<T: Clone> SpmcProducer<T> {
             self.push_to_all(value);
             return Ok(());
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    pub async fn send_with_cx(&self, _cx: &crate::cx::Cx, value: T) -> Result<(), T> {
-        self.send(value).await
     }
 
     /// Try to send a value to all consumers without waiting.
@@ -486,7 +473,6 @@ impl<T> SpmcConsumer<T> {
     /// pre-cancel or mid-wait cancel — matches the
     /// closed-and-drained return shape so existing callers
     /// that check for `None` need no changes.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<T> {
         loop {
             if cx.checkpoint().is_err() {
@@ -590,7 +576,6 @@ mod tests {
     /// must match their legacy siblings for an uncancelled cx.
     /// Exercises the full send-then-recv round-trip on an SPSC
     /// channel with 3 values.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spsc_with_cx_preserves_fifo_order() {
         run_async_test(async {
@@ -611,7 +596,6 @@ mod tests {
     /// `recv_with_cx` must match their legacy siblings —
     /// broadcast semantics preserved, each consumer gets every
     /// value.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn spmc_with_cx_broadcasts_to_all_consumers() {
         run_async_test(async {

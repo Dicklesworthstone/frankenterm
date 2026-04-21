@@ -728,7 +728,6 @@ mod tests {
     // Cx-first send_* error path tests (no injector configured)
     // ========================================================================
 
-    #[cfg(feature = "asupersync-runtime")]
     fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -758,14 +757,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn make_injector_from_handle(handle: crate::wezterm::WeztermHandle) -> CxPolicyInjector {
         let engine = crate::policy::PolicyEngine::new(100, 1000, false);
         let gated = crate::policy::PolicyGatedInjector::new(engine, handle);
         CxPolicyInjector::new(gated)
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_text_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0001, || async {
@@ -778,7 +775,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_c_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0002, || async {
@@ -791,7 +787,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_d_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0003, || async {
@@ -804,7 +799,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_z_with_cx_no_injector_returns_err() {
         run_lab(0xA001_0004, || async {
@@ -821,7 +815,6 @@ mod tests {
     // Cx-first send_* with injector (LabRuntime end-to-end)
     // ========================================================================
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_text_with_cx_with_injector_delegates_to_policy() {
         run_lab(0xA002_0001, || async {
@@ -841,7 +834,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_c_with_cx_with_injector_delegates_to_policy() {
         run_lab(0xA002_0002, || async {
@@ -869,7 +861,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_d_with_cx_with_injector_delegates_to_policy() {
         run_lab(0xA002_0003, || async {
@@ -897,7 +888,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn send_ctrl_z_with_cx_with_injector_delegates_to_policy() {
         run_lab(0xA002_0004, || async {
@@ -929,7 +919,6 @@ mod tests {
     // Pre-cancelled cx propagation test
     // ========================================================================
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     #[should_panic(expected = "Cancelled")]
     fn send_text_with_cx_pre_cancelled_cx_panics_on_lock() {

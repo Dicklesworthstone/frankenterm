@@ -9,8 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime_compat::notify::Notify;
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::{CompatRuntime, mpsc};
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
 
@@ -137,7 +135,6 @@ impl BridgeCancellationToken {
     /// caller short-circuit the bridge-cancellation wait when an
     /// outer cx is cancelled — useful for supervisor futures that
     /// race the bridge token against a shutdown scope.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn cancelled_with_cx(&self, cx: &crate::cx::Cx) -> BridgeWaitOutcome {
         if self.is_cancelled() {
             return BridgeWaitOutcome::BridgeCancelled;
@@ -168,7 +165,6 @@ impl BridgeCancellationToken {
 }
 
 /// Outcome of [`BridgeCancellationToken::cancelled_with_cx`].
-#[cfg(feature = "asupersync-runtime")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeWaitOutcome {
     /// The bridge cancellation token was observed.
@@ -262,15 +258,10 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             self.search_direct(cx, request, on_phase).await
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.search_via_tokio_bridge(cx, request, on_phase).await
-        }
     }
 
     /// Run a search against a caller-provided asupersync capability context
@@ -289,7 +280,6 @@ impl SearchBridge {
     /// because frankensearch's cooperative-cancel API is defined against
     /// its own Cx type; the bridge token is the single source of truth
     /// that ties the two together.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_with_asupersync_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -335,7 +325,6 @@ impl SearchBridge {
         result
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn search_direct(
         &self,
         cx: Cx,
@@ -409,135 +398,6 @@ impl SearchBridge {
         }
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn search_via_tokio_bridge(
-        &self,
-        cx: Cx,
-        request: SearchBridgeRequest,
-        mut on_phase: impl FnMut(SearchPhase) + Send + 'static,
-    ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        let SearchBridgeRequest {
-            query,
-            limit,
-            timeout,
-            cancellation,
-            text_provider,
-        } = request;
-
-        let cancellation = cancellation.unwrap_or_default();
-        if cx.is_cancel_requested() {
-            cancellation.cancel();
-            return Err(SearchBridgeError::Cancelled {
-                reason: "capability context already cancelled".to_owned(),
-            });
-        }
-        if cancellation.is_cancelled() {
-            cx.set_cancel_requested(true);
-            return Err(SearchBridgeError::Cancelled {
-                reason: "bridge cancellation requested".to_owned(),
-            });
-        }
-
-        let (timeout_done, timeout_fired, timeout_thread) =
-            spawn_timeout_thread(timeout, cancellation.clone());
-
-        let (phase_tx, mut phase_rx) = mpsc::unbounded_channel();
-        let searcher = Arc::clone(&self.searcher);
-        let worker_cancellation = cancellation.clone();
-
-        let worker = crate::runtime_compat::spawn_blocking(
-            move || -> Result<SearchBridgeResult, SearchError> {
-                let (cancel_done, cancel_thread) =
-                    spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());
-
-                let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
-                    .build()
-                    .map_err(|err| SearchError::InvalidConfig {
-                        field: "search_bridge.runtime".to_owned(),
-                        value: "current_thread".to_owned(),
-                        reason: err,
-                    })?;
-
-                let search_result = runtime.block_on(async move {
-                    let mut best_results = Vec::new();
-                    let metrics = searcher
-                        .search(
-                            &cx,
-                            &query,
-                            limit,
-                            |doc_id| text_provider(doc_id),
-                            |phase| {
-                                update_best_results(&mut best_results, &phase);
-                                let _ = phase_tx.send(phase);
-                            },
-                        )
-                        .await?;
-
-                    Ok(SearchBridgeResult {
-                        results: best_results,
-                        metrics,
-                    })
-                });
-
-                cancel_done.store(true, Ordering::Release);
-                if let Some(handle) = cancel_thread {
-                    handle.thread().unpark();
-                    let _ = handle.join();
-                }
-
-                search_result
-            },
-        );
-        let mut worker = std::pin::pin!(worker);
-
-        let search_result = loop {
-            crate::runtime_compat::select! {
-                maybe_phase = phase_rx.recv() => {
-                    if let Some(phase) = maybe_phase {
-                        on_phase(phase);
-                    }
-                }
-                () = cancellation.cancelled() => {
-                    // The current blocking backend does not stop a running
-                    // blocking task on cancellation, so this bridge relies on the
-                    // worker cancellation thread to request cooperative exit.
-                    let timeout_ms = timeout.map_or(0, |value| value.as_millis() as u64);
-                    if timeout_fired.load(Ordering::Acquire) {
-                        break Err(SearchBridgeError::Timeout { timeout_ms });
-                    }
-                    break Err(SearchBridgeError::Cancelled {
-                        reason: "bridge cancellation requested".to_owned(),
-                    });
-                }
-                worker_result = &mut worker => {
-                    while let Ok(phase) = phase_rx.try_recv() {
-                        on_phase(phase);
-                    }
-                    let worker_result = worker_result.map_err(|message| SearchBridgeError::Runtime {
-                        message,
-                    })?;
-
-                    break match worker_result {
-                        Ok(result) => Ok(result),
-                        Err(error) => Err(map_search_error(
-                            error,
-                            &cancellation,
-                            timeout_fired.load(Ordering::Acquire),
-                            timeout,
-                        )),
-                    };
-                }
-            }
-        };
-
-        timeout_done.store(true, Ordering::Release);
-        if let Some(handle) = timeout_thread {
-            handle.thread().unpark();
-            let _ = handle.join();
-        }
-
-        search_result
-    }
 }
 
 fn map_search_error(
@@ -616,7 +476,6 @@ fn spawn_cancellation_thread(
 /// search finishes so the watcher thread exits without doing any more
 /// polling. The watcher is also unparked when the flag is flipped to
 /// shorten the worst-case teardown latency.
-#[cfg(feature = "asupersync-runtime")]
 fn spawn_asupersync_cancellation_watcher(
     cx: crate::cx::Cx,
     cancellation: BridgeCancellationToken,
@@ -829,7 +688,6 @@ mod tests {
         limit: usize,
         text_provider: TextProvider,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::for_testing();
             let (results, metrics) = searcher
@@ -839,34 +697,6 @@ mod tests {
             return Ok(SearchBridgeResult { results, metrics });
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let joined = crate::runtime_compat::spawn_blocking(
-                move || -> Result<SearchBridgeResult, SearchError> {
-                    let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
-                        .build()
-                        .map_err(|err| SearchError::InvalidConfig {
-                            field: "search_bridge.raw.runtime".to_owned(),
-                            value: "tokio_current_thread".to_owned(),
-                            reason: err,
-                        })?;
-
-                    runtime.block_on(async move {
-                        let cx = Cx::for_testing();
-                        let (results, metrics) = searcher
-                            .search_collect_with_text(&cx, &query, limit, |doc_id| {
-                                text_provider(doc_id)
-                            })
-                            .await?;
-                        Ok(SearchBridgeResult { results, metrics })
-                    })
-                },
-            )
-            .await
-            .map_err(|message| SearchBridgeError::Runtime { message })?;
-
-            joined.map_err(SearchBridgeError::Search)
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1454,7 +1284,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `cancelled_with_cx` returns
     /// `BridgeCancelled` when the bridge token is cancelled
     /// first (fast path via is_cancelled() check).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cancelled_with_cx_observes_bridge_cancel_fast_path() {
         let token = BridgeCancellationToken::new();
@@ -1468,7 +1297,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `cancelled_with_cx` returns
     /// `CxCancelled` when the cx is pre-cancelled and the
     /// bridge is NOT cancelled.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn cancelled_with_cx_observes_cx_cancel_when_bridge_live() {
         let token = BridgeCancellationToken::new();
@@ -1677,7 +1505,6 @@ mod tests {
     // Cx-first cancellation contract this slice owns.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_search_bridge {
         use super::*;
 

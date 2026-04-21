@@ -11,8 +11,6 @@ use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::timeout;
 #[cfg(feature = "cass-export")]
 use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery, StorageHandle};
 use crate::suggestions::Platform;
@@ -803,16 +801,9 @@ impl CassClient {
         query: &str,
         options: &SearchOptions,
     ) -> Result<CassSearchResult, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.search_with_cx(&cx, query, options).await
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = build_search_args(query, options);
-            let output = self.run(&args).await?;
-            parse_json(&output, self.max_error_bytes)
         }
     }
 
@@ -827,7 +818,6 @@ impl CassClient {
     /// The legacy [`search`](Self::search) entry point is preserved for
     /// non-migrated callers; under `asupersync-runtime` it now delegates
     /// to this method with an ambient Cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -845,28 +835,14 @@ impl CassClient {
         path: &Path,
         agent: Option<CassAgent>,
     ) -> Result<Vec<CassSession>, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.search_sessions_with_cx(&cx, path, agent).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = build_search_sessions_args(path, agent);
-            let output = self.run(&args).await?;
-            let sessions = parse_sessions(&output, self.max_error_bytes)?;
-            if sessions.is_empty() {
-                return Err(CassError::NoResults {
-                    query: format!("path={}", path.display()),
-                });
-            }
-            Ok(sessions)
         }
     }
 
     /// Search sessions under a given path + agent under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn search_sessions_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -886,28 +862,14 @@ impl CassClient {
 
     /// Query a specific session by session id.
     pub async fn query_session(&self, session_id: &str) -> Result<CassSession, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.query_session_with_cx(&cx, session_id).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = build_query_session_args(session_id);
-            let output = self.run(&args).await?;
-            let mut sessions = parse_sessions(&output, self.max_error_bytes)?;
-            if let Some(session) = sessions.pop() {
-                return Ok(session);
-            }
-            Err(CassError::NoResults {
-                query: format!("session_id={session_id}"),
-            })
         }
     }
 
     /// Query a specific session by session id under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn query_session_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -931,24 +893,16 @@ impl CassClient {
         line_number: usize,
         options: &ViewOptions,
     ) -> Result<CassViewResult, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self
                 .query_with_cx(&cx, session_path, line_number, options)
                 .await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = build_query_args(session_path, line_number, options);
-            let output = self.run(&args).await?;
-            parse_json(&output, self.max_error_bytes)
-        }
     }
 
     /// Query a specific session via `cass view` under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn query_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -963,22 +917,14 @@ impl CassClient {
 
     /// Check cass health via `cass status`.
     pub async fn status(&self) -> Result<CassStatus, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.status_with_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = vec!["status".to_string(), "--json".to_string()];
-            let output = self.run(&args).await?;
-            parse_json(&output, self.max_error_bytes)
         }
     }
 
     /// Check cass health via `cass status` under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn status_with_cx(&self, cx: &crate::cx::Cx) -> Result<CassStatus, CassError> {
         let args = vec!["status".to_string(), "--json".to_string()];
         let output = self.run_with_cx(cx, &args).await?;
@@ -996,22 +942,14 @@ impl CassClient {
         &self,
         workspace: Option<&str>,
     ) -> Result<CassIndexResult, CassError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.trigger_index_with_cx(&cx, workspace).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = build_trigger_index_args(workspace);
-            let output = self.run(&args).await?;
-            parse_json(&output, self.max_error_bytes)
         }
     }
 
     /// Trigger a cass index refresh under an explicit `&Cx`
     /// (ft-xbnl0.2.3 Cx-first entry point).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn trigger_index_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1022,30 +960,11 @@ impl CassClient {
         parse_json(&output, self.max_error_bytes)
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run(&self, args: &[String]) -> Result<String, CassError> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(args);
-        cmd.kill_on_drop(true);
-
-        let output = match timeout(self.timeout, cmd.output()).await {
-            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-            Err(_) => {
-                return Err(CassError::Timeout {
-                    timeout_secs: self.timeout.as_secs(),
-                });
-            }
-        };
-
-        self.finalize_output(output)
-    }
-
     /// Cx-first subprocess execution (ft-xbnl0.2.3). The subprocess
     /// timeout is bound to the provided `Cx` via
     /// [`crate::runtime_compat::timeout_with_cx`] so cancellation,
     /// budget, and virtual time propagate into the `cass` invocation.
     /// Mirrors the pattern in [`caut::CautClient::run_with_cx`].
-    #[cfg(feature = "asupersync-runtime")]
     async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CassError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
@@ -2374,7 +2293,6 @@ mod tests {
     /// Pins the error-surface contract so a future refactor doesn't
     /// accidentally flip invalid-binary into one of the other error
     /// surfaces.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn search_with_cx_returns_io_error_for_invalid_binary() {
         use crate::runtime_compat::CompatRuntime;

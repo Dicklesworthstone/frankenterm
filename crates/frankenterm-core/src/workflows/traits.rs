@@ -119,7 +119,6 @@ pub trait Workflow: Send + Sync {
     /// `&Cx` themselves; new workflows and workflows that need
     /// fine-grained cancellation should override this to consume the
     /// `Cx` explicitly.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -140,7 +139,6 @@ pub trait Workflow: Send + Sync {
     ///
     /// Delegates to [`cleanup`] by default; override to consume `&Cx`
     /// when cleanup work needs explicit cancellation or budget control.
-    #[cfg(feature = "asupersync-runtime")]
     fn cleanup_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -344,7 +342,6 @@ mod tests {
     /// compiler type-checks that every `Workflow` implementation
     /// automatically gets a callable `execute_step_cx` via the default
     /// impl, with the correct lifetime plumbing on `BoxFuture<'a, _>`.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(dead_code)]
     fn _execute_step_cx_signature_check<'a, W: Workflow>(
         w: &'a W,
@@ -355,7 +352,6 @@ mod tests {
     }
 
     /// Compile-time signature check for `Workflow::cleanup_cx` (ft-xbnl0.2.2).
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(dead_code)]
     fn _cleanup_cx_signature_check<'a, W: Workflow>(
         w: &'a W,

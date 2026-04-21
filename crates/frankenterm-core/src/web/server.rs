@@ -55,7 +55,6 @@ pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle
 ///
 /// Tick 101 upgraded this from a simple pre-flight delegate to
 /// a true cx-threading entry point.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn start_web_server_with_cx(
     cx: &crate::cx::Cx,
     config: WebServerConfig,
@@ -131,7 +130,6 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 /// caller-initiated cx-cancel now triggers the same graceful-
 /// shutdown path (`signal_shutdown` + `poke_listener` + drain
 /// join handle) that a SIGTERM would.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig) -> Result<()> {
     let WebServerHandle {
         bound_addr,

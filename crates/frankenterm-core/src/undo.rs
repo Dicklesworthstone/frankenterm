@@ -258,7 +258,6 @@ impl UndoExecutor {
     /// follow-on: once WeztermInterface pane-lifecycle methods
     /// (all Cx-first since tick 46) are threaded through here,
     /// the dispatched undo action will also honor caller cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn execute_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -443,7 +442,6 @@ impl UndoExecutor {
     /// honours caller cancellation at the two points where it can
     /// actually block: the cross-WorkflowRunner abort flow and
     /// the storage write.
-    #[cfg(feature = "asupersync-runtime")]
     async fn execute_workflow_abort_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -600,7 +598,6 @@ impl UndoExecutor {
     /// IS gone. The error includes the pane_id so the caller can
     /// surface "pane closed but audit update failed" to
     /// operators.
-    #[cfg(feature = "asupersync-runtime")]
     async fn execute_pane_close_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -723,7 +720,6 @@ impl UndoExecutor {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`Self::mark_undone`].
     /// Routes both storage calls through cx-first siblings.
-    #[cfg(feature = "asupersync-runtime")]
     async fn mark_undone_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1493,7 +1489,6 @@ mod tests {
     /// not-found path (action_id=99999 returns NotApplicable with
     /// a "not found" message) on both variants and asserts the
     /// UndoExecutionResult is structurally equivalent.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_matches_legacy_on_not_found() {
         run_async_test(async {
@@ -1539,7 +1534,6 @@ mod tests {
     /// on the no-metadata path — a valid action_id with no undo
     /// metadata returns NotApplicable via the second storage
     /// query (`get_action_undo` returns None).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_matches_legacy_on_no_metadata() {
         run_async_test(async {
@@ -1940,7 +1934,6 @@ mod tests {
     /// delegation) would still succeed, but a future concrete
     /// WeztermHandle with different pre-flight behavior on the
     /// Cx vs non-Cx path would diverge.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn execute_with_cx_pane_close_end_to_end() {
         run_async_test(async {

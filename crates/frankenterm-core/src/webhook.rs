@@ -302,7 +302,6 @@ pub trait WebhookTransport: Send + Sync {
     /// The `cx` parameter lifetime matches the returned future so
     /// overrides can thread cx into async operations held by the
     /// future.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -365,7 +364,6 @@ impl WebhookDispatcher {
     /// propagates through each endpoint's `transport.send_with_cx`
     /// call. Caller cancellation cuts mid-fanout once the
     /// transport observes it.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn dispatch_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -437,7 +435,6 @@ impl WebhookDispatcher {
     /// through each endpoint delivery via `transport.send_with_cx`.
     /// When the transport is a Cx-aware HTTP client, caller
     /// cancellation propagates through to the underlying request.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn dispatch_payload_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -513,7 +510,6 @@ impl NotificationSender for WebhookDispatcher {
         "webhook"
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     fn send_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -637,7 +633,6 @@ mod tests {
             self.requests.lock().unwrap().clone()
         }
 
-        #[cfg(feature = "asupersync-runtime")]
         fn cx_requests(&self) -> Vec<MockRequest> {
             self.cx_requests.lock().unwrap().clone()
         }
@@ -664,7 +659,6 @@ mod tests {
         /// suite can observe which path was used. Concrete transports
         /// (e.g. asupersync::http) override this to propagate caller
         /// cx; the default trait impl would delegate to `send`.
-        #[cfg(feature = "asupersync-runtime")]
         fn send_with_cx<'a>(
             &'a self,
             _cx: &'a crate::cx::Cx,
@@ -879,7 +873,6 @@ mod tests {
     /// HTTP call. Regression guard: if the dispatcher regressed to
     /// calling `send` directly, `cx_requests` would stay empty while
     /// `requests` would populate — this test would fail loudly.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn dispatch_payload_with_cx_invokes_transport_cx_path() {
         run_async_test(async {
@@ -929,7 +922,6 @@ mod tests {
     /// `dispatch_payload_with_cx_invokes_transport_cx_path` but
     /// via the higher-level detection surface used by pattern
     /// handlers.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn dispatch_with_cx_routes_through_cx_aware_transport() {
         run_async_test(async {

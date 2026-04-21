@@ -10,8 +10,6 @@ use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
 use crate::runtime_compat::process::Command;
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::timeout;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -279,16 +277,9 @@ impl CautClient {
 
     /// Fetch usage data via `caut usage`.
     pub async fn usage(&self, service: CautService) -> Result<CautUsage, CautError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.usage_cx(&cx, service).await
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = Self::build_args("usage", service);
-            let output = self.run_inner(&args).await?;
-            parse_usage_json(&output, service, self.max_error_bytes)
         }
     }
 
@@ -297,7 +288,6 @@ impl CautClient {
     /// Cx-first entry point (ft-xbnl0.2.2): the subprocess timeout binds to
     /// the provided `Cx` so cancellation, budget, and virtual time propagate
     /// into the `caut` invocation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn usage_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -314,21 +304,13 @@ impl CautClient {
     /// `usage` call performs the refresh/read in one step and returns the latest
     /// account snapshot.
     pub async fn refresh(&self, service: CautService) -> Result<CautRefresh, CautError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.refresh_cx(&cx, service).await
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let args = Self::build_args("usage", service);
-            let output = self.run_inner(&args).await?;
-            parse_refresh_json(&output, service, self.max_error_bytes)
-        }
     }
 
     /// Refresh usage data under an explicit `&Cx` (ft-xbnl0.2.2 Cx-first API).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn refresh_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -351,7 +333,6 @@ impl CautClient {
 
     /// Cx-first subprocess execution (ft-xbnl0.2.2). The subprocess timeout
     /// is bound to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`].
-    #[cfg(feature = "asupersync-runtime")]
     async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
@@ -371,24 +352,6 @@ impl CautClient {
     }
 
     /// Non-Cx subprocess execution used by the non-asupersync fallback path.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_inner(&self, args: &[String]) -> Result<String, CautError> {
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(args);
-        cmd.kill_on_drop(true);
-
-        let output = match timeout(self.timeout, cmd.output()).await {
-            Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
-            Err(_) => {
-                return Err(CautError::Timeout {
-                    timeout_secs: self.timeout.as_secs(),
-                });
-            }
-        };
-
-        self.finalize_output(output)
-    }
-
     fn finalize_output(&self, output: std::process::Output) -> Result<String, CautError> {
         if !output.status.success() {
             let status = output.status.code().unwrap_or(-1);
@@ -773,7 +736,6 @@ mod tests {
     /// starts, no real time elapses, and the LabRuntime scheduler remains in
     /// control. If a wall-clock timeout or ambient runtime handle sneaks
     /// back in, this test either step-explodes or burns real seconds.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn caut_client_usage_cx_runs_under_labruntime() {
         use std::sync::Arc;

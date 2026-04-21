@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "asupersync-runtime")]
 use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
 use crate::retry::RetryPolicy;
@@ -198,19 +197,13 @@ impl MuxPool {
     /// Used directly by tests and by `execute_with_recovery_inner`.
     #[cfg_attr(feature = "asupersync-runtime", allow(dead_code))]
     async fn acquire_client(&self) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.acquire_client_with_cx(&cx).await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.acquire_client_inner().await
-        }
     }
 
     /// Acquire a client using an explicit capability context.
-    #[cfg(feature = "asupersync-runtime")]
     async fn acquire_client_with_cx(
         &self,
         cx: &Cx,
@@ -250,44 +243,6 @@ impl MuxPool {
     }
 
     /// Acquire a client without an explicit capability context.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn acquire_client_inner(
-        &self,
-    ) -> Result<(DirectMuxClient, PoolAcquireGuard), MuxPoolError> {
-        let result = self.pool.acquire().await?;
-        let (conn, guard) = result.into_parts();
-        let client = match conn {
-            Some(c) => {
-                tracing::trace!(
-                    subsystem = "mux_pool",
-                    event = "acquire",
-                    source = "idle",
-                    "reused idle mux connection"
-                );
-                c
-            }
-            None => match DirectMuxClient::connect(self.mux_config.clone()).await {
-                Ok(client) => {
-                    let count = self.connections_created.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::debug!(
-                        subsystem = "mux_pool",
-                        event = "acquire",
-                        source = "new",
-                        total_created = count,
-                        "created new mux connection"
-                    );
-                    client
-                }
-                Err(e) => {
-                    let count = self.connections_failed.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::warn!(subsystem = "mux_pool", event = "connect_failed", total_failed = count, error = %e, "mux connection creation failed");
-                    return Err(MuxPoolError::Mux(e));
-                }
-            },
-        };
-        Ok((client, guard))
-    }
-
     /// Return a healthy client to the pool for reuse.
     ///
     /// Legacy ambient path retained alongside the cx-first sibling
@@ -310,7 +265,6 @@ impl MuxPool {
     /// waiting. Callers inside cx-aware execute paths (e.g.
     /// `execute_with_recovery_with_cx`) should prefer this sibling
     /// so release honors cancellation end-to-end.
-    #[cfg(feature = "asupersync-runtime")]
     async fn return_client_with_cx(&self, cx: &Cx, client: DirectMuxClient) {
         tracing::trace!(
             subsystem = "mux_pool",
@@ -329,18 +283,12 @@ impl MuxPool {
     where
         Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
     {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = Cx::current().unwrap_or_else(cx::for_request);
             return self.execute_with_recovery_with_cx(&cx, op_name, op).await;
         }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.execute_with_recovery_inner(op_name, op).await
-        }
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     async fn execute_with_recovery_with_cx<T, Op>(
         &self,
         cx: &Cx,
@@ -432,86 +380,6 @@ impl MuxPool {
     }
 
     /// Non-cx recovery loop for when asupersync-runtime is not enabled.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn execute_with_recovery_inner<T, Op>(
-        &self,
-        op_name: &'static str,
-        mut op: Op,
-    ) -> Result<T, MuxPoolError>
-    where
-        Op: for<'a> FnMut(&'a mut DirectMuxClient) -> MuxOpFuture<'a, T>,
-    {
-        let max_attempts = if self.recovery.enabled {
-            self.recovery.retry_policy.max_attempts.unwrap_or(1).max(1)
-        } else {
-            1
-        };
-
-        let mut attempt: u32 = 0;
-        loop {
-            attempt = attempt.saturating_add(1);
-
-            let (mut client, _guard) = self.acquire_client().await?;
-            let result = op(&mut client).await;
-            match result {
-                Ok(value) => {
-                    self.return_client(client).await;
-                    if attempt > 1 {
-                        self.recovery_successes.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Ok(value);
-                }
-                Err(err) => {
-                    let cancelled = err.is_cancelled();
-                    let kind = err.protocol_error_kind();
-                    let can_retry = !cancelled
-                        && self.recovery.enabled
-                        && attempt < max_attempts
-                        && matches!(
-                            kind,
-                            ProtocolErrorKind::Recoverable | ProtocolErrorKind::Transient
-                        );
-                    if can_retry {
-                        self.recovery_attempts.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            op = op_name,
-                            attempt,
-                            max_attempts,
-                            cancelled,
-                            kind = ?kind,
-                            error = %err,
-                            "mux pool op failed; reconnecting and retrying"
-                        );
-
-                        let delay = self
-                            .recovery
-                            .retry_policy
-                            .delay_for_attempt(attempt.saturating_sub(1));
-                        if !delay.is_zero() {
-                            sleep(delay).await;
-                        }
-                        continue;
-                    }
-
-                    if kind == ProtocolErrorKind::Permanent {
-                        self.permanent_failures.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    tracing::debug!(
-                        op = op_name,
-                        attempt,
-                        max_attempts,
-                        cancelled,
-                        kind = ?kind,
-                        error = %err,
-                        "mux pool op failed; dropping client"
-                    );
-                    return Err(MuxPoolError::Mux(err));
-                }
-            }
-        }
-    }
-
     /// List all panes via a pooled connection.
     pub async fn list_panes(&self) -> Result<ListPanesResponse, MuxPoolError> {
         self.execute_with_recovery("list_panes", |client| Box::pin(client.list_panes()))
@@ -519,7 +387,6 @@ impl MuxPool {
     }
 
     /// List all panes via a pooled connection using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn list_panes_with_cx(&self, cx: &Cx) -> Result<ListPanesResponse, MuxPoolError> {
         let op_cx = cx.clone();
         self.execute_with_recovery_with_cx(cx, "list_panes", move |client| {
@@ -543,7 +410,6 @@ impl MuxPool {
     }
 
     /// Get lines from a pane via a pooled connection using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_lines_with_cx(
         &self,
         cx: &Cx,
@@ -571,7 +437,6 @@ impl MuxPool {
     }
 
     /// Poll for pane render changes using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_with_cx(
         &self,
         cx: &Cx,
@@ -641,7 +506,6 @@ impl MuxPool {
     }
 
     /// Poll render changes for many panes using depth-limited pipelining and explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn get_pane_render_changes_batch_with_cx(
         &self,
         cx: &Cx,
@@ -720,7 +584,6 @@ impl MuxPool {
     }
 
     /// Write raw bytes to a pane via a pooled connection using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn write_to_pane_with_cx(
         &self,
         cx: &Cx,
@@ -750,7 +613,6 @@ impl MuxPool {
     }
 
     /// Send text via paste mode through a pooled connection using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn send_paste_with_cx(
         &self,
         cx: &Cx,
@@ -789,7 +651,6 @@ impl MuxPool {
     }
 
     /// Run a health check by listing panes using explicit `Cx`.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn health_check_with_cx(&self, cx: &Cx) -> Result<(), MuxPoolError> {
         let check_num = self.health_checks.fetch_add(1, Ordering::Relaxed) + 1;
         match self.list_panes_with_cx(cx).await {
@@ -830,7 +691,6 @@ impl MuxPool {
     /// Routes through `ConnectionPool::evict_idle_with_cx` so
     /// periodic-eviction tasks can be interrupted by a pool
     /// shutdown-cancel without hanging on the idle mutex.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn evict_idle_with_cx(&self, cx: &Cx) -> usize {
         let evicted = self.pool.evict_idle_with_cx(cx).await;
         if evicted > 0 {
@@ -861,7 +721,6 @@ impl MuxPool {
     /// paths that invoke a pool-wide flush can bail under a
     /// cancelled parent cx instead of deadlocking on the idle
     /// mutex (which itself cx-threads its acquire).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn clear_with_cx(&self, cx: &Cx) {
         tracing::debug!(
             subsystem = "mux_pool",
@@ -891,7 +750,6 @@ impl MuxPool {
     /// Routes through `ConnectionPool::stats_with_cx` so a
     /// telemetry exporter running under a cancelled parent cx
     /// doesn't stall waiting for the idle mutex snapshot.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn stats_with_cx(&self, cx: &Cx) -> MuxPoolStats {
         MuxPoolStats {
             pool: self.pool.stats_with_cx(cx).await,
@@ -1256,7 +1114,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_cx_succeeds() {
         run_async_test(async {
@@ -1276,7 +1133,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_cx_reuses_idle_connection() {
         run_async_test(async {
@@ -1420,7 +1276,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_cx_recovers_from_unexpected_response_by_reconnecting() {
         run_async_test(async {
@@ -1478,7 +1333,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_success() {
         run_async_test(async {
@@ -1621,7 +1475,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_failure() {
         run_async_test(async {
@@ -1657,7 +1510,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_recovers_from_unexpected_response() {
         run_async_test(async {
@@ -1703,7 +1555,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_cx_without_recovery_does_not_retry() {
         run_async_test(async {
@@ -2235,7 +2086,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_empty_pane_ids_with_cx() {
         run_async_test(async {
@@ -2275,7 +2125,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_single_pane_with_cx() {
         run_async_test(async {
@@ -2323,7 +2172,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_multiple_panes_with_cx() {
         run_async_test(async {
@@ -2377,7 +2225,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_large_batch_with_cx_preserves_order() {
         run_async_test(async {
@@ -2424,7 +2271,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_duplicate_pane_ids_with_cx() {
         run_async_test(async {
@@ -2477,7 +2323,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_pipeline_depth_one_with_cx() {
         run_async_test(async {
@@ -2602,7 +2447,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_cx_without_recovery_does_not_retry() {
         run_async_test(async {
@@ -2680,7 +2524,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_multiple_connect_failures_with_cx_increment_counter() {
         run_async_test(async {
@@ -2712,7 +2555,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_list_panes_with_precancelled_cx_returns_pool_cancelled_without_connecting() {
         run_async_test(async {
@@ -2754,7 +2596,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_execute_with_recovery_with_cx_does_not_retry_cancelled_mux_io() {
         run_async_test(async {
@@ -2824,7 +2665,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_health_check_with_precancelled_cx_tracks_failure_without_connecting() {
         run_async_test(async {
@@ -2868,7 +2708,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_get_lines_with_precancelled_cx_returns_pool_cancelled_without_connecting() {
         run_async_test(async {
@@ -2912,7 +2751,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_write_to_pane_with_precancelled_cx_returns_pool_cancelled_without_connecting() {
         run_async_test(async {
@@ -2956,7 +2794,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_send_paste_with_precancelled_cx_returns_pool_cancelled_without_connecting() {
         run_async_test(async {
@@ -3018,7 +2855,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_multiple_health_checks_with_cx_track_counter() {
         run_async_test(async {
@@ -3061,7 +2897,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_get_lines_with_cx_succeeds() {
         run_async_test(async {
@@ -3085,7 +2920,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_get_pane_render_changes_with_cx_succeeds() {
         run_async_test(async {
@@ -3122,7 +2956,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_write_to_pane_with_cx_succeeds() {
         run_async_test(async {
@@ -3164,7 +2997,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_send_paste_with_cx_reuses_connection() {
         run_async_test(async {
@@ -3216,7 +3048,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_with_cx_falls_back_to_sequential_after_pipeline_error() {
         run_async_test(async {
@@ -3268,7 +3099,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_batch_render_with_cx_pipeline_depth_one_skips_pipeline_fallback() {
         run_async_test(async {
@@ -3310,7 +3140,6 @@ mod tests {
     //   - pre-cancelled ops after a successful op leave idle connections intact
     //   - get_pane_render_changes and batch render paths also fast-fail
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_get_lines_with_recovery_enabled_skips_retry() {
         run_async_test(async {
@@ -3363,7 +3192,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_write_to_pane_with_recovery_enabled_skips_retry() {
         run_async_test(async {
@@ -3415,7 +3243,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_send_paste_with_recovery_enabled_skips_retry() {
         run_async_test(async {
@@ -3467,7 +3294,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_multiple_precancelled_ops_accumulate_no_side_effects() {
         run_async_test(async {
@@ -3525,7 +3351,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_after_successful_op_leaves_idle_intact() {
         run_async_test(async {
@@ -3583,7 +3408,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_get_pane_render_changes_returns_cancelled_without_connecting() {
         run_async_test(async {
@@ -3630,7 +3454,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pool_precancelled_batch_render_returns_cancelled_without_connecting() {
         run_async_test(async {
@@ -3729,7 +3552,6 @@ mod tests {
     // the whole point of the deterministic scheduler.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_mux_pool {
         use super::*;
         use std::sync::Arc;

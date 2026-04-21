@@ -160,7 +160,6 @@ pub trait NotificationSender: Send + Sync {
     /// The `cx` parameter lifetime matches the returned future so
     /// overrides can thread cx into async operations held by the
     /// future.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_with_cx<'a>(
         &'a self,
         _cx: &'a crate::cx::Cx,
@@ -233,7 +232,6 @@ where
     /// sender's `send_with_cx`. Without this override the trait
     /// default would delegate to our `send()` which loses cx at the
     /// wrapper boundary.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -377,7 +375,6 @@ impl NotificationPipeline {
     /// The legacy [`handle_detection`](Self::handle_detection) entry
     /// point is preserved for non-migrated callers; this is strictly
     /// additive.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn handle_detection_with_cx(
         &mut self,
         cx: &crate::cx::Cx,
@@ -452,7 +449,6 @@ impl NotificationPipeline {
     /// through `NotificationSender::send_with_cx` so each sender's
     /// cancellable I/O honors caller cancellation. The
     /// `handle_detection_with_cx` path uses this helper.
-    #[cfg(feature = "asupersync-runtime")]
     async fn dispatch_payload_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -577,7 +573,6 @@ mod tests {
         /// `send` fallback — without this, the default trait impl
         /// `send_with_cx → send` would be indistinguishable from a
         /// Cx-aware override at the MockSender level.
-        #[cfg(feature = "asupersync-runtime")]
         cx_sent: Arc<Mutex<Vec<NotificationPayload>>>,
     }
 
@@ -586,12 +581,10 @@ mod tests {
             Self {
                 name,
                 sent,
-                #[cfg(feature = "asupersync-runtime")]
                 cx_sent: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        #[cfg(feature = "asupersync-runtime")]
         fn with_cx_sent(
             name: &'static str,
             sent: Arc<Mutex<Vec<NotificationPayload>>>,
@@ -631,7 +624,6 @@ mod tests {
         /// took. Without this override, the `NotificationSender` trait
         /// default would delegate to `send`, making the two paths
         /// indistinguishable at the MockSender boundary.
-        #[cfg(feature = "asupersync-runtime")]
         fn send_with_cx<'a>(
             &'a self,
             _cx: &'a crate::cx::Cx,
@@ -949,7 +941,6 @@ mod tests {
     /// forward cx to the wrapped sender. Pins the tick 35 fix — the
     /// wrapper's Cx-first path reaches the inner sender's Cx-aware
     /// surface instead of falling back to the ambient `send()`.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn rate_limited_sender_with_cx_forwards_to_inner() {
         run_async_test(async {
@@ -1145,7 +1136,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: handle_detection_with_cx with a fresh Cx
     /// behaves identically to handle_detection for the mute-filter path.
     /// Pins no-regression on the Cx-first variant.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pipeline_with_cx_mute_store_blocks_muted_events() {
         run_async_test(async {
@@ -1221,7 +1211,6 @@ mod tests {
     /// separate buckets. Fans out across two senders to additionally
     /// verify that cx reaches every sender in the vec (not just the
     /// first).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn pipeline_handle_detection_with_cx_invokes_sender_cx_path() {
         run_async_test(async {

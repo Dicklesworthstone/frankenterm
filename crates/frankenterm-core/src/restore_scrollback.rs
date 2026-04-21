@@ -295,7 +295,6 @@ impl ScrollbackInjector {
     /// `InjectionReport` gathered so far — panes that have not
     /// yet been processed are simply absent from the result, so
     /// callers can inspect what did land before shutdown.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn inject_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -422,7 +421,6 @@ impl ScrollbackInjector {
     /// delays so a cx-cancel during a large-scrollback injection cleanly
     /// aborts at the next chunk boundary rather than completing the full
     /// injection before unwinding.
-    #[cfg(feature = "asupersync-runtime")]
     async fn inject_pane_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -833,7 +831,6 @@ mod tests {
     /// equivalent `InjectionReport` to `inject` (same success/
     /// failure counts) for an uncancelled cx. Verified on a
     /// 2-pane injection where both panes are in the id_map.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn inject_with_cx_matches_legacy() {
         run_async_test(async {

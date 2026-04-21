@@ -1578,7 +1578,6 @@ pub async fn persist_captured_segment(
 ///
 /// Legacy [`persist_captured_segment`] preserved for ambient-cx
 /// callers and non-asupersync builds.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn persist_captured_segment_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -2925,7 +2924,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first:
     /// `persist_captured_segment_with_cx` must match
     /// `persist_captured_segment` on the basic append flow.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn persist_captured_segment_with_cx_matches_legacy() {
         run_async_test(async {

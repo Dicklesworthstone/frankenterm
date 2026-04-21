@@ -9,9 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::sleep;
-
 /// Backoff configuration for wait loops.
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -154,14 +151,9 @@ pub async fn wait_for<P>(
 where
     P: WaitPredicate + Send,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         wait_for_cx(&cx, predicate, timeout, backoff).await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        wait_for_inner(predicate, timeout, backoff).await
     }
 }
 
@@ -171,7 +163,6 @@ where
 /// All inter-poll sleeps bind to the provided capability context so
 /// cancellation, budget, and virtual time propagate cleanly into the
 /// backoff delay.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_cx<P>(
     cx: &crate::cx::Cx,
     mut predicate: P,
@@ -250,54 +241,7 @@ where
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn wait_for_inner<P>(
-    mut predicate: P,
-    timeout: Duration,
-    backoff: Backoff,
-) -> Result<P::Output, WaitError>
-where
-    P: WaitPredicate + Send,
-{
-    let expected = predicate.describe();
-    let start = Instant::now();
-    let deadline = start + timeout;
-    let mut retries = 0usize;
-    let mut delay = backoff.initial;
-    let mut last_observed = None;
-
-    loop {
-        retries = retries.saturating_add(1);
-        match predicate.check().await {
-            WaitFor::Ready(value) => return Ok(value),
-            WaitFor::NotReady { last_observed: obs } => {
-                if obs.is_some() {
-                    last_observed = obs;
-                }
-            }
-        }
-
-        let now = Instant::now();
-        if now >= deadline || backoff.max_retries.is_some_and(|max| retries >= max) {
-            return Err(WaitError {
-                expected,
-                last_observed,
-                retries,
-                elapsed: now.saturating_duration_since(start),
-            });
-        }
-
-        let remaining = deadline.saturating_duration_since(now);
-        let sleep_for = if delay > remaining { remaining } else { delay };
-        if !sleep_for.is_zero() {
-            sleep(sleep_for).await;
-        }
-        delay = backoff.next_delay(delay);
-    }
-}
-
 /// Wait for a query to return the expected value under an explicit `&Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_value_cx<F, Fut, T>(
     cx: &crate::cx::Cx,
     query: F,
@@ -421,7 +365,6 @@ where
 }
 
 /// Wait for quiescence under an explicit `&Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_quiescence_cx<S>(
     cx: &crate::cx::Cx,
     signals: S,
@@ -434,7 +377,6 @@ where
 }
 
 /// Wait for quiescence with custom backoff under an explicit `&Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_quiescence_with_backoff_cx<S>(
     cx: &crate::cx::Cx,
     signals: S,
@@ -762,7 +704,6 @@ impl QuiescenceSignals for QuiescenceSnapshot {
 }
 
 /// Wait for a boolean condition under an explicit `&Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_condition_cx<F, Fut>(
     cx: &crate::cx::Cx,
     description: impl Into<String>,
@@ -788,7 +729,6 @@ where
 }
 
 /// Wait for a boolean condition with custom backoff under an explicit `&Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn wait_for_condition_with_backoff_cx<F, Fut>(
     cx: &crate::cx::Cx,
     description: impl Into<String>,
@@ -877,7 +817,6 @@ mod tests {
     /// `wait_for_cx` path runs under seed-locked virtual-time scheduling.
     /// A predicate that succeeds on the 3rd poll verifies that the backoff
     /// sleep uses virtual time (no wall seconds consumed).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn wait_for_cx_runs_under_labruntime() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

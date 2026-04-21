@@ -207,7 +207,6 @@ impl SecretScanEngine {
     /// synchronous + CPU-only, so per-row cancellation would require
     /// storage._with_cx which does not yet exist (147 storage async
     /// fns without cx). The between-batches seam is the value-add.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn scan_storage_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -225,7 +224,6 @@ impl SecretScanEngine {
     /// `latest_secret_scan_report` (checkpoint read) and
     /// `record_secret_scan_report` (checkpoint write) now route
     /// through their cx-first siblings.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn scan_storage_incremental_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -267,7 +265,6 @@ impl SecretScanEngine {
     /// Cx-first [`Self::scan_storage_from`] (ft-xbnl0.2.3). Identical
     /// batch-loop semantics with a per-iteration `cx.checkpoint()?`
     /// gating the next `scan_segments` call.
-    #[cfg(feature = "asupersync-runtime")]
     async fn scan_storage_from_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1122,7 +1119,6 @@ mod tests {
     /// the Cx-first variant's per-batch checkpoint gating doesn't
     /// accidentally perturb the report's match counts, samples, or
     /// bytes-scanned totals.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn scan_storage_with_cx_matches_legacy_with_matches() {
         run_async_test(async {

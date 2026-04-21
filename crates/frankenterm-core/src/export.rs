@@ -240,7 +240,6 @@ pub async fn export_jsonl<W: Write>(
 /// serialization + I/O. Adding checkpoints inside the loop
 /// would be excessive — storage query cost dominates export
 /// time on large tables.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn export_jsonl_with_cx<W: Write>(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -695,7 +694,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `export_jsonl_with_cx` must match
     /// `export_jsonl` on the same fixture. Uses the same
     /// topology as `export_segments_to_buffer` with a fresh cx.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn export_jsonl_with_cx_matches_legacy() {
         run_async_test(async {

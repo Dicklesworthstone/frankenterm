@@ -105,13 +105,7 @@ impl CxPolicyInjector {
         cx: &crate::cx::Cx,
         adapter: crate::replay_capture::SharedCaptureAdapter,
     ) {
-        #[cfg(feature = "asupersync-runtime")]
         let mut injector = self.inner.lock_with_cx(cx).await;
-        #[cfg(not(feature = "asupersync-runtime"))]
-        let mut injector = {
-            let _ = cx;
-            self.inner.lock().await
-        };
         injector.set_decision_capture(adapter);
     }
 
@@ -124,20 +118,11 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let mut injector = self.inner.lock_with_cx(cx).await;
             return injector
                 .send_text_with_cx(cx, pane_id, text, actor, capabilities, workflow_id)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = cx;
-            let mut injector = self.inner.lock().await;
-            injector
-                .send_text(pane_id, text, actor, capabilities, workflow_id)
-                .await
         }
     }
 
@@ -149,20 +134,11 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let mut injector = self.inner.lock_with_cx(cx).await;
             return injector
                 .send_ctrl_c_with_cx(cx, pane_id, actor, capabilities, workflow_id)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = cx;
-            let mut injector = self.inner.lock().await;
-            injector
-                .send_ctrl_c(pane_id, actor, capabilities, workflow_id)
-                .await
         }
     }
 
@@ -174,20 +150,11 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let mut injector = self.inner.lock_with_cx(cx).await;
             return injector
                 .send_ctrl_d_with_cx(cx, pane_id, actor, capabilities, workflow_id)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = cx;
-            let mut injector = self.inner.lock().await;
-            injector
-                .send_ctrl_d(pane_id, actor, capabilities, workflow_id)
-                .await
         }
     }
 
@@ -199,20 +166,11 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let mut injector = self.inner.lock_with_cx(cx).await;
             return injector
                 .send_ctrl_z_with_cx(cx, pane_id, actor, capabilities, workflow_id)
                 .await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            let _ = cx;
-            let mut injector = self.inner.lock().await;
-            injector
-                .send_ctrl_z(pane_id, actor, capabilities, workflow_id)
-                .await
         }
     }
 }

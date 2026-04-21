@@ -285,7 +285,6 @@ pub async fn correlate_with_cass(
 /// caller cancellation propagates into the `cass` invocation.
 /// The override-session-id fast path short-circuits identically
 /// to the legacy function.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn correlate_with_cass_with_cx(
     cx: &crate::cx::Cx,
     cass: &CassClient,
@@ -369,7 +368,6 @@ pub async fn correlate_and_persist_for_pane(
 /// through their cx-first siblings so caller cancellation
 /// propagates into storage's pre-flight checkpoints. Explicit
 /// `cx.checkpoint()` seams also bracket the cass call.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn correlate_and_persist_for_pane_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -530,7 +528,6 @@ pub async fn refresh_cass_summary_for_session(
 /// checkpoint between the cass call and the persist step lets
 /// a late-cancelled caller abort before updating the session
 /// record.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn refresh_cass_summary_for_session_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -631,7 +628,6 @@ async fn select_session_record(
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`select_session_record`].
-#[cfg(feature = "asupersync-runtime")]
 async fn select_session_record_with_cx(
     cx: &crate::cx::Cx,
     storage: &StorageHandle,
@@ -1349,7 +1345,6 @@ mod tests {
     /// pre-flight checkpoint on the Cx-first path doesn't
     /// short-circuit uncancelled cx — the storage read still
     /// fires and the same error surfaces.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn refresh_cass_summary_with_cx_missing_session_matches_legacy() {
         run_async_test(async {
@@ -1387,7 +1382,6 @@ mod tests {
     /// the override-session-id fast path. Same fixture as
     /// `correlate_and_persist_override_updates_session` but
     /// drives the Cx-first entry point.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn correlate_and_persist_with_cx_override_updates_session() {
         run_async_test(async {

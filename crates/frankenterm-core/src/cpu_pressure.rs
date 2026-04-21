@@ -13,8 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -249,17 +247,11 @@ impl CpuPressureMonitor {
 
     /// Run the monitoring loop until the shutdown flag is set.
     pub async fn run(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.run_with_cx(&cx, shutdown).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.run_legacy(shutdown).await;
-            return;
-        }
     }
 
     /// Explicit quarantine for legacy non-asupersync CPU-pressure sampling.
@@ -267,32 +259,6 @@ impl CpuPressureMonitor {
     /// Owner: `ft-xbnl0.2.5`.
     /// Removal path: drop this helper once the workspace no longer supports
     /// non-`asupersync-runtime` sampling loops.
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_legacy(&self, shutdown: Arc<std::sync::atomic::AtomicBool>) {
-        let interval = Duration::from_millis(self.config.sample_interval_ms.max(1000));
-        let mut first_tick = true;
-
-        loop {
-            if !first_tick {
-                sleep(interval).await;
-            }
-            first_tick = false;
-
-            if shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let sample = self.sample();
-            if sample.tier >= CpuPressureTier::Yellow {
-                tracing::info!(
-                    pressure = sample.pressure,
-                    tier = %sample.tier,
-                    "CPU pressure elevated"
-                );
-            }
-        }
-    }
-
     /// Run the monitoring loop against the caller's asupersync capability
     /// context (ft-xbnl0.2.x Cx-first entry point).
     ///
@@ -307,7 +273,6 @@ impl CpuPressureMonitor {
     ///
     /// [`run`](Self::run) now prefers the ambient current Cx under
     /// `asupersync-runtime`; this remains the explicit inherited-Cx sibling.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -933,7 +898,6 @@ mod tests {
     // be StuckBailout and the test will fail.
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "asupersync-runtime")]
     mod labruntime_cpu_pressure {
         use super::*;
 

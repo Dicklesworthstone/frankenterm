@@ -518,7 +518,6 @@ impl NotificationSender for DesktopNotifier {
     /// boundaries (e.g. cass/caut clients before their
     /// timeout_with_cx wrappers). Without this override the
     /// trait default would delegate to `send()` which ignores cx.
-    #[cfg(feature = "asupersync-runtime")]
     fn send_with_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,

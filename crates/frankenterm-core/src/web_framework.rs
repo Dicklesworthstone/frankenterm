@@ -48,49 +48,11 @@ pub struct FrameworkWebRuntime {
 impl FrameworkWebRuntime {
     #[doc(hidden)]
     pub async fn start(bind_addr: String, app: App) -> Result<(SocketAddr, Self)> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return Self::start_with_cx(&cx, bind_addr, app).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            match app.run_startup_hooks().await {
-                StartupOutcome::Success => {}
-                StartupOutcome::PartialSuccess { warnings } => {
-                    warn!(target: "wa.web", warnings, "web startup hooks had warnings");
-                }
-                StartupOutcome::Aborted(err) => {
-                    return Err(Error::Runtime(format!(
-                        "web startup aborted: {}",
-                        err.message
-                    )));
-                }
-            }
-
-            let app = Arc::new(app);
-            let listener = TcpListener::bind(bind_addr.clone())
-                .await
-                .map_err(Error::Io)?;
-            let local_addr = listener.local_addr().map_err(Error::Io)?;
-
-            let server = Arc::new(TcpServer::new(ServerConfig::new(bind_addr)));
-            let handler: Arc<dyn Handler> = Arc::clone(&app) as Arc<dyn Handler>;
-            let runtime_handle = Runtime::current_handle().ok_or_else(|| {
-                Error::Runtime("web runtime unavailable during startup".to_string())
-            })?;
-
-            let join = {
-                let server = Arc::clone(&server);
-                runtime_handle.spawn(async move {
-                    let cx = crate::cx::for_request();
-                    server.serve_on_handler(&cx, listener, handler).await
-                })
-            };
-
-            Ok((local_addr, Self { app, server, join }))
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`start`].
@@ -101,7 +63,6 @@ impl FrameworkWebRuntime {
     /// per-request cx. Also adds checkpoint seams before
     /// startup hooks and before the bind call so a cancelled
     /// caller can bail before claiming resources.
-    #[cfg(feature = "asupersync-runtime")]
     #[doc(hidden)]
     pub async fn start_with_cx(
         cx: &crate::cx::Cx,
@@ -160,29 +121,11 @@ impl FrameworkWebRuntime {
 
     #[doc(hidden)]
     pub async fn finish(self, result: FrameworkServerJoinResult) -> Result<()> {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             return self.finish_with_cx(&cx, result).await;
         }
 
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            match result {
-                Ok(()) => {}
-                Err(ServerError::Shutdown) => {}
-                Err(err) => {
-                    return Err(Error::Runtime(format!("web server error: {err}")));
-                }
-            }
-
-            let forced = self.server.drain().await;
-            if forced > 0 {
-                warn!(target: "wa.web", forced, "web server forced closed connections");
-            }
-            self.app.run_shutdown_hooks().await;
-            Ok(())
-        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`finish`].
@@ -195,7 +138,6 @@ impl FrameworkWebRuntime {
     /// leaking connections, so cancellation only skips waiting
     /// for the hooks to complete in-order by letting the caller
     /// return early after signalling the error.
-    #[cfg(feature = "asupersync-runtime")]
     #[doc(hidden)]
     pub async fn finish_with_cx(
         self,

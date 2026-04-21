@@ -1433,7 +1433,6 @@ impl SessionRestorer {
     /// Per-step `cx.checkpoint()` seams also gate each stage so a
     /// cancelled caller can bail between topology parse, layout,
     /// scrollback, banners, bookkeeping, and relaunch.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn restore_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -1731,7 +1730,6 @@ impl SessionRestorer {
     /// (5) before the actual restore fires. The inner restore is
     /// routed through [`restore_with_cx`] so cancellation
     /// propagates into the expensive multi-step pipeline.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn detect_and_restore_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -4314,7 +4312,6 @@ mod tests {
     /// clean-restore case. Uses the same MockWezterm harness
     /// the legacy success test uses; asserts restored_count,
     /// failed_count, and pane_id_map size match expectations.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn session_restorer_restore_with_cx_matches_legacy() {
         let (db_path, conn, _dir) = setup_test_db();

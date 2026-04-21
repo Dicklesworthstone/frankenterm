@@ -26,8 +26,6 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-#[cfg(not(feature = "asupersync-runtime"))]
-use crate::runtime_compat::sleep;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -976,14 +974,9 @@ impl SurvivalModel {
 
     /// Run the model update loop (call from async context).
     pub async fn run(&self) {
-        #[cfg(feature = "asupersync-runtime")]
         {
             let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
             self.run_cx(&cx).await;
-        }
-        #[cfg(not(feature = "asupersync-runtime"))]
-        {
-            self.run_inner().await;
         }
     }
 
@@ -993,7 +986,6 @@ impl SurvivalModel {
     /// Inter-update sleeps bind to the provided capability context, and
     /// `cx.checkpoint()` at each iteration allows Cx cancellation to
     /// terminate the loop even when the shutdown flag has not been set.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_cx(&self, cx: &crate::cx::Cx) {
         let interval = self.config.update_interval.max(Duration::from_secs(1));
         let mut first_tick = true;
@@ -1010,28 +1002,6 @@ impl SurvivalModel {
             }
             if cx.checkpoint().is_err() {
                 debug!("Survival model exiting via Cx cancellation");
-                break;
-            }
-
-            if !self.in_warmup() {
-                self.update_parameters();
-            }
-        }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    async fn run_inner(&self) {
-        let interval = self.config.update_interval.max(Duration::from_secs(1));
-        let mut first_tick = true;
-
-        loop {
-            if !first_tick {
-                sleep(interval).await;
-            }
-            first_tick = false;
-
-            if self.shutdown.load(Ordering::SeqCst) {
-                debug!("Survival model shutting down");
                 break;
             }
 
@@ -1140,7 +1110,6 @@ mod tests {
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `SurvivalModel::run_cx` path exits cleanly under seed-locked
     /// virtual-time scheduling when shutdown is pre-signaled.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn survival_model_run_cx_honors_shutdown_under_labruntime() {
         use std::sync::atomic::{AtomicBool, Ordering};

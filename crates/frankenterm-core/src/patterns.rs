@@ -1488,8 +1488,11 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "rate limit".to_string(),
                     "limit reached".to_string(),
                     "quota exceeded".to_string(),
+                    "You've hit your limit".to_string(),
                 ],
-                regex: Some(r"(?:retry|reset|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC))".to_string()),
+                regex: Some(
+                    r"(?:retry|reset(?:s)?|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC)|\d+(?::\d+)?\s*(?:am|pm|AM|PM)(?:\s*\([^)]+\))?)".to_string()
+                ),
                 description: "Claude Code usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch session".to_string()),
                 workflow: Some("handle_claude_code_limits".to_string()),
@@ -4051,6 +4054,26 @@ rules:
     }
 
     #[test]
+    fn detect_claude_code_usage_reached_resets_variant() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your limit · resets 2pm (America/New_York)\n/extra-usage to finish what you're working on.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "claude_code.usage.reached");
+        assert!(
+            detection.is_some(),
+            "Should match claude_code.usage.reached for resets variant"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("reset_time").and_then(|v| v.as_str()),
+            Some("2pm (America/New_York)")
+        );
+        assert_eq!(d.severity, Severity::Critical);
+    }
+
+    #[test]
     fn detect_gemini_usage_warning() {
         let engine = PatternEngine::new();
         let text = "Usage limit warning: 10% of your Pro models quota remaining.";
@@ -5711,6 +5734,114 @@ rules:
         let path = dir.path().join("test.xml");
         fs::write(&path, "<rules/>").unwrap();
         assert!(load_pack_from_file(path.to_str().unwrap(), None).is_err());
+    }
+
+    // ── Sandbox hardening regressions ───────────────────────────────
+    //
+    // These lock down the fix to a concrete vulnerability: before the
+    // sandbox check was added, `load_pack_from_file` let any config-
+    // controllable `file:` pack escape the project root via absolute
+    // paths, `..` traversal, or symlinks pointing out. Each test below
+    // builds the exact escape shape and asserts the loader refuses it
+    // with an InvalidRule/PackNotFound error, while the happy case (a
+    // legitimate pack inside the root) still loads.
+
+    fn minimal_yaml_pack() -> &'static str {
+        "name: sandbox_test\nversion: 1.0.0\nrules: []\n"
+    }
+
+    #[test]
+    fn sandbox_accepts_relative_path_inside_root() {
+        // Baseline: a normal relative path under the sandbox root loads
+        // fine. If this regresses, the sandbox check has become
+        // too restrictive.
+        let root = tempfile::tempdir().unwrap();
+        let pack_path = root.path().join("pack.yaml");
+        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+
+        let pack = load_pack_from_file("pack.yaml", Some(root.path()))
+            .expect("legitimate relative path inside root must load");
+        assert_eq!(pack.name, "sandbox_test");
+    }
+
+    #[test]
+    fn sandbox_rejects_relative_traversal_outside_root() {
+        // The classic attack: `file:../secret.yaml` with a sandbox root
+        // set must not escape. Place the target one level above the
+        // sandbox so a traversal would hit it.
+        let parent = tempfile::tempdir().unwrap();
+        let secret = parent.path().join("secret.yaml");
+        fs::write(&secret, minimal_yaml_pack()).unwrap();
+
+        let root = parent.path().join("sandbox");
+        fs::create_dir(&root).unwrap();
+
+        let err = load_pack_from_file("../secret.yaml", Some(&root))
+            .expect_err("..-traversal must be rejected by the sandbox check");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sandbox_rejects_absolute_path_outside_root() {
+        // Absolute-path bypass: earlier the loader used an absolute
+        // caller-supplied path as-is, ignoring `root` entirely. An
+        // absolute path to a file that exists but lives outside the
+        // sandbox must now be rejected.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_pack = outside.path().join("elsewhere.yaml");
+        fs::write(&outside_pack, minimal_yaml_pack()).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let err = load_pack_from_file(
+            outside_pack.to_str().unwrap(),
+            Some(root.path()),
+        )
+        .expect_err("absolute path outside sandbox must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_rejects_symlink_pointing_outside_root() {
+        // Symlink escape: a symlink sitting inside the sandbox pointing
+        // at a file outside. `fs::canonicalize` resolves the link
+        // target, and the prefix check rejects the final resolved path.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target.yaml");
+        fs::write(&target, minimal_yaml_pack()).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let link_path = root.path().join("pack.yaml");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let err = load_pack_from_file("pack.yaml", Some(root.path()))
+            .expect_err("symlink pointing outside sandbox must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside sandbox root") || msg.contains("sandbox"),
+            "unexpected rejection message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sandbox_absolute_path_inside_root_accepted() {
+        // An absolute path that happens to point inside the sandbox
+        // root is legitimate — reject only the out-of-root shapes.
+        let root = tempfile::tempdir().unwrap();
+        let pack_path = root.path().join("inside.yaml");
+        fs::write(&pack_path, minimal_yaml_pack()).unwrap();
+
+        let pack = load_pack_from_file(pack_path.to_str().unwrap(), Some(root.path()))
+            .expect("absolute path inside sandbox must be accepted");
+        assert_eq!(pack.name, "sandbox_test");
     }
 
     // ── ft-05hfm size-cap regressions ───────────────────────────────

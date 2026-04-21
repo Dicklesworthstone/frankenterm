@@ -348,7 +348,6 @@ impl MigrationEngine {
     /// caller can't abort a scan — M0 is a no-op blocker but can
     /// still take minutes in practice. The checkpoint per batch
     /// keeps the loop responsive to operator cancel signals.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn m0_preflight_with_cx<S: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -570,7 +569,6 @@ impl MigrationEngine {
     /// the right behavior: a partial import's digest won't match
     /// the full-export digest, so we'd get a spurious
     /// DigestMismatch on top of a cancellation.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn m2_import_with_cx<T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -800,7 +798,6 @@ impl MigrationEngine {
     /// the `commit_checkpoint` idempotency (Advanced /
     /// NoopAlreadyAdvanced outcomes) means a subsequent resume
     /// replays safely.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn m3_checkpoint_sync_with_cx<S: RecorderStorage, T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -1030,7 +1027,6 @@ impl MigrationEngine {
     /// it, so idempotency is epoch-scoped). Operators should
     /// treat a mid-cutover cancellation as "cutover started, re-run
     /// to confirm".
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn m5_cutover_with_cx<T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -1173,7 +1169,6 @@ impl MigrationEngine {
     ///     the boundary checkpoint (before or after m1).
     ///   - m2 cancel: already-committed chunks on target remain
     ///     (batch_id idempotency on resume).
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_m0_m2_with_cx<S: RecorderStorage, T: RecorderStorage>(
         &self,
         cx: &crate::cx::Cx,
@@ -1551,7 +1546,6 @@ mod tests {
     /// the legacy `m0_preflight` for an uncancelled cx. Uses the
     /// same 5-record fixture as `test_m0_captures_manifest_with_correct_counts`
     /// to prove the manifest counts are bit-for-bit identical.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m0_preflight_with_cx_matches_legacy() {
         run_async_test(async {
@@ -1595,7 +1589,6 @@ mod tests {
     /// a degraded source with SourceDegraded, same as the legacy
     /// path. Proves the health-check branch short-circuits on
     /// the Cx path too.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m0_preflight_with_cx_rejects_degraded_source() {
         run_async_test(async {
@@ -1745,7 +1738,6 @@ mod tests {
     ///   * same import_count and import_digest in the manifest
     ///   * import_digest matches export_digest (the full
     ///     round-trip parity check the legacy test already makes)
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m2_import_with_cx_matches_legacy() {
         run_async_test(async {
@@ -1782,7 +1774,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `m2_import_with_cx` must detect
     /// digest mismatches the same as the legacy path. Proves the
     /// verification branches still run on the Cx-first path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m2_import_with_cx_digest_mismatch_aborts() {
         run_async_test(async {
@@ -1912,7 +1903,6 @@ mod tests {
     /// M0 → M1 → M2 pipeline under the Cx-first path and
     /// verifies the import digest matches the export digest
     /// (round-trip parity).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_m0_m2_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2429,7 +2419,6 @@ mod tests {
     /// Mirrors the two-consumer topology from
     /// `test_m3_migrates_all_consumer_checkpoints` and asserts
     /// CheckpointSyncResult parity across all fields.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m3_checkpoint_sync_with_cx_matches_legacy() {
         run_async_test(async {
@@ -2469,7 +2458,6 @@ mod tests {
     /// reset an out-of-range checkpoint the same as the legacy
     /// path (same branch as `test_m3_rejects_checkpoint_referencing_missing_ordinal`).
     /// Proves the reset branch fires on the Cx path too.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m3_checkpoint_sync_with_cx_resets_out_of_range() {
         run_async_test(async {
@@ -2768,7 +2756,6 @@ mod tests {
     /// `m5_cutover`. Parallel of `test_m5_emits_lifecycle_marker`
     /// under the Cx-first path, plus cross-path parity
     /// assertions.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn m5_cutover_with_cx_matches_legacy() {
         run_async_test(async {

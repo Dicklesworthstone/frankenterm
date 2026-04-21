@@ -1064,7 +1064,6 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     /// and the storage checkpoint commit inside the loop body fires
     /// BEFORE the next iteration's top-of-body checkpoint so no
     /// indexed-but-not-checkpointed state is leaked.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_cx<S: RecorderStorage>(
         &mut self,
         cx: &crate::cx::Cx,
@@ -1326,7 +1325,6 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     ///
     /// Identical indexing + commit logic to
     /// [`Self::run_with_reader`] for uncancelled cx.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn run_with_reader_with_cx<S: RecorderStorage>(
         &mut self,
         cx: &crate::cx::Cx,
@@ -1517,7 +1515,6 @@ pub async fn compute_indexer_lag<S: RecorderStorage>(
 /// legacy path via [`build_indexer_lag_snapshot`] so both variants
 /// produce bit-for-bit identical snapshots for the same health +
 /// checkpoint inputs.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
     cx: &crate::cx::Cx,
     storage: &S,
@@ -2510,7 +2507,6 @@ mod tests {
     /// extraction regressed the `records_behind` computation or
     /// the `caught_up` flag, both variants would diverge and the
     /// parity assertions would fire.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn compute_indexer_lag_with_cx_matches_legacy() {
         run_async_test(async {
@@ -4034,7 +4030,6 @@ mod tests {
     /// events, runs both variants on separate consumer_ids, asserts
     /// bit-for-bit IndexerRunResult parity. Paired with the
     /// tick-52 `run_with_reader_with_cx_matches_legacy` test.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_with_cx_matches_legacy() {
         run_async_test(async {
@@ -4096,7 +4091,6 @@ mod tests {
     /// per-batch; for an uncancelled Cx::for_request() these are
     /// no-ops (checkpoint on a live cx returns Ok()), so the
     /// observable behavior matches legacy exactly.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn run_with_reader_with_cx_matches_legacy() {
         run_async_test(async {

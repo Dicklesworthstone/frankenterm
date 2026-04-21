@@ -188,7 +188,6 @@ where
 /// Execute an async operation with retry under an explicit `&Cx`.
 ///
 /// Cx-first wrapper around [`with_retry_outcome_cx`] (ft-xbnl0.2.2).
-#[cfg(feature = "asupersync-runtime")]
 pub async fn with_retry_cx<T, F, Fut>(
     cx: &crate::cx::Cx,
     policy: &RetryPolicy,
@@ -207,14 +206,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         with_retry_outcome_cx(&cx, policy, operation).await
-    }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        with_retry_outcome_inner(policy, operation).await
     }
 }
 
@@ -226,7 +220,6 @@ where
 /// that cancellation, budget, and virtual time propagate cleanly into the
 /// retry sleep. Inter-attempt sleeps use [`crate::runtime_compat::sleep_with_cx`]
 /// which binds the sleep to the provided `Cx`.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn with_retry_outcome_cx<T, F, Fut>(
     cx: &crate::cx::Cx,
     policy: &RetryPolicy,
@@ -322,45 +315,6 @@ where
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn with_retry_outcome_inner<T, F, Fut>(
-    policy: &RetryPolicy,
-    mut operation: F,
-) -> RetryOutcome<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    let start = std::time::Instant::now();
-    let mut attempt = 0u32;
-
-    loop {
-        match operation().await {
-            Ok(value) => {
-                return RetryOutcome {
-                    result: Ok(value),
-                    attempts: attempt + 1,
-                    elapsed: start.elapsed(),
-                };
-            }
-            Err(e) => {
-                attempt += 1;
-                if let Some(max) = policy.max_attempts {
-                    if attempt >= max {
-                        return RetryOutcome {
-                            result: Err(e),
-                            attempts: attempt,
-                            elapsed: start.elapsed(),
-                        };
-                    }
-                }
-                let delay = policy.delay_for_attempt(attempt - 1);
-                crate::runtime_compat::sleep(delay).await;
-            }
-        }
-    }
-}
-
 /// Execute an operation with retry and circuit breaker integration.
 ///
 /// If the circuit is open, returns immediately with a circuit open error.
@@ -379,37 +333,14 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return with_retry_and_circuit_cx(&cx, policy, circuit, operation).await;
     }
 
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        use crate::error::WeztermError;
-
-        // Check circuit state first
-        if !circuit.allow() {
-            let status = circuit.status();
-            let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
-            return Err(Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms }));
-        }
-
-        let outcome = with_retry_outcome(policy, operation).await;
-
-        // Update circuit state based on outcome
-        match &outcome.result {
-            Ok(_) => circuit.record_success(),
-            Err(_) => circuit.record_failure(),
-        }
-
-        outcome.result
-    }
 }
 
 /// Circuit-aware retry under an explicit `&Cx` (ft-xbnl0.2.2).
-#[cfg(feature = "asupersync-runtime")]
 pub async fn with_retry_and_circuit_cx<T, F, Fut>(
     cx: &crate::cx::Cx,
     policy: &RetryPolicy,
@@ -497,19 +428,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    #[cfg(feature = "asupersync-runtime")]
     {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         with_smart_retry_cx(&cx, policy, operation).await
     }
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        with_smart_retry_inner(policy, operation).await
-    }
 }
 
 /// Smart retry under an explicit `&Cx` (ft-xbnl0.2.2).
-#[cfg(feature = "asupersync-runtime")]
 pub async fn with_smart_retry_cx<T, F, Fut>(
     cx: &crate::cx::Cx,
     policy: &RetryPolicy,
@@ -581,33 +506,6 @@ where
     }
 }
 
-#[cfg(not(feature = "asupersync-runtime"))]
-async fn with_smart_retry_inner<T, F, Fut>(policy: &RetryPolicy, mut operation: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    let mut attempt = 0u32;
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(e) => {
-                attempt += 1;
-                if !is_retryable(&e) {
-                    return Err(e);
-                }
-                if let Some(max) = policy.max_attempts {
-                    if attempt >= max {
-                        return Err(e);
-                    }
-                }
-                let delay = policy.delay_for_attempt(attempt - 1);
-                crate::runtime_compat::sleep(delay).await;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,7 +517,6 @@ mod tests {
     /// dependence. If inter-attempt sleeps ever re-acquire a tokio-shaped
     /// (real-time) assumption, this test will either block the wall clock or
     /// step-explode and fail.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn retry_runs_deterministically_under_labruntime_with_cx() {
         const SEED: u64 = 0x2A2B_C5E1_0102_2000;
@@ -1572,7 +1469,6 @@ mod tests {
     // ========================================================================
 
     /// Helper: run a closure inside a LabRuntime task.
-    #[cfg(feature = "asupersync-runtime")]
     fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
@@ -1604,7 +1500,6 @@ mod tests {
 
     /// Pre-cancelled cx returns Cancelled immediately from with_retry_cx
     /// without invoking the operation closure at all.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_cx_pre_cancelled_returns_cancelled() {
         let invoked = Arc::new(AtomicU32::new(0));
@@ -1645,7 +1540,6 @@ mod tests {
     /// with_retry_outcome_cx cancel after first attempt: the operation fails
     /// once, then cx is cancelled before the next attempt boundary check,
     /// so the retry loop returns Cancelled instead of continuing.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_outcome_cx_cancel_after_first_attempt_returns_cancelled() {
         let attempts = Arc::new(AtomicU32::new(0));
@@ -1701,7 +1595,6 @@ mod tests {
 
     /// with_retry_and_circuit_cx returns CircuitOpen when circuit is open,
     /// without invoking the operation.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_and_circuit_cx_open_circuit_returns_circuit_open() {
         let invoked = Arc::new(AtomicU32::new(0));
@@ -1747,7 +1640,6 @@ mod tests {
 
     /// with_retry_and_circuit_cx pre-cancelled cx returns Cancelled and
     /// records a failure on the circuit breaker.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_and_circuit_cx_pre_cancelled_returns_cancelled() {
         run_lab(0xC1AC_0002, || async move {
@@ -1783,7 +1675,6 @@ mod tests {
     }
 
     /// with_smart_retry_cx pre-cancelled cx returns Cancelled immediately.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_smart_retry_cx_pre_cancelled_returns_cancelled() {
         let invoked = Arc::new(AtomicU32::new(0));
@@ -1824,7 +1715,6 @@ mod tests {
 
     /// with_retry_outcome_cx succeeds on first attempt under LabRuntime
     /// and reports attempts=1 with Ok result.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_outcome_cx_first_try_success() {
         run_lab(0xF105_7000, || async move {
@@ -1848,7 +1738,6 @@ mod tests {
     }
 
     /// with_retry_outcome_cx exhausts max_attempts and returns last error.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn with_retry_outcome_cx_exhausts_retries() {
         let attempts = Arc::new(AtomicU32::new(0));

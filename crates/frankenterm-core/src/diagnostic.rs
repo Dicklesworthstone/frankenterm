@@ -758,7 +758,6 @@ pub async fn generate_bundle(
 /// pre-flight checkpoints. Per-section cx.checkpoint() seams
 /// also give mid-bundle cancellation before each storage
 /// query.
-#[cfg(feature = "asupersync-runtime")]
 pub async fn generate_bundle_with_cx(
     cx: &crate::cx::Cx,
     config: &Config,
@@ -1447,7 +1446,6 @@ mod tests {
     /// ft-xbnl0.2.3 Cx-first: `generate_bundle_with_cx` must
     /// produce a bundle equivalent to `generate_bundle` for
     /// an uncancelled cx (same file set, same manifest shape).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn generate_bundle_with_cx_matches_legacy() {
         run_async_test(async {

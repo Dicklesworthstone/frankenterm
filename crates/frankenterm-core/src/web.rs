@@ -24,7 +24,6 @@ mod websocket;
 
 use server::poke_listener;
 pub use server::{run_web_server, start_web_server};
-#[cfg(feature = "asupersync-runtime")]
 pub use server::{run_web_server_with_cx, start_web_server_with_cx};
 
 #[cfg(test)]
@@ -259,7 +258,6 @@ impl WebServerHandle {
     ///
     /// Tick 101 upgraded this from a pre-flight-only delegate to
     /// a two-seam path that threads cx through finish.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) -> Result<()> {
         let WebServerHandle {
             bound_addr,

@@ -601,7 +601,6 @@ impl Workflow for HandleSessionEnd {
     ///
     /// Pre-step cx.checkpoint() gates entry so a cx-cancel fired
     /// between steps short-circuits before touching storage.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1244,7 +1243,6 @@ impl Workflow for HandleProcessTriageLifecycle {
     /// This override delegates to `execute_step` after a pre-step
     /// `cx.checkpoint()`. No body inlining needed — there's nothing
     /// to thread cx through.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -1572,7 +1570,6 @@ impl HandleSessionStartContext {
     /// Threads cx through `storage.get_pane_with_cx` + `cass.search_with_cx`
     /// so a cancelled outer scope interrupts the pane read AND the cass
     /// subprocess loop without running the full multi-query cass sweep.
-    #[cfg(feature = "asupersync-runtime")]
     async fn lookup_cass_hints_with_cx(
         cx: &crate::cx::Cx,
         storage: &StorageHandle,
@@ -1944,7 +1941,6 @@ impl Workflow for HandleSessionStartContext {
     ///     `send_with_cx` mpsc backpressure)
     ///
     /// Pre-step cx.checkpoint() gates entry.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -2352,7 +2348,6 @@ impl HandleOnErrorCassSearch {
     /// routes `storage.get_pane_with_cx` + each `cass.search_with_cx`
     /// and adds a per-query checkpoint to avoid waiting through all
     /// N cass timeouts after cancel.
-    #[cfg(feature = "asupersync-runtime")]
     async fn lookup_cass_hints_with_cx(
         cx: &crate::cx::Cx,
         storage: &StorageHandle,
@@ -2714,7 +2709,6 @@ impl Workflow for HandleOnErrorCassSearch {
     ///   - `record_audit_action_with_cx` (audit write)
     ///
     /// Pre-step cx.checkpoint() gates entry.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3127,7 +3121,6 @@ impl Workflow for HandleSwarmLearningIndex {
     ///
     /// No private helper to migrate — all calls inline. Pre-step
     /// `cx.checkpoint()` gates entry between steps.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -3533,7 +3526,6 @@ impl HandleAuthRequired {
     /// Single-query cass lookup (no candidate loop like the other two
     /// cass handlers), so no per-query checkpoint needed — the
     /// `cass.search_with_cx` call itself observes cx at entry.
-    #[cfg(feature = "asupersync-runtime")]
     async fn lookup_cass_hints_with_cx(
         cx: &crate::cx::Cx,
         storage: &StorageHandle,
@@ -3891,7 +3883,6 @@ impl Workflow for HandleAuthRequired {
     ///   - `record_audit_action_with_cx` (audit write)
     ///
     /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -4412,7 +4403,6 @@ impl Workflow for HandleClaudeCodeLimits {
     ///   - `record_audit_action_with_cx` (audit write)
     ///
     /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,
@@ -4894,7 +4884,6 @@ impl Workflow for HandleGeminiQuota {
     ///   - `record_audit_action_with_cx` (audit write)
     ///
     /// Pre-step `cx.checkpoint()` gates entry between all 3 steps.
-    #[cfg(feature = "asupersync-runtime")]
     fn execute_step_cx<'a>(
         &'a self,
         cx: &'a crate::cx::Cx,

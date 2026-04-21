@@ -405,7 +405,6 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// so a cx cancelled after clear-before-start still lets the
     /// caller observe what was cleared in `progress.docs_cleared`
     /// — no silent data loss.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn full_reindex_with_cx<S: RecorderStorage>(
         &mut self,
         cx: &crate::cx::Cx,
@@ -582,7 +581,6 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// construction. Empty ranges (`to <= from`) still return
     /// `Ok(ReindexProgress::new())` without calling storage — the
     /// Cx-first path preserves the fast-path optimization.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn reindex_range_with_cx<S: RecorderStorage>(
         &mut self,
@@ -881,7 +879,6 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// path on non-cx IO errors where on_complete is also not
     /// called. Callers that need a cancellation-aware completion
     /// signal should inspect the returned `Err` variant.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     pub async fn reindex_range_observed_with_cx<S: RecorderStorage, O: ReindexObserver + Sync>(
         &mut self,
@@ -1149,7 +1146,6 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// and `start > 0`, the cursor is opened at the range start
     /// (same as legacy), avoiding wasted batches on events before
     /// the range.
-    #[cfg(feature = "asupersync-runtime")]
     pub async fn backfill_with_cx<S: RecorderStorage>(
         &mut self,
         cx: &crate::cx::Cx,
@@ -1331,7 +1327,6 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// honored between batches. Mid-batch cancellation is not
     /// offered here — the per-record loop body is CPU-only
     /// document mapping + writer operations, no await points.
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     async fn index_loop_with_cx<S: RecorderStorage>(
         &mut self,
@@ -1557,7 +1552,6 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// embedding the current_ordinal in the error message. Per-record
     /// body is CPU-only, so cancellation granularity is per-batch
     /// (matches ticks 52/53/55).
-    #[cfg(feature = "asupersync-runtime")]
     #[allow(clippy::too_many_arguments)]
     async fn index_loop_exclusive_with_cx<S: RecorderStorage>(
         &mut self,
@@ -2305,7 +2299,6 @@ mod tests {
     /// the legacy `full_reindex` for an uncancelled cx. Exercises
     /// the cold-start path (5 events, clear_before_start=true) and
     /// asserts ReindexProgress parity across all counter fields.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn full_reindex_with_cx_matches_legacy_cold_start() {
         run_async_test(async {
@@ -2453,7 +2446,6 @@ mod tests {
     /// `open_cursor_from_start`). If a future refactor broke the
     /// cursor-positioning branch on the Cx path, the indexed ids
     /// would diverge from the legacy path.
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn backfill_with_cx_matches_legacy_ordinal_range() {
         run_async_test(async {
@@ -4031,7 +4023,6 @@ mod tests {
     /// legacy `reindex_range` for an uncancelled cx. Exercises the
     /// exclusive [from, to) range semantics (events e5/e6/e7
     /// indexed from [5, 8)).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn reindex_range_with_cx_matches_legacy_exclusive_bounds() {
         run_async_test(async {
@@ -4637,7 +4628,6 @@ mod tests {
     /// cx across ReindexProgress, indexed docs, AND observer
     /// callback counts (on_progress invocations + on_complete
     /// exactly-once).
-    #[cfg(feature = "asupersync-runtime")]
     #[test]
     fn reindex_range_observed_with_cx_matches_legacy() {
         run_async_test(async {
