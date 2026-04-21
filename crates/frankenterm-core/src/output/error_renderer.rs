@@ -76,6 +76,17 @@ impl ErrorRenderer {
             Error::Io(_) => "FT-9002",
             Error::Json(_) => "FT-9003",
             Error::Runtime(_) => "FT-9001",
+            // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
+            // 79702a50 ("ux(errors): type runtime, pane, and watchdog
+            // failures"). Route them through the existing generic code
+            // bucket until per-variant codes are assigned in
+            // error_code.rs — keeps the CLI JSON shape consistent and
+            // unblocks the workspace check. FT-9001 is the same
+            // bucket the deprecated Runtime variant uses, so
+            // behaviourally identical for operators.
+            Error::RuntimeOperation { .. }
+            | Error::PaneOperation { .. }
+            | Error::WatchdogWarningRead { .. } => "FT-9001",
             Error::SetupError(_) => "FT-6001",
             Error::Cancelled(_) => "FT-9004",
             Error::Panicked(_) => "FT-9005",

@@ -413,6 +413,17 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Json(_) => false,
         // Runtime errors might be transient
         Error::Runtime(_) => true,
+        // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
+        // 79702a50. Mirror the deprecated Runtime retry semantics
+        // (generally transient / retryable) for backwards-compatible
+        // behaviour until per-variant retry decisions can be keyed off
+        // the inner `source` field. Conservative default: treat as
+        // retryable, same as the Runtime fallback. A follow-up can
+        // inspect `source` on each variant and flip non-transient
+        // failures (e.g. PermissionDenied) to false.
+        Error::RuntimeOperation { .. }
+        | Error::PaneOperation { .. }
+        | Error::WatchdogWarningRead { .. } => true,
         // Setup errors are not retryable
         Error::SetupError(_) => false,
         // Cancelled operations are not retryable
