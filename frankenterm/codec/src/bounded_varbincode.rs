@@ -5,6 +5,17 @@ use varbincode::error::{Error, Result};
 
 const MAX_CONTAINER_ITEMS: usize = 1_000_000;
 
+/// Hard byte budget for any single varbincode container or byte-buffer
+/// allocation. Attacker-controlled leb128 lengths get clamped by this cap
+/// before they reach `vec![0u8; len]` in [`Deserializer::read_vec`] or the
+/// visitor-driven `Vec::with_capacity(size_hint)` preallocation in serde
+/// collection deserializers. 16 MiB is tight enough that a fuzzer cannot
+/// stack multiple allocations into OOM within the libFuzzer 2 GiB limit
+/// while still covering every production PDU we ship. Kept separate from
+/// the outer frame-level [`super::MAX_PDU_SIZE`] (256 MiB) so per-container
+/// blast radius stays small even when the frame is near the wire cap.
+const MAX_CONTAINER_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn deserialize<T: serde::de::DeserializeOwned, R: Read>(reader: &mut R) -> Result<T> {
     let mut deserializer = Deserializer::new(reader);
     serde::Deserialize::deserialize(&mut deserializer)
@@ -39,10 +50,9 @@ impl<'a, R: Read> Deserializer<'a, R> {
 
     fn read_vec(&mut self) -> Result<Vec<u8>> {
         let len: usize = serde::Deserialize::deserialize(&mut *self)?;
-        if len > super::MAX_PDU_SIZE {
+        if len > MAX_CONTAINER_BYTES {
             return Err(Error::custom(format!(
-                "byte buffer length {len} exceeds maximum {}",
-                super::MAX_PDU_SIZE
+                "byte buffer length {len} exceeds maximum {MAX_CONTAINER_BYTES}"
             )));
         }
         let mut result = vec![0u8; len];
@@ -331,7 +341,13 @@ impl<'de, 'a, 'b, R: Read> de::SeqAccess<'de> for Access<'a, 'b, R> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.len.min(MAX_CONTAINER_ITEMS))
+        // Clamp the hint so visitor-driven `Vec::with_capacity(size_hint)`
+        // cannot preallocate an attacker-controlled number of elements.
+        // `self.len` is already bounded by MAX_CONTAINER_ITEMS at the call
+        // site, but 1M × sizeof(T) can still OOM for large T. 4096 is the
+        // serde convention for a "reasonable" starter capacity; the vec
+        // still grows to hold every element actually deserialized.
+        Some(self.len.min(4096))
     }
 }
 
@@ -359,7 +375,13 @@ impl<'de, 'a, 'b, R: Read> de::MapAccess<'de> for Access<'a, 'b, R> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.len.min(MAX_CONTAINER_ITEMS))
+        // Clamp the hint so visitor-driven `Vec::with_capacity(size_hint)`
+        // cannot preallocate an attacker-controlled number of elements.
+        // `self.len` is already bounded by MAX_CONTAINER_ITEMS at the call
+        // site, but 1M × sizeof(T) can still OOM for large T. 4096 is the
+        // serde convention for a "reasonable" starter capacity; the vec
+        // still grows to hold every element actually deserialized.
+        Some(self.len.min(4096))
     }
 }
 
