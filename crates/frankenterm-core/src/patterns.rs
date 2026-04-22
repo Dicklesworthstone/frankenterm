@@ -1215,7 +1215,14 @@ fn sandbox_resolve_dir(candidate: &Path, root: &Path) -> Result<Option<PathBuf>>
         // file. Treat it as "nothing to load" rather than erroring — the
         // attack surface here is read-side, and a dangling link can't
         // exfiltrate anything.
-        Err(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(PatternError::InvalidRule(format!(
+                "pack directory {} is not accessible: {e}",
+                candidate.display()
+            ))
+            .into());
+        }
     };
     if !candidate_canonical.starts_with(&root_canonical) {
         return Err(PatternError::InvalidRule(format!(
@@ -5148,6 +5155,30 @@ description = "Health check rule"
         assert!(
             msg.contains("resolves outside sandbox root") || msg.contains("ft-6mxfs"),
             "error should cite sandbox escape: {msg}"
+        );
+    }
+
+    /// Non-dangling canonicalize failures must fail closed. A symlink
+    /// loop is malformed input, not "no packs configured", and silently
+    /// treating it as `Ok(None)` would mask both operator mistakes and
+    /// hostile path tricks.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_resolve_dir_symlink_loop_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let ft_dir = root.path().join(".ft");
+        fs::create_dir_all(&ft_dir).unwrap();
+        let ws_dir = ft_dir.join("patterns");
+        std::os::unix::fs::symlink("patterns", &ws_dir).unwrap();
+
+        let err = sandbox_resolve_dir(&ws_dir, root.path())
+            .expect_err("symlink loop must not be treated as a missing pack dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not accessible")
+                || msg.contains("Too many levels of symbolic links")
+                || msg.contains("filesystem loop"),
+            "error should surface the canonicalize failure: {msg}"
         );
     }
 
