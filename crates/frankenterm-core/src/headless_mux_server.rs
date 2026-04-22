@@ -1122,6 +1122,7 @@ mod tests {
             peer_timeout_ms: 60_000,
             auto_checkpoint: false,
             max_panes: 50_000,
+            max_peers: 256,
         };
 
         let json = serde_json::to_string(&config).unwrap();
