@@ -2114,10 +2114,11 @@ impl RateLimiter {
     ///
     /// [ft-yjt9e] Defense-in-depth for panes that left without a
     /// PaneDestroyed signal (crashes, abrupt SSH detach, reaper race).
-    /// Iterates every `pane_counts` entry; prunes each Vec to the active
-    /// window, then drops the whole entry if the pruned Vec is empty.
-    /// Callers should invoke this periodically from the backpressure
-    /// tick or a lifecycle sweep — O(total timestamps across panes).
+    /// Iterates both `pane_counts` and `global_counts`; prunes each Vec
+    /// to the active window, then drops the whole entry if the pruned
+    /// Vec is empty. Callers should invoke this periodically from the
+    /// backpressure tick or a lifecycle sweep — O(total tracked
+    /// timestamps across panes and global action buckets).
     pub fn gc(&mut self) {
         self.gc_at(Instant::now());
     }
@@ -2125,6 +2126,10 @@ impl RateLimiter {
     pub fn gc_at(&mut self, now: Instant) {
         let window_start = now.checked_sub(self.window).unwrap_or(now);
         self.pane_counts.retain(|_, timestamps| {
+            prune_old(timestamps, window_start);
+            !timestamps.is_empty()
+        });
+        self.global_counts.retain(|_, timestamps| {
             prune_old(timestamps, window_start);
             !timestamps.is_empty()
         });
@@ -7388,6 +7393,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rate_limiter_gc_drops_expired_global_entries() {
+        let mut limiter =
+            RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(10));
+
+        limiter.check(ActionKind::SendText, Some(1));
+        limiter.check(ActionKind::SendText, Some(2));
+        assert_eq!(
+            limiter
+                .global_counts
+                .get(&ActionKind::SendText)
+                .map_or(0, Vec::len),
+            2,
+            "precondition: global bucket should hold both timestamps"
+        );
+
+        let way_later = Instant::now() + std::time::Duration::from_millis(100);
+        limiter.gc_at(way_later);
+
+        assert!(
+            !limiter.global_counts.contains_key(&ActionKind::SendText),
+            "gc must drop fully expired global buckets too"
+        );
+    }
+
     /// [ft-yjt9e] Task-specified shape: push traffic for 3 panes,
     /// destroy 2, assert `pane_counts` holds exactly 1 entry. Companion
     /// to `rate_limiter_remove_pane_drops_all_action_entries_for_that_pane`
@@ -7472,6 +7502,46 @@ mod tests {
             limiter.tracked_pane_entry_count(),
             3,
             "gc must preserve entries with live timestamps"
+        );
+        assert_eq!(
+            limiter
+                .global_counts
+                .get(&ActionKind::SendText)
+                .map_or(0, Vec::len),
+            2,
+            "gc must preserve still-live global timestamps"
+        );
+    }
+
+    #[test]
+    fn policy_engine_gc_rate_limiter_forwards_to_global_bucket_cleanup() {
+        let mut engine = PolicyEngine::new(10, 10, false);
+        engine.rate_limiter.window = Duration::from_millis(1);
+
+        for pane_id in [10u64, 20u64] {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(pane_id)
+                .with_capabilities(PaneCapabilities::prompt());
+            let _ = engine.authorize(&input);
+        }
+
+        assert!(
+            engine
+                .rate_limiter
+                .global_counts
+                .contains_key(&ActionKind::SendText),
+            "precondition: authorize should populate the global bucket"
+        );
+
+        std::thread::sleep(Duration::from_millis(5));
+        engine.gc_rate_limiter();
+
+        assert!(
+            !engine
+                .rate_limiter
+                .global_counts
+                .contains_key(&ActionKind::SendText),
+            "PolicyEngine::gc_rate_limiter must prune expired global buckets"
         );
     }
 

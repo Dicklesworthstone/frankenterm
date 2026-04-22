@@ -14,6 +14,16 @@ pub type TmuxSessionId = u64;
 /// 1 MiB is generous for any real tmux command response.
 const MAX_GUARDED_OUTPUT_LEN: usize = 1_048_576;
 
+/// Upper bound on a single pre-newline line buffer in [`Parser`]. Real tmux
+/// control-mode lines are short (%output, %begin, %end and friends stay
+/// well under a KiB). Capping at 1 MiB — same budget as
+/// [`MAX_GUARDED_OUTPUT_LEN`] — leaves ~6 orders of magnitude of headroom
+/// over normal traffic while preventing a malformed or malicious upstream
+/// that never sends a newline from growing `Parser::buffer` until the
+/// process OOMs. Mirrors the ft-phz7x codec defense for the same attack
+/// shape. [ft-kfy99]
+const MAX_LINE_LEN: usize = 1_048_576;
+
 pub mod parser {
     use pest_derive::Parser;
     #[derive(Parser)]
@@ -859,6 +869,20 @@ impl Parser {
         if c == b'\n' {
             self.process_line()
         } else {
+            // [ft-kfy99] Drop the pre-newline line if it exceeds
+            // MAX_LINE_LEN. Without this cap, an upstream that never
+            // sends a newline would grow self.buffer without bound.
+            // We also drop any active begun-block so the next legitimate
+            // %begin isn't appended to the discarded tail.
+            if self.buffer.len() >= MAX_LINE_LEN {
+                log::warn!(
+                    "tmux CC line exceeded {} byte cap with no newline; \
+                     discarding buffer and dropping any active begun block",
+                    MAX_LINE_LEN
+                );
+                self.buffer.clear();
+                self.begun.take();
+            }
             self.buffer.push(c);
             Ok(None)
         }
@@ -1323,6 +1347,50 @@ here
         assert_eq!(
             vec![Event::SessionsChanged],
             parser.advance_string("\n").unwrap()
+        );
+    }
+
+    // [ft-kfy99] An upstream that never sends a newline must not be
+    // able to grow the parser's pre-line buffer without bound. Feed
+    // MAX_LINE_LEN + some bytes without a newline and verify:
+    //   1. advance_bytes never errors on the overflow discard path.
+    //   2. no events fire (no newline means no complete line).
+    //   3. the internal buffer stays at/below MAX_LINE_LEN, never
+    //      growing past it (the whole point of the fix).
+    //
+    // We deliberately do NOT assert post-discard parse recovery on the
+    // SAME parser — the `%sessions-changed\n` path would first see the
+    // 32-byte 'x' tail prefix still in the buffer and parse_line would
+    // bail on the mixed junk. That's the parser's existing (and
+    // documented) per-line-failure contract; ft-kfy99 is scoped to the
+    // memory-exhaustion defense, not to buffer-reset-on-parse-error.
+    #[test]
+    fn ft_kfy99_advance_byte_caps_line_buffer_without_newline() {
+        let mut parser = Parser::new();
+        // Feed a small excess over the cap so we exercise the discard
+        // path once without materializing a huge chunk. The bound is
+        // on `self.buffer`, not on how many bytes we push — after
+        // each overflow the buffer is cleared and starts filling
+        // again, so len stays <= MAX_LINE_LEN at all times.
+        let payload = vec![b'x'; MAX_LINE_LEN + 32];
+        let events = parser.advance_bytes(&payload).expect(
+            "ft-kfy99: advance_byte must discard overflowing buffer \
+             rather than error or panic",
+        );
+        assert!(
+            events.is_empty(),
+            "no newline means no complete line, so no events should fire; got {events:?}"
+        );
+        assert!(
+            parser.buffer.len() <= MAX_LINE_LEN,
+            "ft-kfy99: buffer grew past MAX_LINE_LEN ({} > {})",
+            parser.buffer.len(),
+            MAX_LINE_LEN,
+        );
+        assert!(
+            parser.begun.is_none(),
+            "ft-kfy99: the overflow path must drop any active begun-block \
+             so a stale %begin doesn't poison the next %end"
         );
     }
 

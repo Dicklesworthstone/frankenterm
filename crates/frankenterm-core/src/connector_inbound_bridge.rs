@@ -336,6 +336,22 @@ impl SignalDeduplicator {
     /// If new, records it and returns `true`.
     /// If duplicate, returns `false`.
     pub fn check_and_record(&mut self, correlation_id: &str, now_ms: u64) -> bool {
+        // [ft-bx4le] Zero-capacity short-circuit. The dedup_capacity
+        // config field doesn't document a special 0 value, so operators
+        // reasonably expect `dedup_capacity = 0` to mean "dedup
+        // disabled." Without this guard, the `len >= 0` check below
+        // evaluates as always-true and the cache degrades to a 1-slot
+        // replacer (pop_front on empty is a no-op, push_back still
+        // succeeds, next call pops-and-replaces). That silently
+        // destroys dedup semantics. Parallel to the outbound
+        // zero-capacity fix in 1ad5c8cc; inbound treats 0 as "bypass
+        // dedup" (every signal is new) because the inbound surface
+        // uses dedup to SUPPRESS, not to BLOCK — bypassing is the
+        // closest behavior to "no cache."
+        if self.capacity == 0 {
+            return true;
+        }
+
         self.evict_expired(now_ms);
 
         // Check for existing entry
@@ -877,6 +893,35 @@ mod tests {
     fn dedup_empty_initially() {
         let dedup = SignalDeduplicator::new(10, Duration::from_secs(60));
         assert!(dedup.is_empty());
+        assert_eq!(dedup.len(), 0);
+    }
+
+    /// [ft-bx4le] Zero-capacity cache bypasses dedup entirely —
+    /// every call returns `true` (signal is "new") and nothing is
+    /// tracked. Pre-fix, the `len >= 0` check degraded the cache
+    /// into a 1-slot replacer, so the SAME correlation_id would
+    /// return true once, then false, then true, etc. This test
+    /// pins the "bypass" semantic.
+    #[test]
+    fn dedup_zero_capacity_bypasses_dedup() {
+        let mut dedup = SignalDeduplicator::new(0, Duration::from_secs(60));
+
+        // Same correlation_id pushed 5 times — all must return true
+        // because with capacity=0 there is no cache to hold them.
+        for i in 0..5 {
+            assert!(
+                dedup.check_and_record("same-id", 100 + i),
+                "call {i} with capacity=0 must return true (no dedup cache)"
+            );
+        }
+
+        // Cache stays empty — no entries accumulated.
+        assert_eq!(dedup.len(), 0, "capacity=0 must not track any entries");
+        assert!(dedup.is_empty());
+
+        // Different correlation_ids also all return true.
+        assert!(dedup.check_and_record("other-id", 200));
+        assert!(dedup.check_and_record("third-id", 300));
         assert_eq!(dedup.len(), 0);
     }
 

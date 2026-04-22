@@ -25038,6 +25038,29 @@ mod fts_sync_tests {
         .unwrap();
     }
 
+    /// Helper: exercise the `defer_fts_triggers: false` reopen path. Mirrors
+    /// the `else` branch in StorageHandle::with_config that reapplies
+    /// `FTS_TRIGGER_RECREATE_SQL` so the flag is bidirectional
+    /// (ft-ih4tm). Runs the same const the production path runs.
+    fn apply_recreate_fts_triggers(conn: &Connection) {
+        conn.execute_batch(FTS_TRIGGER_RECREATE_SQL).unwrap();
+    }
+
+    /// Helper: count how many of the three `output_segments_*` FTS
+    /// triggers currently exist in sqlite_master. 3 = all present
+    /// (sync mode), 0 = all dropped (deferred mode), anything else is a
+    /// partial/broken state.
+    fn fts_trigger_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger'
+               AND name IN ('output_segments_ai', 'output_segments_ad', 'output_segments_au')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
     /// Baseline: with triggers present, insertions flow straight into FTS.
     /// Pins the "sync" mode that StorageConfig::default() preserves.
     ///
@@ -25162,6 +25185,97 @@ mod fts_sync_tests {
                 fts_match_count(&conn, &format!("roundtoken{round}")),
                 100,
                 "round {round}'s 100 docs must be indexed and searchable"
+            );
+        }
+    }
+
+    /// [ft-ih4tm] `defer_fts_triggers` must be bidirectional: flipping
+    /// `true` → `false` on a second open MUST re-create the three
+    /// `output_segments_a[iud]` triggers so synchronous FTS indexing
+    /// resumes. Prior to commit fcb8b1df, the first open with `true`
+    /// dropped the triggers, but the second open with `false` did NOT
+    /// re-run `CREATE TRIGGER` because `initialize_schema` short-
+    /// circuits for up-to-date schemas — a silent one-way door the
+    /// operator couldn't diagnose without reading
+    /// `sqlite_master WHERE type='trigger'` by hand.
+    ///
+    /// This test simulates the three open phases at the SQL level
+    /// (the existing ft-wk5fo tests use the same Connection-level
+    /// pattern to avoid the broken full-StorageHandle test build) and
+    /// pins: (1) fresh init leaves triggers present; (2) DROP mimics
+    /// `defer_fts_triggers: true` leaves zero; (3) re-applying
+    /// `FTS_TRIGGER_RECREATE_SQL` (the const the production else-
+    /// branch runs) restores all three; (4) an INSERT after the
+    /// re-create lands in FTS synchronously — proving the trigger
+    /// body is not just present in schema but functionally wired.
+    #[test]
+    fn fts_deferred_mode_is_reversible_after_toggle() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Phase 1: fresh schema → all three triggers present.
+        assert_eq!(
+            fts_trigger_count(&conn),
+            3,
+            "fresh schema init must install all three FTS triggers"
+        );
+
+        // Phase 2: simulate `defer_fts_triggers: true` open.
+        apply_defer_fts_triggers(&conn);
+        assert_eq!(
+            fts_trigger_count(&conn),
+            0,
+            "defer path must drop all three FTS triggers"
+        );
+
+        // Phase 3: simulate `defer_fts_triggers: false` REOPEN —
+        // the ft-ih4tm regression point. Before fcb8b1df, this did
+        // nothing and the operator's intent was silently ignored.
+        apply_recreate_fts_triggers(&conn);
+        assert_eq!(
+            fts_trigger_count(&conn),
+            3,
+            "toggling defer back to false must re-create all three FTS triggers \
+             (ft-ih4tm — the one-way-door regression)"
+        );
+
+        // Phase 4: functional verification — an INSERT after the
+        // recreate must populate FTS synchronously via the restored
+        // trigger. If the CREATE TRIGGER ran but the body is wrong,
+        // the FTS index stays empty.
+        insert_test_pane(&conn, 1);
+        insert_test_segment(&conn, 1, 1, "synctoken after recreate");
+        assert_eq!(
+            fts_match_count(&conn, "synctoken"),
+            1,
+            "recreated AFTER INSERT trigger must synchronously index new segments"
+        );
+    }
+
+    /// [ft-ih4tm] Round-trip stress: toggle defer true ↔ false several
+    /// times. Every `false` phase must fully restore all three triggers
+    /// (no leaks, no stale state); every `true` phase must fully drop
+    /// them (no partial state). Guards against anyone later "optimizing"
+    /// the reapply into a conditional (`if triggers_absent { ... }`)
+    /// that would silently miss a malformed intermediate state.
+    #[test]
+    fn fts_deferred_mode_toggle_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        for iteration in 0..5 {
+            apply_defer_fts_triggers(&conn);
+            assert_eq!(
+                fts_trigger_count(&conn),
+                0,
+                "iteration {iteration}: defer=true must leave 0 triggers"
+            );
+
+            apply_recreate_fts_triggers(&conn);
+            assert_eq!(
+                fts_trigger_count(&conn),
+                3,
+                "iteration {iteration}: defer=false must restore 3 triggers"
             );
         }
     }

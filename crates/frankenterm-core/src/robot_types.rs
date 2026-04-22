@@ -33,16 +33,16 @@ pub struct RobotResponse<T> {
     /// `true` when the command succeeded.
     pub ok: bool,
     /// Command-specific payload (present when `ok == true`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
     /// Human-readable error message (present when `ok == false`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Machine-readable error code like `"robot.pane_not_found"` (present when `ok == false`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Actionable hint for recovery (present on some errors).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     /// Wall-clock milliseconds the command took.
     pub elapsed_ms: u64,
@@ -3442,6 +3442,53 @@ mod tests {
         let data = deserialized.data.unwrap();
         assert_eq!(data.pane_id, 42);
         assert_eq!(data.text, "roundtrip");
+    }
+
+    #[test]
+    fn success_envelope_omits_absent_error_fields() {
+        let resp = RobotResponse::success(
+            GetTextData {
+                pane_id: 1,
+                text: "ok".to_string(),
+                tail_lines: 1,
+                escapes_included: false,
+                truncated: false,
+                truncation_info: None,
+            },
+            5,
+        );
+        let value = serde_json::to_value(&resp).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(object.contains_key("data"));
+        assert!(!object.contains_key("error"));
+        assert!(!object.contains_key("error_code"));
+        assert!(!object.contains_key("hint"));
+    }
+
+    #[test]
+    fn error_envelope_omits_absent_data_field() {
+        let resp: RobotResponse<GetTextData> = RobotResponse {
+            ok: false,
+            data: None,
+            error: Some("pane missing".to_string()),
+            error_code: Some("robot.pane_not_found".to_string()),
+            hint: None,
+            elapsed_ms: 2,
+            version: "0.1.0".to_string(),
+            now: 1700000000000,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("data"));
+        assert_eq!(
+            object.get("error"),
+            Some(&serde_json::json!("pane missing"))
+        );
+        assert_eq!(
+            object.get("error_code"),
+            Some(&serde_json::json!("robot.pane_not_found"))
+        );
+        assert!(!object.contains_key("hint"));
     }
 
     #[test]

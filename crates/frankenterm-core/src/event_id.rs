@@ -740,29 +740,37 @@ mod tests {
     // -- ft-7s0vw: overflow fail-silent regression suite --
 
     /// `prev + threshold` overflows u64 when prev is near MAX. Release
-    /// builds previously wrapped, debug builds panicked. The fix uses
-    /// checked_add and treats overflow as "no future-skew anomaly".
+    /// builds previously wrapped (false-positive future-skew); debug
+    /// builds panicked. The fix uses checked_add and treats overflow as
+    /// "no future-skew anomaly". To exercise the overflow path we need
+    /// current >= prev (so the regression branch doesn't fire first)
+    /// AND prev + threshold to overflow.
     #[test]
-    fn ft_7s0vw_overflow_with_max_prev_does_not_panic_or_false_positive() {
-        let r = detect_clock_anomaly(123, u64::MAX, 1);
+    fn ft_7s0vw_overflow_does_not_panic_or_false_positive() {
+        // current == prev, so regression branch is skipped.
+        // prev + threshold = u64::MAX + 1 → overflow.
+        let r = detect_clock_anomaly(u64::MAX, u64::MAX, 1);
         assert!(
             !r.is_anomaly,
-            "overflow on prev+threshold must fail silent, not flag every current"
+            "overflow on prev+threshold must fail silent, not flag a non-regression current"
         );
     }
 
-    /// Symmetric: small prev, threshold near MAX → overflow.
+    /// Symmetric: legitimate prev, threshold so large the addition overflows.
+    /// current > prev so we'd normally enter the future-skew branch; the
+    /// overflow guard must short-circuit instead of wrapping.
     #[test]
-    fn ft_7s0vw_overflow_with_max_threshold_does_not_panic_or_false_positive() {
-        let r = detect_clock_anomaly(500, 1000, u64::MAX);
-        assert!(!r.is_anomaly);
+    fn ft_7s0vw_overflow_with_huge_threshold_does_not_panic_or_false_positive() {
+        let r = detect_clock_anomaly(2_000, 1_000, u64::MAX);
+        assert!(!r.is_anomaly, "huge threshold must not wrap into a positive flag");
     }
 
-    /// Edge: prev=u64::MAX-1 + threshold=2 = overflow. Pre-fix: release
-    /// build wraps to 0, current=u64::MAX-100 looks like future skew.
+    /// Boundary: prev = u64::MAX, threshold = 1, current = u64::MAX → overflow.
+    /// Pre-fix release build wraps to 0; current = u64::MAX > 0 → false flag.
     #[test]
-    fn ft_7s0vw_overflow_at_boundary_minus_one() {
-        let r = detect_clock_anomaly(u64::MAX - 100, u64::MAX - 1, 2);
+    fn ft_7s0vw_overflow_at_boundary_max() {
+        // Use current == prev (== u64::MAX) so regression check is skipped.
+        let r = detect_clock_anomaly(u64::MAX, u64::MAX, u64::MAX);
         assert!(!r.is_anomaly);
     }
 
