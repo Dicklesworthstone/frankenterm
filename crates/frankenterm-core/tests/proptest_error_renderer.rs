@@ -10,32 +10,33 @@
 //!  7. JSON render always has error string field
 //!  8. JSON render includes title when catalog entry exists
 //!  9. JSON render includes description when catalog entry exists
-//! 10. JSON render remediation has required fields when present
-//! 11. Plain render always contains the error code
-//! 12. Plain render always contains ft why hint
-//! 13. Plain render always contains Error: header
-//! 14. Plain render is non-empty for all errors
-//! 15. render dispatches to JSON for Json format
-//! 16. render dispatches to plain for Plain format
-//! 17. render_error convenience matches ErrorRenderer::new().render()
-//! 18. get_code_for_error convenience matches ErrorRenderer::error_code()
-//! 19. all error codes have catalog entries
-//! 20. render_error_code JSON produces valid JSON for all catalog entries
-//! 21. render_error_code plain is non-empty for all catalog entries
-//! 22. render_error_code JSON has code field
-//! 23. render_error_code JSON has title field
-//! 24. render_error_code JSON has category field
-//! 25. render_error_code JSON recovery_steps is array
-//! 26. render_error_code JSON causes is array
-//! 27. Default renderer produces non-empty output
-//! 28. ErrorCategory::from_code roundtrips for rendered codes
-//! 29. JSON render output length is bounded
-//! 30. Plain render output length is bounded
-//! 31. Wezterm error codes are in 1000-1999 range
-//! 32. Storage error codes are in 2000-2999 range
-//! 33. Pattern error codes are in 3000-3999 range
-//! 34. Workflow error codes are in 5000-5999 range
-//! 35. Config error codes are in 7000-7999 range
+//! 10. JSON render category matches serialized ErrorCategory contract
+//! 11. JSON render remediation has required fields when present
+//! 12. Plain render always contains the error code
+//! 13. Plain render always contains ft why hint
+//! 14. Plain render always contains Error: header
+//! 15. Plain render is non-empty for all errors
+//! 16. render dispatches to JSON for Json format
+//! 17. render dispatches to plain for Plain format
+//! 18. render_error convenience matches ErrorRenderer::new().render()
+//! 19. get_code_for_error convenience matches ErrorRenderer::error_code()
+//! 20. all error codes have catalog entries
+//! 21. render_error_code JSON produces valid JSON for all catalog entries
+//! 22. render_error_code plain is non-empty for all catalog entries
+//! 23. render_error_code JSON has code field
+//! 24. render_error_code JSON has title field
+//! 25. render_error_code JSON category matches serialized ErrorCategory contract
+//! 26. render_error_code JSON recovery_steps is array
+//! 27. render_error_code JSON causes is array
+//! 28. Default renderer produces non-empty output
+//! 29. ErrorCategory::from_code roundtrips for rendered codes
+//! 30. JSON render output length is bounded
+//! 31. Plain render output length is bounded
+//! 32. Wezterm error codes are in 1000-1999 range
+//! 33. Storage error codes are in 2000-2999 range
+//! 34. Pattern error codes are in 3000-3999 range
+//! 35. Workflow error codes are in 5000-5999 range
+//! 36. Config error codes are in 7000-7999 range
 
 use proptest::prelude::*;
 
@@ -315,7 +316,30 @@ proptest! {
 }
 
 // =============================================================================
-// 10. JSON render remediation has required structure when present
+// 10. JSON render category matches serialized ErrorCategory contract
+// =============================================================================
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn json_render_category_matches_catalog(error in arb_core_error()) {
+        let code = ErrorRenderer::error_code(&error);
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let output = renderer.render(&error);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        if let Some(def) = get_error_code(code) {
+            let expected = serde_json::to_value(def.category).unwrap();
+            prop_assert_eq!(
+                parsed["category"],
+                expected,
+                "JSON category should match serialized ErrorCategory for {}", code
+            );
+        }
+    }
+}
+
+// =============================================================================
+// 11. JSON render remediation has required structure when present
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -566,7 +590,7 @@ proptest! {
 }
 
 // =============================================================================
-// 24. render_error_code JSON has category field
+// 25. render_error_code JSON category matches serialized ErrorCategory contract
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -578,16 +602,18 @@ proptest! {
             let renderer = ErrorRenderer::new(OutputFormat::Json);
             let output = renderer.render_error_code(def);
             let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-            prop_assert!(
-                parsed["category"].is_string(),
-                "render_error_code JSON should have category for {}", code
+            let expected = serde_json::to_value(def.category).unwrap();
+            prop_assert_eq!(
+                parsed["category"],
+                expected,
+                "render_error_code JSON should use serialized category for {}", code
             );
         }
     }
 }
 
 // =============================================================================
-// 25. render_error_code JSON recovery_steps is array
+// 26. render_error_code JSON recovery_steps is array
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -608,7 +634,7 @@ proptest! {
 }
 
 // =============================================================================
-// 26. render_error_code JSON causes is array
+// 27. render_error_code JSON causes is array
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -629,7 +655,7 @@ proptest! {
 }
 
 // =============================================================================
-// 27. Default renderer produces non-empty output
+// 28. Default renderer produces non-empty output
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -643,7 +669,7 @@ proptest! {
 }
 
 // =============================================================================
-// 28. ErrorCategory::from_code roundtrips for rendered codes
+// 29. ErrorCategory::from_code roundtrips for rendered codes
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
@@ -660,7 +686,7 @@ proptest! {
 }
 
 // =============================================================================
-// 29. JSON render output length is bounded
+// 30. JSON render output length is bounded
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -678,7 +704,7 @@ proptest! {
 }
 
 // =============================================================================
-// 30. Plain render output length is bounded
+// 31. Plain render output length is bounded
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(80))]
@@ -695,7 +721,7 @@ proptest! {
 }
 
 // =============================================================================
-// 31. Wezterm error codes are in 1000-1999 range
+// 32. Wezterm error codes are in 1000-1999 range
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
@@ -713,7 +739,7 @@ proptest! {
 }
 
 // =============================================================================
-// 32. Storage error codes are in 2000-2999 range
+// 33. Storage error codes are in 2000-2999 range
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
@@ -731,7 +757,7 @@ proptest! {
 }
 
 // =============================================================================
-// 33. Pattern error codes are in 3000-3999 range
+// 34. Pattern error codes are in 3000-3999 range
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
@@ -749,7 +775,7 @@ proptest! {
 }
 
 // =============================================================================
-// 34. Workflow error codes are in 5000-5999 range
+// 35. Workflow error codes are in 5000-5999 range
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
@@ -767,7 +793,7 @@ proptest! {
 }
 
 // =============================================================================
-// 35. Config error codes are in 7000-7999 range
+// 36. Config error codes are in 7000-7999 range
 // =============================================================================
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
