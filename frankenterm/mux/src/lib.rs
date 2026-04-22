@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -1694,8 +1694,8 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1845,6 +1845,49 @@ mod tests {
         assert!(
             !mux.pane_output_drain_scheduled.load(Ordering::Relaxed),
             "flush should clear the scheduled flag once the queue is empty",
+        );
+        drop(pending);
+
+        executor
+            .tick()
+            .expect("scheduled pane-output drain should run");
+    }
+
+    #[test]
+    fn pane_output_reentrant_enqueue_is_drained_before_returning() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let pane_outputs = Arc::new(Mutex::new(Vec::new()));
+        let reentered = Arc::new(AtomicBool::new(false));
+
+        let mux_for_subscriber = Arc::clone(&mux);
+        let pane_outputs_for_subscriber = Arc::clone(&pane_outputs);
+        let reentered_for_subscriber = Arc::clone(&reentered);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneOutput(pane_id) = notification {
+                pane_outputs_for_subscriber.lock().push(pane_id);
+                if pane_id == 7 && !reentered_for_subscriber.swap(true, Ordering::Relaxed) {
+                    mux_for_subscriber.enqueue_pane_output_notification(8);
+                }
+            }
+            true
+        });
+
+        mux.enqueue_pane_output_notification(7);
+        mux.flush_pending_pane_output_notifications();
+
+        assert_eq!(
+            &*pane_outputs.lock(),
+            &[7, 8],
+            "reentrant pane-output enqueue should be drained before the current flush returns",
+        );
+        let pending = mux.pending_pane_output.lock();
+        assert!(pending.pane_ids.is_empty());
+        assert!(pending.queued.is_empty());
+        assert!(
+            !mux.pane_output_drain_scheduled.load(Ordering::Relaxed),
+            "flush should clear the scheduled flag after draining reentrant enqueues",
         );
         drop(pending);
 
