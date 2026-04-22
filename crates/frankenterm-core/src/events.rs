@@ -1013,6 +1013,17 @@ impl NotificationCooldown {
     ///
     /// On `Suppress`: the caller should skip the notification.
     pub fn check(&mut self, key: &str) -> CooldownVerdict {
+        // [ft-w80kj] Zero capacity means cooldown tracking is disabled; do
+        // not retain hidden state for a single key. Without this guard, the
+        // len>=max_capacity eviction branch is entered with len=0 and cap=0,
+        // pop_front on empty insertion_order is a no-op, and the insert below
+        // still succeeds — leaving a 1-slot ghost cooldown cache where one key
+        // is silently throttled even though callers configured capacity=0.
+        if self.max_capacity == 0 {
+            return CooldownVerdict::Send {
+                suppressed_since_last: 0,
+            };
+        }
         let now = Instant::now();
 
         if let Some(entry) = self.entries.get_mut(key) {
@@ -2387,6 +2398,35 @@ mod tests {
                 suppressed_since_last: 0
             }
         );
+    }
+
+    #[test]
+    fn cooldown_zero_capacity_bypasses_tracking_ft_w80kj() {
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), 0);
+
+        for _ in 0..5 {
+            assert_eq!(
+                cd.check("a"),
+                CooldownVerdict::Send {
+                    suppressed_since_last: 0,
+                }
+            );
+        }
+        assert_eq!(
+            cd.check("b"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0,
+            }
+        );
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0,
+            }
+        );
+
+        assert_eq!(cd.len(), 0);
+        assert!(cd.is_empty());
     }
 
     #[test]
