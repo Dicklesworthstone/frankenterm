@@ -253,7 +253,14 @@ impl RestoreSummary {
 
 fn open_conn(db_path: &str) -> Result<Connection, RestoreError> {
     let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    // [ft-rfpk6] `PRAGMA foreign_keys` is per-connection. The schema's
+    // ON DELETE CASCADE chain (mux_pane_state → session_checkpoints →
+    // mux_sessions) only fires when FKs are ON. Without this, any
+    // future DELETE that relies on CASCADE leaks orphan rows. See
+    // ft-s4myu for the matching fix on StorageHandle::with_config.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+    )?;
     Ok(conn)
 }
 

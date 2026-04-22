@@ -569,15 +569,55 @@ impl ToolHandler for WaCassSearchTool {
         // child cass binary ever executes, returning a confusing
         // "cass timeout (0 secs)" error on every call. Same shape as
         // ft-t62hq (wa.wait_for/wa.send) extended to the cass surface.
-        if params.timeout_secs == 0 {
+        //
+        // [ft-szuzd] Enforce schema's "timeout_secs": { "maximum": 600 }
+        // bound too. serde_json ignores the upper bound the same way it
+        // ignores the lower. Without this, a client (hostile or buggy)
+        // sending timeout_secs: 3600 blocks the mcp server on cass for
+        // up to an hour — well beyond the 10-minute cap the tool
+        // schema advertises. Mirror the LIMIT_MIN/LIMIT_MAX pattern in
+        // wa.events at mcp_tools.rs:1725-1749.
+        const TIMEOUT_SECS_MIN: u64 = 1;
+        const TIMEOUT_SECS_MAX: u64 = 600;
+        if params.timeout_secs < TIMEOUT_SECS_MIN
+            || params.timeout_secs > TIMEOUT_SECS_MAX
+        {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                "timeout_secs must be >= 1 (got 0)".to_string(),
-                Some(
-                    "The ca.search tool schema declares timeout_secs with \
-                     minimum: 1; omit the field to use the default (15)."
-                        .to_string(),
+                format!(
+                    "timeout_secs must be in {TIMEOUT_SECS_MIN}..={TIMEOUT_SECS_MAX} (got {})",
+                    params.timeout_secs
                 ),
+                Some(format!(
+                    "The wa.cass_search tool schema declares timeout_secs \
+                     ∈ [{TIMEOUT_SECS_MIN}, {TIMEOUT_SECS_MAX}]; clamp your \
+                     request or omit the field to use the default (15)."
+                )),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        // [ft-szuzd] Enforce schema's "limit": { "minimum": 0, "maximum": 1000 }
+        // bound. The 0 case is a cass sentinel ("use cass default") and
+        // is already handled at the call site (params.limit != 0), so we
+        // only need to cap the upper end. Without this, a client sending
+        // limit: u64::MAX stages it straight into CassSearchOptions and
+        // triggers an unbounded cass query.
+        const LIMIT_MAX: usize = 1000;
+        if params.limit > LIMIT_MAX {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "limit must be in 0..={LIMIT_MAX} (got {})",
+                    params.limit
+                ),
+                Some(format!(
+                    "The wa.cass_search tool schema declares limit \
+                     ∈ [0, {LIMIT_MAX}] with 0 meaning 'cass default'; \
+                     clamp your request or omit the field to use the \
+                     default (10)."
+                )),
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
@@ -5920,6 +5960,12 @@ exit 17",
     /// → instant timeout. The guard runs before any cass binary
     /// dispatch, so this test does not need #[cfg(unix)] or a fake
     /// binary stand-in.
+    ///
+    /// [ft-szuzd] Error phrasing is now the range form
+    /// "timeout_secs must be in 1..=600" since the same guard also
+    /// rejects upper-bound violations — that's a strict improvement
+    /// on the original "must be >= 1" wording, carrying both endpoints
+    /// in one error.
     #[test]
     fn ft_tzwuw_ca_search_rejects_zero_timeout_secs() {
         let envelope = parse_json_content(
@@ -5935,13 +5981,75 @@ exit 17",
         );
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
         assert!(
-            envelope["error"]
-                .as_str()
-                .expect("error string")
-                .contains("timeout_secs must be >= 1"),
-            "expected 'timeout_secs must be >= 1' in error, got: {}",
-            envelope["error"]
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected range form 'timeout_secs must be in 1..=600' in error, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 0)"),
+            "error must cite the rejected value, got: {err_str}"
+        );
+    }
+
+    /// [ft-szuzd] ca.search with timeout_secs above the schema
+    /// maximum must also fail-fast. serde_json doesn't honour the
+    /// schema's "maximum": 600, so without the runtime guard a
+    /// client sending timeout_secs: 3600 would block the mcp
+    /// server on cass for up to an hour.
+    #[test]
+    fn ft_szuzd_ca_search_rejects_above_max_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "anything",
+                        "timeout_secs": 3600
+                    }),
+                )
+                .expect("ca.search call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected range error, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 3600)"),
+            "error must cite the rejected value, got: {err_str}"
+        );
+    }
+
+    /// [ft-szuzd] ca.search with limit above the schema maximum
+    /// must fail-fast before staging a potentially-unbounded query
+    /// into CassSearchOptions. limit=0 is a valid 'cass default'
+    /// sentinel and must still be accepted.
+    #[test]
+    fn ft_szuzd_ca_search_rejects_above_max_limit() {
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "anything",
+                        "limit": 10_000
+                    }),
+                )
+                .expect("ca.search call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("limit must be in 0..=1000"),
+            "expected limit range error, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 10000)"),
+            "error must cite the rejected value, got: {err_str}"
         );
     }
 

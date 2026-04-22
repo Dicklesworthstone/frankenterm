@@ -1292,7 +1292,14 @@ fn compute_state_hash(panes: &[PaneInfo]) -> String {
 
 fn open_conn(db_path: &str) -> std::result::Result<Connection, rusqlite::Error> {
     let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+    // [ft-rfpk6] Enable foreign_keys so cleanup_sync's DELETE on
+    // session_checkpoints cascades to mux_pane_state (schema line 646:
+    // `REFERENCES session_checkpoints(id) ON DELETE CASCADE`).
+    // Without this, every cleanup run leaves orphan pane-state rows
+    // that accumulate forever. Same shape as ft-s4myu / session_restore.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+    )?;
     Ok(conn)
 }
 
@@ -1830,6 +1837,72 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(count, 2);
+        });
+    }
+
+    /// [ft-rfpk6] cleanup_sync calls `DELETE FROM session_checkpoints`
+    /// and relies on the schema's `ON DELETE CASCADE` to remove the
+    /// referencing mux_pane_state rows. Before this fix, open_conn
+    /// omitted `PRAGMA foreign_keys=ON`, so the DELETE succeeded but
+    /// child rows were silently orphaned — growing forever across
+    /// every cleanup run.
+    #[test]
+    fn ft_rfpk6_cleanup_cascades_to_mux_pane_state() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let config = SnapshotConfig {
+                retention_count: 1,
+                retention_days: 365,
+                ..SnapshotConfig::default()
+            };
+            let engine = SnapshotEngine::new(db_path.clone(), config);
+
+            // Capture 3 snapshots with a pane each → 3 checkpoints and
+            // at least 3 mux_pane_state rows.
+            for i in 0..3u64 {
+                let panes = vec![make_test_pane(i, 24 + i as u32, 80)];
+                engine
+                    .capture(&panes, SnapshotTrigger::Manual)
+                    .await
+                    .unwrap();
+            }
+
+            let conn = Connection::open(db_path.as_str()).unwrap();
+            let cp_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |r| r.get(0))
+                .unwrap();
+            let ps_before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM mux_pane_state", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(cp_before, 3, "precondition: 3 checkpoints");
+            assert!(ps_before >= 3, "precondition: ≥3 pane-state rows");
+
+            let deleted = engine.cleanup().await.unwrap();
+            assert_eq!(deleted, 2, "retention_count=1 keeps 1, deletes 2");
+
+            let cp_after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(cp_after, 1);
+
+            // With the fix: FKs ON → CASCADE fires → orphan child rows
+            // from the 2 deleted checkpoints are gone.
+            let orphans: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mux_pane_state ps
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM session_checkpoints c
+                         WHERE c.id = ps.checkpoint_id
+                     )",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                orphans, 0,
+                "ft-rfpk6: mux_pane_state must not contain rows whose \
+                 checkpoint_id no longer exists after cleanup"
+            );
         });
     }
 
