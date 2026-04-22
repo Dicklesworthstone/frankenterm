@@ -198,6 +198,26 @@ impl EProcess {
         collapse_std: f64,
         min_streak: usize,
     ) -> f64 {
+        // [ft-eqtcq] Fail closed on non-finite inputs. A single NaN or
+        // Inf in entropy / baseline_* / collapse_* propagates through
+        // likelihood_ratio → log_lr → exp() → NaN, and `f64::clamp`
+        // passes NaN through. e_value *= NaN = NaN pins the e-process
+        // at NaN forever; is_rejected() then returns (NaN >= threshold)
+        // = false and anomaly detection is silently disabled. Skip the
+        // update entirely for bad input — same shape as ft-b4l62
+        // (Histogram), ft-yskcu (continuous_backpressure), ft-c17iw
+        // (semantic_anomaly), ft-n4fdx (bayesian_ledger).
+        if !entropy.is_finite()
+            || !baseline_mean.is_finite()
+            || !baseline_std.is_finite()
+            || baseline_std <= 0.0
+            || !collapse_mean.is_finite()
+            || !collapse_std.is_finite()
+            || collapse_std <= 0.0
+        {
+            return self.e_value;
+        }
+
         self.n_observations += 1;
 
         if is_collapse {
@@ -1239,6 +1259,96 @@ mod tests {
             decision.e_value < 1.1 && decision.e_value > 0.5,
             "e_value should be near 1.0, got {}",
             decision.e_value
+        );
+    }
+
+    // -- ft-eqtcq: non-finite inputs must not poison EProcess --
+
+    /// Build a calibrated EProcess so NaN-update tests exercise the
+    /// `e_value` multiplication path, not a pre-streak no-op.
+    fn calibrated_eprocess() -> EProcess {
+        let mut ep = EProcess::new(0.01, 0.9, 1e10);
+        // Seed a finite, non-1.0 e_value by running one good collapse
+        // update past the min_streak threshold.
+        for _ in 0..3 {
+            ep.update(0.5, true, 4.0, 0.5, 1.0, 0.3, 2);
+        }
+        assert!(ep.e_value().is_finite());
+        ep
+    }
+
+    #[test]
+    fn ft_eqtcq_nan_entropy_does_not_poison_e_value() {
+        let mut ep = calibrated_eprocess();
+        let before = ep.e_value();
+        let after = ep.update(f64::NAN, true, 4.0, 0.5, 1.0, 0.3, 2);
+        assert!(after.is_finite(), "e_value must stay finite, got {after}");
+        assert_eq!(after, before, "NaN entropy must not mutate e_value");
+    }
+
+    #[test]
+    fn ft_eqtcq_inf_entropy_does_not_poison_e_value() {
+        let mut ep = calibrated_eprocess();
+        let before = ep.e_value();
+        let after_pos = ep.update(f64::INFINITY, true, 4.0, 0.5, 1.0, 0.3, 2);
+        let after_neg = ep.update(f64::NEG_INFINITY, true, 4.0, 0.5, 1.0, 0.3, 2);
+        assert!(after_pos.is_finite());
+        assert!(after_neg.is_finite());
+        assert_eq!(after_pos, before);
+        assert_eq!(after_neg, before);
+    }
+
+    #[test]
+    fn ft_eqtcq_nan_baseline_params_do_not_poison_e_value() {
+        let mut ep = calibrated_eprocess();
+        let before = ep.e_value();
+        let after1 = ep.update(0.5, true, f64::NAN, 0.5, 1.0, 0.3, 2);
+        let after2 = ep.update(0.5, true, 4.0, f64::NAN, 1.0, 0.3, 2);
+        let after3 = ep.update(0.5, true, 4.0, 0.5, f64::NAN, 0.3, 2);
+        let after4 = ep.update(0.5, true, 4.0, 0.5, 1.0, f64::NAN, 2);
+        assert!(after1.is_finite());
+        assert!(after2.is_finite());
+        assert!(after3.is_finite());
+        assert!(after4.is_finite());
+        assert_eq!(after1, before);
+        assert_eq!(after2, before);
+        assert_eq!(after3, before);
+        assert_eq!(after4, before);
+    }
+
+    /// Zero or negative std is mathematically undefined for a Gaussian
+    /// (division by zero / negative variance). Must be rejected at the
+    /// boundary — pre-fix it drove likelihood_ratio to +/-Inf or NaN.
+    #[test]
+    fn ft_eqtcq_zero_or_negative_std_rejected() {
+        let mut ep = calibrated_eprocess();
+        let before = ep.e_value();
+        let a = ep.update(0.5, true, 4.0, 0.0, 1.0, 0.3, 2);
+        let b = ep.update(0.5, true, 4.0, 0.5, 1.0, 0.0, 2);
+        let c = ep.update(0.5, true, 4.0, -0.1, 1.0, 0.3, 2);
+        assert_eq!(a, before);
+        assert_eq!(b, before);
+        assert_eq!(c, before);
+    }
+
+    /// After a stream of bad inputs, a subsequent GOOD update must
+    /// still move the e-value. Pre-fix, once e_value was NaN, it
+    /// stayed NaN across all future updates.
+    #[test]
+    fn ft_eqtcq_e_process_recovers_after_bad_inputs() {
+        let mut ep = calibrated_eprocess();
+        for _ in 0..20 {
+            let _ = ep.update(f64::NAN, true, 4.0, 0.5, 1.0, 0.3, 2);
+        }
+        let ev_after_nans = ep.e_value();
+        let after_good = ep.update(0.5, true, 4.0, 0.5, 1.0, 0.3, 2);
+        assert!(after_good.is_finite());
+        // A collapse-consistent sample should raise the e-value above
+        // the post-NaN state (likelihood_ratio > 1 when h is closer
+        // to collapse_mean than baseline_mean).
+        assert!(
+            after_good >= ev_after_nans,
+            "good update must at least not reduce e_value: {after_good} vs {ev_after_nans}"
         );
     }
 }
