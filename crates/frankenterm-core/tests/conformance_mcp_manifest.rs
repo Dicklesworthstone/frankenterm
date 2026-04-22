@@ -291,6 +291,91 @@ fn live_server_manifests_conform_with_and_without_db() {
     );
 }
 
+/// [ft-o657v] Every shipped MCP tool's input_schema MUST set
+/// `additionalProperties: false` at the top level. Without that
+/// constraint, the server silently accepts unknown fields from
+/// untrusted MCP clients — surface for policy bypass, audit pollution,
+/// and ambiguous-field attacks if a tool ever evolves its allowed
+/// field set.
+///
+/// All 29 tools in `crates/frankenterm-core/src/mcp_tools.rs` currently
+/// satisfy this (verified by grep: 29 `additionalProperties` vs 29
+/// `input_schema:`); this test pins the invariant so a future tool
+/// that lands without the clause breaks CI instead of silently
+/// opening a side channel.
+///
+/// The `FormatAwareToolHandler` middleware injects a `format` property
+/// into `properties`, which is orthogonal to `additionalProperties`
+/// and doesn't invalidate the invariant — every tool's schema still
+/// refuses fields that aren't in its declared properties set.
+#[test]
+fn every_tool_input_schema_denies_additional_properties() {
+    let (_dir, db_path) = isolated_db_path();
+    let server = build_server_with_db(&Config::default(), Some(db_path)).expect("build server");
+
+    let tools = server.tools();
+    assert!(
+        !tools.is_empty(),
+        "db-backed server must advertise at least one tool"
+    );
+
+    let mut violations = Vec::new();
+    for tool in &tools {
+        let schema = &tool.input_schema;
+
+        let schema_obj = match schema.as_object() {
+            Some(obj) => obj,
+            None => {
+                violations.push(format!(
+                    "{}: input_schema is not a JSON object, got: {schema}",
+                    tool.name
+                ));
+                continue;
+            }
+        };
+
+        // The tool schema must declare type=object so JSON Schema's
+        // additionalProperties keyword is meaningful here.
+        let schema_type = schema_obj
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        if schema_type != "object" {
+            violations.push(format!(
+                "{}: input_schema type must be 'object', got '{schema_type}'",
+                tool.name
+            ));
+            continue;
+        }
+
+        match schema_obj.get("additionalProperties") {
+            Some(serde_json::Value::Bool(false)) => {
+                // OK — explicit deny.
+            }
+            Some(other) => {
+                violations.push(format!(
+                    "{}: additionalProperties must be literal `false`, got {other}",
+                    tool.name
+                ));
+            }
+            None => {
+                violations.push(format!(
+                    "{}: input_schema is missing `additionalProperties: false` — \
+                     shipped tools must explicitly refuse unknown fields (ft-o657v)",
+                    tool.name
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "additionalProperties:false invariant violated by {} tool(s):\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+}
+
 #[test]
 fn live_server_resource_templates_conform_with_and_without_db() {
     let no_db = parse_resource_template_manifest(capture_resource_template_lists(None))
