@@ -1021,10 +1021,27 @@ impl ConnectorOutboundBridge {
         });
 
         // 1. Deduplication
+        //
+        // [ft-ptjlp] Dedup bookkeeping uses the LOCAL receive clock,
+        // NOT `event.timestamp_ms`. OutboundEvent is Serialize +
+        // Deserialize with a pub `timestamp_ms` field documented as
+        // "Timestamp at source" — any deserialized or replayed event
+        // carries an attacker-controllable value. Feeding that into
+        // `check_and_record` lets a replay with `timestamp_ms =
+        // ttl_ms + 1` trigger `evict_expired`, pop the live entry,
+        // and the replay is treated as new — re-firing every matched
+        // routing rule's downstream connector action (Slack/JIRA/
+        // webhook/etc.). Same fix shape as ft-dijpe (inbound bridge,
+        // commit 0716e112). SystemTime::now() keeps the dedup clock
+        // under local control.
+        let dedup_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         if event.correlation_id.is_some()
             && !self
                 .deduplicator
-                .check_and_record(&correlation_id, event.timestamp_ms)
+                .check_and_record(&correlation_id, dedup_now_ms)
         {
             self.telemetry.events_deduplicated += 1;
             debug!(
@@ -1723,6 +1740,60 @@ mod tests {
 
         let r2 = bridge.process_event(&event).unwrap();
         assert!(r2.deduplicated);
+        assert_eq!(r2.actions_dispatched.len(), 0);
+    }
+
+    /// [ft-ptjlp] Mirror of bridge_dedup_ignores_attacker_controlled_signal_timestamp
+    /// (inbound bridge, ft-dijpe). An attacker or replay source that
+    /// claims `event.timestamp_ms = u64::MAX / 2` on the second copy
+    /// of a correlation_id must NOT bypass dedup. Pre-fix, the huge
+    /// claimed timestamp triggered `evict_expired(now=u64::MAX/2)` on
+    /// the outbound deduplicator, popped the live entry, and the
+    /// replay slipped through to re-fire every matched routing rule's
+    /// downstream connector action (Slack, JIRA, webhook). Post-fix,
+    /// the dedup clock comes from SystemTime::now() and both copies
+    /// land in the same real-time window, so the second is correctly
+    /// flagged `deduplicated=true`.
+    #[test]
+    fn connector_outbound_bridge_dedup_ignores_attacker_controlled_event_timestamp() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // First event: claims timestamp_ms = 0.
+        let first = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"key": "value"}),
+        )
+        .with_correlation_id("replay-target")
+        .with_timestamp_ms(0);
+        let r1 = bridge.process_event(&first).unwrap();
+        assert!(!r1.deduplicated, "first event is always new");
+        assert_eq!(r1.actions_dispatched.len(), 1);
+
+        // Second event: SAME correlation_id, claims a timestamp_ms far
+        // in the "future" — pre-fix would evict the live entry and
+        // bypass dedup. Post-fix the local clock wins.
+        let second = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"key": "value"}),
+        )
+        .with_correlation_id("replay-target")
+        .with_timestamp_ms(u64::MAX / 2);
+        let r2 = bridge.process_event(&second).unwrap();
+        assert!(
+            r2.deduplicated,
+            "replay with future timestamp_ms must still be flagged deduplicated \
+             (ft-ptjlp: dedup clock must not be attacker-controllable)"
+        );
         assert_eq!(r2.actions_dispatched.len(), 0);
     }
 
