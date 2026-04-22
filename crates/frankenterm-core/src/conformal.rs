@@ -212,7 +212,12 @@ impl CalibrationSet {
     /// Returns `None` if there aren't enough calibration points.
     fn quantile(&self, coverage: f64) -> Option<f64> {
         let n = self.scores.len();
-        if n == 0 {
+        // [ft-x50ce] Defense-in-depth: if `coverage` is NaN here, the
+        // arithmetic below would produce `NaN.ceil() as usize = 0`,
+        // `0.max(1) = 1`, and silently return the smallest score. The
+        // ConformalPredictor boundary already snaps NaN to 0.95, but
+        // external callers can reach `quantile` directly — fail closed.
+        if n == 0 || coverage.is_nan() {
             return None;
         }
 
@@ -277,6 +282,17 @@ impl MetricForecaster {
             .map(|&h| (h, CalibrationSet::new(calibration_window)))
             .collect();
 
+        // [ft-x50ce] f64::clamp(NaN, _, _) returns NaN — documented Rust
+        // gotcha, same shape as ft-761tz / ft-b4l62 / ft-jz40p /
+        // ft-0p5q5. A NaN `coverage` propagates into `CalibrationSet::
+        // quantile` where `NaN * (n+1) → NaN.ceil() → NaN as usize == 0`
+        // silently returns the smallest calibration score, producing the
+        // NARROWEST possible prediction interval — the opposite of what
+        // the formal-coverage guarantee promises. Snap NaN to the
+        // default 0.95 (matches ConformalConfig::default()) before the
+        // clamp so operators whose config deserialised NaN fall back to
+        // a sensible coverage rather than silently-undercut intervals.
+        let coverage = if coverage.is_nan() { 0.95 } else { coverage };
         Self {
             name,
             holt: HoltPredictor::new(holt_alpha, holt_beta),
@@ -1418,5 +1434,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── ft-x50ce: NaN coverage fails closed ──────────────────────────────
+
+    /// `ConformalPredictor::new` must not store a NaN `coverage`. Pre-fix
+    /// `coverage.clamp(0.01, 0.999)` returned NaN (documented gotcha),
+    /// and the NaN propagated into `CalibrationSet::quantile` where it
+    /// silently returned the smallest score — producing the NARROWEST
+    /// possible prediction interval instead of the configured coverage.
+    #[test]
+    fn ft_x50ce_predictor_rejects_nan_coverage_at_construction() {
+        let p = MetricForecaster::new(
+            "test".to_string(),
+            0.2,
+            0.1,
+            &[1],
+            100,
+            100,
+            f64::NAN,
+        );
+        assert!(
+            (p.coverage - 0.95).abs() < f64::EPSILON,
+            "NaN coverage must snap to the 0.95 default, got {}",
+            p.coverage
+        );
+    }
+
+    /// Defense-in-depth: `CalibrationSet::quantile(NaN)` must return None
+    /// even when reached directly (bypassing the ConformalPredictor new()
+    /// boundary). Guards future code paths that might route NaN to the
+    /// quantile helper without going through the predictor.
+    #[test]
+    fn ft_x50ce_quantile_nan_coverage_returns_none() {
+        let mut cal = CalibrationSet::new(100);
+        for i in 1..=10 {
+            cal.push(i as f64);
+        }
+        assert!(cal.quantile(f64::NAN).is_none());
+        // Valid coverage still works.
+        assert!(cal.quantile(0.5).is_some());
     }
 }
