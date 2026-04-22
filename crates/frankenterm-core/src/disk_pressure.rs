@@ -288,7 +288,18 @@ impl EwmaEstimator {
     }
 
     /// Feed a new sample and return the smoothed value.
+    ///
+    /// [ft-761tz] `f64::clamp` returns NaN for NaN input (documented Rust
+    /// behaviour, but caller-hostile). Without a separate NaN guard, a
+    /// single NaN sample poisons `self.value` forever — every subsequent
+    /// `alpha * NaN + (1 - alpha) * prev` preserves the NaN. Skip the
+    /// update entirely on NaN and return the prior value; callers get a
+    /// best-effort read of the last clean sample rather than an
+    /// unrecoverable poison.
     pub fn update(&mut self, sample: f64) -> f64 {
+        if sample.is_nan() {
+            return self.value;
+        }
         let sample = sample.clamp(0.0, 1.0);
         if !self.initialized {
             self.value = sample;
@@ -346,7 +357,17 @@ impl PidController {
     }
 
     /// Update the controller state and return the control signal.
+    ///
+    /// [ft-761tz] NaN-defence: a NaN error taints integral + derivative,
+    /// and `f64::clamp(NaN, _, _)` returns NaN, so one bad sample would
+    /// poison the controller indefinitely. On NaN input we emit 0.0 (a
+    /// no-op control signal) and leave internal state untouched — the
+    /// next clean sample continues from the last good integral/derivative
+    /// and the monitor self-heals.
     pub fn update(&mut self, error: f64, dt_secs: f64) -> f64 {
+        if error.is_nan() || dt_secs.is_nan() {
+            return 0.0;
+        }
         let dt_secs = dt_secs.max(f64::EPSILON);
 
         self.integral = error
@@ -585,6 +606,15 @@ fn now_epoch_ms() -> u64 {
 }
 
 fn classify_tier(usage_fraction: f64, thresholds: PressureThresholds) -> DiskPressureTier {
+    // [ft-761tz] Fail closed on NaN. `f64::clamp` returns NaN for NaN
+    // input, and every `>=` comparison against NaN is false, so the
+    // branch below silently fell through to Green — reporting "healthy"
+    // for an unreadable disk. When we cannot prove the disk is safe the
+    // only sound answer is Black: alert operators and let the next clean
+    // sample reclassify.
+    if usage_fraction.is_nan() {
+        return DiskPressureTier::Black;
+    }
     let usage_fraction = usage_fraction.clamp(0.0, 1.0);
     let thresholds = thresholds.normalized();
 
@@ -655,9 +685,10 @@ fn parse_df_data_line(line: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, EwmaEstimator, PidController,
-        PressureThresholds, classify_tier, parse_df_data_line, parse_df_output_kib,
+        DiskPressureConfig, DiskPressureMonitor, DiskPressureTier, DiskSample, EwmaEstimator,
+        PidController, PressureThresholds, classify_tier, parse_df_data_line, parse_df_output_kib,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn tier_ordering_and_labels_are_stable() {
@@ -1013,5 +1044,133 @@ mod tests {
         assert_eq!(DiskPressureTier::Yellow.to_string(), "YELLOW");
         assert_eq!(DiskPressureTier::Red.to_string(), "RED");
         assert_eq!(DiskPressureTier::Black.to_string(), "BLACK");
+    }
+
+    // ── ft-761tz: NaN-sample fail-closed regression ──────────────────────
+
+    /// EwmaEstimator must not let a NaN sample poison `value`. Before
+    /// the fix, `sample.clamp(0.0, 1.0)` returned NaN (documented
+    /// `f64::clamp` behaviour) and every subsequent update preserved it.
+    #[test]
+    fn ft_761tz_ewma_rejects_nan_sample_and_preserves_prior_value() {
+        let mut ewma = EwmaEstimator::new(0.5);
+        assert_eq!(ewma.update(0.42), 0.42);
+        let out = ewma.update(f64::NAN);
+        assert!(out.is_finite(), "NaN sample must not taint ewma.value");
+        assert_eq!(out, 0.42);
+        // Recovery: next clean sample continues from the prior value.
+        let recovered = ewma.update(0.50);
+        assert!(recovered.is_finite());
+        assert!((recovered - 0.46).abs() < 1e-9);
+    }
+
+    /// First sample is NaN → estimator stays uninitialised (value=0.0).
+    #[test]
+    fn ft_761tz_ewma_rejects_nan_first_sample() {
+        let mut ewma = EwmaEstimator::new(0.5);
+        let out = ewma.update(f64::NAN);
+        assert_eq!(out, 0.0, "uninitialised ewma returns the default 0.0");
+        // The next clean sample should initialise (not blend against NaN).
+        let first_clean = ewma.update(0.3);
+        assert_eq!(first_clean, 0.3);
+    }
+
+    /// PidController::update must no-op on NaN so one bad sample cannot
+    /// poison the integral + derivative forever.
+    #[test]
+    fn ft_761tz_pid_no_ops_on_nan_error() {
+        let mut pid = PidController::new(0.5, 0.5, 0.5, -1.0, 1.0);
+        let _ = pid.update(0.1, 1.0);
+        let integral_before = pid.integral();
+        let deriv_before = pid.derivative();
+        let out = pid.update(f64::NAN, 1.0);
+        assert_eq!(out, 0.0, "NaN input must produce a neutral control signal");
+        assert_eq!(
+            pid.integral(),
+            integral_before,
+            "NaN input must not update the integral"
+        );
+        assert_eq!(
+            pid.derivative(),
+            deriv_before,
+            "NaN input must not update the derivative"
+        );
+    }
+
+    /// PidController::update must also no-op on NaN dt (which otherwise
+    /// lands on `NaN.max(EPSILON) = NaN` and poisons downstream math).
+    #[test]
+    fn ft_761tz_pid_no_ops_on_nan_dt() {
+        let mut pid = PidController::new(0.5, 0.5, 0.5, -1.0, 1.0);
+        let _ = pid.update(0.1, 1.0);
+        let out = pid.update(0.2, f64::NAN);
+        assert_eq!(out, 0.0);
+        assert!(pid.integral().is_finite());
+        assert!(pid.derivative().is_finite());
+    }
+
+    /// classify_tier must fail closed on NaN. Before the fix, NaN fell
+    /// through every `>=` comparison and returned Green — the worst
+    /// possible answer, since it silently reports a broken disk as
+    /// healthy. Black is the sound default: we cannot prove safety, so
+    /// alert operators.
+    #[test]
+    fn ft_761tz_classify_nan_fails_closed_to_black() {
+        let thresholds = PressureThresholds::default();
+        assert_eq!(classify_tier(f64::NAN, thresholds), DiskPressureTier::Black);
+    }
+
+    /// End-to-end: one NaN sample into DiskPressureMonitor must not
+    /// corrupt future reads. The monitor should surface Black on the
+    /// NaN tick and reclassify on the next clean tick.
+    #[test]
+    fn ft_761tz_monitor_recovers_after_nan_sample() {
+        let config = DiskPressureConfig {
+            enabled: true,
+            ..DiskPressureConfig::default()
+        };
+        let mut monitor = DiskPressureMonitor::new(config);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1000);
+        let t2 = t0 + Duration::from_millis(2000);
+
+        // Healthy sample → Green.
+        let healthy = DiskSample {
+            usage_fraction: 0.10,
+            available_bytes: 900,
+            total_bytes: 1000,
+            sampled_at: t0,
+        };
+        assert_eq!(
+            monitor.update_with_sample(healthy),
+            DiskPressureTier::Green
+        );
+
+        // NaN sample → Black (fail closed).
+        let broken = DiskSample {
+            usage_fraction: f64::NAN,
+            available_bytes: 0,
+            total_bytes: 0,
+            sampled_at: t1,
+        };
+        assert_eq!(
+            monitor.update_with_sample(broken),
+            DiskPressureTier::Black,
+            "NaN sample must surface as Black, not Green"
+        );
+
+        // Clean sample after the NaN → monitor recovers (not stuck
+        // reporting Black forever, not stuck at NaN inside the EWMA).
+        let recovered = DiskSample {
+            usage_fraction: 0.15,
+            available_bytes: 850,
+            total_bytes: 1000,
+            sampled_at: t2,
+        };
+        let tier = monitor.update_with_sample(recovered);
+        assert!(
+            matches!(tier, DiskPressureTier::Green),
+            "after NaN the monitor must self-heal on the next clean sample, got {tier:?}"
+        );
     }
 }
