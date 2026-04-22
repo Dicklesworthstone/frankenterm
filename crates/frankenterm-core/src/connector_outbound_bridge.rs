@@ -594,6 +594,21 @@ impl OutboundDeduplicator {
     /// If new, records it and returns `true`.
     /// If duplicate, returns `false`.
     pub fn check_and_record(&mut self, correlation_id: &str, now_ms: u64) -> bool {
+        // [ft-zu8g3] Zero-capacity short-circuit. Without this guard,
+        // the `len >= 0` check below evaluates as always-true and the
+        // cache degrades to a 1-slot replacer (pop_front on empty is
+        // a no-op, push_back still succeeds, next alternating id
+        // pops-and-replaces). Silently destroys dedup semantics.
+        // Mirrors the canonical SignalDeduplicator fix at
+        // connector_inbound_bridge.rs:351 (ft-bx4le) and the
+        // EventDeduplicator fix at events.rs:843 (ft-61kg4). Outbound
+        // treats 0 as "bypass dedup" (every correlation_id is new)
+        // because its dedup surface SUPPRESSES routing — bypassing
+        // is the closest behavior to "no cache."
+        if self.capacity == 0 {
+            return true;
+        }
+
         self.evict_expired(now_ms);
 
         if self
@@ -1530,6 +1545,38 @@ mod tests {
         assert_eq!(dedup.len(), 3);
         // "a" was evicted, should be accepted again
         assert!(dedup.check_and_record("a", 500));
+    }
+
+    // [ft-zu8g3] capacity=0 must mean "dedup disabled" (every id treated
+    // as new), not "1-slot ghost cache". Before the fix, alternating
+    // correlation_ids toggled into/out of the single entries slot —
+    // producing false for immediate repeats but true for every
+    // cross-id call. Parallel to ft-bx4le (SignalDeduplicator) and
+    // ft-61kg4 (EventDeduplicator).
+    #[test]
+    fn connector_outbound_bridge_dedup_zero_capacity_bypasses_dedup_ft_zu8g3() {
+        let mut dedup = OutboundDeduplicator::new(0, Duration::from_secs(300));
+
+        // Every call — including immediate repeats of the same id —
+        // must be treated as new (returns true). No state accumulation,
+        // no toggling.
+        for i in 0..5 {
+            assert!(
+                dedup.check_and_record("abc", 1000 + i),
+                "ft-zu8g3: repeat #{} of same id must still be new when capacity=0",
+                i
+            );
+        }
+        // Cross-id calls must also all be new.
+        assert!(dedup.check_and_record("xyz", 2000));
+        assert!(dedup.check_and_record("abc", 3000));
+        assert!(dedup.check_and_record("def", 4000));
+
+        // And no internal state grew — the entries deque stays empty,
+        // so the deduplicator is not a hidden 1-slot cache when a
+        // caller configures dedup_capacity=0.
+        assert_eq!(dedup.len(), 0);
+        assert!(dedup.is_empty());
     }
 
     // ---- Routing rule matching ----
