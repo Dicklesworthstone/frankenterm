@@ -145,5 +145,10 @@ path = "fuzz_targets/ipc_auth_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
+[[bin]]
+name = "escape_parser_raw"
+path = "fuzz_targets/escape_parser_raw.rs"
+doc = false
+
 [profile.release]
 debug = 1
