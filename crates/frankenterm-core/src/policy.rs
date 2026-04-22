@@ -7338,9 +7338,9 @@ mod tests {
         let mut limiter = RateLimiter::new(10, 10);
         // Seed multiple action kinds for pane 1 and pane 2.
         for _ in 0..3 {
-            limiter.check(ActionKind::SendText, Some(1));
-            limiter.check(ActionKind::ReadOutput, Some(1));
-            limiter.check(ActionKind::SendText, Some(2));
+            let _ = limiter.check(ActionKind::SendText, Some(1));
+            let _ = limiter.check(ActionKind::ReadOutput, Some(1));
+            let _ = limiter.check(ActionKind::SendText, Some(2));
         }
         assert_eq!(
             limiter.tracked_pane_entry_count(),
@@ -7361,8 +7361,8 @@ mod tests {
         // global bucket tracks action kinds across all panes and has
         // no inherent pane ownership to evict.
         let mut limiter = RateLimiter::new(10, 10);
-        limiter.check(ActionKind::SendText, Some(1));
-        limiter.check(ActionKind::SendText, Some(2));
+        let _ = limiter.check(ActionKind::SendText, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(2));
 
         let global_before = limiter
             .global_counts
@@ -7390,8 +7390,8 @@ mod tests {
             RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(10));
 
         // Populate pane 1 and pane 2 at t=0.
-        limiter.check(ActionKind::SendText, Some(1));
-        limiter.check(ActionKind::SendText, Some(2));
+        let _ = limiter.check(ActionKind::SendText, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(2));
         assert_eq!(limiter.tracked_pane_entry_count(), 2);
 
         // Advance notional time 100ms past the 10ms window → all
@@ -7411,8 +7411,8 @@ mod tests {
         let mut limiter =
             RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(10));
 
-        limiter.check(ActionKind::SendText, Some(1));
-        limiter.check(ActionKind::SendText, Some(2));
+        let _ = limiter.check(ActionKind::SendText, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(2));
         assert_eq!(
             limiter
                 .global_counts
@@ -7442,9 +7442,9 @@ mod tests {
         // Push one action (SendText) for each of 3 panes. Keep to a
         // single ActionKind so the expected post-destroy count is
         // unambiguously 1 (rather than per-action multiplicity).
-        limiter.check(ActionKind::SendText, Some(1));
-        limiter.check(ActionKind::SendText, Some(2));
-        limiter.check(ActionKind::SendText, Some(3));
+        let _ = limiter.check(ActionKind::SendText, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(2));
+        let _ = limiter.check(ActionKind::SendText, Some(3));
         assert_eq!(
             limiter.tracked_pane_entry_count(),
             3,
@@ -7504,9 +7504,9 @@ mod tests {
         let mut limiter =
             RateLimiter::new(10, 10).with_window(std::time::Duration::from_secs(3600));
 
-        limiter.check(ActionKind::SendText, Some(1));
-        limiter.check(ActionKind::SendText, Some(2));
-        limiter.check(ActionKind::ReadOutput, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(1));
+        let _ = limiter.check(ActionKind::SendText, Some(2));
+        let _ = limiter.check(ActionKind::ReadOutput, Some(1));
         assert_eq!(limiter.tracked_pane_entry_count(), 3);
 
         limiter.gc_at(Instant::now());
