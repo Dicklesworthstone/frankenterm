@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "Wezterm",
+    "code": "FT-1010",
+    "description": "The specified pane ID does not exist. The pane may have been closed or the ID may be incorrect.",
+    "error": "Pane operation 'inject' failed for pane 42: pane not found",
+    "hint": "Pane 42 was missing while performing 'inject'.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Refresh pane state and retry with a valid pane id."
+      ],
+      "commands": [
+        {
+          "command": "ft list",
+          "label": "List panes",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Pane 42 was missing while performing 'inject'."
+    },
+    "title": "Pane not found"
+  },
+  "plain_lines": [
+    "Error: Pane not found",
+    "",
+    "Pane operation 'inject' failed for pane 42: pane not found",
+    "",
+    "The specified pane ID does not exist. The pane may have been closed or the ID may be incorrect.",
+    "",
+    "Suggestions:",
+    "  • Pane 42 was missing while performing 'inject'.",
+    "  → List panes: `ft list`",
+    "  → Diagnostics: `ft doctor`",
+    "  • Refresh pane state and retry with a valid pane id.",
+    "",
+    "Error code: FT-1010",
+    "Run `ft why FT-1010` for more details."
+  ]
+}
