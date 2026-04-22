@@ -8313,6 +8313,120 @@ mod tests {
         );
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn proptest_handle_on_error_query_candidates_ignore_unrelated_nested_events(
+            unrelated_matched_text in "[A-Za-z0-9 _./:-]{0,48}",
+            unrelated_message in "[A-Za-z0-9 _./:-]{0,48}",
+            unrelated_error in "[A-Za-z0-9 _./:-]{0,48}",
+            unrelated_rule_id in "[A-Za-z0-9_.-]{0,48}",
+            unrelated_key_suffix in "[a-z][a-z0-9_]{0,10}",
+        ) {
+            let pane = crate::storage::PaneRecord {
+                pane_id: 42,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: Some(1),
+                tab_id: Some(1),
+                title: Some("Working on ft-3681t".to_string()),
+                cwd: Some("/Users/jemanuel/projects/frankenterm".to_string()),
+                tty_name: None,
+                first_seen_at: now_ms(),
+                last_seen_at: now_ms(),
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            let mut trigger = serde_json::json!({
+                "matched_text": "Connection refused",
+                "rule_id": "claude_code.error.network",
+                "event_type": "error.network",
+                "agent_type": "claude_code",
+                "extracted": {
+                    "message": "Connection refused",
+                },
+            });
+            let baseline = HandleOnErrorCassSearch::query_candidates(&trigger, Some(&pane));
+            let trigger_object = trigger
+                .as_object_mut()
+                .expect("trigger should be an object");
+
+            trigger_object.insert(
+                "recent_events".to_string(),
+                serde_json::json!([
+                    {
+                        "event_type": "session.start",
+                        "matched_text": unrelated_matched_text,
+                        "rule_id": unrelated_rule_id,
+                        "extracted": {
+                            "message": unrelated_message,
+                            "error": unrelated_error,
+                        },
+                    },
+                    {
+                        "event_type": "quota.warning",
+                        "matched_text": unrelated_error,
+                        "extracted": {
+                            "message": unrelated_matched_text,
+                        },
+                    },
+                ]),
+            );
+            trigger_object.insert(
+                "last_non_error_event".to_string(),
+                serde_json::json!({
+                    "event_type": "session.start",
+                    "matched_text": unrelated_message,
+                    "rule_id": unrelated_rule_id,
+                    "extracted": {
+                        "message": unrelated_error,
+                        "error": unrelated_matched_text,
+                    },
+                }),
+            );
+            trigger_object.insert(
+                format!("debug_context_{unrelated_key_suffix}"),
+                serde_json::json!({
+                    "matched_text": unrelated_error,
+                    "rule_id": unrelated_rule_id,
+                    "extracted": {
+                        "message": unrelated_matched_text,
+                        "error": unrelated_message,
+                    },
+                }),
+            );
+
+            let extracted = trigger_object
+                .get_mut("extracted")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("extracted should remain an object");
+            extracted.insert(
+                "recent_event".to_string(),
+                serde_json::json!({
+                    "event_type": "session.start",
+                    "matched_text": unrelated_message,
+                    "rule_id": unrelated_rule_id,
+                    "extracted": {
+                        "message": unrelated_error,
+                        "error": unrelated_matched_text,
+                    },
+                }),
+            );
+            extracted.insert(
+                "extra_context".to_string(),
+                serde_json::json!({
+                    "message": unrelated_message,
+                    "error": unrelated_error,
+                }),
+            );
+
+            let mutated = HandleOnErrorCassSearch::query_candidates(&trigger, Some(&pane));
+            prop_assert_eq!(mutated, baseline);
+        }
+    }
+
     #[test]
     fn handle_on_error_format_cass_hint_basic() {
         let hit_record = CassSearchHit {
