@@ -23,9 +23,18 @@ impl Hyperlink {
 
     pub fn compute_shape_hash<H: Hasher>(&self, hasher: &mut H) {
         self.uri.hash(hasher);
-        for (k, v) in &self.params {
-            k.hash(hasher);
-            v.hash(hasher);
+        if self.params.len() <= 1 {
+            for (k, v) in &self.params {
+                k.hash(hasher);
+                v.hash(hasher);
+            }
+        } else {
+            let mut params: Vec<_> = self.params.iter().collect();
+            params.sort_unstable_by(|(ka, va), (kb, vb)| ka.cmp(kb).then_with(|| va.cmp(vb)));
+            for (k, v) in params {
+                k.hash(hasher);
+                v.hash(hasher);
+            }
         }
         self.implicit.hash(hasher);
     }
@@ -300,5 +309,34 @@ mod tests {
         a.compute_shape_hash(&mut h1);
         b.compute_shape_hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compute_shape_hash_ignores_param_insertion_order() {
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut params_a = HashMap::new();
+        params_a.insert("id".to_string(), "link-1".to_string());
+        params_a.insert("class".to_string(), "external".to_string());
+
+        let mut params_b = HashMap::new();
+        params_b.insert("class".to_string(), "external".to_string());
+        params_b.insert("id".to_string(), "link-1".to_string());
+
+        let a = Hyperlink::new_with_params("https://example.com", params_a);
+        let b = Hyperlink::new_with_params("https://example.com", params_b);
+
+        assert_eq!(a, b, "links with equal params must compare equal");
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        a.compute_shape_hash(&mut h1);
+        b.compute_shape_hash(&mut h2);
+        assert_eq!(
+            h1.finish(),
+            h2.finish(),
+            "shape hash must not depend on HashMap insertion order"
+        );
     }
 }
