@@ -39,20 +39,20 @@ fn assert_decoded_pdu_is_well_formed(decoded: &codec::DecodedPdu) {
 fn structured_header_frame(ident: u64, serial: u64, body: &[u8], is_compressed: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + body.len());
 
-    let mut ident_buf = Vec::new();
-    let _ = leb128::write::unsigned(&mut ident_buf, ident);
-
     let mut serial_buf = Vec::new();
     let _ = leb128::write::unsigned(&mut serial_buf, serial);
 
-    let total_payload_len = ident_buf.len() + serial_buf.len() + body.len();
+    let mut ident_buf = Vec::new();
+    let _ = leb128::write::unsigned(&mut ident_buf, ident);
+
+    let total_payload_len = serial_buf.len() + ident_buf.len() + body.len();
     let mut len_word = total_payload_len as u64;
     if is_compressed {
         len_word |= COMPRESSED_MASK;
     }
     let _ = leb128::write::unsigned(&mut buf, len_word);
-    buf.extend_from_slice(&ident_buf);
     buf.extend_from_slice(&serial_buf);
+    buf.extend_from_slice(&ident_buf);
     buf.extend_from_slice(body);
     buf
 }
@@ -86,7 +86,7 @@ proptest! {
     }
 
     /// (2) Structure-aware fuzz: prepend a plausible leb128 header
-    /// (length, ident, serial) so the input actually reaches the
+    /// (length, serial, ident) so the input actually reaches the
     /// per-variant varbincode deserialize path, then feed random bytes
     /// as the body. This is the deeper surface where a malformed
     /// variant payload could trip the deserializer into an infinite
@@ -105,7 +105,7 @@ proptest! {
         body in proptest::collection::vec(any::<u8>(), 0..1024),
         is_compressed in any::<bool>(),
     ) {
-        // Hand-roll a header: leb128(length) leb128(ident) leb128(serial) body.
+        // Hand-roll a header: leb128(length) leb128(serial) leb128(ident) body.
         // The length field is `ident_bytes.len() + serial_bytes.len() +
         // body.len() | (is_compressed << 63_bit_equivalent)` — the codec uses
         // the top bit of the length word as the compressed flag. We don't
