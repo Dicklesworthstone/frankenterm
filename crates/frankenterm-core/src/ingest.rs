@@ -1416,17 +1416,21 @@ fn trim_utf8_tail_to_max_bytes(text: &str, max_bytes: usize) -> String {
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;
     }
-    // If snapping consumed all remaining bytes (max_bytes smaller than
-    // smallest character at the boundary), fall back to the last full
-    // character rather than returning an empty string.
-    if start >= text.len() && max_bytes > 0 {
-        // Find the start of the last character.
-        let mut last_char_start = text.len();
-        while last_char_start > 0 && !text.is_char_boundary(last_char_start - 1) {
-            last_char_start -= 1;
-        }
-        last_char_start = last_char_start.saturating_sub(1);
-        return text[last_char_start..].to_string();
+    // [ft-a0up5] If snapping consumed all remaining bytes — i.e. the
+    // last character is wider than max_bytes and there's no shorter
+    // suffix that fits — return empty rather than the previous
+    // "last full character" fallback. The pre-fix fallback returned
+    // the entire last character even when it exceeded max_bytes
+    // (e.g. trim("中", 1) returned 3 bytes), violating the function's
+    // declared cap. Callers that need at-least-one-character semantics
+    // must explicitly handle empty here; persistence-side
+    // enforce_segment_size_for_persistence already wraps the oversize
+    // case in a Gap segment via the truncation_reason path, so an
+    // empty-content gap is a sound default — operators see "this
+    // pane's snapshot exceeded max_segment_bytes" without us secretly
+    // exceeding the configured cap.
+    if start >= text.len() {
+        return String::new();
     }
     text[start..].to_string()
 }
@@ -6065,6 +6069,70 @@ mod tests {
         // Should be 4 bytes from the tail, staying on char boundary
         assert!(result.is_char_boundary(0));
         assert!(result.len() <= 4);
+    }
+
+    /// [ft-a0up5] When the last character is wider than max_bytes and
+    /// no shorter suffix exists, the function MUST return empty
+    /// rather than the previous "last full character" fallback that
+    /// returned the entire 3-byte 中 even when only 1 or 2 bytes were
+    /// permitted. Pin the cap-respecting contract for all such cases.
+    #[test]
+    fn ft_a0up5_trim_utf8_tail_returns_at_most_max_bytes_for_multibyte_only_text() {
+        let result = trim_utf8_tail_to_max_bytes("中", 1);
+        assert!(
+            result.len() <= 1,
+            "max_bytes=1 must not return {} bytes (the bare 3-byte 中)",
+            result.len()
+        );
+        let result = trim_utf8_tail_to_max_bytes("中", 2);
+        assert!(
+            result.len() <= 2,
+            "max_bytes=2 must not return {} bytes",
+            result.len()
+        );
+    }
+
+    /// Symmetric: "a中" with max_bytes=2 must not return "中" (3 bytes).
+    /// Pre-fix returned the full 中 character via the
+    /// last-full-character fallback even though the cap was 2.
+    #[test]
+    fn ft_a0up5_trim_utf8_tail_handles_2_byte_cap_with_3_byte_trailing_char() {
+        let result = trim_utf8_tail_to_max_bytes("a中", 2);
+        assert!(
+            result.len() <= 2,
+            "max_bytes=2 must not return {} bytes (was returning the bare 中)",
+            result.len()
+        );
+        // Acceptable post-fix outputs: "" or "a" — both are <= 2 bytes
+        // and on char boundaries.
+        assert!(result.is_char_boundary(0));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    /// The wrapper enforce_segment_size_for_persistence must NEVER emit
+    /// a segment whose content exceeds max_segment_bytes — the gap
+    /// reason already captures the oversize signal, and downstream
+    /// caps (FTS column truncation, DB CHECK constraints) treat
+    /// max_segment_bytes as a hard ceiling.
+    #[test]
+    fn ft_a0up5_enforce_segment_size_respects_kept_bytes_le_max_bytes() {
+        let captured = CapturedSegment {
+            pane_id: 1,
+            seq: 0,
+            content: "中".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 0,
+        };
+        let (bounded, detail) = enforce_segment_size_for_persistence(&captured, 1);
+        assert!(
+            bounded.content.len() <= 1,
+            "enforce returned {} bytes for max_bytes=1; persistence cap must be a ceiling",
+            bounded.content.len()
+        );
+        let detail = detail.expect("oversize input must report enforcement");
+        assert_eq!(detail.max_bytes, 1);
+        assert_eq!(detail.original_bytes, 3);
+        assert!(detail.kept_bytes <= 1);
     }
 
     #[test]
