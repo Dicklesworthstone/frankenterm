@@ -311,6 +311,7 @@ impl ProcessLauncher {
             .cwd
             .as_deref()
             .map(normalize_cwd)
+            .filter(|cwd| !cwd.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("/"));
 
         // Check for agent metadata first
@@ -614,6 +615,9 @@ fn percent_decode(s: &str) -> String {
 /// Escape a path for use in a shell command.
 fn shell_escape(path: &Path) -> String {
     let s = path.to_string_lossy();
+    if s.is_empty() {
+        return "''".to_string();
+    }
     if s.contains(|c: char| c.is_whitespace() || "\"'$`!#&|;(){}[]<>?*~\\".contains(c)) {
         format!("'{}'", s.replace('\'', "'\\''"))
     } else {
@@ -1133,6 +1137,34 @@ mod tests {
             shell_escape(&PathBuf::from("/foo/my project")),
             "'/foo/my project'"
         );
+    }
+
+    #[test]
+    fn shell_escape_empty_path_is_quoted() {
+        assert_eq!(shell_escape(&PathBuf::from("")), "''");
+    }
+
+    #[test]
+    fn shell_escape_roundtrips_as_single_shell_token() {
+        for fixture in [
+            "",
+            "/foo/bar",
+            "/foo/my project",
+            "/foo/$USER",
+            "/foo/it's",
+            "/foo/\"bar\"",
+            "/foo/(copy)",
+            "/foo/~backup",
+        ] {
+            let escaped = shell_escape(&PathBuf::from(fixture));
+            let parsed = shell_words::split(&format!("cd {escaped}"))
+                .expect("shell_escape output must remain parseable");
+            assert_eq!(
+                parsed,
+                vec!["cd".to_string(), fixture.to_string()],
+                "fixture {fixture:?} escaped to {escaped:?} but parsed as {parsed:?}"
+            );
+        }
     }
 
     // ── ft-kegvt sanitizer regression suite ───────────────────────────
@@ -2062,6 +2094,59 @@ mod tests {
                 assert!(reason.contains("no process information"));
             }
             other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_empty_cwd_matches_missing_cwd_root_fallback_for_shells() {
+        let launcher = test_launcher();
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.cwd = Some(String::new());
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::LaunchShell { shell, cwd } => {
+                assert_eq!(shell, "bash");
+                assert_eq!(cwd, &PathBuf::from("/"));
+                assert!(cwd.is_absolute());
+            }
+            other => panic!("expected LaunchShell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_empty_cwd_matches_missing_cwd_root_fallback_for_agents() {
+        let mut agent_commands = HashMap::new();
+        agent_commands.insert("claude_code".into(), "cd {cwd} && claude --resume".into());
+        let config = LaunchConfig {
+            launch_agents: true,
+            agent_commands,
+            ..Default::default()
+        };
+        let wez = crate::wezterm::mock_wezterm_handle();
+        let launcher = ProcessLauncher::new(wez, config);
+        let id_map = test_pane_id_map();
+
+        let mut state = test_pane_state(1);
+        state.cwd = Some(String::new());
+        state.agent = Some(AgentMetadata {
+            agent_type: "claude_code".into(),
+            session_id: None,
+            state: None,
+        });
+
+        let plans = launcher.plan(&id_map, &[state]);
+        match &plans[0].action {
+            LaunchAction::LaunchAgent { command, cwd, .. } => {
+                assert_eq!(cwd, &PathBuf::from("/"));
+                assert!(
+                    command.contains("cd / && claude --resume"),
+                    "empty cwd must not render as bare `cd`: {command}"
+                );
+            }
+            other => panic!("expected LaunchAgent, got {other:?}"),
         }
     }
 
