@@ -2923,7 +2923,7 @@ mod tests {
             }
 
             if previous[start..] == current[..overlap_len] {
-                best_overlap = Some(best_overlap.map_or(overlap_len, |best| best.max(overlap_len)));
+                best_overlap = Some(best_overlap.map_or(overlap_len, |best: usize| best.max(overlap_len)));
             }
         }
 
