@@ -94,6 +94,21 @@ const MAX_EVENTS_PER_PANE: usize = crate::tuning_config::PolicyTuning::DEFAULT_M
 /// Default cooldown if no retry_after is extracted from the detection.
 const DEFAULT_COOLDOWN_SECS: u64 = 300; // 5 minutes
 
+/// Upper bound on any parsed cooldown duration.
+///
+/// [ft-7ojbj] `Instant + Duration` panics on overflow, and
+/// `parse_retry_after("18446744073709551615")` (plain u64::MAX) used to
+/// return `Duration::from_secs(u64::MAX)` unclamped — adding ~584 billion
+/// years to a fresh `Instant` panics the tracker on the very first
+/// `record_at`. Legitimate provider Retry-After values top out around 1h
+/// (OpenAI, Anthropic, Google all sit well below that); anything beyond
+/// is a signal to bail the whole pane rather than block the tracker.
+///
+/// 24h is generous enough to absorb "come back tomorrow" quota-reset
+/// messages while being small enough that `now + MAX_COOLDOWN` cannot
+/// overflow on any realistic clock epoch.
+const MAX_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+
 /// Provider-level rate limit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -445,12 +460,18 @@ impl Default for RateLimitTracker {
 /// - "5 minutes"
 /// - "1 hour"
 /// - "30" (assumed seconds)
+///
+/// [ft-7ojbj] Both the plain-number and "N unit" paths clamp the result at
+/// [`MAX_COOLDOWN_SECS`] (24h). Without the clamp, a provider emitting
+/// `Retry-After: 18446744073709551615` (u64::MAX seconds) would propagate a
+/// [`Duration`] that panics the next `Instant + cooldown` in
+/// [`PaneRateLimitState::record_event`].
 fn parse_retry_after(text: &str) -> Option<Duration> {
     let text = text.trim().to_lowercase();
 
     // Try plain number (assumed seconds)
     if let Ok(secs) = text.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+        return Some(Duration::from_secs(secs.min(MAX_COOLDOWN_SECS)));
     }
 
     // Try "N unit" pattern
@@ -465,7 +486,7 @@ fn parse_retry_after(text: &str) -> Option<Duration> {
                 _ => return None,
             };
             let secs = n.checked_mul(multiplier)?;
-            return Some(Duration::from_secs(secs));
+            return Some(Duration::from_secs(secs.min(MAX_COOLDOWN_SECS)));
         }
     }
 
@@ -515,6 +536,57 @@ mod tests {
     fn parse_retry_after_overflow_returns_none() {
         let text = format!("{} hours", u64::MAX);
         assert_eq!(parse_retry_after(&text), None);
+    }
+
+    // [ft-7ojbj] Before the MAX_COOLDOWN clamp landed, the plain-number
+    // path returned Duration::from_secs(u64::MAX) unclamped — which, added
+    // to an `Instant`, panics the platform clock arithmetic. Pin the
+    // bound at the parser so every downstream (record_event, gc, status)
+    // sees a safe Duration.
+    #[test]
+    fn parse_retry_after_plain_u64_max_is_clamped() {
+        let text = format!("{}", u64::MAX);
+        let parsed = parse_retry_after(&text).expect("u64::MAX must parse, not fail");
+        assert_eq!(
+            parsed,
+            Duration::from_secs(MAX_COOLDOWN_SECS),
+            "plain-number path must clamp at MAX_COOLDOWN_SECS"
+        );
+    }
+
+    // [ft-7ojbj] The 'N unit' path already had a checked_mul guard against
+    // multiplication overflow, but that still leaves room for overflow in
+    // the reasonable-input range (e.g. 1_000_000 hours = 3.6e9 seconds =
+    // ~114 years, within u64 bounds but still absurd). Clamp uniformly.
+    #[test]
+    fn parse_retry_after_huge_hours_is_clamped() {
+        let parsed = parse_retry_after("1000000 hours")
+            .expect("1M hours multiplies in u64 range, must return Some");
+        assert!(
+            parsed <= Duration::from_secs(MAX_COOLDOWN_SECS),
+            "1M-hour input must clamp at MAX_COOLDOWN_SECS, got {parsed:?}"
+        );
+    }
+
+    // [ft-7ojbj] End-to-end: record_at must not panic when the parser is
+    // fed a u64::MAX retry-after — before the clamp, this would panic at
+    // `event.detected_at + event.cooldown` on the first record call.
+    #[test]
+    fn record_at_with_u64_max_retry_after_does_not_panic() {
+        let mut tracker = RateLimitTracker::new();
+        let now = Instant::now();
+        tracker.record_at(
+            1,
+            AgentType::Codex,
+            "codex.rate_limit".into(),
+            Some(format!("{}", u64::MAX)),
+            now,
+        );
+        assert!(tracker.is_pane_rate_limited_at(1, now));
+        // And the cooldown window is bounded — a pane queried 24h+1s
+        // later must be clear.
+        let far_future = now + Duration::from_secs(MAX_COOLDOWN_SECS + 1);
+        assert!(!tracker.is_pane_rate_limited_at(1, far_future));
     }
 
     #[test]
