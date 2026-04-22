@@ -419,12 +419,32 @@ impl BackpressureMetrics {
 /// Evaluates queue depths and manages tier transitions with hysteresis.
 pub struct BackpressureManager {
     config: BackpressureConfig,
-    current_tier: RwLock<BackpressureTier>,
-    tier_entered_at: RwLock<Instant>,
+    /// Combined (tier, tier_entered_at) pair under a single lock.
+    ///
+    /// [ft-89fl5] Previously two separate RwLocks (`current_tier` +
+    /// `tier_entered_at`). A concurrent evaluator could observe a
+    /// half-applied transition: new tier + stale entered_at. The stale
+    /// entered_at made the hysteresis check at line 540 use a timestamp
+    /// from a *previous* tier, treating the elapsed window as already
+    /// satisfied and allowing a downgrade that should have been
+    /// blocked. Collapsing into one lock makes the transition atomic
+    /// from every observer's perspective — either you see the old tier
+    /// + old entered_at, or the new tier + new entered_at, never the
+    /// cross.
+    tier_state: RwLock<TierState>,
     transition_count: AtomicU64,
     paused_panes: Arc<RwLock<HashSet<u64>>>,
     pub metrics: BackpressureMetrics,
     telemetry: BackpressureTelemetry,
+}
+
+/// Atomic snapshot of the manager's current tier + entry timestamp.
+/// Used internally to keep the (tier, entered_at) pair consistent under
+/// concurrent evaluate() calls (ft-89fl5).
+#[derive(Debug, Clone, Copy)]
+struct TierState {
+    tier: BackpressureTier,
+    entered_at: Instant,
 }
 
 impl BackpressureManager {
@@ -433,8 +453,10 @@ impl BackpressureManager {
     pub fn new(config: BackpressureConfig) -> Self {
         Self {
             config,
-            current_tier: RwLock::new(BackpressureTier::Green),
-            tier_entered_at: RwLock::new(Instant::now()),
+            tier_state: RwLock::new(TierState {
+                tier: BackpressureTier::Green,
+                entered_at: Instant::now(),
+            }),
             transition_count: AtomicU64::new(0),
             paused_panes: Arc::new(RwLock::new(HashSet::new())),
             metrics: BackpressureMetrics::default(),
@@ -456,7 +478,10 @@ impl BackpressureManager {
     /// Current tier (lock-free read when only an approximate value is needed).
     #[must_use]
     pub fn current_tier(&self) -> BackpressureTier {
-        *self.current_tier.read().unwrap_or_else(|e| e.into_inner())
+        self.tier_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .tier
     }
 
     /// Classify queue depths into a tier without applying any state change.
@@ -523,7 +548,15 @@ impl BackpressureManager {
         }
 
         let proposed = self.classify(depths);
-        let current = self.current_tier();
+
+        // [ft-89fl5] Single lock acquisition covers the read-check-
+        // write sequence so another concurrent evaluator cannot
+        // observe a half-applied transition (new tier + stale
+        // entered_at). The write guard is held for the duration of
+        // the check AND the apply, so `if proposed == current` ...
+        // decision and the final mutation are consistent.
+        let mut guard = self.tier_state.write().unwrap_or_else(|e| e.into_inner());
+        let current = guard.tier;
 
         if proposed == current {
             return None;
@@ -532,22 +565,19 @@ impl BackpressureManager {
         // Upgrades (toward Black) are immediate.
         // Downgrades require hysteresis.
         if proposed < current {
-            let entered = *self
-                .tier_entered_at
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let elapsed_ms = u64::try_from(entered.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let elapsed_ms =
+                u64::try_from(guard.entered_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             if elapsed_ms < self.config.hysteresis_ms {
                 return None; // too soon to downgrade
             }
         }
 
-        // Apply transition.
-        *self.current_tier.write().unwrap_or_else(|e| e.into_inner()) = proposed;
-        *self
-            .tier_entered_at
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        // Apply transition atomically under the held write lock.
+        guard.tier = proposed;
+        guard.entered_at = Instant::now();
+        // Release the write lock before the fetch_add + tracing::warn
+        // so those don't hold the lock any longer than necessary.
+        drop(guard);
         self.transition_count.fetch_add(1, Ordering::Relaxed);
         self.telemetry.transitions.fetch_add(1, Ordering::Relaxed);
 
@@ -659,11 +689,15 @@ impl BackpressureManager {
     /// Produce a serialisable snapshot of the current state.
     #[must_use]
     pub fn snapshot(&self, depths: &QueueDepths) -> BackpressureSnapshot {
-        let tier = self.current_tier();
-        let entered = *self
-            .tier_entered_at
+        // [ft-89fl5] Single read covers both tier and entered_at so
+        // the duration_in_tier_ms can't straddle a concurrent
+        // transition.
+        let state = *self
+            .tier_state
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        let tier = state.tier;
+        let entered = state.entered_at;
         let now_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
