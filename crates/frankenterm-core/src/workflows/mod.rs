@@ -5994,6 +5994,84 @@ steps:
         });
     }
 
+    /// Test: cx-cancelled pre-start execution fails the record and releases the pane lock.
+    #[test]
+    fn pre_start_cancelled_cx_fails_execution_and_releases_lock() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("test_pre_start_cancel_cleanup.db")
+                .to_string_lossy()
+                .to_string();
+
+            let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+            let pane_id = 431u64;
+
+            create_test_pane(&storage, pane_id).await;
+            runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
+
+            let detection = make_test_detection("simple_complete.cx_pre_cancel");
+            let start_cx = crate::cx::for_testing();
+            let start_result = runner
+                .handle_detection_with_cx(&start_cx, pane_id, &detection, None)
+                .await;
+            assert!(start_result.is_started(), "Workflow should start");
+
+            let execution_id = start_result.execution_id().unwrap().to_string();
+            assert!(
+                lock_manager.is_locked(pane_id).is_some(),
+                "Lock should be held after starting workflow"
+            );
+
+            let run_cx = crate::cx::for_testing();
+            run_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("runner pre-start cancel regression"),
+            );
+
+            let workflow = runner.find_workflow_by_name("simple_completing").unwrap();
+            let exec_result = runner
+                .run_workflow_with_cx(&run_cx, pane_id, workflow, &execution_id, 0)
+                .await;
+
+            match &exec_result {
+                WorkflowExecutionResult::Error {
+                    execution_id: Some(id),
+                    error,
+                } => {
+                    assert_eq!(id, &execution_id);
+                    assert!(
+                        error.contains("run_workflow cancelled pre-start"),
+                        "Error should mention pre-start cancellation: {error}"
+                    );
+                }
+                other => panic!("Expected pre-start cancellation error, got {other:?}"),
+            }
+
+            assert!(
+                lock_manager.is_locked(pane_id).is_none(),
+                "Lock should be released after pre-start cancellation"
+            );
+
+            let record = storage
+                .get_workflow(&execution_id)
+                .await
+                .unwrap()
+                .expect("workflow record should still exist");
+            assert_eq!(record.status, "failed");
+            assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("run_workflow cancelled pre-start")),
+                "Failure reason should be persisted"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
     /// Test: Per-pane lock prevents concurrent workflow execution
     #[test]
     fn per_pane_lock_prevents_concurrent_workflows() {

@@ -1864,8 +1864,11 @@ impl WorkflowRunner {
     ///
     /// Tick 178: entry-point shim. Pre-flight `cx.checkpoint()`
     /// gates the workflow start — if the caller's cx is already
-    /// cancelled, surfaces `WorkflowExecutionResult::Error` with
-    /// a cancellation reason before touching storage or policy.
+    /// cancelled after an earlier `handle_detection_with_cx` acquired
+    /// the pane lock and persisted the execution record, this entry
+    /// point now performs best-effort cleanup (release lock, mark the
+    /// execution failed, mark the trigger handled) before surfacing
+    /// `WorkflowExecutionResult::Error`.
     ///
     /// Tick 180: upgraded to route through the shared
     /// `run_workflow_inner(Some(cx), ...)` path so the 4 startup
@@ -1887,9 +1890,25 @@ impl WorkflowRunner {
         start_step: usize,
     ) -> WorkflowExecutionResult {
         if let Err(err) = cx.checkpoint() {
+            let reason = format!("run_workflow cancelled pre-start: {err}");
+            self.lock_manager.release(pane_id, execution_id);
+            if let Err(cleanup_err) = self.fail_execution(execution_id, &reason).await {
+                tracing::warn!(
+                    execution_id,
+                    error = %cleanup_err,
+                    "Failed to mark pre-start cancelled workflow as failed"
+                );
+            }
+            if let Err(cleanup_err) = self.mark_trigger_event_handled(execution_id, "error").await {
+                tracing::warn!(
+                    execution_id,
+                    error = %cleanup_err,
+                    "Failed to mark trigger event handled after pre-start cancellation"
+                );
+            }
             return WorkflowExecutionResult::Error {
                 execution_id: Some(execution_id.to_string()),
-                error: format!("run_workflow cancelled pre-start: {err}"),
+                error: reason,
             };
         }
         self.run_workflow_inner(Some(cx), pane_id, workflow, execution_id, start_step)
