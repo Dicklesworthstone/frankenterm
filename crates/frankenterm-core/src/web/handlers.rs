@@ -610,7 +610,7 @@ mod tests {
     }
 
     fn make_request(path: &str, query: Option<&str>, storage: Option<StorageHandle>) -> Request {
-        let mut req = Request::new(Method::GET, path);
+        let mut req = Request::new(Method::Get, path);
         if let Some(query) = query {
             req.set_query(Some(query.to_string()));
         }
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn handle_panes_without_state_returns_internal_error() {
         run_async_test(async {
-            let req = Request::new(Method::GET, "/panes");
+            let req = Request::new(Method::Get, "/panes");
             let response = handle_panes(&req).await;
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
             let json = response_json(response);
@@ -839,7 +839,7 @@ mod tests {
     #[test]
     fn handle_search_without_query_returns_bad_request() {
         run_async_test(async {
-            let req = Request::new(Method::GET, "/search");
+            let req = Request::new(Method::Get, "/search");
             let response = handle_search(&req).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let json = response_json(response);
