@@ -300,6 +300,64 @@ proptest! {
         }
     }
 
+    // ── MR7: Gap carries content == current ────────────────────────
+    //
+    // All three Gap return sites in extract_delta (ingest.rs:1675,
+    // :1713, :1724) populate `content` with `current.to_string()` —
+    // the caller treats Gap as a full snapshot reset, so the content
+    // field must be the whole new snapshot, not a truncated slice.
+    // Pin this shipping contract so a future refactor that switches
+    // any return site to (say) the overlap-trimmed tail cannot land
+    // silently. [ft-31kaq]
+    #[test]
+    fn extract_delta_gap_content_equals_current(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Gap { content, .. } =
+            extract_delta(&previous, &current, overlap_size)
+        {
+            prop_assert_eq!(
+                content.as_str(),
+                current.as_str(),
+                "Gap.content must equal current (full-snapshot reset contract)"
+            );
+        }
+    }
+
+    // ── MR8: Content delta is strictly shorter than current ────────
+    //
+    // The algorithm returns Content only when it proved a real overlap
+    // of length >= 1 exists between previous and current (search_window
+    // non-empty + memchr hit + full match). overlap_len = 1 at minimum
+    // (pos == search_window.len() - 1 case), so delta = current[1..]
+    // at longest, i.e. delta.len() <= current.len() - 1. Any Content
+    // with delta.len() == current.len() would mean the algorithm
+    // claims an empty overlap — a fabricated zero-length match that
+    // MR3b would also flag, but it's worth pinning the strict-
+    // shorter form directly because it's the delta-compaction
+    // contract consumers rely on for storage efficiency. [ft-31kaq]
+    #[test]
+    fn extract_delta_content_is_strictly_shorter_than_current(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
+            prop_assert!(
+                delta.len() < current.len(),
+                "Content delta.len()={} must be strictly < current.len()={} \
+                 (overlap is always >= 1 byte when Content is returned); \
+                 delta={:?}, current={:?}",
+                delta.len(),
+                current.len(),
+                delta,
+                current
+            );
+        }
+    }
+
     /// Zero-overlap degrades to Gap when previous != current and
     /// previous is non-empty. Pins the branch contract at line 1675.
     #[test]
