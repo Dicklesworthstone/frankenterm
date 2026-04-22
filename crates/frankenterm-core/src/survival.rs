@@ -450,7 +450,23 @@ impl ActivityProfile {
     }
 
     /// Update a specific hour bucket directly.
+    ///
+    /// [ft-26k3h] NaN-defence: `f64::clamp(NaN, _, _)` returns NaN
+    /// (documented Rust gotcha — same shape as ft-761tz, ft-b4l62,
+    /// ft-jz40p, ft-0p5q5, ft-x50ce). Without this guard, a NaN
+    /// `normalized_activity` poisoned `hourly_ewma[index]` permanently:
+    /// either on first insert (when `sample_count == 0` takes the
+    /// `sample` branch) or on EWMA update where `alpha * NaN + (1-α) *
+    /// prev = NaN`. Every subsequent `predict_hour` call would return
+    /// NaN for that slot until process restart.
+    ///
+    /// Skip the update on NaN so the slot retains its last good value
+    /// (or the default for an uninitialised bucket) and the next
+    /// well-formed sample continues the EWMA cleanly.
     pub fn update_hour(&mut self, hour: u8, normalized_activity: f64) {
+        if normalized_activity.is_nan() {
+            return;
+        }
         let index = usize::from(hour % 24);
         let sample = normalized_activity.clamp(0.0, 1.0);
         let prev = self.hourly_ewma[index];
@@ -2581,5 +2597,54 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: SurvivalTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // ── ft-26k3h: ActivityProfile::update_hour rejects NaN ───────────────
+
+    /// Pre-fix: `normalized_activity.clamp(0.0, 1.0)` returned NaN
+    /// unchanged (documented `f64::clamp` gotcha), which either
+    /// initialised the bucket to NaN (`sample_count == 0` path) or
+    /// poisoned the EWMA (`alpha * NaN + (1-α) * prev = NaN`). Every
+    /// subsequent predict_hour call would return NaN for that slot
+    /// until process restart.
+    #[test]
+    fn ft_26k3h_update_hour_nan_does_not_poison_ewma() {
+        let mut profile = ActivityProfile::new(0.5, 0.3);
+        // Seed with a known-good sample so we can prove NaN doesn't
+        // overwrite it.
+        profile.update_hour(0, 0.7);
+        let before_ewma = profile.predict_hour(0);
+        let before_count = profile.sample_count(0);
+
+        profile.update_hour(0, f64::NAN);
+
+        assert_eq!(
+            profile.predict_hour(0),
+            before_ewma,
+            "NaN must not overwrite the bucket"
+        );
+        assert_eq!(
+            profile.sample_count(0),
+            before_count,
+            "NaN must not advance sample_count"
+        );
+    }
+
+    /// End-to-end: even if a NaN sample is attempted on a fresh
+    /// bucket, the default is preserved and the next clean sample
+    /// initialises the EWMA correctly.
+    #[test]
+    fn ft_26k3h_update_hour_nan_then_clean_sample_initialises_correctly() {
+        let mut profile = ActivityProfile::new(0.5, 0.3);
+        profile.update_hour(5, f64::NAN);
+        // Default was 0.3; NaN did not overwrite.
+        assert!((profile.predict_hour(5) - 0.3).abs() < f64::EPSILON);
+        assert_eq!(profile.sample_count(5), 0);
+
+        // First clean sample becomes the stored value (initial insert
+        // branch, not EWMA blend).
+        profile.update_hour(5, 0.8);
+        assert!((profile.predict_hour(5) - 0.8).abs() < f64::EPSILON);
+        assert_eq!(profile.sample_count(5), 1);
     }
 }
