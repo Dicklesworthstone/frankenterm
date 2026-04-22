@@ -361,6 +361,12 @@ where
     let outcome = with_retry_outcome_cx(cx, policy, operation).await;
     match &outcome.result {
         Ok(_) => circuit.record_success(),
+        // [ft-gc4hz] Cancellation is caller intent, not a backend fault.
+        // Counting Cancelled as a failure lets an external cx.cancel() push
+        // the breaker past `failure_threshold` and reject unrelated callers
+        // with CircuitOpen. Skip both record_success and record_failure so
+        // the circuit's consecutive_failures counter stays truthful.
+        Err(Error::Cancelled(_)) => {}
         Err(_) => circuit.record_failure(),
     }
     outcome.result
