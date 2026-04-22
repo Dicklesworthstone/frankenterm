@@ -826,7 +826,6 @@ pub fn spawn_mux_watchdog(
             }
         })
     }
-
 }
 
 /// Get the RSS (resident set size) of the wezterm-mux-server process.

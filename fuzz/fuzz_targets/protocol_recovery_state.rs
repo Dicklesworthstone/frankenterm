@@ -19,8 +19,8 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use frankenterm_core::protocol_recovery::{
-    classify_error_message, ConnectionHealth, ConnectionHealthTracker,
-    FrameCorruptionDetector, ProtocolErrorKind, RecoveryConfig,
+    ConnectionHealth, ConnectionHealthTracker, FrameCorruptionDetector, ProtocolErrorKind,
+    RecoveryConfig, classify_error_message,
 };
 use libfuzzer_sys::fuzz_target;
 use std::time::Duration;
@@ -57,7 +57,7 @@ enum Op<'a> {
 /// to shake out f64::NAN handling that callers can't produce anyway.
 #[derive(Arbitrary, Debug)]
 struct FuzzConfig {
-    initial_delay_ms: u16,  // up to 64s
+    initial_delay_ms: u16, // up to 64s
     max_delay_ms: u16,
     /// Stored as u8 → mapped into [0.5, 4.5] so backoff_factor stays finite and realistic.
     backoff_factor_raw: u8,
@@ -132,24 +132,35 @@ fuzz_target!(|data: &[u8]| {
                 let corrupted = detector.record_error(kind.into(), &msg_str);
                 // Invariant: `is_corrupted()` must agree with the bool
                 // `record_error` just returned, at least at this point.
-                assert_eq!(corrupted, detector.is_corrupted(),
-                    "detector.record_error return value disagrees with is_corrupted()");
+                assert_eq!(
+                    corrupted,
+                    detector.is_corrupted(),
+                    "detector.record_error return value disagrees with is_corrupted()"
+                );
                 let h = tracker.record_error(kind.into(), &msg_str);
                 check_health_valid(h);
                 // Invariant: the health we just observed matches the
                 // tracker's stored health (no hidden drift).
-                assert_eq!(h, tracker.health(),
-                    "tracker.record_error return value disagrees with tracker.health()");
+                assert_eq!(
+                    h,
+                    tracker.health(),
+                    "tracker.record_error return value disagrees with tracker.health()"
+                );
             }
             Op::Reset => {
                 detector.reset();
                 tracker.reset();
                 // Invariant: after reset, the detector is not corrupted
                 // and the tracker is healthy.
-                assert!(!detector.is_corrupted(),
-                    "detector.is_corrupted() true after reset");
-                assert_eq!(tracker.health(), ConnectionHealth::Healthy,
-                    "tracker.health() not Healthy after reset");
+                assert!(
+                    !detector.is_corrupted(),
+                    "detector.is_corrupted() true after reset"
+                );
+                assert_eq!(
+                    tracker.health(),
+                    ConnectionHealth::Healthy,
+                    "tracker.health() not Healthy after reset"
+                );
                 let (a, b) = detector.error_counts();
                 assert_eq!(a, 0, "detector unexpected_count != 0 after reset");
                 assert_eq!(b, 0, "detector codec_error_count != 0 after reset");
@@ -168,8 +179,10 @@ fuzz_target!(|data: &[u8]| {
                 let bounded = attempt.min(256);
                 let d = config.delay_for_attempt(bounded);
                 // Invariant 1: delay is at least 1ms (documented floor).
-                assert!(d >= Duration::from_millis(1),
-                    "delay_for_attempt returned {d:?}, below 1ms floor");
+                assert!(
+                    d >= Duration::from_millis(1),
+                    "delay_for_attempt returned {d:?}, below 1ms floor"
+                );
                 // Invariant 2: jitter cannot push beyond max_delay * 2
                 // (jitter_range = capped * jitter_fraction <= capped, so
                 // capped + jitter <= 2 * capped). Allow 1ms slop for
@@ -178,8 +191,10 @@ fuzz_target!(|data: &[u8]| {
                     .max_delay
                     .saturating_mul(2)
                     .saturating_add(Duration::from_millis(1));
-                assert!(d <= max_bound,
-                    "delay {d:?} exceeds 2*max_delay bound {max_bound:?}");
+                assert!(
+                    d <= max_bound,
+                    "delay {d:?} exceeds 2*max_delay bound {max_bound:?}"
+                );
             }
         }
 

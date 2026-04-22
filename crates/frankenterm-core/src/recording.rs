@@ -313,8 +313,7 @@ impl RecordingManager {
         started_at_ms: i64,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .start_recording_with_cx(&cx, pane_id, path, started_at_ms)
+        self.start_recording_with_cx(&cx, pane_id, path, started_at_ms)
             .await
     }
 
@@ -412,8 +411,7 @@ impl RecordingManager {
         captured_at_ms: i64,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
+        self.record_event_with_cx(&cx, pane_id, detection, captured_at_ms)
             .await
     }
 
@@ -446,7 +444,6 @@ impl RecordingManager {
         }
         recorder.record_event(detection_ref, captured_at_ms)
     }
-
 }
 
 fn redact_detection(detection: &Detection, redactor: &Redactor) -> Detection {

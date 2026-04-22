@@ -28,7 +28,13 @@ fn frame_type_tag(frame_type: FrameType) -> u8 {
     }
 }
 
-fn raw_frame(ts: u64, frame_type_byte: u8, flags: u8, claimed_payload_len: u32, payload: &[u8]) -> Vec<u8> {
+fn raw_frame(
+    ts: u64,
+    frame_type_byte: u8,
+    flags: u8,
+    claimed_payload_len: u32,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     buf.extend_from_slice(&ts.to_le_bytes());
     buf.push(frame_type_byte);
@@ -44,7 +50,11 @@ fn payload(len: usize) -> Vec<u8> {
 
 fn parse_single_frame(bytes: &[u8]) -> frankenterm_core::recording::RecordingFrame {
     let recording = Recording::from_bytes(bytes).expect("frame should parse");
-    assert_eq!(recording.frames.len(), 1, "expected exactly one parsed frame");
+    assert_eq!(
+        recording.frames.len(),
+        1,
+        "expected exactly one parsed frame"
+    );
     recording.frames.into_iter().next().unwrap()
 }
 
@@ -71,7 +81,10 @@ fn conformance_constants_still_match_encoder() {
         .encode();
 
         assert_eq!(encoded.len(), FRAME_HEADER_LEN);
-        assert_eq!(encoded[8], expected_tag, "encoder tag drift for {frame_type:?}");
+        assert_eq!(
+            encoded[8], expected_tag,
+            "encoder tag drift for {frame_type:?}"
+        );
     }
 }
 
@@ -115,7 +128,13 @@ fn conformance_max_field_values_round_trip() {
 #[test]
 fn conformance_boundary_payload_len_one_round_trip() {
     let data = payload(1);
-    let bytes = raw_frame(11, frame_type_tag(FrameType::Output), 0, data.len() as u32, &data);
+    let bytes = raw_frame(
+        11,
+        frame_type_tag(FrameType::Output),
+        0,
+        data.len() as u32,
+        &data,
+    );
     let frame = parse_single_frame(&bytes);
     assert_eq!(frame.header.payload_len as usize, data.len());
     assert_eq!(frame.payload, data);
@@ -124,7 +143,13 @@ fn conformance_boundary_payload_len_one_round_trip() {
 #[test]
 fn conformance_boundary_payload_len_255_round_trip() {
     let data = payload(255);
-    let bytes = raw_frame(22, frame_type_tag(FrameType::Output), 0, data.len() as u32, &data);
+    let bytes = raw_frame(
+        22,
+        frame_type_tag(FrameType::Output),
+        0,
+        data.len() as u32,
+        &data,
+    );
     let frame = parse_single_frame(&bytes);
     assert_eq!(frame.header.payload_len as usize, data.len());
     assert_eq!(frame.payload, data);
@@ -133,7 +158,13 @@ fn conformance_boundary_payload_len_255_round_trip() {
 #[test]
 fn conformance_boundary_payload_len_256_round_trip() {
     let data = payload(256);
-    let bytes = raw_frame(33, frame_type_tag(FrameType::Output), 0, data.len() as u32, &data);
+    let bytes = raw_frame(
+        33,
+        frame_type_tag(FrameType::Output),
+        0,
+        data.len() as u32,
+        &data,
+    );
     let frame = parse_single_frame(&bytes);
     assert_eq!(frame.header.payload_len as usize, data.len());
     assert_eq!(frame.payload, data);
@@ -142,7 +173,13 @@ fn conformance_boundary_payload_len_256_round_trip() {
 #[test]
 fn conformance_boundary_payload_len_65535_round_trip() {
     let data = payload(65_535);
-    let bytes = raw_frame(44, frame_type_tag(FrameType::Marker), 0, data.len() as u32, &data);
+    let bytes = raw_frame(
+        44,
+        frame_type_tag(FrameType::Marker),
+        0,
+        data.len() as u32,
+        &data,
+    );
     let frame = parse_single_frame(&bytes);
     assert_eq!(frame.header.payload_len as usize, data.len());
     assert_eq!(frame.payload.len(), data.len());
@@ -152,7 +189,13 @@ fn conformance_boundary_payload_len_65535_round_trip() {
 #[test]
 fn conformance_boundary_payload_len_65536_round_trip() {
     let data = payload(65_536);
-    let bytes = raw_frame(55, frame_type_tag(FrameType::Event), 0, data.len() as u32, &data);
+    let bytes = raw_frame(
+        55,
+        frame_type_tag(FrameType::Event),
+        0,
+        data.len() as u32,
+        &data,
+    );
     let frame = parse_single_frame(&bytes);
     assert_eq!(frame.header.payload_len as usize, data.len());
     assert_eq!(frame.payload, data);
@@ -196,7 +239,8 @@ fn conformance_non_canonical_unknown_flag_bits_are_preserved() {
 
 #[test]
 fn conformance_invalid_frame_type_byte_is_rejected() {
-    let err = Recording::from_bytes(&raw_frame(0, 0, 0, 0, &[])).expect_err("invalid type must fail");
+    let err =
+        Recording::from_bytes(&raw_frame(0, 0, 0, 0, &[])).expect_err("invalid type must fail");
     let message = err.to_string();
     assert!(
         message.contains("unknown frame type byte"),
@@ -216,8 +260,14 @@ fn conformance_truncated_header_is_rejected() {
 
 #[test]
 fn conformance_truncated_payload_is_rejected() {
-    let err = Recording::from_bytes(&raw_frame(0, frame_type_tag(FrameType::Output), 0, 8, b"abc"))
-        .expect_err("short payload must fail");
+    let err = Recording::from_bytes(&raw_frame(
+        0,
+        frame_type_tag(FrameType::Output),
+        0,
+        8,
+        b"abc",
+    ))
+    .expect_err("short payload must fail");
     let message = err.to_string();
     assert!(
         message.contains("unexpected EOF reading frame payload"),

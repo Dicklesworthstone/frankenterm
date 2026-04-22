@@ -5823,10 +5823,7 @@ impl WriteCommandSender {
     }
 
     fn max_capacity(&self) -> usize {
-        {
-            self.inner.capacity()
-        }
-
+        { self.inner.capacity() }
     }
 
     fn capacity(&self) -> usize {
@@ -6016,8 +6013,7 @@ impl StorageHandle {
         content_hash: Option<String>,
     ) -> Result<Segment> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .append_segment_with_cx(&cx, pane_id, content, content_hash)
+        self.append_segment_with_cx(&cx, pane_id, content, content_hash)
             .await
     }
 
@@ -6137,8 +6133,7 @@ impl StorageHandle {
         status: &str,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .mark_event_handled_with_cx(&cx, event_id, workflow_id, status)
+        self.mark_event_handled_with_cx(&cx, event_id, workflow_id, status)
             .await
     }
 
@@ -6186,8 +6181,7 @@ impl StorageHandle {
         updated_by: Option<String>,
     ) -> Result<bool> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .set_event_triage_state_with_cx(&cx, event_id, triage_state, updated_by)
+        self.set_event_triage_state_with_cx(&cx, event_id, triage_state, updated_by)
             .await
     }
 
@@ -6229,8 +6223,7 @@ impl StorageHandle {
         updated_by: Option<String>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .set_event_note_with_cx(&cx, event_id, note, updated_by)
+        self.set_event_note_with_cx(&cx, event_id, note, updated_by)
             .await
     }
 
@@ -6271,8 +6264,7 @@ impl StorageHandle {
         created_by: Option<String>,
     ) -> Result<bool> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .add_event_label_with_cx(&cx, event_id, label, created_by)
+        self.add_event_label_with_cx(&cx, event_id, label, created_by)
             .await
     }
 
@@ -6642,8 +6634,7 @@ impl StorageHandle {
     /// action was already undone, non-undoable, or missing undo metadata.
     pub async fn mark_action_undone(&self, audit_action_id: i64, undone_by: &str) -> Result<bool> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .mark_action_undone_with_cx(&cx, audit_action_id, undone_by)
+        self.mark_action_undone_with_cx(&cx, audit_action_id, undone_by)
             .await
     }
 
@@ -6677,8 +6668,7 @@ impl StorageHandle {
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .purge_audit_actions_before_with_cx(&cx, before_ts)
+        self.purge_audit_actions_before_with_cx(&cx, before_ts)
             .await
     }
 
@@ -6805,14 +6795,7 @@ impl StorageHandle {
         last_error: Option<String>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .update_saved_search_run_with_cx(
-                &cx,
-                id,
-                last_run_at,
-                last_result_count,
-                last_error,
-            )
+        self.update_saved_search_run_with_cx(&cx, id, last_run_at, last_result_count, last_error)
             .await
     }
 
@@ -6854,8 +6837,7 @@ impl StorageHandle {
         schedule_interval_ms: Option<i64>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .update_saved_search_schedule_with_cx(&cx, id, enabled, schedule_interval_ms)
+        self.update_saved_search_schedule_with_cx(&cx, id, enabled, schedule_interval_ms)
             .await
     }
 
@@ -7393,8 +7375,7 @@ impl StorageHandle {
         error_message: Option<String>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .update_notification_status_with_cx(&cx, id, status, error_message)
+        self.update_notification_status_with_cx(&cx, id, status, error_message)
             .await
     }
 
@@ -7434,8 +7415,7 @@ impl StorageHandle {
         action_taken: Option<String>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .acknowledge_notification_with_cx(&cx, id, acknowledged_by, action_taken)
+        self.acknowledge_notification_with_cx(&cx, id, acknowledged_by, action_taken)
             .await
     }
 
@@ -7497,8 +7477,7 @@ impl StorageHandle {
     /// Purge notification history older than the given timestamp.
     pub async fn purge_notification_history(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .purge_notification_history_with_cx(&cx, before_ts)
+        self.purge_notification_history_with_cx(&cx, before_ts)
             .await
     }
 
@@ -7589,8 +7568,7 @@ impl StorageHandle {
         handled: Option<bool>,
     ) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .count_events_by_tier_with_cx(&cx, before_ts, severities, event_types, handled)
+        self.count_events_by_tier_with_cx(&cx, before_ts, severities, event_types, handled)
             .await
     }
 
@@ -7621,8 +7599,7 @@ impl StorageHandle {
     /// Count audit_actions older than a cutoff (read-path).
     pub async fn count_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .count_audit_actions_before_with_cx(&cx, before_ts)
+        self.count_audit_actions_before_with_cx(&cx, before_ts)
             .await
     }
 
@@ -7648,8 +7625,7 @@ impl StorageHandle {
     /// Count usage_metrics older than a cutoff (read-path).
     pub async fn count_usage_metrics_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .count_usage_metrics_before_with_cx(&cx, before_ts)
+        self.count_usage_metrics_before_with_cx(&cx, before_ts)
             .await
     }
 
@@ -7675,8 +7651,7 @@ impl StorageHandle {
     /// Count notification_history older than a cutoff (read-path).
     pub async fn count_notification_history_before(&self, before_ts: i64) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .count_notification_history_before_with_cx(&cx, before_ts)
+        self.count_notification_history_before_with_cx(&cx, before_ts)
             .await
     }
 
@@ -7704,8 +7679,7 @@ impl StorageHandle {
     /// Delete events older than a cutoff (flat, no tier; write-path).
     pub async fn delete_events_before(&self, before_ts: i64, batch_size: usize) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .delete_events_before_with_cx(&cx, before_ts, batch_size)
+        self.delete_events_before_with_cx(&cx, before_ts, batch_size)
             .await
     }
 
@@ -7745,16 +7719,15 @@ impl StorageHandle {
         batch_size: usize,
     ) -> Result<usize> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .delete_events_by_tier_with_cx(
-                &cx,
-                before_ts,
-                severities,
-                event_types,
-                handled,
-                batch_size,
-            )
-            .await
+        self.delete_events_by_tier_with_cx(
+            &cx,
+            before_ts,
+            severities,
+            event_types,
+            handled,
+            batch_size,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`delete_events_by_tier`].
@@ -8096,16 +8069,15 @@ impl StorageHandle {
         action_fingerprint: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .consume_approval_token_with_cx(
-                &cx,
-                code_hash,
-                workspace_id,
-                action_kind,
-                pane_id,
-                action_fingerprint,
-            )
-            .await
+        self.consume_approval_token_with_cx(
+            &cx,
+            code_hash,
+            workspace_id,
+            action_kind,
+            pane_id,
+            action_fingerprint,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`consume_approval_token`].
@@ -8147,8 +8119,7 @@ impl StorageHandle {
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .get_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
+        self.get_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
             .await
     }
 
@@ -8190,8 +8161,7 @@ impl StorageHandle {
         workspace_id: &str,
     ) -> Result<Option<ApprovalTokenRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .consume_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
+        self.consume_approval_token_by_code_with_cx(&cx, code_hash, workspace_id)
             .await
     }
 
@@ -8292,8 +8262,7 @@ impl StorageHandle {
         plan: &crate::plan::ActionPlan,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .upsert_action_plan_with_cx(&cx, workflow_id, plan)
+        self.upsert_action_plan_with_cx(&cx, workflow_id, plan)
             .await
     }
 
@@ -8360,8 +8329,7 @@ impl StorageHandle {
         now_ms: i64,
     ) -> Result<Option<PreparedPlanRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .consume_prepared_plan_with_cx(&cx, plan_id, now_ms)
+        self.consume_prepared_plan_with_cx(&cx, plan_id, now_ms)
             .await
     }
 
@@ -8410,24 +8378,23 @@ impl StorageHandle {
         completed_at: i64,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .insert_step_log_with_cx(
-                &cx,
-                workflow_id,
-                audit_action_id,
-                step_index,
-                step_name,
-                step_id,
-                step_kind,
-                result_type,
-                result_data,
-                policy_summary,
-                verification_refs,
-                error_code,
-                started_at,
-                completed_at,
-            )
-            .await
+        self.insert_step_log_with_cx(
+            &cx,
+            workflow_id,
+            audit_action_id,
+            step_index,
+            step_name,
+            step_id,
+            step_kind,
+            result_type,
+            result_data,
+            policy_summary,
+            verification_refs,
+            error_code,
+            started_at,
+            completed_at,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_step_log`].
@@ -8495,8 +8462,7 @@ impl StorageHandle {
         host_id: Option<String>,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .insert_mux_session_with_cx(&cx, session_id, topology_json, ft_version, host_id)
+        self.insert_mux_session_with_cx(&cx, session_id, topology_json, ft_version, host_id)
             .await
     }
 
@@ -8543,18 +8509,17 @@ impl StorageHandle {
         pane_states: Vec<SessionPaneStateRow>,
     ) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .insert_session_checkpoint_with_cx(
-                &cx,
-                session_id,
-                checkpoint_type,
-                state_hash,
-                pane_count,
-                total_bytes,
-                metadata_json,
-                pane_states,
-            )
-            .await
+        self.insert_session_checkpoint_with_cx(
+            &cx,
+            session_id,
+            checkpoint_type,
+            state_hash,
+            pane_count,
+            total_bytes,
+            metadata_json,
+            pane_states,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`insert_session_checkpoint`].
@@ -8642,8 +8607,7 @@ impl StorageHandle {
     /// Mark a session as cleanly shut down.
     pub async fn mark_session_shutdown_clean(&self, session_id: String) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .mark_session_shutdown_clean_with_cx(&cx, session_id)
+        self.mark_session_shutdown_clean_with_cx(&cx, session_id)
             .await
     }
 
@@ -8674,8 +8638,7 @@ impl StorageHandle {
     /// Get the state_hash of the latest checkpoint for a session.
     pub async fn get_latest_checkpoint_hash(&self, session_id: String) -> Result<Option<String>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .get_latest_checkpoint_hash_with_cx(&cx, session_id)
+        self.get_latest_checkpoint_hash_with_cx(&cx, session_id)
             .await
     }
 
@@ -8918,8 +8881,7 @@ impl StorageHandle {
         vector: &[u8],
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .store_embedding_with_cx(&cx, segment_id, embedder_id, dimension, vector)
+        self.store_embedding_with_cx(&cx, segment_id, embedder_id, dimension, vector)
             .await
     }
 
@@ -8965,8 +8927,7 @@ impl StorageHandle {
         limit: usize,
     ) -> Result<Vec<i64>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .get_unembedded_segments_with_cx(&cx, embedder_id, limit)
+        self.get_unembedded_segments_with_cx(&cx, embedder_id, limit)
             .await
     }
 
@@ -9017,8 +8978,7 @@ impl StorageHandle {
         embedder_id: &str,
     ) -> Result<Option<Vec<u8>>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .get_embedding_with_cx(&cx, segment_id, embedder_id)
+        self.get_embedding_with_cx(&cx, segment_id, embedder_id)
             .await
     }
 
@@ -9154,8 +9114,7 @@ impl StorageHandle {
         options: SearchOptions,
     ) -> Result<Vec<SemanticSearchHit>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .semantic_search_with_cx(&cx, embedder_id, query_vector, options)
+        self.semantic_search_with_cx(&cx, embedder_id, query_vector, options)
             .await
     }
 
@@ -9199,20 +9158,19 @@ impl StorageHandle {
         fusion_backend: Option<FusionBackend>,
     ) -> Result<HybridSearchBundle> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .hybrid_search_with_results_with_cx(
-                &cx,
-                query,
-                options,
-                embedder_id,
-                query_vector,
-                mode,
-                rrf_k,
-                lexical_weight,
-                semantic_weight,
-                fusion_backend,
-            )
-            .await
+        self.hybrid_search_with_results_with_cx(
+            &cx,
+            query,
+            options,
+            embedder_id,
+            query_vector,
+            mode,
+            rrf_k,
+            lexical_weight,
+            semantic_weight,
+            fusion_backend,
+        )
+        .await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`hybrid_search_with_results`].
@@ -9524,8 +9482,7 @@ impl StorageHandle {
     /// Count active (unused + unexpired) approval tokens for a workspace
     pub async fn count_active_approvals(&self, workspace_id: &str, now_ms: i64) -> Result<u32> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .count_active_approvals_with_cx(&cx, workspace_id, now_ms)
+        self.count_active_approvals_with_cx(&cx, workspace_id, now_ms)
             .await
     }
 
@@ -9746,8 +9703,7 @@ impl StorageHandle {
         scope_hash: &str,
     ) -> Result<Option<SecretScanReportRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .latest_secret_scan_report_with_cx(&cx, scope_hash)
+        self.latest_secret_scan_report_with_cx(&cx, scope_hash)
             .await
     }
 
@@ -10018,8 +9974,7 @@ impl StorageHandle {
         last_used_at: i64,
     ) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .update_account_last_used_with_cx(&cx, service, account_id, last_used_at)
+        self.update_account_last_used_with_cx(&cx, service, account_id, last_used_at)
             .await
     }
 
@@ -10190,8 +10145,7 @@ impl StorageHandle {
         ttl_ms: i64,
     ) -> Result<PaneReservation> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .create_reservation_with_cx(&cx, pane_id, owner_kind, owner_id, reason, ttl_ms)
+        self.create_reservation_with_cx(&cx, pane_id, owner_kind, owner_id, reason, ttl_ms)
             .await
     }
 

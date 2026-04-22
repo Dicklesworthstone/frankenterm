@@ -755,7 +755,6 @@ fn check_control(rx: &mut watch::Receiver<PlayerControl>) -> Option<PlayerContro
             None
         }
     }
-
 }
 
 /// Route a decoded frame to the appropriate sink method.

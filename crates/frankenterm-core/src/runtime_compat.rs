@@ -2036,9 +2036,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    {
-        Ok(asupersync::runtime::spawn_blocking(work).await)
-    }
+    { Ok(asupersync::runtime::spawn_blocking(work).await) }
 }
 
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
@@ -2100,17 +2098,13 @@ pub fn mpsc_try_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
 ///
 /// Returns `false` if the channel has closed.
 pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
-    {
-        rx.has_changed()
-    }
+    { rx.has_changed() }
 }
 
 /// Borrows the latest watch value and clones it while marking the update as
 /// consumed where required by the active runtime backend.
 pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
-    {
-        rx.borrow_and_clone()
-    }
+    { rx.borrow_and_clone() }
 }
 
 /// Waits until the watch receiver observes a change, abstracting the

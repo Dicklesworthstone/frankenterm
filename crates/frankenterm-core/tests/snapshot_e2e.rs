@@ -1548,11 +1548,7 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
             &mut report,
             "load_and_compare_identity",
             load_start,
-            if checkpoint_id_matches
-                && pane_count_matches
-                && pane_ids_match
-                && cwds_match
-            {
+            if checkpoint_id_matches && pane_count_matches && pane_ids_match && cwds_match {
                 "ok"
             } else {
                 "error"
@@ -1641,7 +1637,10 @@ fn e2e_save_restart_restore_session_identity_survives_engine_rebuild() {
             && cwds_match
             && restore_ok
             && detect_cleared
-            && report.pane_reports.iter().all(|p| p.content_match && p.layout_match);
+            && report
+                .pane_reports
+                .iter()
+                .all(|p| p.content_match && p.layout_match);
         report.total_duration_ms = run_start.elapsed().as_millis() as u64;
         report.passed = success;
         report.failure_reason = if success {
@@ -1663,8 +1662,8 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
     run_async_test(async {
         let run_start = Instant::now();
         let mut report = E2ETestReport {
-            test_name:
-                "e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild".to_string(),
+            test_name: "e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild"
+                .to_string(),
             phases: Vec::new(),
             total_duration_ms: 0,
             passed: false,
@@ -1673,17 +1672,28 @@ fn e2e_save_restart_restore_scrollback_bytes_survive_engine_rebuild() {
         };
 
         let (_tmp, db_path) = setup_test_db();
-        let pane = make_pane(7, 0, 0, 24, 80, "claude-code", "file:///tmp/scrollback-roundtrip");
+        let pane = make_pane(
+            7,
+            0,
+            0,
+            24,
+            80,
+            "claude-code",
+            "file:///tmp/scrollback-roundtrip",
+        );
 
         // Known scrollback content — includes an ANSI color escape, a tab,
         // and a UTF-8 multi-byte character so we can detect byte-level loss.
         let segments: Vec<(i64, String, i64)> = vec![
             (0, "line 1 — plain ASCII\n".to_string(), 6_000),
-            (1, "line 2 \t with \x1b[31mred\x1b[0m color\n".to_string(), 6_100),
+            (
+                1,
+                "line 2 \t with \x1b[31mred\x1b[0m color\n".to_string(),
+                6_100,
+            ),
             (2, "line 3 🦀 emoji and résumé accents\n".to_string(), 6_200),
         ];
-        let expected_concatenated: String =
-            segments.iter().map(|(_, c, _)| c.clone()).collect();
+        let expected_concatenated: String = segments.iter().map(|(_, c, _)| c.clone()).collect();
         let expected_bytes_hash = hash_text(&expected_concatenated);
 
         let captured_session_id;
@@ -1950,10 +1960,7 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         // ── restart ─────────────────────────────────────────────────────
         let restart_start = Instant::now();
         let _engine_b = SnapshotEngine::new(db_path.clone(), SnapshotConfig::default());
-        let restorer = SessionRestorer::new(
-            db_path.clone(),
-            SessionRestoreConfig::default(),
-        );
+        let restorer = SessionRestorer::new(db_path.clone(), SessionRestoreConfig::default());
         add_phase(
             &mut report,
             "restart_rebuild_handles",
@@ -1968,10 +1975,8 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
         let reparsed_topology = TopologySnapshot::from_json(&captured_topology_json)
             .expect("persisted topology_json must re-parse");
         let reparsed_panes = collect_fixture_panes(&reparsed_topology);
-        let reparsed_pane_ids: HashSet<u64> =
-            reparsed_panes.iter().map(|p| p.pane_id).collect();
-        let original_pane_ids: HashSet<u64> =
-            panes.iter().map(|p| p.pane_id).collect();
+        let reparsed_pane_ids: HashSet<u64> = reparsed_panes.iter().map(|p| p.pane_id).collect();
+        let original_pane_ids: HashSet<u64> = panes.iter().map(|p| p.pane_id).collect();
         let pane_set_match = reparsed_pane_ids == original_pane_ids;
         let pane_count_match = reparsed_topology.pane_count() == panes.len();
         let window_count_match = reparsed_topology.windows.len() >= 1;
@@ -1987,11 +1992,7 @@ fn e2e_save_restart_restore_nested_split_topology_preserved() {
             &mut report,
             "verify_topology_tree_shape",
             verify_start,
-            if pane_set_match
-                && pane_count_match
-                && window_count_match
-                && topology_self_roundtrip
-            {
+            if pane_set_match && pane_count_match && window_count_match && topology_self_roundtrip {
                 "ok"
             } else {
                 "error"

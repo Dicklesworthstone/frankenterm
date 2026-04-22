@@ -104,23 +104,15 @@ fn cargo_manifest_dir() -> PathBuf {
 
 fn read_frankenterm_core_cargo_toml() -> (PathBuf, String) {
     let path = cargo_manifest_dir().join("Cargo.toml");
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "conformance harness cannot read {}: {e}",
-            path.display()
-        )
-    });
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("conformance harness cannot read {}: {e}", path.display()));
     (path, text)
 }
 
 fn read_wezterm_rs() -> (PathBuf, String) {
     let path = cargo_manifest_dir().join("src").join("wezterm.rs");
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "conformance harness cannot read {}: {e}",
-            path.display()
-        )
-    });
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("conformance harness cannot read {}: {e}", path.display()));
     (path, text)
 }
 
@@ -209,8 +201,7 @@ fn spec_xbnl_2_5_must_3_asupersync_runtime_is_empty_noop() {
 #[test]
 fn spec_xbnl_2_5_must_4_sync_feature_is_empty() {
     let (_, text) = read_frankenterm_core_cargo_toml();
-    let body = feature_body(&text, "sync")
-        .expect("[MUST-4] `sync` feature must still be declared");
+    let body = feature_body(&text, "sync").expect("[MUST-4] `sync` feature must still be declared");
     assert!(
         body.trim().is_empty(),
         "[MUST-4] `sync` feature must have an empty body — it previously \
@@ -234,8 +225,7 @@ fn spec_xbnl_2_5_must_5_native_wezterm_feature_is_empty() {
 #[test]
 fn spec_xbnl_2_5_must_6_web_feature_only_declares_fastapi() {
     let (_, text) = read_frankenterm_core_cargo_toml();
-    let body = feature_body(&text, "web")
-        .expect("[MUST-6] `web` feature must be declared");
+    let body = feature_body(&text, "web").expect("[MUST-6] `web` feature must be declared");
     // Normalize whitespace + quotes for comparison.
     let entries: Vec<String> = body
         .split(',')
@@ -350,7 +340,9 @@ fn spec_2h5wv_must_11_every_mux_caller_cites_classifier() {
     // has `fn mux_error_should_fallback_to_cli(`; callers use
     // `Self::mux_error_should_fallback_to_cli(` — count only the
     // caller form.
-    let call_sites = text.matches("Self::mux_error_should_fallback_to_cli").count();
+    let call_sites = text
+        .matches("Self::mux_error_should_fallback_to_cli")
+        .count();
     assert!(
         call_sites >= MIN_CALL_SITES,
         "[MUST-11] {} — found only {call_sites} caller(s) of \
@@ -384,7 +376,8 @@ fn coverage_matrix_reports_every_must_clause() {
     // clauses in the doc header. Meta-test catches drift between the
     // MUST enumeration and the actual test bodies.
     assert_eq!(
-        must_tests, 11,
+        must_tests,
+        11,
         "[COVERAGE] {} — found {must_tests} `fn spec_*` tests; expected \
          11 (one per MUST clause declared in the file header). Either \
          a MUST test was added/removed without updating the coverage \

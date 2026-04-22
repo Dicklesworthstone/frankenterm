@@ -34,9 +34,7 @@ use frankenterm_core::pattern_trigger::TriggerScanner;
 use frankenterm_core::patterns::{
     AgentType, Detection, PatternEngine, PatternPack, RuleDef, Severity,
 };
-use frankenterm_core::scan_pipeline::{
-    ChunkedPipelineState, ScanPipeline, ScanPipelineConfig,
-};
+use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -348,15 +346,15 @@ fn chunked_trigger_counts(
     pipeline: &ScanPipeline,
     bytes: &[u8],
     chunks: &[&[u8]],
-) -> std::collections::HashMap<
-    frankenterm_core::pattern_trigger::TriggerCategory,
-    u64,
-> {
+) -> std::collections::HashMap<frankenterm_core::pattern_trigger::TriggerCategory, u64> {
     // Sanity on helper input. The test body only constructs chunk slices
     // via `slice_at_splits`, but this debug-only check catches future
     // refactors that might break the concat invariant.
     debug_assert_eq!(
-        chunks.iter().flat_map(|c| c.iter().copied()).collect::<Vec<u8>>(),
+        chunks
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect::<Vec<u8>>(),
         bytes,
     );
 
@@ -431,11 +429,7 @@ fn engine_from(rules: Vec<RuleDef>) -> PatternEngine {
 }
 
 fn detection_id_set(engine: &PatternEngine, text: &str) -> Vec<String> {
-    let mut ids: Vec<String> = engine
-        .detect(text)
-        .into_iter()
-        .map(|d| d.rule_id)
-        .collect();
+    let mut ids: Vec<String> = engine.detect(text).into_iter().map(|d| d.rule_id).collect();
     ids.sort();
     ids.dedup();
     ids

@@ -337,7 +337,6 @@ where
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return with_retry_and_circuit_cx(&cx, policy, circuit, operation).await;
     }
-
 }
 
 /// Circuit-aware retry under an explicit `&Cx` (ft-xbnl0.2.2).

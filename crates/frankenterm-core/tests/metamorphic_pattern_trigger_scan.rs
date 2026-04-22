@@ -58,7 +58,15 @@ fn safe_prefix_pool() -> Vec<&'static [u8]> {
     // Short ASCII strings with no capital letters near known triggers
     // (avoid: ERROR, FATAL, FAILED, SIGSEGV, SIGABRT, Compiling, …) and
     // no lowercase panic/segfault/deprecated matches. Keep them simple.
-    vec![b"xxxxxxxx", b"12345", b"...", b"abcabc", b"    ", b"|", b"zz"]
+    vec![
+        b"xxxxxxxx",
+        b"12345",
+        b"...",
+        b"abcabc",
+        b"    ",
+        b"|",
+        b"zz",
+    ]
 }
 
 fn arb_safe_prefix() -> impl Strategy<Value = &'static [u8]> {
@@ -323,8 +331,36 @@ fn default_scanner_still_has_multi_category_coverage() {
     let counts = scanner.scan_counts(
         b"   Compiling foo v0.1\nERROR: build failed\nwarning: unused\n    Finished\n",
     );
-    assert!(counts.counts.get(&TriggerCategory::Error).copied().unwrap_or(0) > 0);
-    assert!(counts.counts.get(&TriggerCategory::Warning).copied().unwrap_or(0) > 0);
-    assert!(counts.counts.get(&TriggerCategory::Progress).copied().unwrap_or(0) > 0);
-    assert!(counts.counts.get(&TriggerCategory::Completion).copied().unwrap_or(0) > 0);
+    assert!(
+        counts
+            .counts
+            .get(&TriggerCategory::Error)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        counts
+            .counts
+            .get(&TriggerCategory::Warning)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        counts
+            .counts
+            .get(&TriggerCategory::Progress)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(
+        counts
+            .counts
+            .get(&TriggerCategory::Completion)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
 }

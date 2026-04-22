@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use frankenterm_core::patterns::{AgentType, Severity};
 use frankenterm_core::snapshot_engine::SnapshotTrigger;
 use frankenterm_core::wire_protocol::{
-    DetectionNotice, GapNotice, PaneDelta, PaneMeta, PanesMeta, WireEnvelope, WirePayload,
-    PROTOCOL_VERSION,
+    DetectionNotice, GapNotice, PROTOCOL_VERSION, PaneDelta, PaneMeta, PanesMeta, WireEnvelope,
+    WirePayload,
 };
 
 // ─── Golden helper ─────────────────────────────────────────────────────
@@ -55,9 +55,8 @@ fn assert_golden_bytes(relative_path: &str, actual: &[u8]) {
 
     if updating_goldens() {
         fs::create_dir_all(path.parent().expect("golden path has parent")).unwrap();
-        fs::write(&path, actual).unwrap_or_else(|e| {
-            panic!("failed to write golden {}: {e}", path.display())
-        });
+        fs::write(&path, actual)
+            .unwrap_or_else(|e| panic!("failed to write golden {}: {e}", path.display()));
         eprintln!("[GOLDEN UPDATED] {}", path.display());
         return;
     }
@@ -222,10 +221,10 @@ fn golden_envelope_panes_meta() {
     let pane_a = canonical_pane_meta();
     let pane_b = PaneMeta {
         pane_id: 43,
-        pane_uuid: None,                      // exercise None
+        pane_uuid: None, // exercise None
         domain: "ssh://remote".to_string(),
-        title: None,                          // exercise None
-        cwd: None,                            // exercise None
+        title: None, // exercise None
+        cwd: None,   // exercise None
         rows: Some(24),
         cols: Some(80),
         observed: false,

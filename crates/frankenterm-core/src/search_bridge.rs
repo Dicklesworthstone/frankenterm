@@ -258,10 +258,7 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        {
-            self.search_direct(cx, request, on_phase).await
-        }
-
+        { self.search_direct(cx, request, on_phase).await }
     }
 
     /// Run a search against a caller-provided asupersync capability context
@@ -397,7 +394,6 @@ impl SearchBridge {
             )),
         }
     }
-
 }
 
 fn map_search_error(
@@ -696,7 +692,6 @@ mod tests {
                 .map_err(SearchBridgeError::Search)?;
             return Ok(SearchBridgeResult { results, metrics });
         }
-
     }
 
     // -----------------------------------------------------------------------

@@ -85,11 +85,7 @@ struct ScriptedDispatchStream {
 }
 
 impl ScriptedDispatchStream {
-    fn new(
-        script: Vec<u8>,
-        stream_kind: DispatchStreamKind,
-        chunk: usize,
-    ) -> (Self, ScriptHandle) {
+    fn new(script: Vec<u8>, stream_kind: DispatchStreamKind, chunk: usize) -> (Self, ScriptHandle) {
         let state = Arc::new(ScriptState {
             script,
             cursor: AtomicUsize::new(0),

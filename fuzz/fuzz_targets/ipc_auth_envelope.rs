@@ -165,10 +165,20 @@ enum TokenVariant {
 enum RequestKind {
     Ping,
     Status,
-    PaneState { pane_id: u64 },
-    UserVar { key: String, value: String },
-    SetPanePriority { pane_id: u64, level: u8 },
-    ClearPanePriority { pane_id: u64 },
+    PaneState {
+        pane_id: u64,
+    },
+    UserVar {
+        key: String,
+        value: String,
+    },
+    SetPanePriority {
+        pane_id: u64,
+        level: u8,
+    },
+    ClearPanePriority {
+        pane_id: u64,
+    },
     /// Unknown kind — tests the serde untagged fallthrough.
     Unknown(String),
 }
@@ -313,8 +323,9 @@ impl FuzzEnvelope {
                 obj.insert("kind".into(), wrong.into_json());
                 serde_json::to_vec(&Value::Object(obj)).unwrap_or_default()
             }
-            EnvelopeMode::TopLevelIs(shape) => serde_json::to_vec(&shape.into_json())
-                .unwrap_or_default(),
+            EnvelopeMode::TopLevelIs(shape) => {
+                serde_json::to_vec(&shape.into_json()).unwrap_or_default()
+            }
             EnvelopeMode::TrailingGarbage(garbage) => {
                 let mut bytes = serde_json::to_vec(&Value::Object(obj)).unwrap_or_default();
                 // Cap the garbage to ~1KB so the line stays under
@@ -346,7 +357,10 @@ impl RequestKind {
                 Value::String("user_var".into()),
                 vec![
                     ("key".into(), Value::String(bound_string(key, MAX_STR_LEN))),
-                    ("value".into(), Value::String(bound_string(value, MAX_STR_LEN))),
+                    (
+                        "value".into(),
+                        Value::String(bound_string(value, MAX_STR_LEN)),
+                    ),
                 ],
             ),
             Self::SetPanePriority { pane_id, level } => (
@@ -362,11 +376,7 @@ impl RequestKind {
                 Value::String("clear_pane_priority".into()),
                 vec![("pane_id".into(), Value::from(pane_id))],
             ),
-            Self::Unknown(s) => (
-                "kind",
-                Value::String(bound_string(s, 32)),
-                vec![],
-            ),
+            Self::Unknown(s) => ("kind", Value::String(bound_string(s, 32)), vec![]),
         }
     }
 }
@@ -445,7 +455,10 @@ fuzz_target!(|input: FuzzInput| {
     // a real bug.
     if check_determinism {
         let second = __fuzz_parse_envelope_and_authorize(&line, &auth);
-        assert_eq!(status, second, "authorize is non-deterministic on same input");
+        assert_eq!(
+            status, second,
+            "authorize is non-deterministic on same input"
+        );
     }
 
     // ── Crash oracle #2: ipc_constant_time_eq must never panic on

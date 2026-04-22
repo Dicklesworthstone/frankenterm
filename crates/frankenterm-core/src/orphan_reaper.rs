@@ -80,7 +80,6 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         return run_orphan_reaper_with_cx(&cx, config, shutdown_flag).await;
     }
-
 }
 
 /// Run the orphan reaper loop against the caller's asupersync capability

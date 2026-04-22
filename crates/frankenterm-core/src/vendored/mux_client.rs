@@ -238,7 +238,6 @@ impl DirectMuxClient {
             let cx = ambient_mux_cx();
             return Self::connect_with_cx(&cx, config).await;
         }
-
     }
 
     /// Connect using an explicit capability context.
@@ -1896,10 +1895,7 @@ async fn join_subscription_task(task: SubscriptionTask) {
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for the update-taking watch path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    {
-        cancel_rx.borrow_and_clone()
-    }
-
+    { cancel_rx.borrow_and_clone() }
 }
 
 async fn wait_for_cancel_change_with_cx(cx: &Cx, cancel_rx: &mut watch::Receiver<bool>) -> bool {
@@ -2025,7 +2021,6 @@ impl PaneOutputSubscription {
             let cx = ambient_mux_cx();
             self.next_with_cx(&cx).await
         }
-
     }
 
     /// Cancel the subscription.
@@ -2159,7 +2154,6 @@ pub fn subscribe_pane_output(
         let cx = ambient_mux_cx();
         subscribe_pane_output_with_inherited_cx(&cx, client, pane_id, config)
     }
-
 }
 
 fn total_dirty_rows(ranges: &[std::ops::Range<isize>]) -> usize {

@@ -1147,9 +1147,9 @@ fn sandbox_resolve(candidate: &Path, root: &Path) -> Result<PathBuf> {
             root.display()
         ))
     })?;
-    let candidate_canonical = candidate.canonicalize().map_err(|e| {
-        PatternError::PackNotFound(format!("{} ({e})", candidate.display()))
-    })?;
+    let candidate_canonical = candidate
+        .canonicalize()
+        .map_err(|e| PatternError::PackNotFound(format!("{} ({e})", candidate.display())))?;
     if !candidate_canonical.starts_with(&root_canonical) {
         return Err(PatternError::InvalidRule(format!(
             "pack path {} resolves outside sandbox root {}",
@@ -6228,11 +6228,8 @@ rules:
         fs::write(&outside_pack, minimal_yaml_pack()).unwrap();
 
         let root = tempfile::tempdir().unwrap();
-        let err = load_pack_from_file(
-            outside_pack.to_str().unwrap(),
-            Some(root.path()),
-        )
-        .expect_err("absolute path outside sandbox must be rejected");
+        let err = load_pack_from_file(outside_pack.to_str().unwrap(), Some(root.path()))
+            .expect_err("absolute path outside sandbox must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("outside sandbox root") || msg.contains("sandbox"),
