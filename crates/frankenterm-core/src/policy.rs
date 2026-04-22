@@ -4989,6 +4989,29 @@ impl PolicyEngine {
         decision
     }
 
+    /// Drop all rate-limit state for the given pane (ft-yjt9e).
+    ///
+    /// Forwards to [`RateLimiter::remove_pane`] on the engine's inner
+    /// rate limiter. Long-lived PolicyEngine holders
+    /// (`ConnectorOutboundBridge`, future ObservationRuntime-side
+    /// engines) should call this from their PaneDestroyed handlers so a
+    /// closed pane's per-pane `(pane_id, ActionKind)` buckets don't
+    /// linger forever. Global rate-limit state is not touched — it's
+    /// already bounded by the finite `ActionKind` enum.
+    pub fn remove_pane(&mut self, pane_id: u64) {
+        self.rate_limiter.remove_pane(pane_id);
+    }
+
+    /// Garbage-collect expired rate-limit entries (ft-yjt9e).
+    ///
+    /// Defense-in-depth for panes that disappear without firing a
+    /// PaneDestroyed event (crashes, abrupt SSH detach, reaper race).
+    /// Safe to call periodically from a lifecycle sweep — O(total
+    /// timestamps across all tracked panes).
+    pub fn gc_rate_limiter(&mut self) {
+        self.rate_limiter.gc();
+    }
+
     /// Authorize a connector credential action using an explicit least-privilege scope.
     pub fn authorize_connector_credential_action(
         &mut self,
@@ -7362,6 +7385,72 @@ mod tests {
             limiter.tracked_pane_entry_count(),
             0,
             "gc must drop entries whose entire window has expired"
+        );
+    }
+
+    /// [ft-yjt9e] Task-specified shape: push traffic for 3 panes,
+    /// destroy 2, assert `pane_counts` holds exactly 1 entry. Companion
+    /// to `rate_limiter_remove_pane_drops_all_action_entries_for_that_pane`
+    /// — that one covers multi-action eviction for a single destroyed
+    /// pane; this one covers repeated-destroy stability at fleet scale.
+    #[test]
+    fn rate_limiter_three_panes_destroy_two_leaves_one_entry() {
+        let mut limiter = RateLimiter::new(10, 100);
+        // Push one action (SendText) for each of 3 panes. Keep to a
+        // single ActionKind so the expected post-destroy count is
+        // unambiguously 1 (rather than per-action multiplicity).
+        limiter.check(ActionKind::SendText, Some(1));
+        limiter.check(ActionKind::SendText, Some(2));
+        limiter.check(ActionKind::SendText, Some(3));
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            3,
+            "expected one entry per pane pre-destroy"
+        );
+
+        // Destroy two panes.
+        limiter.remove_pane(1);
+        limiter.remove_pane(3);
+
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            1,
+            "exactly one pane (pane 2) should remain after destroying 1 and 3"
+        );
+        // And the surviving pane's rate-limit state is still queryable.
+        assert!(limiter.check(ActionKind::SendText, Some(2)).is_allowed());
+    }
+
+    /// [ft-yjt9e] Verify the `PolicyEngine` public forwarder reaches
+    /// the inner RateLimiter's eviction path. Long-lived
+    /// PolicyEngine holders (e.g. `ConnectorOutboundBridge`) only have
+    /// access to the engine, not the inner limiter — they need
+    /// `engine.remove_pane(id)` to work end-to-end.
+    #[test]
+    fn policy_engine_remove_pane_forwards_to_rate_limiter() {
+        let mut engine = PolicyEngine::permissive();
+        // Seed three panes through the authorize path (which exercises
+        // rate_limiter.check internally). PermissiveEngine allows
+        // everything, so no denials will distort the entry count.
+        for pane_id in [10u64, 20u64, 30u64] {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(pane_id)
+                .with_capabilities(PaneCapabilities::prompt());
+            let _ = engine.authorize(&input);
+        }
+        assert_eq!(
+            engine.rate_limiter.tracked_pane_entry_count(),
+            3,
+            "authorize should have registered one entry per pane"
+        );
+
+        engine.remove_pane(10);
+        engine.remove_pane(30);
+
+        assert_eq!(
+            engine.rate_limiter.tracked_pane_entry_count(),
+            1,
+            "PolicyEngine::remove_pane must drop the inner RateLimiter's entries"
         );
     }
 
