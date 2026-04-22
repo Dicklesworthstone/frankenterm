@@ -849,6 +849,186 @@ impl Domain for LocalDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portable_pty::{Child, ChildKiller, SlavePty};
+    use std::future::{poll_fn, Future};
+    use std::io::{Read, Result as IoResult, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    fn mux_test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct ScopedMux {
+        prior: Option<Arc<Mux>>,
+        _guard: StdMutexGuard<'static, ()>,
+    }
+
+    impl ScopedMux {
+        fn install(mux: Arc<Mux>) -> Self {
+            let guard = mux_test_lock()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let prior = Mux::try_get();
+            Mux::set_mux(&mux);
+            Self {
+                prior,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedMux {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestChild;
+
+    impl ChildKiller for TestChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Child for TestChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(4242)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BufferWriter {
+        written: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+            self.written
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    struct TestMasterPty {
+        written: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl TestMasterPty {
+        fn new() -> Self {
+            Self {
+                written: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl MasterPty for TestMasterPty {
+        fn resize(&self, _size: PtySize) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<PtySize, Error> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
+            Ok(Box::new(std::io::Cursor::new(Vec::<u8>::new())))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>, Error> {
+            Ok(Box::new(BufferWriter {
+                written: Arc::clone(&self.written),
+            }))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    struct SlowSpawnSlavePty {
+        delay: Duration,
+        spawn_calls: Arc<AtomicUsize>,
+    }
+
+    impl SlavePty for SlowSpawnSlavePty {
+        fn spawn_command(
+            &self,
+            _cmd: CommandBuilder,
+        ) -> Result<Box<dyn Child + Send + Sync>, Error> {
+            self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            Ok(Box::new(TestChild))
+        }
+    }
+
+    struct SlowSpawnPtySystem {
+        delay: Duration,
+        spawn_calls: Arc<AtomicUsize>,
+    }
+
+    impl SlowSpawnPtySystem {
+        fn new(delay: Duration) -> (Self, Arc<AtomicUsize>) {
+            let spawn_calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    delay,
+                    spawn_calls: Arc::clone(&spawn_calls),
+                },
+                spawn_calls,
+            )
+        }
+    }
+
+    impl PtySystem for SlowSpawnPtySystem {
+        fn openpty(&self, _size: PtySize) -> anyhow::Result<PtyPair> {
+            Ok(PtyPair {
+                slave: Box::new(SlowSpawnSlavePty {
+                    delay: self.delay,
+                    spawn_calls: Arc::clone(&self.spawn_calls),
+                }),
+                master: Box::new(TestMasterPty::new()),
+            })
+        }
+    }
 
     fn wslenv_entries(cmd: &CommandBuilder) -> Vec<String> {
         cmd.get_env("WSLENV")
@@ -1052,5 +1232,61 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[test]
+    fn local_domain_spawn_pane_first_poll_stays_non_blocking() {
+        const SPAWN_DELAY: Duration = Duration::from_millis(200);
+        const FIRST_POLL_BUDGET: Duration = Duration::from_millis(100);
+
+        let exec = promise::spawn::ScopedExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let (pty_system, spawn_calls) = SlowSpawnPtySystem::new(SPAWN_DELAY);
+        let domain = LocalDomain::with_pty_system("slow-spawn-test", Box::new(pty_system));
+
+        let pane_id = promise::spawn::block_on(exec.run(async {
+            let mut spawn_pane =
+                std::pin::pin!(domain.spawn_pane(
+                    TerminalSize::default(),
+                    Some(CommandBuilder::new("slow-spawn-test")),
+                    None,
+                ));
+            let start = Instant::now();
+
+            let first_poll = poll_fn(|cx| {
+                Poll::Ready(match spawn_pane.as_mut().poll(cx) {
+                    Poll::Ready(result) => (start.elapsed(), Some(result)),
+                    Poll::Pending => (start.elapsed(), None),
+                })
+            })
+            .await;
+
+            assert!(
+                first_poll.1.is_none(),
+                "[ft-odywh] spawn_pane completed during the first poll after {:?}; \
+                 spawn_command is likely running synchronously on the executor thread again",
+                first_poll.0,
+            );
+            assert!(
+                first_poll.0 < FIRST_POLL_BUDGET,
+                "[ft-odywh] first spawn_pane poll blocked for {:?}, exceeding {:?}; \
+                 the synchronous spawn_command path is stalling the executor thread again",
+                first_poll.0,
+                FIRST_POLL_BUDGET,
+            );
+
+            spawn_pane.await.expect("spawn pane should succeed").pane_id()
+        }));
+
+        assert_eq!(
+            spawn_calls.load(Ordering::SeqCst),
+            1,
+            "[ft-odywh] fake PTY should be spawned exactly once"
+        );
+        assert!(
+            mux.get_pane(pane_id).is_some(),
+            "[ft-odywh] mux should register the pane returned by spawn_pane"
+        );
     }
 }
