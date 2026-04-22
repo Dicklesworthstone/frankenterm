@@ -1131,7 +1131,7 @@ impl KittyImage {
                 verbosity,
                 placement,
             } => {
-                keys.insert("a", "Q".to_string());
+                keys.insert("a", "T".to_string());
                 verbosity.to_keys(keys);
                 placement.to_keys(keys);
                 transmit.to_keys(keys);
@@ -1766,6 +1766,41 @@ mod test {
                 verbosity: KittyImageVerbosity::Quiet,
             }
         );
+    }
+
+    #[test]
+    fn kitty_transmit_and_display_display_roundtrips_via_parse_apc() {
+        let img = KittyImage::TransmitDataAndDisplay {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgb),
+                data: KittyImageData::Direct("aGVsbG8=".to_string()),
+                width: Some(10),
+                height: Some(20),
+                image_id: Some(42),
+                image_number: Some(7),
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            placement: KittyImagePlacement {
+                x: Some(1),
+                y: Some(2),
+                w: Some(3),
+                h: Some(4),
+                x_offset: Some(5),
+                y_offset: Some(6),
+                columns: Some(7),
+                rows: Some(8),
+                do_not_move_cursor: true,
+                placement_id: Some(9),
+                z_index: Some(10),
+            },
+            verbosity: KittyImageVerbosity::OnlyErrors,
+        };
+
+        let display = format!("{}", img);
+        let parsed = KittyImage::parse_apc(display.trim_start_matches("\x1b_").as_bytes())
+            .expect("TransmitDataAndDisplay display should parse back");
+        assert_eq!(parsed, img);
     }
 
     #[test]
