@@ -259,6 +259,36 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // Pins the currently-broken Display→parse roundtrip for Hyperlinks
+    // whose params or uri contain the OSC 8 separator characters (: = ;).
+    // The TODOs at hyperlink.rs:104 and :110 flag that Display writes raw
+    // key/value/uri strings without escaping, so a param value like
+    // "a:b" round-trips through Display as "8;id=a:b;uri" — which parse
+    // then splits on ':' into ["id=a", "b"], trips on the keyless "b"
+    // fragment, and fails with "bad params", silently dropping the
+    // ENTIRE hyperlink. See ft-mw1nw.
+    //
+    // When the fix lands (either escaping in Display or validation at
+    // new_with_params time), this test's `is_err()` assertion will flip
+    // to `is_ok()` with a matching round-trip — either outcome should be
+    // a deliberate choice, not a silent regression.
+    #[test]
+    fn ft_mw1nw_parse_rejects_value_with_embedded_colon() {
+        // This is what Display emits today for
+        //   Hyperlink::new_with_params("uri", {"id": "a:b"})
+        // but wrapped in the &[&[u8]] shape parse expects. If someone
+        // teaches Display to escape, update the literal to the escaped
+        // form and flip the assertion to is_ok().
+        let osc: Vec<&[u8]> = vec![b"8", b"id=a:b", b"https://example.com"];
+        let result = Hyperlink::parse(&osc);
+        assert!(
+            result.is_err(),
+            "ft-mw1nw regression: parse must fail on unescaped ':' \
+             until Display learns to escape (or a try_new_with_params \
+             validator lands). got Ok({result:?})"
+        );
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn compute_shape_hash_same_for_equal_links() {
