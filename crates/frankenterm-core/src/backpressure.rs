@@ -488,11 +488,19 @@ impl BackpressureManager {
             return BackpressureTier::Black;
         }
 
-        // Black: near saturation (within 5 slots of full, or ratio ≥ 0.995).
+        // Black: near saturation. The absolute "within N slots of full"
+        // guard is only meaningful once the queue is already highly filled;
+        // otherwise tiny capacities (for example 0/1 or 0/5) would trip
+        // `saturating_sub` and classify empty or lightly-loaded queues as
+        // Black. Keep the large-queue early warning, but require a high
+        // fill ratio before the absolute margin can escalate to Black.
         let capture_saturated = depths.capture_capacity > 0
-            && depths.capture_depth >= depths.capture_capacity.saturating_sub(5);
+            && (cr >= 0.995
+                || (cr >= 0.95
+                    && depths.capture_depth >= depths.capture_capacity.saturating_sub(5)));
         let write_saturated = depths.write_capacity > 0
-            && depths.write_depth >= depths.write_capacity.saturating_sub(100);
+            && (wr >= 0.995
+                || (wr >= 0.95 && depths.write_depth >= depths.write_capacity.saturating_sub(100)));
 
         if capture_saturated || write_saturated {
             BackpressureTier::Black
@@ -1322,6 +1330,46 @@ mod tests {
         let m = default_manager();
         let d = depths(1024, 1024, 10_000, 10_000);
         assert_eq!(m.classify(&d), BackpressureTier::Black);
+    }
+
+    #[test]
+    fn classify_small_capture_capacity_does_not_blackhole_empty_queue() {
+        let m = default_manager();
+
+        // Before ft-5 tick audit fix, `saturating_sub(5)` turned every
+        // capacity <= 5 capture queue into an always-Black queue because
+        // even depth 0 satisfies `depth >= 0`. Empty and lightly-loaded
+        // tiny queues must stay out of emergency mode.
+        assert_eq!(
+            m.classify(&depths(0, 5, 0, 10_000)),
+            BackpressureTier::Green
+        );
+        assert_eq!(
+            m.classify(&depths(1, 5, 0, 10_000)),
+            BackpressureTier::Green
+        );
+        assert_eq!(
+            m.classify(&depths(5, 5, 0, 10_000)),
+            BackpressureTier::Black
+        );
+    }
+
+    #[test]
+    fn classify_small_write_capacity_requires_high_fill_for_black() {
+        let m = default_manager();
+
+        // Same regression shape on the write queue: `capacity.saturating_sub(100)`
+        // collapses to zero for capacity <= 100. Small queues should reach Black
+        // only when they are actually near full, not merely because they exist.
+        assert_eq!(
+            m.classify(&depths(0, 1024, 0, 100)),
+            BackpressureTier::Green
+        );
+        assert_eq!(m.classify(&depths(0, 1024, 80, 100)), BackpressureTier::Red);
+        assert_eq!(
+            m.classify(&depths(0, 1024, 95, 100)),
+            BackpressureTier::Black
+        );
     }
 
     // -----------------------------------------------------------------------
