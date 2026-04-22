@@ -1243,6 +1243,12 @@ fn is_pack_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn nested_pack_manifest_candidates(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    ["rules.toml", "rules.yaml", "rules.yml", "rules.json"]
+        .into_iter()
+        .map(|name| dir.join(name))
+}
+
 fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1272,8 +1278,10 @@ fn discover_packs_from_dir(dir: &Path) -> Result<Vec<PatternPack>> {
                 }
             }
         } else if path.is_dir() {
-            let rules_file = path.join("rules.toml");
-            if rules_file.is_file() {
+            for rules_file in nested_pack_manifest_candidates(&path) {
+                if !rules_file.is_file() {
+                    continue;
+                }
                 match load_pack_from_file(rules_file.to_str().unwrap_or_default(), Some(dir)) {
                     Ok(pack) => packs.push(pack),
                     Err(e) => {
@@ -5059,6 +5067,56 @@ description = "Health check rule"
         let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"user:alerts"));
         assert!(names.contains(&"user:monitoring"));
+    }
+
+    #[test]
+    fn discover_packs_finds_nested_rules_yaml_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let yaml_dir = dir.path().join("yaml-pack");
+        fs::create_dir(&yaml_dir).unwrap();
+        fs::write(
+            yaml_dir.join("rules.yaml"),
+            r#"
+name: "user:yaml_nested"
+version: "1.0.0"
+rules:
+  - id: "myorg.yaml_nested"
+    agent_type: "codex"
+    event_type: "custom.yaml_nested"
+    severity: "info"
+    anchors: ["yaml nested"]
+    description: "YAML nested rule"
+"#,
+        )
+        .unwrap();
+
+        let json_dir = dir.path().join("json-pack");
+        fs::create_dir(&json_dir).unwrap();
+        fs::write(
+            json_dir.join("rules.json"),
+            r#"{
+  "name": "user:json_nested",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "myorg.json_nested",
+      "agent_type": "codex",
+      "event_type": "custom.json_nested",
+      "severity": "warning",
+      "anchors": ["json nested"],
+      "description": "JSON nested rule"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let packs = discover_packs_from_dir(dir.path()).unwrap();
+        assert_eq!(packs.len(), 2);
+        let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"user:yaml_nested"));
+        assert!(names.contains(&"user:json_nested"));
     }
 
     #[test]
