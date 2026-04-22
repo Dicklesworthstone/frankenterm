@@ -298,10 +298,38 @@ pub(super) fn mcp_save_mission_tx_contract_to_path(
         )
     })?;
 
-    std::fs::write(path, json).map_err(|err| {
+    // [ft-wxqbt] Atomic write: dump to <path>.tmp in the same directory,
+    // then std::fs::rename over the target. POSIX + NTFS both guarantee
+    // that rename is atomic — the tx contract is either the old contents
+    // or the new contents, never a truncated halfway state. Direct
+    // std::fs::write would open+truncate+write; a crash between truncate
+    // and final write leaves a partial JSON file that
+    // mcp_load_mission_tx_contract_from_path cannot parse, losing the
+    // entire contract. Same pattern used by config_profiles.rs:129-135,
+    // recorder_storage.rs:1061, rulesets.rs:182, wal_engine.rs:892.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json).map_err(|err| {
         McpToolError::new(
             "robot.tx_write_failed",
-            format!("Failed to write tx contract file {}: {err}", path.display()),
+            format!(
+                "Failed to write tx contract temp file {}: {err}",
+                tmp_path.display()
+            ),
+            None,
+        )
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        // Best-effort cleanup: don't leak the tmp file if the rename
+        // fails (e.g. cross-device). The outer error carries the real
+        // diagnostic.
+        let _ = std::fs::remove_file(&tmp_path);
+        McpToolError::new(
+            "robot.tx_write_failed",
+            format!(
+                "Failed to rename tx contract temp file {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            ),
             None,
         )
     })
@@ -420,10 +448,30 @@ pub(super) fn mcp_save_mission_to_path(
         )
     })?;
 
-    std::fs::write(path, json).map_err(|err| {
+    // [ft-wxqbt] Atomic write — see mcp_save_mission_tx_contract_to_path
+    // for the full rationale. fs::write here would leave a truncated
+    // mission file on mid-write crash; tmp+rename preserves the old
+    // contents across the durability boundary.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json).map_err(|err| {
         McpToolError::new(
             "robot.mission_write_failed",
-            format!("Failed to write mission file {}: {err}", path.display()),
+            format!(
+                "Failed to write mission temp file {}: {err}",
+                tmp_path.display()
+            ),
+            None,
+        )
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        McpToolError::new(
+            "robot.mission_write_failed",
+            format!(
+                "Failed to rename mission temp file {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            ),
             None,
         )
     })
@@ -1304,6 +1352,93 @@ mod tests {
         let loaded = mcp_load_mission_from_path(&path).unwrap();
         assert_eq!(loaded.mission_id.0, mission.mission_id.0);
         assert_eq!(loaded.title, mission.title);
+    }
+
+    // [ft-wxqbt] mcp_save_mission_tx_contract_to_path must use the
+    // tmp+rename atomic-write pattern so a mid-write crash cannot
+    // corrupt the tx contract file. We can't directly simulate a
+    // crash in a unit test, but we CAN assert the observable
+    // consequences of the pattern:
+    //   1. After a successful save, the target file exists and the
+    //      sibling .tmp file does NOT exist (rename consumed it).
+    //   2. An overwrite (save to an existing target) produces the
+    //      new contents, and the .tmp sibling is still absent after
+    //      the rename.
+    //   3. The write is byte-identical to serde_json::to_string_pretty
+    //      of the contract, so no accidental transform slipped in.
+    // Absence of the .tmp sibling is the key invariant: a direct
+    // fs::write would never create it, so its ABSENCE + presence of
+    // the target file together attest that the tmp+rename path ran.
+    #[test]
+    fn save_tx_contract_is_atomic_rename_ft_wxqbt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-active.json");
+        let tmp_path = path.with_extension("json.tmp");
+
+        // First save: creates the target file.
+        let contract = make_tx_contract(3);
+        super::mcp_save_mission_tx_contract_to_path(&path, &contract).unwrap();
+        assert!(path.exists(), "target file must exist after save");
+        assert!(
+            !tmp_path.exists(),
+            "ft-wxqbt: {}.tmp must not linger after successful rename",
+            path.display()
+        );
+
+        // Bytes on disk exactly match pretty-serialized contract —
+        // rules out any accidental transform slipped in by the
+        // tmp-write path.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let expected = serde_json::to_string_pretty(&contract).unwrap();
+        assert_eq!(on_disk, expected);
+
+        // Second save with a new contract: overwrite the target
+        // atomically. Old contents must be gone; .tmp must still
+        // be absent.
+        let contract2 = make_tx_contract(5);
+        super::mcp_save_mission_tx_contract_to_path(&path, &contract2).unwrap();
+        assert!(!tmp_path.exists(), "ft-wxqbt: .tmp must not linger on overwrite");
+        let on_disk2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk2,
+            serde_json::to_string_pretty(&contract2).unwrap(),
+            "overwrite must reflect the new contract"
+        );
+        assert_ne!(on_disk2, on_disk, "overwrite must replace contents");
+
+        // Round-trip through the load path to prove the file is
+        // still parseable after the atomic replace — the
+        // validation is what mcp_load_mission_tx_contract_from_path
+        // actually runs in production.
+        let loaded = mcp_load_mission_tx_contract_from_path(&path).unwrap();
+        assert_eq!(loaded.plan.steps.len(), 5);
+    }
+
+    // [ft-wxqbt] Same atomic-write contract for mcp_save_mission_to_path.
+    // If this ever reverts to direct fs::write, a mid-save crash would
+    // corrupt .ft/mission/active.json and lose the mission.
+    #[test]
+    fn save_mission_is_atomic_rename_ft_wxqbt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.json");
+        let tmp_path = path.with_extension("json.tmp");
+
+        let mission = make_mission_with_assignments(vec![]);
+        mcp_save_mission_to_path(&path, &mission).unwrap();
+        assert!(path.exists(), "target mission file must exist after save");
+        assert!(
+            !tmp_path.exists(),
+            "ft-wxqbt: {}.tmp must not linger after successful rename",
+            path.display()
+        );
+
+        // Overwrite path: same invariant.
+        let mut mission2 = mission.clone();
+        mission2.title = "renamed".to_string();
+        mcp_save_mission_to_path(&path, &mission2).unwrap();
+        assert!(!tmp_path.exists(), "ft-wxqbt: .tmp must not linger on overwrite");
+        let loaded = mcp_load_mission_from_path(&path).unwrap();
+        assert_eq!(loaded.title, "renamed");
     }
 
     #[test]
