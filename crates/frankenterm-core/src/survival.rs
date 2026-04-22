@@ -2708,4 +2708,37 @@ mod tests {
             );
         }
     }
+
+    /// [review] Both-NaN construction — neither snap should depend on
+    /// the other being clean. Pre-fix, a BOTH-NaN construction would
+    /// produce `alpha=NaN` AND `default_activity=NaN` simultaneously,
+    /// and every predict_hour + update_hour output would propagate
+    /// NaN forever. The two separate `if is_nan` branches at
+    /// construction time compose, so this test pins the composition.
+    #[test]
+    fn ft_icreu_new_sanitises_both_nan_alpha_and_default_simultaneously() {
+        let mut profile = ActivityProfile::new(f64::NAN, f64::NAN);
+        // All buckets start at the 0.5 snap default (not NaN).
+        for hour in 0..24 {
+            let v = profile.predict_hour(hour);
+            assert!(
+                (v - 0.5).abs() < f64::EPSILON,
+                "both-NaN construction: bucket {hour} must snap to 0.5, got {v}"
+            );
+        }
+        // EWMA path: after two updates with finite samples, the value
+        // must be finite (alpha must have snapped from NaN, not
+        // poisoned the EWMA blend).
+        profile.update_hour(5, 0.2);
+        profile.update_hour(5, 0.8);
+        let blended = profile.predict_hour(5);
+        assert!(
+            blended.is_finite(),
+            "both-NaN construction: EWMA after clean samples must be finite, got {blended}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&blended),
+            "both-NaN construction: EWMA must stay in [0, 1], got {blended}"
+        );
+    }
 }
