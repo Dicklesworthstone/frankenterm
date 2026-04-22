@@ -2854,6 +2854,144 @@ mod tests {
         assert!(matches!(result, DeltaResult::Content(ref s) if s == "next"));
     }
 
+    fn enumerate_utf8_corpus(
+        corpus: &mut Vec<String>,
+        current: &mut String,
+        alphabet: &[&str],
+        remaining: usize,
+    ) {
+        if remaining == 0 {
+            corpus.push(current.clone());
+            return;
+        }
+
+        for symbol in alphabet {
+            current.push_str(symbol);
+            enumerate_utf8_corpus(corpus, current, alphabet, remaining - 1);
+            let new_len = current.len() - symbol.len();
+            current.truncate(new_len);
+        }
+    }
+
+    fn utf8_boundaries(text: &str) -> Vec<usize> {
+        let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+        boundaries.push(0);
+        let mut offset = 0;
+        for ch in text.chars() {
+            offset += ch.len_utf8();
+            boundaries.push(offset);
+        }
+        boundaries
+    }
+
+    fn extract_delta_reference(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
+        if previous == current {
+            return DeltaResult::NoChange;
+        }
+
+        if previous.is_empty() {
+            return DeltaResult::Content(current.to_string());
+        }
+
+        if current.len() > previous.len()
+            && current.starts_with(previous)
+            && current.is_char_boundary(previous.len())
+        {
+            return DeltaResult::Content(current[previous.len()..].to_string());
+        }
+
+        if overlap_size == 0 || current.is_empty() {
+            return DeltaResult::Gap {
+                reason: "overlap_size_zero_or_current_empty".to_string(),
+                content: current.to_string(),
+            };
+        }
+
+        let max_overlap = overlap_size.min(previous.len()).min(current.len());
+        let current_boundaries = utf8_boundaries(current);
+        let previous_boundaries = utf8_boundaries(previous);
+        let mut best_overlap: Option<usize> = None;
+
+        for start in previous_boundaries {
+            let overlap_len = previous.len() - start;
+            if overlap_len == 0
+                || overlap_len > max_overlap
+                || overlap_len > current.len()
+                || !current_boundaries.contains(&overlap_len)
+            {
+                continue;
+            }
+
+            if previous[start..] == current[..overlap_len] {
+                best_overlap = Some(best_overlap.map_or(overlap_len, |best| best.max(overlap_len)));
+            }
+        }
+
+        match best_overlap {
+            Some(overlap_len) => {
+                let delta = &current[overlap_len..];
+                if delta.is_empty() {
+                    DeltaResult::Gap {
+                        reason: "content_changed_without_append".to_string(),
+                        content: current.to_string(),
+                    }
+                } else {
+                    DeltaResult::Content(delta.to_string())
+                }
+            }
+            None => DeltaResult::Gap {
+                reason: "overlap_not_found".to_string(),
+                content: current.to_string(),
+            },
+        }
+    }
+
+    fn assert_same_delta_result(actual: &DeltaResult, expected: &DeltaResult) {
+        match (actual, expected) {
+            (DeltaResult::NoChange, DeltaResult::NoChange) => {}
+            (DeltaResult::Content(actual), DeltaResult::Content(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (
+                DeltaResult::Gap {
+                    reason: actual_reason,
+                    content: actual_content,
+                },
+                DeltaResult::Gap {
+                    reason: expected_reason,
+                    content: expected_content,
+                },
+            ) => {
+                assert_eq!(actual_reason, expected_reason);
+                assert_eq!(actual_content, expected_content);
+            }
+            _ => panic!("delta result mismatch: actual={actual:?} expected={expected:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_delta_matches_utf8_reference_oracle() {
+        // Guard the optimized memchr/UTF-8 path against a slower maximal-overlap
+        // reference over a mixed ASCII/multibyte corpus.
+        let alphabet = ["a", "b", "é", "🌍", "┌"];
+        let overlap_sizes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 16];
+        let mut corpus = vec![String::new()];
+        let mut scratch = String::new();
+        for len in 1..=3 {
+            enumerate_utf8_corpus(&mut corpus, &mut scratch, &alphabet, len);
+        }
+
+        for previous in &corpus {
+            for current in &corpus {
+                for overlap_size in overlap_sizes {
+                    let actual = extract_delta(previous, current, overlap_size);
+                    let expected = extract_delta_reference(previous, current, overlap_size);
+                    assert_same_delta_result(&actual, &expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn capture_snapshot_assigns_monotonic_seq() {
         let mut cursor = PaneCursor::new(7);
