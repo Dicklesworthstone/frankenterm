@@ -84,9 +84,35 @@ impl Default for PressureThresholds {
 impl PressureThresholds {
     #[must_use]
     fn normalized(self) -> Self {
-        let yellow = self.yellow.clamp(0.0, 1.0);
-        let red = self.red.clamp(yellow, 1.0);
-        let black = self.black.clamp(red, 1.0);
+        // Extend ft-761tz's fail-closed posture to the threshold side:
+        // `f64::clamp(NaN, _, _)` returns NaN, so a NaN yellow/red/black
+        // slips through the clamp and every `>=` in classify_tier falls
+        // through to Green — reinstating the exact bug ft-761tz fixed on
+        // the usage_fraction side. NaN thresholds can arrive from a
+        // TOML/JSON config that permits NaN, a buggy caller constructing
+        // the struct directly, or arithmetic producing NaN upstream.
+        // Fall back to the Default values when any threshold is NaN;
+        // this preserves ordering invariants (yellow <= red <= black)
+        // and keeps classify_tier arithmetically well-defined.
+        let defaults = Self::default();
+        let yellow = if self.yellow.is_nan() {
+            defaults.yellow
+        } else {
+            self.yellow
+        };
+        let red = if self.red.is_nan() {
+            defaults.red
+        } else {
+            self.red
+        };
+        let black = if self.black.is_nan() {
+            defaults.black
+        } else {
+            self.black
+        };
+        let yellow = yellow.clamp(0.0, 1.0);
+        let red = red.clamp(yellow, 1.0);
+        let black = black.clamp(red, 1.0);
         Self { yellow, red, black }
     }
 }
@@ -1171,6 +1197,61 @@ mod tests {
         assert!(
             matches!(tier, DiskPressureTier::Green),
             "after NaN the monitor must self-heal on the next clean sample, got {tier:?}"
+        );
+    }
+
+    /// Companion to `ft_761tz_classify_nan_fails_closed_to_black`: the
+    /// original ft-761tz landing only guarded NaN on the sample side.
+    /// `PressureThresholds::normalized` still used `f64::clamp` which
+    /// preserves NaN, so a NaN `yellow`/`red`/`black` threshold would
+    /// slip through — every `>=` in `classify_tier` returns false, the
+    /// branch cascade falls through to Green, and we silently report a
+    /// healthy disk for any usage_fraction (including 1.0) as long as
+    /// one threshold is NaN. Reinstates the exact bug on the config side.
+    ///
+    /// Post-fix: NaN thresholds normalize to Default, ordering invariants
+    /// hold, and a 1.0 usage classifies as Black.
+    #[test]
+    fn thresholds_with_nan_fields_fall_back_to_defaults_instead_of_green() {
+        // Single NaN in black.
+        let t_nan_black = PressureThresholds {
+            yellow: 0.70,
+            red: 0.85,
+            black: f64::NAN,
+        };
+        assert_eq!(
+            classify_tier(1.0, t_nan_black),
+            DiskPressureTier::Black,
+            "NaN black threshold must not let 1.0 usage surface as Green"
+        );
+
+        // Single NaN in red — 0.90 (above default red=0.85) should be Red.
+        let t_nan_red = PressureThresholds {
+            yellow: 0.70,
+            red: f64::NAN,
+            black: 0.95,
+        };
+        assert_eq!(
+            classify_tier(0.90, t_nan_red),
+            DiskPressureTier::Red,
+            "NaN red threshold must not let 0.90 usage surface as Green"
+        );
+
+        // All NaN — every sample classifies by defaults.
+        let t_all_nan = PressureThresholds {
+            yellow: f64::NAN,
+            red: f64::NAN,
+            black: f64::NAN,
+        };
+        assert_eq!(
+            classify_tier(0.99, t_all_nan),
+            DiskPressureTier::Black,
+            "All-NaN thresholds must fall back to defaults, not Green"
+        );
+        assert_eq!(
+            classify_tier(0.50, t_all_nan),
+            DiskPressureTier::Green,
+            "Sub-yellow usage must still classify as Green under all-NaN defaults"
         );
     }
 }
