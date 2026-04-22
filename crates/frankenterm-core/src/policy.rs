@@ -2150,11 +2150,24 @@ impl RateLimiter {
 
         if let Some(pane_id) = pane_id {
             if self.limit_per_pane > 0 {
-                let timestamps = self.pane_counts.entry((pane_id, action)).or_default();
-                prune_old(timestamps, window_start);
-                let current = timestamps.len();
+                let key = (pane_id, action);
+                let mut current = 0;
+                let mut drop_empty_bucket = false;
+                if let Some(timestamps) = self.pane_counts.get_mut(&key) {
+                    prune_old(timestamps, window_start);
+                    current = timestamps.len();
+                    drop_empty_bucket = current == 0;
+                }
+                if drop_empty_bucket {
+                    self.pane_counts.remove(&key);
+                }
                 if current >= self.limit_per_pane as usize {
-                    let retry_after = retry_after(now, timestamps, self.window);
+                    let retry_after = self
+                        .pane_counts
+                        .get(&key)
+                        .map_or(self.window, |timestamps| {
+                            retry_after(now, timestamps, self.window)
+                        });
                     return RateLimitOutcome::Limited(RateLimitHit {
                         scope: RateLimitScope::PerPane { pane_id },
                         action,
@@ -7590,6 +7603,33 @@ mod tests {
                 .get(&(1, ActionKind::SendText))
                 .map_or(0, Vec::len),
             1
+        );
+    }
+
+    #[test]
+    fn rate_limiter_repeated_global_rejection_does_not_leak_empty_pane_entries() {
+        let mut limiter = RateLimiter::new(2, 1);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert_eq!(limiter.tracked_pane_entry_count(), 1);
+
+        for pane_id in 2..=8 {
+            let hit = match limiter.check(ActionKind::SendText, Some(pane_id)) {
+                RateLimitOutcome::Limited(hit) => hit,
+                RateLimitOutcome::Allowed => {
+                    panic!("Expected global rate limit for pane {pane_id}")
+                }
+            };
+            assert!(matches!(hit.scope, RateLimitScope::Global));
+        }
+
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            1,
+            "global rejections for fresh panes must not accumulate empty pane buckets"
+        );
+        assert!(
+            !limiter.pane_counts.contains_key(&(8, ActionKind::SendText)),
+            "the last globally-rejected pane must not leave behind an empty bucket"
         );
     }
 
