@@ -110,6 +110,14 @@ pub struct ServerConfig {
     /// Maximum panes this server will manage.
     #[serde(default = "default_max_panes")]
     pub max_panes: u32,
+    /// Maximum federation peers tracked in self.peers. Prevents a
+    /// hostile or buggy counterparty from OOM'ing the server by
+    /// spamming JoinFederation with distinct node_ids. Default is
+    /// 512 (2× max_connections by default) — well above any
+    /// realistic production federation but low enough to keep the
+    /// peer map bounded at ~128 KiB. [ft-ry224]
+    #[serde(default = "default_max_peers")]
+    pub max_peers: u32,
 }
 
 fn default_max_connections() -> u32 {
@@ -127,6 +135,9 @@ fn default_true() -> bool {
 fn default_max_panes() -> u32 {
     10_000
 }
+fn default_max_peers() -> u32 {
+    512
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -139,6 +150,7 @@ impl Default for ServerConfig {
             peer_timeout_ms: default_peer_timeout(),
             auto_checkpoint: true,
             max_panes: default_max_panes(),
+            max_peers: default_max_peers(),
         }
     }
 }
@@ -401,14 +413,54 @@ impl HeadlessMuxServer {
 
             RemoteRequest::JoinFederation { peer } => {
                 let node_id = peer.node_id.clone();
+                let now = epoch_ms();
+
+                // [ft-ry224] Bound the peer registry. A hostile or
+                // buggy counterparty spamming JoinFederation with
+                // distinct node_ids would otherwise grow self.peers
+                // until OOM. prune_unreachable_peers only fires
+                // after peer_timeout_ms + an external sweep, so a
+                // burst is not naturally bounded. Reject new peers
+                // past max_peers with a specific error code so the
+                // sender can back off or escalate. Re-joins of an
+                // already-known node_id are allowed even at cap —
+                // capacity is reserved for DISTINCT node_ids.
+                let is_rejoin = self.peers.contains_key(&node_id);
+                if !is_rejoin && self.peers.len() >= self.config.max_peers as usize {
+                    return RemoteResponse::Error {
+                        code: "peer_registry_full".into(),
+                        message: format!(
+                            "federation peer registry is at capacity \
+                             ({}/{} peers); refusing to admit {}",
+                            self.peers.len(),
+                            self.config.max_peers,
+                            node_id,
+                        ),
+                    };
+                }
+
+                // [ft-ry224] Preserve first_seen_at on re-join. The
+                // previous implementation overwrote the whole
+                // PeerInfo on every JoinFederation, including
+                // first_seen_at. A peer that re-joined (e.g. the
+                // ft-lekgj recovery path: Heartbeat → peer_not_
+                // federated → JoinFederation) lost its original
+                // federation timestamp. Keep the insert idempotent
+                // on the "has this peer ever joined?" metric while
+                // refreshing everything else.
+                let first_seen_at = self
+                    .peers
+                    .get(&node_id)
+                    .map_or(now, |existing| existing.first_seen_at);
+
                 self.peers.insert(
                     node_id.clone(),
                     PeerInfo {
                         node: peer,
                         status: PeerStatus::Connected,
                         pane_count: 0,
-                        last_heartbeat_at: epoch_ms(),
-                        first_seen_at: epoch_ms(),
+                        last_heartbeat_at: now,
+                        first_seen_at,
                         capabilities: vec![],
                     },
                 );
@@ -763,6 +815,106 @@ mod tests {
         }
 
         assert_eq!(server.peer_count(), 1);
+    }
+
+    // [ft-ry224] Unbounded peer-map growth DoS: a counterparty
+    // spamming JoinFederation with distinct node_ids used to grow
+    // self.peers without bound. Now max_peers caps the registry at
+    // 512 (default) — the 513th distinct join is rejected with
+    // peer_registry_full. Known peers (re-joins) are allowed even
+    // at cap because they don't consume a new slot.
+    #[test]
+    fn join_federation_rejects_beyond_max_peers_ft_ry224() {
+        // Shrink max_peers so the test runs fast. Keep all other
+        // config at the default.
+        let mut server = HeadlessMuxServer::new(ServerConfig {
+            bind_address: "127.0.0.1:9876".into(),
+            node_id: "test-node".into(),
+            label: Some("Test Server".into()),
+            max_peers: 3,
+            ..ServerConfig::default()
+        });
+
+        for i in 0..3 {
+            let peer = ServerNodeId::new("host", 9876, &format!("peer-{i}"));
+            match server.handle_request(RemoteRequest::JoinFederation { peer }) {
+                RemoteResponse::FederationJoined { .. } => {}
+                other => panic!("peer-{i} expected FederationJoined, got {other:?}"),
+            }
+        }
+        assert_eq!(server.peer_count(), 3);
+
+        // The fourth DISTINCT peer exceeds max_peers — must be
+        // rejected with peer_registry_full, and the registry size
+        // stays at the cap.
+        let peer4 = ServerNodeId::new("host", 9876, "peer-3");
+        match server.handle_request(RemoteRequest::JoinFederation { peer: peer4 }) {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(code, "peer_registry_full");
+                assert!(
+                    message.contains("3/3") && message.contains("peer-3"),
+                    "ft-ry224: rejection must cite cap + node_id, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(server.peer_count(), 3, "ft-ry224: registry must stay at cap");
+
+        // But an EXISTING peer re-joining at cap is fine — re-join
+        // doesn't consume a new slot.
+        let peer_rejoin = ServerNodeId::new("host", 9876, "peer-0");
+        match server.handle_request(RemoteRequest::JoinFederation {
+            peer: peer_rejoin,
+        }) {
+            RemoteResponse::FederationJoined { node_id } => {
+                assert_eq!(node_id, "peer-0");
+            }
+            other => panic!("expected FederationJoined for re-join, got {other:?}"),
+        }
+        assert_eq!(server.peer_count(), 3);
+    }
+
+    // [ft-ry224] first_seen_at must survive a re-join. The ft-lekgj
+    // recovery path (Heartbeat from unknown peer → peer_not_federated
+    // → re-JoinFederation) would previously clobber the original
+    // federation timestamp on every re-join, making 'how long has
+    // this peer been federated' observability lie.
+    #[test]
+    fn join_federation_preserves_first_seen_at_on_rejoin_ft_ry224() {
+        let mut server = make_server();
+        let peer = ServerNodeId::new("host", 9876, "persistent-peer");
+
+        server.handle_request(RemoteRequest::JoinFederation { peer: peer.clone() });
+        let first_seen = server
+            .peers
+            .get("persistent-peer")
+            .expect("peer must be in registry")
+            .first_seen_at;
+
+        // Sleep long enough that epoch_ms() definitely advances.
+        // 5ms is well inside SystemTime's resolution on all supported
+        // platforms; we only need it to be non-zero.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Re-join the same node_id.
+        server.handle_request(RemoteRequest::JoinFederation { peer });
+        let after_rejoin = server
+            .peers
+            .get("persistent-peer")
+            .expect("peer must still be in registry")
+            .first_seen_at;
+
+        assert_eq!(
+            after_rejoin, first_seen,
+            "ft-ry224: first_seen_at must survive a re-join (original {first_seen}, after re-join {after_rejoin})"
+        );
+        // last_heartbeat_at should have advanced (not required by
+        // the contract, but a nice sanity check that the re-join
+        // actually touched something).
+        assert!(
+            server.peers.get("persistent-peer").unwrap().last_heartbeat_at >= first_seen,
+            "ft-ry224: last_heartbeat_at must be refreshed on re-join"
+        );
     }
 
     #[test]
