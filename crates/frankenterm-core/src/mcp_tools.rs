@@ -562,6 +562,27 @@ impl ToolHandler for WaCassSearchTool {
             return envelope_to_content(envelope);
         }
 
+        // [ft-tzwuw] Enforce schema's "timeout_secs": { "minimum": 1 }
+        // bound. serde_json doesn't honour JSON-Schema bounds, so a
+        // client sending timeout_secs=0 reaches cass_client_with_timeout(0)
+        // → Duration::from_secs(0) → timeout_with_cx fires before the
+        // child cass binary ever executes, returning a confusing
+        // "cass timeout (0 secs)" error on every call. Same shape as
+        // ft-t62hq (wa.wait_for/wa.send) extended to the cass surface.
+        if params.timeout_secs == 0 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "timeout_secs must be >= 1 (got 0)".to_string(),
+                Some(
+                    "The ca.search tool schema declares timeout_secs with \
+                     minimum: 1; omit the field to use the default (15)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
         let agent: Option<CassAgent> = if let Some(ref agent_str) = params.agent {
             match parse_cass_agent(agent_str) {
                 Some(agent) => Some(agent),
@@ -675,6 +696,22 @@ impl ToolHandler for WaCassViewTool {
             return envelope_to_content(envelope);
         }
 
+        // [ft-tzwuw] See ca.search call() for context. Same fix applied
+        // here to match the ca.view schema's "timeout_secs": { "minimum": 1 }.
+        if params.timeout_secs == 0 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "timeout_secs must be >= 1 (got 0)".to_string(),
+                Some(
+                    "The ca.view tool schema declares timeout_secs with \
+                     minimum: 1; omit the field to use the default (15)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -754,6 +791,22 @@ impl ToolHandler for WaCassStatusTool {
                 }
             }
         };
+
+        // [ft-tzwuw] See ca.search call() for context. Same fix applied
+        // here to match the ca.status schema's "timeout_secs": { "minimum": 1 }.
+        if params.timeout_secs == 0 {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "timeout_secs must be >= 1 (got 0)".to_string(),
+                Some(
+                    "The ca.status tool schema declares timeout_secs with \
+                     minimum: 1; omit the field to use the default (15)."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
 
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
@@ -5857,6 +5910,90 @@ exit 17",
                 expected_name
             );
         }
+    }
+
+    // -- ft-tzwuw: cass tools must reject timeout_secs=0 before --
+    //              dispatching a zero-duration timeout to the binary --
+
+    /// ca.search with timeout_secs=0 must fail-fast with INVALID_ARGS,
+    /// not reach cass_client_with_timeout(0) → Duration::from_secs(0)
+    /// → instant timeout. The guard runs before any cass binary
+    /// dispatch, so this test does not need #[cfg(unix)] or a fake
+    /// binary stand-in.
+    #[test]
+    fn ft_tzwuw_ca_search_rejects_zero_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassSearchTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "query": "anything",
+                        "timeout_secs": 0
+                    }),
+                )
+                .expect("ca.search call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("timeout_secs must be >= 1"),
+            "expected 'timeout_secs must be >= 1' in error, got: {}",
+            envelope["error"]
+        );
+    }
+
+    /// ca.view symmetric: timeout_secs=0 → INVALID_ARGS before dispatch.
+    #[test]
+    fn ft_tzwuw_ca_view_rejects_zero_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassViewTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "source_path": "/tmp/session.md",
+                        "line_number": 1,
+                        "timeout_secs": 0
+                    }),
+                )
+                .expect("ca.view call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("timeout_secs must be >= 1")
+        );
+    }
+
+    /// ca.status symmetric: timeout_secs=0 → INVALID_ARGS before dispatch.
+    /// Also verifies that the explicit-zero path is reached even though
+    /// CassStatusParams::default() returns the schema default (15) for
+    /// the null-args path.
+    #[test]
+    fn ft_tzwuw_ca_status_rejects_zero_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassStatusTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "timeout_secs": 0
+                    }),
+                )
+                .expect("ca.status call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error string")
+                .contains("timeout_secs must be >= 1")
+        );
     }
 
     // ========================================================================
