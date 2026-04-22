@@ -209,6 +209,21 @@ impl Evidence {
             Evidence::ScrollbackGrowth(_) => "scrollback_growth",
         }
     }
+
+    /// Whether this Evidence carries only finite numeric values. Used by
+    /// BayesianClassifier::update to reject NaN/Inf before they poison the
+    /// log_posterior. PatternDetection is always considered finite
+    /// (it carries no numeric value).
+    #[must_use]
+    fn is_finite(&self) -> bool {
+        match self {
+            Evidence::OutputRate(x)
+            | Evidence::Entropy(x)
+            | Evidence::TimeSinceOutput(x)
+            | Evidence::ScrollbackGrowth(x) => x.is_finite(),
+            Evidence::PatternDetection(_) => true,
+        }
+    }
 }
 
 // =============================================================================
@@ -428,6 +443,18 @@ impl BayesianClassifier {
     /// Update a pane with new evidence.
     pub fn update(&mut self, pane_id: u64, evidence: Evidence) {
         self.telemetry.updates += 1;
+        // [ft-n4fdx] Reject non-finite Evidence before it poisons the
+        // log_posterior. The numeric Evidence variants feed into
+        // gaussian_log_likelihoods / time_since_output_log_likelihoods,
+        // which produce NaN for NaN/Inf input. PaneClassifier::update
+        // then does `log_posterior[i] += ll`, and NaN+x=NaN, so one bad
+        // observation permanently pins all 7 posteriors at NaN and
+        // every future classify() returns useless probabilities.
+        // Fail closed silently — same shape as ft-b4l62 / ft-yskcu /
+        // ft-0p5q5 / ft-c17iw.
+        if !evidence.is_finite() {
+            return;
+        }
         let max_entries = self.config.max_ledger_entries;
         let pane = self
             .panes
@@ -1494,5 +1521,69 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: LedgerTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // -- ft-n4fdx: non-finite Evidence must not poison log_posterior --
+
+    /// Calibrate a pane with a clean observation, then feed it a
+    /// NaN-carrying Evidence. The classifier must still return finite
+    /// probabilities on the very next classify() call — pre-fix, the
+    /// log_posterior was permanently pinned at NaN and classify()
+    /// returned NaN probabilities everywhere.
+    #[test]
+    fn ft_n4fdx_nan_evidence_does_not_poison_posterior() {
+        let mut led = BayesianClassifier::new(LedgerConfig::default());
+        led.update(1, Evidence::OutputRate(5.0));
+        led.update(1, Evidence::OutputRate(f64::NAN));
+        led.update(1, Evidence::OutputRate(5.0));
+        let result = led.classify(1).expect("pane 1 must be classified");
+        for (state, &prob) in &result.posterior {
+            assert!(
+                prob.is_finite(),
+                "posterior[{state}] = {prob} must be finite after NaN evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn ft_n4fdx_inf_evidence_does_not_poison_posterior() {
+        let mut led = BayesianClassifier::new(LedgerConfig::default());
+        led.update(1, Evidence::Entropy(3.5));
+        led.update(1, Evidence::Entropy(f64::INFINITY));
+        led.update(1, Evidence::Entropy(f64::NEG_INFINITY));
+        led.update(1, Evidence::Entropy(3.5));
+        let result = led.classify(1).expect("pane 1 must be classified");
+        for (_state, &prob) in &result.posterior {
+            assert!(prob.is_finite());
+            assert!((0.0..=1.0).contains(&prob));
+        }
+    }
+
+    /// NaN Evidence on a pane that has never been observed must NOT
+    /// silently create a new PaneClassifier entry. The pane stays
+    /// unknown to classify().
+    #[test]
+    fn ft_n4fdx_nan_evidence_on_unseen_pane_is_noop() {
+        let mut led = BayesianClassifier::new(LedgerConfig::default());
+        led.update(42, Evidence::OutputRate(f64::NAN));
+        led.update(42, Evidence::TimeSinceOutput(f64::INFINITY));
+        assert!(
+            led.classify(42).is_none(),
+            "NaN/Inf-only evidence must not initialize a pane"
+        );
+    }
+
+    /// PatternDetection carries no numeric value, so it must still flow
+    /// through even in a session where NaN evidence was also submitted.
+    #[test]
+    fn ft_n4fdx_pattern_detection_still_works_after_nan() {
+        let mut led = BayesianClassifier::new(LedgerConfig::default());
+        led.update(1, Evidence::OutputRate(f64::NAN));
+        led.update(
+            1,
+            Evidence::PatternDetection("rate_limit_hit".to_string()),
+        );
+        let result = led.classify(1).expect("pane 1 must be classified");
+        assert!(result.posterior.values().all(|p| p.is_finite()));
     }
 }
