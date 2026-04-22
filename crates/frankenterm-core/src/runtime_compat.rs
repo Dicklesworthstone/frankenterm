@@ -1342,18 +1342,22 @@ pub use futures::join;
 macro_rules! select {
     // Two-branch, block bodies, no trailing comma between branches
     ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block) => {{
-        ::futures::pin_mut!($fut1);
-        ::futures::pin_mut!($fut2);
-        match ::futures::future::select($fut1, $fut2).await {
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
             ::futures::future::Either::Left(($pat1, _)) => $body1,
             ::futures::future::Either::Right(($pat2, _)) => $body2,
         }
     }};
     // Two-branch, expression bodies, comma-separated
     ($pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
-        ::futures::pin_mut!($fut1);
-        ::futures::pin_mut!($fut2);
-        match ::futures::future::select($fut1, $fut2).await {
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
             ::futures::future::Either::Left(($pat1, _)) => $body1,
             ::futures::future::Either::Right(($pat2, _)) => $body2,
         }
@@ -2035,7 +2039,6 @@ where
     {
         Ok(asupersync::runtime::spawn_blocking(work).await)
     }
-
 }
 
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
@@ -2051,7 +2054,6 @@ pub async fn mpsc_recv_option<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
         let cx = crate::cx::for_testing();
         rx.recv(&cx).await.ok()
     }
-
 }
 
 /// Sends one message through an mpsc sender using the active runtime semantics.
@@ -2063,7 +2065,6 @@ pub async fn mpsc_send<T>(tx: &mpsc::Sender<T>, value: T) -> Result<(), mpsc::Se
         let cx = crate::cx::for_testing();
         tx.send(&cx, value).await
     }
-
 }
 
 /// Reserves one mpsc slot and commits `value`, returning whether delivery was
@@ -2080,7 +2081,6 @@ pub async fn mpsc_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
         }
         false
     }
-
 }
 
 /// Attempts an immediate reserve/commit send and reports whether delivery was
@@ -2103,7 +2103,6 @@ pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
     {
         rx.has_changed()
     }
-
 }
 
 /// Borrows the latest watch value and clones it while marking the update as
@@ -2112,7 +2111,6 @@ pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T
     {
         rx.borrow_and_clone()
     }
-
 }
 
 /// Waits until the watch receiver observes a change, abstracting the
@@ -2126,7 +2124,6 @@ pub async fn watch_changed<T: Send + Sync>(
         let cx = crate::cx::for_testing();
         rx.changed(&cx).await
     }
-
 }
 
 /// Send a value on a broadcast channel using the active runtime backend.
@@ -2239,7 +2236,6 @@ pub async fn oneshot_recv<T>(rx: oneshot::Receiver<T>) -> Result<T, String> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         oneshot_recv_with_cx(&cx, rx).await
     }
-
 }
 
 /// Receive from a oneshot channel under an explicit `&Cx` (ft-xbnl0.2.x
@@ -3564,7 +3560,6 @@ mod tests {
                 ),
                 "expected disconnected send error carrying original value",
             );
-
         });
     }
 
