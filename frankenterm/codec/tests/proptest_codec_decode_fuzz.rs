@@ -21,11 +21,10 @@
 //!   (3) `stream_decode` over random buffers — exercises the partial-
 //!       frame path that the mux uses on every read from a socket.
 
-use codec::{Pdu, Ping};
+use codec::{CompressionMode, ErrorResponse, Pdu};
 use proptest::prelude::*;
 
 const COMPRESSED_MASK: u64 = 1 << 63;
-const PING_IDENT: u64 = 1;
 
 fn assert_decoded_pdu_is_well_formed(decoded: &codec::DecodedPdu) {
     // The serial is a u64; nothing stronger to assert at the envelope.
@@ -57,15 +56,33 @@ fn structured_header_frame(ident: u64, serial: u64, body: &[u8], is_compressed: 
     buf
 }
 
+fn split_single_frame(frame: &[u8]) -> (u64, u64, Vec<u8>) {
+    let mut slice = frame;
+    let _tagged_len = leb128::read::unsigned(&mut slice).expect("frame length");
+    let serial = leb128::read::unsigned(&mut slice).expect("frame serial");
+    let ident = leb128::read::unsigned(&mut slice).expect("frame ident");
+    (serial, ident, slice.to_vec())
+}
+
 #[test]
 fn structured_header_helper_uses_real_codec_compression_bit() {
-    let decoded = Pdu::decode(structured_header_frame(PING_IDENT, 77, &[], false).as_slice())
-        .expect("uncompressed empty Ping frame should decode");
-    assert_eq!(decoded.serial, 77);
-    assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+    let expected = Pdu::ErrorResponse(ErrorResponse {
+        reason: "compressed-flag sentinel".to_string(),
+    });
+    let mut canonical = Vec::new();
+    expected
+        .encode_with_mode(&mut canonical, 77, CompressionMode::Never)
+        .expect("encode canonical uncompressed frame");
+    let (serial, ident, body) = split_single_frame(canonical.as_slice());
 
-    let err = Pdu::decode(structured_header_frame(PING_IDENT, 77, &[], true).as_slice())
-        .expect_err("compressed-flagged empty Ping frame should hit zstd decode and fail");
+    let decoded =
+        Pdu::decode(structured_header_frame(ident, serial, body.as_slice(), false).as_slice())
+            .expect("helper should preserve the canonical uncompressed frame");
+    assert_eq!(decoded.serial, 77);
+    assert_eq!(decoded.pdu, expected);
+
+    let err = Pdu::decode(structured_header_frame(ident, serial, body.as_slice(), true).as_slice())
+        .expect_err("compressed-flagged raw varbincode body should hit zstd decode and fail");
     assert!(
         !err.to_string().is_empty(),
         "invalid compressed payload should surface a typed error"
