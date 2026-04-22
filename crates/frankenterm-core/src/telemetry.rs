@@ -336,8 +336,15 @@ impl Histogram {
     /// returns `None` for NaN pairs. Same fail-closed shape as ft-761tz
     /// (disk_pressure): skip NaN entirely so one bad sample cannot
     /// poison observability forever.
+    ///
+    /// [ft-trot7] Broaden the guard to all non-finite values. Inf is
+    /// also absorbing under addition (`finite + INF = INF`), pins
+    /// `max` to ±INF on the first non-finite sample, and serialises as
+    /// JSON `null` in `HistogramSummary` (RFC 8259 forbids Inf), which
+    /// silently drops the value from downstream telemetry payloads.
+    /// `f64::is_finite` rejects NaN and ±Infinity in one check.
     pub fn record(&mut self, value: f64) {
-        if value.is_nan() {
+        if !value.is_finite() {
             return;
         }
         self.total_count += 1;
@@ -3355,5 +3362,76 @@ mod tests {
         assert_eq!(h.quantile(f64::INFINITY), Some(30.0));
         // -inf → clamp to 0.0 → min sample (10.0).
         assert_eq!(h.quantile(f64::NEG_INFINITY), Some(10.0));
+    }
+
+    // -- ft-trot7: broaden NaN guard to all non-finite samples --
+
+    /// `record(f64::INFINITY)` must be a no-op. Pre-fix, the NaN guard
+    /// missed Inf, so `total_sum += INF` set total_sum to INF
+    /// permanently and every subsequent finite sample preserved it.
+    #[test]
+    fn ft_trot7_histogram_record_pos_infinity_does_not_poison_mean() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(10.0);
+        h.record(20.0);
+        h.record(f64::INFINITY);
+        h.record(30.0);
+
+        let m = h.mean().expect("mean");
+        assert!(
+            m.is_finite(),
+            "mean must stay finite after Inf sample, got {m}"
+        );
+        assert_eq!(m, 20.0, "mean = (10+20+30)/3, Inf dropped on input");
+        assert_eq!(h.count(), 3, "Inf must not advance total_count");
+        assert_eq!(h.retained(), 3, "Inf must not enter the sample window");
+    }
+
+    /// Symmetric: `record(f64::NEG_INFINITY)` is also a no-op. Pre-fix,
+    /// `total_sum += -INF` permanently pinned mean to -INF.
+    #[test]
+    fn ft_trot7_histogram_record_neg_infinity_does_not_poison_mean() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(10.0);
+        h.record(f64::NEG_INFINITY);
+        h.record(30.0);
+
+        let m = h.mean().expect("mean");
+        assert!(m.is_finite(), "mean must stay finite, got {m}");
+        assert_eq!(m, 20.0);
+        assert_eq!(h.count(), 2);
+    }
+
+    /// All-Inf stream → mean stays None and min/max stay at sentinels,
+    /// matching the all-NaN contract.
+    #[test]
+    fn ft_trot7_histogram_all_infinity_keeps_mean_none() {
+        let mut h = Histogram::new("latency_ms", 16);
+        for _ in 0..5 {
+            h.record(f64::INFINITY);
+        }
+        assert!(h.mean().is_none(), "all-Inf stream must surface as no samples");
+        assert_eq!(h.count(), 0);
+        assert!(h.min_max().is_none());
+    }
+
+    /// summary().max must stay finite after an Inf attempt — pre-fix
+    /// the very first Inf would pin max to Inf forever, and serde_json
+    /// would silently emit `null` (RFC 8259 forbids Inf), dropping the
+    /// telemetry value from downstream payloads.
+    #[test]
+    fn ft_trot7_histogram_summary_max_stays_finite_after_inf_attempt() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(5.0);
+        h.record(f64::INFINITY);
+        h.record(15.0);
+
+        let s = h.summary();
+        let max = s.max.expect("max present");
+        assert!(max.is_finite(), "summary.max must stay finite, got {max}");
+        assert_eq!(max, 15.0);
+        let min = s.min.expect("min present");
+        assert!(min.is_finite());
+        assert_eq!(min, 5.0);
     }
 }
