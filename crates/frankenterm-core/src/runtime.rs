@@ -226,6 +226,27 @@ async fn send_runtime_channel<T>(
     { tx.send(runtime_cx, value).await.is_ok() }
 }
 
+#[cfg(all(feature = "vendored", unix))]
+async fn forward_vendored_streaming_delta(
+    runtime_cx: &RuntimeLoopCx,
+    bridge: &mut StreamingBridge,
+    capture_tx: &mpsc::Sender<CaptureEvent>,
+    delta: PaneDelta,
+) -> Option<String> {
+    let exit_reason = match &delta {
+        PaneDelta::Ended { reason, .. } => Some(reason.clone()),
+        _ => None,
+    };
+
+    for segment in bridge.process_delta(delta) {
+        if !send_runtime_channel(runtime_cx, capture_tx, CaptureEvent { segment }).await {
+            return Some("capture ingress closed".to_string());
+        }
+    }
+
+    exit_reason
+}
+
 // ---------------------------------------------------------------------------
 // Native event output coalescing (wa-x4rq)
 // ---------------------------------------------------------------------------
@@ -3477,10 +3498,25 @@ async fn run_vendored_streaming_capture(
         subscription_config.clone(),
     );
 
+    let exit_reason = loop {
+        match subscription.next_with_cx(&runtime_cx).await {
+            Some(delta) => {
+                if let Some(reason) =
+                    forward_vendored_streaming_delta(&runtime_cx, &mut bridge, &capture_tx, delta)
+                        .await
+                {
+                    break reason;
+                }
+            }
+            None if runtime_cx.checkpoint().is_err() => break "cancelled".to_string(),
+            None => break "subscription channel closed".to_string(),
+        }
+    };
+
     if should_record_streaming_fallback(&exit_reason) {
         bridge.record_fallback();
     }
-    subscription.shutdown().await;
+    subscription.shutdown_with_cx(&runtime_cx).await;
     exit_reason
 }
 
@@ -4597,6 +4633,118 @@ mod tests {
             drop(rx);
             let loop_cx = runtime_loop_cx();
             assert!(!send_runtime_channel(&loop_cx, &tx, 7).await);
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn forward_vendored_streaming_delta_emits_capture_event() {
+        run_async_test(async {
+            let (capture_tx, mut capture_rx) = mpsc::channel(4);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+
+            let exit_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                PaneDelta::Output {
+                    pane_id: 17,
+                    seqno: 1,
+                    delta_text: "hello from vendored stream".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 2,
+                },
+            )
+            .await;
+
+            assert!(exit_reason.is_none());
+            let event = recv_mpsc(&mut capture_rx).await;
+            assert_eq!(event.segment.pane_id, 17);
+            assert_eq!(event.segment.content, "hello from vendored stream");
+            assert!(matches!(
+                event.segment.kind,
+                crate::ingest::CapturedSegmentKind::Delta
+            ));
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn forward_vendored_streaming_delta_returns_end_reason_and_emits_close_gap() {
+        run_async_test(async {
+            let (capture_tx, mut capture_rx) = mpsc::channel(4);
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+
+            let output_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                PaneDelta::Output {
+                    pane_id: 21,
+                    seqno: 1,
+                    delta_text: "seed".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+            )
+            .await;
+            assert!(output_reason.is_none());
+            let _ = recv_mpsc(&mut capture_rx).await;
+
+            let exit_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                PaneDelta::Ended {
+                    pane_id: 21,
+                    reason: "mux socket disconnected".to_string(),
+                },
+            )
+            .await;
+
+            assert_eq!(exit_reason.as_deref(), Some("mux socket disconnected"));
+            let event = recv_mpsc(&mut capture_rx).await;
+            assert_eq!(event.segment.pane_id, 21);
+            match &event.segment.kind {
+                crate::ingest::CapturedSegmentKind::Gap { reason } => {
+                    assert!(reason.contains("pane_closed"));
+                }
+                crate::ingest::CapturedSegmentKind::Delta => {
+                    panic!("ended delta must emit pane_closed gap")
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn forward_vendored_streaming_delta_reports_closed_capture_ingress() {
+        run_async_test(async {
+            let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(1);
+            drop(capture_rx);
+
+            let loop_cx = runtime_loop_cx();
+            let mut bridge = StreamingBridge::new();
+            let exit_reason = forward_vendored_streaming_delta(
+                &loop_cx,
+                &mut bridge,
+                &capture_tx,
+                PaneDelta::Output {
+                    pane_id: 9,
+                    seqno: 1,
+                    delta_text: "orphaned".to_string(),
+                    title: "bash".to_string(),
+                    dirty_range_count: 1,
+                    dirty_row_count: 1,
+                },
+            )
+            .await;
+
+            assert_eq!(exit_reason.as_deref(), Some("capture ingress closed"));
         });
     }
 
