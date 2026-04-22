@@ -102,7 +102,17 @@ impl EmaSmoother {
     }
 
     /// Feed a raw observation and return the smoothed value.
+    ///
+    /// Same fail-closed disposition as ft-761tz: a NaN sample must not
+    /// poison `value`. `f64::clamp(NaN, _, _)` returns NaN and the EMA
+    /// recurrence preserves it forever, so we early-return on NaN before
+    /// any state mutation. First-sample-NaN keeps the smoother
+    /// uninitialised (value stays 0.0) so the next clean sample
+    /// initialises cleanly.
     pub fn update(&mut self, raw: f64) -> f64 {
+        if raw.is_nan() {
+            return self.value;
+        }
         if !self.initialized {
             self.value = raw;
             self.initialized = true;
@@ -138,6 +148,13 @@ impl EmaSmoother {
 /// Compute the sigmoid function: σ(x) = 1 / (1 + e⁻ˣ).
 #[inline]
 fn sigmoid(x: f64) -> f64 {
+    // ft-yskcu: f64::clamp does not sanitise NaN — it returns NaN
+    // unchanged. Mirror the backpressure_severity sigmoid's NaN guard
+    // so a NaN input collapses to the neutral midpoint instead of
+    // poisoning every downstream multiply.
+    if x.is_nan() {
+        return 0.5;
+    }
     // Clamp input to avoid overflow
     let x = x.clamp(-500.0, 500.0);
     1.0 / (1.0 + (-x).exp())
@@ -222,6 +239,15 @@ impl ContinuousBackpressure {
     ///
     /// Returns the new throttle actions.
     pub fn update(&mut self, capture_ratio: f64, write_ratio: f64) -> ThrottleActions {
+        // ft-yskcu: defense in depth against NaN-poison cascades. The
+        // smoother's own NaN guard would prevent poisoning of `value`,
+        // but we'd still bump `update_count` and emit a stale-action
+        // snapshot framed as "fresh" telemetry. Skip the whole update on
+        // any non-finite ratio so the snapshot stays consistent with
+        // "no observation happened on this tick".
+        if !capture_ratio.is_finite() || !write_ratio.is_finite() {
+            return self.compute_actions();
+        }
         let capture_ratio = capture_ratio.clamp(0.0, 1.0);
         let write_ratio = write_ratio.clamp(0.0, 1.0);
 
@@ -775,5 +801,116 @@ mod tests {
                 (s2 - s1).abs()
             );
         }
+    }
+
+    // ── ft-yskcu: NaN-poison fail-closed regression suite ──────────────
+
+    /// EmaSmoother::update must not let a NaN sample poison `value`.
+    /// Before the fix, `alpha.mul_add(NaN, ...)` set `value` to NaN
+    /// permanently and every subsequent update preserved it.
+    #[test]
+    fn ft_yskcu_smoother_rejects_nan_sample_and_preserves_prior_value() {
+        let mut smoother = EmaSmoother::new(4);
+        assert_eq!(smoother.update(0.42), 0.42);
+        let out = smoother.update(f64::NAN);
+        assert!(out.is_finite(), "NaN sample must not taint smoother.value");
+        assert_eq!(out, 0.42);
+        // Recovery: next clean sample blends from the preserved prior.
+        let recovered = smoother.update(0.50);
+        assert!(recovered.is_finite());
+        assert!(recovered > 0.42 && recovered < 0.50);
+    }
+
+    /// First sample is NaN → smoother stays uninitialised (value=0.0).
+    #[test]
+    fn ft_yskcu_smoother_rejects_nan_first_sample() {
+        let mut smoother = EmaSmoother::new(4);
+        let out = smoother.update(f64::NAN);
+        assert_eq!(out, 0.0, "uninitialised smoother returns the default 0.0");
+        assert!(
+            !smoother.is_initialized(),
+            "NaN must not flip initialized to true"
+        );
+        // The next clean sample initialises (not blend against NaN).
+        let first_clean = smoother.update(0.3);
+        assert_eq!(first_clean, 0.3);
+        assert!(smoother.is_initialized());
+    }
+
+    /// Local sigmoid must collapse NaN to 0.5 instead of letting NaN
+    /// propagate through every downstream multiply. Mirrors the
+    /// backpressure_severity sigmoid's NaN guard.
+    #[test]
+    fn ft_yskcu_sigmoid_collapses_nan_to_midpoint() {
+        let s = sigmoid(f64::NAN);
+        assert_eq!(s, 0.5, "NaN sigmoid input must collapse to neutral 0.5");
+    }
+
+    /// ContinuousBackpressure::update must skip the entire update when
+    /// either ratio is non-finite, returning the prior actions instead
+    /// of advancing update_count and emitting a stale-but-fresh-framed
+    /// snapshot. End-to-end regression: feed clean → NaN → clean and
+    /// assert the NaN tick is a no-op and the next clean tick continues
+    /// from the prior smoothed state.
+    #[test]
+    fn ft_yskcu_continuous_skips_nan_tick_and_recovers() {
+        let mut bp = ContinuousBackpressure::new(ContinuousBackpressureConfig::default());
+
+        // Healthy baseline.
+        let _ = bp.update(0.10, 0.10);
+        let q_before = bp.queue_ratio();
+        let s_before = bp.severity();
+        let count_before = bp.update_count();
+        assert!(q_before.is_finite());
+        assert!(s_before.is_finite());
+
+        // NaN tick → no state change, update_count not bumped.
+        let actions = bp.update(f64::NAN, 0.10);
+        assert!(
+            actions.severity.is_finite(),
+            "NaN tick must not poison ThrottleActions.severity"
+        );
+        assert_eq!(
+            bp.update_count(),
+            count_before,
+            "NaN tick must not advance update_count (snapshot integrity)"
+        );
+        assert_eq!(bp.queue_ratio(), q_before);
+        assert_eq!(bp.severity(), s_before);
+
+        // Clean tick after the NaN → continues from the prior smoothed
+        // state (no NaN poison, no false reset).
+        let _ = bp.update(0.20, 0.20);
+        assert!(bp.queue_ratio().is_finite());
+        assert!(bp.severity().is_finite());
+        assert_eq!(bp.update_count(), count_before + 1);
+    }
+
+    /// Symmetric guard: NaN in write_ratio also no-ops.
+    #[test]
+    fn ft_yskcu_continuous_skips_nan_write_ratio() {
+        let mut bp = ContinuousBackpressure::new(ContinuousBackpressureConfig::default());
+        let _ = bp.update(0.10, 0.10);
+        let count = bp.update_count();
+        let _ = bp.update(0.10, f64::NAN);
+        assert_eq!(bp.update_count(), count, "NaN write_ratio must no-op");
+        assert!(bp.severity().is_finite());
+    }
+
+    /// Belt-and-braces: even if the NaN guard at the top of
+    /// ContinuousBackpressure::update were ever bypassed (e.g. via a
+    /// subclass-style direct call into the inner smoothers), the
+    /// EmaSmoother NaN guard ensures the inner state never reaches NaN.
+    /// Pin both layers so a future refactor that drops one cannot
+    /// regress the other silently.
+    #[test]
+    fn ft_yskcu_inner_smoothers_remain_finite_after_external_nan_attempt() {
+        let mut bp = ContinuousBackpressure::new(ContinuousBackpressureConfig::default());
+        let _ = bp.update(0.50, 0.50);
+        let _ = bp.update(f64::NAN, f64::NAN);
+        let _ = bp.update(f64::INFINITY, f64::NEG_INFINITY);
+        // Severity stays finite no matter what the caller throws at us.
+        assert!(bp.severity().is_finite());
+        assert!(bp.queue_ratio().is_finite());
     }
 }
