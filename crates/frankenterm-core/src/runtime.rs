@@ -5811,6 +5811,145 @@ mod tests {
         assert!(!pane_activity_tracker.contains_key(&2));
     }
 
+    /// [ft-pp7jk] `handle_native_event` on `NativeEvent::PaneDestroyed` must
+    /// publish `Event::PaneDisappeared` when an `event_bus` is present.
+    ///
+    /// The event variant was declared in events.rs:181 and consumers
+    /// (event_stream filters, wire_protocol serializer, main.rs handler)
+    /// were already matching on it — but no production path ever emitted
+    /// it. Every subscriber remained dormant forever, leaving every
+    /// long-lived per-pane cache (policy rate-limiter state, connector
+    /// bridge caches, future subsystems) unable to release state on
+    /// pane destroy.
+    ///
+    /// Pin the fix: feed a PaneDestroyed event with an attached bus,
+    /// assert the subscriber receives a matching PaneDisappeared. Also
+    /// covers the no-bus path (None) which must be a no-op.
+    #[test]
+    fn ft_pp7jk_pane_destroyed_publishes_pane_disappeared_event() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let bus = Arc::new(crate::events::EventBus::new(16));
+            let mut subscriber = bus.subscribe();
+
+            let (capture_tx, _capture_rx) = mpsc::channel::<CaptureEvent>(4);
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::from([(
+                42_u64,
+                PaneCursor::from_seq(42, 0),
+            )])));
+            let detection_contexts =
+                Arc::new(RwLock::new(HashMap::<u64, DetectionContext>::from([(
+                    42_u64,
+                    DetectionContext::new(),
+                )])));
+            let pane_activity_tracker =
+                Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::from([(
+                    42_u64,
+                    PaneActivityState {
+                        last_seq: 0,
+                        last_output_at_ms: 0,
+                        generation: 1,
+                        first_seen_at_ms: 0,
+                    },
+                )])));
+            let pane_filter = PaneFilterConfig::default();
+            let backpressure = Arc::new(BackpressureMetrics::default());
+            let runtime_cx = runtime_loop_cx();
+
+            handle_native_event(
+                &runtime_cx,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 42,
+                    timestamp_ms: 1_000,
+                },
+                &capture_tx,
+                &cursors,
+                &detection_contexts,
+                &pane_activity_tracker,
+                &storage,
+                Some(&bus),
+                &pane_filter,
+                &backpressure,
+            )
+            .await;
+
+            // The per-pane state tears down (pre-existing ft-l6v1r
+            // behavior) AND the lifecycle event fans out (new ft-pp7jk
+            // behavior). Assert both.
+            assert!(!cursors.read().await.contains_key(&42));
+            assert!(!detection_contexts.read().await.contains_key(&42));
+            assert!(!pane_activity_tracker.read().await.contains_key(&42));
+
+            let cx = crate::cx::for_testing();
+            let received = subscriber
+                .recv(&cx)
+                .await
+                .expect("bus subscriber should receive PaneDisappeared after PaneDestroyed");
+            assert!(
+                matches!(received, Event::PaneDisappeared { pane_id: 42 }),
+                "expected Event::PaneDisappeared{{pane_id:42}}, got {received:?}"
+            );
+        });
+    }
+
+    /// [ft-pp7jk] Companion to the bus-present test: with `event_bus =
+    /// None`, `handle_native_event` on PaneDestroyed must still tear
+    /// down per-pane state and must NOT panic, emit, or otherwise
+    /// require the bus. Regression guard against a future refactor
+    /// that forgets the `if let Some(bus) = ...` guard.
+    #[test]
+    fn ft_pp7jk_pane_destroyed_without_bus_is_still_clean_teardown() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+
+            let (capture_tx, _capture_rx) = mpsc::channel::<CaptureEvent>(4);
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::from([(
+                7_u64,
+                PaneCursor::from_seq(7, 0),
+            )])));
+            let detection_contexts = Arc::new(RwLock::new(HashMap::<
+                u64,
+                DetectionContext,
+            >::from([(7_u64, DetectionContext::new())])));
+            let pane_activity_tracker =
+                Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::from([(
+                    7_u64,
+                    PaneActivityState {
+                        last_seq: 0,
+                        last_output_at_ms: 0,
+                        generation: 1,
+                        first_seen_at_ms: 0,
+                    },
+                )])));
+            let pane_filter = PaneFilterConfig::default();
+            let backpressure = Arc::new(BackpressureMetrics::default());
+            let runtime_cx = runtime_loop_cx();
+
+            handle_native_event(
+                &runtime_cx,
+                NativeEvent::PaneDestroyed {
+                    pane_id: 7,
+                    timestamp_ms: 500,
+                },
+                &capture_tx,
+                &cursors,
+                &detection_contexts,
+                &pane_activity_tracker,
+                &storage,
+                None,
+                &pane_filter,
+                &backpressure,
+            )
+            .await;
+
+            assert!(!cursors.read().await.contains_key(&7));
+            assert!(!detection_contexts.read().await.contains_key(&7));
+            assert!(!pane_activity_tracker.read().await.contains_key(&7));
+        });
+    }
+
     #[test]
     fn ft_xbnl0_4_4_leak_inventory_returns_to_baseline_after_pane_teardown() {
         let mut registry = PaneRegistry::new();
