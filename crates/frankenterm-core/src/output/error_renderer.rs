@@ -6,7 +6,8 @@
 
 use super::format::{OutputFormat, Style};
 use crate::error::{
-    ConfigError, Error, PatternError, Remediation, StorageError, WeztermError, WorkflowError,
+    ConfigError, Error, PaneOperationSource, PatternError, Remediation, StorageError, WeztermError,
+    WorkflowError,
 };
 use crate::error_codes::{ErrorCodeDef, get_error_code};
 
@@ -76,14 +77,15 @@ impl ErrorRenderer {
             Error::Io(_) => "FT-9002",
             Error::Json(_) => "FT-9003",
             Error::Runtime(_) => "FT-9001",
-            // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
-            // 79702a50 ("ux(errors): type runtime, pane, and watchdog
-            // failures"). Route them through the existing generic code
-            // bucket until per-variant codes are assigned in
-            // error_code.rs — keeps the CLI JSON shape consistent and
-            // unblocks the workspace check. FT-9001 is the same
-            // bucket the deprecated Runtime variant uses, so
-            // behaviourally identical for operators.
+            // Preserve the existing pane-not-found operator contract even
+            // after the typed pane operation variants were introduced.
+            Error::PaneOperation {
+                source: PaneOperationSource::PaneNotFound,
+                ..
+            } => "FT-1010",
+            // [ft-h9g0q] Other typed runtime/pane/watchdog variants still
+            // share the generic internal bucket until dedicated catalog
+            // codes are assigned in error_codes.rs.
             Error::RuntimeOperation { .. }
             | Error::PaneOperation { .. }
             | Error::WatchdogWarningRead { .. } => "FT-9001",
@@ -304,6 +306,74 @@ pub fn get_code_for_error(error: &Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Map, Value, json};
+    use std::path::PathBuf;
+
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut sorted: Vec<(&String, &Value)> = map.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(b.0));
+                let mut out = Map::new();
+                for (k, v) in sorted {
+                    out.insert(k.clone(), canonicalize(v));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn pretty_canonical(value: &Value) -> String {
+        serde_json::to_string_pretty(&canonicalize(value)).expect("serialize error renderer golden")
+    }
+
+    fn typed_pane_not_found_golden_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("error_renderer_typed_pane_not_found.json")
+    }
+
+    fn read_or_update_golden(path: &PathBuf, actual: &str) -> String {
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create fixtures dir");
+            }
+            std::fs::write(path, format!("{actual}\n")).expect("write golden");
+            return actual.to_string();
+        }
+
+        std::fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "missing error renderer golden at {}: {err}. Regenerate with:\n  \
+                 UPDATE_GOLDEN=1 cargo test -p frankenterm-core --lib \
+                 typed_pane_not_found_renderer_matches_golden",
+                path.display()
+            )
+        })
+    }
+
+    fn assert_matches_golden(actual: &str, golden: &PathBuf) {
+        let expected = read_or_update_golden(golden, actual);
+        let expected_trimmed = expected.trim_end_matches('\n');
+        let actual_trimmed = actual.trim_end_matches('\n');
+
+        if expected_trimmed != actual_trimmed {
+            let actual_path = golden.with_extension("actual.json");
+            let _ = std::fs::write(&actual_path, format!("{actual}\n"));
+            panic!(
+                "error renderer golden drift detected. Review the diff between:\n  \
+                 expected: {}\n  actual:   {}\n\n\
+                 If intentional, regenerate with:\n  \
+                 UPDATE_GOLDEN=1 cargo test -p frankenterm-core --lib \
+                 typed_pane_not_found_renderer_matches_golden",
+                golden.display(),
+                actual_path.display()
+            );
+        }
+    }
 
     #[test]
     fn error_codes_mapped_correctly() {
@@ -843,6 +913,36 @@ mod tests {
         let output = renderer.render(&error);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["code"], "FT-9005");
+    }
+
+    #[test]
+    fn typed_pane_not_found_uses_pane_not_found_code() {
+        let error = Error::PaneOperation {
+            pane_id: 42,
+            operation: "inject",
+            source: PaneOperationSource::PaneNotFound,
+        };
+        assert_eq!(ErrorRenderer::error_code(&error), "FT-1010");
+    }
+
+    #[test]
+    fn typed_pane_not_found_renderer_matches_golden() {
+        let error = Error::PaneOperation {
+            pane_id: 42,
+            operation: "inject",
+            source: PaneOperationSource::PaneNotFound,
+        };
+        let plain = ErrorRenderer::new(OutputFormat::Plain).render(&error);
+        let json_output = ErrorRenderer::new(OutputFormat::Json).render(&error);
+        let json_value: Value =
+            serde_json::from_str(&json_output).expect("typed pane not found JSON output");
+
+        let actual = pretty_canonical(&json!({
+            "plain_lines": plain.trim_end_matches('\n').lines().collect::<Vec<_>>(),
+            "json": json_value,
+        }));
+
+        assert_matches_golden(&actual, &typed_pane_not_found_golden_path());
     }
 
     #[test]
