@@ -1001,27 +1001,38 @@ pub fn session_doctor(db_path: &str) -> Result<SessionDoctorReport, RestoreError
 
 /// Delete a session and all its checkpoints (cascading via SQL).
 pub fn delete_session(db_path: &str, session_id: &str) -> Result<bool, RestoreError> {
-    let conn = open_conn(db_path)?;
+    let mut conn = open_conn(db_path)?;
+
+    // [ft-dqsev] Wrap the three DELETEs in one transaction so a
+    // mid-sequence failure (lock contention, disk full, cancel) can't
+    // leave pane_state orphaned from its checkpoints or checkpoints
+    // orphaned from their session row. Without this, a partial failure
+    // was silent data corruption — subsequent `load_checkpoint_by_id`
+    // calls would return Some(checkpoint) with an empty `pane_states`
+    // vec, producing a restored session that looks clean but carries
+    // no terminal state.
+    let tx = conn.transaction()?;
 
     // Delete pane states via checkpoint cascade
-    conn.execute(
+    tx.execute(
         "DELETE FROM mux_pane_state WHERE checkpoint_id IN
          (SELECT id FROM session_checkpoints WHERE session_id = ?1)",
         [session_id],
     )?;
 
     // Delete checkpoints
-    conn.execute(
+    tx.execute(
         "DELETE FROM session_checkpoints WHERE session_id = ?1",
         [session_id],
     )?;
 
     // Delete session
-    let deleted = conn.execute(
+    let deleted = tx.execute(
         "DELETE FROM mux_sessions WHERE session_id = ?1",
         [session_id],
     )?;
 
+    tx.commit()?;
     Ok(deleted > 0)
 }
 
