@@ -2280,8 +2280,8 @@ pub struct PaneIndexingStats {
     /// Timestamp of the most recent segment (epoch ms)
     pub last_segment_at: Option<i64>,
     /// Number of FTS rows for this pane (should equal segment_count)
-    pub fts_indexed_count: u64,
-    /// Whether FTS index is consistent (fts_indexed_count == segment_count)
+    pub fts_row_count: u64,
+    /// Whether FTS index is consistent (fts_row_count == segment_count)
     pub fts_consistent: bool,
 }
 
@@ -15657,14 +15657,14 @@ fn get_pane_indexing_stats_sync(conn: &Connection) -> Result<Vec<PaneIndexingSta
             };
             let max_seq: Option<u64> = row.get::<_, Option<i64>>(3)?.map(|v| v as u64);
             let last_segment_at: Option<i64> = row.get(4)?;
-            // Trigger-driven FTS: segment_count == fts_indexed_count by construction
+            // Trigger-driven FTS: segment_count == fts_row_count by construction
             Ok(PaneIndexingStats {
                 pane_id,
                 segment_count,
                 total_bytes,
                 max_seq,
                 last_segment_at,
-                fts_indexed_count: segment_count,
+                fts_row_count: segment_count,
                 fts_consistent: true,
             })
         })
@@ -15704,7 +15704,7 @@ fn build_indexing_health_report(
 ) -> IndexingHealthReport {
     let total_segments: u64 = pane_stats.iter().map(|p| p.segment_count).sum();
     let total_bytes: u64 = pane_stats.iter().map(|p| p.total_bytes).sum();
-    let total_fts_rows: u64 = pane_stats.iter().map(|p| p.fts_indexed_count).sum();
+    let total_fts_rows: u64 = pane_stats.iter().map(|p| p.fts_row_count).sum();
     let inconsistent_panes = if fts_ok {
         0
     } else {
@@ -27503,7 +27503,7 @@ mod storage_handle_tests {
             total_bytes: 100,
             max_seq: Some(9),
             last_segment_at: Some(1000),
-            fts_indexed_count: 10,
+            fts_row_count: 10,
             fts_consistent: true,
         }];
         let report = build_indexing_health_report(stats, true);
@@ -27520,7 +27520,7 @@ mod storage_handle_tests {
                 total_bytes: 100,
                 max_seq: Some(9),
                 last_segment_at: Some(1000),
-                fts_indexed_count: 10,
+                fts_row_count: 10,
                 fts_consistent: true,
             },
             PaneIndexingStats {
@@ -27529,7 +27529,7 @@ mod storage_handle_tests {
                 total_bytes: 50,
                 max_seq: Some(4),
                 last_segment_at: Some(2000),
-                fts_indexed_count: 5,
+                fts_row_count: 5,
                 fts_consistent: true,
             },
         ];

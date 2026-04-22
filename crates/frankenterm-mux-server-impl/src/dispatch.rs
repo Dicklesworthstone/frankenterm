@@ -41,7 +41,7 @@ impl DispatchIoBackend {
     pub const fn readiness_default() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return Self::Epoll;
+            Self::Epoll
         }
         #[cfg(any(
             target_os = "macos",
@@ -52,9 +52,20 @@ impl DispatchIoBackend {
             target_os = "openbsd"
         ))]
         {
-            return Self::Kqueue;
+            Self::Kqueue
         }
-        Self::Poll
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        {
+            Self::Poll
+        }
     }
 
     pub const fn current_default() -> Self {
@@ -619,13 +630,13 @@ impl Future for DispatchIoUringWaitFuture<'_> {
 
 async fn wait_for_dispatch_readable<T>(
     stream: &T,
-    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+    _io_uring_runtime: Option<&DispatchIoUringRuntime>,
 ) -> std::io::Result<()>
 where
     T: DispatchStream,
 {
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
-    if let (Some(runtime), Some(raw_fd)) = (io_uring_runtime, stream.io_uring_fd()) {
+    if let (Some(runtime), Some(raw_fd)) = (_io_uring_runtime, stream.io_uring_fd()) {
         return runtime.wait_for_fd(raw_fd, Interest::READABLE).await;
     }
 
@@ -634,13 +645,13 @@ where
 
 async fn wait_for_dispatch_writable<T>(
     stream: &T,
-    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+    _io_uring_runtime: Option<&DispatchIoUringRuntime>,
 ) -> std::io::Result<()>
 where
     T: DispatchStream,
 {
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
-    if let (Some(runtime), Some(raw_fd)) = (io_uring_runtime, stream.io_uring_fd()) {
+    if let (Some(runtime), Some(raw_fd)) = (_io_uring_runtime, stream.io_uring_fd()) {
         return runtime.wait_for_fd(raw_fd, Interest::WRITABLE).await;
     }
 
@@ -700,7 +711,7 @@ where
     process_async_with_config(stream, config).await
 }
 
-pub async fn process_async<T>(mut stream: T) -> anyhow::Result<()>
+pub async fn process_async<T>(stream: T) -> anyhow::Result<()>
 where
     T: 'static,
     T: DispatchStream,
@@ -1067,7 +1078,9 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            panic!("poll_read should not run when readability wait fails first");
+            Poll::Ready(Err(io::Error::other(
+                "poll_read unexpectedly ran before the readiness error surfaced",
+            )))
         }
     }
 
@@ -1077,7 +1090,9 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            panic!("poll_write should not run in the readability failure test");
+            Poll::Ready(Err(io::Error::other(
+                "poll_write unexpectedly ran in the readability failure test",
+            )))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
