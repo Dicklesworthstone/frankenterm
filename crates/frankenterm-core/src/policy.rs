@@ -2098,6 +2098,45 @@ impl RateLimiter {
         self
     }
 
+    /// Drop all rate-limit state for the given pane.
+    ///
+    /// [ft-yjt9e] Called from the runtime's PaneDestroyed handler so a
+    /// closed pane's `(pane_id, ActionKind)` entries don't linger in
+    /// `pane_counts` forever. Without this, high-churn fleets accumulate
+    /// one stale entry per `(closed_pane, action)` pair and silently
+    /// leak ~48 MB after 10k destroyed panes × 5 action kinds × 60
+    /// peak timestamps. Global counts are not touched — they're already
+    /// bounded by the finite ActionKind enum.
+    pub fn remove_pane(&mut self, pane_id: u64) {
+        self.pane_counts.retain(|(pid, _), _| *pid != pane_id);
+    }
+    /// Garbage-collect entries whose timestamp windows are fully expired.
+    ///
+    /// [ft-yjt9e] Defense-in-depth for panes that left without a
+    /// PaneDestroyed signal (crashes, abrupt SSH detach, reaper race).
+    /// Iterates every `pane_counts` entry; prunes each Vec to the active
+    /// window, then drops the whole entry if the pruned Vec is empty.
+    /// Callers should invoke this periodically from the backpressure
+    /// tick or a lifecycle sweep — O(total timestamps across panes).
+    pub fn gc(&mut self) {
+        self.gc_at(Instant::now());
+    }
+    /// Time-injectable variant of [`gc`] for deterministic tests.
+    pub fn gc_at(&mut self, now: Instant) {
+        let window_start = now.checked_sub(self.window).unwrap_or(now);
+        self.pane_counts.retain(|_, timestamps| {
+            prune_old(timestamps, window_start);
+            !timestamps.is_empty()
+        });
+    }
+
+    /// Count of distinct (pane_id, action) entries currently held.
+    /// Surface for tests and operational telemetry.
+    #[must_use]
+    pub fn tracked_pane_entry_count(&self) -> usize {
+        self.pane_counts.len()
+    }
+
     /// Check if operation is allowed for pane/action
     #[must_use]
     pub fn check(&mut self, action: ActionKind, pane_id: Option<u64>) -> RateLimitOutcome {
@@ -2154,6 +2193,37 @@ impl RateLimiter {
         }
 
         RateLimitOutcome::Allowed
+    }
+
+    /// Remove every `(pane_id, _)` entry from `pane_counts`, returning
+    /// the number of entries actually removed.
+    ///
+    /// [ft-3l5bu] Must be called from `PaneDestroyed` teardown paths.
+    /// Every `check(_, Some(pane_id))` call inserts a `Vec<Instant>`
+    /// under `(pane_id, action)` via `entry().or_default()` — even
+    /// when the action is limited, even when the Vec immediately gets
+    /// pruned to empty. Without this hook the HashMap grows
+    /// monotonically for the life of the `PolicyEngine`, and reused
+    /// `pane_id`s can mis-attribute residual timestamps onto the
+    /// fresh pane. Same class as ft-l6v1r (pane_activity_tracker in
+    /// runtime.rs) and f2390da9 (BackpressureMetrics::dropped_by_pane).
+    ///
+    /// Wiring this into `PaneDestroyed` handlers is a separate
+    /// follow-up — `PolicyEngine` is not currently plumbed through
+    /// `ObservationRuntime`'s teardown paths.
+    pub fn cleanup_pane(&mut self, pane_id: u64) -> usize {
+        let before = self.pane_counts.len();
+        self.pane_counts.retain(|(p, _), _| *p != pane_id);
+        before - self.pane_counts.len()
+    }
+
+    /// Diagnostic: how many `(pane_id, action)` entries are currently
+    /// tracked in the per-pane map? Used by tests to assert the
+    /// cleanup hook works; exposed so operators can surface this in
+    /// telemetry if the leak ever shows up in production.
+    #[must_use]
+    pub fn pane_entry_count(&self) -> usize {
+        self.pane_counts.len()
     }
 }
 
@@ -7218,6 +7288,150 @@ mod tests {
         ));
         std::thread::sleep(Duration::from_millis(20));
         assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+    }
+
+    // ── [ft-yjt9e] pane_counts eviction + GC ───────────────────────────
+
+    #[test]
+    fn rate_limiter_remove_pane_drops_all_action_entries_for_that_pane() {
+        let mut limiter = RateLimiter::new(10, 10);
+        // Seed multiple action kinds for pane 1 and pane 2.
+        for _ in 0..3 {
+            limiter.check(ActionKind::SendText, Some(1));
+            limiter.check(ActionKind::ReadOutput, Some(1));
+            limiter.check(ActionKind::SendText, Some(2));
+        }
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            3,
+            "expected (1,SendText) + (1,ReadOutput) + (2,SendText) = 3 entries"
+        );
+
+        limiter.remove_pane(1);
+
+        // Only (2, SendText) remains.
+        assert_eq!(limiter.tracked_pane_entry_count(), 1);
+        assert!(limiter.check(ActionKind::SendText, Some(2)).is_allowed());
+    }
+
+    #[test]
+    fn rate_limiter_remove_pane_leaves_global_counts_intact() {
+        // Global side must NOT shrink when a pane is removed — the
+        // global bucket tracks action kinds across all panes and has
+        // no inherent pane ownership to evict.
+        let mut limiter = RateLimiter::new(10, 10);
+        limiter.check(ActionKind::SendText, Some(1));
+        limiter.check(ActionKind::SendText, Some(2));
+
+        let global_before = limiter
+            .global_counts
+            .get(&ActionKind::SendText)
+            .map_or(0, Vec::len);
+        assert_eq!(global_before, 2);
+
+        limiter.remove_pane(1);
+
+        let global_after = limiter
+            .global_counts
+            .get(&ActionKind::SendText)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            global_after, global_before,
+            "remove_pane must not touch global_counts"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_gc_drops_expired_empty_entries() {
+        // Use a tiny window + manual time advancement via gc_at so the
+        // test is deterministic and doesn't sleep.
+        let mut limiter =
+            RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(10));
+
+        // Populate pane 1 and pane 2 at t=0.
+        limiter.check(ActionKind::SendText, Some(1));
+        limiter.check(ActionKind::SendText, Some(2));
+        assert_eq!(limiter.tracked_pane_entry_count(), 2);
+
+        // Advance notional time 100ms past the 10ms window → all
+        // timestamps are expired → gc should drop both entries.
+        let way_later = Instant::now() + std::time::Duration::from_millis(100);
+        limiter.gc_at(way_later);
+
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            0,
+            "gc must drop entries whose entire window has expired"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_gc_preserves_still_active_entries() {
+        // Very long window + gc_at at time-of-record → every entry has
+        // at least one live timestamp → gc preserves them all.
+        let mut limiter =
+            RateLimiter::new(10, 10).with_window(std::time::Duration::from_secs(3600));
+
+        limiter.check(ActionKind::SendText, Some(1));
+        limiter.check(ActionKind::SendText, Some(2));
+        limiter.check(ActionKind::ReadOutput, Some(1));
+        assert_eq!(limiter.tracked_pane_entry_count(), 3);
+
+        limiter.gc_at(Instant::now());
+
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            3,
+            "gc must preserve entries with live timestamps"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_per_pane_rejection_does_not_consume_global_quota() {
+        let mut limiter = RateLimiter::new(1, 2);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+
+        let hit = match limiter.check(ActionKind::SendText, Some(1)) {
+            RateLimitOutcome::Limited(hit) => hit,
+            RateLimitOutcome::Allowed => panic!("Expected per-pane rate limit"),
+        };
+        assert!(matches!(hit.scope, RateLimitScope::PerPane { pane_id: 1 }));
+        assert_eq!(
+            limiter
+                .global_counts
+                .get(&ActionKind::SendText)
+                .map_or(0, Vec::len),
+            1
+        );
+
+        assert!(limiter.check(ActionKind::SendText, Some(2)).is_allowed());
+        assert_eq!(
+            limiter
+                .global_counts
+                .get(&ActionKind::SendText)
+                .map_or(0, Vec::len),
+            2
+        );
+    }
+
+    #[test]
+    fn rate_limiter_global_rejection_does_not_create_per_pane_bucket() {
+        let mut limiter = RateLimiter::new(2, 1);
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+
+        let hit = match limiter.check(ActionKind::SendText, Some(2)) {
+            RateLimitOutcome::Limited(hit) => hit,
+            RateLimitOutcome::Allowed => panic!("Expected global rate limit"),
+        };
+        assert!(matches!(hit.scope, RateLimitScope::Global));
+        assert!(!limiter.pane_counts.contains_key(&(2, ActionKind::SendText)));
+        assert_eq!(
+            limiter
+                .pane_counts
+                .get(&(1, ActionKind::SendText))
+                .map_or(0, Vec::len),
+            1
+        );
     }
 
     // ========================================================================
