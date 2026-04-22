@@ -224,11 +224,11 @@ impl SseRecvState {
         }
     }
 
-    /// Explicit quarantine for legacy non-asupersync builds.
-    ///
-    /// Owner: `ft-xbnl0.2.5`.
-    /// Removal path: drop this method once the workspace no longer supports
-    /// non-`asupersync-runtime` SSE builds.
+    // Explicit quarantine for legacy non-asupersync builds.
+    //
+    // Owner: `ft-xbnl0.2.5`.
+    // Removal path: drop this note once the workspace no longer supports
+    // non-`asupersync-runtime` SSE builds.
 }
 
 impl SseByteStream {
