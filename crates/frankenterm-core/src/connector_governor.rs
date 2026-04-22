@@ -384,11 +384,11 @@ impl QuotaTracker {
     /// Returns true if the action is within quota, false if quota exhausted.
     pub fn record(&mut self, now_ms: u64) -> bool {
         self.gc(now_ms);
-        self.total_actions += 1;
         if self.window_actions.len() as u64 >= self.config.max_actions {
             return false;
         }
         self.window_actions.push(now_ms);
+        self.total_actions += 1;
         true
     }
 
@@ -1519,6 +1519,33 @@ mod tests {
     }
 
     #[test]
+    fn quota_rejected_attempts_do_not_increment_total_lifetime() {
+        let config = QuotaConfig {
+            max_actions: 2,
+            window_ms: 10_000,
+            warning_threshold: 0.8,
+        };
+        let mut qt = QuotaTracker::new(config);
+
+        assert!(qt.record(1000));
+        assert!(qt.record(2000));
+        assert!(!qt.record(3000));
+
+        assert_eq!(qt.total_actions(), 2);
+        assert_eq!(
+            qt.snapshot(3000),
+            QuotaSnapshot {
+                used: 2,
+                max: 2,
+                remaining: 0,
+                usage_fraction: 1.0,
+                total_lifetime: 2,
+                window_ms: 10_000,
+            }
+        );
+    }
+
+    #[test]
     fn quota_warning_threshold() {
         let config = QuotaConfig {
             max_actions: 10,
@@ -2039,6 +2066,33 @@ mod tests {
 
         // Should still be allowed because only one global quota slot was actually used.
         assert_eq!(gov.evaluate(&github, 3000).verdict, GovernorVerdict::Allow);
+    }
+
+    #[test]
+    fn governor_snapshot_connector_quota_lifetime_excludes_rejected_attempts() {
+        let mut config = ConnectorGovernorConfig::default();
+        config.default_quota = QuotaConfig {
+            max_actions: 1,
+            window_ms: 60_000,
+            warning_threshold: 0.5,
+        };
+        let mut gov = ConnectorGovernor::new(config);
+        let slack = sample_action("slack", ConnectorActionKind::Notify);
+
+        assert_eq!(gov.evaluate(&slack, 1000).verdict, GovernorVerdict::Allow);
+        let rejected = gov.evaluate(&slack, 2000);
+        assert_eq!(rejected.verdict, GovernorVerdict::Reject);
+        assert_eq!(rejected.reason, GovernorReason::ConnectorQuotaExhausted);
+
+        let snap = gov.snapshot(2000);
+        let connector = snap
+            .connectors
+            .iter()
+            .find(|connector| connector.connector_id == "slack")
+            .expect("slack connector snapshot");
+        assert_eq!(connector.quota.total_lifetime, 1);
+        assert_eq!(connector.quota.used, 1);
+        assert_eq!(connector.quota.remaining, 0);
     }
 
     // ---- Stress test ----
