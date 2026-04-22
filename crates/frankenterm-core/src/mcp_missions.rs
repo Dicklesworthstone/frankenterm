@@ -14,6 +14,91 @@ use super::{
     McpMissionTransitionInfo, McpTxTransitionInfo, MissionStateParams,
 };
 
+// ── Size caps for mission + tx contract file reads ──────────────────────
+//
+// [ft-up6u2] Mission files under `.ft/mission/*.json` have the same
+// trust property as pattern packs under `.ft/patterns/*.{yaml,json,toml}`:
+// a hostile cloned repo can ship them, and they're loaded at MCP tool
+// invocation time. `resolve_workspace_scoped_path` (below) blocks
+// path-traversal OUT of the workspace; these caps block OOM from a
+// malicious IN-workspace file.
+//
+// Mirrors `patterns::MAX_PACK_BYTES = 16 MiB` (ft-05hfm). Real-world
+// missions + tx contracts at the ~100-candidate scale serialize to
+// ~50-100 KiB, so 16 MiB leaves ~200x headroom for legitimate
+// oversize cases (giant assignment fan-out, embedded evidence, etc.)
+// while still rejecting obvious DoS payloads before the allocator or
+// serde_json::from_str sees them.
+const MAX_MISSION_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TX_CONTRACT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a mission-adjacent JSON file with a hard size cap. Stat-checks
+/// before `read_to_string` to reject oversize files without allocating
+/// the full content; re-checks bytes-read after to catch filesystems
+/// that misreport size (procfs-like pseudo files) or TOCTOU swap.
+///
+/// `error_code` and `hint` are threaded through so callers keep their
+/// existing error envelope shape on cap rejection.
+fn read_capped_file(
+    path: &Path,
+    max_bytes: u64,
+    read_error_code: &'static str,
+    oversize_error_code: &'static str,
+) -> std::result::Result<String, McpToolError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            return Err(McpToolError::new(
+                oversize_error_code,
+                format!(
+                    "File {} is {} bytes; max allowed is {} bytes",
+                    path.display(),
+                    meta.len(),
+                    max_bytes
+                ),
+                Some(
+                    "Shrink the file or split its payload — 16 MiB is the ft-up6u2 hostile-repo \
+                     DoS cap."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            McpToolError::new(
+                read_error_code,
+                format!("File not found: {}", path.display()),
+                None,
+            )
+        } else {
+            McpToolError::new(
+                read_error_code,
+                format!("Failed to read {}: {err}", path.display()),
+                None,
+            )
+        }
+    })?;
+
+    // Second-line defense: the metadata check can be dodged on
+    // filesystems that misreport size (procfs-like pseudo files) or
+    // via TOCTOU swap. Verify the actual bytes read fit the cap too.
+    if raw.len() as u64 > max_bytes {
+        return Err(McpToolError::new(
+            oversize_error_code,
+            format!(
+                "File {} read {} bytes; max allowed is {} bytes",
+                path.display(),
+                raw.len(),
+                max_bytes
+            ),
+            None,
+        ));
+    }
+
+    Ok(raw)
+}
+
 // ── Tx contract file resolution and loading ─────────────────────────────
 
 pub(super) fn mcp_default_mission_tx_file_path(
@@ -141,21 +226,32 @@ pub(super) fn resolve_workspace_scoped_path(
 pub(super) fn mcp_load_mission_tx_contract_from_path(
     path: &Path,
 ) -> std::result::Result<crate::plan::MissionTxContract, McpToolError> {
-    let raw = std::fs::read_to_string(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            McpToolError::new(
+    // [ft-up6u2] Cap bytes read from a tx contract file to block an
+    // OOM DoS from a hostile `.ft/mission/tx-active.json` shipped in a
+    // cloned repo. See `read_capped_file` docstring.
+    //
+    // Preserve the historical `robot.tx_not_found` error code + hint on
+    // the NotFound path so callers that pattern-match on it continue
+    // to work; for all other I/O errors we surface `robot.tx_read_failed`
+    // and oversize rejections use `robot.tx_oversize`.
+    let raw = match read_capped_file(
+        path,
+        MAX_TX_CONTRACT_BYTES,
+        "robot.tx_read_failed",
+        "robot.tx_oversize",
+    ) {
+        Ok(raw) => raw,
+        Err(err) if err.code == "robot.tx_read_failed"
+            && err.message.starts_with("File not found: ") =>
+        {
+            return Err(McpToolError::new(
                 "robot.tx_not_found",
                 format!("Tx contract file not found: {}", path.display()),
                 Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
-            )
-        } else {
-            McpToolError::new(
-                "robot.tx_read_failed",
-                format!("Failed to read tx contract file {}: {err}", path.display()),
-                None,
-            )
+            ));
         }
-    })?;
+        Err(err) => return Err(err),
+    };
 
     let contract: crate::plan::MissionTxContract = serde_json::from_str(&raw).map_err(|err| {
         McpToolError::new(
@@ -257,21 +353,26 @@ pub(super) fn mcp_resolve_mission_file_path(
 pub(super) fn mcp_load_mission_from_path(
     path: &Path,
 ) -> std::result::Result<crate::plan::Mission, McpToolError> {
-    let raw = std::fs::read_to_string(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            McpToolError::new(
+    // [ft-up6u2] Same 16 MiB cap as the tx contract loader. See
+    // `read_capped_file` docstring for the threat model.
+    let raw = match read_capped_file(
+        path,
+        MAX_MISSION_BYTES,
+        "robot.mission_read_failed",
+        "robot.mission_oversize",
+    ) {
+        Ok(raw) => raw,
+        Err(err) if err.code == "robot.mission_read_failed"
+            && err.message.starts_with("File not found: ") =>
+        {
+            return Err(McpToolError::new(
                 "robot.mission_not_found",
                 format!("Mission file not found: {}", path.display()),
                 Some("Pass mission_file or create .ft/mission/active.json.".to_string()),
-            )
-        } else {
-            McpToolError::new(
-                "robot.mission_read_failed",
-                format!("Failed to read mission file {}: {err}", path.display()),
-                None,
-            )
+            ));
         }
-    })?;
+        Err(err) => return Err(err),
+    };
 
     let mission: crate::plan::Mission = serde_json::from_str(&raw).map_err(|err| {
         McpToolError::new(
@@ -1085,6 +1186,58 @@ mod tests {
         let err = mcp_load_mission_tx_contract_from_path(path).unwrap_err();
         assert_eq!(err.code, "robot.tx_not_found");
         assert!(err.hint.is_some());
+    }
+
+    /// [ft-up6u2] Oversize tx contract file must be rejected before
+    /// `read_to_string` buffers the full content. Mirrors the
+    /// pattern-pack `load_pack_from_file_rejects_oversize_yaml`
+    /// regression in patterns.rs.
+    #[test]
+    fn load_tx_contract_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-tx.json");
+        // Fabricate a file that's larger than the 16 MiB cap by
+        // padding JSON with spaces. Shape doesn't matter — parser
+        // never sees the bytes.
+        let target_bytes = (super::MAX_TX_CONTRACT_BYTES as usize) + 64;
+        let mut body = String::with_capacity(target_bytes);
+        body.push_str("{\"comment\":\"");
+        while body.len() < target_bytes - 2 {
+            body.push(' ');
+        }
+        body.push_str("\"}");
+        std::fs::write(&path, &body).unwrap();
+
+        let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
+        assert_eq!(err.code, "robot.tx_oversize");
+        assert!(
+            err.message.contains(&format!("{}", super::MAX_TX_CONTRACT_BYTES)),
+            "rejection must cite the cap value, got: {}",
+            err.message
+        );
+    }
+
+    /// [ft-up6u2] Same oversize guard for mission files.
+    #[test]
+    fn load_mission_rejects_oversize_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-mission.json");
+        let target_bytes = (super::MAX_MISSION_BYTES as usize) + 64;
+        let mut body = String::with_capacity(target_bytes);
+        body.push_str("{\"pad\":\"");
+        while body.len() < target_bytes - 2 {
+            body.push(' ');
+        }
+        body.push_str("\"}");
+        std::fs::write(&path, &body).unwrap();
+
+        let err = mcp_load_mission_from_path(&path).unwrap_err();
+        assert_eq!(err.code, "robot.mission_oversize");
+        assert!(
+            err.message.contains(&format!("{}", super::MAX_MISSION_BYTES)),
+            "rejection must cite the cap value, got: {}",
+            err.message
+        );
     }
 
     #[test]
