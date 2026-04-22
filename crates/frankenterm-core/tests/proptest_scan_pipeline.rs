@@ -249,6 +249,74 @@ proptest! {
         prop_assert_eq!(batch_total, chunked_total);
     }
 
+    /// [ft-v5do5] Arbitrary chunk boundaries preserve the per-category
+    /// trigger distribution, not just the aggregate total. A future
+    /// refactor that miscounts one category and compensates in another
+    /// (e.g. off-by-one in overlap skip that drops an Error match while
+    /// spuriously counting a Warning) would pass the total-only assertion
+    /// while quietly corrupting per-category analytics (rate-limit
+    /// detection, error clustering, workflow routing). Compare the
+    /// entire HashMap to close that gap.
+    #[test]
+    fn chunked_batch_per_category_trigger_parity(
+        data in terminal_text(),
+        chunk_sizes in prop::collection::vec(0usize..128, 0..16),
+    ) {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+
+        let batch_output = pipeline.process(&data);
+
+        let chunks = arbitrary_chunks(&data, &chunk_sizes);
+        let mut state = ChunkedPipelineState::new(16_777_216);
+        for chunk in &chunks {
+            pipeline.process_chunk(chunk, &mut state);
+        }
+        let chunked_output = pipeline.flush(&mut state);
+
+        let batch_counts = &batch_output.triggers.as_ref().unwrap().counts;
+        let chunked_counts = &chunked_output.triggers.as_ref().unwrap().counts;
+        prop_assert_eq!(
+            batch_counts,
+            chunked_counts,
+            "per-category trigger counts must match batch vs chunked"
+        );
+    }
+
+    /// [ft-v5do5] Per-category parity under compression: the chunked path
+    /// reuses `uncompressed_buffer` for the definitive flush scan, which
+    /// is a different code path than the non-compression one. Pin the
+    /// same per-category invariant there.
+    #[test]
+    fn chunked_batch_per_category_trigger_parity_with_compression(
+        data in terminal_text(),
+        chunk_sizes in prop::collection::vec(0usize..128, 0..16),
+    ) {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            compression_threshold: 1,
+            ..Default::default()
+        });
+
+        let batch_output = pipeline.process(&data);
+
+        let chunks = arbitrary_chunks(&data, &chunk_sizes);
+        let mut state = ChunkedPipelineState::new(16_777_216);
+        for chunk in &chunks {
+            pipeline.process_chunk(chunk, &mut state);
+        }
+        let chunked_output = pipeline.flush(&mut state);
+
+        let batch_counts = &batch_output.triggers.as_ref().unwrap().counts;
+        let chunked_counts = &chunked_output.triggers.as_ref().unwrap().counts;
+        prop_assert_eq!(
+            batch_counts,
+            chunked_counts,
+            "per-category trigger counts must match batch vs chunked (compressed)"
+        );
+    }
+
     /// Arbitrary chunk boundaries preserve trigger totals even when
     /// compression is enabled and the chunked path reuses the compression
     /// buffer for definitive trigger scanning at flush time.
