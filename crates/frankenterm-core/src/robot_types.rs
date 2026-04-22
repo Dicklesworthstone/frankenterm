@@ -224,6 +224,11 @@ impl ErrorCode {
                 | "robot.caut_error"
                 | "robot.agent_detection_error"
                 | "robot.rate_limited"
+                | "robot.mission_reservation_conflict"
+                | "robot.mission_rate_limited"
+                | "robot.mission_stale_state"
+                | "robot.mission_dispatch_error"
+                | "robot.mission_approval_expired"
                 | "robot.circuit_open"
         )
     }
@@ -2423,118 +2428,182 @@ mod tests {
 
     #[test]
     fn error_code_retryable() {
-        assert!(
-            ErrorCode::parse("robot.wezterm_not_running")
-                .unwrap()
-                .is_retryable()
-        );
-        assert!(
-            ErrorCode::parse("robot.rate_limited")
-                .unwrap()
-                .is_retryable()
-        );
+        assert!(ErrorCode::parse("robot.wezterm_not_running")
+            .unwrap()
+            .is_retryable());
+        assert!(ErrorCode::parse("robot.rate_limited")
+            .unwrap()
+            .is_retryable());
         assert!(ErrorCode::parse("robot.timeout").unwrap().is_retryable());
-        assert!(
-            !ErrorCode::parse("robot.policy_denied")
-                .unwrap()
-                .is_retryable()
-        );
-        assert!(
-            !ErrorCode::parse("robot.config_error")
-                .unwrap()
-                .is_retryable()
-        );
-        assert!(
-            !ErrorCode::parse("robot.internal_error")
-                .unwrap()
-                .is_retryable()
-        );
+        assert!(!ErrorCode::parse("robot.policy_denied")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.config_error")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.internal_error")
+            .unwrap()
+            .is_retryable());
         // Transient external-tool errors are retryable
         assert!(ErrorCode::parse("robot.cass_error").unwrap().is_retryable());
         assert!(ErrorCode::parse("robot.caut_error").unwrap().is_retryable());
         // Transient local-subsystem errors are retryable
-        assert!(
-            ErrorCode::parse("robot.agent_detection_error")
-                .unwrap()
-                .is_retryable()
-        );
+        assert!(ErrorCode::parse("robot.agent_detection_error")
+            .unwrap()
+            .is_retryable());
+        // Mission failure retryability should stay aligned with plan::MissionFailureCode.
+        assert!(ErrorCode::parse("robot.mission_reservation_conflict")
+            .unwrap()
+            .is_retryable());
+        assert!(ErrorCode::parse("robot.mission_rate_limited")
+            .unwrap()
+            .is_retryable());
+        assert!(ErrorCode::parse("robot.mission_stale_state")
+            .unwrap()
+            .is_retryable());
+        assert!(ErrorCode::parse("robot.mission_dispatch_error")
+            .unwrap()
+            .is_retryable());
+        assert!(ErrorCode::parse("robot.mission_approval_expired")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.mission_policy_denied")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.mission_approval_required")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.mission_approval_denied")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.mission_kill_switch_activated")
+            .unwrap()
+            .is_retryable());
         // Data-format errors are NOT retryable (same bad data on retry)
-        assert!(
-            !ErrorCode::parse("robot.cass_invalid_json")
-                .unwrap()
-                .is_retryable()
-        );
-        assert!(
-            !ErrorCode::parse("robot.cass_output_too_large")
-                .unwrap()
-                .is_retryable()
-        );
+        assert!(!ErrorCode::parse("robot.cass_invalid_json")
+            .unwrap()
+            .is_retryable());
+        assert!(!ErrorCode::parse("robot.cass_output_too_large")
+            .unwrap()
+            .is_retryable());
     }
 
-    /// Verify every known emitted robot error code has explicit categorization
-    /// and does NOT fall through to the catch-all `_ => Internal` arm.
+    /// Verify the current emitted robot error-code surface still maps to the
+    /// expected public categories.
     #[test]
-    fn all_emitted_codes_have_explicit_category() {
+    fn all_emitted_codes_have_expected_category() {
         let emitted_codes = [
-            "robot.agent_detection_error",
-            "robot.approval_error",
-            "robot.assignment_not_found",
-            "robot.cass_error",
-            "robot.cass_invalid_json",
-            "robot.cass_not_installed",
-            "robot.cass_output_too_large",
-            "robot.cass_timeout",
-            "robot.caut_error",
-            "robot.circuit_open",
-            "robot.code_not_found",
-            "robot.config_error",
-            "robot.event_not_found",
-            "robot.feature_not_available",
-            "robot.fts_query_error",
-            "robot.internal_error",
-            "robot.invalid_args",
-            "robot.invalid_service",
-            "robot.mission_error",
-            "robot.mission_invalid_json",
-            "robot.mission_not_found",
-            "robot.mission_read_failed",
-            "robot.mission_validation_failed",
-            "robot.not_implemented",
-            "robot.pane_not_found",
-            "robot.policy_denied",
-            "robot.rate_limited",
-            "robot.require_approval",
-            "robot.reservation_conflict",
-            "robot.rule_not_found",
-            "robot.storage_error",
-            "robot.timeout",
-            "robot.tx_error",
-            "robot.tx_execution_failed",
-            "robot.tx_invalid_json",
-            "robot.tx_not_found",
-            "robot.tx_read_failed",
-            "robot.tx_validation_failed",
-            "robot.unknown_subcommand",
-            "robot.unsupported",
-            "robot.wezterm_command_failed",
-            "robot.wezterm_error",
-            "robot.wezterm_not_found",
-            "robot.wezterm_not_running",
-            "robot.wezterm_parse_error",
-            "robot.wezterm_socket_not_found",
-            "robot.workflow_aborted",
-            "robot.workflow_error",
-            "robot.workflow_not_found",
+            ("robot.agent_detection_error", ErrorCategory::Internal),
+            ("robot.approval_error", ErrorCategory::Policy),
+            ("robot.assignment_not_found", ErrorCategory::Workflow),
+            ("robot.cass_error", ErrorCategory::Network),
+            ("robot.cass_invalid_json", ErrorCategory::Internal),
+            ("robot.cass_not_installed", ErrorCategory::Config),
+            ("robot.cass_output_too_large", ErrorCategory::Internal),
+            ("robot.cass_timeout", ErrorCategory::Network),
+            ("robot.caut_error", ErrorCategory::Network),
+            ("robot.circuit_open", ErrorCategory::Wezterm),
+            ("robot.code_not_found", ErrorCategory::Config),
+            ("robot.config_error", ErrorCategory::Config),
+            ("robot.event_not_found", ErrorCategory::Storage),
+            ("robot.feature_not_available", ErrorCategory::Config),
+            ("robot.fts_query_error", ErrorCategory::Storage),
+            ("robot.internal_error", ErrorCategory::Internal),
+            ("robot.invalid_args", ErrorCategory::Config),
+            ("robot.invalid_service", ErrorCategory::Config),
+            ("robot.mission_approval_denied", ErrorCategory::Workflow),
+            ("robot.mission_approval_expired", ErrorCategory::Workflow),
+            ("robot.mission_approval_required", ErrorCategory::Workflow),
+            ("robot.mission_contention", ErrorCategory::Workflow),
+            ("robot.mission_dispatch_error", ErrorCategory::Workflow),
+            ("robot.mission_error", ErrorCategory::Workflow),
+            ("robot.mission_invalid_json", ErrorCategory::Workflow),
+            (
+                "robot.mission_kill_switch_activated",
+                ErrorCategory::Workflow,
+            ),
+            ("robot.mission_not_found", ErrorCategory::Workflow),
+            ("robot.mission_oversize", ErrorCategory::Workflow),
+            ("robot.mission_policy_denied", ErrorCategory::Workflow),
+            ("robot.mission_rate_limited", ErrorCategory::Workflow),
+            ("robot.mission_read_failed", ErrorCategory::Workflow),
+            (
+                "robot.mission_reservation_conflict",
+                ErrorCategory::Workflow,
+            ),
+            ("robot.mission_serialize_failed", ErrorCategory::Workflow),
+            ("robot.mission_stale_state", ErrorCategory::Workflow),
+            ("robot.mission_validation_failed", ErrorCategory::Workflow),
+            ("robot.mission_write_failed", ErrorCategory::Workflow),
+            ("robot.not_implemented", ErrorCategory::Config),
+            ("robot.pane_not_found", ErrorCategory::Wezterm),
+            ("robot.policy_denied", ErrorCategory::Policy),
+            ("robot.rate_limited", ErrorCategory::Policy),
+            ("robot.require_approval", ErrorCategory::Policy),
+            ("robot.reservation_conflict", ErrorCategory::Storage),
+            ("robot.rule_not_found", ErrorCategory::Pattern),
+            ("robot.storage_error", ErrorCategory::Storage),
+            ("robot.timeout", ErrorCategory::Network),
+            ("robot.tx_error", ErrorCategory::Workflow),
+            ("robot.tx_execution_failed", ErrorCategory::Workflow),
+            ("robot.tx_invalid_json", ErrorCategory::Workflow),
+            ("robot.tx_not_found", ErrorCategory::Workflow),
+            ("robot.tx_oversize", ErrorCategory::Workflow),
+            ("robot.tx_read_failed", ErrorCategory::Workflow),
+            ("robot.tx_serialize_failed", ErrorCategory::Workflow),
+            ("robot.tx_validation_failed", ErrorCategory::Workflow),
+            ("robot.tx_write_failed", ErrorCategory::Workflow),
+            ("robot.unknown_subcommand", ErrorCategory::Config),
+            ("robot.unsupported", ErrorCategory::Config),
+            ("robot.wezterm_command_failed", ErrorCategory::Wezterm),
+            ("robot.wezterm_error", ErrorCategory::Wezterm),
+            ("robot.wezterm_not_found", ErrorCategory::Wezterm),
+            ("robot.wezterm_not_running", ErrorCategory::Wezterm),
+            ("robot.wezterm_parse_error", ErrorCategory::Wezterm),
+            ("robot.wezterm_socket_not_found", ErrorCategory::Wezterm),
+            ("robot.workflow_aborted", ErrorCategory::Workflow),
+            ("robot.workflow_error", ErrorCategory::Workflow),
+            ("robot.workflow_not_found", ErrorCategory::Workflow),
         ];
 
-        for code in emitted_codes {
-            let parsed = ErrorCode::parse(code)
-                .unwrap_or_else(|| panic!("{code} should parse as valid robot error code"));
-            // Verify the code routes to an explicit match arm, not the catch-all.
-            // The catch-all returns Internal; codes explicitly mapped to Internal
-            // (like robot.internal_error) are fine — we just want to ensure every
-            // known code is accounted for in the match.
-            let _category = parsed.category();
+        for (code, expected_category) in emitted_codes {
+            let parsed = ErrorCode::parse(code).expect("emitted robot error code should parse");
+            assert_eq!(
+                parsed.category(),
+                expected_category,
+                "unexpected category for emitted robot code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn mission_failure_retryability_matches_plan_contract() {
+        use crate::plan::{MissionFailureCode, MissionFailureRetryability};
+
+        let cases = [
+            MissionFailureCode::PolicyDenied,
+            MissionFailureCode::ReservationConflict,
+            MissionFailureCode::RateLimited,
+            MissionFailureCode::StaleState,
+            MissionFailureCode::DispatchError,
+            MissionFailureCode::ApprovalRequired,
+            MissionFailureCode::ApprovalDenied,
+            MissionFailureCode::ApprovalExpired,
+            MissionFailureCode::KillSwitchActivated,
+        ];
+
+        for failure in cases {
+            let code = ErrorCode::parse(failure.error_code())
+                .expect("mission failure error code should parse");
+            assert_eq!(
+                code.is_retryable(),
+                matches!(
+                    failure.retryability(),
+                    MissionFailureRetryability::Retryable
+                ),
+                "robot_types retryability drifted from MissionFailureCode for {}",
+                failure.error_code()
+            );
         }
     }
 
@@ -5596,11 +5665,10 @@ mod tests {
         assert!(data.summary.contains("4 consecutive crashes"));
         // Should have guidance for both backpressure and fleet pressure
         assert!(data.guidance.iter().any(|g| g.code == "backpressure_high"));
-        assert!(
-            data.guidance
-                .iter()
-                .any(|g| g.code == "fleet_pressure_high")
-        );
+        assert!(data
+            .guidance
+            .iter()
+            .any(|g| g.code == "fleet_pressure_high"));
     }
 
     #[test]
