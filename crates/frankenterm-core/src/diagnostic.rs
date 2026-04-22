@@ -1819,6 +1819,7 @@ mod tests {
             audit_limit: 5,
             workflow_limit: 3,
             output: Some(PathBuf::from("/tmp/custom")),
+            include_full_cwd: false,
         };
         assert_eq!(opts.event_limit, 10);
         assert_eq!(
@@ -2713,6 +2714,7 @@ mod tests {
             audit_limit: 5,
             workflow_limit: 3,
             output: Some(PathBuf::from("/tmp/a")),
+            include_full_cwd: false,
         };
         let mut clone = opts.clone();
         clone.event_limit = 999;

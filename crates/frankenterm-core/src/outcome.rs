@@ -593,7 +593,7 @@ mod tests {
     fn cancel_user_helper() {
         let r = cancel_user("user stopped");
         assert_eq!(r.kind, CancelKind::User);
-        assert_eq!(r.message, Some("user stopped"));
+        assert_eq!(r.message.as_deref(), Some("user stopped"));
     }
 
     #[test]
