@@ -997,6 +997,134 @@ impl Parser {
 mod tests {
     use super::*;
     use k9::assert_equal as assert_eq;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum ScriptBlock {
+        Line(String),
+        Guarded {
+            timestamp: i64,
+            number: u64,
+            flags: i64,
+            error: bool,
+            output_lines: Vec<String>,
+        },
+    }
+
+    fn arb_simple_line() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("%sessions-changed".to_string()),
+            (1u64..5).prop_map(|pane| format!("%pane-mode-changed %{pane}")),
+            (1u64..5).prop_map(|pane| format!("%continue %{pane}")),
+            (1u64..5).prop_map(|pane| format!("%pause %{pane}")),
+            (1u64..5).prop_map(|window| format!("%window-add @{window}")),
+            (1u64..5).prop_map(|window| format!("%window-close @{window}")),
+            (1u64..5).prop_map(|window| format!("%unlinked-window-close @{window}")),
+            (1u64..5).prop_map(|window| format!("%unlinked-window-add @{window}")),
+            (1u64..5).prop_map(|window| format!("%unlinked-window-renamed @{window}")),
+            prop::sample::select(vec!["message text", "status ok", "compact done"])
+                .prop_map(|message| format!("%message {message}")),
+            prop::sample::select(vec!["buf-a", "buf-b", "buf-c"])
+                .prop_map(|buffer| format!("%paste-buffer-changed {buffer}")),
+            prop::sample::select(vec!["buf-a", "buf-b", "buf-c"])
+                .prop_map(|buffer| format!("%paste-buffer-deleted {buffer}")),
+            prop::sample::select(vec!["config broke", "unknown flag", "bad path"])
+                .prop_map(|error| format!("%config-error {error}")),
+            (1u64..5).prop_map(|pane| format!("%output %{pane} hello")),
+            (1u64..5).prop_map(|pane| format!("%extended-output %{pane} hello")),
+            (1u64..5).prop_map(|window| {
+                format!("%layout-change @{window} b25d,80x24,0,0,{}", window + 10)
+            }),
+            (1u64..5, prop::sample::select(vec!["main", "home", "dev"]))
+                .prop_map(|(session, name)| format!("%session-changed ${session} {name}")),
+            prop::sample::select(vec![
+                "%exit",
+                "%exit I said so",
+                "%subscription-changed something ignored",
+            ])
+            .prop_map(str::to_string),
+        ]
+    }
+
+    fn arb_guarded_output_line() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["stuff", "line", "result", "ok", "42"]).prop_map(str::to_string)
+    }
+
+    fn arb_script_block() -> impl Strategy<Value = ScriptBlock> {
+        prop_oneof![
+            arb_simple_line().prop_map(ScriptBlock::Line),
+            (
+                1i64..1000,
+                1u64..1000,
+                0i64..4,
+                any::<bool>(),
+                prop::collection::vec(arb_guarded_output_line(), 1..4),
+            )
+                .prop_map(|(timestamp, number, flags, error, output_lines)| ScriptBlock::Guarded {
+                    timestamp,
+                    number,
+                    flags,
+                    error,
+                    output_lines,
+                }),
+        ]
+    }
+
+    fn push_script_block(script: &mut String, block: ScriptBlock) {
+        match block {
+            ScriptBlock::Line(line) => {
+                script.push_str(&line);
+                script.push('\n');
+            }
+            ScriptBlock::Guarded {
+                timestamp,
+                number,
+                flags,
+                error,
+                output_lines,
+            } => {
+                script.push_str(&format!("%begin {timestamp} {number} {flags}\n"));
+                for line in output_lines {
+                    script.push_str(&line);
+                    script.push('\n');
+                }
+                let terminator = if error { "%error" } else { "%end" };
+                script.push_str(&format!("{terminator} {timestamp} {number} {flags}\n"));
+            }
+        }
+    }
+
+    fn arb_script() -> impl Strategy<Value = String> {
+        prop::collection::vec(arb_script_block(), 1..16).prop_map(|blocks| {
+            let mut script = String::new();
+            for block in blocks {
+                push_script_block(&mut script, block);
+            }
+            script
+        })
+    }
+
+    fn parse_in_chunks(script: &str, chunk_sizes: &[usize]) -> Result<Vec<Event>> {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        let bytes = script.as_bytes();
+        let mut offset = 0;
+
+        for chunk_size in chunk_sizes {
+            if offset >= bytes.len() {
+                break;
+            }
+            let end = (offset + (*chunk_size).max(1)).min(bytes.len());
+            events.extend(parser.advance_bytes(&bytes[offset..end])?);
+            offset = end;
+        }
+
+        if offset < bytes.len() {
+            events.extend(parser.advance_bytes(&bytes[offset..])?);
+        }
+
+        Ok(events)
+    }
 
     #[test]
     fn test_parse_line() {
@@ -1186,5 +1314,29 @@ here
         assert!(matches!(&layout[0], WindowLayout::SplitHorizontal(_x)));
         assert!(matches!(&layout[1], WindowLayout::SplitVertical(_x)));
         assert!(matches!(&layout[2], WindowLayout::SplitHorizontal(_x)));
+    }
+
+    #[test]
+    fn parser_waits_for_newline_before_emitting_line_event() {
+        let mut parser = Parser::new();
+        assert_eq!(Vec::<Event>::new(), parser.advance_string("%sessions-changed").unwrap());
+        assert_eq!(
+            vec![Event::SessionsChanged],
+            parser.advance_string("\n").unwrap()
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn parser_events_are_chunk_boundary_invariant(
+            script in arb_script(),
+            chunk_sizes in prop::collection::vec(0usize..16, 0..64),
+        ) {
+            let expected = Parser::new().advance_string(&script).unwrap();
+            let actual = parse_in_chunks(&script, &chunk_sizes).unwrap();
+            prop_assert_eq!(actual, expected);
+        }
     }
 }
