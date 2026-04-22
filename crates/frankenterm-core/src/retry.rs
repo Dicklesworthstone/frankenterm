@@ -33,6 +33,17 @@ use tracing::{debug, warn};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::error::{Error, Result};
 
+fn is_cancellation_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Cancelled(_)
+            | Error::RuntimeOperation {
+                source: crate::error::RuntimeOperationSource::Cancelled(_),
+                ..
+            }
+    )
+}
+
 /// Configuration for retry behavior with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -405,7 +416,7 @@ where
         // the breaker past `failure_threshold` and reject unrelated callers
         // with CircuitOpen. Skip both record_success and record_failure so
         // the circuit's consecutive_failures counter stays truthful.
-        Err(Error::Cancelled(_)) => {}
+        Err(err) if is_cancellation_error(err) => {}
         Err(_) => circuit.record_failure(),
     }
     outcome.result
@@ -457,6 +468,12 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Json(_) => false,
         // Runtime errors might be transient
         Error::Runtime(_) => true,
+        // Typed runtime cancellation should behave the same as the top-level
+        // Cancelled variant: caller intent, not something to retry.
+        Error::RuntimeOperation {
+            source: crate::error::RuntimeOperationSource::Cancelled(_),
+            ..
+        } => false,
         // [ft-h9g0q] Typed runtime/pane/watchdog variants added in
         // 79702a50. Retry decisions now key off the inner `source`
         // so they stay consistent with `error_kind()`'s
@@ -945,6 +962,42 @@ mod tests {
             let ok: Result<i32> =
                 with_retry_and_circuit(&policy, &mut circuit, || async { Ok(7) }).await;
             assert_eq!(ok.unwrap(), 7);
+        });
+    }
+
+    #[test]
+    fn runtime_operation_cancelled_does_not_trip_circuit_breaker_ft_t0gd0() {
+        run_async_test(async {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
+            use crate::error::RuntimeOperationSource;
+
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(1),
+            };
+
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
+
+            let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || async {
+                Err(Error::RuntimeOperation {
+                    operation: "build_explain_context",
+                    source: RuntimeOperationSource::Cancelled("caller cancelled".into()),
+                })
+            })
+            .await;
+
+            assert!(matches!(result, Err(Error::RuntimeOperation { .. })));
+            let status = circuit.status();
+            assert_eq!(status.state, CircuitStateKind::Closed);
+            assert_eq!(status.consecutive_failures, 0);
+            let tel = circuit.telemetry().snapshot();
+            assert_eq!(tel.failures_recorded, 0);
+            assert_eq!(tel.successes_recorded, 0);
+            assert_eq!(tel.trips_total, 0);
         });
     }
 
@@ -1555,6 +1608,16 @@ mod tests {
     }
 
     #[test]
+    fn not_retryable_runtime_operation_cancelled() {
+        use crate::error::RuntimeOperationSource;
+        let err = Error::RuntimeOperation {
+            operation: "build_explain_context",
+            source: RuntimeOperationSource::Cancelled("budget exhausted".into()),
+        };
+        assert!(!is_retryable(&err));
+    }
+
+    #[test]
     fn not_retryable_panicked_error() {
         assert!(!is_retryable(&Error::Panicked("thread panic".into())));
     }
@@ -1579,6 +1642,38 @@ mod tests {
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
                     Err(Error::Policy("forbidden".into()))
+                }
+            })
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn smart_retry_stops_on_runtime_operation_cancelled() {
+        run_async_test(async {
+            use crate::error::RuntimeOperationSource;
+
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
+
+            let result: Result<i32> = with_smart_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::RuntimeOperation {
+                        operation: "export_jsonl",
+                        source: RuntimeOperationSource::Cancelled("caller cancelled".into()),
+                    })
                 }
             })
             .await;
