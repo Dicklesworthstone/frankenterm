@@ -177,6 +177,55 @@ proptest! {
         }
     }
 
+    // ── MR3b: overlap-existence invariant ──────────────────────────
+    //
+    // The stronger semantic contract the algorithm actually proves
+    // (but which MR3's suffix-only check doesn't catch): when
+    // Content(delta) returns, the non-delta head of `current` must
+    // itself be a SUFFIX of `previous`. In other words, the "overlap"
+    // that the algorithm claims to have found must actually exist in
+    // previous. Formally:
+    //
+    //     extract_delta(previous, current, _) = Content(delta)
+    //   ⇒ previous.ends_with(&current[..current.len() - delta.len()])
+    //
+    // This is what `search_window[pos..] == current[..overlap_len]`
+    // at ingest.rs:1711 actually proves — and what the pure-append
+    // fast path at :1666-1670 reduces to (previous ends with itself,
+    // which is the whole current[..previous.len()]).
+    //
+    // A regression in the candidate-acceptance logic — say, a
+    // slice-boundary bug that accepted a mismatching window — would
+    // let this property fail while MR3 (suffix-of-current) still
+    // passes. MR3 + MR3b together force the algorithm to prove it
+    // found a REAL overlap, not a fabricated one.
+    //
+    // Overlap len is exactly `current.len() - delta.len()`; when
+    // this is zero (delta IS the entire current), the empty-suffix
+    // check is trivially true, so we don't need a separate case.
+    #[test]
+    fn extract_delta_content_overlap_exists_in_previous(
+        previous in arb_text(),
+        current in arb_text(),
+        overlap_size in arb_overlap_size(),
+    ) {
+        if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
+            // The non-delta head of current is what the algorithm
+            // claims was "the overlap" it found in previous.
+            let overlap_len = current.len().saturating_sub(delta.len());
+            let claimed_overlap = &current[..overlap_len];
+            prop_assert!(
+                previous.ends_with(claimed_overlap),
+                "overlap-existence violated: algorithm returned \
+                 Content(delta={:?}), which implies previous ends with {:?}, \
+                 but previous is {:?}",
+                delta,
+                claimed_overlap,
+                previous
+            );
+        }
+    }
+
     // ── MR4: pure-append recoverability ────────────────────────────
 
     /// When `current` starts with `previous` on a char boundary and

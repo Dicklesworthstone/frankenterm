@@ -166,6 +166,54 @@ impl Default for BackpressureConfig {
     }
 }
 
+impl BackpressureConfig {
+    /// Validate that every threshold is finite, non-negative, and ordered
+    /// yellow ≤ red. Returns a human-readable error on the first violation.
+    ///
+    /// [ft-atcr0] TOML supports `nan`/`inf` float literals, and serde passes
+    /// them through to this struct unchanged. If any f64 threshold reaches
+    /// `classify` as NaN, every `>=` comparison against it is false and the
+    /// tier silently resolves to Green — disabling every backpressure
+    /// action at the exact moment the operator tried to configure one.
+    /// Same failure shape as ft-761tz (disk_pressure), same disposition:
+    /// reject at the config boundary AND fail closed in classify().
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (name, value) in [
+            ("yellow_capture", self.yellow_capture),
+            ("red_capture", self.red_capture),
+            ("yellow_write", self.yellow_write),
+            ("red_write", self.red_write),
+            ("idle_poll_backoff_factor", self.idle_poll_backoff_factor),
+            ("skip_detection_ratio", self.skip_detection_ratio),
+            ("pause_ratio", self.pause_ratio),
+        ] {
+            if !value.is_finite() {
+                return Err(format!(
+                    "backpressure config {name} must be finite, got {value}"
+                ));
+            }
+            if value < 0.0 {
+                return Err(format!(
+                    "backpressure config {name} must be non-negative, got {value}"
+                ));
+            }
+        }
+        if self.yellow_capture > self.red_capture {
+            return Err(format!(
+                "backpressure config yellow_capture ({}) must be ≤ red_capture ({})",
+                self.yellow_capture, self.red_capture
+            ));
+        }
+        if self.yellow_write > self.red_write {
+            return Err(format!(
+                "backpressure config yellow_write ({}) must be ≤ red_write ({})",
+                self.yellow_write, self.red_write
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ─── Queue Observation ───────────────────────────────────────────────
 
 /// A point-in-time reading of queue depths.
@@ -420,6 +468,26 @@ impl BackpressureManager {
         let cr = depths.capture_ratio();
         let wr = depths.write_ratio();
 
+        // [ft-atcr0] Fail closed on non-finite inputs or thresholds.
+        // `cr >= NaN` is always false, so a single NaN threshold would
+        // silently classify every queue depth as Green — the exact
+        // inverse of what backpressure exists to do. Same disposition as
+        // ft-761tz (disk_pressure classify_tier returning Black on NaN
+        // usage_fraction): when we cannot prove the queue is safe, the
+        // only sound answer is Black. The config-load path also has a
+        // validate() gate that rejects NaN at boundary crossing; this
+        // is the defense-in-depth layer for call sites that bypass
+        // validation (tests, ad-hoc construction).
+        if !cr.is_finite()
+            || !wr.is_finite()
+            || !self.config.yellow_capture.is_finite()
+            || !self.config.red_capture.is_finite()
+            || !self.config.yellow_write.is_finite()
+            || !self.config.red_write.is_finite()
+        {
+            return BackpressureTier::Black;
+        }
+
         // Black: near saturation (within 5 slots of full, or ratio ≥ 0.995).
         let capture_saturated = depths.capture_capacity > 0
             && depths.capture_depth >= depths.capture_capacity.saturating_sub(5);
@@ -630,6 +698,103 @@ mod tests {
     fn initial_state_is_green() {
         let m = default_manager();
         assert_eq!(m.current_tier(), BackpressureTier::Green);
+    }
+
+    // ── [ft-atcr0] NaN-threshold fail-closed + config validation ───────
+
+    /// Defense-in-depth: if a BackpressureManager is constructed with a
+    /// NaN threshold (bypassing validate(), e.g. via direct struct
+    /// literal in tests or ad-hoc callers), `classify()` must return
+    /// Black rather than silently falling through to Green.
+    #[test]
+    fn classify_returns_black_on_nan_config_threshold() {
+        let mut config = BackpressureConfig::default();
+        config.yellow_capture = f64::NAN;
+        let m = BackpressureManager::new(config);
+
+        let depths = QueueDepths {
+            capture_depth: 50,
+            capture_capacity: 100,
+            write_depth: 50,
+            write_capacity: 100,
+        };
+        assert_eq!(
+            m.classify(&depths),
+            BackpressureTier::Black,
+            "NaN yellow_capture must fail closed to Black, not silently Green"
+        );
+    }
+
+    #[test]
+    fn classify_returns_black_on_inf_threshold() {
+        let mut config = BackpressureConfig::default();
+        config.red_capture = f64::INFINITY;
+        let m = BackpressureManager::new(config);
+
+        let depths = QueueDepths {
+            capture_depth: 50,
+            capture_capacity: 100,
+            write_depth: 50,
+            write_capacity: 100,
+        };
+        assert_eq!(
+            m.classify(&depths),
+            BackpressureTier::Black,
+            "infinite red_capture must fail closed to Black"
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_defaults() {
+        assert!(BackpressureConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_nan_threshold() {
+        let mut config = BackpressureConfig::default();
+        config.yellow_capture = f64::NAN;
+        let err = config.validate().expect_err("NaN must be rejected");
+        assert!(err.contains("yellow_capture"));
+        assert!(err.contains("finite"));
+    }
+
+    #[test]
+    fn config_validate_rejects_inf_threshold() {
+        let mut config = BackpressureConfig::default();
+        config.red_write = f64::INFINITY;
+        let err = config.validate().expect_err("infinity must be rejected");
+        assert!(err.contains("red_write"));
+    }
+
+    #[test]
+    fn config_validate_rejects_negative_threshold() {
+        let mut config = BackpressureConfig::default();
+        config.skip_detection_ratio = -0.1;
+        let err = config.validate().expect_err("negative must be rejected");
+        assert!(err.contains("skip_detection_ratio"));
+        assert!(err.contains("non-negative"));
+    }
+
+    #[test]
+    fn config_validate_rejects_yellow_above_red() {
+        let mut config = BackpressureConfig::default();
+        config.yellow_capture = 0.9;
+        config.red_capture = 0.5; // yellow > red is a misconfiguration
+        let err = config
+            .validate()
+            .expect_err("yellow > red must be rejected");
+        assert!(err.contains("yellow_capture"));
+        assert!(err.contains("red_capture"));
+    }
+
+    #[test]
+    fn config_validate_rejects_yellow_write_above_red_write() {
+        let mut config = BackpressureConfig::default();
+        config.yellow_write = 0.95;
+        config.red_write = 0.7;
+        let err = config.validate().expect_err("yellow_write > red_write");
+        assert!(err.contains("yellow_write"));
+        assert!(err.contains("red_write"));
     }
 
     // ── [ft-0e179] per-pane drop attribution ───────────────────────────
