@@ -5654,12 +5654,28 @@ pub struct SessionPaneStateRow {
 pub struct StorageConfig {
     /// Maximum number of pending write commands before backpressure
     pub write_queue_size: usize,
+    /// [ft-wk5fo] Opt out of the synchronous FTS5 triggers.
+    ///
+    /// When `true`, the three `output_segments_a[iud]` triggers at
+    /// storage.rs:169/173/177 are dropped immediately after schema init.
+    /// New segments are NOT automatically indexed — callers MUST invoke
+    /// [`StorageHandle::sync_fts`] (or the Cx-first `sync_fts_with_cx`)
+    /// periodically to catch the FTS index up to the latest segments via
+    /// the existing `fts_pane_progress` + `sync_fts_on_startup` engine.
+    ///
+    /// Default `false` preserves the immediate-indexing behavior the
+    /// subsystem has always had. Flip this to `true` only in deployments
+    /// that have a periodic catchup tick wired and can tolerate
+    /// search-freshness lag equal to the tick interval. See ft-wk5fo for
+    /// the full deferred-indexing rollout plan.
+    pub defer_fts_triggers: bool,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             write_queue_size: 1024,
+            defer_fts_triggers: false,
         }
     }
 }
@@ -5964,6 +5980,7 @@ impl StorageHandle {
         // Open connection, recover WAL if needed, and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
         let db_existed = Path::new(&db_path_owned).exists();
+        let defer_fts_triggers = config.defer_fts_triggers;
         let init_result = Self::spawn_blocking_storage(move || -> Result<Connection> {
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
@@ -5972,6 +5989,36 @@ impl StorageHandle {
             check_and_recover_wal(&conn, &db_path_owned)?;
 
             initialize_schema(&conn)?;
+
+            // [ft-wk5fo] Deferred FTS indexing: drop the three
+            // per-INSERT/DELETE/UPDATE triggers on output_segments so new
+            // segment writes no longer synchronously rebuild the FTS
+            // inverted-index pages inside `append_segment_sync`'s
+            // transaction. Callers are responsible for invoking
+            // `StorageHandle::sync_fts` periodically to catch the index
+            // up — the `fts_pane_progress` table + `sync_fts_on_startup`
+            // engine already support resumable batched indexing.
+            //
+            // `DROP TRIGGER IF EXISTS` is idempotent — safe on both
+            // fresh databases (where the CREATE TRIGGER in SCHEMA_SQL
+            // just ran) and existing databases being reopened with the
+            // deferred flag for the first time. The triggers can be
+            // re-created by re-opening with `defer_fts_triggers: false`,
+            // though this commit ships the opt-in direction only;
+            // reverting would require re-running SCHEMA_SQL or the
+            // operator dropping the DB.
+            if defer_fts_triggers {
+                conn.execute_batch(
+                    "DROP TRIGGER IF EXISTS output_segments_ai;
+                     DROP TRIGGER IF EXISTS output_segments_ad;
+                     DROP TRIGGER IF EXISTS output_segments_au;",
+                )
+                .map_err(|e| {
+                    StorageError::Database(format!(
+                        "Failed to drop FTS triggers for deferred indexing (ft-wk5fo): {e}"
+                    ))
+                })?;
+            }
             #[cfg(unix)]
             {
                 ensure_db_permissions(Path::new(&db_path_owned), !db_existed)?;
@@ -24307,6 +24354,7 @@ fn storage_handle_writer_queue_processes_all() {
         // Create storage with small queue
         let config = StorageConfig {
             write_queue_size: 4,
+            defer_fts_triggers: false,
         };
         let storage = StorageHandle::with_config(&db_path_str, config)
             .await
@@ -24917,6 +24965,140 @@ mod fts_sync_tests {
         // State should be initialized
         let state = get_fts_index_state_sync(&conn).unwrap().unwrap();
         assert_eq!(state.index_version, FTS_INDEX_VERSION);
+    }
+
+    // ── [ft-wk5fo] Deferred FTS trigger mode ──────────────────────────
+
+    /// Helper: count FTS rows. FTS5 virtual tables don't support COUNT(*)
+    /// via the normal query planner, but the content table rowid space
+    /// is the segment id space, so we can count via a scan.
+    fn fts_row_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM output_segments_fts",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    /// Helper: exercise the StorageConfig.defer_fts_triggers path
+    /// directly on a Connection. Mirrors the DROP TRIGGER block in
+    /// StorageHandle::with_config so the test exercises the same
+    /// SQL the production path runs.
+    fn apply_defer_fts_triggers(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS output_segments_ai;
+             DROP TRIGGER IF EXISTS output_segments_ad;
+             DROP TRIGGER IF EXISTS output_segments_au;",
+        )
+        .unwrap();
+    }
+
+    /// Baseline: with triggers present, insertions flow straight into FTS.
+    /// Pins the "sync" mode that StorageConfig::default() preserves.
+    #[test]
+    fn fts_sync_mode_indexes_on_insert() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        insert_test_pane(&conn, 1);
+        for seq in 0..5u64 {
+            insert_test_segment(&conn, 1, seq, &format!("content-{seq}"));
+        }
+
+        assert_eq!(
+            fts_row_count(&conn),
+            5,
+            "sync mode (triggers present) must index every insert"
+        );
+    }
+
+    /// [ft-wk5fo] Headline contract: with triggers dropped (deferred
+    /// mode), writing segments does NOT populate FTS. The search index
+    /// is empty immediately after a batch of writes, proving the
+    /// capture-write path is no longer paying trigger-indexing cost.
+    #[test]
+    fn fts_deferred_mode_does_not_index_on_insert() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+
+        insert_test_pane(&conn, 1);
+        for seq in 0..500u64 {
+            insert_test_segment(&conn, 1, seq, &format!("content-{seq}"));
+        }
+
+        assert_eq!(
+            fts_row_count(&conn),
+            0,
+            "deferred mode must leave FTS empty after 500 inserts"
+        );
+    }
+
+    /// [ft-wk5fo] End-to-end: the `sync_fts_on_startup` catchup engine
+    /// sees all 500 deferred segments and indexes them through the
+    /// `fts_pane_progress` resume mechanism. Proves the deferred path
+    /// achieves eventual consistency — the whole point of the rollout.
+    #[test]
+    fn fts_deferred_mode_catchup_indexes_all_segments() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+
+        insert_test_pane(&conn, 1);
+        for seq in 0..500u64 {
+            insert_test_segment(&conn, 1, seq, &format!("content-{seq}"));
+        }
+        // Pre-catchup: FTS is empty.
+        assert_eq!(fts_row_count(&conn), 0);
+
+        // Trigger the batched catchup engine. Same entry point the
+        // future periodic writer-thread tick will use.
+        let config = FtsSyncConfig::default();
+        let result = sync_fts_on_startup(&conn, &config).unwrap();
+
+        assert_eq!(result.segments_indexed, 500);
+        assert_eq!(result.panes_processed, 1);
+        assert!(!result.full_rebuild);
+        assert_eq!(
+            fts_row_count(&conn),
+            500,
+            "catchup must bring every deferred segment into FTS"
+        );
+
+        // And a second catchup is a no-op (progress prevents re-indexing).
+        let second = sync_fts_on_startup(&conn, &config).unwrap();
+        assert_eq!(
+            second.segments_indexed, 0,
+            "second catchup must see no new work (progress is resumable)"
+        );
+        assert_eq!(fts_row_count(&conn), 500);
+    }
+
+    /// [ft-wk5fo] Interleaved: alternating catchup + insert rounds
+    /// preserve the resumable-progress invariant. This is the shape the
+    /// future periodic writer-thread tick will produce in production.
+    #[test]
+    fn fts_deferred_mode_catchup_resumes_across_rounds() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+
+        insert_test_pane(&conn, 1);
+        let config = FtsSyncConfig::default();
+
+        for round in 0..5u64 {
+            for seq in (round * 100)..((round + 1) * 100) {
+                insert_test_segment(&conn, 1, seq, &format!("r{round}-s{seq}"));
+            }
+            let result = sync_fts_on_startup(&conn, &config).unwrap();
+            assert_eq!(
+                result.segments_indexed, 100,
+                "round {round} must index exactly the 100 new segments, not re-index prior rounds"
+            );
+        }
+
+        assert_eq!(fts_row_count(&conn), 500);
     }
 
     #[test]
@@ -26756,6 +26938,7 @@ mod storage_handle_tests {
             // Use a small queue to test bounded channel behavior
             let config = StorageConfig {
                 write_queue_size: 4,
+                defer_fts_triggers: false,
             };
             let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
