@@ -305,6 +305,88 @@ impl TriggerScanner {
         }
     }
 
+    fn exact_trigger_match(&self, mat: aho_corasick::Match) -> TriggerMatch {
+        let pattern_idx = self.exact_indices[mat.pattern().as_usize()];
+        TriggerMatch {
+            offset: mat.start(),
+            length: mat.end() - mat.start(),
+            pattern_index: pattern_idx,
+            category: self.patterns[pattern_idx].category,
+        }
+    }
+
+    fn nocase_trigger_match(&self, mat: aho_corasick::Match) -> TriggerMatch {
+        let pattern_idx = self.nocase_indices[mat.pattern().as_usize()];
+        TriggerMatch {
+            offset: mat.start(),
+            length: mat.end() - mat.start(),
+            pattern_index: pattern_idx,
+            category: self.patterns[pattern_idx].category,
+        }
+    }
+
+    fn for_each_leftmost_match<F>(&self, input: &[u8], mut on_match: F)
+    where
+        F: FnMut(TriggerMatch),
+    {
+        let mut exact_iter = self
+            .automaton
+            .find_iter(input)
+            .map(|mat| self.exact_trigger_match(mat))
+            .peekable();
+        let mut nocase_iter = self.automaton_ci.as_ref().map(|automaton| {
+            automaton
+                .find_iter(input)
+                .map(|mat| self.nocase_trigger_match(mat))
+                .peekable()
+        });
+        let mut next_allowed_offset = 0usize;
+
+        loop {
+            while let Some(matched) = exact_iter.peek() {
+                if matched.offset < next_allowed_offset {
+                    exact_iter.next();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(iter) = nocase_iter.as_mut() {
+                while let Some(matched) = iter.peek() {
+                    if matched.offset < next_allowed_offset {
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let next = match (
+                exact_iter.peek().cloned(),
+                nocase_iter.as_mut().and_then(|iter| iter.peek().cloned()),
+            ) {
+                (Some(exact), Some(nocase))
+                    if exact.offset < nocase.offset
+                        || (exact.offset == nocase.offset
+                            && exact.pattern_index <= nocase.pattern_index) =>
+                {
+                    exact_iter.next()
+                }
+                (Some(_), Some(_)) => nocase_iter.as_mut().and_then(|iter| iter.next()),
+                (Some(_), None) => exact_iter.next(),
+                (None, Some(_)) => nocase_iter.as_mut().and_then(|iter| iter.next()),
+                (None, None) => None,
+            };
+
+            let Some(matched) = next else {
+                break;
+            };
+
+            next_allowed_offset = matched.offset.saturating_add(matched.length);
+            on_match(matched);
+        }
+    }
+
     /// Scan and return per-category counts (fast path — no match locations).
     #[must_use]
     pub fn scan_counts(&self, input: &[u8]) -> TriggerScanResult {
@@ -312,24 +394,10 @@ impl TriggerScanner {
             bytes_scanned: input.len() as u64,
             ..Default::default()
         };
-
-        // Case-sensitive matches
-        for mat in self.automaton.find_iter(input) {
-            let pattern_idx = self.exact_indices[mat.pattern().as_usize()];
-            let category = self.patterns[pattern_idx].category;
-            *result.counts.entry(category).or_insert(0) += 1;
+        self.for_each_leftmost_match(input, |matched| {
+            *result.counts.entry(matched.category).or_insert(0) += 1;
             result.total_matches += 1;
-        }
-
-        // Case-insensitive matches
-        if let Some(ref aci) = self.automaton_ci {
-            for mat in aci.find_iter(input) {
-                let pattern_idx = self.nocase_indices[mat.pattern().as_usize()];
-                let category = self.patterns[pattern_idx].category;
-                *result.counts.entry(category).or_insert(0) += 1;
-                result.total_matches += 1;
-            }
-        }
+        });
 
         result
     }
@@ -338,33 +406,7 @@ impl TriggerScanner {
     #[must_use]
     pub fn scan_locate(&self, input: &[u8]) -> Vec<TriggerMatch> {
         let mut matches = Vec::new();
-
-        // Case-sensitive matches
-        for mat in self.automaton.find_iter(input) {
-            let pattern_idx = self.exact_indices[mat.pattern().as_usize()];
-            matches.push(TriggerMatch {
-                offset: mat.start(),
-                length: mat.end() - mat.start(),
-                pattern_index: pattern_idx,
-                category: self.patterns[pattern_idx].category,
-            });
-        }
-
-        // Case-insensitive matches
-        if let Some(ref aci) = self.automaton_ci {
-            for mat in aci.find_iter(input) {
-                let pattern_idx = self.nocase_indices[mat.pattern().as_usize()];
-                matches.push(TriggerMatch {
-                    offset: mat.start(),
-                    length: mat.end() - mat.start(),
-                    pattern_index: pattern_idx,
-                    category: self.patterns[pattern_idx].category,
-                });
-            }
-        }
-
-        // Sort by offset for deterministic output
-        matches.sort_by_key(|m| m.offset);
+        self.for_each_leftmost_match(input, |matched| matches.push(matched));
         matches
     }
 
@@ -523,6 +565,41 @@ mod tests {
         let scanner = TriggerScanner::new(Vec::new());
         let result = scanner.scan_counts(b"ERROR: this should not match\n");
         assert_eq!(result.total_matches, 0);
+    }
+
+    #[test]
+    fn overlapping_exact_and_case_insensitive_patterns_follow_leftmost_first_once() {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::new("ERROR", TriggerCategory::Custom),
+            TriggerPattern::case_insensitive("error", TriggerCategory::Error),
+        ]);
+
+        let counts = scanner.scan_counts(b"ERROR: duplicated?");
+        assert_eq!(counts.total_matches, 1);
+        assert_eq!(counts.get(&TriggerCategory::Custom), Some(&1));
+        assert_eq!(counts.get(&TriggerCategory::Error), None);
+
+        let located = scanner.scan_locate(b"ERROR: duplicated?");
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].offset, 0);
+        assert_eq!(located[0].length, 5);
+        assert_eq!(located[0].pattern_index, 0);
+        assert_eq!(located[0].category, TriggerCategory::Custom);
+    }
+
+    #[test]
+    fn overlapping_mixed_case_patterns_prefer_earlier_pattern_order() {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::case_insensitive("error", TriggerCategory::Error),
+            TriggerPattern::new("ERROR:", TriggerCategory::Warning),
+        ]);
+
+        let located = scanner.scan_locate(b"ERROR: still one logical match");
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].offset, 0);
+        assert_eq!(located[0].length, 5);
+        assert_eq!(located[0].pattern_index, 0);
+        assert_eq!(located[0].category, TriggerCategory::Error);
     }
 
     // -- Large input --
