@@ -112,10 +112,20 @@ impl HoltPredictor {
     /// Create a new predictor with smoothing parameters.
     ///
     /// Both α and β are clamped to \[0.001, 0.999\] for numerical stability.
+    /// NaN inputs snap to the midpoint default (0.5) — `f64::clamp(NaN, _, _)`
+    /// returns NaN, which would propagate through every `update()` recurrence
+    /// (`alpha.mul_add(value, ...)` is NaN regardless of value), permanently
+    /// disabling the predictor even though `update`'s post-hoc finite-check
+    /// resets `level`/`trend` each call. Same family as ft-icreu
+    /// (ActivityProfile::new), ft-761tz (disk_pressure), ft-yskcu
+    /// (continuous_backpressure): pathological numeric input must not survive
+    /// a clamp that doesn't sanitize it.
     pub fn new(alpha: f64, beta: f64) -> Self {
+        let alpha = if alpha.is_nan() { 0.5 } else { alpha.clamp(0.001, 0.999) };
+        let beta = if beta.is_nan() { 0.5 } else { beta.clamp(0.001, 0.999) };
         Self {
-            alpha: alpha.clamp(0.001, 0.999),
-            beta: beta.clamp(0.001, 0.999),
+            alpha,
+            beta,
             level: 0.0,
             trend: 0.0,
             observations: 0,
@@ -1092,6 +1102,35 @@ mod tests {
         h_high.update(20.0);
         assert!(h_high.level().is_finite());
         assert!(h_high.trend().is_finite());
+    }
+
+    /// NaN α/β must snap to the safe midpoint (0.5) instead of surviving
+    /// the clamp and poisoning every subsequent update via mul_add.
+    /// Without this guard, the predictor's level / trend would race
+    /// between NaN (computed) and value (the in-loop reset), never
+    /// converging — same shape as ft-icreu (ActivityProfile::new),
+    /// ft-761tz (disk_pressure), ft-yskcu (continuous_backpressure).
+    #[test]
+    fn holt_predictor_new_rejects_nan_alpha_and_beta() {
+        let mut h = HoltPredictor::new(f64::NAN, 0.3);
+        h.update(10.0);
+        h.update(20.0);
+        h.update(30.0);
+        assert!(h.level().is_finite(), "level must stay finite after NaN α");
+        assert!(h.trend().is_finite(), "trend must stay finite after NaN α");
+
+        let mut h = HoltPredictor::new(0.3, f64::NAN);
+        h.update(10.0);
+        h.update(20.0);
+        h.update(30.0);
+        assert!(h.level().is_finite(), "level must stay finite after NaN β");
+        assert!(h.trend().is_finite(), "trend must stay finite after NaN β");
+
+        let mut h = HoltPredictor::new(f64::NAN, f64::NAN);
+        h.update(10.0);
+        h.update(20.0);
+        assert!(h.level().is_finite());
+        assert!(h.trend().is_finite());
     }
 
     #[test]
