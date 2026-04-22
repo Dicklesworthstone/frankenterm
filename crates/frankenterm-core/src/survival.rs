@@ -432,10 +432,31 @@ pub struct ActivityProfile {
 
 impl ActivityProfile {
     /// Create a new profile.
+    ///
+    /// [ft-icreu] Construction-time counterpart to ft-26k3h's
+    /// `update_hour` fix. `f64::clamp(NaN, _, _)` returns NaN (same
+    /// documented gotcha as ft-761tz, ft-b4l62, ft-jz40p, ft-0p5q5,
+    /// ft-x50ce, ft-26k3h), so a caller supplying NaN for `alpha`
+    /// would store NaN in `self.alpha` and every non-first
+    /// `update_hour` would poison the EWMA via
+    /// `alpha.mul_add(sample, (1-α)*prev) = NaN`. Similarly a NaN
+    /// `default_activity` would populate all 24 `hourly_ewma` slots
+    /// with NaN so `predict_hour` returned NaN until the first clean
+    /// `update_hour` overwrote each slot.
+    ///
+    /// Snap NaN to conservative defaults (alpha → 0.1, default
+    /// activity → 0.5 neutral midpoint) BEFORE the clamp so the clamp
+    /// still trims out-of-range finite inputs normally and the
+    /// monitor is NaN-safe by construction.
     #[must_use]
     pub fn new(alpha: f64, default_activity: f64) -> Self {
-        let alpha = alpha.clamp(0.0, 1.0);
-        let default_activity = default_activity.clamp(0.0, 1.0);
+        let alpha = if alpha.is_nan() { 0.1 } else { alpha }.clamp(0.0, 1.0);
+        let default_activity = if default_activity.is_nan() {
+            0.5
+        } else {
+            default_activity
+        }
+        .clamp(0.0, 1.0);
         Self {
             alpha,
             hourly_ewma: [default_activity; 24],
@@ -2646,5 +2667,45 @@ mod tests {
         profile.update_hour(5, 0.8);
         assert!((profile.predict_hour(5) - 0.8).abs() < f64::EPSILON);
         assert_eq!(profile.sample_count(5), 1);
+    }
+
+    // ── ft-icreu: construction-time NaN sanitization ─────────────────────
+
+    /// Construction-time complement to ft-26k3h: a NaN `alpha` used to
+    /// survive `alpha.clamp(0.0, 1.0)` unchanged (documented
+    /// `f64::clamp` gotcha), and every non-first `update_hour` would
+    /// then poison the EWMA via
+    /// `alpha.mul_add(sample, (1-α)*prev) = NaN`. Snap to 0.1.
+    #[test]
+    fn ft_icreu_new_sanitises_nan_alpha() {
+        let mut profile = ActivityProfile::new(f64::NAN, 0.3);
+        // Seed two samples so we go through the EWMA branch (sample_count>0).
+        profile.update_hour(0, 0.2);
+        profile.update_hour(0, 0.8);
+        let v = profile.predict_hour(0);
+        assert!(
+            v.is_finite(),
+            "EWMA must stay finite after NaN alpha is sanitised; got {v}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&v),
+            "EWMA must remain in [0, 1] after NaN alpha sanitisation; got {v}"
+        );
+    }
+
+    /// A NaN `default_activity` used to fill all 24 hourly_ewma slots
+    /// with NaN so `predict_hour` returned NaN until the first clean
+    /// update overwrote each bucket. Snap to 0.5 so untouched buckets
+    /// yield the neutral midpoint.
+    #[test]
+    fn ft_icreu_new_sanitises_nan_default_activity() {
+        let profile = ActivityProfile::new(0.3, f64::NAN);
+        for hour in 0..24 {
+            let v = profile.predict_hour(hour);
+            assert!(
+                (v - 0.5).abs() < f64::EPSILON,
+                "bucket {hour} default must snap to 0.5 midpoint, got {v}"
+            );
+        }
     }
 }
