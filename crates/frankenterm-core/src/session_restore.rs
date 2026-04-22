@@ -708,12 +708,28 @@ fn load_scrollback_data(
     max_lines: usize,
 ) -> Result<HashMap<u64, ScrollbackData>, RestoreError> {
     let conn = open_conn(db_path)?;
+    // [ft-8ihuz] Pull at most `max_lines` segments by ORDER BY seq DESC
+    // + LIMIT, then reverse in Rust to restore chronological order.
+    // The old query had no LIMIT and relied on an in-memory truncate
+    // after loading all segments up to max_seq — for a pane with
+    // hundreds of MB / multi-GB of captured scrollback (realistic for
+    // long-running agent sessions), the full read allocates the whole
+    // dataset and throws ~99.5% away once scrollback.truncate runs.
+    // That allocation spike could OOM frankenterm on restore of a
+    // heavy session. DESC + LIMIT bounds the allocation at
+    // max_lines × avg_segment_size, and the final `.reverse()` keeps
+    // the resulting ScrollbackData byte-for-byte identical to the
+    // pre-fix output for any input where the old code would NOT have
+    // truncated.
     let mut stmt = conn.prepare(
         "SELECT content
          FROM output_segments
          WHERE pane_id = ?1 AND seq <= ?2
-         ORDER BY seq ASC",
+         ORDER BY seq DESC
+         LIMIT ?3",
     )?;
+
+    let max_lines_i64 = i64::try_from(max_lines).unwrap_or(i64::MAX);
 
     let mut scrollbacks = HashMap::new();
     for pane_state in pane_states {
@@ -734,15 +750,26 @@ fn load_scrollback_data(
             ))
         })?;
 
-        let segments = stmt
-            .query_map([pane_id_i64, max_seq_i64], |row| row.get::<_, String>(0))?
+        let mut segments = stmt
+            .query_map([pane_id_i64, max_seq_i64, max_lines_i64], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         if segments.is_empty() {
             continue;
         }
 
+        // Query returned segments in DESC order; ScrollbackData needs
+        // chronological (ASC). Single in-place reverse, no re-alloc.
+        segments.reverse();
+
         let mut scrollback = ScrollbackData::from_segments(segments);
+        // Second-line-of-defense truncate: the SQL LIMIT already caps
+        // segments at max_lines, but truncate also enforces the
+        // contract at the ScrollbackData level so any future caller
+        // that passes a pre-built Vec doesn't accidentally exceed
+        // the cap.
         scrollback.truncate(max_lines);
         scrollbacks.insert(pane_state.pane_id, scrollback);
     }
@@ -2647,6 +2674,74 @@ mod tests {
                 value: 2
             }
         ));
+    }
+
+    // [ft-8ihuz] Pin the DESC+LIMIT behavior in load_scrollback_data:
+    //   1. When more segments exist than max_lines, only the last
+    //      max_lines are loaded and they appear in chronological
+    //      order (the SQL gives DESC, the code reverses in-place).
+    //   2. Total loaded content is bounded at max_lines segments —
+    //      what would have been an OOM hazard on the old
+    //      no-LIMIT path is now capped.
+    // Structured as a direct call to load_scrollback_data via the
+    // setup_test_db helper rather than going through the full
+    // SessionRestorer to keep the test focused on the query shape.
+    #[test]
+    fn load_scrollback_data_respects_max_lines_limit_ft_8ihuz() {
+        let (db_path, conn, _dir) = setup_test_db();
+        let pane_id = 42u64;
+
+        // Seed 50 segments, each with distinct content. The
+        // scrollback_checkpoint_seq in pane state caps at 49 so
+        // all segments are eligible.
+        for seq in 0i64..50 {
+            insert_output_segment(
+                &conn,
+                pane_id,
+                seq,
+                &format!("segment-content-{seq}"),
+                1000 + seq,
+            );
+        }
+
+        let pane_state = RestoredPaneState {
+            pane_id,
+            cwd: None,
+            command: None,
+            terminal_state: None,
+            agent_metadata: None,
+            scrollback_checkpoint_seq: Some(49),
+            last_output_at: None,
+        };
+
+        // Ask for at most 5 lines; the SQL LIMIT should bound
+        // the read to 5 rows even though 50 are available.
+        let scrollbacks =
+            load_scrollback_data(&db_path, std::slice::from_ref(&pane_state), 5).unwrap();
+        let sb = scrollbacks.get(&pane_id).expect("pane has a scrollback");
+
+        assert_eq!(
+            sb.lines.len(),
+            5,
+            "ft-8ihuz: SQL LIMIT must cap segments at max_lines, not load all 50"
+        );
+        // DESC + reverse must produce chronological (ascending seq)
+        // order. The last 5 segments by seq are 45..=49; content
+        // reflects that.
+        assert_eq!(sb.lines[0], "segment-content-45");
+        assert_eq!(sb.lines[1], "segment-content-46");
+        assert_eq!(sb.lines[2], "segment-content-47");
+        assert_eq!(sb.lines[3], "segment-content-48");
+        assert_eq!(sb.lines[4], "segment-content-49");
+
+        // When max_lines is larger than the total, we get
+        // everything in chronological order (no LIMIT truncation,
+        // just the natural tail).
+        let all = load_scrollback_data(&db_path, std::slice::from_ref(&pane_state), 100).unwrap();
+        let all_sb = all.get(&pane_id).expect("pane has scrollback");
+        assert_eq!(all_sb.lines.len(), 50);
+        assert_eq!(all_sb.lines[0], "segment-content-0");
+        assert_eq!(all_sb.lines[49], "segment-content-49");
     }
 
     #[test]
