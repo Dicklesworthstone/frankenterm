@@ -72,6 +72,32 @@ pub const SCHEMA_VERSION: i32 = 23;
 /// - Timestamps: epoch milliseconds (i64) for hot-path queries
 /// - JSON columns: TEXT containing JSON (v0 simplicity)
 /// - All tables use INTEGER PRIMARY KEY for rowid aliasing
+
+/// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
+/// triggers. Called when a database is opened with
+/// `defer_fts_triggers: false` so the flag is truly reversible — without
+/// this, a DB opened once with `true` stays in deferred mode forever
+/// because `initialize_schema` short-circuits for up-to-date schemas and
+/// `CREATE TRIGGER IF NOT EXISTS` from the main `SCHEMA_SQL` never re-runs.
+///
+/// KEEP IN SYNC with the `CREATE TRIGGER IF NOT EXISTS output_segments_*`
+/// block inside `SCHEMA_SQL` below — if a trigger body changes here,
+/// change it there too and vice versa.
+const FTS_TRIGGER_RECREATE_SQL: &str = r#"
+CREATE TRIGGER IF NOT EXISTS output_segments_ai AFTER INSERT ON output_segments BEGIN
+    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_ad AFTER DELETE ON output_segments BEGIN
+    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments BEGIN
+    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+END;
+"#;
+
 pub const SCHEMA_SQL: &str = r#"
 -- Enable WAL mode for concurrent reads and single-writer semantics
 PRAGMA journal_mode = WAL;
@@ -5999,14 +6025,16 @@ impl StorageHandle {
             // up — the `fts_pane_progress` table + `sync_fts_on_startup`
             // engine already support resumable batched indexing.
             //
-            // `DROP TRIGGER IF EXISTS` is idempotent — safe on both
-            // fresh databases (where the CREATE TRIGGER in SCHEMA_SQL
-            // just ran) and existing databases being reopened with the
-            // deferred flag for the first time. The triggers can be
-            // re-created by re-opening with `defer_fts_triggers: false`,
-            // though this commit ships the opt-in direction only;
-            // reverting would require re-running SCHEMA_SQL or the
-            // operator dropping the DB.
+            // [ft-ih4tm] Both branches are now idempotent so the flag is
+            // truly bidirectional. `initialize_schema` short-circuits for
+            // up-to-date databases (line ~4315 — returns without
+            // re-running SCHEMA_SQL), so a DB opened first with
+            // `defer_fts_triggers: true` and then reopened with `false`
+            // needs the explicit re-create here; otherwise the triggers
+            // stay dropped and the operator's "turn deferred off" intent
+            // is silently ignored. The CREATE statements mirror the ones
+            // in SCHEMA_SQL at line ~169 (see FTS_TRIGGER_RECREATE_SQL);
+            // keep the two in lockstep.
             if defer_fts_triggers {
                 conn.execute_batch(
                     "DROP TRIGGER IF EXISTS output_segments_ai;
@@ -6016,6 +6044,12 @@ impl StorageHandle {
                 .map_err(|e| {
                     StorageError::Database(format!(
                         "Failed to drop FTS triggers for deferred indexing (ft-wk5fo): {e}"
+                    ))
+                })?;
+            } else {
+                conn.execute_batch(FTS_TRIGGER_RECREATE_SQL).map_err(|e| {
+                    StorageError::Database(format!(
+                        "Failed to re-create FTS triggers after deferred indexing was disabled (ft-ih4tm): {e}"
                     ))
                 })?;
             }

@@ -185,7 +185,7 @@ pub(super) fn resolve_workspace_scoped_path(
     let ancestor_canon = loop {
         match ancestor.canonicalize() {
             Ok(p) => break p,
-            Err(_) => match ancestor.parent() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
                 Some(parent) if parent.as_os_str().is_empty() => {
                     return Err(McpToolError::new(
                         MCP_ERR_INVALID_ARGS,
@@ -202,6 +202,19 @@ pub(super) fn resolve_workspace_scoped_path(
                     ));
                 }
             },
+            Err(err) => {
+                return Err(McpToolError::new(
+                    MCP_ERR_INVALID_ARGS,
+                    format!(
+                        "path {} is not accessible while resolving workspace containment: {err}",
+                        candidate.display()
+                    ),
+                    Some(
+                        "mission_file and contract_file must point to readable paths inside the workspace."
+                            .to_string(),
+                    ),
+                ));
+            }
         }
     };
 
@@ -241,8 +254,9 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
         "robot.tx_oversize",
     ) {
         Ok(raw) => raw,
-        Err(err) if err.code == "robot.tx_read_failed"
-            && err.message.starts_with("File not found: ") =>
+        Err(err)
+            if err.code == "robot.tx_read_failed"
+                && err.message.starts_with("File not found: ") =>
         {
             return Err(McpToolError::new(
                 "robot.tx_not_found",
@@ -362,8 +376,9 @@ pub(super) fn mcp_load_mission_from_path(
         "robot.mission_oversize",
     ) {
         Ok(raw) => raw,
-        Err(err) if err.code == "robot.mission_read_failed"
-            && err.message.starts_with("File not found: ") =>
+        Err(err)
+            if err.code == "robot.mission_read_failed"
+                && err.message.starts_with("File not found: ") =>
         {
             return Err(McpToolError::new(
                 "robot.mission_not_found",
@@ -1211,7 +1226,8 @@ mod tests {
         let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
         assert_eq!(err.code, "robot.tx_oversize");
         assert!(
-            err.message.contains(&format!("{}", super::MAX_TX_CONTRACT_BYTES)),
+            err.message
+                .contains(&format!("{}", super::MAX_TX_CONTRACT_BYTES)),
             "rejection must cite the cap value, got: {}",
             err.message
         );
@@ -1234,7 +1250,8 @@ mod tests {
         let err = mcp_load_mission_from_path(&path).unwrap_err();
         assert_eq!(err.code, "robot.mission_oversize");
         assert!(
-            err.message.contains(&format!("{}", super::MAX_MISSION_BYTES)),
+            err.message
+                .contains(&format!("{}", super::MAX_MISSION_BYTES)),
             "rejection must cite the cap value, got: {}",
             err.message
         );
@@ -1450,5 +1467,32 @@ mod tests {
             .expect_err("absolute symlink escape must be rejected");
         assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
         assert!(err.message.contains("escapes workspace root"));
+    }
+
+    /// Existing malformed paths inside the workspace must fail closed.
+    /// A symlink loop is not "a missing target", so the ancestor walk
+    /// must not silently skip upward and accept the parent directory.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_scoped_path_rejects_symlink_loop_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+        std::fs::create_dir_all(workspace_root.join("mission")).expect("mkdir mission/");
+
+        let loop_path = workspace_root.join("mission/loop.json");
+        symlink("loop.json", &loop_path).expect("create self-referential symlink");
+
+        let err = resolve_workspace_scoped_path(workspace_root, "mission/loop.json")
+            .expect_err("symlink loop must be rejected instead of treated as missing");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
+        assert!(
+            err.message.contains("not accessible")
+                || err.message.contains("Too many levels of symbolic links")
+                || err.message.contains("filesystem loop"),
+            "unexpected rejection message: {}",
+            err.message
+        );
     }
 }
