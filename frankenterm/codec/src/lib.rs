@@ -259,6 +259,23 @@ fn buffered_frame_len(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
     let payload_len: usize = raw_len
         .try_into()
         .map_err(|_| anyhow::anyhow!("buffered PDU length {raw_len} does not fit in usize"))?;
+
+    // [ft-phz7x] Reject oversize headers BEFORE the caller's read loop
+    // accumulates an attacker-advertised payload into memory. decode_raw
+    // already enforces MAX_PDU_SIZE at lib.rs:395-403, but stream_decode's
+    // first check short-circuits to "need more bytes" while buffer.len() <
+    // total_len — so callers like try_read_and_decode would keep extending
+    // the buffer 4 KiB at a time until they reach the advertised length.
+    // A 10 GiB tagged_len would OOM the process long before the inner
+    // MAX_PDU_SIZE check fires. Mirror the inner cap here.
+    if payload_len > MAX_PDU_SIZE {
+        anyhow::bail!(
+            "buffered PDU payload size {} exceeds maximum {} — refusing to accumulate",
+            payload_len,
+            MAX_PDU_SIZE,
+        );
+    }
+
     let prefix_len = buffer.len().saturating_sub(slice.len());
     let total_len = prefix_len
         .checked_add(payload_len)
@@ -1540,6 +1557,51 @@ mod test {
         assert_eq!(
             err.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn buffered_frame_len_rejects_oversize_tagged_len_ft_phz7x() {
+        // Craft a header whose leb128 tagged_len advertises MAX_PDU_SIZE + 1.
+        // buffered_frame_len must Err out immediately, instead of returning
+        // Ok(None) and inviting try_read_and_decode to accumulate the full
+        // advertised size into memory. See ft-phz7x.
+        let oversize = (MAX_PDU_SIZE as u64) + 1;
+        let mut header = Vec::new();
+        leb128::write::unsigned(&mut header, oversize).unwrap();
+        // Feed a buffer that contains only the leb128 header plus a stub
+        // byte — not enough to satisfy the advertised length. Pre-fix, this
+        // returned Ok(None); post-fix, it returns Err.
+        header.push(0);
+        let result = buffered_frame_len(&header);
+        let err = result.expect_err(
+            "buffered_frame_len must reject oversize tagged_len (ft-phz7x); \
+             got Ok which means callers would keep accumulating",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds maximum") && msg.contains("refusing to accumulate"),
+            "ft-phz7x rejection must name the cap and the refusal reason; got {msg:?}",
+        );
+
+        // Sanity: the same cap boundary at MAX_PDU_SIZE exactly is still
+        // considered complete (no early bail) when the buffer is long
+        // enough — this ensures we didn't off-by-one the comparison. We
+        // only check the length-decode path, not a full PDU: a buffer
+        // matching the advertised length should report Some(total_len).
+        let boundary = MAX_PDU_SIZE as u64;
+        let mut boundary_header = Vec::new();
+        leb128::write::unsigned(&mut boundary_header, boundary).unwrap();
+        let prefix_len = boundary_header.len();
+        // Don't actually allocate 256 MiB — just confirm the path that
+        // would reach the "buffer.len() < total_len" check. When we're
+        // below total_len we get Ok(None), which is the correct "need
+        // more bytes" signal for a legitimate boundary-sized frame.
+        let below = buffered_frame_len(&boundary_header).unwrap();
+        assert_eq!(
+            below, None,
+            "boundary-sized frame at the MAX_PDU_SIZE cap must be treated \
+             as incomplete (Ok(None)), not rejected; header_len={prefix_len}",
         );
     }
 
