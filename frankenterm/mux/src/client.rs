@@ -1,5 +1,5 @@
 use crate::PaneId;
-use chrono::serde::ts_seconds;
+use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Utc};
 use serde::*;
 use std::sync::Arc;
@@ -43,12 +43,22 @@ impl ClientId {
 pub struct ClientInfo {
     pub client_id: Arc<ClientId>,
     /// The time this client last connected
-    #[serde(with = "ts_seconds")]
+    ///
+    /// [ft-ztcsl] Serialized as milliseconds-since-epoch rather than
+    /// seconds so a JSON roundtrip preserves the sub-second portion of
+    /// the timestamp. `ts_seconds` truncated `Utc::now()`'s nanosecond
+    /// precision to whole seconds, so any `ClientInfo` that went
+    /// through the wire once came back coarsened — two clients that
+    /// connected within the same second became JSON-equal.
+    #[serde(with = "ts_milliseconds")]
     pub connected_at: DateTime<Utc>,
     /// Which workspace is active
     pub active_workspace: Option<String>,
     /// The last time we received input from this client
-    #[serde(with = "ts_seconds")]
+    ///
+    /// [ft-ztcsl] Same millisecond-resolution wire format as
+    /// `connected_at` for the same roundtrip-precision reason.
+    #[serde(with = "ts_milliseconds")]
     pub last_input: DateTime<Utc>,
     /// The currently-focused pane
     pub focused_pane_id: Option<PaneId>,
@@ -176,6 +186,57 @@ mod tests {
         assert_eq!(info.focused_pane_id, Some(42));
         info.update_focused_pane(99);
         assert_eq!(info.focused_pane_id, Some(99));
+    }
+
+    // [ft-ztcsl] Pre-fix, ClientInfo::{connected_at, last_input}
+    // serialized via chrono::serde::ts_seconds — a JSON roundtrip
+    // truncated the subsecond portion of the timestamp to whole
+    // seconds, so two clients that connected inside the same second
+    // became JSON-equal. The switch to ts_milliseconds preserves
+    // millisecond resolution, enough to distinguish connections that
+    // happen in the same wall-clock second.
+    #[test]
+    fn client_info_json_roundtrip_preserves_subsecond_ft_ztcsl() {
+        use chrono::TimeZone;
+
+        let cid = Arc::new(make_client_id("host", 1));
+        // Construct a timestamp with a non-zero millisecond remainder
+        // so the pre-fix ts_seconds path would visibly lose precision.
+        let ts = Utc
+            .timestamp_opt(1_700_000_000, 123_000_000)
+            .single()
+            .expect("valid chrono timestamp");
+        let info = ClientInfo {
+            client_id: cid,
+            connected_at: ts,
+            active_workspace: None,
+            last_input: ts,
+            focused_pane_id: None,
+        };
+
+        let json = serde_json::to_string(&info).expect("serialize ClientInfo");
+        let back: ClientInfo =
+            serde_json::from_str(&json).expect("deserialize ClientInfo roundtrip");
+
+        // Millisecond precision must survive. The pre-fix ts_seconds
+        // encoding would truncate .123 seconds to .000, making this
+        // assertion fail.
+        assert_eq!(
+            back.connected_at, info.connected_at,
+            "ft-ztcsl: connected_at must roundtrip with millisecond precision"
+        );
+        assert_eq!(
+            back.last_input, info.last_input,
+            "ft-ztcsl: last_input must roundtrip with millisecond precision"
+        );
+        // Explicit subsecond sanity check — prevents a future regress
+        // that flips back to ts_seconds from passing the whole-second
+        // equality comparison above by coincidence.
+        assert_eq!(
+            back.connected_at.timestamp_subsec_millis(),
+            123,
+            "ft-ztcsl: the 123ms remainder must survive the roundtrip"
+        );
     }
 
     #[test]
