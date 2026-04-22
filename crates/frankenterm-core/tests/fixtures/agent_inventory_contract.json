@@ -1,0 +1,68 @@
+{
+  "filesystem_detection_available": true,
+  "installed": [
+    {
+      "binary_path": "/usr/local/bin/claude",
+      "config_path": "/Users/demo/.claude/settings.json",
+      "detected": true,
+      "display_name": "Claude Code",
+      "evidence": [
+        "found ~/.claude",
+        "binary: /usr/local/bin/claude"
+      ],
+      "root_paths": [
+        "/Users/demo/.claude"
+      ],
+      "slug": "claude",
+      "version": "1.2.3"
+    },
+    {
+      "binary_path": "/usr/local/bin/codex",
+      "detected": true,
+      "display_name": "Codex",
+      "root_paths": [
+        "/Users/demo/.codex"
+      ],
+      "slug": "codex",
+      "version": "0.9.0"
+    },
+    {
+      "config_path": "/Users/demo/.config/aider/aider.conf.yml",
+      "detected": true,
+      "evidence": [
+        "detected via ~/.config/aider"
+      ],
+      "slug": "aider"
+    },
+    {
+      "detected": false,
+      "display_name": "Gemini CLI",
+      "evidence": [
+        "not installed"
+      ],
+      "slug": "gemini"
+    }
+  ],
+  "running": {
+    "42": {
+      "display_name": "Codex",
+      "pane_id": 42,
+      "session_id": "sess-codex-42",
+      "slug": "codex",
+      "source": "pattern_engine",
+      "state": "working"
+    },
+    "7": {
+      "pane_id": 7,
+      "slug": "claude",
+      "source": "pane_title",
+      "state": "waiting_approval"
+    }
+  },
+  "summary": {
+    "configured_count": 2,
+    "installed_but_idle_count": 1,
+    "installed_count": 3,
+    "running_count": 2
+  }
+}
