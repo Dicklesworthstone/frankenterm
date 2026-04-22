@@ -7254,6 +7254,7 @@ mod tests {
         pane_id: u64,
         execution_id: impl Into<String>,
     ) -> StepResult {
+        use crate::runtime_compat::CompatRuntime;
         let execution_id = execution_id.into();
         let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
