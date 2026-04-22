@@ -29,7 +29,8 @@ pub struct RetentionConfig {
     pub cold_days: u32,
     /// Maximum hours for T3 (restricted/unredacted) data before mandatory purge.
     pub t3_max_hours: u32,
-    /// Extended retention days for T1 (metadata) data. Max 90.
+    /// Archived-phase retention days for T1 (metadata) data after the hot and
+    /// warm lifecycle windows complete. Max 90.
     pub t1_extended_days: u32,
     /// Maximum segment size in bytes before rolling to a new segment.
     pub max_segment_bytes: u64,
@@ -87,11 +88,15 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Effective retention window in hours for a given sensitivity tier.
+    /// Effective total retention window in hours for a given sensitivity tier.
     #[must_use]
     pub fn retention_hours(&self, tier: SensitivityTier) -> u64 {
         match tier {
-            SensitivityTier::T1Standard => (self.t1_extended_days as u64) * 24,
+            SensitivityTier::T1Standard => {
+                (self.hot_hours as u64)
+                    + (self.warm_days as u64) * 24
+                    + (self.t1_extended_days as u64) * 24
+            }
             SensitivityTier::T2Sensitive => {
                 (self.hot_hours as u64)
                     + (self.warm_days as u64) * 24
@@ -746,7 +751,10 @@ mod tests {
             t1_extended_days: 60,
             ..Default::default()
         };
-        assert_eq!(cfg.retention_hours(SensitivityTier::T1Standard), 60 * 24);
+        assert_eq!(
+            cfg.retention_hours(SensitivityTier::T1Standard),
+            24 + 7 * 24 + 60 * 24
+        );
         assert_eq!(
             cfg.retention_hours(SensitivityTier::T2Sensitive),
             24 + 7 * 24 + 30 * 24

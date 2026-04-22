@@ -349,7 +349,9 @@ proptest! {
     #[test]
     fn config_retention_hours_per_tier(cfg in arb_valid_config()) {
         let t1_hours = cfg.retention_hours(SensitivityTier::T1Standard);
-        let expected_t1 = (cfg.t1_extended_days as u64) * 24;
+        let expected_t1 = (cfg.hot_hours as u64)
+            + (cfg.warm_days as u64) * 24
+            + (cfg.t1_extended_days as u64) * 24;
         prop_assert_eq!(t1_hours, expected_t1, "T1 retention_hours mismatch");
 
         let t2_hours = cfg.retention_hours(SensitivityTier::T2Sensitive);
