@@ -47,11 +47,33 @@ pub fn canonicalize_json(value: &mut Value, parent_key: Option<&str>) {
         }
         Value::Number(number) => {
             if let Some(float) = number.as_f64() {
+                // [ft-m9gob] Guard against overflow in the rounding step.
+                // `float * 10_000.0` can produce f64::INFINITY for values
+                // above ~1.8e304 (still a valid finite f64, still valid
+                // JSON). `INFINITY.round() / 10_000 = INFINITY`, and
+                // `serde_json::Number::from_f64(INFINITY) = None` —
+                // the previous `.expect("rounded float")` then panicked
+                // the caller. Skip canonicalization when either the
+                // input or the rounded product is non-finite; the
+                // caller's original Number stays in place (no rounding
+                // applied, but no panic either). Non-finite input is
+                // also impossible via the public serde_json API —
+                // `Number::from_f64(NaN)` returns None — but the check
+                // is cheap defense-in-depth for any future construction
+                // path.
+                if !float.is_finite() {
+                    return;
+                }
                 if float.fract() != 0.0 {
                     let rounded = (float * 10_000.0).round() / 10_000.0;
-                    *value = Value::Number(
-                        serde_json::Number::from_f64(rounded).expect("rounded float"),
-                    );
+                    if let Some(num) = serde_json::Number::from_f64(rounded) {
+                        *value = Value::Number(num);
+                    }
+                    // else: rounded overflowed to ±Infinity (input was
+                    // above ~1.8e304). Preserve the caller's original
+                    // finite number — a golden-file diff on the
+                    // untrimmed precision is a lesser evil than a
+                    // panicked test.
                 }
             }
         }
@@ -137,6 +159,63 @@ mod tests {
             "golden mismatch for {}",
             path.display()
         );
+    }
+
+    // ── [ft-m9gob] canonicalize_json huge-f64 panic guard ──────────────
+
+    /// [ft-m9gob] A non-integer f64 above ~1.8e304 overflows the
+    /// `float * 10_000.0` rounding step to Infinity, which
+    /// `Number::from_f64` cannot represent. Pre-fix, the unconditional
+    /// `.expect("rounded float")` panicked. Post-fix, the huge
+    /// original Number is preserved (no rounding applied) and the
+    /// call returns cleanly.
+    #[test]
+    fn ft_m9gob_canonicalize_json_preserves_huge_finite_float_without_panicking() {
+        let mut value = json!({"metric": 1.5e305});
+        canonicalize_json(&mut value, None);
+        // Original finite float must be preserved — no panic, no
+        // silent mutation to Infinity.
+        let metric = value.get("metric").and_then(Value::as_f64).unwrap();
+        assert!(metric.is_finite(), "metric must stay finite: {metric}");
+        assert_eq!(metric, 1.5e305);
+    }
+
+    /// [ft-m9gob] Values that DO round cleanly still get canonicalized.
+    /// The fix must only skip the rounding when the overflow occurs,
+    /// not for every non-integer input.
+    #[test]
+    fn ft_m9gob_canonicalize_json_still_rounds_small_floats() {
+        let mut value = json!({"metric": 1.234_567_8});
+        canonicalize_json(&mut value, None);
+        let metric = value.get("metric").and_then(Value::as_f64).unwrap();
+        // Rounded to 4 decimal places: 1.2346.
+        assert!(
+            (metric - 1.2346).abs() < 1e-9,
+            "small float must still be rounded to 4dp, got {metric}"
+        );
+    }
+
+    /// [ft-m9gob] Integer-valued f64 passes through unchanged
+    /// (fract() == 0.0 branch) — guards against the fix accidentally
+    /// short-circuiting integer values too.
+    #[test]
+    fn ft_m9gob_canonicalize_json_integers_unchanged() {
+        let mut value = json!({"count": 1_000_000.0});
+        canonicalize_json(&mut value, None);
+        let count = value.get("count").and_then(Value::as_f64).unwrap();
+        assert_eq!(count, 1_000_000.0);
+    }
+
+    /// [ft-m9gob] Negative huge float — same overflow shape on the
+    /// absolute value side. `-1.5e305 * 10_000 = -inf`, same failure
+    /// mode pre-fix.
+    #[test]
+    fn ft_m9gob_canonicalize_json_negative_huge_float_is_safe() {
+        let mut value = json!({"metric": -1.5e305});
+        canonicalize_json(&mut value, None);
+        let metric = value.get("metric").and_then(Value::as_f64).unwrap();
+        assert!(metric.is_finite(), "negative huge must stay finite: {metric}");
+        assert_eq!(metric, -1.5e305);
     }
 
     #[test]
