@@ -379,7 +379,10 @@ pub trait RecorderStorage: Send + Sync {
     async fn health_with_cx(&self, cx: &crate::cx::Cx) -> RecorderStorageHealth {
         if cx.checkpoint().is_err() {
             return RecorderStorageHealth {
-                backend: RecorderBackendKind::AppendLog,
+                // Preserve the probed backend in degraded snapshots so
+                // operators can distinguish a cancelled Frankensqlite
+                // probe from a healthy append-log selection.
+                backend: self.backend_kind(),
                 degraded: true,
                 queue_depth: 0,
                 queue_capacity: 0,
@@ -1263,6 +1266,72 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct StubRecorderStorage {
+        backend: RecorderBackendKind,
+    }
+
+    impl RecorderStorage for StubRecorderStorage {
+        fn backend_kind(&self) -> RecorderBackendKind {
+            self.backend
+        }
+
+        async fn append_batch(
+            &self,
+            _req: AppendRequest,
+        ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+            Err(RecorderStorageError::BackendUnavailable {
+                backend: self.backend,
+                message: "append_batch unused in StubRecorderStorage".to_string(),
+            })
+        }
+
+        async fn flush(
+            &self,
+            _mode: FlushMode,
+        ) -> std::result::Result<FlushStats, RecorderStorageError> {
+            Ok(FlushStats {
+                backend: self.backend,
+                flushed_at_ms: 0,
+                latest_offset: None,
+            })
+        }
+
+        async fn read_checkpoint(
+            &self,
+            _consumer: &CheckpointConsumerId,
+        ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
+            Ok(None)
+        }
+
+        async fn commit_checkpoint(
+            &self,
+            _checkpoint: RecorderCheckpoint,
+        ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+            Ok(CheckpointCommitOutcome::NoopAlreadyAdvanced)
+        }
+
+        async fn health(&self) -> RecorderStorageHealth {
+            RecorderStorageHealth {
+                backend: self.backend,
+                degraded: false,
+                queue_depth: 0,
+                queue_capacity: 1,
+                latest_offset: None,
+                last_error: None,
+            }
+        }
+
+        async fn lag_metrics(
+            &self,
+        ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
+            Ok(RecorderStorageLag {
+                latest_offset: None,
+                consumers: Vec::new(),
+            })
+        }
+    }
+
     fn test_config(path: &Path) -> AppendLogStorageConfig {
         AppendLogStorageConfig {
             data_path: path.join("events.log"),
@@ -1502,6 +1571,39 @@ mod tests {
             assert_eq!(read_back.upto_offset.ordinal, 7);
             assert_eq!(read_back.upto_offset.byte_offset, 100);
             assert_eq!(read_back.schema_version, "ft.recorder.event.v1");
+        });
+    }
+
+    #[test]
+    fn trait_health_with_cx_cancelled_preserves_backend_kind() {
+        run_async_test(async {
+            let storage = StubRecorderStorage {
+                backend: RecorderBackendKind::FrankenSqlite,
+            };
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("pre-cancelled recorder health probe"),
+            );
+
+            let health = storage.health_with_cx(&cx).await;
+            assert!(health.degraded);
+            assert_eq!(health.backend, RecorderBackendKind::FrankenSqlite);
+            assert_eq!(
+                health.last_error.as_deref(),
+                Some("health cancelled pre-start via Cx")
+            );
+
+            let health_json = serde_json::to_value(&health).expect("serialize recorder health");
+            assert_eq!(
+                health_json["backend"],
+                serde_json::Value::String("frankensqlite".to_string())
+            );
+            assert_eq!(health_json["degraded"], serde_json::Value::Bool(true));
+            assert_eq!(
+                health_json["last_error"],
+                serde_json::Value::String("health cancelled pre-start via Cx".to_string())
+            );
         });
     }
 
