@@ -312,26 +312,43 @@ fn ping_stream_produces_identical_wire_output_across_backends() {
 }
 
 #[test]
-fn chunked_reads_preserve_wire_output() {
-    let script = encoded_ping_series(8);
-    let unchunked = run_once(
-        DispatchIoPreference::Auto,
+fn chunked_reads_preserve_wire_output_across_backends() {
+    let script = encoded_ping_series(12);
+    let baseline = run_once(
+        DispatchIoPreference::Poll,
         DispatchStreamKind::Unix,
         script.clone(),
         0,
-    )
-    .writes();
-    let chunked = run_once(
-        DispatchIoPreference::Auto,
-        DispatchStreamKind::Unix,
-        script,
-        1,
-    )
-    .writes();
-    assert_eq!(
-        chunked, unchunked,
-        "1-byte chunked reads must produce identical wire output"
     );
+    let baseline_bytes = baseline.writes();
+    let baseline_flushes = baseline.flush_count();
+
+    for chunk in [1usize, 2, 3, 5, 8, 13] {
+        for pref in ALL_PREFERENCES {
+            for stream_kind in ALL_STREAM_KINDS {
+                let handle = run_once(*pref, *stream_kind, script.clone(), chunk);
+                assert_eq!(
+                    handle.writes(),
+                    baseline_bytes,
+                    "wire output diverged for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+                assert_eq!(
+                    handle.flush_count(),
+                    baseline_flushes,
+                    "flush count diverged for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+                assert_eq!(
+                    handle.writable_waits(),
+                    baseline_flushes,
+                    "writable waits diverged for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+                assert!(
+                    handle.readable_waits() >= 1,
+                    "chunked read path should observe readiness for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
