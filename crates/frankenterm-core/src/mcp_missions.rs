@@ -45,6 +45,12 @@ fn read_capped_file(
     read_error_code: &'static str,
     oversize_error_code: &'static str,
 ) -> std::result::Result<String, McpToolError> {
+    use std::io::Read;
+
+    // Stage 1: stat-based early rejection when metadata is reliable.
+    // Succeeds on normal filesystems and catches the common hostile-
+    // repo case (a multi-GiB .ft/mission/active.json) before allocating
+    // anything.
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > max_bytes {
             return Err(McpToolError::new(
@@ -63,8 +69,20 @@ fn read_capped_file(
             ));
         }
     }
+    // metadata Err falls through deliberately. The streaming reader in
+    // stage 2 bounds memory at max_bytes + 1 regardless of whether
+    // metadata was available, so we don't need to hard-fail on stat
+    // failure (legitimate network filesystems, some procfs-style mounts).
 
-    let raw = std::fs::read_to_string(path).map_err(|err| {
+    // Stage 2: streaming bounded read. `Read::take(max_bytes + 1)` is
+    // the correct DoS defense — it caps the I/O layer itself, so a
+    // filesystem that lies about size via stat (procfs-like pseudo
+    // files, networked FS with untrusted stat) or a TOCTOU swap
+    // between stat and open cannot cause an unbounded allocation.
+    // Using read_to_string without `take()` would allocate the full
+    // content even when we planned to reject it at the post-read
+    // length check — exactly the OOM shape ft-up6u2 exists to prevent.
+    let file = std::fs::File::open(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             McpToolError::new(
                 read_error_code,
@@ -74,29 +92,51 @@ fn read_capped_file(
         } else {
             McpToolError::new(
                 read_error_code,
-                format!("Failed to read {}: {err}", path.display()),
+                format!("Failed to open {}: {err}", path.display()),
                 None,
             )
         }
     })?;
 
-    // Second-line defense: the metadata check can be dodged on
-    // filesystems that misreport size (procfs-like pseudo files) or
-    // via TOCTOU swap. Verify the actual bytes read fit the cap too.
-    if raw.len() as u64 > max_bytes {
+    let mut buf = Vec::with_capacity(max_bytes.min(1 << 20) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|err| {
+            McpToolError::new(
+                read_error_code,
+                format!("Failed to read {}: {err}", path.display()),
+                None,
+            )
+        })?;
+
+    // If read_to_end consumed max_bytes + 1 bytes, the file was AT
+    // LEAST one byte larger than the cap — reject. We can't distinguish
+    // "exactly max_bytes+1" from "5 GiB" from the length alone, but
+    // either case is equally a cap violation.
+    if buf.len() as u64 > max_bytes {
         return Err(McpToolError::new(
             oversize_error_code,
             format!(
-                "File {} read {} bytes; max allowed is {} bytes",
+                "File {} exceeds {} byte cap (streaming reader stopped after reading {} bytes)",
                 path.display(),
-                raw.len(),
-                max_bytes
+                max_bytes,
+                buf.len()
             ),
             None,
         ));
     }
 
-    Ok(raw)
+    // UTF-8 validation — mirrors the shape read_to_string previously
+    // provided. Invalid UTF-8 is a structural error in a JSON file
+    // anyway, so returning the read_error_code (not oversize) matches
+    // how serde_json::from_str would fail downstream.
+    String::from_utf8(buf).map_err(|err| {
+        McpToolError::new(
+            read_error_code,
+            format!("File {} is not valid UTF-8: {err}", path.display()),
+            None,
+        )
+    })
 }
 
 // ── Tx contract file resolution and loading ─────────────────────────────
