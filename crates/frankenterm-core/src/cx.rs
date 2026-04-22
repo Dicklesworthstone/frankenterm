@@ -282,10 +282,7 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    {
-        crate::runtime_compat::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await
-    }
-
+    { crate::runtime_compat::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await }
 }
 
 #[cfg(test)]

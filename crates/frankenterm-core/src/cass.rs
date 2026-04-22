@@ -888,8 +888,7 @@ impl CassClient {
         options: &ViewOptions,
     ) -> Result<CassViewResult, CassError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self
-            .query_with_cx(&cx, session_path, line_number, options)
+        self.query_with_cx(&cx, session_path, line_number, options)
             .await
     }
 

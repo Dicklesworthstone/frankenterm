@@ -875,7 +875,6 @@ impl IpcServer {
             self.run_with_auth_with_cx(&cx, event_bus, auth, shutdown_rx)
                 .await;
         }
-
     }
 
     /// Run the IPC server with registry and optional auth configuration.
@@ -3539,7 +3538,10 @@ mod tests {
 
     #[test]
     fn ipc_constant_time_eq_matches_on_equal_strings() {
-        assert!(ipc_constant_time_eq("correct-horse-battery-staple", "correct-horse-battery-staple"));
+        assert!(ipc_constant_time_eq(
+            "correct-horse-battery-staple",
+            "correct-horse-battery-staple"
+        ));
     }
 
     #[test]
@@ -3572,9 +3574,21 @@ mod tests {
         // always scans the full vector, so a back-of-vec match is equally
         // fast — functional side-effect: either ordering still authorizes.
         let auth = IpcAuth::new(vec![
-            IpcAuthToken { token: "decoy-1".to_string(), scopes: vec![IpcScope::All], expires_at_ms: None },
-            IpcAuthToken { token: "decoy-2".to_string(), scopes: vec![IpcScope::All], expires_at_ms: None },
-            IpcAuthToken { token: "real".to_string(),    scopes: vec![IpcScope::All], expires_at_ms: None },
+            IpcAuthToken {
+                token: "decoy-1".to_string(),
+                scopes: vec![IpcScope::All],
+                expires_at_ms: None,
+            },
+            IpcAuthToken {
+                token: "decoy-2".to_string(),
+                scopes: vec![IpcScope::All],
+                expires_at_ms: None,
+            },
+            IpcAuthToken {
+                token: "real".to_string(),
+                scopes: vec![IpcScope::All],
+                expires_at_ms: None,
+            },
         ]);
         assert!(auth.authorize(Some("real"), IpcScope::Read).is_ok());
     }
@@ -3588,7 +3602,10 @@ mod tests {
         // AND the loop must scan every candidate (timing invariant is
         // enforced by code review of the loop, not by measurement here).
         let auth = build_auth("correct-horse", vec![IpcScope::All], None);
-        assert!(auth.authorize(Some("correct-hors"), IpcScope::Read).is_err());
+        assert!(
+            auth.authorize(Some("correct-hors"), IpcScope::Read)
+                .is_err()
+        );
         assert!(auth.authorize(Some("correct-hor"), IpcScope::Read).is_err());
         assert!(auth.authorize(Some("c"), IpcScope::Read).is_err());
         assert!(auth.authorize(Some(""), IpcScope::Read).is_err());

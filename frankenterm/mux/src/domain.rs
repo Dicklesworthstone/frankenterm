@@ -1246,12 +1246,11 @@ mod tests {
         let domain = LocalDomain::with_pty_system("slow-spawn-test", Box::new(pty_system));
 
         let pane_id = promise::spawn::block_on(exec.run(async {
-            let mut spawn_pane =
-                std::pin::pin!(domain.spawn_pane(
-                    TerminalSize::default(),
-                    Some(CommandBuilder::new("slow-spawn-test")),
-                    None,
-                ));
+            let mut spawn_pane = std::pin::pin!(domain.spawn_pane(
+                TerminalSize::default(),
+                Some(CommandBuilder::new("slow-spawn-test")),
+                None,
+            ));
             let start = Instant::now();
 
             let first_poll = poll_fn(|cx| {
@@ -1276,7 +1275,10 @@ mod tests {
                 FIRST_POLL_BUDGET,
             );
 
-            spawn_pane.await.expect("spawn pane should succeed").pane_id()
+            spawn_pane
+                .await
+                .expect("spawn pane should succeed")
+                .pane_id()
         }));
 
         assert_eq!(

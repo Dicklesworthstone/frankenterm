@@ -43988,12 +43988,9 @@ mod tests {
             let restore_ok = mask & 0b1000 != 0;
 
             run_async_test(async move {
-                let stop_called =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let start_called =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let restore_called =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let start_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let restore_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                 let outcome = execute_restart_post_preflight(
                     sample_restart_options(),
@@ -44029,8 +44026,7 @@ mod tests {
                     {
                         let restore_called = std::sync::Arc::clone(&restore_called);
                         move |_, _, _| async move {
-                            restore_called
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            restore_called.store(true, std::sync::atomic::Ordering::SeqCst);
                             if restore_ok {
                                 Ok(sample_restart_restore_summary())
                             } else {
@@ -44043,14 +44039,12 @@ mod tests {
 
                 let stop_was = stop_called.load(std::sync::atomic::Ordering::SeqCst);
                 let start_was = start_called.load(std::sync::atomic::Ordering::SeqCst);
-                let restore_was =
-                    restore_called.load(std::sync::atomic::Ordering::SeqCst);
+                let restore_was = restore_called.load(std::sync::atomic::Ordering::SeqCst);
 
                 if !snap_ok {
                     // Snapshot abort: no downstream phase runs, no snapshot metadata.
-                    let abort = outcome.expect_err(&format!(
-                        "mask={mask:04b}: snapshot failure must abort"
-                    ));
+                    let abort = outcome
+                        .expect_err(&format!("mask={mask:04b}: snapshot failure must abort"));
                     assert_eq!(abort.phase, "snapshot", "mask={mask:04b}");
                     assert!(
                         abort.snapshot.is_none(),
@@ -44070,9 +44064,8 @@ mod tests {
                     );
                 } else if !stop_ok {
                     // Stop abort: snapshot preserved for manual recovery, start NOT attempted.
-                    let abort = outcome.expect_err(&format!(
-                        "mask={mask:04b}: stop failure must abort"
-                    ));
+                    let abort =
+                        outcome.expect_err(&format!("mask={mask:04b}: stop failure must abort"));
                     assert_eq!(abort.phase, "stop", "mask={mask:04b}");
                     assert_eq!(
                         abort.snapshot.as_ref().map(|s| s.checkpoint_id),
@@ -44093,9 +44086,8 @@ mod tests {
                     );
                 } else if !start_ok {
                     // Start abort: snapshot AND stopped_pids preserved; restore NOT attempted.
-                    let abort = outcome.expect_err(&format!(
-                        "mask={mask:04b}: start failure must abort"
-                    ));
+                    let abort =
+                        outcome.expect_err(&format!("mask={mask:04b}: start failure must abort"));
                     assert_eq!(abort.phase, "start", "mask={mask:04b}");
                     assert_eq!(
                         abort.snapshot.as_ref().map(|s| s.checkpoint_id),
@@ -44133,9 +44125,7 @@ mod tests {
                                 "mask={mask:04b}: RestoreFailed forwards restore error"
                             );
                         }
-                        other => panic!(
-                            "mask={mask:04b}: expected RestoreFailed, got {other:?}"
-                        ),
+                        other => panic!("mask={mask:04b}: expected RestoreFailed, got {other:?}"),
                     }
                     assert!(
                         stop_was && start_was && restore_was,

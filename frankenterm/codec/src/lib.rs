@@ -16,7 +16,7 @@
 // smol Async streams into codec async APIs, mixed graphs must continue to use
 // the smol path until those callers migrate.
 
-use anyhow::{Context as _, Error, bail};
+use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
@@ -321,15 +321,15 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         .checked_add(ident_len)
         .context("decode_raw_async: serial + ident header length overflow")?;
     let data_len = match (len as usize).overflowing_sub(header_len) {
-            (_, true) => {
-                return Err(CorruptResponse(format!(
-                    "decode_raw_async: sizes don't make sense: \
+        (_, true) => {
+            return Err(CorruptResponse(format!(
+                "decode_raw_async: sizes don't make sense: \
                     len:{len} serial:{serial} (enc={serial_len}) ident:{ident} (enc={ident_len})",
-                ))
-                .into());
-            }
-            (data_len, false) => data_len,
-        };
+            ))
+            .into());
+        }
+        (data_len, false) => data_len,
+    };
 
     if data_len > MAX_PDU_SIZE {
         anyhow::bail!(
@@ -379,18 +379,18 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
         .checked_add(ident_len)
         .context("serial + ident header length overflow")?;
     let data_len = match (len as usize).overflowing_sub(header_len) {
-            (_, true) => {
-                anyhow::bail!(
-                    "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
-                    len,
-                    serial,
-                    serial_len,
-                    ident,
-                    ident_len
-                );
-            }
-            (data_len, false) => data_len,
-        };
+        (_, true) => {
+            anyhow::bail!(
+                "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
+                len,
+                serial,
+                serial_len,
+                ident,
+                ident_len
+            );
+        }
+        (data_len, false) => data_len,
+    };
 
     if data_len > MAX_PDU_SIZE {
         anyhow::bail!(
@@ -1783,28 +1783,22 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_true_variants() {
-        assert!(
-            Pdu::WriteToPane(WriteToPane {
-                pane_id: 0,
-                data: vec![]
-            })
-            .is_user_input()
-        );
-        assert!(
-            Pdu::SendPaste(SendPaste {
-                pane_id: 0,
-                data: String::new()
-            })
-            .is_user_input()
-        );
-        assert!(
-            Pdu::Resize(Resize {
-                containing_tab_id: 0,
-                pane_id: 0,
-                size: TerminalSize::default(),
-            })
-            .is_user_input()
-        );
+        assert!(Pdu::WriteToPane(WriteToPane {
+            pane_id: 0,
+            data: vec![]
+        })
+        .is_user_input());
+        assert!(Pdu::SendPaste(SendPaste {
+            pane_id: 0,
+            data: String::new()
+        })
+        .is_user_input());
+        assert!(Pdu::Resize(Resize {
+            containing_tab_id: 0,
+            pane_id: 0,
+            size: TerminalSize::default(),
+        })
+        .is_user_input());
     }
 
     #[test]
@@ -2649,14 +2643,12 @@ mod test {
 
     #[test]
     fn pdu_is_user_input_set_pane_zoomed() {
-        assert!(
-            Pdu::SetPaneZoomed(SetPaneZoomed {
-                containing_tab_id: 0,
-                pane_id: 0,
-                zoomed: true,
-            })
-            .is_user_input()
-        );
+        assert!(Pdu::SetPaneZoomed(SetPaneZoomed {
+            containing_tab_id: 0,
+            pane_id: 0,
+            zoomed: true,
+        })
+        .is_user_input());
     }
 
     #[test]
