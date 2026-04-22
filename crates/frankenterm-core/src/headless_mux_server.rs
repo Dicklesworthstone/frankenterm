@@ -421,12 +421,39 @@ impl HeadlessMuxServer {
             }
 
             RemoteRequest::Heartbeat { from, pane_count } => {
+                // [ft-lekgj] Fail closed on unknown peer. Previously the
+                // handler silently returned HeartbeatAck for any node_id,
+                // producing a split-brain: the peer believed the
+                // federation was healthy while the server's `peers` map
+                // didn't contain it. Two natural paths reach this state:
+                //
+                //   1. Post-prune race — peer goes `Unreachable` via
+                //      check_peer_health, is removed by
+                //      prune_unreachable_peers, then reconnects after a
+                //      partition heal. Silent ACK means it never
+                //      rejoins.
+                //   2. Heartbeat-before-Join — message-reordering on a
+                //      lossy link delivers the first Heartbeat before
+                //      JoinFederation.
+                //
+                // A distinct `peer_not_federated` error lets the sender
+                // re-send JoinFederation and self-heal; HeartbeatAck is
+                // reserved for the case where the server actually
+                // updated its state for `from`.
                 if let Some(peer) = self.peers.get_mut(&from.node_id) {
                     peer.last_heartbeat_at = epoch_ms();
                     peer.pane_count = pane_count;
                     peer.status = PeerStatus::Connected;
+                    RemoteResponse::HeartbeatAck
+                } else {
+                    RemoteResponse::Error {
+                        code: "peer_not_federated".into(),
+                        message: format!(
+                            "node {} has not joined this server; re-send JoinFederation",
+                            from.node_id
+                        ),
+                    }
                 }
-                RemoteResponse::HeartbeatAck
             }
         }
     }
@@ -776,12 +803,86 @@ mod tests {
         server.handle_request(RemoteRequest::JoinFederation { peer: peer.clone() });
 
         // Send heartbeat with pane count
-        server.handle_request(RemoteRequest::Heartbeat {
+        let resp = server.handle_request(RemoteRequest::Heartbeat {
             from: peer.clone(),
             pane_count: 42,
         });
 
+        // [ft-lekgj] Regression: known peer still yields HeartbeatAck
+        // and state is updated.
+        match resp {
+            RemoteResponse::HeartbeatAck => {}
+            other => panic!("expected HeartbeatAck for known peer, got {other:?}"),
+        }
         assert_eq!(server.peers.get("n1").unwrap().pane_count, 42);
+    }
+
+    /// [ft-lekgj] A Heartbeat from a node the server never saw via
+    /// JoinFederation must NOT silently succeed. The peer needs to
+    /// learn that the server has no record of it so it can re-send
+    /// JoinFederation and self-heal; a silent HeartbeatAck would leave
+    /// the peer believing federation was healthy while the server's
+    /// registry excluded it.
+    #[test]
+    fn ft_lekgj_heartbeat_for_unknown_peer_returns_error() {
+        let mut server = make_server();
+        let ghost = ServerNodeId::new("phantom", 1234, "never-joined");
+
+        let resp = server.handle_request(RemoteRequest::Heartbeat {
+            from: ghost,
+            pane_count: 7,
+        });
+
+        match resp {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(
+                    code, "peer_not_federated",
+                    "distinct code so clients can pattern-match: got {code}, message={message}",
+                );
+                assert!(
+                    message.contains("never-joined"),
+                    "error message should cite the node_id for debuggability: {message}"
+                );
+            }
+            other => panic!(
+                "expected Error {{ code: peer_not_federated, .. }}, got {other:?}"
+            ),
+        }
+        assert!(
+            server.peers.is_empty(),
+            "unknown peer heartbeat must not synthesise a peer entry"
+        );
+    }
+
+    /// [ft-lekgj] Post-prune race: peer joined, went unreachable,
+    /// was removed by prune_unreachable_peers, then sent a fresh
+    /// heartbeat (the partition healed). The server must surface
+    /// `peer_not_federated` so the peer knows to rejoin.
+    #[test]
+    fn ft_lekgj_heartbeat_after_prune_returns_error() {
+        let mut server = make_server();
+        let peer = ServerNodeId::new("host1", 9876, "n1");
+        server.handle_request(RemoteRequest::JoinFederation { peer: peer.clone() });
+
+        // Force the peer into Unreachable and then prune it.
+        if let Some(p) = server.peers.get_mut("n1") {
+            p.status = PeerStatus::Unreachable;
+        }
+        let pruned = server.prune_unreachable_peers();
+        assert_eq!(pruned, vec!["n1".to_string()]);
+        assert!(server.peers.is_empty());
+
+        // Peer reconnects and heartbeats — must get the peer_not_federated signal.
+        let resp = server.handle_request(RemoteRequest::Heartbeat {
+            from: peer,
+            pane_count: 1,
+        });
+        match resp {
+            RemoteResponse::Error { code, .. } => {
+                assert_eq!(code, "peer_not_federated");
+            }
+            other => panic!("expected Error after prune, got {other:?}"),
+        }
     }
 
     #[test]
