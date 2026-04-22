@@ -54,7 +54,15 @@ kitty-shm = ["dep:nix", "dep:winapi"]
 use_serde = ["dep:serde", "frankenterm-color-types/use_serde", "frankenterm-blob-leases/serde", "bitflags/serde", "frankenterm-input-types/serde"]
 use_image = ["image", "dep:image"]
 image = ["sha2", "frankenterm-blob-leases"]
-tmux_cc = ["dep:pest", "dep:pest_derive"]
+# [ft-t995m] tmux_cc requires std — the generated pest parser and the
+# module's own code both rely on HashMap/String/ToString/format!,
+# none of which are available when the crate compiles with the
+# default `no_std` shape. Without the `std` implication, building
+# with `--features tmux_cc` alone produces 90+ "trait not in scope"
+# errors. Declaring the dependency makes `cargo test --features
+# tmux_cc` work out of the box and matches the shape the docs
+# feature (which already pulls tmux_cc + std via use_serde) uses.
+tmux_cc = ["dep:pest", "dep:pest_derive", "std"]
 docs = ["use_serde", "image", "tmux_cc", "kitty-shm"]
 
 [dev-dependencies]
