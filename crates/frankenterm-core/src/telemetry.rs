@@ -329,7 +329,17 @@ impl Histogram {
     }
 
     /// Record a value.
+    ///
+    /// [ft-b4l62] NaN-defence: `total_sum += NaN` corrupts the running
+    /// mean permanently (NaN is absorbing under addition), and NaN
+    /// samples make `quantile` non-deterministic because `partial_cmp`
+    /// returns `None` for NaN pairs. Same fail-closed shape as ft-761tz
+    /// (disk_pressure): skip NaN entirely so one bad sample cannot
+    /// poison observability forever.
     pub fn record(&mut self, value: f64) {
+        if value.is_nan() {
+            return;
+        }
         self.total_count += 1;
         self.total_sum += value;
         if value < self.min {
@@ -347,10 +357,13 @@ impl Histogram {
 
     /// Compute a quantile (0.0–1.0) from the retained samples.
     ///
-    /// Returns `None` if no samples have been recorded.
+    /// Returns `None` if no samples have been recorded or if `q` is NaN
+    /// ([ft-b4l62]: `f64::clamp(NaN, _, _)` returns NaN and
+    /// `(NaN as usize)` is 0, so the pre-fix code silently returned the
+    /// smallest sample for a NaN quantile instead of erroring out).
     #[must_use]
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        if self.samples.is_empty() {
+        if self.samples.is_empty() || q.is_nan() {
             return None;
         }
 
@@ -3236,5 +3249,67 @@ mod tests {
             "365 days should be 8760 hours, got: {}",
             dbg_365
         );
+    }
+
+    // ── ft-b4l62: Histogram NaN fail-closed regression ──────────────────
+
+    /// A NaN sample must not poison `total_sum`. Pre-fix, `record(NaN)`
+    /// made `mean()` return `Some(NaN)` forever even after thousands of
+    /// clean samples.
+    #[test]
+    fn ft_b4l62_histogram_record_nan_does_not_poison_mean() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(10.0);
+        h.record(20.0);
+        h.record(f64::NAN);
+        h.record(30.0);
+
+        let m = h.mean().expect("mean");
+        assert!(m.is_finite(), "mean must stay finite after NaN sample, got {m}");
+        assert_eq!(m, 20.0, "mean = (10+20+30)/3, NaN dropped on input");
+        assert_eq!(h.count(), 3, "NaN must not advance total_count");
+        assert_eq!(h.retained(), 3, "NaN must not enter the sample window");
+    }
+
+    /// All NaN samples → mean stays None (no division by the wrong
+    /// count) and min/max stay at their sentinel values.
+    #[test]
+    fn ft_b4l62_histogram_all_nan_keeps_mean_none() {
+        let mut h = Histogram::new("latency_ms", 16);
+        for _ in 0..5 {
+            h.record(f64::NAN);
+        }
+        assert!(h.mean().is_none(), "all-NaN stream must surface as no samples");
+        assert_eq!(h.count(), 0);
+        assert!(h.min_max().is_none());
+    }
+
+    /// A NaN quantile input must not silently return the smallest
+    /// sample. Pre-fix, `f64::clamp(NaN, 0.0, 1.0)` returned NaN and
+    /// `(NaN as usize)` was 0, so `quantile(NaN)` landed on `sorted[0]`.
+    #[test]
+    fn ft_b4l62_histogram_quantile_nan_returns_none() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(10.0);
+        h.record(20.0);
+        h.record(30.0);
+        assert!(h.quantile(f64::NAN).is_none());
+        // Valid quantiles still work after the check.
+        assert!(h.quantile(0.5).is_some());
+    }
+
+    /// The `{+,-}infinity` edge-cases on `q` are clamped to [0.0, 1.0]
+    /// and still return a real sample — this is the pre-existing
+    /// contract and the ft-b4l62 fix must not regress it.
+    #[test]
+    fn ft_b4l62_histogram_quantile_infinity_inputs_still_work() {
+        let mut h = Histogram::new("latency_ms", 16);
+        h.record(10.0);
+        h.record(20.0);
+        h.record(30.0);
+        // +inf → clamp to 1.0 → max sample (30.0).
+        assert_eq!(h.quantile(f64::INFINITY), Some(30.0));
+        // -inf → clamp to 0.0 → min sample (10.0).
+        assert_eq!(h.quantile(f64::NEG_INFINITY), Some(10.0));
     }
 }
