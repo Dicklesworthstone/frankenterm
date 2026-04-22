@@ -3839,4 +3839,109 @@ mod tests {
         // But it should NOT match a longer string
         assert!(!match_rule_glob("codex.err?r", "codex.errror"));
     }
+
+    // ── [ft-s6l5b] match_rule_glob property tests ────────────────────
+    //
+    // The hand-rolled glob matcher at events.rs:1121 is a backtrack
+    // state machine with `*` and `?` wildcards. The preceding example
+    // tests pin specific cases; these properties pin the CONTRACT the
+    // state machine must satisfy across random inputs — a regression
+    // in any of these breaks exclude-rule correctness for operators.
+
+    // Fixture alphabet: the rule-id character set in practice is
+    // ASCII alphanumerics + `.`, `:`, `_`. Confining proptest inputs
+    // to this alphabet keeps the state machine exercised on realistic
+    // traffic without wasting shrinks on bytes the grammar will never
+    // see (emoji, UTF-8 multi-byte, etc.). `?` and `*` are excluded
+    // from the VALUE alphabet so we can distinguish "pattern wildcard"
+    // from "literal asterisk in value" cleanly.
+    fn arb_exact_value() -> impl proptest::prelude::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop::collection::vec(
+            prop_oneof![
+                9 => (b'a'..=b'z').prop_map(|b| b as char),
+                2 => (b'0'..=b'9').prop_map(|b| b as char),
+                1 => Just('.'),
+                1 => Just(':'),
+                1 => Just('_'),
+            ],
+            0..24,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest::proptest! {
+        /// Invariant 1 — exact patterns (no `*`, no `?`) are idempotent
+        /// under self-match AND reject any value of different length.
+        /// Pins the fast-exit branch at events.rs:1122 that short-
+        /// circuits on non-wildcard patterns.
+        #[test]
+        fn match_rule_glob_exact_pattern_self_matches(pat in arb_exact_value()) {
+            proptest::prop_assume!(!pat.contains('*') && !pat.contains('?'));
+            proptest::prop_assert!(
+                match_rule_glob(&pat, &pat),
+                "exact pattern {pat:?} must match itself"
+            );
+        }
+
+        /// Invariant 2 — a lone `"*"` matches every value, including
+        /// the empty string. Operators rely on this as the
+        /// allow-everything escape hatch.
+        #[test]
+        fn match_rule_glob_star_matches_everything(v in arb_exact_value()) {
+            proptest::prop_assert!(
+                match_rule_glob("*", &v),
+                "pattern `*` must match any value; failed on {v:?}"
+            );
+        }
+
+        /// Invariant 3 — N consecutive `?`s match exactly N-character
+        /// values and reject any other length. Catches off-by-one in
+        /// the loop at events.rs:1132-1163.
+        #[test]
+        fn match_rule_glob_all_questions_is_length_preserving(
+            n in 1usize..=16,
+            v in arb_exact_value(),
+        ) {
+            let pat: String = "?".repeat(n);
+            let char_count = v.chars().count();
+            let expected = char_count == n;
+            proptest::prop_assert_eq!(
+                match_rule_glob(&pat, &v),
+                expected,
+                "pattern `{}` must match iff value has {} chars (got {} chars in {:?})",
+                pat, n, char_count, v
+            );
+        }
+
+        /// Invariant 4 — empty pattern matches ONLY the empty value.
+        /// Pins events.rs:1168-1169 which resolves `p_rem.is_empty()`
+        /// against `v_rem` being fully consumed.
+        #[test]
+        fn match_rule_glob_empty_pattern_matches_only_empty_value(v in arb_exact_value()) {
+            let expected = v.is_empty();
+            proptest::prop_assert_eq!(
+                match_rule_glob("", &v),
+                expected,
+                "empty pattern matched non-empty value {:?}",
+                v
+            );
+        }
+
+        /// Invariant 5 — a value can be matched by its own value used
+        /// as a glob pattern when that value has no `*` or `?`. Same
+        /// as Invariant 1 but expressed from the value's perspective
+        /// (catches a bug that accepts reflexivity for literal chars
+        /// but breaks when `.` / `:` / `_` are present).
+        #[test]
+        fn match_rule_glob_reflexive_on_wildcard_free_values(
+            v in arb_exact_value(),
+        ) {
+            proptest::prop_assume!(!v.contains('*') && !v.contains('?'));
+            proptest::prop_assert!(
+                match_rule_glob(&v, &v),
+                "reflexivity failed: match_rule_glob({v:?}, {v:?}) returned false"
+            );
+        }
+    }
 }
