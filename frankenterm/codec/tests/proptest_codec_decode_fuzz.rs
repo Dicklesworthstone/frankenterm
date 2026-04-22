@@ -21,8 +21,11 @@
 //!   (3) `stream_decode` over random buffers — exercises the partial-
 //!       frame path that the mux uses on every read from a socket.
 
-use codec::Pdu;
+use codec::{Pdu, Ping};
 use proptest::prelude::*;
+
+const COMPRESSED_MASK: u64 = 1 << 63;
+const PING_IDENT: u64 = 1;
 
 fn assert_decoded_pdu_is_well_formed(decoded: &codec::DecodedPdu) {
     // The serial is a u64; nothing stronger to assert at the envelope.
@@ -31,6 +34,42 @@ fn assert_decoded_pdu_is_well_formed(decoded: &codec::DecodedPdu) {
     // documented fall-through for unknown idents and is acceptable.
     let name = decoded.pdu.pdu_name();
     assert!(!name.is_empty(), "decoded pdu must have a non-empty name");
+}
+
+fn structured_header_frame(ident: u64, serial: u64, body: &[u8], is_compressed: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + body.len());
+
+    let mut ident_buf = Vec::new();
+    let _ = leb128::write::unsigned(&mut ident_buf, ident);
+
+    let mut serial_buf = Vec::new();
+    let _ = leb128::write::unsigned(&mut serial_buf, serial);
+
+    let total_payload_len = ident_buf.len() + serial_buf.len() + body.len();
+    let mut len_word = total_payload_len as u64;
+    if is_compressed {
+        len_word |= COMPRESSED_MASK;
+    }
+    let _ = leb128::write::unsigned(&mut buf, len_word);
+    buf.extend_from_slice(&ident_buf);
+    buf.extend_from_slice(&serial_buf);
+    buf.extend_from_slice(body);
+    buf
+}
+
+#[test]
+fn structured_header_helper_uses_real_codec_compression_bit() {
+    let decoded = Pdu::decode(structured_header_frame(PING_IDENT, 77, &[], false).as_slice())
+        .expect("uncompressed empty Ping frame should decode");
+    assert_eq!(decoded.serial, 77);
+    assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+
+    let err = Pdu::decode(structured_header_frame(PING_IDENT, 77, &[], true).as_slice())
+        .expect_err("compressed-flagged empty Ping frame should hit zstd decode and fail");
+    assert!(
+        !err.to_string().is_empty(),
+        "invalid compressed payload should surface a typed error"
+    );
 }
 
 proptest! {
@@ -72,27 +111,7 @@ proptest! {
         // the top bit of the length word as the compressed flag. We don't
         // need to replicate the exact flag encoding for fuzz purposes;
         // generating plausible but possibly invalid headers is the point.
-        let mut buf = Vec::with_capacity(32 + body.len());
-
-        let mut ident_buf = Vec::new();
-        let _ = leb128::write::unsigned(&mut ident_buf, ident);
-
-        let mut serial_buf = Vec::new();
-        let _ = leb128::write::unsigned(&mut serial_buf, serial);
-
-        let total_payload_len = ident_buf.len() + serial_buf.len() + body.len();
-        let mut len_word = total_payload_len as u64;
-        if is_compressed {
-            // Flip the top bit so the decoder exercises the compressed
-            // branch of its length decode; if the body isn't actually a
-            // valid compressed payload, the decoder should surface a
-            // typed error, not panic.
-            len_word |= 1u64 << 62;
-        }
-        let _ = leb128::write::unsigned(&mut buf, len_word);
-        buf.extend_from_slice(&ident_buf);
-        buf.extend_from_slice(&serial_buf);
-        buf.extend_from_slice(&body);
+        let buf = structured_header_frame(ident, serial, body.as_slice(), is_compressed);
 
         match Pdu::decode(buf.as_slice()) {
             Ok(decoded) => assert_decoded_pdu_is_well_formed(&decoded),

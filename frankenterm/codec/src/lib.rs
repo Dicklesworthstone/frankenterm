@@ -170,7 +170,7 @@ async fn encode_raw_async<W: Unpin + AsyncWriteExt>(
 }
 
 /// Read a single leb128 encoded value from the stream
-async fn read_u64_async<R>(r: &mut R) -> anyhow::Result<u64>
+async fn read_u64_async_with_len<R>(r: &mut R) -> anyhow::Result<(u64, usize)>
 where
     R: Unpin + AsyncRead + std::fmt::Debug,
 {
@@ -192,8 +192,32 @@ where
 
         match leb128::read::unsigned(&mut buf.as_slice()) {
             Ok(n) => {
-                return Ok(n);
+                return Ok((n, buf.len()));
             }
+            Err(leb128::read::Error::IoError(_)) => continue,
+            Err(leb128::read::Error::Overflow) => anyhow::bail!("leb128 is too large"),
+        }
+    }
+}
+
+/// Read a single leb128 encoded value from the stream.
+async fn read_u64_async<R>(r: &mut R) -> anyhow::Result<u64>
+where
+    R: Unpin + AsyncRead + std::fmt::Debug,
+{
+    read_u64_async_with_len(r).await.map(|(value, _)| value)
+}
+
+/// Read a single leb128 encoded value from the stream
+fn read_u64_with_len<R: std::io::Read>(r: &mut R) -> anyhow::Result<(u64, usize)> {
+    let mut buf = vec![];
+    loop {
+        let mut byte = [0u8];
+        r.read_exact(&mut byte).context("reading leb128")?;
+        buf.push(byte[0]);
+
+        match leb128::read::unsigned(&mut buf.as_slice()) {
+            Ok(n) => return Ok((n, buf.len())),
             Err(leb128::read::Error::IoError(_)) => continue,
             Err(leb128::read::Error::Overflow) => anyhow::bail!("leb128 is too large"),
         }
@@ -202,12 +226,7 @@ where
 
 /// Read a single leb128 encoded value from the stream
 fn read_u64<R: std::io::Read>(mut r: R) -> anyhow::Result<u64> {
-    leb128::read::unsigned(&mut r)
-        .map_err(|err| match err {
-            leb128::read::Error::IoError(ioerr) => anyhow::Error::new(ioerr),
-            err => anyhow::Error::new(err),
-        })
-        .context("reading leb128")
+    read_u64_with_len(&mut r).map(|(value, _)| value)
 }
 
 #[derive(Debug)]
@@ -275,7 +294,7 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
 ) -> anyhow::Result<Decoded> {
-    let len = read_u64_async(r)
+    let (len, _len_len) = read_u64_async_with_len(r)
         .await
         .context("decode_raw_async failed to read PDU length")?;
     let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
@@ -283,7 +302,7 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     } else {
         (len, false)
     };
-    let serial = read_u64_async(r)
+    let (serial, serial_len) = read_u64_async_with_len(r)
         .await
         .context("decode_raw_async failed to read PDU serial")?;
     if let Some(max_serial) = max_serial {
@@ -295,17 +314,17 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
             .into());
         }
     }
-    let ident = read_u64_async(r)
+    let (ident, ident_len) = read_u64_async_with_len(r)
         .await
         .context("decode_raw_async failed to read PDU ident")?;
-    let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
+    let header_len = serial_len
+        .checked_add(ident_len)
+        .context("decode_raw_async: serial + ident header length overflow")?;
+    let data_len = match (len as usize).overflowing_sub(header_len) {
             (_, true) => {
                 return Err(CorruptResponse(format!(
                     "decode_raw_async: sizes don't make sense: \
-                    len:{len} serial:{serial} (enc={}) ident:{ident} (enc={})",
-                    encoded_length(serial),
-                    encoded_length(ident)
+                    len:{len} serial:{serial} (enc={serial_len}) ident:{ident} (enc={ident_len})",
                 ))
                 .into());
             }
@@ -348,24 +367,26 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
 /// Decode a frame.
 /// See encode_raw() for the frame format.
 fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
-    let len = read_u64(r.by_ref()).context("reading PDU length")?;
+    let (len, _len_len) = read_u64_with_len(&mut r).context("reading PDU length")?;
     let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
         (len & !COMPRESSED_MASK, true)
     } else {
         (len, false)
     };
-    let serial = read_u64(r.by_ref()).context("reading PDU serial")?;
-    let ident = read_u64(r.by_ref()).context("reading PDU ident")?;
-    let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
+    let (serial, serial_len) = read_u64_with_len(&mut r).context("reading PDU serial")?;
+    let (ident, ident_len) = read_u64_with_len(&mut r).context("reading PDU ident")?;
+    let header_len = serial_len
+        .checked_add(ident_len)
+        .context("serial + ident header length overflow")?;
+    let data_len = match (len as usize).overflowing_sub(header_len) {
             (_, true) => {
                 anyhow::bail!(
                     "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
                     len,
                     serial,
-                    encoded_length(serial),
+                    serial_len,
                     ident,
-                    encoded_length(ident)
+                    ident_len
                 );
             }
             (data_len, false) => data_len,
@@ -2387,6 +2408,26 @@ mod test {
                 "unexpected error message: {}",
                 message
             );
+        });
+    }
+
+    #[test]
+    fn decode_accepts_valid_non_canonical_leb128_headers() {
+        let wire = [0x84, 0x00, 0x81, 0x00, 0xE3, 0x00];
+        let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
+        assert_eq!(decoded.serial, 1);
+        assert_eq!(decoded.pdu, Pdu::Invalid { ident: 99 });
+    }
+
+    #[test]
+    fn decode_raw_async_accepts_valid_non_canonical_leb128_headers() {
+        runtime::block_on(async {
+            let mut reader = runtime::Cursor::new(vec![0x84, 0x00, 0x81, 0x00, 0xE3, 0x00]);
+            let decoded = Pdu::decode_async(&mut reader, None)
+                .await
+                .expect("valid non-canonical header");
+            assert_eq!(decoded.serial, 1);
+            assert_eq!(decoded.pdu, Pdu::Invalid { ident: 99 });
         });
     }
 
