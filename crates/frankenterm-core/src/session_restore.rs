@@ -1014,26 +1014,26 @@ pub fn delete_session(db_path: &str, session_id: &str) -> Result<bool, RestoreEr
     let tx = conn.transaction()?;
 
     // Delete pane states via checkpoint cascade
-    tx.execute(
+    let deleted_pane_states = tx.execute(
         "DELETE FROM mux_pane_state WHERE checkpoint_id IN
          (SELECT id FROM session_checkpoints WHERE session_id = ?1)",
         [session_id],
     )?;
 
     // Delete checkpoints
-    tx.execute(
+    let deleted_checkpoints = tx.execute(
         "DELETE FROM session_checkpoints WHERE session_id = ?1",
         [session_id],
     )?;
 
     // Delete session
-    let deleted = tx.execute(
+    let deleted_sessions = tx.execute(
         "DELETE FROM mux_sessions WHERE session_id = ?1",
         [session_id],
     )?;
 
     tx.commit()?;
-    Ok(deleted > 0)
+    Ok(deleted_sessions > 0 || deleted_checkpoints > 0 || deleted_pane_states > 0)
 }
 
 // =============================================================================
@@ -3967,6 +3967,53 @@ mod tests {
         let (db_path, _conn, _dir) = setup_test_db();
         let deleted = delete_session(&db_path, "nonexistent").unwrap();
         assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_session_reports_cleanup_for_orphaned_checkpoint_rows() {
+        let (db_path, conn, _dir) = setup_test_db();
+
+        // SQLite foreign-key enforcement is connection-local; this helper uses
+        // a fresh connection without enabling it, so corrupted older DBs can
+        // still carry checkpoint rows whose parent mux_sessions row is gone.
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!["sess-orphan", 1000i64, "periodic", "hash123", 1i64, 64i64],
+        )
+        .unwrap();
+        let checkpoint_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (?1, ?2, ?3)",
+            params![checkpoint_id, 7i64, "{}"],
+        )
+        .unwrap();
+
+        let deleted = delete_session(&db_path, "sess-orphan").unwrap();
+        assert!(
+            deleted,
+            "delete_session must report success when it removed orphaned checkpoint/pane rows"
+        );
+
+        let checkpoint_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints WHERE session_id = 'sess-orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+
+        let pane_state_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                [checkpoint_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pane_state_count, 0);
     }
 
     // ---------------------------------------------------------------
