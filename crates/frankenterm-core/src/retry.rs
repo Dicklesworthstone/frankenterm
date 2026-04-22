@@ -127,6 +127,11 @@ impl RetryPolicy {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)] // clamped to [0, max_ms]
+    fn clamp_delay_ms(base_ms: f64, jitter: f64, max_ms: u64) -> u64 {
+        (base_ms + jitter).clamp(0.0, max_ms as f64).round() as u64
+    }
+
     /// Calculate the delay for a given attempt number (0-indexed).
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // ms values are well within f64 precision for delays
@@ -169,7 +174,9 @@ impl RetryPolicy {
             0.0
         };
 
-        let delay_ms = (base_ms + jitter).max(0.0).round();
+        // The configured max_delay is an external contract, so clamp after
+        // jitter as well; otherwise positive jitter can overshoot the cap.
+        let delay_ms = Self::clamp_delay_ms(base_ms, jitter, max_ms);
         Duration::from_millis(delay_ms as u64)
     }
 }
@@ -284,6 +291,19 @@ where
             }
             Err(e) => {
                 attempt += 1;
+
+                // [ft-gjjew] An operation-level Cancelled error is caller
+                // intent, not a transient backend failure. Retrying it burns
+                // budget and can stretch shutdown/cancel paths far past the
+                // first failing attempt. Surface it immediately, matching the
+                // pre-attempt and backoff cancellation semantics above.
+                if matches!(e, Error::Cancelled(_)) {
+                    return RetryOutcome {
+                        result: Err(e),
+                        attempts: attempt,
+                        elapsed: start.elapsed(),
+                    };
+                }
 
                 if let Some(max) = policy.max_attempts {
                     if attempt >= max {
@@ -688,6 +708,31 @@ mod tests {
     }
 
     #[test]
+    fn clamp_delay_ms_caps_positive_jitter_at_max() {
+        assert_eq!(RetryPolicy::clamp_delay_ms(1_000.0, 250.0, 1_000), 1_000);
+        assert_eq!(RetryPolicy::clamp_delay_ms(1_000.0, -1_500.0, 1_000), 0);
+    }
+
+    #[test]
+    fn jitter_never_pushes_delay_above_max() {
+        let max_delay = Duration::from_secs(1);
+        let policy = RetryPolicy {
+            initial_delay: max_delay,
+            max_delay,
+            backoff_factor: 1.0,
+            jitter_percent: 1.0,
+            max_attempts: Some(3),
+        };
+
+        for _ in 0..256 {
+            assert!(
+                policy.delay_for_attempt(0) <= max_delay,
+                "jittered delay exceeded configured max_delay"
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::cast_precision_loss)] // Test values are small enough for f64
     fn jitter_within_range() {
         let policy = RetryPolicy {
@@ -861,9 +906,7 @@ mod tests {
     #[test]
     fn cancelled_error_does_not_trip_circuit_breaker_ft_gc4hz() {
         run_async_test(async {
-            use crate::circuit_breaker::{
-                CircuitBreaker, CircuitBreakerConfig, CircuitStateKind,
-            };
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
 
             let policy = RetryPolicy {
                 initial_delay: Duration::from_millis(1),
@@ -874,11 +917,8 @@ mod tests {
             };
 
             // Threshold of 1 — a single recorded failure would open the circuit.
-            let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
-                1,
-                1,
-                Duration::from_secs(60),
-            ));
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_secs(60)));
 
             // Operation returns Cancelled (as would happen if the caller's
             // Cx is cancelled and the retry loop surfaces it). Before
@@ -1652,6 +1692,37 @@ mod tests {
         });
     }
 
+    #[test]
+    fn retry_cancelled_operation_is_not_retried_ft_gjjew() {
+        run_async_test(async {
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                backoff_factor: 1.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
+
+            let result: Result<i32> = with_retry(&policy, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::Cancelled("stop now".into()))
+                }
+            })
+            .await;
+
+            assert!(matches!(result, Err(Error::Cancelled(_))));
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                1,
+                "operation-level cancellation must surface on the first attempt"
+            );
+        });
+    }
+
     // ── with_retry_and_circuit success path ────────────────────────
 
     #[test]
@@ -1678,6 +1749,43 @@ mod tests {
             assert!(circuit.allow());
             let status = circuit.status();
             assert_eq!(format!("{:?}", status.state), "Closed");
+        });
+    }
+
+    #[test]
+    fn circuit_retry_cancelled_operation_is_not_retried_ft_gjjew() {
+        run_async_test(async {
+            use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitStateKind};
+
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                backoff_factor: 1.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(5),
+            };
+            let call_count = Arc::new(AtomicU32::new(0));
+            let call_count_clone = Arc::clone(&call_count);
+            let mut circuit =
+                CircuitBreaker::new(CircuitBreakerConfig::new(2, 1, Duration::from_secs(60)));
+
+            let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || {
+                let count = Arc::clone(&call_count_clone);
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::Cancelled("shutdown requested".into()))
+                }
+            })
+            .await;
+
+            assert!(matches!(result, Err(Error::Cancelled(_))));
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            let status = circuit.status();
+            assert_eq!(status.state, CircuitStateKind::Closed);
+            assert_eq!(status.consecutive_failures, 0);
+            let tel = circuit.telemetry().snapshot();
+            assert_eq!(tel.failures_recorded, 0);
+            assert_eq!(tel.trips_total, 0);
         });
     }
 
