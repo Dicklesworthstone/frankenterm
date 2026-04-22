@@ -1038,6 +1038,20 @@ impl NotificationCooldown {
             let suppressed = entry.suppressed_since_notify;
             entry.last_notified = now;
             entry.suppressed_since_notify = 0;
+            // [ft-hyrav] Refresh the insertion_order position so this
+            // just-used key is the MOST recent, not stuck where it was
+            // first inserted. Without this, a busy key that emits Send
+            // repeatedly can be evicted by the next-novel-key path at
+            // line 1047-1050 while a genuinely-dormant key with a
+            // later insertion stays alive. Mirrors the same fix in
+            // EventDeduplicator at events.rs:867-870 for window-expired
+            // reset. The remove(pos)+push_back pair is O(n) but n <=
+            // max_capacity so the cost is bounded by the caller's
+            // chosen capacity.
+            if let Some(pos) = self.insertion_order.iter().position(|k| k == key) {
+                self.insertion_order.remove(pos);
+            }
+            self.insertion_order.push_back(key.to_string());
             return CooldownVerdict::Send {
                 suppressed_since_last: suppressed,
             };
@@ -2397,6 +2411,68 @@ mod tests {
             CooldownVerdict::Send {
                 suppressed_since_last: 0
             }
+        );
+    }
+
+    // [ft-hyrav] When a cooldown expires and Send fires, the insertion_order
+    // position for that key must be refreshed so the next LRU eviction
+    // doesn't pick it over an older-but-truly-dormant key. Pre-fix, the
+    // expired-Send branch mutated the entry but left insertion_order
+    // alone, so a busy key would be evicted before a dormant one —
+    // silently losing its cooldown state and flooding a notification that
+    // should have carried a suppressed-count.
+    //
+    // The test uses a short cooldown so we can observe the expired branch
+    // without slow wall-clock sleeps: 5ms cooldown + 50ms sleep is well
+    // outside the Instant::now() resolution floor on all supported
+    // platforms.
+    #[test]
+    fn cooldown_expired_send_refreshes_lru_position_ft_hyrav() {
+        let mut cd = NotificationCooldown::with_config(Duration::from_millis(5), 3);
+
+        // Seed A, B, C in insertion order. Each is a first-occurrence
+        // Send; insertion_order is [A, B, C].
+        cd.check("a");
+        cd.check("b");
+        cd.check("c");
+        assert_eq!(cd.len(), 3);
+
+        // Let A's cooldown expire, then re-check. Pre-fix: entry
+        // last_notified bumped, but insertion_order stayed [A, B, C].
+        // Post-fix: insertion_order becomes [B, C, A].
+        std::thread::sleep(Duration::from_millis(50));
+        let verdict = cd.check("a");
+        assert!(
+            matches!(verdict, CooldownVerdict::Send { .. }),
+            "A's cooldown expired so check must emit Send, got {verdict:?}"
+        );
+
+        // Introduce D to trigger a capacity eviction. Pre-fix: the
+        // oldest by INSERTION is A, so A gets evicted even though it
+        // was just refreshed. Post-fix: B is now the oldest-by-use,
+        // so B is evicted.
+        cd.check("d");
+        assert_eq!(cd.len(), 3);
+
+        // The key observation: A's state must SURVIVE the D insert.
+        // If A was evicted (pre-fix behavior), re-checking A returns
+        // Send { suppressed_since_last: 0 } — indistinguishable from
+        // a first-occurrence. If A survived (post-fix), the entry is
+        // still in cooldown (its last_notified is ~50ms ago, still
+        // < 5ms, wait — actually 50ms > 5ms so cooldown has expired
+        // again). So we can't detect survival via Suppress alone.
+        //
+        // Instead, assert the deterministic LRU outcome: B must be
+        // the one that's gone. Re-checking B after eviction returns
+        // Send with suppressed_since_last=0 (first-occurrence shape),
+        // and cd.len() stays at 3.
+        assert!(
+            cd.get("b").is_none(),
+            "ft-hyrav: B must be evicted (oldest-by-use after A was refreshed), but it's still present"
+        );
+        assert!(
+            cd.get("a").is_some(),
+            "ft-hyrav: A was just refreshed — it must NOT be the eviction victim"
         );
     }
 
