@@ -24,6 +24,13 @@ struct ManifestListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ResourceTemplateManifestResponse {
+    #[serde(rename = "resourceTemplates")]
+    resource_templates: Vec<ResourceTemplateListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolListEntry {
     name: String,
     #[serde(default)]
@@ -44,6 +51,22 @@ struct ToolListEntry {
 #[serde(deny_unknown_fields)]
 struct ResourceListEntry {
     uri: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceTemplateListEntry {
+    #[serde(rename = "uriTemplate")]
+    uri_template: String,
     name: String,
     #[serde(default)]
     description: Option<String>,
@@ -155,10 +178,47 @@ fn capture_manifest_lists(db_path: Option<PathBuf>) -> Value {
     })
 }
 
+fn capture_resource_template_lists(db_path: Option<PathBuf>) -> Value {
+    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+
+    let mut resource_templates: Vec<Value> = server
+        .resource_templates()
+        .into_iter()
+        .map(|resource_template| {
+            json!({
+                "uriTemplate": resource_template.uri_template,
+                "name": resource_template.name,
+                "description": resource_template.description,
+                "mimeType": resource_template.mime_type,
+                "version": resource_template.version,
+                "tags": resource_template.tags,
+            })
+        })
+        .collect();
+    resource_templates.sort_by(|a, b| {
+        let ua = a.get("uriTemplate").and_then(Value::as_str).unwrap_or("");
+        let ub = b.get("uriTemplate").and_then(Value::as_str).unwrap_or("");
+        ua.cmp(ub)
+    });
+
+    json!({
+        "resourceTemplates": resource_templates,
+    })
+}
+
 fn parse_manifest(value: Value) -> Result<ManifestListResponse, String> {
     let manifest: ManifestListResponse =
         serde_json::from_value(value).map_err(|err| err.to_string())?;
     validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn parse_resource_template_manifest(
+    value: Value,
+) -> Result<ResourceTemplateManifestResponse, String> {
+    let manifest: ResourceTemplateManifestResponse =
+        serde_json::from_value(value).map_err(|err| err.to_string())?;
+    validate_resource_template_manifest(&manifest)?;
     Ok(manifest)
 }
 
@@ -181,6 +241,22 @@ fn validate_manifest(manifest: &ManifestListResponse) -> Result<(), String> {
     for prompt in &manifest.prompts {
         if !prompt_names.insert(prompt.name.clone()) {
             return Err(format!("duplicate prompt name: {}", prompt.name));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_resource_template_manifest(
+    manifest: &ResourceTemplateManifestResponse,
+) -> Result<(), String> {
+    let mut template_uris = BTreeSet::new();
+    for resource_template in &manifest.resource_templates {
+        if !template_uris.insert(resource_template.uri_template.clone()) {
+            return Err(format!(
+                "duplicate resource template uri: {}",
+                resource_template.uri_template
+            ));
         }
     }
 
@@ -212,6 +288,24 @@ fn live_server_manifests_conform_with_and_without_db() {
     assert!(
         !with_db.resources.is_empty(),
         "db-backed manifest should advertise at least one resource"
+    );
+}
+
+#[test]
+fn live_server_resource_templates_conform_with_and_without_db() {
+    let no_db = parse_resource_template_manifest(capture_resource_template_lists(None))
+        .expect("no-db resource-template manifest should parse");
+    assert!(
+        !no_db.resource_templates.is_empty(),
+        "current frankenterm MCP server should advertise at least one resource template"
+    );
+
+    let (_dir, db_path) = isolated_db_path();
+    let with_db = parse_resource_template_manifest(capture_resource_template_lists(Some(db_path)))
+        .expect("db-backed resource-template manifest should parse");
+    assert!(
+        with_db.resource_templates.len() >= no_db.resource_templates.len(),
+        "db-backed resource-template surface should be at least as large as the no-db surface"
     );
 }
 
@@ -514,6 +608,115 @@ fn conformance_invalid_cases_reject_shape_and_uniqueness_breaks() {
     for (name, payload, expected) in cases {
         let err =
             parse_manifest(payload).unwrap_err_or_else(|| panic!("{name} should be rejected"));
+        assert!(
+            err.contains(expected),
+            "{name} expected error containing {expected:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn conformance_resource_template_valid_cases_cover_minimal_and_optional_fields() {
+    let cases = vec![
+        (
+            "minimal_empty_resource_template_list",
+            json!({
+                "resourceTemplates": [],
+            }),
+        ),
+        (
+            "resource_template_optional_fields_set",
+            json!({
+                "resourceTemplates": [{
+                    "uriTemplate": "ft://events/{limit}",
+                    "name": "events-by-limit",
+                    "description": "Fetch event windows",
+                    "mimeType": "application/json",
+                    "version": "2026.04",
+                    "tags": ["events", "history"]
+                }],
+            }),
+        ),
+        (
+            "resource_template_null_optional_fields",
+            json!({
+                "resourceTemplates": [{
+                    "uriTemplate": "ft://rules/{agent_type}",
+                    "name": "rules-by-agent",
+                    "description": null,
+                    "mimeType": null,
+                    "version": null,
+                    "tags": []
+                }],
+            }),
+        ),
+    ];
+
+    for (name, payload) in cases {
+        parse_resource_template_manifest(payload)
+            .unwrap_or_else(|err| panic!("{name} should conform: {err}"));
+    }
+}
+
+#[test]
+fn conformance_resource_template_invalid_cases_reject_shape_and_uniqueness_breaks() {
+    let cases = vec![
+        (
+            "missing_resource_templates_field",
+            json!({}),
+            "missing field `resourceTemplates`",
+        ),
+        (
+            "resource_templates_wrong_type",
+            json!({
+                "resourceTemplates": {},
+            }),
+            "invalid type",
+        ),
+        (
+            "duplicate_template_uris",
+            json!({
+                "resourceTemplates": [
+                    {"uriTemplate": "ft://same/{pane_id}", "name": "one"},
+                    {"uriTemplate": "ft://same/{pane_id}", "name": "two"}
+                ],
+            }),
+            "duplicate resource template uri",
+        ),
+        (
+            "template_missing_uri_template",
+            json!({
+                "resourceTemplates": [{"name": "resource-template-no-uri"}],
+            }),
+            "missing field `uriTemplate`",
+        ),
+        (
+            "template_mime_type_wrong_type",
+            json!({
+                "resourceTemplates": [{
+                    "uriTemplate": "ft://bad/{arg}",
+                    "name": "bad-template",
+                    "mimeType": 12
+                }],
+            }),
+            "invalid type",
+        ),
+        (
+            "template_extra_field",
+            json!({
+                "resourceTemplates": [{
+                    "uriTemplate": "ft://extra/{arg}",
+                    "name": "extra-template",
+                    "oops": false
+                }],
+            }),
+            "unknown field `oops`",
+        ),
+    ];
+
+    for (name, payload, expected) in cases {
+        let err = parse_resource_template_manifest(payload)
+            .unwrap_err_or_else(|| panic!("{name} should be rejected"));
         assert!(
             err.contains(expected),
             "{name} expected error containing {expected:?}, got {err:?}"
