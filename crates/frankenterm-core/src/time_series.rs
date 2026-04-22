@@ -235,6 +235,13 @@ impl TimeSeries {
     }
 
     /// Compute percentile over points in `[start_ms, end_ms]`.
+    ///
+    /// Returns `None` when the requested range has no points OR when `p`
+    /// is NaN. [ft-jz40p] `f64::clamp(NaN, _, _)` returns NaN (documented
+    /// Rust gotcha — same shape as ft-b4l62 for `Histogram::quantile`),
+    /// which then cascades through `(NaN as usize) == 0` and silently
+    /// returns the smallest sample. Fail closed on NaN so callers see
+    /// `None` rather than a plausible-looking wrong value.
     #[must_use]
     pub fn percentile_range(&self, p: f64, start_ms: u64, end_ms: u64) -> Option<f64> {
         let mut values: Vec<f64> = self
@@ -242,7 +249,7 @@ impl TimeSeries {
             .iter()
             .map(|dp| dp.value)
             .collect();
-        if values.is_empty() {
+        if values.is_empty() || p.is_nan() {
             return None;
         }
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -703,5 +710,37 @@ mod tests {
     #[should_panic(expected = "max_points must be > 0")]
     fn zero_capacity_panics() {
         let _ = TimeSeries::with_config(TimeSeriesConfig { max_points: 0 });
+    }
+
+    // ── ft-jz40p: NaN percentile fails closed ───────────────────────────
+
+    /// Pre-fix: `percentile(NaN)` clamped to NaN and then `NaN as usize
+    /// = 0` silently returned the smallest sample — a plausible-looking
+    /// wrong answer that had no relationship to the caller's intent.
+    #[test]
+    fn ft_jz40p_percentile_nan_returns_none() {
+        let mut ts = TimeSeries::new();
+        for i in 1..=10 {
+            ts.push(i * 10, i as f64);
+        }
+        assert!(ts.percentile(f64::NAN).is_none());
+        assert!(ts.percentile_range(f64::NAN, 0, u64::MAX).is_none());
+        // Valid p still works after the NaN guard is added.
+        assert!(ts.percentile(0.5).is_some());
+    }
+
+    /// Regression: ±infinity still clamp to 0.0/1.0 and return the min
+    /// / max sample — the pre-existing contract must survive the NaN
+    /// guard.
+    #[test]
+    fn ft_jz40p_percentile_infinity_inputs_still_work() {
+        let mut ts = TimeSeries::new();
+        for i in 1..=5 {
+            ts.push(i * 10, i as f64 * 10.0);
+        }
+        // +inf → clamp to 1.0 → max sample (50.0).
+        assert_eq!(ts.percentile(f64::INFINITY), Some(50.0));
+        // -inf → clamp to 0.0 → min sample (10.0).
+        assert_eq!(ts.percentile(f64::NEG_INFINITY), Some(10.0));
     }
 }
