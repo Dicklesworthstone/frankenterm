@@ -15995,13 +15995,31 @@ fn sync_fts_for_pane(
     let progress = get_fts_pane_progress_sync(conn, pane_id)?;
     let last_seq = progress.as_ref().map_or(0, |p| p.last_indexed_seq);
     let mut indexed_count = progress.as_ref().map_or(0, |p| p.indexed_count);
+    // [ft-7do6c] "Never indexed" sentinel: the absence of a progress
+    // row is distinct from "indexed up to seq=0". Without tracking
+    // this, the strict `seq > 0` filter would skip the pane's first
+    // segment forever — COALESCE(MAX(seq)+1, 0) at append_segment_sync:
+    // 12355 assigns seq=0 to every pane's very first segment.
+    let had_prior_progress = progress.is_some();
 
     let mut total_indexed = 0u64;
     let mut max_seq = last_seq;
 
     loop {
-        // Get batch of unindexed segments
-        let segments = get_unindexed_segments_sync(conn, pane_id, max_seq, config.batch_size)?;
+        // Get batch of unindexed segments. Only the very first batch
+        // of the very first sync (no prior progress row AND nothing
+        // indexed yet in this call) uses the inclusive `WHERE pane_id
+        // = ?1` variant to cover seq=0. Every subsequent batch reverts
+        // to the strict `seq > max_seq` variant so we don't re-index
+        // rows we just handled.
+        let include_from_zero = !had_prior_progress && total_indexed == 0;
+        let segments = get_unindexed_segments_sync(
+            conn,
+            pane_id,
+            max_seq,
+            config.batch_size,
+            include_from_zero,
+        )?;
         if segments.is_empty() {
             break;
         }
@@ -25169,6 +25187,62 @@ mod fts_sync_tests {
             "second catchup must see no new work (progress is resumable)"
         );
         assert_eq!(fts_match_count(&conn, "content"), 500);
+    }
+
+    /// [ft-7do6c] The seq=0 off-by-one: a fresh pane's FIRST segment
+    /// gets seq=0 (COALESCE(MAX(seq)+1, 0) at append_segment_sync:12355).
+    /// Before the fix, sync_fts_for_pane's `WHERE seq > last_indexed_seq`
+    /// filter — with last_indexed_seq defaulting to 0 for a never-synced
+    /// pane — silently skipped that first segment forever under deferred
+    /// mode. This test constructs the exact shape that was broken:
+    /// fresh pane, first segment at seq=0, deferred triggers, then
+    /// catchup — and asserts the seq=0 row is indexed alongside the
+    /// rest. The ft-wk5fo tests above deliberately avoided seq=0 while
+    /// this bug was open; this test removes that restriction.
+    #[test]
+    fn ft_7do6c_catchup_indexes_seq_zero_on_first_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+
+        insert_test_pane(&conn, 1);
+        // Seed seq starting from 0 — the real-world first-segment case.
+        for seq in 0u64..5 {
+            insert_test_segment(&conn, 1, seq, &format!("seqzero-{seq}"));
+        }
+        // Deferred mode: FTS empty pre-catchup.
+        assert_eq!(fts_match_count(&conn, "seqzero"), 0);
+
+        let config = FtsSyncConfig::default();
+        let result = sync_fts_on_startup(&conn, &config).unwrap();
+
+        // Before the fix: 4 (seq 1,2,3,4 indexed; seq=0 dropped).
+        // After the fix: 5 (seq 0,1,2,3,4 all indexed).
+        assert_eq!(
+            result.segments_indexed, 5,
+            "ft-7do6c: first-ever catchup must include seq=0, \
+             not just seq 1..=4 as the pre-fix strict `seq > 0` filter"
+        );
+        assert_eq!(
+            fts_match_count(&conn, "seqzero"),
+            5,
+            "ft-7do6c: all five segments (including seq=0) must be \
+             searchable via FTS after catchup"
+        );
+        // And the seq=0 match is specifically present — not just some
+        // other permutation that happens to sum to 5.
+        assert_eq!(
+            fts_match_count(&conn, "\"seqzero-0\""),
+            1,
+            "ft-7do6c: the exact seq=0 content must be searchable"
+        );
+
+        // Resume invariant still holds: a second catchup is a no-op
+        // (progress table was written with last_indexed_seq=4 in the
+        // first pass, so `seq > 4` correctly excludes everything).
+        let second = sync_fts_on_startup(&conn, &config).unwrap();
+        assert_eq!(second.segments_indexed, 0);
+        assert_eq!(fts_match_count(&conn, "seqzero"), 5);
     }
 
     /// [ft-wk5fo] Interleaved: alternating catchup + insert rounds
