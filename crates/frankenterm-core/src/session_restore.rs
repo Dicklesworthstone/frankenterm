@@ -4235,6 +4235,176 @@ mod tests {
     }
 
     #[test]
+    fn session_restore_json_contract_golden() {
+        #[derive(serde::Serialize)]
+        struct SessionCandidateGolden<'a> {
+            session_id: &'a str,
+            created_at: u64,
+            last_checkpoint_at: Option<u64>,
+            topology_json: &'a str,
+            ft_version: &'a str,
+            host_id: Option<&'a str>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct ShowSessionGolden<'a> {
+            session: SessionCandidateGolden<'a>,
+            checkpoints: Vec<CheckpointInfo>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct SessionRestoreGolden<'a> {
+            list_sessions: Vec<SessionInfo>,
+            show_session: ShowSessionGolden<'a>,
+            session_doctor: SessionDoctorReport,
+            restore_banner: String,
+        }
+
+        let (db_path, conn, _dir) = setup_test_db();
+        insert_session(&conn, "sess-clean", true);
+        insert_session(&conn, "sess-restore", false);
+        conn.execute(
+            "UPDATE mux_sessions
+             SET created_at = 1500, last_checkpoint_at = 3000, host_id = 'host-a'
+             WHERE session_id = 'sess-restore'",
+            [],
+        )
+        .unwrap();
+
+        let older_checkpoint = insert_checkpoint(&conn, "sess-restore", 2000, 1);
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET total_bytes = 2048
+             WHERE id = ?1",
+            [older_checkpoint],
+        )
+        .unwrap();
+        insert_pane_state(
+            &conn,
+            older_checkpoint,
+            7,
+            Some("/agents"),
+            Some("codex --resume"),
+        );
+
+        let newer_checkpoint = insert_checkpoint(&conn, "sess-restore", 3000, 2);
+        conn.execute(
+            "UPDATE session_checkpoints
+             SET checkpoint_type = 'startup',
+                 total_bytes = 512,
+                 state_hash = 'startup-hash',
+                 metadata_json = '{\"old_to_new\":{\"7\":42}}'
+             WHERE id = ?1",
+            [newer_checkpoint],
+        )
+        .unwrap();
+
+        let list_sessions = list_sessions(&db_path).expect("list sessions");
+        let (session, checkpoints) = show_session(&db_path, "sess-restore").expect("show session");
+        let session_doctor = session_doctor(&db_path).expect("session doctor");
+        let restore_banner = restore_banner(
+            7,
+            "sess-restore",
+            3_000,
+            Some(&RestoredPaneState {
+                pane_id: 7,
+                cwd: Some("/agents".to_string()),
+                command: Some("codex --resume".to_string()),
+                terminal_state: None,
+                agent_metadata: Some(AgentMetadata {
+                    agent_type: "codex".to_string(),
+                    session_id: Some("agent-sess-7".to_string()),
+                    state: Some("running".to_string()),
+                }),
+                scrollback_checkpoint_seq: None,
+                last_output_at: None,
+            }),
+        );
+
+        let actual = serde_json::to_string_pretty(&SessionRestoreGolden {
+            list_sessions,
+            show_session: ShowSessionGolden {
+                session: SessionCandidateGolden {
+                    session_id: &session.session_id,
+                    created_at: session.created_at,
+                    last_checkpoint_at: session.last_checkpoint_at,
+                    topology_json: &session.topology_json,
+                    ft_version: &session.ft_version,
+                    host_id: session.host_id.as_deref(),
+                },
+                checkpoints,
+            },
+            session_doctor,
+            restore_banner,
+        })
+        .expect("serialize golden contract");
+
+        let expected = r#"{
+  "list_sessions": [
+    {
+      "session_id": "sess-restore",
+      "created_at": 1500,
+      "last_checkpoint_at": 3000,
+      "shutdown_clean": false,
+      "ft_version": "0.1.0",
+      "host_id": "host-a",
+      "checkpoint_count": 2,
+      "pane_count": 2
+    },
+    {
+      "session_id": "sess-clean",
+      "created_at": 1000,
+      "last_checkpoint_at": null,
+      "shutdown_clean": true,
+      "ft_version": "0.1.0",
+      "host_id": null,
+      "checkpoint_count": 0,
+      "pane_count": null
+    }
+  ],
+  "show_session": {
+    "session": {
+      "session_id": "sess-restore",
+      "created_at": 1500,
+      "last_checkpoint_at": 3000,
+      "topology_json": "{\"schema_version\":1,\"captured_at\":1000,\"windows\":[]}",
+      "ft_version": "0.1.0",
+      "host_id": "host-a"
+    },
+    "checkpoints": [
+      {
+        "id": 2,
+        "checkpoint_at": 3000,
+        "checkpoint_type": "startup",
+        "pane_count": 2,
+        "total_bytes": 512
+      },
+      {
+        "id": 1,
+        "checkpoint_at": 2000,
+        "checkpoint_type": "periodic",
+        "pane_count": 1,
+        "total_bytes": 2048
+      }
+    ]
+  },
+  "session_doctor": {
+    "total_sessions": 2,
+    "unclean_sessions": 1,
+    "total_checkpoints": 2,
+    "orphaned_pane_states": 0,
+    "total_data_bytes": 2560
+  },
+  "restore_banner": "\u001b[1;36m═══ Session restored from checkpoint at 00:00:03 UTC ═══\u001b[0m\r\n\u001b[1;33m═══ Previously running: codex (session agent-sess-7, state: running) ═══\u001b[0m\r\n\u001b[90m═══ Process: codex --resume ═══\u001b[0m\r\n\u001b[90m═══ Previous output: ft session show sess-restore --pane 7 ═══\u001b[0m\r\n"
+}"#;
+
+        assert_eq!(
+            actual, expected,
+            "session restore JSON contract drifted; review intentional changes before updating the golden"
+        );
+    }
+
+    #[test]
     fn session_info_serialize() {
         let info = SessionInfo {
             session_id: "sess-1".to_string(),
