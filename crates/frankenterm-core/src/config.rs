@@ -868,6 +868,21 @@ impl StorageConfig {
         }
         self.retention_days
     }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.writer_queue_size == 0 {
+            return Err("storage.writer_queue_size must be >= 1".to_string());
+        }
+
+        if self.recorder_backend == crate::recorder_storage::RecorderBackendKind::FrankenSqlite {
+            return Err(
+                "storage.recorder_backend=frankensqlite is not supported in this build; use append_log"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Check whether a single tier matches the given event attributes.
@@ -3857,12 +3872,9 @@ impl Config {
 
         crate::backup::BackupSchedule::parse(&self.backup.scheduled.schedule)?;
 
-        if self.storage.writer_queue_size == 0 {
-            return Err(crate::error::ConfigError::ValidationError(
-                "storage.writer_queue_size must be >= 1".to_string(),
-            )
-            .into());
-        }
+        self.storage
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
 
         self.gc
             .validate()
@@ -5771,6 +5783,21 @@ recorder_backend = "franken_sqlite"
             legacy.storage.recorder_backend,
             crate::recorder_storage::RecorderBackendKind::FrankenSqlite
         );
+    }
+
+    #[test]
+    fn config_validation_rejects_unimplemented_frankensqlite_backend() {
+        let config = Config::from_toml(
+            r#"
+[storage]
+recorder_backend = "frankensqlite"
+"#,
+        )
+        .expect("parse frankensqlite backend");
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("storage.recorder_backend=frankensqlite"));
+        assert!(err.contains("append_log"));
     }
 
     #[test]
