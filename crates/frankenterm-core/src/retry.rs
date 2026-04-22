@@ -877,8 +877,10 @@ mod tests {
             let status = circuit.status();
             assert_eq!(status.state, CircuitStateKind::Closed);
             assert_eq!(status.consecutive_failures, 0);
-            assert_eq!(circuit.telemetry().failures_recorded, 0);
-            assert_eq!(circuit.telemetry().successes_recorded, 0);
+            let tel = circuit.telemetry().snapshot();
+            assert_eq!(tel.failures_recorded, 0);
+            assert_eq!(tel.successes_recorded, 0);
+            assert_eq!(tel.trips_total, 0);
 
             // Subsequent real operations must still be allowed through.
             let ok: Result<i32> =

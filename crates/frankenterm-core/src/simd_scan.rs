@@ -327,20 +327,17 @@ pub(crate) fn scan_newlines_and_ansi_scalar(bytes: &[u8]) -> OutputScanMetrics {
     let mut newline_count = 0usize;
     let mut ansi_byte_count = 0usize;
     let mut in_escape = false;
+    let mut string_phase = StringPhase::None;
 
     for &b in bytes {
         if b == b'\n' {
             newline_count += 1;
         }
 
-        if b == 0x1b {
-            in_escape = true;
+        // [ft-nk6u9] Unified state machine handles CSI, single-char
+        // C1, and string-introducer C1 (OSC/DCS/SOS/PM/APC) correctly.
+        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
-        } else if in_escape {
-            ansi_byte_count += 1;
-            if (0x40..=0x7E).contains(&b) && b != b'[' {
-                in_escape = false;
-            }
         }
     }
 
@@ -358,6 +355,7 @@ fn scan_newlines_and_ansi_scalar_with_state(
     let mut newline_count = 0usize;
     let mut ansi_byte_count = 0usize;
     let mut in_escape = state.in_escape;
+    let mut string_phase = state.string_phase;
     let mut pending_utf8 = state.pending_utf8_continuations;
 
     for &b in bytes {
@@ -365,20 +363,17 @@ fn scan_newlines_and_ansi_scalar_with_state(
             newline_count += 1;
         }
 
-        if b == 0x1b {
-            in_escape = true;
+        // [ft-nk6u9] Same unified step as the batch path so the stateful
+        // scanner stays in lockstep with the non-stateful reference.
+        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
-        } else if in_escape {
-            ansi_byte_count += 1;
-            if (0x40..=0x7E).contains(&b) && b != b'[' {
-                in_escape = false;
-            }
         }
 
         update_utf8_pending(&mut pending_utf8, b);
     }
 
     state.in_escape = in_escape;
+    state.string_phase = string_phase;
     state.pending_utf8_continuations = pending_utf8;
 
     OutputScanMetrics {
@@ -852,5 +847,127 @@ mod tests {
         let _ = scan_newlines_and_ansi_with_state(b"A", &mut state);
         assert_eq!(state.pending_utf8_continuations, 0);
         assert!(!state.in_escape);
+    }
+
+    // ── ft-nk6u9: OSC / DCS / PM / APC / SOS string-body counting ────────
+
+    /// Pre-fix: `ESC ] 0 ; title BEL` counted only 2 ANSI bytes (ESC + ]).
+    /// Everything after `]` fell out of `in_escape` because `]` is in the
+    /// `0x40..=0x7E` "terminator" range, and the title + BEL were billed
+    /// as plain text.
+    #[test]
+    fn ft_nk6u9_osc_bel_terminator_counts_full_sequence() {
+        let data = b"\x1b]0;window title\x07after";
+        let scan = scan_newlines_and_ansi(data);
+        // ESC + ] + "0;window title" + BEL = 2 + 14 + 1 = 17 ANSI bytes.
+        assert_eq!(scan.ansi_byte_count, 17);
+        assert_eq!(scan.newline_count, 0);
+        let density = scan.ansi_density(data.len());
+        assert!(density > 0.7, "OSC dense-path density should exceed 0.7, got {density}");
+    }
+
+    /// OSC can alternatively terminate with the ST sequence `ESC \`.
+    /// Pin that both the intro + body + ST bytes count as ANSI.
+    #[test]
+    fn ft_nk6u9_osc_st_terminator_counts_full_sequence() {
+        let data = b"\x1b]52;c;base64payload\x1b\\tail";
+        let scan = scan_newlines_and_ansi(data);
+        // ESC + ] + "52;c;base64payload" + ESC + \ = 2 + 18 + 2 = 22.
+        assert_eq!(scan.ansi_byte_count, 22);
+    }
+
+    /// DCS (`ESC P`) opens a string that continues until ST — commonly
+    /// used for Sixel / ReGIS / DECRQSS.
+    #[test]
+    fn ft_nk6u9_dcs_sequence_counts_full_body() {
+        let data = b"\x1bP1;0q#0;2;100;100;100#0~~@@\x1b\\after";
+        let scan = scan_newlines_and_ansi(data);
+        // Sequence bytes: ESC P 1 ; 0 q # 0 ; 2 ; 1 0 0 ; 1 0 0 ; 1 0 0
+        // # 0 ~ ~ @ @ ESC \  = 30 bytes; "after" is 5 plain bytes.
+        assert_eq!(scan.ansi_byte_count, 30);
+    }
+
+    /// PM (`ESC ^`) and APC (`ESC _`) are rarer but follow the same
+    /// shape. Pin both so the state machine doesn't regress.
+    #[test]
+    fn ft_nk6u9_pm_and_apc_sequences_count_full_body() {
+        let pm = b"\x1b^payload\x1b\\";
+        let apc = b"\x1b_Gf=32,payload\x1b\\";
+        assert_eq!(scan_newlines_and_ansi(pm).ansi_byte_count, pm.len());
+        assert_eq!(scan_newlines_and_ansi(apc).ansi_byte_count, apc.len());
+    }
+
+    /// Newlines inside an OSC body must still be counted as newlines —
+    /// the OSC state machine doesn't suppress other byte classes.
+    #[test]
+    fn ft_nk6u9_osc_body_preserves_newline_count() {
+        let data = b"pre\n\x1b]0;multi\nline title\x07post\n";
+        let scan = scan_newlines_and_ansi(data);
+        assert_eq!(scan.newline_count, 3);
+    }
+
+    /// The stateful scanner must resume an OSC body across a chunk
+    /// boundary that lands inside the body. Pre-fix the second chunk
+    /// wouldn't realise it was still in an escape — `in_escape` had
+    /// already been cleared when the first `]` was seen.
+    #[test]
+    fn ft_nk6u9_osc_body_split_across_chunks() {
+        let mut state = OutputScanState::default();
+        let first = b"\x1b]0;win";
+        let second = b"dow title\x07rest";
+
+        let m1 = scan_newlines_and_ansi_with_state(first, &mut state);
+        // Whole first chunk is inside the OSC body.
+        assert_eq!(m1.ansi_byte_count, first.len());
+        assert!(state.in_escape);
+        assert!(matches!(state.string_phase, StringPhase::Body));
+
+        let m2 = scan_newlines_and_ansi_with_state(second, &mut state);
+        // "dow title\x07" = 10 bytes of remaining body + BEL terminator;
+        // "rest" = 4 plain bytes.
+        assert_eq!(m2.ansi_byte_count, 10);
+        assert!(!state.in_escape);
+        assert!(matches!(state.string_phase, StringPhase::None));
+    }
+
+    /// Chunk split directly on the two-byte `ESC \` string terminator
+    /// must not misinterpret the trailing `\` as a plain byte. This
+    /// pins the StringPhase::SawEsc carry across chunks.
+    #[test]
+    fn ft_nk6u9_osc_st_split_between_esc_and_backslash() {
+        let mut state = OutputScanState::default();
+        let first = b"\x1b]0;title\x1b";
+        let second = b"\\done";
+
+        let m1 = scan_newlines_and_ansi_with_state(first, &mut state);
+        assert_eq!(m1.ansi_byte_count, first.len());
+        assert!(state.in_escape);
+        assert!(matches!(state.string_phase, StringPhase::SawEsc));
+
+        let m2 = scan_newlines_and_ansi_with_state(second, &mut state);
+        // Just the `\` belongs to the ST; "done" is plain.
+        assert_eq!(m2.ansi_byte_count, 1);
+        assert!(!state.in_escape);
+        assert!(matches!(state.string_phase, StringPhase::None));
+    }
+
+    /// CSI is unchanged — make sure the string-introducer branch
+    /// didn't regress the pre-existing `ESC [ … letter` path.
+    #[test]
+    fn ft_nk6u9_csi_sequence_still_terminates_on_final_byte() {
+        let data = b"\x1b[1;31mhello\x1b[0mworld";
+        let scan = scan_newlines_and_ansi(data);
+        // \x1b[1;31m = 7, \x1b[0m = 4, total = 11.
+        assert_eq!(scan.ansi_byte_count, 11);
+    }
+
+    /// Single-char C1 like `ESC M` (reverse index) is also unchanged —
+    /// the terminator rule for non-string-intro letters still fires.
+    #[test]
+    fn ft_nk6u9_single_char_c1_still_terminates() {
+        let data = b"\x1bMhello\x1bD";
+        let scan = scan_newlines_and_ansi(data);
+        // ESC M + ESC D = 4 ANSI bytes, "hello" is plain.
+        assert_eq!(scan.ansi_byte_count, 4);
     }
 }
