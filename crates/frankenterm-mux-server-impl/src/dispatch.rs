@@ -956,11 +956,8 @@ mod tests {
     use std::io::Write;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::os::fd::AsRawFd;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-
-    static GLOBAL_STATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -1049,7 +1046,9 @@ mod tests {
 
     #[test]
     fn process_async_treats_unexpected_eof_as_clean_disconnect() {
-        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .expect("global test lock");
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(EofDispatchStream));
@@ -1106,7 +1105,9 @@ mod tests {
 
     #[test]
     fn process_async_propagates_readable_wait_failures() {
-        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .expect("global test lock");
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(FailingReadableDispatchStream));
@@ -1177,7 +1178,9 @@ mod tests {
 
     #[test]
     fn write_pending_pdus_batches_flush_and_preserves_first_non_write_item() {
-        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .expect("global test lock");
         let (item_tx, item_rx) = unbounded();
         item_tx
             .try_send(Item::WritePdu(queued_ping(2)))

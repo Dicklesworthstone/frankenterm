@@ -10,6 +10,9 @@ pub mod local;
 pub mod pki;
 pub mod sessionhandler;
 
+#[cfg(test)]
+pub(crate) static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];
     for unix_dom in &config.unix_domains {

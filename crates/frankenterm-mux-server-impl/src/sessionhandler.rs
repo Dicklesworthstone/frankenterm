@@ -1527,13 +1527,9 @@ mod tests {
     use promise::spawn::SimpleExecutor;
     use rangeset::RangeSet;
     use std::ops::Range;
-    use std::sync::Mutex as StdMutex;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
-
-    // These tests mutate process-global mux/executor state, so they must not run in parallel.
-    static GLOBAL_STATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -1879,7 +1875,7 @@ mod tests {
 
     #[test]
     fn select_stack_pane_pdu_selects_requested_stack_member() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
@@ -1928,7 +1924,7 @@ mod tests {
 
     #[test]
     fn update_pane_constraints_pdu_updates_effective_constraints() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
@@ -1964,7 +1960,7 @@ mod tests {
 
     #[test]
     fn floating_pane_pdus_update_live_tab_state() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
@@ -2160,7 +2156,7 @@ mod tests {
 
     #[test]
     fn update_pane_constraints_all_none_keeps_default_constraints() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
@@ -2303,7 +2299,7 @@ mod tests {
 
     #[test]
     fn set_client_id_replaces_prior_registered_client_without_leaking_stale_entries() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let first = test_client_id("review-first", 41_001);
@@ -2352,7 +2348,7 @@ mod tests {
 
     #[test]
     fn dropping_handler_after_mux_shutdown_does_not_panic() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mux = Arc::new(Mux::new(None));
@@ -2375,7 +2371,7 @@ mod tests {
 
     #[test]
     fn set_active_workspace_updates_registered_client_workspace() {
-        let _lock = GLOBAL_STATE_TEST_LOCK
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let executor = SimpleExecutor::new();
