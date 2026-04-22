@@ -402,7 +402,20 @@ impl ScanPipeline {
     #[must_use]
     pub fn process(&self, bytes: &[u8]) -> ScanOutput {
         // Stage 1: SIMD metrics scan
-        let metrics = scan_newlines_and_ansi(bytes);
+        let mut metrics = scan_newlines_and_ansi(bytes);
+        // [ft-5m5xc] Respect enable_ansi_analysis. The SIMD scan
+        // always computes both newline_count and ansi_byte_count in
+        // one pass; when the operator opts out of ANSI analysis we
+        // zero the ANSI portion before it flows into the
+        // ScanMetricsSummary / downstream density math, so the
+        // documented "disable ANSI analysis" switch actually
+        // surfaces clean ansi_byte_count=0 / ansi_density=0.
+        // Newline and logical-line counts still come through —
+        // they don't depend on ANSI scanning and callers who set
+        // enable_ansi_analysis=false typically still want them.
+        if !self.config.enable_ansi_analysis {
+            metrics.ansi_byte_count = 0;
+        }
         let summary = ScanMetricsSummary::from_metrics(metrics, bytes);
 
         // Stage 2: Pattern trigger scan
@@ -440,7 +453,17 @@ impl ScanPipeline {
         state: &mut ChunkedPipelineState,
     ) -> ScanMetricsSummary {
         // Stage 1: Stateful SIMD metrics scan (cross-boundary aware)
-        let chunk_metrics = scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
+        let mut chunk_metrics =
+            scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
+        // [ft-5m5xc] Respect enable_ansi_analysis. Same shape as the
+        // batch process() path above — zero ansi_byte_count AFTER the
+        // stateful scan so the scan_state still advances (keeping the
+        // cross-chunk in_escape / utf8-continuation carry honest for
+        // future chunks that DO want ANSI analysis if the config is
+        // ever flipped back on).
+        if !self.config.enable_ansi_analysis {
+            chunk_metrics.ansi_byte_count = 0;
+        }
 
         // Accumulate metrics (saturating to prevent wrap in release builds)
         state.accumulated_metrics.newline_count = state
@@ -639,6 +662,71 @@ mod tests {
         let output = pipeline.process(data);
         assert!(output.metrics.ansi_byte_count > 0);
         assert!(output.metrics.ansi_density > 0.0);
+    }
+
+    // [ft-5m5xc] enable_ansi_analysis=false must zero ansi_byte_count
+    // and ansi_density in the returned metrics. Pre-fix, the config
+    // field was ignored entirely — setting it false still reported
+    // the SIMD-scanned ANSI byte count, a silent reality-gap between
+    // the documented config surface and the actual behavior.
+    #[test]
+    fn pipeline_honors_enable_ansi_analysis_false_ft_5m5xc() {
+        let config = ScanPipelineConfig {
+            enable_ansi_analysis: false,
+            ..ScanPipelineConfig::default()
+        };
+        let pipeline = ScanPipeline::new(config);
+        let data = b"line1\n\x1b[32mOK\x1b[0m\nline3\n";
+        let output = pipeline.process(data);
+
+        // Newlines and logical-line counts are independent of ANSI
+        // analysis and must still flow through.
+        assert_eq!(output.metrics.newline_count, 3);
+        assert_eq!(output.metrics.logical_lines, 3);
+
+        // ANSI portion must be zeroed.
+        assert_eq!(
+            output.metrics.ansi_byte_count, 0,
+            "ft-5m5xc: enable_ansi_analysis=false must zero ansi_byte_count"
+        );
+        assert_eq!(
+            output.metrics.ansi_density, 0.0,
+            "ft-5m5xc: density derived from zeroed ansi_byte_count must also be zero"
+        );
+
+        // Sanity: the same input under the DEFAULT (enable_ansi_analysis=true)
+        // config yields a non-zero ansi_byte_count, proving the branch is
+        // actually doing work. Pre-fix, the "false" path returned the same
+        // count as the "true" path.
+        let default_pipeline = ScanPipeline::default();
+        let default_output = default_pipeline.process(data);
+        assert!(
+            default_output.metrics.ansi_byte_count > 0,
+            "sanity: default config must count ANSI bytes on a known-ANSI input"
+        );
+    }
+
+    // [ft-5m5xc] Same contract for the chunked path — process_chunk
+    // must respect enable_ansi_analysis so accumulated_metrics doesn't
+    // grow ANSI counts when the operator opted out.
+    #[test]
+    fn chunked_pipeline_honors_enable_ansi_analysis_false_ft_5m5xc() {
+        let config = ScanPipelineConfig {
+            enable_ansi_analysis: false,
+            ..ScanPipelineConfig::default()
+        };
+        let pipeline = ScanPipeline::new(config);
+        let mut state = ChunkedPipelineState::new(1024 * 1024);
+
+        pipeline.process_chunk(b"line1\n\x1b[32mOK\x1b[0m\n", &mut state);
+        pipeline.process_chunk(b"line3\n", &mut state);
+
+        assert_eq!(state.newline_count(), 3);
+        assert_eq!(
+            state.ansi_byte_count(),
+            0,
+            "ft-5m5xc: chunked accumulation must also respect the flag"
+        );
     }
 
     #[test]
