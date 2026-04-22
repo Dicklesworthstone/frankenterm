@@ -539,13 +539,24 @@ mod tests {
             .make_completion_event_for_result("a1", &result)
             .expect("rejected dispatch should emit a failure event");
 
-        assert_eq!(
-            event,
+        // [ft-zv3u9] crate::events::Event does not impl PartialEq (its
+        // payload includes types like Detection and UserVarPayload that
+        // would each need PartialEq, cascading the trait bound through
+        // a wide surface). Match-and-destructure the variant instead
+        // of relying on assert_eq! so this test compiles without
+        // expanding the PartialEq surface across events.rs and
+        // patterns.rs.
+        match event {
             crate::events::Event::WorkflowCompleted {
-                workflow_id: "mission.dispatch.a1".to_string(),
-                success: false,
-                reason: Some("no workflow".to_string()),
+                workflow_id,
+                success,
+                reason,
+            } => {
+                assert_eq!(workflow_id, "mission.dispatch.a1");
+                assert!(!success);
+                assert_eq!(reason.as_deref(), Some("no workflow"));
             }
-        );
+            other => panic!("expected WorkflowCompleted, got {other:?}"),
+        }
     }
 }
