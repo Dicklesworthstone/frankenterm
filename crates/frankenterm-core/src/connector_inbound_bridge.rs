@@ -491,8 +491,23 @@ impl ConnectorInboundBridge {
         self.telemetry.signals_received += 1;
 
         // 1. Deduplication
+        //
+        // [ft-dijpe] Dedup bookkeeping uses the LOCAL receive clock,
+        // NOT `signal.timestamp_ms`. The timestamp field is documented
+        // as "at the source" (line 132) and comes from the remote
+        // connector on the other side of the wire — an attacker or
+        // buggy upstream can claim any value. Feeding that straight
+        // into `check_and_record` lets a replay bypass the window: a
+        // second copy of the same correlation_id with
+        // `timestamp_ms = ttl_ms + 1` triggers `evict_expired`, pops
+        // the live entry, and the replay is treated as a new signal.
+        // Use SystemTime::now() so the attacker can't manipulate the
+        // dedup clock.
         if let Some(ref cid) = signal.correlation_id {
-            let now_ms = signal.timestamp_ms;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             if !self.deduplicator.check_and_record(cid, now_ms) {
                 self.telemetry.signals_deduplicated += 1;
                 debug!(
@@ -965,6 +980,57 @@ mod tests {
 
         let r2 = bridge.route_signal(&sig).unwrap();
         assert!(r2.deduplicated);
+        assert_eq!(r2.delivered_count, 0);
+
+        let snap = bridge.telemetry_snapshot();
+        assert_eq!(snap.signals_received, 2);
+        assert_eq!(snap.signals_routed, 1);
+        assert_eq!(snap.signals_deduplicated, 1);
+    }
+
+    /// [ft-dijpe] Attacker-replay guard: dedup must NOT be bypassable
+    /// by claiming a future `signal.timestamp_ms`. Before the fix at
+    /// route_signal, the bridge used `signal.timestamp_ms` directly as
+    /// the dedup "now" clock — so a second copy of the same
+    /// correlation_id with `timestamp_ms = ttl+1` would trigger
+    /// `evict_expired`, pop the live entry, and re-route the replay as
+    /// if new. Post-fix, dedup uses the local SystemTime::now() and
+    /// the attacker's claimed timestamp has zero influence on the
+    /// eviction window; both copies land well within the real-time
+    /// ttl window and the second is correctly flagged duplicated.
+    #[test]
+    fn bridge_dedup_ignores_attacker_controlled_signal_timestamp() {
+        let bus = make_bus();
+        let _sub = bus.subscribe_detections();
+        // Short ttl to make the "ttl+1 future timestamp" attack shape
+        // ergonomic; even with this tight window, the fix relies on
+        // local clock and the two calls happen <1ms apart.
+        let config = ConnectorInboundBridgeConfig {
+            dedup_ttl_secs: 60, // 60s — huge real-time window
+            ..Default::default()
+        };
+        let mut bridge = ConnectorInboundBridge::new(bus, config);
+
+        // First signal: claims timestamp_ms = 0 (epoch).
+        let first = test_signal("github", ConnectorSignalKind::Webhook)
+            .with_correlation_id("replay-target")
+            .with_timestamp_ms(0);
+        let r1 = bridge.route_signal(&first).unwrap();
+        assert!(!r1.deduplicated, "first signal is always new");
+
+        // Second signal: SAME correlation_id, claims a timestamp
+        // millions of milliseconds in the "future" — pre-fix, this
+        // would evict the live entry and bypass dedup. Post-fix, the
+        // local clock is what matters and the second call is a dup.
+        let second = test_signal("github", ConnectorSignalKind::Webhook)
+            .with_correlation_id("replay-target")
+            .with_timestamp_ms(u64::MAX / 2);
+        let r2 = bridge.route_signal(&second).unwrap();
+        assert!(
+            r2.deduplicated,
+            "replay with future timestamp_ms must still be flagged duplicated \
+             (ft-dijpe: dedup clock must not be attacker-controllable)"
+        );
         assert_eq!(r2.delivered_count, 0);
 
         let snap = bridge.telemetry_snapshot();
