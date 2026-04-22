@@ -1888,6 +1888,39 @@ pub struct PaneOutputSubscription {
     task: Option<SubscriptionTask>,
 }
 
+async fn pane_delta_recv_with_cx(cx: &Cx, rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
+    rx.recv(cx).await.ok()
+}
+
+#[cfg(test)]
+async fn pane_delta_recv(rx: &mut mpsc::Receiver<PaneDelta>) -> Option<PaneDelta> {
+    let cx = ambient_mux_cx();
+    pane_delta_recv_with_cx(&cx, rx).await
+}
+
+#[cfg(test)]
+async fn pane_delta_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) {
+    let _ = mpsc_reserve_send(tx, delta).await;
+}
+
+fn pane_delta_try_send(tx: &mpsc::Sender<PaneDelta>, delta: PaneDelta) -> bool {
+    mpsc_try_reserve_send(tx, delta)
+}
+
+fn pane_delta_try_emit_ended(
+    tx: &mpsc::Sender<PaneDelta>,
+    pane_id: u64,
+    reason: impl Into<String>,
+) {
+    let _ = pane_delta_try_send(
+        tx,
+        PaneDelta::Ended {
+            pane_id,
+            reason: reason.into(),
+        },
+    );
+}
+
 async fn join_subscription_task(task: SubscriptionTask) {
     let SubscriptionTask::Scoped(handle) = task;
     handle.await;
