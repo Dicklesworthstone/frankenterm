@@ -6,7 +6,7 @@
 //! tagged_len : leb128 u64   (bit 63 set iff payload is zstd-compressed)
 //! serial     : leb128 u64
 //! ident      : leb128 u64
-//! data       : tagged_len - encoded_length(serial) - encoded_length(ident) bytes
+//! data       : tagged_len - encoded byte length of serial - encoded byte length of ident
 //! ```
 //!
 //! These tests pin the decoder's response to minimal/maximum/boundary/non-canonical
@@ -56,6 +56,17 @@ fn frame(tagged_len: u64, serial: u64, ident: u64, data: &[u8]) -> Vec<u8> {
     let mut buf = leb128_u64(tagged_len);
     buf.extend(leb128_u64(serial));
     buf.extend(leb128_u64(ident));
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Hand-build a frame with verbatim leb128 fields. Use this when the test
+/// needs non-canonical encodings that the encoder would normalize away.
+fn frame_verbatim(tagged_len: &[u8], serial: &[u8], ident: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(tagged_len.len() + serial.len() + ident.len() + data.len());
+    buf.extend_from_slice(tagged_len);
+    buf.extend_from_slice(serial);
+    buf.extend_from_slice(ident);
     buf.extend_from_slice(data);
     buf
 }
@@ -295,34 +306,33 @@ fn conformance_two_back_to_back_pdus_decode_cleanly() {
 }
 
 // -----------------------------------------------------------------------------
-// 12. Non-canonical leb128 — 0x80 0x00 encodes 0 in a two-byte form.
-//     The `leb128` crate accepts non-canonical forms (the RFC does not
-//     forbid them), so the decoder must accept them too. Pinning this
-//     behavior prevents accidental drift.
+// 12. Non-canonical leb128 — valid wire frames must use the actual bytes
+//     consumed on the wire, not the decoder's re-encoded canonical lengths.
 // -----------------------------------------------------------------------------
 
 #[test]
-fn conformance_non_canonical_leb128_zero_is_accepted() {
-    // Construct a frame where tagged_len, serial, and ident are each zero,
-    // encoded in a non-canonical two-byte form. data_len works out to 0 — 0 = 0.
-    let mut wire = Vec::new();
-    wire.extend_from_slice(&[0x80, 0x00]); // tagged_len = 0 (non-canonical)
-    wire.extend_from_slice(&[0x80, 0x00]); // serial     = 0 (non-canonical)
-    wire.extend_from_slice(&[0x80, 0x00]); // ident      = 0 (non-canonical, ErrorResponse)
+fn conformance_valid_non_canonical_leb128_headers_are_accepted() {
+    // tagged_len=4, serial=1, ident=99, each encoded in a 2-byte non-canonical
+    // form. The frame is valid because tagged_len counts the ACTUAL bytes consumed
+    // by serial + ident on the wire: 2 + 2 = 4, leaving data_len = 0.
+    let wire = frame_verbatim(&[0x84, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
+    let decoded = Pdu::decode(wire.as_slice()).expect("valid non-canonical header");
+    assert_eq!(
+        decoded,
+        DecodedPdu {
+            serial: 1,
+            pdu: Pdu::Invalid { ident: 99 },
+        }
+    );
+}
 
-    // ErrorResponse with empty reason serializes to... a non-zero number of
-    // varbincode bytes. Crafting that by hand is brittle, so instead we use
-    // ident=99 (unknown) with zero data, and expect Pdu::Invalid.
-    let mut wire = Vec::new();
-    wire.extend_from_slice(&[0x80, 0x00]); // tagged_len = 0 non-canonical
-    wire.extend_from_slice(&[0x80, 0x01]); // serial     = 1 non-canonical, encoded_length = 2
-    wire.extend_from_slice(&[0x80, 0x63]); // ident      = 99 non-canonical, encoded_length = 2
-
-    // Important: we just wrote tagged_len = 0 but serial + ident consume 2+2 = 4
-    // header bytes. That violates the invariant `tagged_len >= enc_len(serial)
-    // + enc_len(ident)` — the decoder's overflow check should catch it.
-    let err = Pdu::decode(wire.as_slice())
-        .expect_err("non-canonical header with impossible arithmetic must fail the sanity check");
+#[test]
+fn conformance_impossible_non_canonical_header_fails_sanity_check() {
+    // tagged_len = 0 (non-canonical two-byte form), while serial + ident each
+    // consume two bytes on the wire. The decoder must reject the impossible
+    // arithmetic before attempting to read payload bytes.
+    let wire = frame_verbatim(&[0x80, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
+    let err = Pdu::decode(wire.as_slice()).expect_err("impossible non-canonical header must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("sizes don't make sense"),
