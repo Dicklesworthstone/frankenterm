@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
@@ -1189,6 +1189,15 @@ impl TmuxCommand for SplitPane {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
             let error = format!("split-window in domain={domain_id} failed: {result:#?}");
+            if let Some(mux) = Mux::try_get() {
+                if let Some(domain) = mux.get_domain(domain_id) {
+                    if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                        let _ = tmux_domain
+                            .inner
+                            .fail_oldest_pending_split(anyhow!(error.clone()));
+                    }
+                }
+            }
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
@@ -1563,11 +1572,13 @@ mod tests {
 
         cmd.process_result(domain_id, &result)?;
 
-        assert!(tmux_domain
-            .inner
-            .support_commands
-            .lock()
-            .contains_key("list-windows"));
+        assert!(
+            tmux_domain
+                .inner
+                .support_commands
+                .lock()
+                .contains_key("list-windows")
+        );
 
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.len(), 1);

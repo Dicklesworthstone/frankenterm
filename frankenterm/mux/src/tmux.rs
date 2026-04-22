@@ -1,5 +1,5 @@
 use crate::activity::Activity;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use crate::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand};
@@ -130,6 +130,26 @@ pub struct TmuxDomain {
 }
 
 impl TmuxDomainState {
+    fn resolve_oldest_pending_split(&self, pane_id: TmuxPaneId) -> bool {
+        let mut pending_splits = self.pending_splits.lock();
+        if let Some(mut promise) = pending_splits.pop_front() {
+            promise.ok(pane_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn fail_oldest_pending_split(&self, err: anyhow::Error) -> bool {
+        let mut pending_splits = self.pending_splits.lock();
+        if let Some(mut promise) = pending_splits.pop_front() {
+            promise.err(err);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Push a command onto the tmux cmd_queue while enforcing the
     /// `CMD_QUEUE_MAX_DEPTH` hard cap (ft-4qom2), preserving the
     /// in-flight head when the state machine is `WaitingForResponse`
@@ -358,10 +378,7 @@ impl TmuxDomainState {
 
                     // Split pane
                     if !self.check_pane_attached(*window, *pane) {
-                        let mut pending_splits = self.pending_splits.lock();
-                        if let Some(mut promise) = pending_splits.pop_front() {
-                            promise.ok(*pane);
-                        }
+                        let _ = self.resolve_oldest_pending_split(*pane);
                     }
                     log::info!("tmux window pane changed: {}:{}", window, pane);
                 }
@@ -625,6 +642,8 @@ mod tests {
     use crate::domain::{Domain, LocalDomain};
     use crate::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use crate::renderable::{RenderableDimensions, StableCursorPosition};
+    use crate::tab::SplitDirection;
+    use crate::tmux_commands::{SplitPane, TmuxCommand};
     use frankenterm_term::color::ColorPalette;
     use parking_lot::{MappedMutexGuard, MutexGuard};
     use promise::spawn::block_on;
@@ -1080,8 +1099,6 @@ mod tests {
     /// head to preserve.
     #[test]
     fn cmd_queue_cap_drops_oldest_when_not_waiting_for_response() {
-        use crate::tab::SplitDirection;
-
         let default_domain: Arc<dyn Domain> =
             Arc::new(LocalDomain::new("tmux-ft-wajba-idle-default").expect("local domain"));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
@@ -1133,6 +1150,45 @@ mod tests {
             head_text, distinctive_text,
             "under state=Idle the oldest-at-front should have been dropped; \
              the distinctive head must NOT survive"
+        );
+    }
+
+    #[test]
+    fn split_command_error_resolves_pending_split_with_error() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+
+        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain);
+
+        let mut promise = promise::Promise::new();
+        let future = promise.get_future().expect("split future");
+        tmux_domain.inner.pending_splits.lock().push_back(promise);
+
+        let cmd = SplitPane {
+            pane_id: 99,
+            direction: SplitDirection::Horizontal,
+        };
+        let result = Guarded {
+            error: true,
+            timestamp: 0,
+            number: 0,
+            flags: 0,
+            output: "split failed".to_string(),
+        };
+
+        let err = cmd
+            .process_result(tmux_domain.domain_id(), &result)
+            .expect_err("tmux split failure should bubble up");
+        assert!(err.to_string().contains("split-window"));
+
+        let future_err = block_on(future).expect_err("pending split should fail closed");
+        let future_err = future_err.to_string();
+        assert!(future_err.contains("split-window"), "{}", future_err);
+        assert!(
+            tmux_domain.inner.pending_splits.lock().is_empty(),
+            "failed split should consume the pending promise instead of leaving it queued"
         );
     }
 }
