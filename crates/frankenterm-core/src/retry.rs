@@ -840,6 +840,54 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_error_does_not_trip_circuit_breaker_ft_gc4hz() {
+        run_async_test(async {
+            use crate::circuit_breaker::{
+                CircuitBreaker, CircuitBreakerConfig, CircuitStateKind,
+            };
+
+            let policy = RetryPolicy {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                backoff_factor: 2.0,
+                jitter_percent: 0.0,
+                max_attempts: Some(1),
+            };
+
+            // Threshold of 1 — a single recorded failure would open the circuit.
+            let mut circuit = CircuitBreaker::new(CircuitBreakerConfig::new(
+                1,
+                1,
+                Duration::from_secs(60),
+            ));
+
+            // Operation returns Cancelled (as would happen if the caller's
+            // Cx is cancelled and the retry loop surfaces it). Before
+            // ft-gc4hz the breaker recorded this as a failure and opened.
+            let result: Result<i32> = with_retry_and_circuit(&policy, &mut circuit, || async {
+                Err(Error::Cancelled("caller cancelled".into()))
+            })
+            .await;
+
+            // Error must propagate unchanged...
+            assert!(matches!(result, Err(Error::Cancelled(_))));
+            // ...but the circuit must still be closed and carry zero
+            // failures, because cancellation is caller intent, not
+            // backend fault.
+            let status = circuit.status();
+            assert_eq!(status.state, CircuitStateKind::Closed);
+            assert_eq!(status.consecutive_failures, 0);
+            assert_eq!(circuit.telemetry().failures_recorded, 0);
+            assert_eq!(circuit.telemetry().successes_recorded, 0);
+
+            // Subsequent real operations must still be allowed through.
+            let ok: Result<i32> =
+                with_retry_and_circuit(&policy, &mut circuit, || async { Ok(7) }).await;
+            assert_eq!(ok.unwrap(), 7);
+        });
+    }
+
+    #[test]
     fn preset_policies_have_sensible_defaults() {
         let wezterm = RetryPolicy::wezterm_cli();
         assert_eq!(wezterm.max_attempts, Some(3));

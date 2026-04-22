@@ -283,7 +283,11 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
     }
 
     let mut parts: Vec<String> = Vec::new();
-    for (key, value) in obj {
+    let mut entries: Vec<(&str, &serde_json::Value)> =
+        obj.iter().map(|(key, value)| (key.as_str(), value)).collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (key, value) in entries {
         let mut rendered = match value {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
@@ -2408,6 +2412,34 @@ mod tests {
         let key = event_identity_key(&detection, 7, None);
         assert!(key.starts_with("evt:"));
         assert_eq!(key.len(), 68); // "evt:" + 64 hex chars
+    }
+
+    #[test]
+    fn event_identity_key_ignores_extracted_object_insertion_order() {
+        let mut first = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let mut first_map = serde_json::Map::new();
+        first_map.insert("agent".to_string(), serde_json::json!("codex"));
+        first_map.insert("retry_after".to_string(), serde_json::json!(120));
+        first.extracted = serde_json::Value::Object(first_map);
+
+        let mut second = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let mut second_map = serde_json::Map::new();
+        second_map.insert("retry_after".to_string(), serde_json::json!(120));
+        second_map.insert("agent".to_string(), serde_json::json!("codex"));
+        second.extracted = serde_json::Value::Object(second_map);
+
+        assert_eq!(
+            event_identity_key(&first, 7, None),
+            event_identity_key(&second, 7, None)
+        );
     }
 
     #[test]
