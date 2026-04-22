@@ -136,15 +136,34 @@ impl RetryPolicy {
         let initial_ms = u64::try_from(self.initial_delay.as_millis()).unwrap_or(u64::MAX);
         let max_ms = u64::try_from(self.max_delay.as_millis()).unwrap_or(u64::MAX);
 
+        // [ft-s4c6y] Fail closed on non-finite or out-of-range backoff_factor
+        // and jitter_percent. Although `new()` applies `.max(1.0)` and
+        // `.clamp(0.0, 1.0)`, those checks are bypassed by struct-literal
+        // construction and `clamp` passes NaN through. A NaN backoff_factor
+        // makes base_ms NaN, which makes jitter_range NaN, which makes
+        // `rng.random_range(NaN..=NaN)` panic. Substitute safe defaults
+        // (backoff_factor=1.0 means no growth; jitter_percent=0.0 means
+        // deterministic) rather than blowing up the retry loop.
+        let backoff_factor = if self.backoff_factor.is_finite() && self.backoff_factor >= 1.0 {
+            self.backoff_factor
+        } else {
+            1.0
+        };
+        let jitter_percent = if self.jitter_percent.is_finite() {
+            self.jitter_percent.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
         // Cap exponent to prevent overflow in powi; 31 iterations of 2x is already huge
         let exp = attempt.min(31) as i32;
-        let base_ms = (initial_ms as f64) * self.backoff_factor.powi(exp);
+        let base_ms = (initial_ms as f64) * backoff_factor.powi(exp);
         let base_ms = base_ms.min(max_ms as f64);
 
         // Apply jitter: ±jitter_percent
-        let jitter = if self.jitter_percent > 0.0 {
+        let jitter = if jitter_percent > 0.0 {
             let mut rng = rand::rng();
-            let jitter_range = base_ms * self.jitter_percent;
+            let jitter_range = base_ms * jitter_percent;
             rng.random_range(-jitter_range..=jitter_range)
         } else {
             0.0
@@ -992,6 +1011,71 @@ mod tests {
             "jitter_percent: {}",
             p.jitter_percent
         );
+    }
+
+    /// [ft-s4c6y] Struct-literal construction can bypass `new()`'s
+    /// clamping. If `backoff_factor` or `jitter_percent` is NaN, infinite,
+    /// or negative, `delay_for_attempt` must still return a finite
+    /// Duration and must NOT panic (a NaN value previously reached
+    /// `rng.random_range(NaN..=NaN)` which panics).
+    #[test]
+    fn delay_for_attempt_nan_backoff_is_fail_closed() {
+        let p = RetryPolicy {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: f64::NAN,
+            jitter_percent: 0.1,
+            max_attempts: Some(3),
+        };
+        for attempt in 0..=10 {
+            let d = p.delay_for_attempt(attempt);
+            // With backoff_factor treated as 1.0, base_ms stays at
+            // initial_ms (100) and the only variance is ±10% jitter.
+            assert!(d.as_millis() <= 200, "attempt {attempt} => {d:?}");
+        }
+    }
+
+    #[test]
+    fn delay_for_attempt_nan_jitter_is_fail_closed() {
+        let p = RetryPolicy {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: f64::NAN,
+            max_attempts: Some(3),
+        };
+        for attempt in 0..=10 {
+            // Must not panic; NaN jitter is treated as 0.0.
+            let _ = p.delay_for_attempt(attempt);
+        }
+    }
+
+    #[test]
+    fn delay_for_attempt_infinite_backoff_is_fail_closed() {
+        let p = RetryPolicy {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: f64::INFINITY,
+            jitter_percent: 0.1,
+            max_attempts: Some(3),
+        };
+        // With backoff_factor treated as 1.0, never exceeds max_delay.
+        let d = p.delay_for_attempt(31);
+        assert!(d.as_millis() <= 10_000, "infinite backoff => {d:?}");
+    }
+
+    #[test]
+    fn delay_for_attempt_negative_backoff_is_fail_closed() {
+        let p = RetryPolicy {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: -2.0,
+            jitter_percent: 0.0,
+            max_attempts: Some(3),
+        };
+        // -2.0 is < 1.0 so treated as 1.0. base_ms stays 100ms; no jitter.
+        let d = p.delay_for_attempt(5);
+        assert_eq!(d.as_millis(), 100);
     }
 
     #[test]

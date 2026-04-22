@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn ft_0p5q5_observe_nan_does_not_enter_calibration() {
         let config = quick_config();
-        let mut monitor = DriftMonitor::new("pane:1");
+        let mut monitor = EValueMonitor::new("pane:1");
 
         let verdict = monitor.observe(f64::NAN, &config);
         assert!(matches!(verdict, DriftVerdict::InsufficientData { .. }));
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn ft_0p5q5_observe_nan_after_calibration_preserves_state() {
         let config = quick_config();
-        let mut monitor = DriftMonitor::new("pane:1");
+        let mut monitor = EValueMonitor::new("pane:1");
 
         // Calibrate with clean data.
         for _ in 0..config.min_calibration {
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn ft_0p5q5_observe_nan_then_clean_sample_detects_drift() {
         let config = quick_config();
-        let mut monitor = DriftMonitor::new("pane:1");
+        let mut monitor = EValueMonitor::new("pane:1");
 
         // Calibrate at 50/50.
         for _ in 0..config.min_calibration {

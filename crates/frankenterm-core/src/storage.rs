@@ -5677,6 +5677,7 @@ pub struct SessionPaneStateRow {
 }
 
 /// Configuration for the storage handle
+#[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// Maximum number of pending write commands before backpressure
     pub write_queue_size: usize,
@@ -15898,21 +15899,42 @@ fn clear_fts_pane_progress_sync(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Get segments that need indexing for a pane (seq > last_indexed_seq)
+/// Get segments that need indexing for a pane.
+///
+/// When `include_from_zero` is `true`, the query is `WHERE pane_id = ?1`
+/// with no seq filter — used on the very first batch of the very first
+/// sync for a pane, where `last_indexed_seq = 0` is the default-zero
+/// sentinel meaning "never indexed", not a claim that seq=0 has been
+/// indexed. See [ft-7do6c] for the full rationale: `append_segment_sync`
+/// assigns `seq = COALESCE(MAX(seq) + 1, 0)`, so the pane's first-ever
+/// segment is seq=0, and a strict `seq > 0` filter would silently skip
+/// it forever under deferred-FTS mode.
+///
+/// Otherwise the query is `WHERE pane_id = ?1 AND seq > ?2`, which is
+/// correct once any segment has actually been indexed (at which point
+/// `last_indexed_seq` carries the real high-water mark).
 fn get_unindexed_segments_sync(
     conn: &Connection,
     pane_id: u64,
     last_indexed_seq: u64,
     limit: usize,
+    include_from_zero: bool,
 ) -> Result<Vec<Segment>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+    let sql = if include_from_zero {
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq
+             LIMIT ?3"
+    } else {
+        "SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
              FROM output_segments
              WHERE pane_id = ?1 AND seq > ?2
              ORDER BY seq
-             LIMIT ?3",
-        )
+             LIMIT ?3"
+    };
+    let mut stmt = conn
+        .prepare(sql)
         .map_err(|e| StorageError::Database(format!("Failed to prepare unindexed query: {e}")))?;
 
     let rows = stmt
@@ -27136,6 +27158,89 @@ mod storage_handle_tests {
 
             handle.shutdown().await.unwrap();
             let _ = std::fs::remove_file(&db_path);
+        });
+    }
+
+    #[test]
+    fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let config = StorageConfig {
+                write_queue_size: 4,
+                defer_fts_triggers: false,
+            };
+            let fts_trigger_count = |conn: &Connection| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'trigger'
+                       AND name IN ('output_segments_ai', 'output_segments_ad', 'output_segments_au')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            let fts_match_count = |conn: &Connection, match_token: &str| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM output_segments_fts
+                     WHERE output_segments_fts MATCH ?1",
+                    [match_token],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+
+            let handle: StorageHandle = StorageHandle::with_config(&db_path, config.clone())
+                .await
+                .unwrap();
+            handle.upsert_pane(test_pane(1)).await.unwrap();
+            handle
+                .append_segment(1, "beforereopen", None)
+                .await
+                .unwrap();
+            handle.shutdown().await.unwrap();
+
+            let conn = Connection::open(&db_path).unwrap();
+            assert_eq!(
+                fts_trigger_count(&conn),
+                3,
+                "fresh default open should leave all three FTS triggers installed"
+            );
+            assert_eq!(
+                fts_match_count(&conn, "beforereopen"),
+                1,
+                "default open should synchronously index the first write"
+            );
+            drop(conn);
+
+            let reopened: StorageHandle =
+                StorageHandle::with_config(&db_path, config).await.unwrap();
+            reopened
+                .append_segment(1, "afterreopen", None)
+                .await
+                .unwrap();
+            reopened.shutdown().await.unwrap();
+
+            let conn = Connection::open(&db_path).unwrap();
+            assert_eq!(
+                fts_trigger_count(&conn),
+                3,
+                "reopening with defer_fts_triggers=false must keep all three FTS triggers installed"
+            );
+            assert_eq!(
+                fts_match_count(&conn, "beforereopen"),
+                1,
+                "reopening must not disturb previously indexed rows"
+            );
+            assert_eq!(
+                fts_match_count(&conn, "afterreopen"),
+                1,
+                "reopened handle must still synchronously index new writes"
+            );
+            drop(conn);
+
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
         });
     }
 
