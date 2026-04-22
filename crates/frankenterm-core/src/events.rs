@@ -841,6 +841,17 @@ impl EventDeduplicator {
 
     /// Check and record an event. Returns whether it's new or a duplicate.
     pub fn check(&mut self, key: &str) -> DedupeVerdict {
+        // [ft-61kg4] Zero capacity means dedup is disabled; short-circuit
+        // before any entry-map bookkeeping. Without this, the novel-key
+        // eviction path at "if entries.len() >= max_capacity" is entered
+        // with len=0 and cap=0, pop_front on empty insertion_order is a
+        // no-op, and the insert below still succeeds — leaving a
+        // 1-slot ghost cache where alternating keys toggle "New" while
+        // immediate repeats spuriously return "Duplicate". Mirrors the
+        // ft-bx4le fix in connector_inbound_bridge::SignalDeduplicator.
+        if self.max_capacity == 0 {
+            return DedupeVerdict::New;
+        }
         let now = Instant::now();
 
         if let Some(entry) = self.entries.get_mut(key) {
@@ -2161,6 +2172,33 @@ mod tests {
         assert_eq!(dedup.len(), 3);
         // "a" was evicted, should be treated as new
         assert_eq!(dedup.check("a"), DedupeVerdict::New);
+    }
+
+    // [ft-61kg4] max_capacity=0 must mean "dedup disabled" (every call is
+    // New), not "1-slot ghost cache". Before the fix, alternating keys
+    // toggled into/out of the single entries slot — producing Duplicate
+    // for immediate repeats but New for every cross-key call. Parallel to
+    // ft-bx4le in connector_inbound_bridge::SignalDeduplicator.
+    #[test]
+    fn dedup_zero_capacity_bypasses_dedup_ft_61kg4() {
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 0);
+
+        // Every call — including immediate repeats of the same key — must
+        // be treated as New. No state accumulation, no toggling.
+        for _ in 0..5 {
+            assert_eq!(dedup.check("a"), DedupeVerdict::New);
+        }
+        // Cross-key calls must also all be New.
+        assert_eq!(dedup.check("b"), DedupeVerdict::New);
+        assert_eq!(dedup.check("a"), DedupeVerdict::New);
+        assert_eq!(dedup.check("c"), DedupeVerdict::New);
+
+        // And no internal state grew — the entries map stays empty, so
+        // the deduplicator is not a hidden unbounded-in-practice cache
+        // when a caller configures capacity=0.
+        assert_eq!(dedup.len(), 0);
+        assert!(dedup.is_empty());
+        assert_eq!(dedup.suppressed_count("a"), 0);
     }
 
     #[test]
